@@ -76,7 +76,10 @@ pub fn init(file: *File) InitError!Model {
     try assignScopes(a, scopes.items, token_scopes);
     var declarations: std.ArrayList(Declaration) = .empty;
     var lowered: std.ArrayList(LoweredDeclaration) = .empty;
-    if (file.zir) |zir| for (zir.instructions.items(.tag), 0..) |tag, index| {
+    // AstGen can leave uninitialized declaration payloads after rejection.
+    // Preserve the failed frontend and never inspect that partial instruction stream.
+    if (file.status == .parsed) for (file.zir.?.instructions.items(.tag), 0..) |tag, index| {
+        const zir = file.zir.?;
         if (tag != .declaration) continue;
         const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         const decl = zir.getDeclaration(instruction);

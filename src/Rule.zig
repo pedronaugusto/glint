@@ -87,7 +87,11 @@ pub const Config = struct {
             if (exception.function.len == 0) return error.InvalidSelection;
         }
         for (self.function_exceptions) |exception| if (std.mem.trim(u8, exception.reason, " \t\r\n").len == 0 or exception.lines == 0) return error.InvalidSelection;
-        for (self.disallowed) |entry| if (entry.declaration.len == 0 or entry.source.len == 0 or entry.reason.len == 0 or entry.replacement.len == 0) return error.InvalidSelection;
+        for (self.disallowed) |entry| {
+            if (std.mem.trim(u8, entry.source, " \t\r\n").len == 0 or std.mem.trim(u8, entry.reason, " \t\r\n").len == 0 or std.mem.trim(u8, entry.replacement, " \t\r\n").len == 0) return error.InvalidSelection;
+            var parts = std.mem.splitScalar(u8, entry.declaration, '.');
+            while (parts.next()) |part| if (part.len == 0) return error.InvalidSelection;
+        }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
         for (self.enabled, 0..) |enabled, index| {
             if (!enabled) continue;

@@ -20,7 +20,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - Breaking: removed 20 unsupported or overlapping policy IDs and `Config.compatibility()` / `--compatibility`; select reviewed rules explicitly or use `Config.reviewed()` / `--reviewed`. Numeric selections and suppressions reject removed IDs.
 - Breaking: diagnostic rule version 2 names correctness, zig_style and family_policy groups; JSON version 1 and the independent completion contract remain unchanged.
 - Z024 defaults to a 100-byte readability report; it is not a universal line-length gate. Split assertion suggestions preserve evaluation effects and stay advisory.
-- Raw G1 evidence moved to immutable private trials; tests, benchmarks and the consumer fixture remain here. Published green preflight/shakedown pins refreshed, and CI uses the canonical planner.
+- Tests, benchmarks and the consumer fixture remain here; evidence stays outside the package. Published green preflight/shakedown pins refreshed, and CI uses the canonical planner.
 
 [Unreleased]: https://github.com/pedronaugusto/glint/commits/main
 
@@ -29,5 +29,6 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - Breaking: distinct aegis-backed file/node/token IDs and rule metadata version 3; explicit reviewed selection expands to 21 IDs. Generic defaults stay Z003/Z013; JSON/SARIF and completion versions remain unchanged.
 - Restore Z012/Z026 as explicit family reports with site reasons. Add configured cast/safety-off/length/unreachable/debug-print/disallowed predicates and a conservative dead-private report which withholds unresolved projects.
 - Public compiled-rule API, per-source levels/options, native input build helper and complete-output verification before accepting reports; shared frozen Zig projection for architecture consumers.
+- Rejected AstGen lowering no longer decodes partially initialized ZIR declaration payloads; failed analysis remains incomplete.
 - Pin published green aegis for typed identities and checked byte accounting. Planned Untrusted/bounded leaves and broad dead-private family admission remain open; consumer repos are unchanged.
-- Lasting contracts moved to docs/design.md; raw scans and timings remain in private trials.
+- Lasting contracts moved to docs/design.md; removed historical results/review tables under the owner package-content rule.

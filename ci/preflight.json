@@ -27,7 +27,7 @@
     ]
   ],
   "shipped": {
-    "docs": "Commit-pinned reviewed rule contracts and concise dated results are the package documentation linked from README.",
+    "docs": "Lasting model, rule, completion and adopter contracts in docs/design.md are linked from README.",
     "examples": "Standalone project-owned rule and CLI entry used by adopters with the public build helper."
   }
 }

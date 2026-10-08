@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) !void {
     }) });
     const project_check = b.step("check-project", "Compile a standalone linter with project-owned rules");
     project_check.dependOn(&project_linter.step);
-    const project_smoke = addLint(b, project_linter, .{ .sources = &.{b.path("examples/input.zig")}, .directories = &.{b.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
+    const project_smoke = addLint(b, project_linter, .{ .sources = &.{b.path("examples/report.zig")}, .directories = &.{b.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
     helper_check.dependOn(&project_smoke.step);
     const portable_smoke = b.addRunArtifact(project_linter);

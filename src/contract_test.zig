@@ -125,3 +125,16 @@ test "contract G2 allocation failures release projection and dead-private owners
     var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(allocation.allocator(), Case.run, .{});
 }
+
+test "contract invalid lowering never indexes partial ZIR declaration payloads" {
+    var invalid = try glint.Project.init(std.testing.allocator, &.{.{ .name = "invalid", .bytes = "pub fn make() Unknown { return .{}; }" }}, &.{}, .{});
+    defer invalid.deinit();
+    try std.testing.expectEqual(.invalid_lowering, invalid.files[0].status);
+    try std.testing.expectEqual(@as(usize, 0), invalid.models[0].zir_declarations.len); // safe: rejected lowering has no admitted declaration payloads.
+    var report = try glint.run(std.testing.allocator, &invalid, .{});
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    var valid = try glint.Project.init(std.testing.allocator, &.{.{ .name = "valid", .bytes = "pub fn make() u8 { return 1; }" }}, &.{}, .{});
+    defer valid.deinit();
+    try std.testing.expect(valid.models[0].zir_declarations.len != 0);
+}

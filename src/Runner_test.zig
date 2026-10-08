@@ -261,3 +261,21 @@ test "G2 disallowed policy follows qualified declaration identity and aliases" {
     try std.testing.expect(!missing.complete);
     try std.testing.expectEqual(@as(usize, 0), missing.diagnostics.len); // safe: no invented missing declaration.
 }
+
+test "G2 policy configuration rejects blank reasons empty qualifiers and stale exceptions" {
+    var config = glint.Config.none();
+    config.disallowed = &.{.{ .source = "module", .declaration = "A.raw", .reason = " ", .replacement = "checked" }};
+    try std.testing.expectError(error.InvalidSelection, config.validate());
+    config.disallowed = &.{.{ .source = "module", .declaration = "A..raw", .reason = "requires guard", .replacement = "checked" }};
+    try std.testing.expectError(error.InvalidSelection, config.validate());
+    config.disallowed = &.{};
+    config.set(.P003, true);
+    config.selections = &.{.{ .rule = .P003, .level = .gate }};
+    config.function_exceptions = &.{.{ .function = "missing", .lines = 120, .reason = "old reviewed boundary" }};
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "pub fn live() void {}" }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: incomplete policy has no invented finding.
+}
