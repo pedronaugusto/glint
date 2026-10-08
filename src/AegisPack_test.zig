@@ -127,3 +127,17 @@ test "aegis pack direct cleanup twice and use after cleanup have local witnesses
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 2), count(report, pack.cleanup)); // safe: fixture counts are representable.
 }
+
+test "aegis pack type factory is not acquisition and repeated defers have witnesses" {
+    var project = try fixture(
+        \\const S = @import("secret").Secret;
+        \\pub fn template() void { const T = S(u32); _ = &T; }
+        \\pub fn repeated() void { var s = S(u32).init(1); defer s.deinit(); defer s.deinit(); }
+        \\pub fn late() void { var s = S(u32).init(1); s.deinit(); defer s.deinit(); }
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 2), count(report, pack.cleanup)); // safe: two explicit repeated cleanup witnesses, no type-template obligation.
+    for (report.diagnostics) |d| try std.testing.expect(d.span.line != 2);
+}

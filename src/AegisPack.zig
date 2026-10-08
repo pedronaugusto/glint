@@ -108,7 +108,10 @@ fn checkCleanup(c: *Context) Context.Error!void {
         // Only actual acquisition expressions, never an owner alias or type alias.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const acquisition = if (tree.nodeTag(init) == .@"try") tree.nodeData(init).node else init;
-        if (tree.fullCall(&call_buffer, acquisition) == null) continue;
+        const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
+        if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
+        const operation = tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]);
+        if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !std.mem.eql(u8, operation, "acquire")) continue;
         const k = (try Contract.owner(c, acquisition)) orelse continue;
         if (k != .secret and k != .bytes and k != .guard) continue;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -126,6 +129,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
             const tag = tree.nodeTag(stmt);
             if (tag == .@"defer") {
                 if (try release(c, tree.nodeData(stmt).node, decl.token)) {
+                    if (released or normal_cleanup) try c.at(cleanup, tree.nodeMainToken(stmt), "same local capability has repeated cleanup scheduled on this straight-line path");
                     normal_cleanup = true;
                     continue;
                 }
