@@ -41,7 +41,7 @@ pub fn deinit(self: *Facts) void {
 }
 
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    if (self.project.files[@backingInt(file)].status != .parsed) return .{ .unknown = .invalid_front_end }; // safe: enum identities index their owning frozen tables without narrowing.
+    if (self.project.files[file.raw()].status != .parsed) return .{ .unknown = .invalid_front_end }; // safe: enum identities index their owning frozen tables without narrowing.
     const key: Key = .{ .file = file, .node = node };
     if (self.cache.get(key)) |value| return value;
     if (self.remaining == 0 or self.active.count() >= 128) return .{ .unknown = .budget };
@@ -62,7 +62,7 @@ fn boxed(self: *Facts, value: Value) ResolveError!*const Value {
 }
 
 fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    const index = @backingInt(file); // safe: enum identities index their owning frozen tables without narrowing.
+    const index = file.raw(); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[index].tree;
     const model = &self.project.models[index];
     const tag = tree.nodeTag(node);
@@ -120,6 +120,11 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                     scope = model.scopes[s].parent;
                 }
             }
+            if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
+                const target = (try self.reflected(file, node)) orelse return .{ .unknown = .comptime_dependent };
+                if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
+                return self.declaration(target);
+            }
             if (std.mem.eql(u8, name, "@as") and args.len == 2) return instance(try self.resolve(file, args[0]));
             return .{ .unknown = .comptime_dependent };
         },
@@ -129,8 +134,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const callee = try self.resolve(file, call.ast.fn_expr);
             if (callee == .function) {
                 const decl = callee.function;
-                const declaration_record = self.project.models[@backingInt(decl.file)].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
-                const target_tree = &self.project.files[@backingInt(decl.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+                const declaration_record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+                const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
                 var fn_buffer: [1]Ast.Node.Index = undefined;
                 const function = target_tree.fullFnProto(&fn_buffer, declaration_record.node).?;
                 const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
@@ -139,8 +144,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                     // A sole, direct returned container retains template identity.
                     // This is not execution or a concrete generic instantiation.
                     const lowered = declaration_record.lowered orelse return .{ .unknown = .comptime_dependent };
-                    var fn_node = self.project.files[@backingInt(decl.file)].zir.?.getDeclaration(lowered).src_node; // safe: enum identities index their owning frozen tables without narrowing.
-                    if (target_tree.nodeTag(fn_node) != .fn_decl) fn_node = self.project.models[@backingInt(decl.file)].node_parents[@backingInt(fn_node)] orelse return .{ .unknown = .comptime_dependent }; // safe: enum identities index their owning frozen tables without narrowing.
+                    var fn_node = self.project.files[decl.file.raw()].zir.?.getDeclaration(lowered).src_node; // safe: enum identities index their owning frozen tables without narrowing.
+                    if (target_tree.nodeTag(fn_node) != .fn_decl) fn_node = self.project.models[decl.file.raw()].node_parents[@backingInt(fn_node)] orelse return .{ .unknown = .comptime_dependent }; // safe: enum identities index their owning frozen tables without narrowing.
                     if (target_tree.nodeTag(fn_node) != .fn_decl) return .{ .unknown = .comptime_dependent };
                     var body_buffer: [2]Ast.Node.Index = undefined;
                     const statements = target_tree.blockStatements(&body_buffer, target_tree.nodeData(fn_node).node_and_node[1]) orelse return .{ .unknown = .comptime_dependent };
@@ -175,9 +180,9 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
 }
 
 pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
-    const model = &self.project.models[@backingInt(decl.file)]; // safe: enum identities index their owning frozen tables without narrowing.
+    const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const declaration_record = model.declarations[decl.index];
-    const tree = &self.project.files[@backingInt(decl.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     if (declaration_record.kind == .function) return .{ .function = decl };
     if (declaration_record.kind == .parameter) {
         const value = try self.resolve(decl.file, declaration_record.node);
@@ -205,16 +210,16 @@ fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
 }
 
 pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl {
-    const model = &self.project.models[@backingInt(container.file)]; // safe: enum identities index their owning frozen tables without narrowing.
+    const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     if (model.scopes[container.scope].names.get(name)) |decl| return .{ .file = container.file, .index = decl };
     for (model.declarations, 0..) |decl, i| if (decl.kind == .field and decl.scope == container.scope and std.mem.eql(u8, decl.name, name)) return .{ .file = container.file, .index = @intCast(i) }; // safe: scope indexes come from the bounded frozen per-file model.
     return null;
 }
 
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
-    const tree = &self.project.files[@backingInt(file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     if (tree.nodeTag(node) == .identifier) {
-        const ref = self.project.models[@backingInt(file)].reference(node) orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
+        const ref = self.project.models[file.raw()].reference(node) orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
         return if (ref.declaration) |decl| .{ .file = file, .index = decl } else null;
     }
     if (tree.nodeTag(node) == .field_access) {
@@ -233,6 +238,25 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
     return null;
 }
 
+/// Literal reflection binds a declaration only on a concrete, resolved container.
+pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
+    const tree = &self.project.files[file.raw()].tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
+    const value = try self.resolve(file, args[0]);
+    const container = switch (value) {
+        .container, .instance => |c| c,
+        else => return null,
+    };
+    if (container.symbolic) return null;
+    const name = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return self.member(container, name);
+}
+
 /// Follows only declaration aliases, keeping the final declaration's provenance.
 /// Cycles, computed expressions and unsupported comptime retain uncertainty.
 pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
@@ -243,9 +267,9 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
         for (visited[0..count]) |earlier| if (std.meta.eql(earlier, current)) return null;
         visited[count] = current;
         count += 1;
-        const record = self.project.models[@backingInt(current.file)].declarations[current.index]; // safe: declaration identities index their owning frozen model.
+        const record = self.project.models[current.file.raw()].declarations[current.index]; // safe: declaration identities index their owning frozen model.
         if (record.kind != .variable) return current;
-        const tree = &self.project.files[@backingInt(current.file)].tree; // safe: declaration identities index their owning frozen file table.
+        const tree = &self.project.files[current.file.raw()].tree; // safe: declaration identities index their owning frozen file table.
         const variable = tree.fullVarDecl(record.node).?;
         const expr = variable.ast.init_node.unwrap() orelse return current;
         if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) return current;
@@ -287,7 +311,7 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     const first = project.files[0].tree.fullVarDecl(project.models[0].declarations[0].node).?.ast.init_node.unwrap().?;
-    try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(@fromBackingInt(0), first)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
+    try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(Project.FileId.fromRaw(0), first)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
     const dep = project.files[0].tree.fullVarDecl(project.models[0].declarations[2].node).?.ast.init_node.unwrap().?;
-    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(@fromBackingInt(0), dep)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
+    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(Project.FileId.fromRaw(0), dep)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
 }

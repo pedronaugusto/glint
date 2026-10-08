@@ -4,7 +4,7 @@ const glint = @import("glint");
 pub fn main() !void {
     var project = try glint.Project.init(std.heap.page_allocator, &.{.{ .name = "consumer", .bytes = "const dependency = @import(\"dependency\");" }}, &.{}, .{});
     defer project.deinit();
-    const handle = try project.handle(@fromBackingInt(0)); // safe: the fixture creates source zero.
+    const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: the fixture creates source zero.
     if ((try project.declarations(handle)).len != 1) return error.MissingDeclaration;
     var report = try glint.run(std.heap.page_allocator, &project, .{});
     defer report.deinit();

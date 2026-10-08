@@ -3,6 +3,7 @@ const std = @import("std");
 const File = @import("File.zig");
 const Model = @import("Model.zig");
 const Project = @This();
+const aegis = @import("aegis");
 
 /// Private: allocation owner for frozen project indexes.
 arena: std.heap.ArenaAllocator,
@@ -18,7 +19,11 @@ imports: []const Import,
 identity: u64,
 
 /// A source index within one project.
-pub const FileId = enum(u32) { _ };
+pub const FileId = aegis.id.Id(struct {}, u32);
+/// Distinct source AST indices; conversions to std occur only at query boundaries.
+pub const NodeId = aegis.id.Id(struct {}, u32);
+/// Token identities cannot be confused with node or file identities.
+pub const TokenId = aegis.id.Id(struct {}, u32);
 /// A source handle that cannot silently identify a replacement snapshot.
 pub const Handle = struct { file: FileId, snapshot: u64 };
 /// Explicit source data. `name` is a diagnostic label; `stem` is Zig file-struct naming input.
@@ -41,10 +46,10 @@ pub const QueryError = error{InvalidHandle};
 /// Copies all source inputs and lowers each valid file through std AstGen/ZIR.
 pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Import, options: Options) InitError!Project {
     if (inputs.len > options.files or inputs.len > std.math.maxInt(u32)) return error.ProjectBudgetExceeded;
-    var remaining_bytes = options.bytes;
+    var remaining_bytes = aegis.int.Checked(usize).init(options.bytes);
     for (inputs) |input| {
-        if (input.bytes.len > remaining_bytes) return error.ProjectBudgetExceeded;
-        remaining_bytes -= input.bytes.len;
+        if (input.bytes.len > remaining_bytes.raw()) return error.ProjectBudgetExceeded;
+        remaining_bytes = remaining_bytes.sub(input.bytes.len) catch return error.ProjectBudgetExceeded;
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -65,8 +70,8 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     }
     const mappings = try a.dupe(Import, imports);
     for (mappings, 0..) |*mapping, index| {
-        if (@backingInt(mapping.from) >= inputs.len or @backingInt(mapping.target) >= inputs.len) return error.InvalidMapping; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-        for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
+        if (mapping.from.raw() >= inputs.len or mapping.target.raw() >= inputs.len) return error.InvalidMapping; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+        for (mappings[0..index]) |earlier| if (mapping.from.eql(earlier.from) and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
         mapping.spelling = try a.dupe(u8, mapping.spelling);
     }
     const identity = try nextIdentity();
@@ -82,7 +87,7 @@ pub fn deinit(self: *Project) void {
 
 /// Creates a handle for an existing source.
 pub fn handle(self: *const Project, file: FileId) QueryError!Handle {
-    if (@backingInt(file) >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    if (file.raw() >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     return .{ .file = file, .snapshot = self.identity };
 }
 
@@ -96,6 +101,11 @@ pub fn references(self: *const Project, source_handle: Handle) QueryError![]cons
 pub fn loweredReferences(self: *const Project, source_handle: Handle) QueryError![]const Model.LoweredReference {
     return self.models[try self.checkedIndex(source_handle)].zir_references;
 }
+/// Source-mapped call/member/reflection operations from actual std ZIR bodies.
+pub fn operations(self: *const Project, h: Handle) QueryError![]const Model.Operation {
+    return self.models[try self.checkedIndex(h)].operations;
+}
+
 /// Reports the bounds of the std-ZIR reference index without implying type checking.
 pub fn loweredCoverage(self: *const Project, source_handle: Handle) QueryError!@FieldType(Model, "lowered_coverage") {
     return self.models[try self.checkedIndex(source_handle)].lowered_coverage;
@@ -120,8 +130,44 @@ pub fn source(self: *const Project, source_handle: Handle) QueryError![]const u8
 
 /// Returns the explicit module target, or unknown when no mapping was supplied.
 pub fn imported(self: *const Project, from: FileId, spelling: []const u8) ?FileId {
-    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) return mapping.target;
+    for (self.imports) |mapping| if (mapping.from.eql(from) and std.mem.eql(u8, mapping.spelling, spelling)) return mapping.target;
     return null;
+}
+
+/// Number of source inputs, including unselected dependencies.
+pub fn count(self: *const Project) usize {
+    return self.inputs.len;
+}
+/// Caller-provided source classification and diagnostic identity.
+pub fn metadata(self: *const Project, h: Handle) QueryError!Input {
+    return self.inputs[try self.checkedIndex(h)];
+}
+/// Frozen std AST. Invalid inputs retain syntax but cannot supply semantic facts.
+pub fn syntax(self: *const Project, h: Handle) QueryError!*const std.zig.Ast {
+    return &self.files[try self.checkedIndex(h)].tree;
+}
+/// Frozen std ZIR, absent when parsing failed.
+pub fn lowered(self: *const Project, h: Handle) QueryError!?*const std.zig.Zir {
+    const file = &self.files[try self.checkedIndex(h)];
+    return if (file.zir) |*zir| zir else null;
+}
+/// Honest front-end status, independent of selected rules.
+pub fn status(self: *const Project, h: Handle) QueryError!File.Status {
+    return self.files[try self.checkedIndex(h)].status;
+}
+/// Real tokenizer comments; strings and multiline strings cannot forge a reason.
+pub fn comments(self: *const Project, h: Handle) QueryError![]const File.Comment {
+    return self.files[try self.checkedIndex(h)].comments;
+}
+/// Validates distinct node identity before converting to std's AST index.
+pub fn node(self: *const Project, h: Handle, id: NodeId) QueryError!std.zig.Ast.Node.Index {
+    if (id.raw() >= (try self.syntax(h)).nodes.len) return error.InvalidHandle;
+    return @fromBackingInt(id.raw()); // safe: checked against this snapshot's AST inventory.
+}
+/// Validates distinct token identity before crossing the std boundary.
+pub fn token(self: *const Project, h: Handle, id: TokenId) QueryError!std.zig.Ast.TokenIndex {
+    if (id.raw() >= (try self.syntax(h)).tokens.len) return error.InvalidHandle;
+    return id.raw();
 }
 
 // Process-local identities are monotonic; allocator reuse cannot revive stale handles.
@@ -135,8 +181,8 @@ fn nextIdentity() error{SnapshotLimit}!u64 {
 }
 
 fn checkedIndex(self: *const Project, source_handle: Handle) QueryError!usize {
-    if (source_handle.snapshot != self.identity or @backingInt(source_handle.file) >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-    return @backingInt(source_handle.file); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    if (source_handle.snapshot != self.identity or source_handle.file.raw() >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    return source_handle.file.raw(); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }
 
 test "project handles cannot refer to another snapshot" {
@@ -144,7 +190,7 @@ test "project handles cannot refer to another snapshot" {
     defer first.deinit();
     var second = try init(std.testing.allocator, &.{.{ .name = "two", .bytes = "const x = 2;" }}, &.{}, .{});
     defer second.deinit();
-    const h = try first.handle(@fromBackingInt(0)); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    const h = try first.handle(Project.FileId.fromRaw(0)); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     try std.testing.expectError(error.InvalidHandle, second.source(h));
     try std.testing.expectEqualStrings("const x = 1;", try first.source(h));
 }
@@ -153,10 +199,10 @@ test "project maps opaque module identities without filesystem access" {
     var project = try init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = "const dep = @import(\"dep\");" },
         .{ .name = "other", .bytes = "pub const value = 1;", .selected = false },
-    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{}); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    }, &.{.{ .from = Project.FileId.fromRaw(0), .spelling = "dep", .target = Project.FileId.fromRaw(1) }}, .{}); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     defer project.deinit();
-    try std.testing.expectEqual(@as(?FileId, @fromBackingInt(1)), project.imported(@fromBackingInt(0), "dep")); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-    try std.testing.expect(project.imported(@fromBackingInt(0), "missing") == null); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    try std.testing.expectEqual(@as(?FileId, Project.FileId.fromRaw(1)), project.imported(Project.FileId.fromRaw(0), "dep")); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    try std.testing.expect(project.imported(Project.FileId.fromRaw(0), "missing") == null); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }
 
 test "project allocation failures release partially initialized files" {
@@ -175,7 +221,7 @@ test "project stale handles survive allocator address reuse without aliasing" {
     var storage: [262144]u8 = undefined;
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     var first = try init(allocator.allocator(), &.{.{ .name = "one", .bytes = "const x = 1;" }}, &.{}, .{});
-    const stale = try first.handle(@fromBackingInt(0)); // safe: source zero exists in this single-source fixture.
+    const stale = try first.handle(Project.FileId.fromRaw(0)); // safe: source zero exists in this single-source fixture.
     first.deinit();
     allocator.reset();
     var replacement = try init(allocator.allocator(), &.{.{ .name = "two", .bytes = "const x = 2;" }}, &.{}, .{});

@@ -1,6 +1,6 @@
 //! Compatibility contracts use complete contrasting source inputs and stable IDs.
 const std = @import("std");
-const glint = @import("glint.zig");
+const glint = @import("glint");
 
 fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .stem = "Fixture", .bytes = source }}, &.{}, .{});
@@ -28,7 +28,7 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = source },
         .{ .name = "dep", .selected = false, .bytes = "/// Deprecated: use modern.\npub fn old() u8 { return 1; } pub fn modern(x: u8) u8 { return x; }" },
-    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
+    }, &.{.{ .from = glint.Project.FileId.fromRaw(0), .spelling = "dep", .target = glint.Project.FileId.fromRaw(1) }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z011, true);
@@ -57,7 +57,7 @@ test "compatibility Z016 splits only conjunction of the mapped standard assertio
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = root },
         .{ .name = "standard", .bytes = "pub const debug = struct { pub fn assert(ok: bool) void { _ = ok; } };", .selected = false },
-    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "std" }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
+    }, &.{.{ .from = glint.Project.FileId.fromRaw(0), .target = glint.Project.FileId.fromRaw(1), .spelling = "std" }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z016, true);
@@ -189,4 +189,75 @@ test "G2 amended policies are explicit family choices and count suppressed sites
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: expected count fits usize.
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
+}
+
+test "G2 dead-private model resolves member calls hooks and literal reflection before counting" {
+    try check(.D001, "fn unused() void {} pub fn live() void {}", 1);
+    try check(.D001, "const S = struct { fn read(self: S) u8 { _ = self; return 1; } }; pub fn live(s: S) u8 { return s.read(); }", 0);
+    try check(.D001, "const S = struct { const needed = 1; }; pub fn live() void { _ = @field(S, \"needed\"); }", 0);
+    try check(.D001, "pub const S = struct { fn format(self: S) void { _ = self; } };", 0);
+    try check(.D001, "fn retained() void {}\n// glint-ignore: D001 -- deliberate fixture declaration tests unused-name reporting\nfn unused() void {}\npub fn live() void { retained(); }", 0);
+}
+
+test "G2 dead-private never accuses dynamic reflection generics or unresolved calls" {
+    try check(.D001, "const S = struct { const needed = 1; }; pub fn live(name: []const u8) void { _ = @field(S, name); }", 0);
+    try check(.D001, "fn Box(comptime T: type) type { return struct { value: T }; }", 0);
+    try check(.D001, "const unknown = @import(\"external\"); fn unused() void {} pub fn live() void { unknown.f(); }", 0);
+}
+
+test "G2 casts safety-off catches and length follow configured code policy" {
+    try check(.P001, "pub fn f(x: u32) u8 { return @intCast(x); }", 1);
+    try check(.P001, "pub fn f(x: u32) u8 { return @intCast(x); } // safe: bounded input validated by caller\n", 0);
+    try check(.P001, "const text = \"// safe: forged\"; pub fn f(x: u32) u8 { _ = text; return @intCast(x); }", 1);
+    try check(.P002, "pub fn f() void { @setRuntimeSafety(false); }", 1);
+    try check(.P002, "pub fn f() void { @setRuntimeSafety(false); } // safe: measured parser loop, length validated at entry\n", 0);
+    try check(.P004, "fn fail() error{Failure}!void {} pub fn f() void { fail() catch unreachable; }", 1);
+    try check(.P004, "fn fail() error{Failure}!void {}\n// unreachable: this implementation cannot emit Failure\npub fn f() void { fail() catch unreachable; }", 0);
+    try check(.P004, "fn fail() error{Failure}!void {} test { fail() catch unreachable; }", 0);
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "length", .bytes = "pub fn f() void {\n\n\n}\n" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.P003, true);
+    config.max_function_lines = 3;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: single overlong function.
+    config.function_exceptions = &.{.{ .function = "f", .lines = 4, .reason = "audited dispatch" }};
+    var allowed = try glint.run(std.testing.allocator, &project, config);
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), allowed.diagnostics.len); // safe: exception matches exact body budget.
+}
+
+test "G2 function-length type constructors subtract returned container bodies" {
+    const source = "pub fn Box(comptime T: type) type {\n    return struct {\n        value: T,\n        a: u8,\n        b: u8,\n        c: u8,\n        fn get(self: @This()) T {\n            return self.value;\n        }\n    };\n}\n";
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "types", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.P003, true);
+    config.max_function_lines = 4;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: constructor and method each fit the limit.
+}
+
+test "G2 hook retention includes nested private namespaces" {
+    try check(.D001, "pub const Outer = struct { const Inner = struct { fn format() void {} }; };", 0);
+}
+
+test "G2 disallowed policy follows qualified declaration identity and aliases" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const A = struct { fn raw() void {} }; const B = struct { fn raw() void {} }; const alias = A.raw; pub fn run() void { alias(); B.raw(); }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.P006, true);
+    config.disallowed = &.{.{ .source = "policy", .declaration = "A.raw", .reason = "this project requires the guarded API", .replacement = "checked" }};
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    // The alias definition and its call refer to A.raw; B.raw is a distinct declaration.
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: exact fixture identity uses.
+    config.disallowed = &.{.{ .source = "missing", .declaration = "A.raw", .reason = "requires guarded API", .replacement = "checked" }};
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    var missing = try glint.run(std.testing.allocator, &project, config);
+    defer missing.deinit();
+    try std.testing.expect(!missing.complete);
+    try std.testing.expectEqual(@as(usize, 0), missing.diagnostics.len); // safe: no invented missing declaration.
 }

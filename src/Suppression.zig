@@ -14,6 +14,10 @@ matched_start: ?u32 = null,
 pub const ParseError = std.mem.Allocator.Error || error{ MalformedSuppression, AmbiguousSuppression, UnknownRule };
 
 pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
+    return parseConfigured(a, file, &.{});
+}
+
+pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []const rules.Definition) ParseError![]Suppression {
     var result: std.ArrayList(Suppression) = .empty;
     for (file.comments) |comment| {
         const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t");
@@ -21,7 +25,7 @@ pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
         const rest = std.mem.trim(u8, raw[13..], " \t");
         const separator = std.mem.find(u8, rest, " -- ") orelse return error.MalformedSuppression;
         const id = std.mem.trim(u8, rest[0..separator], " \t");
-        const rule = rules.Rule.parse(id) orelse return error.UnknownRule;
+        const rule = rules.parseConfigured(id, definitions) orelse return error.UnknownRule;
         const reason = std.mem.trim(u8, rest[separator + 4 ..], " \t");
         if (reason.len == 0) return error.MalformedSuppression;
         const before = std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t\r");

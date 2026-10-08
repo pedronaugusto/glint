@@ -1,6 +1,6 @@
 //! Public contracts: allocation failures, arbitrary parser input and rendering.
 const std = @import("std");
-const glint = @import("glint.zig");
+const glint = @import("glint");
 const shakedown = @import("shakedown");
 
 test "contract allocation failures release project and report owners" {
@@ -74,7 +74,7 @@ test "contract a report cannot silently render against another project snapshot"
 test "contract public lowered references disclose partial std ZIR coverage" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const x = 1; pub fn f() u32 { return x; }" }}, &.{}, .{});
     defer project.deinit();
-    const handle = try project.handle(@fromBackingInt(0)); // safe: source zero exists in this fixture.
+    const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: source zero exists in this fixture.
     try std.testing.expectEqual(.partial, try project.loweredCoverage(handle));
     try std.testing.expect((try project.loweredReferences(handle)).len != 0);
 }

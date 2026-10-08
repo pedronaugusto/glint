@@ -1,5 +1,6 @@
 //! Completed-run evidence is separate from analysis coverage and process status.
 const std = @import("std");
+const glint = @import("glint");
 const cli = @import("cli.zig");
 
 fn resultPath(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]const u8 {
@@ -188,4 +189,23 @@ test "completion retired rule selections are argument failures" {
     try expectOutcome(&tmp, "argument_failure");
     try std.testing.expectError(error.UnknownOption, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "retired", "--compatibility" }, &output.writer));
     try expectOutcome(&tmp, "argument_failure");
+}
+
+test "G2 completion rejects incomplete analysis despite every finding being allowed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "// glint-ignore: Z012 -- intentionally inference-only factory\npub fn make() Unknown { return .{}; }" });
+    const input = try tmp.dir.realPathFileAlloc(std.testing.io, "input.zig", a);
+    defer a.free(input);
+    const result = try std.fs.path.join(a, &.{ input[0 .. input.len - 9], "result.json" });
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--only", "Z012", "--gate", "Z012", "--result", result, "--run-id", "incomplete-allowed", input }, &output.writer);
+    try std.testing.expectEqual(@as(u8, 2), status); // safe: incomplete analysis uses the failure exit class.
+    const receipt = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, result, a, .limited(4096));
+    defer a.free(receipt);
+    try std.testing.expect(!try glint.Completion.verify(a, receipt, "incomplete-allowed", status, output.written()));
+    try std.testing.expect(std.mem.find(u8, receipt, "analysis_incomplete") != null);
 }

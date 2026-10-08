@@ -1,10 +1,11 @@
 //! Atomic completed-run sidecar. Consumers verify nonce, exit, length and digest.
 const std = @import("std");
 const Result = @This();
+const glint = @import("glint");
 
-pub const Outcome = @import("Completion.zig").Outcome;
+pub const Outcome = glint.Completion.Outcome;
 pub const Request = struct { path: []const u8, run_id: []const u8 };
-pub const Record = @import("Completion.zig").Record;
+pub const Record = glint.Completion.Record;
 
 pub fn request(args: []const []const u8) !?Request {
     var path: ?[]const u8 = null;

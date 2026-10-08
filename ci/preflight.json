@@ -3,7 +3,8 @@
     "src"
   ],
   "test_roots": [
-    "src/tests.zig"
+    "src/tests.zig",
+    "src/glint.zig"
   ],
   "test_dependencies": [
     "shakedown"
@@ -13,9 +14,20 @@
       "zig",
       "build",
       "check-consumer"
+    ],
+    [
+      "zig",
+      "build",
+      "check-project"
+    ],
+    [
+      "zig",
+      "build",
+      "check-helper"
     ]
   ],
   "shipped": {
-    "docs": "Commit-pinned reviewed rule contracts and concise dated results are the package documentation linked from README."
+    "docs": "Commit-pinned reviewed rule contracts and concise dated results are the package documentation linked from README.",
+    "examples": "Standalone project-owned rule and CLI entry used by adopters with the public build helper."
   }
 }

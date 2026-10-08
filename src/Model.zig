@@ -12,6 +12,8 @@ node_references: []const ?u32,
 node_parents: []const ?Ast.Node.Index,
 zir_declarations: []const LoweredDeclaration,
 zir_references: []const LoweredReference,
+operations: []const Operation,
+node_operations: []const ?u32,
 unknown_references: usize,
 /// Import expressions indexed once for repeated coverage queries.
 import_nodes: []const Ast.Node.Index,
@@ -44,6 +46,12 @@ pub const Reference = struct {
     declaration: ?u32,
     unknown: ?enum { primitive, unresolved, invalid_lowering, before_declaration } = null,
 };
+pub const Operation = struct {
+    instruction: std.zig.Zir.Inst.Index,
+    node: Ast.Node.Index,
+    kind: enum { call, member_call, member, reflection, type_info },
+};
+
 pub const LoweredReference = struct { instruction: std.zig.Zir.Inst.Index, token: Ast.TokenIndex, declaration: ?u32 };
 
 pub const LoweredDeclaration = struct {
@@ -84,7 +92,10 @@ pub fn init(file: *File) InitError!Model {
     for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)]; // safe: enum identities index their owning frozen tables without narrowing.
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);
-    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
+    const node_operations = try a.alloc(?u32, tree.nodes.len);
+    @memset(node_operations, null);
+    var operations: std.ArrayList(Operation) = .empty;
+    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .operations = &.{}, .node_operations = node_operations, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
     var references: std.ArrayList(Reference) = .empty;
     var import_nodes: std.ArrayList(Ast.Node.Index) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
@@ -114,10 +125,12 @@ pub fn init(file: *File) InitError!Model {
         @memset(visited, false);
         for (lowered.items) |decl| {
             const baseline = tree.nodeMainToken(decl.node);
-            if (decl.type_body) |body| try walkLowered(a, file.zir.?, body, baseline, tree, &model, visited, &zir_refs, 0);
-            if (decl.value_body) |body| try walkLowered(a, file.zir.?, body, baseline, tree, &model, visited, &zir_refs, 0);
+            if (decl.type_body) |body| try walkLowered(a, file.zir.?, body, baseline, decl.node, tree, &model, visited, &zir_refs, &operations, 0);
+            if (decl.value_body) |body| try walkLowered(a, file.zir.?, body, baseline, decl.node, tree, &model, visited, &zir_refs, &operations, 0);
         }
         model.zir_references = zir_refs.items;
+        model.operations = operations.items;
+        for (operations.items, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i); // safe: bounded std index inventory.
     }
     return model;
 }
@@ -146,7 +159,7 @@ fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.I
     return result;
 }
 
-fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir.Inst.Index, baseline: Ast.TokenIndex, tree: *const Ast, model: *Model, visited: []bool, refs: *std.ArrayList(LoweredReference), depth: usize) InitError!void {
+fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir.Inst.Index, baseline: Ast.TokenIndex, baseline_node: Ast.Node.Index, tree: *const Ast, model: *Model, visited: []bool, refs: *std.ArrayList(LoweredReference), operations: *std.ArrayList(Operation), depth: usize) InitError!void {
     if (depth >= 128) {
         model.lowered_coverage = .budget_exhausted;
         return;
@@ -159,6 +172,29 @@ fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir
         const tag = zir.instructions.items(.tag)[i];
         const data = zir.instructions.items(.data)[i];
         switch (tag) {
+            .call, .field_call, .field_ptr, .field_ptr_load, .field_ptr_named, .field_ptr_named_load, .has_decl, .type_info => {
+                const node = (if (tag == .type_info) data.un_node.src_node else data.pl_node.src_node).toAbsolute(baseline_node);
+                if (@backingInt(node) >= tree.nodes.len) {
+                    model.lowered_coverage = .budget_exhausted;
+                    continue;
+                } // safe: reject source mappings outside frozen AST.
+                try operations.append(a, .{ .instruction = instruction, .node = node, .kind = switch (tag) {
+                    .call => .call,
+                    .field_call => .member_call,
+                    .field_ptr, .field_ptr_load => .member,
+                    .type_info => .type_info,
+                    else => .reflection,
+                } });
+                if (tag == .call or tag == .field_call) {
+                    const flags = if (tag == .call) zir.extraData(Inst.Call, data.pl_node.payload_index).data.flags else zir.extraData(Inst.FieldCall, data.pl_node.payload_index).data.flags;
+                    const end = if (tag == .call) zir.extraData(Inst.Call, data.pl_node.payload_index).end else zir.extraData(Inst.FieldCall, data.pl_node.payload_index).end;
+                    if (flags.args_len != 0) {
+                        const final_end = zir.extra[end + flags.args_len - 1];
+                        try walkLowered(a, zir, zir.bodySlice(end + flags.args_len, final_end - flags.args_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
+                    }
+                }
+            },
+            .@"defer" => try walkLowered(a, zir, zir.bodySlice(data.@"defer".index, data.@"defer".len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1),
             .decl_ref, .decl_val => {
                 const token = data.str_tok.src_tok.toAbsolute(baseline);
                 if (token >= tree.tokens.len) continue;
@@ -167,28 +203,29 @@ fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir
             },
             .func, .func_inferred, .func_fancy => {
                 const info = zir.getFnInfo(instruction);
-                try walkLowered(a, zir, info.ret_ty_body, baseline, tree, model, visited, refs, depth + 1);
-                try walkLowered(a, zir, info.body, baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, info.param_body, baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
+                try walkLowered(a, zir, info.ret_ty_body, baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
+                try walkLowered(a, zir, info.body, baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             .block, .block_inline, .loop => {
                 const extra = zir.extraData(Inst.Block, data.pl_node.payload_index);
-                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             .block_comptime => {
                 const extra = zir.extraData(Inst.BlockComptime, data.pl_node.payload_index);
-                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             .condbr, .condbr_inline => {
                 const extra = zir.extraData(Inst.CondBr, data.pl_node.payload_index);
-                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.then_body_len + extra.data.else_body_len), baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.then_body_len + extra.data.else_body_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             .@"try", .try_ptr => {
                 const extra = zir.extraData(Inst.Try, data.pl_node.payload_index);
-                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.body_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             .param, .param_comptime => {
                 const extra = zir.extraData(Inst.Param, data.pl_tok.payload_index);
-                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.type.body_len), baseline, tree, model, visited, refs, depth + 1);
+                try walkLowered(a, zir, zir.bodySlice(extra.end, extra.data.type.body_len), baseline, baseline_node, tree, model, visited, refs, operations, depth + 1);
             },
             else => {}, // No alternate IR: unsupported structured instruction coverage stays in std ZIR.
         }

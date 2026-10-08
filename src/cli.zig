@@ -1,6 +1,6 @@
 //! Filesystem front end for explicit inputs. No globs, build execution or hidden cache.
 const std = @import("std");
-const glint = @import("glint.zig");
+const glint = @import("glint");
 const Result = @import("Result.zig");
 const Cli = @This();
 
@@ -29,7 +29,7 @@ const Loader = struct {
     fn load(self: *Loader, path: []const u8, selected: bool) !glint.Project.FileId {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.a);
         if (self.paths.get(canonical)) |id| {
-            if (selected) self.inputs.items[@backingInt(id)].selected = true; // safe: enum identities index their owning frozen tables without narrowing.
+            if (selected) self.inputs.items[id.raw()].selected = true; // safe: enum identities index their owning frozen tables without narrowing.
             return id;
         }
         if (self.inputs.items.len >= 4096) return error.FileBudgetExceeded;
@@ -44,7 +44,7 @@ const Loader = struct {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(self.io, canonical, self.a, .limited(16 * 1024 * 1024), .@"1", 0);
         self.bytes += bytes.len;
         if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
-        const id: glint.Project.FileId = @fromBackingInt(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
+        const id: glint.Project.FileId = glint.Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
         const basename = std.fs.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected });
@@ -56,7 +56,7 @@ const Loader = struct {
     fn imports(self: *Loader) !void {
         var cursor: usize = 0;
         while (cursor < self.inputs.items.len) : (cursor += 1) {
-            const from: glint.Project.FileId = @fromBackingInt(@intCast(cursor)); // safe: the loader bounds source count to 4096 before creating u32 identities.
+            const from: glint.Project.FileId = glint.Project.FileId.fromRaw(@intCast(cursor)); // safe: the loader bounds source count to 4096 before creating u32 identities.
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
             var lexer: std.zig.Tokenizer = .init(sentinel);
@@ -73,7 +73,7 @@ const Loader = struct {
                 const target_path = try self.importPath(cursor, spelling) orelse continue;
                 const target = try self.load(target_path, false);
                 var duplicate = false;
-                for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
+                for (self.mappings.items) |m| if (m.from.eql(from) and std.mem.eql(u8, m.spelling, spelling)) {
                     duplicate = true;
                     break;
                 };
@@ -106,6 +106,9 @@ fn value(args: []const []const u8, index: *usize) ![]const u8 {
 }
 
 fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options {
+    return optionsConfigured(a, io, args, &.{});
+}
+fn optionsConfigured(a: std.mem.Allocator, io: std.Io, args: []const []const u8, definitions: []const glint.RuleDefinition) !Options {
     var result: Options = .{};
     var selected = false;
     var i: usize = 1;
@@ -120,14 +123,26 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
                 result.config = glint.Config.none();
                 selected = true;
             }
-            const rule = glint.Rule.parse(try value(args, &i)) orelse return error.UnknownRule;
-            result.config.set(rule, true);
+            const rule = glint.parseRule(try value(args, &i), definitions) orelse return error.UnknownRule;
+            try select(a, &result.config, rule, .report);
         } else if (std.mem.eql(u8, arg, "--reviewed")) {
             result.config = glint.Config.reviewed();
             selected = false;
         } else if (std.mem.eql(u8, arg, "--enable") or std.mem.eql(u8, arg, "--disable")) {
-            const rule = glint.Rule.parse(try value(args, &i)) orelse return error.UnknownRule;
-            result.config.set(rule, std.mem.eql(u8, arg, "--enable"));
+            const rule = glint.parseRule(try value(args, &i), definitions) orelse return error.UnknownRule;
+            try select(a, &result.config, rule, if (std.mem.eql(u8, arg, "--enable")) .report else .off);
+        } else if (std.mem.eql(u8, arg, "--family")) {
+            result.config = glint.Config.family();
+            selected = false;
+        } else if (std.mem.eql(u8, arg, "--gate") or std.mem.eql(u8, arg, "--report")) {
+            const rule = glint.parseRule(try value(args, &i), definitions) orelse return error.UnknownRule;
+            try select(a, &result.config, rule, if (std.mem.eql(u8, arg, "--gate")) .gate else .report);
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, try value(args, &i), a, .limited(4 * 1024 * 1024));
+            result.config = try configure(a, bytes, definitions);
+            selected = false;
+        } else if (std.mem.eql(u8, arg, "--max-function-lines")) {
+            result.config.max_function_lines = try std.fmt.parseInt(u32, try value(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--fact-budget")) {
             result.config.fact_budget = try std.fmt.parseInt(usize, try value(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--max-line-length")) {
@@ -145,6 +160,8 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
             try result.modules.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
         } else if (std.mem.eql(u8, arg, "--result") or std.mem.eql(u8, arg, "--run-id")) {
             _ = try value(args, &i);
+        } else if (std.mem.eql(u8, arg, "--input-directory")) {
+            _ = try value(args, &i); // Caller build input only; never source selection.
         } else if (std.mem.eql(u8, arg, "--files-from")) {
             const list = try std.Io.Dir.cwd().readFileAlloc(io, try value(args, &i), a, .limited(4 * 1024 * 1024));
             var lines = std.mem.splitScalar(u8, list, '\n');
@@ -158,13 +175,17 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
 }
 
 pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer) !u8 {
+    return executeConfigured(gpa, io, args, writer, &.{});
+}
+/// Standalone CLI for compiled project rules. Same completion and output contract.
+pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, project_rules: []const glint.ProjectRule) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const requested = try Result.request(args);
     var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .version = 1, .completed = false, .outcome = .running, .sources = 0, .findings = 0, .suppressed = 0, .output_bytes = 0, .output_sha256 = "" };
     try Result.publish(a, io, requested, record);
-    const status = executeInner(gpa, a, io, args, writer, &record) catch |err| {
+    const status = executeInner(gpa, a, io, args, writer, &record, project_rules) catch |err| {
         if (err == error.Canceled) record.outcome = .canceled;
         if (err == error.OutOfMemory) record.outcome = .tool_failure;
         switch (err) {
@@ -178,12 +199,14 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     return status;
 }
 
-fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, record: *Result.Record) !u8 {
+fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, record: *Result.Record, project_rules: []const glint.ProjectRule) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     record.outcome = .argument_failure;
-    const configured = try options(a, io, args);
+    const definitions = try a.alloc(glint.RuleDefinition, project_rules.len);
+    for (project_rules, 0..) |rule, i| definitions[i] = rule.definition;
+    const configured = try optionsConfigured(a, io, args, definitions);
     if (configured.help) {
         record.outcome = .output_failure;
         try writer.writeAll("glint [--only Znnn | --reviewed] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
@@ -198,7 +221,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
         const id = try loader.load(path, true);
-        const canonical = loader.canonical_paths.items[@backingInt(id)]; // safe: enum identities index their owning frozen tables without narrowing.
+        const canonical = loader.canonical_paths.items[id.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
         try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
@@ -211,7 +234,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .tool_failure;
     var project = try glint.Project.init(gpa, loader.inputs.items, loader.mappings.items, .{});
     defer project.deinit();
-    var report = try glint.run(gpa, &project, configured.config);
+    var report = try glint.runConfigured(gpa, &project, configured.config, .{ .project_rules = project_rules });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);
@@ -240,4 +263,54 @@ test "CLI invalid selections and unknown formats fail" {
     try std.testing.expectError(error.UnknownFormat, options(arena.allocator(), std.testing.io, &.{ "glint", "--format", "other" }));
     try std.testing.expect(within("/root", "/root/src/x.zig"));
     try std.testing.expect(!within("/root", "/root-copy/x.zig"));
+}
+
+/// Strict JSON policy, containing code options only. Callers own file selection.
+pub const Configuration = struct {
+    profile: enum { core, none, reviewed, family } = .core,
+    rules: []const Setting = &.{},
+    max_line_length: u32 = 100,
+    max_function_lines: u32 = 120,
+    cast_scope: @FieldType(glint.Config, "cast_scope") = .all,
+    casts: @FieldType(glint.Config, "casts") = .all,
+    function_exceptions: []const glint.Config.FunctionException = &.{},
+    disallowed: []const glint.Config.Disallowed = &.{},
+    strict_suppressions: bool = false,
+    fact_budget: usize = 100_000,
+    pub const Setting = struct { id: []const u8, level: glint.Config.Level };
+};
+fn select(a: std.mem.Allocator, config: *glint.Config, id: glint.Rule, level: glint.Config.Level) !void {
+    const selections = try a.alloc(glint.Config.Selection, config.selections.len + 1);
+    @memcpy(selections[0..config.selections.len], config.selections);
+    for (selections[0..config.selections.len], 0..) |selection, i| if (selection.rule == id) {
+        selections[i].level = level;
+        config.selections = selections[0..config.selections.len];
+        return;
+    };
+    selections[config.selections.len] = .{ .rule = id, .level = level };
+    config.selections = selections;
+}
+fn configure(a: std.mem.Allocator, bytes: []const u8, definitions: []const glint.RuleDefinition) !glint.Config {
+    const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
+    var config: glint.Config = switch (document.profile) {
+        .core => .{},
+        .none => glint.Config.none(),
+        .reviewed => glint.Config.reviewed(),
+        .family => glint.Config.family(),
+    };
+    config.max_line_length = document.max_line_length;
+    config.max_function_lines = document.max_function_lines;
+    config.cast_scope = document.cast_scope;
+    config.casts = document.casts;
+    config.function_exceptions = document.function_exceptions;
+    config.disallowed = document.disallowed;
+    config.strict_suppressions = document.strict_suppressions;
+    config.fact_budget = document.fact_budget;
+    for (document.rules, 0..) |setting, i| {
+        for (document.rules[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
+        const id = glint.parseRule(setting.id, definitions) orelse return error.UnknownRule;
+        try select(a, &config, id, setting.level);
+    }
+    try config.validate();
+    return config;
 }

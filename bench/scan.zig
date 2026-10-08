@@ -9,7 +9,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(a);
     const small = args.len > 1 and std.mem.eql(u8, args[1], "--smoke");
     const count: usize = if (small) 4 else 256;
-    const rounds: usize = if (small) 1 else 15;
+    const rounds: usize = if (small) 1 else if (args.len > 2 and std.mem.eql(u8, args[1], "--rounds")) try std.fmt.parseInt(usize, args[2], 10) else 15;
     var text: std.Io.Writer.Allocating = .init(a);
     for (0..count) |n| try text.writer.print("pub const Item{d} = struct {{ value: u32, pub fn read(self: Item{d}) u32 {{ return self.value; }} }};\n", .{ n, n });
     const source = try a.dupeSentinel(u8, text.written(), 0);
@@ -58,6 +58,17 @@ pub fn main(init: std.process.Init) !void {
         }
         try row(writer, if (all) "warm_reviewed" else "warm_core", elapsed(init.io, rules_start, small), rounds, findings);
     }
+    var old = glint.Config.none();
+    for ([_]glint.Rule{ .Z001, .Z003, .Z005, .Z006, .Z009, .Z011, .Z013, .Z014, .Z016, .Z024, .Z031, .Z032 }) |rule| old.set(rule, true);
+    const matched = now(init.io, small);
+    var matched_findings: usize = 0;
+    for (0..rounds) |_| {
+        var report = try glint.run(init.gpa, &project, old);
+        defer report.deinit();
+        if (!report.complete) return error.IncompleteMatchedScan;
+        matched_findings = report.diagnostics.len;
+    }
+    try row(writer, "warm_g1r_selection", elapsed(init.io, matched, small), rounds, matched_findings);
     var stats: Stats = .{ .backing = init.gpa };
     {
         var measured = try glint.Project.init(stats.allocator(), inputs, &.{}, .{});
@@ -67,6 +78,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (stats.live != 0) return error.LeakedBenchmarkOwner;
     try writer.print("row=cold_core_memory allocations={d} peak_requested_bytes={d} live_after={d}\n", .{ stats.allocations, stats.peak, stats.live });
+    try g2Rows(init.gpa, init.io, writer, &project, rounds, small);
     try semanticRows(init.gpa, init.io, writer, rounds, small);
     try writer.flush();
 }
@@ -86,7 +98,7 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     const root = "const dep = @import(\"dep\"); const Alias = dep.S; pub fn f(v: Alias) Alias { _ = dep.old(); return v; }";
     const dependency = "/// Deprecated: use the replacement.\npub fn old() u8 { return 1; } pub const S = struct { value: u8 };";
     const inputs: []const glint.Project.Input = &.{ .{ .name = "root", .stem = "Root", .bytes = root }, .{ .name = "dependency", .stem = "Dependency", .bytes = dependency, .selected = false } };
-    const imports: []const glint.Project.Import = &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}; // safe: the two frozen fixture sources have indexes zero and one.
+    const imports: []const glint.Project.Import = &.{.{ .from = glint.Project.FileId.fromRaw(0), .spelling = "dep", .target = glint.Project.FileId.fromRaw(1) }}; // safe: the two frozen fixture sources have indexes zero and one.
     var config = glint.Config.none();
     for ([_]glint.Rule{.Z011}) |rule| config.set(rule, true);
     try writer.print("case=cross_module bytes={d} files=2 rounds={d}\n", .{ root.len + dependency.len, rounds });
@@ -119,4 +131,33 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
         if (!report.complete or report.diagnostics.len != 1 or report.diagnostics[0].rule != .Z013) return error.UnexpectedImportResult;
     }
     try row(writer, "warm_private_import", elapsed(io, import_start, small), rounds, 1);
+}
+
+fn g2Rows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, project: *const glint.Project, rounds: usize, small: bool) !void {
+    const Probe = struct {
+        fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
+            for (try context.project.declarations(try context.source())) |decl| {
+                if (decl.name.len == 0) try context.emit(@fromBackingInt(1000), 0, 0, "unnamed declaration"); // safe: registered benchmark extension ID.
+            }
+        }
+    };
+    const id: glint.Rule = @fromBackingInt(1000); // safe: registered benchmark extension ID.
+    const rules = [_]glint.ProjectRule{.{ .definition = .{ .id = id, .name = "BENCH_DECL", .group = .family_policy, .purpose = "measure compiled declaration traversal", .version = 1 }, .check = Probe.check }};
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = id, .level = .report }};
+    const start = now(io, small);
+    for (0..rounds) |_| {
+        var report = try glint.runConfigured(gpa, project, config, .{ .project_rules = &rules });
+        defer report.deinit();
+        if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedProjectRuleResult;
+    }
+    try row(writer, "warm_project_rule", elapsed(io, start, small), rounds, 1);
+    const projection_start = now(io, small);
+    var references: usize = 0;
+    for (0..rounds) |_| {
+        var projection = try glint.Projection.init(gpa, project, 100_000);
+        defer projection.deinit();
+        references = projection.references.len;
+    }
+    try row(writer, "projection", elapsed(io, projection_start, small), rounds, references);
 }
