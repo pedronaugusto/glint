@@ -59,3 +59,63 @@ test "completion output failure cannot publish success" {
     try std.testing.expect(!json.value.object.get("completed").?.bool);
     try std.testing.expectEqualStrings("output_failure", json.value.object.get("outcome").?.string);
 }
+
+fn expectOutcome(tmp: *std.testing.TmpDir, outcome: []const u8) !void {
+    const a = std.testing.allocator;
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "result.json", a, .limited(65536));
+    defer a.free(bytes);
+    const json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer json.deinit();
+    try std.testing.expect(!json.value.object.get("completed").?.bool);
+    try std.testing.expectEqualStrings(outcome, json.value.object.get("outcome").?.string);
+}
+
+test "completion missing input and bad arguments never certify clean" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try resultPath(a, &tmp, "missing.zig");
+    defer a.free(missing);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "missing", missing }, &output.writer));
+    try expectOutcome(&tmp, "input_failure");
+    try std.testing.expectError(error.UnknownOption, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "bad-args", "--invalid" }, &output.writer));
+    try expectOutcome(&tmp, "argument_failure");
+}
+
+test "completion unread required import is a traversal failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "pub const dep = @import(\"missing.zig\");" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "traversal", input }, &output.writer));
+    try expectOutcome(&tmp, "traversal_failure");
+}
+
+test "completion canceled input publishes failure and cannot inherit old success" {
+    const shakedown = @import("shakedown");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "pub const value = 1;" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    _ = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "old-success", input }, &output.writer);
+    const fault = try shakedown.FaultIo.init(a, std.testing.io, .{ .plan = &.{.{ .at = .{ .nth = .{ .call = .dirRealPathFile, .n = 1 } }, .fault = .{ .fail = error.Canceled } }} });
+    defer fault.deinit();
+    try std.testing.expectError(error.Canceled, cli.execute(a, fault.io(), &.{ "glint", "--result", result, "--run-id", "canceled", input }, &output.writer));
+    try expectOutcome(&tmp, "canceled");
+}

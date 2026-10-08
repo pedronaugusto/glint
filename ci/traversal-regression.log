@@ -1,0 +1,18 @@
+test
++- run test 2 pass, 1 fail (3 total)
+error: 'cli_test.test.completion unread required import is a traversal failure' failed:
+       preflight: test seed 645261526 (reproduce with PREFLIGHT_TEST_SEED=645261526)
+       expected error.FileNotFound, found 0
+       cli_test.test.completion unread required import is a traversal failure: TestExpectedError; seed 645261526
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:634:9: 0x104e6ebef in expectError__func_1181 (test)
+               return error.TestExpectedError;
+               ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/cli_test.zig:100:5: 0x104e6f94b in test.completion unread required import is a traversal failure (test)
+           try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "traversal", input }, &output.writer));
+           ^
+failed command: ./.zig-cache/o/14b15b2cc360c3862352b0d81b2136bd/test --cache-dir=./.zig-cache --seed=0x2675e8d6 --listen=-
+
+Build Summary: 5/7 steps succeeded (1 failed); 2/3 tests passed (1 failed)
+test transitive failure
++- run test 2 pass, 1 fail (3 total)
+
