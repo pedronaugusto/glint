@@ -152,6 +152,13 @@ fn g2Rows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, project: *
         if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedProjectRuleResult;
     }
     try row(writer, "warm_project_rule", elapsed(io, start, small), rounds, 1);
+    const family_start = now(io, small);
+    for (0..rounds) |_| {
+        var report = try glint.run(gpa, project, glint.Config.family());
+        defer report.deinit();
+        if (!report.complete) return error.IncompleteFamilyScan;
+    }
+    try row(writer, "warm_family", elapsed(io, family_start, small), rounds, 20);
     const projection_start = now(io, small);
     var references: usize = 0;
     for (0..rounds) |_| {

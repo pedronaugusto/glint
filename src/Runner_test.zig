@@ -279,3 +279,17 @@ test "G2 policy configuration rejects blank reasons empty qualifiers and stale e
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: incomplete policy has no invented finding.
 }
+
+test "G2 complete cast inventory includes boolean and volatile conversion reasons" {
+    try check(.P001, "pub fn f(b: bool) u1 { return @intFromBool(b); }", 1);
+    try check(.P001, "pub fn f(p: *volatile u8) *u8 { return @volatileCast(p); }", 1);
+    try check(.P001, "pub fn f(b: bool) u1 { return @intFromBool(b); } // safe: bool conversion yields exactly zero or one\n", 0);
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "migration", .bytes = "pub fn f(b: bool) u1 { return @intFromBool(b); }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.P001, true);
+    config.casts = .pointer;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit narrower migration selection.
+}

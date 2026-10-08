@@ -335,9 +335,12 @@ fn hasReason(self: *const Context, token: Ast.TokenIndex, prefix: []const u8, pr
     return false;
 }
 fn isCast(name: []const u8, all: bool) bool {
-    for ([_][]const u8{ "@constCast", "@ptrCast", "@alignCast", "@intFromPtr" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    if (all) for ([_][]const u8{ "@as", "@bitCast", "@intCast", "@floatCast", "@floatFromInt", "@intFromFloat", "@ptrFromInt", "@truncate", "@enumFromInt", "@intFromEnum", "@fromBackingInt", "@backingInt", "@addrSpaceCast", "@errorCast", "@errorFromInt", "@intFromError" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+    const builtin = std.zig.BuiltinFn.list.get(name) orelse return false;
+    return switch (builtin.tag) {
+        .const_cast, .ptr_cast, .align_cast, .int_from_ptr => true,
+        .as, .bit_cast, .int_cast, .float_cast, .float_from_int, .int_from_float, .ptr_from_int, .truncate, .enum_from_int, .int_from_enum, .from_backing_int, .backing_int, .addrspace_cast, .error_cast, .error_from_int, .int_from_error, .int_from_bool, .volatile_cast => all,
+        else => false,
+    };
 }
 fn sourcePolicies(self: *Context) RunError!void {
     if (!self.selected(&.{ .P001, .P002, .P004, .P005 })) return;
