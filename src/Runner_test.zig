@@ -198,3 +198,8 @@ test "compatibility suppression rejects multiple distinct binding sites" {
 test "compatibility deprecation resolves escaped member identity" {
     try check(.Z011, "const S = struct {\n /// Deprecated: use fresh.\n pub fn @\"old name\"() void {} }; pub fn run() void { S.@\"old name\"(); }", 1);
 }
+
+test "compatibility function-pointer parameter labels cannot shadow fields or imports" {
+    try check(.Z027, "const S = struct { context: usize, call: *const fn (context: usize) void, pub fn f(self: S) void { self.call(self.context); } };", 0);
+    try check(.Z013, "const dep = @import(\"dep\"); const S = struct { call: *const fn (dep: u8) void, pub fn f(self: S) void { self.call(dep.value); } };", 0);
+}
