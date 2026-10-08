@@ -24,6 +24,11 @@
       "zig",
       "build",
       "check-helper"
+    ],
+    [
+      "zig",
+      "build",
+      "check-source-policy"
     ]
   ],
   "shipped": {

@@ -40,6 +40,40 @@ pub fn build(b: *std.Build) !void {
     const project_check = b.step("check-project", "Compile a standalone linter with project-owned rules");
     project_check.dependOn(&project_linter.step);
     const project_smoke = addLint(b, project_linter, .{ .sources = &.{b.path("examples/report.zig")}, .directories = &.{b.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
+    const source_policy = addLint(b, executable, .{
+        .sources = &.{
+            b.path("src/BuildGate.zig"),
+            b.path("src/Builtins.zig"),
+            b.path("src/Completion.zig"),
+            b.path("src/DeadDeclarations.zig"),
+            b.path("src/Facts.zig"),
+            b.path("src/File.zig"),
+            b.path("src/Model.zig"),
+            b.path("src/Project.zig"),
+            b.path("src/Projection.zig"),
+            b.path("src/Projection_test.zig"),
+            b.path("src/Report.zig"),
+            b.path("src/Result.zig"),
+            b.path("src/Rule.zig"),
+            b.path("src/RuleContext.zig"),
+            b.path("src/RuleContext_test.zig"),
+            b.path("src/Runner.zig"),
+            b.path("src/Runner_test.zig"),
+            b.path("src/Suppression.zig"),
+            b.path("src/Usage.zig"),
+            b.path("src/build_gate_test.zig"),
+            b.path("src/cli.zig"),
+            b.path("src/cli_test.zig"),
+            b.path("src/contract_test.zig"),
+            b.path("src/glint.zig"),
+            b.path("src/main.zig"),
+            b.path("src/names.zig"),
+            b.path("src/tests.zig"),
+        },
+        .directories = &.{b.path("src")},
+        .args = &.{ "--only", "P001", "--only", "P002", "--only", "P003", "--gate", "P001", "--gate", "P002", "--gate", "P003" },
+    });
+    b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
     helper_check.dependOn(&project_smoke.step);
     const portable_smoke = b.addRunArtifact(project_linter);
