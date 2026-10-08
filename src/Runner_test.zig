@@ -51,3 +51,46 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     try std.testing.expectEqual(@as(usize, 7), report.diagnostics.len);
     try std.testing.expect(report.complete);
 }
+
+test "compatibility declaration and naming contrasts" {
+    const Case = struct { rule: glint.Rule, bad: []const u8, good: []const u8 };
+    for ([_]Case{
+        .{ .rule = .Z001, .bad = "pub fn Bad_name() void {}", .good = "pub fn goodName() void {}" },
+        .{ .rule = .Z002, .bad = "const _unused = 1;", .good = "const __internal = 1;" },
+        .{ .rule = .Z004, .bad = "const S = struct {}; const s = S{};", .good = "const S = struct {}; const s: S = .{};" },
+        .{ .rule = .Z005, .bad = "pub fn factory() type { return struct {}; }", .good = "pub fn Factory() type { return struct {}; }" },
+        .{ .rule = .Z006, .bad = "const badName = 1;", .good = "const good_name = 1;" },
+        .{ .rule = .Z007, .bad = "const a = @import(\"dep\"); const b = @import(\"dep\");", .good = "const a = @import(\"a\"); const b = @import(\"b\");" },
+        .{ .rule = .Z010, .bad = "const S = struct {}; pub fn f() S { return S{}; }", .good = "const S = struct {}; pub fn f() S { return .{}; }" },
+        .{ .rule = .Z014, .bad = "const errors = error{Bad};", .good = "const Errors = error{Bad};" },
+        .{ .rule = .Z017, .bad = "pub fn f() !u8 { return try g(); } fn g() !u8 { return 1; }", .good = "pub fn f() !u8 { return g(); } fn g() !u8 { return 1; }" },
+        .{ .rule = .Z018, .bad = "const x: u8 = @as(u8, 1);", .good = "const x: u8 = 1;" },
+        .{ .rule = .Z019, .bad = "const S = struct { const Self = @This(); };", .good = "const S = struct { const Self = S; };" },
+        .{ .rule = .Z020, .bad = "pub fn f(s: *@This()) void { _ = s; }", .good = "const Self = @This(); pub fn f(s: *Self) void { _ = s; }" },
+        .{ .rule = .Z021, .bad = "value: u8, const Wrong = @This();", .good = "value: u8, const Fixture = @This();" },
+        .{ .rule = .Z022, .bad = "pub fn Factory() type { return struct { const Wrong = @This(); }; }", .good = "pub fn Factory() type { return struct { const Self = @This(); }; }" },
+        .{ .rule = .Z025, .bad = "pub fn f() !void { g() catch |err| return err; } fn g() !void {}", .good = "pub fn f() !void { try g(); } fn g() !void {}" },
+        .{ .rule = .Z026, .bad = "pub fn f() void { g() catch {}; } fn g() !void {}", .good = "pub fn f() void { defer g() catch {}; } fn g() !void {}" },
+        .{ .rule = .Z028, .bad = "pub fn f() void { const d = @import(\"dep\"); _ = d; }", .good = "const d = @import(\"dep\"); pub fn f() void { _ = d; }" },
+        .{ .rule = .Z031, .bad = "pub fn _private() void {}", .good = "pub fn __internal() void {}" },
+        .{ .rule = .Z032, .bad = "pub fn readXML() void {}", .good = "pub fn readXml() void {}" },
+        .{ .rule = .Z033, .bad = "const ValueManager = struct {};", .good = "const Record = struct {};" },
+    }) |case| {
+        try check(case.rule, case.bad, 1);
+        try check(case.rule, case.good, 0);
+    }
+}
+
+test "compatibility byte line length counts CRLF content and file-struct stem" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "opaque", .stem = "bad_name", .bytes = "value: u8,\r\n" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z024, true);
+    config.set(.Z009, true);
+    config.max_line_length = 10;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqual(glint.Rule.Z009, report.diagnostics[0].rule);
+    try std.testing.expect(report.complete);
+}
