@@ -5,7 +5,6 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
     .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Report.zig" } },
-    .{ .name = "debug hygiene flow", .patterns = &.{"src/Poison.zig"} },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },
     .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },

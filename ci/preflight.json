@@ -1,6 +1,21 @@
 {
-  "sources": ["src"],
-  "test_roots": ["src/tests.zig"],
-  "test_dependencies": ["shakedown"],
-  "extra_checks": [["zig", "build", "check-consumer"]]
+  "sources": [
+    "src"
+  ],
+  "test_roots": [
+    "src/tests.zig"
+  ],
+  "test_dependencies": [
+    "shakedown"
+  ],
+  "extra_checks": [
+    [
+      "zig",
+      "build",
+      "check-consumer"
+    ]
+  ],
+  "shipped": {
+    "docs": "Commit-pinned reviewed rule contracts and concise dated results are the package documentation linked from README."
+  }
 }

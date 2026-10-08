@@ -51,12 +51,12 @@ pub fn main(init: std.process.Init) !void {
         const rules_start = now(init.io, small);
         var findings: usize = 0;
         for (0..rounds) |_| {
-            var report = try glint.run(init.gpa, &project, if (all) glint.Config.compatibility() else .{});
+            var report = try glint.run(init.gpa, &project, if (all) glint.Config.reviewed() else .{});
             defer report.deinit();
             findings = report.diagnostics.len;
             if (!all and (!report.complete or findings != 0)) return error.UnexpectedCoreResult;
         }
-        try row(writer, if (all) "warm_compatibility" else "warm_core", elapsed(init.io, rules_start, small), rounds, findings);
+        try row(writer, if (all) "warm_reviewed" else "warm_core", elapsed(init.io, rules_start, small), rounds, findings);
     }
     var stats: Stats = .{ .backing = init.gpa };
     {
@@ -88,7 +88,7 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     const inputs: []const glint.Project.Input = &.{ .{ .name = "root", .stem = "Root", .bytes = root }, .{ .name = "dependency", .stem = "Dependency", .bytes = dependency, .selected = false } };
     const imports: []const glint.Project.Import = &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}; // safe: the two frozen fixture sources have indexes zero and one.
     var config = glint.Config.none();
-    for ([_]glint.Rule{ .Z011, .Z012, .Z015, .Z023 }) |rule| config.set(rule, true);
+    for ([_]glint.Rule{.Z011}) |rule| config.set(rule, true);
     try writer.print("case=cross_module bytes={d} files=2 rounds={d}\n", .{ root.len + dependency.len, rounds });
     const cold = now(io, small);
     for (0..rounds) |_| {
@@ -108,17 +108,15 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
         if (!report.complete or report.diagnostics.len != 1) return error.UnexpectedCrossModuleResult;
     }
     try row(writer, "warm_cross_module", elapsed(io, warm, small), rounds, 1);
-    const source = "const S = struct { value: u8, pub fn deinit(self: *S) void { self.* = undefined; } };";
-    var flow_project = try glint.Project.init(gpa, &.{.{ .name = "flow", .bytes = source }}, &.{}, .{});
-    defer flow_project.deinit();
-    var flow_config = glint.Config.none();
-    flow_config.set(.Z030, true);
-    try writer.print("case=debug_poison_hygiene bytes={d} files=1 rounds={d}\n", .{ source.len, rounds });
-    const flow = now(io, small);
+    const source = "const unused = @import(\"unused\");";
+    var import_project = try glint.Project.init(gpa, &.{.{ .name = "private_import", .bytes = source }}, &.{}, .{});
+    defer import_project.deinit();
+    try writer.print("case=private_import bytes={d} files=1 rounds={d}\n", .{ source.len, rounds });
+    const import_start = now(io, small);
     for (0..rounds) |_| {
-        var report = try glint.run(gpa, &flow_project, flow_config);
+        var report = try glint.run(gpa, &import_project, .{});
         defer report.deinit();
-        if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedFlowResult;
+        if (!report.complete or report.diagnostics.len != 1 or report.diagnostics[0].rule != .Z013) return error.UnexpectedImportResult;
     }
-    try row(writer, "warm_debug_poison", elapsed(io, flow, small), rounds, 0);
+    try row(writer, "warm_private_import", elapsed(io, import_start, small), rounds, 1);
 }

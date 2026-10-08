@@ -28,13 +28,6 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         } });
-        const dep = try b.dependencyLazy("preflight", .{});
-        const plan = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "--build-file" });
-        plan.addFileArg(dep.path("build.zig"));
-        plan.addDirectoryArg2(b.path("."), .{ .prefix = "-Drepo-root=" });
-        plan.addArgs(&.{ "plan", "--" });
-        plan.addPassthruArgs();
-        b.step("plan", "Generate hosted CI through preflight").dependOn(&plan.step);
         preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig") });
     }
     return needed;

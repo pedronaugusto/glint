@@ -13,20 +13,6 @@ fn check(rule: glint.Rule, source: []const u8, expected: usize) !void {
     try std.testing.expect(report.complete);
 }
 
-test "compatibility Z012 enclosing-container visibility is declaration based" {
-    try check(.Z012, "const Outer = struct { pub const Public = struct {}; const Private = struct {}; pub fn good(v: Public) Public { return v; } pub fn bad(v: Private) Private { return v; } };", 2);
-}
-
-test "compatibility Z015 merged named error sets preserve public provenance" {
-    try check(.Z015, "pub const A = error{A}; pub const B = error{B}; pub const Combined = A || B; pub fn good() Combined!void {}", 0);
-    try check(.Z015, "const Private = error{Bad}; pub fn bad() Private!void {}", 1);
-}
-
-test "compatibility Z023 only the actual nested container is a receiver" {
-    try check(.Z023, "const Outer = struct { const Inner = struct { pub fn good(self: *Inner, comptime T: type) void { _ = self; _ = T; } }; };", 0);
-    try check(.Z023, "const Other = struct {}; const Outer = struct { pub fn bad(other: *Other, comptime T: type) void { _ = other; _ = T; } };", 1);
-}
-
 test "compatibility Z011 finds deprecated calls at every expression position" {
     const source =
         \\const d = @import("dep");
@@ -50,35 +36,6 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 7), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
-}
-
-test "compatibility declaration and naming contrasts" {
-    const Case = struct { rule: glint.Rule, bad: []const u8, good: []const u8 };
-    for ([_]Case{
-        .{ .rule = .Z001, .bad = "pub fn Bad_name() void {}", .good = "pub fn goodName() void {}" },
-        .{ .rule = .Z002, .bad = "const _unused = 1;", .good = "const __internal = 1;" },
-        .{ .rule = .Z004, .bad = "const S = struct {}; const s = S{};", .good = "const S = struct {}; const s: S = .{};" },
-        .{ .rule = .Z005, .bad = "pub fn factory() type { return struct {}; }", .good = "pub fn Factory() type { return struct {}; }" },
-        .{ .rule = .Z006, .bad = "const badName = 1;", .good = "const good_name = 1;" },
-        .{ .rule = .Z007, .bad = "const a = @import(\"dep\"); const b = @import(\"dep\");", .good = "const a = @import(\"a\"); const b = @import(\"b\");" },
-        .{ .rule = .Z010, .bad = "const S = struct {}; pub fn f() S { return S{}; }", .good = "const S = struct {}; pub fn f() S { return .{}; }" },
-        .{ .rule = .Z014, .bad = "const errors = error{Bad};", .good = "const Errors = error{Bad};" },
-        .{ .rule = .Z017, .bad = "pub fn f() !u8 { return try g(); } fn g() !u8 { return 1; }", .good = "pub fn f() !u8 { return g(); } fn g() !u8 { return 1; }" },
-        .{ .rule = .Z018, .bad = "const x: u8 = @as(u8, 1);", .good = "const x: u8 = 1;" },
-        .{ .rule = .Z019, .bad = "const S = struct { const Self = @This(); };", .good = "const S = struct { const Self = S; };" },
-        .{ .rule = .Z020, .bad = "pub fn f(s: *@This()) void { _ = s; }", .good = "const Self = @This(); pub fn f(s: *Self) void { _ = s; }" },
-        .{ .rule = .Z021, .bad = "value: u8, const Wrong = @This();", .good = "value: u8, const Fixture = @This();" },
-        .{ .rule = .Z022, .bad = "pub fn Factory() type { return struct { const Wrong = @This(); }; }", .good = "pub fn Factory() type { return struct { const Self = @This(); }; }" },
-        .{ .rule = .Z025, .bad = "pub fn f() !void { g() catch |err| return err; } fn g() !void {}", .good = "pub fn f() !void { try g(); } fn g() !void {}" },
-        .{ .rule = .Z026, .bad = "pub fn f() void { g() catch {}; } fn g() !void {}", .good = "pub fn f() void { defer g() catch {}; } fn g() !void {}" },
-        .{ .rule = .Z028, .bad = "pub fn f() void { const d = @import(\"dep\"); _ = d; }", .good = "const d = @import(\"dep\"); pub fn f() void { _ = d; }" },
-        .{ .rule = .Z031, .bad = "pub fn _private() void {}", .good = "pub fn __internal() void {}" },
-        .{ .rule = .Z032, .bad = "pub fn readXML() void {}", .good = "pub fn readXml() void {}" },
-        .{ .rule = .Z033, .bad = "const ValueManager = struct {};", .good = "const Record = struct {};" },
-    }) |case| {
-        try check(case.rule, case.bad, 1);
-        try check(case.rule, case.good, 0);
-    }
 }
 
 test "compatibility byte line length counts CRLF content and file-struct stem" {
@@ -109,26 +66,6 @@ test "compatibility Z016 splits only conjunction of the mapped standard assertio
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
     try check(.Z016, "const std = struct { const debug = struct { fn assert(ok: bool) void { _ = ok; } }; }; pub fn f(a: bool, b: bool) void { std.debug.assert(a and b); }", 0);
-}
-
-test "compatibility Z027 instance static access excludes fields and unknown receivers" {
-    try check(.Z027, "const S = struct { x: u8, const constant = 1; }; pub fn f(s: S) void { _ = s.constant; _ = s.x; }", 1);
-    try check(.Z027, "const S = struct { const constant = 1; }; pub fn f() void { _ = S.constant; }", 0);
-}
-
-test "compatibility Z029 uses contextual types and emits each cast once" {
-    try check(.Z029, "fn g(x: u8) void { _ = x; } pub fn f() void { g(@as(u8, 1)); }", 1);
-    try check(.Z029, "const S = struct { x: u8 }; const s = S{ .x = @as(u8, 1) }; const a = [1]u8{ @as(u8, 1) };", 2);
-    try check(.Z029, "fn g(x: u16) void { _ = x; } pub fn f() void { g(@as(u8, 1)); }", 0);
-}
-
-test "compatibility Z030 is deinit poisoning hygiene, including cleanup and destruction" {
-    try check(.Z030, "const S = struct { pub fn deinit(self: *S) void { _ = self; } };", 1);
-    try check(.Z030, "const S = struct { pub fn deinit(self: *S) void { self.* = undefined; } };", 0);
-    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { if (early) return; self.* = undefined; } };", 1);
-    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { defer self.* = undefined; if (early) return; } };", 0);
-    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { a.destroy(self); } };", 0);
-    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { defer self.* = undefined; a.destroy(self); } };", 1);
 }
 
 test "compatibility deprecation follows aliases and symbolic returned containers" {
@@ -164,31 +101,6 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     try std.testing.expect(!exhausted.complete);
 }
 
-test "compatibility unknown receiver and callee record uncertainty without invented facts" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const Self = @import(\"unmapped\").S; pub fn f(self: *Self, comptime T: type) void { _ = self; _ = T; @import(\"unmapped\").old(); }" }}, &.{}, .{});
-    defer project.deinit();
-    var config = glint.Config.none();
-    config.set(.Z011, true);
-    config.set(.Z023, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
-    defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
-    var unknown_callee = false;
-    var unknown_receiver = false;
-    for (report.coverage) |coverage| {
-        if (coverage.rule == .Z011) unknown_callee = true;
-        if (coverage.rule == .Z023) unknown_receiver = true;
-    }
-    try std.testing.expect(unknown_callee and unknown_receiver);
-}
-
-test "compatibility Z030 inherited branch destroy and poison order contrasts" {
-    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A, flag: bool) void { if (flag) { a.destroy(self); return; } self.* = undefined; } };", 0);
-    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A, flag: bool) void { if (flag) a.destroy(self); self.* = undefined; } };", 1);
-    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { self.* = undefined; a.destroy(self); } };", 0);
-    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { if (early) { self.* = undefined; return; } self.* = undefined; } };", 0);
-}
-
 test "compatibility suppression rejects multiple distinct binding sites" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
     defer project.deinit();
@@ -199,29 +111,43 @@ test "compatibility deprecation resolves escaped member identity" {
     try check(.Z011, "const S = struct {\n /// Deprecated: use fresh.\n pub fn @\"old name\"() void {} }; pub fn run() void { S.@\"old name\"(); }", 1);
 }
 
-test "compatibility function-pointer parameter labels cannot shadow fields or imports" {
-    try check(.Z027, "const S = struct { context: usize, call: *const fn (context: usize) void, pub fn f(self: S) void { self.call(self.context); } };", 0);
-    try check(.Z013, "const dep = @import(\"dep\"); const S = struct { call: *const fn (dep: u8) void, pub fn f(self: S) void { self.call(dep.value); } };", 0);
+test "review Z006 resolves callable aliases instead of their spelling" {
+    try check(.Z006, "fn snake_fn() void {} const callableAlias = snake_fn; pub fn run() void { callableAlias(); }", 0);
+    try check(.Z006, "const snake_alias = factory; fn factory() type { return u8; } const TypeAlias = snake_alias; pub const value: TypeAlias() = 1;", 0);
 }
 
-test "compatibility Z010 needs a known literal context and keeps generic explicit types" {
-    try check(.Z010, "const S = struct {}; fn g(x: anytype) void { _ = x; } pub fn f() void { g(S{}); }", 0);
-    try check(.Z010, "const S = struct {}; fn g(x: S) void { _ = x; } pub fn f() void { g(S{}); }", 1);
+test "review Z006 declines computed naming facts" {
+    try check(.Z006, "const dep = @import(\"unmapped\"); const computedAlias = @field(dep, \"Type\"); pub fn run() void { _ = computedAlias; }", 0);
 }
 
-test "compatibility public signature retains imported alias provenance" {
-    var project = try glint.Project.init(std.testing.allocator, &.{
-        .{ .name = "root", .bytes = "const d = @import(\"dep\"); const Alias = d.Errors; pub fn f() Alias!void {}" },
-        .{ .name = "dep", .selected = false, .bytes = "pub const Errors = error{Bad};" },
-    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "dep" }}, .{}); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-    defer project.deinit();
-    var config = glint.Config.none();
-    config.set(.Z015, true);
-    var report = try glint.run(std.testing.allocator, &project, config);
-    defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+test "review canonical naming contrasts" {
+    try check(.Z001, "pub fn Bad_name() void {}", 1);
+    try check(.Z001, "pub fn goodName() void {}", 0);
+    try check(.Z005, "pub fn factory() type { return u8; }", 1);
+    try check(.Z005, "pub fn Factory() type { return u8; }", 0);
+    try check(.Z006, "const badName = 1;", 1);
+    try check(.Z006, "const good_name = 1;", 0);
+    try check(.Z014, "const errors = error{Bad};", 1);
+    try check(.Z014, "const Errors = error{Bad};", 0);
+    try check(.Z031, "pub fn _private() void {}", 1);
+    try check(.Z031, "pub fn visible() void {}", 0);
+    try check(.Z032, "pub fn readXML() void {}", 1);
+    try check(.Z032, "pub fn readXml() void {}", 0);
 }
 
-test "compatibility Z027 excludes resolved function aliases used as methods" {
-    try check(.Z027, "const S = struct { pub const read = readImpl; }; fn readImpl(_: S) void {} pub fn f(s: S) void { s.read(); }", 0);
+test "review preserves names fixed by external ABIs" {
+    try check(.Z001, "extern \"c\" fn proc_listchildpids(u32) c_int;", 0);
+    try check(.Z032, "extern \"kernel32\" fn GetXML(u32) u32;", 0);
+    try check(.Z031, "export fn __entry_point() void {}", 0);
+    try check(.Z031, "pub fn __private() void {}", 1);
+}
+
+test "review acronym casing still covers concrete type aliases" {
+    try check(.Z032, "pub const XMLParser = struct { value: u8 };", 1);
+    try check(.Z032, "pub const XmlParser = struct { value: u8 };", 0);
+}
+
+test "review preserves resolved external callable aliases" {
+    try check(.Z006, "const c = struct { extern \"c\" fn CancelIoEx(u32) void; }; pub const CancelIoEx = c.CancelIoEx;", 0);
+    try check(.Z006, "fn run() void {} const RunAlias = run; pub fn f() void { RunAlias(); }", 1);
 }

@@ -122,8 +122,8 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
             }
             const rule = glint.Rule.parse(try value(args, &i)) orelse return error.UnknownRule;
             result.config.set(rule, true);
-        } else if (std.mem.eql(u8, arg, "--compatibility")) {
-            result.config = glint.Config.compatibility();
+        } else if (std.mem.eql(u8, arg, "--reviewed")) {
+            result.config = glint.Config.reviewed();
             selected = false;
         } else if (std.mem.eql(u8, arg, "--enable") or std.mem.eql(u8, arg, "--disable")) {
             const rule = glint.Rule.parse(try value(args, &i)) orelse return error.UnknownRule;
@@ -186,7 +186,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const configured = try options(a, io, args);
     if (configured.help) {
         record.outcome = .output_failure;
-        try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only Znnn | --reviewed] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;
         record.completed = false;

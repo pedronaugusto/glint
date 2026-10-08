@@ -16,7 +16,7 @@ pub const Span = struct { file: Project.FileId, start: u32, end: u32, line: u32,
 pub const Diagnostic = struct {
     rule: rules.Rule,
     rule_version: u32 = 1,
-    class: enum { correctness, hygiene, style, suspicious },
+    class: enum { correctness, zig_style, family_policy },
     severity: enum { @"error", warning, note },
     span: Span,
     message: []const u8,

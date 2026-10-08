@@ -1,6 +1,6 @@
 # glint
 
-Work in progress: G0/G1 provide a std-only Zig source model, 32 selected compatibility checks and a standalone CLI. Family integration, rule adoption and retirement of the predecessor have not landed. This is an unreleased development package.
+Work in progress: G0/G1/G1r provide a std-only Zig source model and 12 reviewed checks and a standalone CLI. Family integration, new safety-rule admission and retirement of the predecessor have not landed. This is an unreleased development package.
 
 Requires Zig 0.17.0. Runtime dependencies are Zig std only; preflight and shakedown are lazy build/test dependencies.
 
@@ -12,12 +12,12 @@ cd glint
 zig build -Doptimize=fast
 ./zig-out/bin/glint src/example.zig
 ./zig-out/bin/glint --format json --only Z011 --only Z012 src/example.zig
-./zig-out/bin/glint --format sarif --compatibility src/example.zig
+./zig-out/bin/glint --format sarif --reviewed src/example.zig
 ```
 
 No preflight installation is needed to run the executable. Inputs are explicit files or a newline-separated `--files-from FILE` list. Relative literal imports are followed within the input directories; `--root DIR` adds an allowed import root. `--module NAME=FILE` supplies a named module, and `--zig-lib-path DIR` supplies the Zig library directory for std resolution. Unconfigured named or computed imports remain unknown. Glint never executes the checked project's build or comptime code.
 
-Default checks are Z003 (parser incompatibility) and Z013 (dead private import binding). `--only ID` starts an explicit selection; `--enable ID` and `--disable ID` amend it. `--compatibility` selects the predecessor's 31 enabled IDs; Z033 requires explicit selection. Z008 is absent. A port does not admit a safety default. `--max-line-length N`, `--fact-budget N` and `--strict-suppressions` configure their respective limits. See `--help` and the [inventory](ci/evidence/rule-inventory.json).
+Default checks are Z003 (parser incompatibility) and Z013 (dead private import binding). `--only ID` starts an explicit selection; `--enable ID` and `--disable ID` amend it. `--reviewed` selects all retained rules for reporting. Diagnostics identify correctness, Zig style and family policy separately; the caller decides which findings gate. Removed IDs and the old compatibility selector are errors. `--max-line-length N` defaults to 100 bytes as a readability report, and `--fact-budget N` and `--strict-suppressions` configure work and suppression limits. See the [reviewed contracts](docs/rules.md).
 
 Exit 0 means completed execution with no findings, 1 means completed execution with findings, and 2 means argument, input, traversal, cancellation, output, analysis-budget/frontend or tool failure. Help is not an analysis run. Unresolved facts and unsupported semantic shapes are reported as coverage; completion never certifies compiler type checking or program safety.
 
@@ -66,14 +66,14 @@ One real comment suppresses one rule at one logical site, either inline or immed
 
 ## Limits and ownership
 
-std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Z030 is conservative debug-poison hygiene, with unknown flow reported; it proves neither release safety nor secret erasure. Selected naming rules retain syntactic heuristics and have documented computed-type false alarms; they are not defaults.
+std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Naming rules use known value kinds; computed and unmapped facts remain coverage. Established external ABI function names are preserved. Escape analysis and the aegis rule pack await later admission; no safety proof is claimed.
 
-Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint owns source analysis; G2 integration and G3 adoption are not implemented here. The [G1 report](ci/g1-report.md) records evidence, known limitations and later seams.
+Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint owns source analysis; G2 integration and G3 adoption are not implemented here. The [dated results note](docs/results.md) cites private G1 evidence. G1r records rule contracts and removals in the review; G2 integration and G3 safety adoption are still work in progress.
 
 ## Development
 
-Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=compatibility`. `zig build plan -- --tier merge --output ci/merge-matrix.txt` generates the CI plan through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
+Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=compatibility`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
-`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse, std lowering, cold project/core analysis, warm core and compatibility runs, requested allocations, mapped cross-module checks and debug-poison hygiene. `--smoke` checks small fixtures without timing. [Retained measurements](ci/evidence/paired-core.json) and the [import-index correction](ci/evidence/paired-import-index.json) expose costs and scope; G0's unavailable compatibility rules are never a valid speed baseline. Private comparative drivers and dated records live in [trials](https://github.com/pedronaugusto/trials/tree/main/glint).
+`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse, std lowering, cold project/core analysis, warm core and reviewed-rule runs, requested allocations, mapped deprecation and private-import checks. `--smoke` checks small fixtures without timing. [Retained measurements](https://github.com/pedronaugusto/trials/blob/f501b66f9679760f5fadd118b95bfb36670a891b/glint/g1/paired-core.json) and the [import-index correction](https://github.com/pedronaugusto/trials/blob/f501b66f9679760f5fadd118b95bfb36670a891b/glint/g1/paired-import-index.json) expose costs and scope; G0's unavailable compatibility rules are never a valid speed baseline. Private comparative drivers and dated records live in [trials](https://github.com/pedronaugusto/trials/tree/f501b66f9679760f5fadd118b95bfb36670a891b/glint).
 
 MIT. See [LICENSE](LICENSE).

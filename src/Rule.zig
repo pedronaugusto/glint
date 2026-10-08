@@ -1,39 +1,36 @@
-//! Stable compatibility inventory. Porting a rule does not adopt a default.
+//! Reviewed rules. Removed identities are rejected, never aliased or silently enabled.
+pub const Group = enum { correctness, zig_style, family_policy };
 const std = @import("std");
 pub const Rule = enum(u16) {
     Z001 = 1,
-    Z002 = 2,
     Z003 = 3,
-    Z004 = 4,
     Z005 = 5,
     Z006 = 6,
-    Z007 = 7,
     Z009 = 9,
-    Z010 = 10,
     Z011 = 11,
-    Z012 = 12,
     Z013 = 13,
     Z014 = 14,
-    Z015 = 15,
     Z016 = 16,
-    Z017 = 17,
-    Z018 = 18,
-    Z019 = 19,
-    Z020 = 20,
-    Z021 = 21,
-    Z022 = 22,
-    Z023 = 23,
     Z024 = 24,
-    Z025 = 25,
-    Z026 = 26,
-    Z027 = 27,
-    Z028 = 28,
-    Z029 = 29,
-    Z030 = 30,
     Z031 = 31,
     Z032 = 32,
-    Z033 = 33,
 
+    pub fn group(self: Rule) Group {
+        return switch (self) {
+            .Z003, .Z011, .Z013 => .correctness,
+            .Z016 => .family_policy,
+            else => .zig_style,
+        };
+    }
+    pub fn purpose(self: Rule) []const u8 {
+        return switch (self) {
+            .Z003 => "syntax incompatibility",
+            .Z011 => "deprecated API migration",
+            .Z013 => "dead private import binding",
+            .Z016 => "assertion failure localization (advisory)",
+            else => "Zig style naming or readability (no runtime bug claimed)",
+        };
+    }
     pub fn parse(name: []const u8) ?Rule {
         return std.meta.stringToEnum(Rule, name);
     }
@@ -42,7 +39,7 @@ pub const Rule = enum(u16) {
 /// Explicit rule selection. Only the two inspected inherited core rules default on.
 pub const Config = struct {
     enabled: [34]bool = core,
-    max_line_length: u32 = 120,
+    max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     fact_budget: usize = 100_000,
 
@@ -55,16 +52,23 @@ pub const Config = struct {
 
     /// Unknown/removed IDs cannot silently enter a library configuration.
     pub fn validate(self: Config) error{InvalidSelection}!void {
-        if (self.enabled[0] or self.enabled[8]) return error.InvalidSelection;
+        for (self.enabled, 0..) |enabled, index| {
+            if (!enabled) continue;
+            var known = false;
+            for (std.meta.tags(Rule)) |rule| if (@backingInt(rule) == index) { // safe: frozen rule identities fit the selection table.
+                known = true;
+            };
+            if (!known) return error.InvalidSelection;
+        }
     }
     /// An empty selection for callers migrating explicit policy.
     pub fn none() Config {
         return .{ .enabled = @splat(false) };
     }
-    /// The predecessor's selection, explicitly requested; Z033 remains disabled.
-    pub fn compatibility() Config {
+    /// All reviewed rules for reporting. A caller decides which groups gate.
+    pub fn reviewed() Config {
         var config = none();
-        for (std.meta.tags(Rule)) |rule| config.set(rule, rule != .Z033);
+        for (std.meta.tags(Rule)) |rule| config.set(rule, true);
         return config;
     }
     /// Selects a stable rule ID.
@@ -77,11 +81,11 @@ pub const Config = struct {
     }
 };
 
-test "inventory preserves exactly 32 IDs without Z008" {
-    try std.testing.expectEqual(@as(usize, 32), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+test "review inventory excludes removed identities without compatibility aliases" {
+    try std.testing.expectEqual(@as(usize, 12), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
     try std.testing.expect(Rule.parse("Z013-extra") == null);
-    try std.testing.expect(!Config.compatibility().has(.Z033));
+    for ([_][]const u8{ "Z002", "Z004", "Z012", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 

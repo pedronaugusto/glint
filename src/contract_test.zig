@@ -8,7 +8,7 @@ test "contract allocation failures release project and report owners" {
         fn run(a: std.mem.Allocator) !void {
             var project = try glint.Project.init(a, &.{.{ .name = "fixture", .bytes = "const d = @import(\"dep\"); pub fn f() void {}" }}, &.{}, .{});
             defer project.deinit();
-            var report = try glint.run(a, &project, glint.Config.compatibility());
+            var report = try glint.run(a, &project, glint.Config.reviewed());
             defer report.deinit();
             var output: std.Io.Writer.Allocating = .init(a);
             defer output.deinit();
@@ -79,16 +79,16 @@ test "contract public lowered references disclose partial std ZIR coverage" {
     try std.testing.expect((try project.loweredReferences(handle)).len != 0);
 }
 
-test "contract private API diagnostic carries its resolved declaration span" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture label", .bytes = "const Hidden = struct { value: u8 }; pub fn f(v: Hidden) void { _ = v; }" }}, &.{}, .{});
+test "contract deprecation diagnostic carries its resolved declaration span" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture label", .bytes = "/// Deprecated: use fresh.\nfn old() void {} pub fn run() void { old(); }" }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
-    config.set(.Z012, true);
+    config.set(.Z011, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: expected single fixture diagnostic fits usize.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics[0].related.len); // safe: expected single declaration span fits usize.
-    try std.testing.expectEqual(@as(u32, 6), report.diagnostics[0].related[0].start); // safe: the declaration name begins at byte six of the fixed fixture.
+    try std.testing.expectEqual(@as(u32, 30), report.diagnostics[0].related[0].start); // safe: the declaration name begins at byte 30 of the fixed fixture.
     for ([_]glint.Report.Format{ .json, .sarif }) |format| {
         var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer output.deinit();
@@ -102,7 +102,7 @@ test "contract private API diagnostic carries its resolved declaration span" {
             const diagnostic = parsed.value.object.get("runs").?.array.items[0].object.get("results").?.array.items[0];
             const location = diagnostic.object.get("relatedLocations").?.array.items[0].object.get("physicalLocation").?;
             try std.testing.expectEqualStrings("fixture%20label", location.object.get("artifactLocation").?.object.get("uri").?.string);
-            try std.testing.expectEqual(@as(i64, 6), location.object.get("region").?.object.get("byteOffset").?.integer); // safe: byte six of the fixed fixture fits i64.
+            try std.testing.expectEqual(@as(i64, 30), location.object.get("region").?.object.get("byteOffset").?.integer); // safe: byte 30 of the fixed fixture fits i64.
         }
     }
 }
