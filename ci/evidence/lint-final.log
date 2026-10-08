@@ -7,8 +7,3 @@ preflight: function length
 preflight: documentation
 preflight: test imports
 preflight: package paths
-test
-+- run test w
-preflight: test seed 970429576 (reproduce with PREFLIGHT_TEST_SEED=970429576)
-failed command: ./.zig-cache/o/1040dd87906df18c312f251cf0688944/test --cache-dir=./.zig-cache --seed=0x39d79488 --listen=-
-

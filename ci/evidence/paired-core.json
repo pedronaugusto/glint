@@ -1,0 +1,96 @@
+{
+  "before": "c45f9fc0128b02170e1291f723c262a96de9f169",
+  "candidate": "0a3414acd41c731297622742197ca8451f0d033d",
+  "utc": "2026-10-08T18:51:44.900431+00:00",
+  "machine": "Darwin-25.2.0-arm64-arm-64bit-Mach-O",
+  "driver_sha256": "e08fa76605cf5d51353cb9c11dbf321f99ee4b798137a549532d968409eb36ac",
+  "compiler": "/Users/gusto/.local/zig/0.17.0/zig",
+  "optimize": "ReleaseFast",
+  "uptime": "19:51  up 3 days,  7:20, 11 users, load averages: 12.70 12.37 10.54\n",
+  "samples": [
+    {
+      "round": 0,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1354333 rounds=15 observed=3073\nrow=lower total_ns=7835375 rounds=15 observed=4097\nrow=cold_core total_ns=13118166 rounds=15 observed=4097\nrow=warm_core total_ns=8584 rounds=15 observed=0\nrow=warm_compatibility total_ns=8208 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 0,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1279500 rounds=15 observed=3073\nrow=lower total_ns=7750333 rounds=15 observed=4097\nrow=cold_core total_ns=14904667 rounds=15 observed=4097\nrow=warm_core total_ns=28125 rounds=15 observed=0\nrow=warm_compatibility total_ns=3832208 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 1,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1209459 rounds=15 observed=3073\nrow=lower total_ns=7581959 rounds=15 observed=4097\nrow=cold_core total_ns=14812959 rounds=15 observed=4097\nrow=warm_core total_ns=28000 rounds=15 observed=0\nrow=warm_compatibility total_ns=3806625 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 1,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1218791 rounds=15 observed=3073\nrow=lower total_ns=7544375 rounds=15 observed=4097\nrow=cold_core total_ns=12004208 rounds=15 observed=4097\nrow=warm_core total_ns=7792 rounds=15 observed=0\nrow=warm_compatibility total_ns=7083 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 2,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1241125 rounds=15 observed=3073\nrow=lower total_ns=7582500 rounds=15 observed=4097\nrow=cold_core total_ns=11982166 rounds=15 observed=4097\nrow=warm_core total_ns=7583 rounds=15 observed=0\nrow=warm_compatibility total_ns=7500 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 2,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1237208 rounds=15 observed=3073\nrow=lower total_ns=7814000 rounds=15 observed=4097\nrow=cold_core total_ns=16622917 rounds=15 observed=4097\nrow=warm_core total_ns=30875 rounds=15 observed=0\nrow=warm_compatibility total_ns=3902292 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 3,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1203500 rounds=15 observed=3073\nrow=lower total_ns=7551167 rounds=15 observed=4097\nrow=cold_core total_ns=14878500 rounds=15 observed=4097\nrow=warm_core total_ns=29833 rounds=15 observed=0\nrow=warm_compatibility total_ns=4133625 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 3,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1335250 rounds=15 observed=3073\nrow=lower total_ns=7803250 rounds=15 observed=4097\nrow=cold_core total_ns=11921000 rounds=15 observed=4097\nrow=warm_core total_ns=7334 rounds=15 observed=0\nrow=warm_compatibility total_ns=7083 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 4,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1221375 rounds=15 observed=3073\nrow=lower total_ns=7524208 rounds=15 observed=4097\nrow=cold_core total_ns=11933208 rounds=15 observed=4097\nrow=warm_core total_ns=7209 rounds=15 observed=0\nrow=warm_compatibility total_ns=7167 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 4,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1208542 rounds=15 observed=3073\nrow=lower total_ns=7522167 rounds=15 observed=4097\nrow=cold_core total_ns=14816834 rounds=15 observed=4097\nrow=warm_core total_ns=28333 rounds=15 observed=0\nrow=warm_compatibility total_ns=3778458 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 5,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1198208 rounds=15 observed=3073\nrow=lower total_ns=7566292 rounds=15 observed=4097\nrow=cold_core total_ns=14813792 rounds=15 observed=4097\nrow=warm_core total_ns=27917 rounds=15 observed=0\nrow=warm_compatibility total_ns=3833667 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 5,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1213875 rounds=15 observed=3073\nrow=lower total_ns=7606417 rounds=15 observed=4097\nrow=cold_core total_ns=11904709 rounds=15 observed=4097\nrow=warm_core total_ns=7250 rounds=15 observed=0\nrow=warm_compatibility total_ns=7208 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 6,
+      "side": "G0",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1205542 rounds=15 observed=3073\nrow=lower total_ns=7509750 rounds=15 observed=4097\nrow=cold_core total_ns=11874666 rounds=15 observed=4097\nrow=warm_core total_ns=7250 rounds=15 observed=0\nrow=warm_compatibility total_ns=7167 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1263046 live_after=0\n",
+      "stderr": ""
+    },
+    {
+      "round": 6,
+      "side": "G1",
+      "stdout": "version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast\nrow=parse total_ns=1214209 rounds=15 observed=3073\nrow=lower total_ns=7550167 rounds=15 observed=4097\nrow=cold_core total_ns=14745125 rounds=15 observed=4097\nrow=warm_core total_ns=28084 rounds=15 observed=0\nrow=warm_compatibility total_ns=3788083 rounds=15 observed=0\nrow=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0\n",
+      "stderr": ""
+    }
+  ]
+}

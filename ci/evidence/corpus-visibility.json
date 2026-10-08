@@ -1,0 +1,22 @@
+{
+  "strand": "PUBLIC",
+  "chronicle": "PUBLIC",
+  "conduit": "PUBLIC",
+  "morse": "PUBLIC",
+  "lookout": "PUBLIC",
+  "visor": "PUBLIC",
+  "relic": "PUBLIC",
+  "gantry": "PUBLIC",
+  "preflight": "PUBLIC",
+  "tycho": "PRIVATE",
+  "airlock": "PUBLIC",
+  "sweep": "PUBLIC",
+  "parallax": "PUBLIC",
+  "uplink": "PUBLIC",
+  "warp": "PUBLIC",
+  "reactor": "PUBLIC",
+  "shakedown": "PUBLIC",
+  "ziglint": "PUBLIC",
+  "cloak": "PUBLIC",
+  "aegis": "PUBLIC"
+}

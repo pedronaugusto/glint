@@ -1,0 +1,11 @@
+{
+  "source_commit": "6388ed2fd17b40f113464968fad63566baf8d2bb",
+  "glint_binary_sha256": "45ad49880e0b3c62a8f38511431c4b7db4c79e9415fea500b97dc4c861f5bb6e",
+  "zig": "0.17.0",
+  "optimize": "ReleaseFast",
+  "machine": "Darwin-25.2.0-arm64-arm-64bit-Mach-O",
+  "utc": "2026-10-08T19:19:24.322778+00:00",
+  "load": "20:19  up 3 days,  7:48, 11 users, load averages: 11.89 10.45 9.91\n",
+  "preflight": "9af905ed85cab6dbb19d9431c65ee3f41fbaa74d",
+  "shakedown": "9357a9ab398ac25fa8a408a71e77a124bc51d311"
+}

@@ -1,0 +1,12 @@
+version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast
+row=parse total_ns=1316250 rounds=15 observed=3073
+row=lower total_ns=7673083 rounds=15 observed=4097
+row=cold_core total_ns=22282541 rounds=15 observed=4097
+row=warm_core total_ns=8583 rounds=15 observed=0
+row=warm_compatibility total_ns=3736750 rounds=15 observed=0
+row=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0
+case=cross_module bytes=204 files=2 rounds=15
+row=cold_cross_module total_ns=242166 rounds=15 observed=1
+row=warm_cross_module total_ns=9042 rounds=15 observed=1
+case=debug_poison_hygiene bytes=85 files=1 rounds=15
+row=warm_debug_poison total_ns=4125 rounds=15 observed=0

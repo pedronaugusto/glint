@@ -1,5 +1,5 @@
 test
 +- run test w
-preflight: test seed 886288971 (reproduce with PREFLIGHT_TEST_SEED=886288971)
-failed command: ./.zig-cache/o/b381635af86bd4775dc66cef078bc729/test --cache-dir=./.zig-cache --seed=0x34d3b24b --listen=-
+preflight: test seed 2249431226 (reproduce with PREFLIGHT_TEST_SEED=2249431226)
+failed command: ./.zig-cache/o/8fd12f2d9c33c1fcdcfc79f6a29a763d/test --cache-dir=./.zig-cache --seed=0x861398ba --listen=-
 
