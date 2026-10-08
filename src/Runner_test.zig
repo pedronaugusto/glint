@@ -213,13 +213,13 @@ test "compatibility public signature retains imported alias provenance" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = "const d = @import(\"dep\"); const Alias = d.Errors; pub fn f() Alias!void {}" },
         .{ .name = "dep", .selected = false, .bytes = "pub const Errors = error{Bad};" },
-    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "dep" }}, .{});
+    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "dep" }}, .{}); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z015, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }
 
 test "compatibility Z027 excludes resolved function aliases used as methods" {

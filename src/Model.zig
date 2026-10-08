@@ -13,6 +13,8 @@ node_parents: []const ?Ast.Node.Index,
 zir_declarations: []const LoweredDeclaration,
 zir_references: []const LoweredReference,
 unknown_references: usize,
+/// Import expressions indexed once for repeated coverage queries.
+import_nodes: []const Ast.Node.Index,
 /// The std-ZIR reference index is partial; lexical references remain a separate query.
 lowered_coverage: enum { partial, invalid_front_end, budget_exhausted },
 
@@ -82,11 +84,16 @@ pub fn init(file: *File) InitError!Model {
     for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)]; // safe: enum identities index their owning frozen tables without narrowing.
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);
-    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
+    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
     var references: std.ArrayList(Reference) = .empty;
+    var import_nodes: std.ArrayList(Ast.Node.Index) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
-        if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std AST node indexes fit the bounded frozen model.
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) try import_nodes.append(a, node),
+            else => {},
+        }
+        if (tag != .identifier) continue; // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         const token = tree.nodeMainToken(node);
         const name = try identifier(a, tree.tokenSlice(token));
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
@@ -100,6 +107,7 @@ pub fn init(file: *File) InitError!Model {
         try references.append(a, ref_record);
     }
     model.references = references.items;
+    model.import_nodes = import_nodes.items;
     if (file.status == .parsed) {
         var zir_refs: std.ArrayList(LoweredReference) = .empty;
         const visited = try a.alloc(bool, file.zir.?.instructions.len);

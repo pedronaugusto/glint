@@ -1,31 +1,79 @@
 # glint
 
-Work in progress: a std-only Zig code model and standalone linter. G0/G1 are under construction; family integration and new safety rules have not landed.
+Work in progress: G0/G1 provide a std-only Zig source model, 32 selected compatibility checks and a standalone CLI. Family integration, rule adoption and retirement of the predecessor have not landed. This is an unreleased development package.
 
-## Install
+Requires Zig 0.17.0. Runtime dependencies are Zig std only; preflight and shakedown are lazy build/test dependencies.
 
-Requires Zig 0.17.0. A fetchable library and standalone CLI are being built.
+## CLI
 
-## Usage
+```sh
+git clone https://github.com/pedronaugusto/glint.git
+cd glint
+zig build -Doptimize=fast
+./zig-out/bin/glint src/example.zig
+./zig-out/bin/glint --format json --only Z011 --only Z012 src/example.zig
+./zig-out/bin/glint --format sarif --compatibility src/example.zig
+```
 
-The public interface is under construction.
+No preflight installation is needed to run the executable. Inputs are explicit files or a newline-separated `--files-from FILE` list. Relative literal imports are followed within the input directories; `--root DIR` adds an allowed import root. `--module NAME=FILE` supplies a named module, and `--zig-lib-path DIR` supplies the Zig library directory for std resolution. Unconfigured named or computed imports remain unknown. Glint never executes the checked project's build or comptime code.
 
-## Design
+Default checks are Z003 (parser incompatibility) and Z013 (dead private import binding). `--only ID` starts an explicit selection; `--enable ID` and `--disable ID` amend it. `--compatibility` selects the predecessor's 31 enabled IDs; Z033 requires explicit selection. Z008 is absent. A port does not admit a safety default. `--max-line-length N`, `--fact-budget N` and `--strict-suppressions` configure their respective limits. See `--help` and the [inventory](ci/evidence/rule-inventory.json).
 
-Sources → std AST and AstGen/ZIR → scopes and references → module facts → selected rules → diagnostics and CLI. Runtime dependencies: std only. No verifier is pursued.
+Exit 0 means completed execution with no findings, 1 means completed execution with findings, and 2 means argument, input, traversal, cancellation, output, analysis-budget/frontend or tool failure. Help is not an analysis run. Unresolved facts and unsupported semantic shapes are reported as coverage; completion never certifies compiler type checking or program safety.
 
-## Scope
+## Completion for automation
 
-Code-level checks belong here. Architecture and path policy belong to gantry; preflight orchestrates builds and family configuration. No new safety default follows from a compatibility port.
+```sh
+./zig-out/bin/glint --format json --result result.json --run-id unique-invocation src/example.zig > diagnostics.json
+```
 
-## Built with
+Use a fresh unpredictable invocation ID and capture the actual exit status and stdout. The version-one sidecar first replaces any old result with `completed: false, outcome: "running"`. It publishes completion by atomic replacement only after all selected analysis and the required stdout write/flush have succeeded. A completed record distinguishes `clean` and `findings` and includes the invocation ID, selected source count, finding/suppression counts, output byte count and SHA-256. Failure records use a distinct outcome and never set `completed: true`; an abrupt interruption can leave the running record. This is an execution/output contract, not a durability guarantee.
 
-Zig std; preflight for build/CI; shakedown for tests only.
+Library callers can use `glint.Completion.verify(allocator, result_bytes, invocation_id, exit_code, captured_stdout)`. It rejects stale IDs, malformed/truncated records, wrong versions, interrupted exit codes and truncated/changed output. Only after verification should a caller decide whether particular findings are allowed. A report's `analysis_complete` field alone cannot certify successful output or process completion. Unknown coverage must be considered separately for the intended policy.
 
-## Testing
+## Library
 
-`zig build check`, `zig build lint`, and targeted `zig build test -Dtest-filter=...`. `zig build plan -- --tier merge --output <file>` generates CI through preflight. `zig build bench` runs the repository's own benchmarks in ReleaseFast.
+Expose the `glint` module from a commit-pinned package dependency with `dependency.module("glint")`. The consumer build does not load the repository's CI or test dependencies.
 
-## Licence
+```zig
+const std = @import("std");
+const glint = @import("glint");
 
-MIT. See LICENSE.
+fn inspect(allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    var project = try glint.Project.init(allocator, &.{.{
+        .name = "source-label",
+        .bytes = "pub const value = 1;",
+    }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.run(allocator, &project, .{});
+    defer report.deinit();
+    try report.write(writer, &project, .json);
+}
+```
+
+The caller supplies bytes, opaque file identities, diagnostic labels, classification and import edges. The engine opens no paths. Project snapshots own their storage; handles and reports cannot be reused against replacement snapshots. Queries expose declarations, scopes, lexical references and a separately identified partial std-ZIR reference index. Facts preserve unknown reasons rather than resolving generic/comptime behavior by spelling.
+
+## Diagnostics and suppression
+
+Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for deprecation and named-signature checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic.
+
+```zig
+// glint-ignore: Z013 -- reserved import retained for this documented migration
+const future = @import("future");
+```
+
+One real comment suppresses one rule at one logical site, either inline or immediately before it. A nonempty written reason is required. Strings, malformed directives and ambiguous multiple sites cannot become silent exemptions. Stale records are counted; strict mode makes them incomplete. Legacy suppression spelling is not silently migrated; that remains a later retirement seam.
+
+## Limits and ownership
+
+std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Z030 is conservative debug-poison hygiene, with unknown flow reported; it proves neither release safety nor secret erasure. Selected naming rules retain syntactic heuristics and have documented computed-type false alarms; they are not defaults.
+
+Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint owns source analysis; G2 integration and G3 adoption are not implemented here. The [G1 report](ci/g1-report.md) records evidence, known limitations and later seams.
+
+## Development
+
+Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=compatibility`. `zig build plan -- --tier merge --output ci/merge-matrix.txt` generates the CI plan through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
+
+`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse, std lowering, cold project/core analysis, warm core and compatibility runs, requested allocations, mapped cross-module checks and debug-poison hygiene. `--smoke` checks small fixtures without timing. [Retained measurements](ci/evidence/paired-core.json) and the [import-index correction](ci/evidence/paired-import-index.json) expose costs and scope; G0's unavailable compatibility rules are never a valid speed baseline. Private comparative drivers and dated records live in [trials](https://github.com/pedronaugusto/trials/tree/main/glint).
+
+MIT. See [LICENSE](LICENSE).

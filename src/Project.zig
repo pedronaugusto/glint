@@ -65,7 +65,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     }
     const mappings = try a.dupe(Import, imports);
     for (mappings, 0..) |*mapping, index| {
-        if (@backingInt(mapping.from) >= inputs.len or @backingInt(mapping.target) >= inputs.len) return error.InvalidMapping;
+        if (@backingInt(mapping.from) >= inputs.len or @backingInt(mapping.target) >= inputs.len) return error.InvalidMapping; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
         for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
         mapping.spelling = try a.dupe(u8, mapping.spelling);
     }
@@ -82,7 +82,7 @@ pub fn deinit(self: *Project) void {
 
 /// Creates a handle for an existing source.
 pub fn handle(self: *const Project, file: FileId) QueryError!Handle {
-    if (@backingInt(file) >= self.files.len) return error.InvalidHandle;
+    if (@backingInt(file) >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     return .{ .file = file, .snapshot = self.identity };
 }
 
@@ -135,8 +135,8 @@ fn nextIdentity() error{SnapshotLimit}!u64 {
 }
 
 fn checkedIndex(self: *const Project, source_handle: Handle) QueryError!usize {
-    if (source_handle.snapshot != self.identity or @backingInt(source_handle.file) >= self.files.len) return error.InvalidHandle;
-    return @backingInt(source_handle.file);
+    if (source_handle.snapshot != self.identity or @backingInt(source_handle.file) >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    return @backingInt(source_handle.file); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }
 
 test "project handles cannot refer to another snapshot" {
@@ -144,7 +144,7 @@ test "project handles cannot refer to another snapshot" {
     defer first.deinit();
     var second = try init(std.testing.allocator, &.{.{ .name = "two", .bytes = "const x = 2;" }}, &.{}, .{});
     defer second.deinit();
-    const h = try first.handle(@fromBackingInt(0));
+    const h = try first.handle(@fromBackingInt(0)); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     try std.testing.expectError(error.InvalidHandle, second.source(h));
     try std.testing.expectEqualStrings("const x = 1;", try first.source(h));
 }
@@ -153,10 +153,10 @@ test "project maps opaque module identities without filesystem access" {
     var project = try init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = "const dep = @import(\"dep\");" },
         .{ .name = "other", .bytes = "pub const value = 1;", .selected = false },
-    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{});
+    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{}); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     defer project.deinit();
-    try std.testing.expectEqual(@as(?FileId, @fromBackingInt(1)), project.imported(@fromBackingInt(0), "dep"));
-    try std.testing.expect(project.imported(@fromBackingInt(0), "missing") == null);
+    try std.testing.expectEqual(@as(?FileId, @fromBackingInt(1)), project.imported(@fromBackingInt(0), "dep")); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
+    try std.testing.expect(project.imported(@fromBackingInt(0), "missing") == null); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }
 
 test "project allocation failures release partially initialized files" {

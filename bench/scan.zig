@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (stats.live != 0) return error.LeakedBenchmarkOwner;
     try writer.print("row=cold_core_memory allocations={d} peak_requested_bytes={d} live_after={d}\n", .{ stats.allocations, stats.peak, stats.live });
+    try semanticRows(init.gpa, init.io, writer, rounds, small);
     try writer.flush();
 }
 
@@ -79,4 +80,45 @@ fn elapsed(io: std.Io, start: std.Io.Timestamp, small: bool) i96 {
 }
 fn row(writer: *std.Io.Writer, label: []const u8, ns: i96, rounds: usize, observed: usize) !void {
     try writer.print("row={s} total_ns={d} rounds={d} observed={d}\n", .{ label, ns, rounds, observed });
+}
+
+fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, rounds: usize, small: bool) !void {
+    const root = "const dep = @import(\"dep\"); const Alias = dep.S; pub fn f(v: Alias) Alias { _ = dep.old(); return v; }";
+    const dependency = "/// Deprecated: use the replacement.\npub fn old() u8 { return 1; } pub const S = struct { value: u8 };";
+    const inputs: []const glint.Project.Input = &.{ .{ .name = "root", .stem = "Root", .bytes = root }, .{ .name = "dependency", .stem = "Dependency", .bytes = dependency, .selected = false } };
+    const imports: []const glint.Project.Import = &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}; // safe: the two frozen fixture sources have indexes zero and one.
+    var config = glint.Config.none();
+    for ([_]glint.Rule{ .Z011, .Z012, .Z015, .Z023 }) |rule| config.set(rule, true);
+    try writer.print("case=cross_module bytes={d} files=2 rounds={d}\n", .{ root.len + dependency.len, rounds });
+    const cold = now(io, small);
+    for (0..rounds) |_| {
+        var project = try glint.Project.init(gpa, inputs, imports, .{});
+        defer project.deinit();
+        var report = try glint.run(gpa, &project, config);
+        defer report.deinit();
+        if (!report.complete or report.diagnostics.len != 1 or report.diagnostics[0].rule != .Z011) return error.UnexpectedCrossModuleResult;
+    }
+    try row(writer, "cold_cross_module", elapsed(io, cold, small), rounds, 1);
+    var project = try glint.Project.init(gpa, inputs, imports, .{});
+    defer project.deinit();
+    const warm = now(io, small);
+    for (0..rounds) |_| {
+        var report = try glint.run(gpa, &project, config);
+        defer report.deinit();
+        if (!report.complete or report.diagnostics.len != 1) return error.UnexpectedCrossModuleResult;
+    }
+    try row(writer, "warm_cross_module", elapsed(io, warm, small), rounds, 1);
+    const source = "const S = struct { value: u8, pub fn deinit(self: *S) void { self.* = undefined; } };";
+    var flow_project = try glint.Project.init(gpa, &.{.{ .name = "flow", .bytes = source }}, &.{}, .{});
+    defer flow_project.deinit();
+    var flow_config = glint.Config.none();
+    flow_config.set(.Z030, true);
+    try writer.print("case=debug_poison_hygiene bytes={d} files=1 rounds={d}\n", .{ source.len, rounds });
+    const flow = now(io, small);
+    for (0..rounds) |_| {
+        var report = try glint.run(gpa, &flow_project, flow_config);
+        defer report.deinit();
+        if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedFlowResult;
+    }
+    try row(writer, "warm_debug_poison", elapsed(io, flow, small), rounds, 0);
 }

@@ -330,6 +330,8 @@ fn under(self: *const Runner, node: Ast.Node.Index, kind: enum { cleanup, test_s
     return false;
 }
 
+// Selected naming compatibility is syntactic policy, not a semantic type fact.
+// Computed/reflected aliases may be misclassified; this pack is explicitly opt-in.
 fn typePolicy(tree: *const Ast, node: Ast.Node.Index, binding: []const u8) bool {
     var b: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&b, node) != null or tree.fullPtrType(node) != null or tree.fullArrayType(node) != null) return true;
@@ -672,8 +674,7 @@ fn poisonRule(self: *Runner) RunError!void {
 
 fn unknownCoverage(self: *Runner) RunError!void {
     const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
+    for (self.project.models[@backingInt(self.file)].import_nodes) |node| { // safe: the selected file indexes its frozen project model.
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
