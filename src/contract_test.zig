@@ -1,0 +1,70 @@
+//! Public contracts: allocation failures, arbitrary parser input and rendering.
+const std = @import("std");
+const glint = @import("glint.zig");
+
+test "contract allocation failures release project and report owners" {
+    const shakedown = @import("shakedown");
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var project = try glint.Project.init(a, &.{.{ .name = "fixture", .bytes = "const d = @import(\"dep\"); pub fn f() void {}" }}, &.{}, .{});
+            defer project.deinit();
+            var report = try glint.run(a, &project, glint.Config.compatibility());
+            defer report.deinit();
+            var output: std.Io.Writer.Allocating = .init(a);
+            defer output.deinit();
+            report.write(&output.writer, &project, .json) catch return error.OutOfMemory; // Allocating has no failure other than allocation.
+        }
+    };
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Case.run, .{});
+}
+
+test "contract seeded arbitrary bytes parse with bounded public ownership" {
+    const shakedown = @import("shakedown");
+    const Property = struct {
+        fn run(_: void, case: *shakedown.Case) !void {
+            var bytes: [128]u8 = undefined;
+            const count = shakedown.gen.intRange(case.source, usize, 0, bytes.len);
+            for (bytes[0..count]) |*byte| byte.* = shakedown.gen.int(case.source, u8);
+            var project = try glint.Project.init(case.gpa, &.{.{ .name = "arbitrary", .bytes = bytes[0..count] }}, &.{}, .{});
+            defer project.deinit();
+            var report = try glint.run(case.gpa, &project, .{});
+            defer report.deinit();
+            for (report.diagnostics) |diagnostic| {
+                try std.testing.expect(diagnostic.span.start <= count);
+                try std.testing.expect(diagnostic.span.end <= count);
+            }
+        }
+    };
+    try shakedown.check(std.testing.allocator, {}, Property.run, .{ .cases = 64 });
+}
+
+test "contract JSON and SARIF preserve stable IDs and reasoned suppressions" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const one = @import(\"one\");\n// glint-ignore: Z013 -- test-only retained declaration\nconst two = @import(\"two\");" }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.run(std.testing.allocator, &project, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: explicit compile-time type selection; the value is representable in that type.
+    for ([_]glint.Report.Format{ .json, .sarif }) |format| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try report.write(&output.writer, &project, format);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expect(std.mem.find(u8, output.written(), "Z013") != null);
+    }
+}
+
+test "contract a report cannot silently render against another project snapshot" {
+    var first = try glint.Project.init(std.testing.allocator, &.{.{ .name = "first", .bytes = "const d = @import(\"dep\");" }}, &.{}, .{});
+    defer first.deinit();
+    var other = try glint.Project.init(std.testing.allocator, &.{.{ .name = "other", .bytes = "pub const x = 1;" }}, &.{}, .{});
+    defer other.deinit();
+    var report = try glint.run(std.testing.allocator, &first, .{});
+    defer report.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectError(error.InvalidProject, report.write(&output.writer, &other, .json));
+}
