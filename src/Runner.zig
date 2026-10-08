@@ -39,13 +39,16 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
             .budget_exhausted => .budget_exhausted,
         } });
         for (std.meta.tags(rules.Rule)) |rule| {
-            if (rule != .Z003 and rule != .Z013 and config.has(rule)) {
+            if (rule != .Z003 and rule != .Z013 and rule != .Z011 and rule != .Z012 and rule != .Z015 and rule != .Z023 and config.has(rule)) {
                 runner.complete = false;
                 try runner.coverage.append(a, .{ .file = runner.file, .rule = rule, .reason = .unsupported, .detail = "compatibility port not implemented yet" });
             }
         }
         try runner.parser();
-        if (file.status == .parsed) try runner.unusedImports();
+        if (file.status == .parsed) {
+            try runner.unusedImports();
+            try runner.priorityRules();
+        }
         if (file.status != .parsed) runner.complete = false;
         for (runner.suppressions) |suppression| if (!suppression.used) {
             runner.stale += 1;
@@ -115,6 +118,132 @@ fn unusedImports(self: *Runner) RunError!void {
             try self.at(.Z013, decl.token, try self.a.print("unused private import '{s}'", .{decl.name}));
         }
     }
+}
+
+fn priorityRules(self: *Runner) RunError!void {
+    const index = @backingInt(self.file);
+    const tree = &self.project.files[index].tree;
+    for (self.project.models[index].declarations) |decl| {
+        if (decl.kind != .function) continue;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const function = tree.fullFnProto(&buffer, decl.node).?;
+        if (decl.public and (self.config.has(.Z012) or self.config.has(.Z015))) {
+            if (function.ast.return_type.unwrap()) |t| try self.privateType(t, decl.token, false, 0);
+            var it = function.iterate(tree);
+            while (it.next()) |param| if (param.type_expr) |t| try self.privateType(t, decl.token, false, 0);
+        }
+        if (self.config.has(.Z023)) {
+            var it = function.iterate(tree);
+            var first = true;
+            var maximum: u8 = 0;
+            while (it.next()) |param| {
+                const t = param.type_expr orelse continue;
+                if (first) {
+                    first = false;
+                    if (try self.receiver(t, decl.scope)) continue;
+                }
+                const order = try self.parameterOrder(t, param.comptime_noalias);
+                if (order < maximum) try self.at(.Z023, param.name_token orelse tree.nodeMainToken(t), "parameter follows a later-ranked parameter");
+                maximum = @max(maximum, order);
+            }
+        }
+    }
+    if (!self.config.has(.Z011)) return;
+    // Node-table enumeration covers every expression position exactly once.
+    for (tree.nodes.items(.tag), 0..) |_, n| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n));
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (try self.facts.definition(self.file, call.ast.fn_expr)) |definition| {
+            var is_deprecated = self.deprecated(definition);
+            if (!is_deprecated) {
+                const value = try self.facts.resolve(self.file, call.ast.fn_expr);
+                if (value == .function) is_deprecated = self.deprecated(value.function);
+            }
+            if (is_deprecated) try self.at(.Z011, if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.nodeData(call.ast.fn_expr).node_and_token[1] else tree.nodeMainToken(call.ast.fn_expr), "call uses a deprecated declaration");
+        }
+    }
+}
+
+fn deprecated(self: *const Runner, definition: Facts.Decl) bool {
+    const tree = &self.project.files[@backingInt(definition.file)].tree;
+    const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index];
+    var token = tree.firstToken(decl.node);
+    while (token > 0) {
+        token -= 1;
+        if (tree.tokenTag(token) == .keyword_pub) continue;
+        if (tree.tokenTag(token) != .doc_comment) break;
+        const line = std.mem.trim(u8, tree.tokenSlice(token)[3..], " \t\r");
+        if (std.ascii.startsWithIgnoreCase(line, "this function is deprecated")) return true;
+        if (std.ascii.startsWithIgnoreCase(line, "deprecated") and (line.len == 10 or std.mem.indexOfScalar(u8, ":;,. ", line[10]) != null)) return true;
+    }
+    return false;
+}
+
+fn privateType(self: *Runner, node: std.zig.Ast.Node.Index, site: std.zig.Ast.TokenIndex, error_position: bool, depth: usize) RunError!void {
+    const tree = &self.project.files[@backingInt(self.file)].tree;
+    if (depth >= 128) {
+        try self.coverage.append(self.a, .{ .file = self.file, .reason = .budget_exhausted, .start = tree.tokenStart(site), .detail = "API type shape depth limit" });
+        return;
+    }
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const definition = (try self.facts.definition(self.file, node)) orelse return;
+            const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index];
+            if (decl.kind == .parameter or decl.public or decl.exported or definition.file != self.file) return;
+            const value = try self.facts.resolve(self.file, node);
+            if (value == .container and value.container.scope == decl.scope) return; // @This alias.
+            try self.at(if (error_position) .Z015 else .Z012, site, try self.a.print("public signature exposes private '{s}'", .{decl.name}));
+        },
+        .optional_type => try self.privateType(tree.nodeData(node).node, site, error_position, depth + 1),
+        .error_union, .merge_error_sets => {
+            const pair = tree.nodeData(node).node_and_node;
+            try self.privateType(pair[0], site, true, depth + 1);
+            try self.privateType(pair[1], site, tree.nodeTag(node) == .merge_error_sets, depth + 1);
+        },
+        .grouped_expression => try self.privateType(tree.nodeData(node).node_and_token[0], site, error_position, depth + 1),
+        else => {}, // Preserve the selected predecessor's shape contract.
+    }
+}
+
+fn receiver(self: *Runner, node: std.zig.Ast.Node.Index, scope: u32) RunError!bool {
+    var value = try self.facts.resolve(self.file, node);
+    while (value == .pointer) value = value.pointer.*;
+    if (value != .container or value.container.file != self.file) return false;
+    const model = &self.project.models[@backingInt(self.file)];
+    var enclosing: ?u32 = scope;
+    while (enclosing) |s| {
+        if (model.scopes[s].kind == .container or model.scopes[s].kind == .file) return value.container.scope == s;
+        enclosing = model.scopes[s].parent;
+    }
+    return false;
+}
+
+fn parameterOrder(self: *Runner, node: std.zig.Ast.Node.Index, modifier: ?std.zig.Ast.TokenIndex) RunError!u8 {
+    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const value = try self.facts.resolve(self.file, node);
+    if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return 0;
+    if (modifier) |t| if (tree.tokenTag(t) == .keyword_comptime) return 1;
+    if (value == .container) {
+        for (self.project.imports) |mapping| {
+            if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
+            const root: Facts.Container = .{ .file = mapping.target, .scope = 0 };
+            if (try self.standardContainer(root, &.{ "mem", "Allocator" })) |c| if (std.meta.eql(c, value.container)) return 2;
+            if (try self.standardContainer(root, &.{"Io"})) |c| if (std.meta.eql(c, value.container)) return 3;
+        }
+    }
+    return 4;
+}
+
+fn standardContainer(self: *Runner, root: Facts.Container, names: []const []const u8) RunError!?Facts.Container {
+    var c = root;
+    for (names) |name| {
+        const decl = self.facts.member(c, name) orelse return null;
+        const v = try self.facts.declaration(decl);
+        if (v != .container) return null;
+        c = v.container;
+    }
+    return c;
 }
 
 test "core diagnostics distinguish invalid parsing and unused imports" {

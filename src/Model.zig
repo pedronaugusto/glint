@@ -9,6 +9,7 @@ declarations: []Declaration,
 references: []Reference,
 token_scopes: []const u32,
 node_references: []const ?u32,
+node_parents: []const ?Ast.Node.Index,
 zir_declarations: []const LoweredDeclaration,
 zir_references: []const LoweredReference,
 unknown_references: usize,
@@ -75,7 +76,7 @@ pub fn init(file: *File) InitError!Model {
     for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)];
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);
-    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0 };
+    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0), .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0 };
     var references: std.ArrayList(Reference) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (tag != .identifier) continue;
@@ -105,6 +106,30 @@ pub fn init(file: *File) InitError!Model {
         model.zir_references = zir_refs.items;
     }
     return model;
+}
+
+fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.Index {
+    const Span = struct { node: Ast.Node.Index, first: Ast.TokenIndex, last: Ast.TokenIndex };
+    const ordered = try a.alloc(Span, tree.nodes.len - 1);
+    for (ordered, 1..) |*span, n| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        span.* = .{ .node = node, .first = tree.firstToken(node), .last = tree.lastToken(node) };
+    }
+    std.mem.sort(Span, ordered, {}, struct {
+        fn less(_: void, l: Span, r: Span) bool {
+            if (l.first != r.first) return l.first < r.first;
+            return if (l.last != r.last) l.last > r.last else @backingInt(l.node) > @backingInt(r.node);
+        }
+    }.less);
+    const result = try a.alloc(?Ast.Node.Index, tree.nodes.len);
+    @memset(result, null);
+    var stack: std.ArrayList(Span) = .empty;
+    for (ordered) |span| {
+        while (stack.items.len != 0 and stack.items[stack.items.len - 1].last < span.last) _ = stack.pop();
+        result[@backingInt(span.node)] = if (stack.items.len != 0) stack.items[stack.items.len - 1].node else .root;
+        try stack.append(a, span);
+    }
+    return result;
 }
 
 fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir.Inst.Index, baseline: Ast.TokenIndex, tree: *const Ast, model: *const Model, visited: []bool, refs: *std.ArrayList(LoweredReference), depth: usize) InitError!void {
