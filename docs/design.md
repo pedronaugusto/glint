@@ -58,7 +58,7 @@ The build helper invokes the compiled linter through a build-only caller, with a
 
 Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks.
 
-Published aegis `fcff07ba18628efc639f527c579d4138fc9cebda` supplies glint's typed IDs and checked byte counts. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. No A4/A5/SecretBytes/Choice branch pin or ABI waiver is used. G3 owns the later paired type/rule and heuristic escape-warning pack; no verifier is pursued.
+Published aegis `313e0a81a497fdec936ba7462e872fb300f5881c` supplies glint's typed IDs and checked byte counts, and the published operation contracts used by the optional G3 pack. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. SecretBytes is published at this pin; unfinished Choice/Order/Confined/own/bounded/scope branches are excluded. The pack uses AST/std ZIR heuristics; no verifier is pursued.
 
 
 ## Published aegis reports (G3)
