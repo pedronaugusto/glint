@@ -175,3 +175,17 @@ test "completion help write failure is an output failure" {
     try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "help-fails", "--help" }, &failed));
     try expectOutcome(&tmp, "output_failure");
 }
+
+test "completion retired rule selections are argument failures" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectError(error.UnknownRule, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "removed", "--only", "Z033" }, &output.writer));
+    try expectOutcome(&tmp, "argument_failure");
+    try std.testing.expectError(error.UnknownOption, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "retired", "--compatibility" }, &output.writer));
+    try expectOutcome(&tmp, "argument_failure");
+}

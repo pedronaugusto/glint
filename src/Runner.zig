@@ -7,6 +7,7 @@ const Report = @import("Report.zig");
 const Suppression = @import("Suppression.zig");
 const Runner = @This();
 const names = @import("names.zig");
+const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 
 a: std.mem.Allocator,
@@ -130,17 +131,44 @@ fn parser(self: *Runner) RunError!void {
 
 fn unusedImports(self: *Runner) RunError!void {
     if (!self.config.has(.Z013)) return;
-    const file_index = @backingInt(self.file); // safe: enum identities index their owning frozen tables without narrowing.
+    const file_index = @backingInt(self.file); // safe: selected identity indexes this frozen project.
     const tree = &self.project.files[file_index].tree;
-    for (self.project.models[file_index].declarations) |decl| {
+    const declarations = self.project.models[file_index].declarations;
+    var candidates: std.StringHashMapUnmanaged(void) = .empty;
+    defer candidates.deinit(self.a);
+    var indexes: std.ArrayList(u32) = .empty;
+    for (declarations, 0..) |decl, index| {
         if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
-        const variable = tree.fullVarDecl(decl.node).?;
-        const value = variable.ast.init_node.unwrap() orelse continue;
-        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
+        var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, value, &buffer);
-        if (args.len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import")) {
-            try self.at(.Z013, decl.token, try self.a.print("unused private import '{s}'", .{decl.name}));
+        if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import")) continue;
+        try candidates.put(self.a, decl.name, {});
+        try indexes.append(self.a, @intCast(index)); // safe: bounded declaration table fits u32.
+    }
+    if (indexes.items.len == 0) return;
+    const used = try self.a.alloc(bool, declarations.len);
+    @memset(used, false);
+    var undecided: std.StringHashMapUnmanaged(void) = .empty;
+    defer undecided.deinit(self.a);
+    // One pass for all candidates: spelling filters work, declaration identity decides usage.
+    for (tree.nodes.items(.tag), 0..) |tag, n| {
+        if (tag != .field_access) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded AST node table fits u32.
+        const pair = tree.nodeData(node).node_and_token;
+        const name = try Model.identifier(self.a, tree.tokenSlice(pair[1]));
+        if (!candidates.contains(name)) continue;
+        if (try self.facts.definition(self.file, node)) |definition| {
+            if (definition.file == self.file) used[definition.index] = true;
+        } else {
+            const receiver = try self.facts.resolve(self.file, pair[0]);
+            try self.unknown(.Z013, node, if (receiver == .unknown) receiver.unknown else .unsupported);
+            try undecided.put(self.a, name, {});
         }
+    }
+    for (indexes.items) |index| {
+        const decl = declarations[index];
+        if (!used[index] and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.a.print("unused private import '{s}'", .{decl.name}));
     }
 }
 
@@ -222,7 +250,7 @@ fn syntaxRules(self: *Runner) RunError!void {
         if (!names.isPascalCase(self.project.inputs[index].stem)) try self.emit(.Z009, 0, 0, "file struct label should use TitleCase; caller owns file naming");
         break;
     };
-    for (model.declarations, 0..) |decl, declaration_index| {
+    for (model.declarations) |decl| {
         if (decl.kind != .variable and decl.kind != .function) continue;
         const name = decl.name;
         if (decl.exported) continue; // An external ABI fixes this spelling.
@@ -247,7 +275,16 @@ fn syntaxRules(self: *Runner) RunError!void {
             if (tree.nodeTag(expr) == .error_set_decl and !names.isPascalCase(name)) try self.at(.Z014, decl.token, "named error set should use TitleCase");
             // Only Z006 needs value-kind facts. Unknown facts are coverage, never spelling guesses.
             if ((self.config.has(.Z006) and !names.isSnakeCase(name)) or (self.config.has(.Z032) and names.acronymIssue(name))) {
-                const value = try self.facts.declaration(.{ .file = self.file, .index = @intCast(declaration_index) }); // safe: the bounded declaration table fits u32.
+                var value = try self.facts.resolve(self.file, expr);
+                if (v.ast.type_node.unwrap()) |type_node| {
+                    const declared_type = try self.facts.resolve(self.file, type_node);
+                    if (declared_type == .unknown) {
+                        value = declared_type;
+                    } else if (!(declared_type == .primitive and std.mem.eql(u8, declared_type.primitive, "type")) and value != .function) {
+                        // A non-metatype annotation describes a value, including primitive-typed constants.
+                        value = .scalar;
+                    }
+                }
                 switch (value) {
                     .unknown => |reason| {
                         try self.unknown(.Z006, expr, reason);

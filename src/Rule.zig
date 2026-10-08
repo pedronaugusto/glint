@@ -91,6 +91,6 @@ test "review inventory excludes removed identities without compatibility aliases
 
 test "inventory rejects unknown selection slots through public configuration" {
     var config = Config.none();
-    config.enabled[8] = true;
+    config.enabled[12] = true;
     try std.testing.expectError(error.InvalidSelection, config.validate());
 }

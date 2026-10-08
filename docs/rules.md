@@ -19,7 +19,7 @@ Zig style is limited to [the language guide](https://ziglang.org/documentation/0
 | Z010 | removed | 0 | Explicit initializer types are legal, often clarify coercion; no Zig style mandate. |
 | Z011 | correctness | 56 | Resolved deprecated call and declaration witness: stale API migration. Warning, with reasoned site exceptions; not a runtime defect claim. |
 | Z012 | removed | 11 | Private signature types are legal and may be inferred. Requiring public helper types broadens the public surface without a demonstrated bug. |
-| Z013 | correctness | 4 | Unused private literal import binding, counted lexical identity; dead dependency after refactor. |
+| Z013 | correctness | 4 | Unused private literal import binding after lexical and resolved member identity checks; unknown same-name member use is coverage, not a dead-binding claim. |
 | Z014 | Zig style | 0 | Named error-set types use TitleCase. |
 | Z015 | removed | 0 | Named private error sets in public functions are legal; no demonstrated bug, merged sets remain valid. |
 | Z016 | family policy | 6 | Resolved standard assertion conjunction, report-only for failure localization. Preserve short circuit/evaluation effects; no automatic rewrite. |

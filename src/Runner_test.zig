@@ -151,3 +151,14 @@ test "review preserves resolved external callable aliases" {
     try check(.Z006, "const c = struct { extern \"c\" fn CancelIoEx(u32) void; }; pub const CancelIoEx = c.CancelIoEx;", 0);
     try check(.Z006, "fn run() void {} const RunAlias = run; pub fn f() void { RunAlias(); }", 1);
 }
+
+test "review typed scalar aliases are values, not type acronyms" {
+    try check(.Z032, "const c = struct { pub const GWINSZ: u32 = 1; }; pub const GWINSZ: u32 = c.GWINSZ;", 0);
+    try check(.Z006, "pub const badName: u32 = 1;", 1);
+    try check(.Z006, "pub const good_name: u32 = 1;", 0);
+}
+
+test "review private imports used through the actual file identity are not dead" {
+    try check(.Z013, "const Self = @This(); const object = @import(\"dep\"); pub const exports = struct { pub const exposed = Self.object; };", 0);
+    try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 1);
+}
