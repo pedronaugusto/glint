@@ -362,3 +362,16 @@ test "binding keeps enclosing containers and captures" {
     try std.testing.expect(captured);
     try std.testing.expectEqual(@as(usize, 0), model.unknown_references);
 }
+
+test "binding isolates catch and switch captures from outside scopes" {
+    var file = try File.init(std.testing.allocator, "pub fn f(v: union(enum) { a: u8, b: void }) !u8 { const x = g() catch |err| return err; return switch (v) { .a => |value| value + x, .b => x }; } fn g() !u8 { return 1; }", .{});
+    defer file.deinit();
+    const model = try init(&file);
+    var captures: usize = 0;
+    for (model.declarations) |decl| if (decl.kind == .capture) {
+        captures += 1;
+        try std.testing.expectEqual(@as(u32, 1), decl.references);
+    };
+    try std.testing.expectEqual(@as(usize, 2), captures);
+    try std.testing.expectEqual(@as(usize, 0), model.unknown_references);
+}

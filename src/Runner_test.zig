@@ -130,3 +130,21 @@ test "compatibility Z030 is deinit poisoning hygiene, including cleanup and dest
     try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { a.destroy(self); } };", 0);
     try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { defer self.* = undefined; a.destroy(self); } };", 1);
 }
+
+test "compatibility deprecation follows aliases and symbolic returned containers" {
+    try check(.Z011, "/// Deprecated: use fresh.\nfn old() void {} const alias = old; pub fn run() void { alias(); }", 1);
+    try check(.Z011, "fn Factory(comptime T: type) type { return struct { value: T, /// Deprecated: use fresh.\n pub fn old() void {} }; } const S = Factory(u8); pub fn run() void { S.old(); }", 1);
+    try check(.Z011, "/// Not deprecated.\nfn old() void {} pub fn run() void { old(); _ = \"Deprecated: string\"; }", 0);
+}
+
+test "compatibility Z024 reports bytes exceeding the configured boundary" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "line", .bytes = "// 12345678\r\n" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z024, true);
+    config.max_line_length = 10;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqual(@as(u32, 10), report.diagnostics[0].span.start);
+}
