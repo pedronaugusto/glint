@@ -181,3 +181,20 @@ test "compatibility unknown receiver and callee record uncertainty without inven
     }
     try std.testing.expect(unknown_callee and unknown_receiver);
 }
+
+test "compatibility Z030 inherited branch destroy and poison order contrasts" {
+    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A, flag: bool) void { if (flag) { a.destroy(self); return; } self.* = undefined; } };", 0);
+    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A, flag: bool) void { if (flag) a.destroy(self); self.* = undefined; } };", 1);
+    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { self.* = undefined; a.destroy(self); } };", 0);
+    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { if (early) { self.* = undefined; return; } self.* = undefined; } };", 0);
+}
+
+test "compatibility suppression rejects multiple distinct binding sites" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
+    defer project.deinit();
+    try std.testing.expectError(error.AmbiguousSuppression, glint.run(std.testing.allocator, &project, .{}));
+}
+
+test "compatibility deprecation resolves escaped member identity" {
+    try check(.Z011, "const S = struct {\n /// Deprecated: use fresh.\n pub fn @\"old name\"() void {} }; pub fn run() void { S.@\"old name\"(); }", 1);
+}
