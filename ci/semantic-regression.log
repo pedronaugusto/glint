@@ -1,0 +1,66 @@
+test
++- run test 6 pass, 4 fail (10 total)
+error: 'Runner_test.test.compatibility Z030 is deinit poisoning hygiene, including cleanup and destruction' failed:
+       preflight: test seed 2787492850 (reproduce with PREFLIGHT_TEST_SEED=2787492850)
+       expected 1, found 0
+       Runner_test.test.compatibility Z030 is deinit poisoning hygiene, including cleanup and destruction: TestExpectedEqual; seed 2787492850
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:93:17: 0x102915927 in expectEqualInner__func_1181 (test)
+                       return error.TestExpectedEqual;
+                       ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:57:5: 0x102915c63 in expectEqual (test)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:12:5: 0x102915ceb in check (test)
+           try std.testing.expectEqual(expected, report.diagnostics.len);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:126:5: 0x102915e3f in test.compatibility Z030 is deinit poisoning hygiene, including cleanup and destruction (test)
+           try check(.Z030, "const S = struct { pub fn deinit(self: *S) void { _ = self; } };", 1);
+           ^
+error: 'Runner_test.test.compatibility Z016 splits only conjunction of the mapped standard assertion' failed:
+       expected 1, found 0
+       Runner_test.test.compatibility Z016 splits only conjunction of the mapped standard assertion: TestExpectedEqual; seed 2787492850
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:93:17: 0x102915927 in expectEqualInner__func_1181 (test)
+                       return error.TestExpectedEqual;
+                       ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:57:5: 0x102b0126f in expectEqual (test)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:109:5: 0x102b012f7 in test.compatibility Z016 splits only conjunction of the mapped standard assertion (test)
+           try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+           ^
+error: 'Runner_test.test.compatibility Z027 instance static access excludes fields and unknown receivers' failed:
+       expected 1, found 0
+       Runner_test.test.compatibility Z027 instance static access excludes fields and unknown receivers: TestExpectedEqual; seed 2787492850
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:93:17: 0x102915927 in expectEqualInner__func_1181 (test)
+                       return error.TestExpectedEqual;
+                       ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:57:5: 0x102915c63 in expectEqual (test)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:12:5: 0x102915ceb in check (test)
+           try std.testing.expectEqual(expected, report.diagnostics.len);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:115:5: 0x102b00fcb in test.compatibility Z027 instance static access excludes fields and unknown receivers (test)
+           try check(.Z027, "const S = struct { x: u8, const constant = 1; }; pub fn f(s: S) void { _ = s.constant; _ = s.x; }", 1);
+           ^
+error: 'Runner_test.test.compatibility Z029 uses contextual types and emits each cast once' failed:
+       expected 1, found 0
+       Runner_test.test.compatibility Z029 uses contextual types and emits each cast once: TestExpectedEqual; seed 2787492850
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:93:17: 0x102915927 in expectEqualInner__func_1181 (test)
+                       return error.TestExpectedEqual;
+                       ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:57:5: 0x102915c63 in expectEqual (test)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:12:5: 0x102915ceb in check (test)
+           try std.testing.expectEqual(expected, report.diagnostics.len);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:120:5: 0x102b00b17 in test.compatibility Z029 uses contextual types and emits each cast once (test)
+           try check(.Z029, "fn g(x: u8) void { _ = x; } pub fn f() void { g(@as(u8, 1)); }", 1);
+           ^
+failed command: ./.zig-cache/o/07394bf19589242e398038af803cfdc5/test --cache-dir=./.zig-cache --seed=0xa625c3f2 --listen=-
+
+Build Summary: 5/7 steps succeeded (1 failed); 6/10 tests passed (4 failed)
+test transitive failure
++- run test 6 pass, 4 fail (10 total)
+

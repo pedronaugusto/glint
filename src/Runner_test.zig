@@ -94,3 +94,39 @@ test "compatibility byte line length counts CRLF content and file-struct stem" {
     try std.testing.expectEqual(glint.Rule.Z009, report.diagnostics[0].rule);
     try std.testing.expect(report.complete);
 }
+
+test "compatibility Z016 splits only conjunction of the mapped standard assertion" {
+    const root = "const std = @import(\"std\"); const assert = std.debug.assert; pub fn f(a: bool, b: bool) void { assert(a and b); assert(a or b); }";
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "standard", .bytes = "pub const debug = struct { pub fn assert(ok: bool) void { _ = ok; } };", .selected = false },
+    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "std" }}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z016, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expect(report.complete);
+    try check(.Z016, "const std = struct { const debug = struct { fn assert(ok: bool) void { _ = ok; } }; }; pub fn f(a: bool, b: bool) void { std.debug.assert(a and b); }", 0);
+}
+
+test "compatibility Z027 instance static access excludes fields and unknown receivers" {
+    try check(.Z027, "const S = struct { x: u8, const constant = 1; }; pub fn f(s: S) void { _ = s.constant; _ = s.x; }", 1);
+    try check(.Z027, "const S = struct { const constant = 1; }; pub fn f() void { _ = S.constant; }", 0);
+}
+
+test "compatibility Z029 uses contextual types and emits each cast once" {
+    try check(.Z029, "fn g(x: u8) void { _ = x; } pub fn f() void { g(@as(u8, 1)); }", 1);
+    try check(.Z029, "const S = struct { x: u8 }; const s = S{ .x = @as(u8, 1) }; const a = [1]u8{ @as(u8, 1) };", 2);
+    try check(.Z029, "fn g(x: u16) void { _ = x; } pub fn f() void { g(@as(u8, 1)); }", 0);
+}
+
+test "compatibility Z030 is deinit poisoning hygiene, including cleanup and destruction" {
+    try check(.Z030, "const S = struct { pub fn deinit(self: *S) void { _ = self; } };", 1);
+    try check(.Z030, "const S = struct { pub fn deinit(self: *S) void { self.* = undefined; } };", 0);
+    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { if (early) return; self.* = undefined; } };", 1);
+    try check(.Z030, "const S = struct { pub fn deinit(self: *S, early: bool) void { defer self.* = undefined; if (early) return; } };", 0);
+    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { a.destroy(self); } };", 0);
+    try check(.Z030, "const A = struct { fn destroy(_: A, _: *S) void {} }; const S = struct { pub fn deinit(self: *S, a: A) void { defer self.* = undefined; a.destroy(self); } };", 1);
+}
