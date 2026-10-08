@@ -179,8 +179,8 @@ test "G2 Z012 family API report respects public aliases receivers and suppressio
 }
 
 test "G2 amended policies are explicit family choices and count suppressed sites" {
-    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012));
-    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026));
+    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012)); // safe: select the default configuration type for this policy assertion.
+    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026)); // safe: select the default configuration type for this policy assertion.
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }" }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();

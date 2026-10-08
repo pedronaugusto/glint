@@ -79,7 +79,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.writeByte('[');
             for (self.coverage, 0..) |c, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .file = c.file.raw(), .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer);
+                try std.json.Stringify.value(.{ .file = c.file.raw(), .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: explicit nullable metadata representation, without narrowing.
             }
             try writer.writeByte(']');
             try writer.writeAll("}}]}\n");
