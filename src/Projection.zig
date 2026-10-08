@@ -15,7 +15,7 @@ pub const Context = enum { production, @"test", @"comptime", may_be_production }
 pub const Import = struct { file: Project.FileId, node: Project.NodeId, spelling: ?[]const u8, target: ?Project.FileId, context: Context, unknown: ?Facts.Unknown };
 pub const Call = struct { file: Project.FileId, node: Project.NodeId, definition: ?Facts.Decl, context: Context, unknown: ?Facts.Unknown, instruction: ?std.zig.Zir.Inst.Index };
 pub const Reference = struct { file: Project.FileId, node: Project.NodeId, definition: ?Facts.Decl, context: Context, unknown: ?Facts.Unknown };
-pub const InitError = Facts.ResolveError;
+pub const InitError = Facts.ResolveError || Project.QueryError;
 /// Unknown graph facts are explicit and make complete false. No exact graph is invented.
 pub fn init(gpa: std.mem.Allocator, project: *const Project, budget: usize) InitError!Projection {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -45,11 +45,11 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, budget: usize) Init
             };
             const unknown = if (value == .unknown) value.unknown else null;
             if (unknown != null) complete = false;
-            try imports.append(a, .{ .file = id, .node = Project.NodeId.fromRaw(@backingInt(node)), .spelling = spelling, .target = if (value == .container) value.container.file else null, .context = context(project, id, file.tree.nodeMainToken(node)), .unknown = unknown }); // safe: std AST node identity fits u32.
+            try imports.append(a, .{ .file = id, .node = Project.NodeId.fromRaw(@backingInt(node)), .spelling = spelling, .target = if (value == .container) value.container.file else null, .context = try context(project, id, file.tree.nodeMainToken(node)), .unknown = unknown }); // safe: std AST node identity fits u32.
         }
         for (file.tree.nodes.items(.tag), 0..) |tag, n| {
             const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: budgeted AST inventory.
-            const ctx = context(project, id, file.tree.nodeMainToken(node));
+            const ctx = try context(project, id, file.tree.nodeMainToken(node));
             if (tag == .identifier or tag == .field_access) {
                 if (tag == .identifier and Model.primitive(file.tree.tokenSlice(file.tree.nodeMainToken(node)))) continue;
                 const definition = try facts.definition(id, node);
@@ -74,7 +74,9 @@ pub fn deinit(self: *Projection) void {
     self.* = undefined;
 }
 /// Context belongs to the importing use, including nested tests and lazy source.
-pub fn context(project: *const Project, file: Project.FileId, token: std.zig.Ast.TokenIndex) Context {
+pub fn context(project: *const Project, file: Project.FileId, token: std.zig.Ast.TokenIndex) Project.QueryError!Context {
+    const tree = try project.syntax(try project.handle(file));
+    if (token >= tree.tokens.len) return error.InvalidHandle;
     if (project.inputs[file.raw()].classification == .@"test") return .@"test";
     const model = &project.models[file.raw()];
     var scope: ?u32 = model.token_scopes[token];

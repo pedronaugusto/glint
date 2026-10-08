@@ -66,6 +66,13 @@ test "G2 compiled rules reject missing definitions collisions and invalid spans"
     var bad = rule;
     bad.check = Invalid.run;
     try std.testing.expectError(error.InvalidHandle, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{bad} }));
+    const InvalidNode = struct {
+        fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
+            try context.unknown(own, @fromBackingInt(1000), .unresolved); // safe: deliberately invalid frozen node for boundary rejection.
+        }
+    };
+    bad.check = InvalidNode.run;
+    try std.testing.expectError(error.InvalidHandle, glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{bad} }));
 }
 test "G2 caller selects per-file rule levels without importing a path dialect" {
     var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "chosen", .bytes = "pub const x = 1;" }, .{ .name = "excluded", .bytes = "pub const y = 2;" } }, &.{}, .{});

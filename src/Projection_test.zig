@@ -36,3 +36,11 @@ test "G2 projection carries actual ZIR method-call identity and missing-map unce
     try std.testing.expect(!missing.complete);
     try std.testing.expectEqual(.missing_mapping, missing.imports[0].unknown.?);
 }
+
+test "G2 projection context validates caller source and token identities" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "source", .bytes = "pub const value = 1;" }}, &.{}, .{});
+    defer project.deinit();
+    try std.testing.expectError(error.InvalidHandle, glint.Projection.context(&project, glint.Project.FileId.fromRaw(1), 0));
+    try std.testing.expectError(error.InvalidHandle, glint.Projection.context(&project, glint.Project.FileId.fromRaw(0), 1000));
+    try std.testing.expectEqual(.production, try glint.Projection.context(&project, glint.Project.FileId.fromRaw(0), 1));
+}

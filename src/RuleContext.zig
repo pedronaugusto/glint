@@ -63,6 +63,7 @@ pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, m
 }
 pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
+    if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
     try self.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), if (reason == .budget) .budget_exhausted else .unresolved, @tagName(reason));
 }
 pub fn selected(self: *const RuleContext, selection: []const rules.Rule) bool {
