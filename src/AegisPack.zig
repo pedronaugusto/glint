@@ -18,14 +18,14 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .report_only = true, .exception = .aegis }, .check = checkScalar },
     .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .report_only = true, .exception = .aegis }, .check = checkCapacity },
 };
-fn internal(c: *Context) bool {
-    return Contract.source(c.project.inputs[c.file.raw()].bytes) != null;
+fn internal(c: *Context) Context.Error!bool {
+    return try Contract.source(c, c.file) != null;
 }
 fn limits(c: *Context, rule: Rule) Context.Error!void {
     try c.undecided(rule, 0, .unsupported, "published-source identities and direct AST shapes over std ZIR only; generic evaluation, reflection, hooks, retained aliases and interprocedural flow remain undecided");
 }
 fn checkAccess(c: *Context) Context.Error!void {
-    if (internal(c)) return;
+    if (try internal(c)) return;
     try limits(c, access);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -45,7 +45,7 @@ fn checkAccess(c: *Context) Context.Error!void {
     }
 }
 fn checkCopies(c: *Context) Context.Error!void {
-    if (internal(c)) return;
+    if (try internal(c)) return;
     try limits(c, copies);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -97,7 +97,7 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return ((k == .secret or k == .bytes) and (std.mem.eql(u8, name, "expose") or std.mem.eql(u8, name, "exposeMut"))) or (k == .guard and std.mem.eql(u8, name, "value"));
 }
 fn checkCleanup(c: *Context) Context.Error!void {
-    if (internal(c)) return;
+    if (try internal(c)) return;
     try limits(c, cleanup);
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
@@ -171,7 +171,7 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return std.mem.eql(u8, tree.tokenSlice(data[1]), "raw") and try Contract.owner(c, data[0]) == .scalar;
 }
 fn checkScalar(c: *Context) Context.Error!void {
-    if (internal(c)) return;
+    if (try internal(c)) return;
     try limits(c, scalar);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -192,7 +192,7 @@ fn checkScalar(c: *Context) Context.Error!void {
     }
 }
 fn checkCapacity(c: *Context) Context.Error!void {
-    if (internal(c)) return;
+    if (try internal(c)) return;
     try limits(c, capacity);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |_, i| {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const glint = @import("glint");
+const shakedown = @import("shakedown");
 const own: glint.Rule = @fromBackingInt(1000); // safe: this project owns its validated extension identity.
 const rule: glint.ProjectRule = .{ .definition = .{ .id = own, .name = "CUSTOM_API", .group = .family_policy, .purpose = "project requires a declared contract", .version = 7 }, .check = check };
 fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -93,4 +94,34 @@ test "G2 caller selects per-file rule levels without importing a path dialect" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: only selected source reports.
     try std.testing.expect(report.diagnostics[0].span.file.eql(glint.Project.FileId.fromRaw(0)));
+}
+
+fn digestCheck(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    const first = try context.sourceDigest(context.file);
+    const second = try context.sourceDigest(context.file);
+    std.debug.assert(std.mem.eql(u8, &first, &second));
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try context.project.source(try context.source()), &expected, .{});
+    std.debug.assert(std.mem.eql(u8, &first, &expected));
+    const invalid = context.sourceDigest(glint.Project.FileId.fromRaw(999)) catch |err| {
+        std.debug.assert(err == error.InvalidHandle);
+        return;
+    };
+    _ = invalid;
+    unreachable;
+}
+test "G3 source digest cache validates handles and releases allocation failures" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var project = try glint.Project.init(a, &.{.{ .name = "digest", .bytes = "pub const value = 1;" }}, &.{}, .{});
+            defer project.deinit();
+            var digester = rule;
+            digester.check = digestCheck;
+            var report = try glint.runConfigured(a, &project, configuration(.report), .{ .project_rules = &.{digester} });
+            defer report.deinit();
+            try std.testing.expect(report.complete);
+        }
+    };
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Case.run, .{});
 }

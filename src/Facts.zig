@@ -10,6 +10,7 @@ project: *const Project,
 gpa: std.mem.Allocator,
 cache: std.AutoHashMapUnmanaged(Key, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Key, void) = .empty,
+source_digests: std.AutoHashMapUnmanaged(Project.FileId, [32]u8) = .empty,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -37,7 +38,17 @@ pub const ResolveError = Model.InitError;
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.active.deinit(self.gpa);
+    self.source_digests.deinit(self.gpa);
     self.* = undefined;
+}
+
+/// Cached identity of immutable input bytes, shared by compiled operation contracts.
+pub fn sourceDigest(self: *Facts, file: Project.FileId) ResolveError![32]u8 {
+    if (self.source_digests.get(file)) |digest| return digest;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(self.project.inputs[file.raw()].bytes, &digest, .{});
+    try self.source_digests.put(self.gpa, file, digest);
+    return digest;
 }
 
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {

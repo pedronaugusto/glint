@@ -107,3 +107,23 @@ test "aegis pack unrelated spelling and explicit exposure do not allege backing 
     try std.testing.expectEqual(@as(usize, 0), count(report, pack.access)); // safe: fixture count is representable.
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.copies)); // safe: fixture count is representable.
 }
+
+test "aegis pack report acceptance never completes invalid input or accepts file gates" {
+    var project = try fixture("pub fn bad() void { const broken = ; }");
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules, .files = &.{.{ .file = P.FileId.fromRaw(0), .config = .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} } }} }));
+}
+
+test "aegis pack direct cleanup twice and use after cleanup have local witnesses" {
+    var project = try fixture(
+        \\const S = @import("secret").Secret;
+        \\pub fn f() void { var s = S(u32).init(1); s.deinit(); s.deinit(); _ = &s; }
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 2), count(report, pack.cleanup)); // safe: fixture counts are representable.
+}

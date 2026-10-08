@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) !void {
     check.dependOn(&project_linter.step);
     if (b.lazyImport(@This(), "preflight")) |preflight| {
         preflight.addCi(b, .{ .tests = test_step, .portable_tests = true, .bench = .{
-            .programs = &.{.{ .name = "glint-scan", .source = "bench/scan.zig" }},
+            .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
             .imports = benchImports,
             .target = target,
             .optimize = optimize,
@@ -105,7 +105,8 @@ pub fn build(b: *std.Build) !void {
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const module = b.createModule(.{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("aegis", b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
-    return b.allocator.dupe(std.Build.Module.Import, &.{.{ .name = "glint", .module = module }}) catch @panic("OOM");
+    const secret_source = b.createModule(.{ .root_source_file = b.dependency("aegis", .{ .target = target, .optimize = optimize }).path("src/Secret.zig"), .target = target });
+    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis-secret", .module = secret_source } }) catch @panic("OOM");
 }
 
 /// Builds a project's linter with statically compiled Zig rules and the standalone CLI.

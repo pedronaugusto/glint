@@ -68,6 +68,8 @@ its IDs but never enables them by default; select `--enable A001` (through A005)
 report selections and the pack descriptors to `runConfigured`. Gate selection is rejected.
 Generic defaults, Z026/Z012 reports and the deferred D001 admission are unchanged.
 
+The rule context caches `sourceDigest(file)` once per immutable source per run, with caller-owned
+scratch lifetime and handle validation. Operation contracts share that identity without global caches.
 Recognition follows lexical declarations, explicit module mappings and exact source digests of
 published aegis `313e0a81a497fdec936ba7462e872fb300f5881c`. It covers Secret, SecretBytes,
 Guarded/Guard, ids, units and integer factories; it does not infer a secret or lock from a name.

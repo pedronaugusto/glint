@@ -32,6 +32,12 @@ pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
 pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
     return self.facts.resolve(self.file, try self.project.node(try self.source(), node));
 }
+/// Content identity of one frozen source; computed at most once per rule run.
+pub fn sourceDigest(self: *RuleContext, file: Project.FileId) Error![32]u8 {
+    _ = try self.project.handle(file);
+    return self.facts.sourceDigest(file);
+}
+
 /// Reports one site; common runner supplies ordering, metadata and reason suppression.
 pub fn emit(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, message: []const u8) Error!void {
     return self.emitRelated(rule, start, end, message, &.{});
