@@ -142,3 +142,36 @@ test "completion flush failure after buffering every byte cannot certify success
     try std.testing.expect(failing.writer.end > 0);
     try expectOutcome(&tmp, "output_failure");
 }
+
+test "completion lexical resource budget refuses a completed run" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    try text.writer.writeAll("const x = ");
+    try text.writer.splatByteAll('(', 300);
+    try text.writer.writeByte('1');
+    try text.writer.splatByteAll(')', 300);
+    try text.writer.writeByte(';');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = text.written() });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try std.testing.expectError(error.SourceTooComplex, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "budget", input }, &output.writer));
+    try expectOutcome(&tmp, "analysis_incomplete");
+}
+
+test "completion help write failure is an output failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var failed: std.Io.Writer = .failing;
+    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "help-fails", "--help" }, &failed));
+    try expectOutcome(&tmp, "output_failure");
+}

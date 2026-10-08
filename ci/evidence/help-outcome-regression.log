@@ -1,0 +1,35 @@
+test
++- run test 2 pass, 1 fail (3 total)
+error: 'cli_test.test.completion help write failure is an output failure' failed:
+       preflight: test seed 3465266059 (reproduce with PREFLIGHT_TEST_SEED=3465266059)
+       
+       ====== expected this output: =========
+       output_failure␃
+       
+       ======== instead found this: =========
+       argument_failure␃
+       
+       ======================================
+       First difference occurs on line 1:
+       expected:
+       output_failure
+       ^ ('\x6f')
+       found:
+       argument_failure
+       ^ ('\x61')
+       cli_test.test.completion help write failure is an output failure: TestExpectedEqual; seed 3465266059
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:696:9: 0x102f1b073 in expectEqualStrings (test)
+               return error.TestExpectedEqual;
+               ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/cli_test.zig:70:5: 0x102f1b6e3 in expectOutcome (test)
+           try std.testing.expectEqualStrings(outcome, json.value.object.get("outcome").?.string);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/cli_test.zig:176:5: 0x102f1ba3b in test.completion help write failure is an output failure (test)
+           try expectOutcome(&tmp, "output_failure");
+           ^
+failed command: ./.zig-cache/o/3c84322f2df185661fe0c7a1114d4147/test --cache-dir=./.zig-cache --seed=0xce8bc38b --listen=-
+
+Build Summary: 5/7 steps succeeded (1 failed); 2/3 tests passed (1 failed)
+test transitive failure
++- run test 2 pass, 1 fail (3 total)
+
