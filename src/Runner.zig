@@ -85,6 +85,9 @@ fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.D
 }
 
 fn emit(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8) RunError!void {
+    return self.emitRelated(rule, start, end, message, &.{});
+}
+fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) RunError!void {
     if (!self.config.has(rule)) return;
     const file = &self.project.files[@backingInt(self.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     const line = file.line(start);
@@ -97,7 +100,7 @@ fn emit(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const 
         .Z013 => .hygiene,
         .Z007, .Z026 => .suspicious,
         else => .style,
-    }, .severity = if (rule == .Z003) .@"error" else .warning, .span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 }, .message = message, .bug_class = switch (rule) {
+    }, .severity = if (rule == .Z003) .@"error" else .warning, .span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 }, .message = message, .related = related, .bug_class = switch (rule) {
         .Z003 => "syntax incompatibility",
         .Z013 => "dead private import binding",
         else => "selected compatibility policy",
@@ -108,6 +111,17 @@ fn at(self: *Runner, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: [
     const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const start = tree.tokenStart(token);
     try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message); // safe: validated file identities and budgeted std source indexes fit u32.
+}
+
+fn atDefinition(self: *Runner, rule: rules.Rule, token: Ast.TokenIndex, message: []const u8, definition: Facts.Decl) RunError!void {
+    const file = &self.project.files[@backingInt(definition.file)]; // safe: a resolved declaration carries a validated file identity.
+    const declaration = self.project.models[@backingInt(definition.file)].declarations[definition.index]; // safe: the definition indexes its owning frozen declaration table.
+    const start = file.tree.tokenStart(declaration.token);
+    const line = file.line(start);
+    const related = try self.a.dupe(Report.Span, &.{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(file.tree.tokenSlice(declaration.token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }}); // safe: token lengths and offsets are bounded by the checked u32 source budget.
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: the selected runner file indexes its frozen project.
+    const site = tree.tokenStart(token);
+    try self.emitRelated(rule, site, site + @as(u32, @intCast(tree.tokenSlice(token).len)), message, related); // safe: the selected token lies within the checked u32 source budget.
 }
 
 fn parser(self: *Runner) RunError!void {
@@ -192,12 +206,12 @@ fn priorityRules(self: *Runner) RunError!void {
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (try self.facts.definition(self.file, call.ast.fn_expr)) |definition| {
-            var is_deprecated = self.deprecated(definition);
-            if (!is_deprecated) {
+            var deprecated_definition: ?Facts.Decl = if (self.deprecated(definition)) definition else null;
+            if (deprecated_definition == null) {
                 const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-                if (value == .function) is_deprecated = self.deprecated(value.function);
+                if (value == .function and self.deprecated(value.function)) deprecated_definition = value.function;
             }
-            if (is_deprecated) try self.at(.Z011, if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.nodeData(call.ast.fn_expr).node_and_token[1] else tree.nodeMainToken(call.ast.fn_expr), "call uses a deprecated declaration");
+            if (deprecated_definition) |resolved| try self.atDefinition(.Z011, if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.nodeData(call.ast.fn_expr).node_and_token[1] else tree.nodeMainToken(call.ast.fn_expr), "call uses a deprecated declaration", resolved);
         } else {
             const value = try self.facts.resolve(self.file, call.ast.fn_expr);
             try self.unknown(.Z011, call.ast.fn_expr, if (value == .unknown) value.unknown else .unsupported);
@@ -242,7 +256,7 @@ fn privateType(self: *Runner, node: std.zig.Ast.Node.Index, site: std.zig.Ast.To
                 return;
             }
             if (value == .container and (value.container.file != self.file or value.container.scope == decl.scope)) return; // @This alias.
-            try self.at(if (error_position) .Z015 else .Z012, site, try self.a.print("public signature exposes private '{s}'", .{decl.name}));
+            try self.atDefinition(if (error_position) .Z015 else .Z012, site, try self.a.print("public signature exposes private '{s}'", .{decl.name}), definition);
         },
         .optional_type => try self.privateType(tree.nodeData(node).node, site, error_position, depth + 1),
         .error_union, .merge_error_sets => {
@@ -595,9 +609,12 @@ fn contextRules(self: *Runner) RunError!void {
             var value = try self.facts.resolve(self.file, pair[0]);
             while (value == .pointer) value = value.pointer.*;
             if (value == .instance) {
-                if (self.facts.member(value.instance, tree.tokenSlice(pair[1]))) |decl| {
+                if (self.facts.member(value.instance, try Model.identifier(self.a, tree.tokenSlice(pair[1])))) |decl| {
                     const record = self.project.models[@backingInt(decl.file)].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
-                    if (record.kind != .field and record.kind != .function) try self.at(.Z027, pair[1], "access container declaration through its type");
+                    if (record.kind != .field and record.kind != .function) {
+                        const declaration_value = try self.facts.declaration(decl);
+                        if (declaration_value == .unknown) try self.unknown(.Z027, node, declaration_value.unknown) else if (declaration_value != .function) try self.at(.Z027, pair[1], "access container declaration through its type");
+                    }
                 }
             }
         }

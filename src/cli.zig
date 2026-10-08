@@ -167,6 +167,10 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     const status = executeInner(gpa, a, io, args, writer, &record) catch |err| {
         if (err == error.Canceled) record.outcome = .canceled;
         if (err == error.OutOfMemory) record.outcome = .tool_failure;
+        switch (err) {
+            error.SourceTooLarge, error.SourceTooComplex, error.FileBudgetExceeded, error.SourceBudgetExceeded, error.ProjectBudgetExceeded, error.SnapshotLimit => record.outcome = .analysis_incomplete,
+            else => {},
+        }
         try Result.publish(a, io, requested, record);
         return err;
     };
@@ -181,6 +185,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .argument_failure;
     const configured = try options(a, io, args);
     if (configured.help) {
+        record.outcome = .output_failure;
         try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;

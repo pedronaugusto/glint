@@ -56,7 +56,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .rule = @tagName(d.rule), .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[@backingInt(d.span.file)].name, .span = d.span, .message = d.message, .bug_class = d.bug_class, .related = d.related }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                try std.json.Stringify.value(.{ .rule = @tagName(d.rule), .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[@backingInt(d.span.file)].name, .span = d.span, .message = d.message, .bug_class = d.bug_class, .related = Related{ .project = project, .spans = d.related } }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
             }
             try writer.writeAll("],\"coverage\":[");
             for (self.coverage, 0..) |c, i| {
@@ -75,10 +75,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                     .message = .{ .text = d.message },
                     .locations = .{.{
                         .physicalLocation = .{
-                            .artifactLocation = .{ .uri = project.inputs[@backingInt(d.span.file)].name }, // safe: enum identities index their owning frozen tables without narrowing.
+                            .artifactLocation = .{ .uri = UriLabel{ .bytes = project.inputs[@backingInt(d.span.file)].name } }, // safe: enum identities index their owning frozen tables without narrowing.
                             .region = .{ .startLine = d.span.line, .byteOffset = d.span.start, .byteLength = d.span.end - d.span.start },
                         },
                     }},
+                    .relatedLocations = Related{ .project = project, .spans = d.related, .sarif = true },
                     .properties = .{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class },
                 }, .{}, writer);
             }
@@ -88,3 +89,29 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
         },
     }
 }
+
+const UriLabel = struct {
+    bytes: []const u8,
+    pub fn jsonStringify(self: UriLabel, stream: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stream.beginWriteRaw();
+        try stream.writer.writeByte('"');
+        try (std.Uri.Component{ .raw = self.bytes }).formatPath(stream.writer);
+        try stream.writer.writeByte('"');
+        stream.endWriteRaw();
+    }
+};
+const Related = struct {
+    project: *const Project,
+    spans: []const Span,
+    sarif: bool = false,
+    pub fn jsonStringify(self: Related, stream: *std.json.Stringify) std.json.Stringify.Error!void {
+        try stream.beginArray();
+        for (self.spans, 0..) |span, index| {
+            const name = self.project.inputs[@backingInt(span.file)].name; // safe: related spans belong to the report's verified frozen project.
+            if (self.sarif) {
+                try stream.write(.{ .id = index + 1, .physicalLocation = .{ .artifactLocation = .{ .uri = UriLabel{ .bytes = name } }, .region = .{ .startLine = span.line, .byteOffset = span.start, .byteLength = span.end - span.start } } });
+            } else try stream.write(.{ .source = name, .span = span });
+        }
+        try stream.endArray();
+    }
+};
