@@ -150,7 +150,7 @@ test "inventory rejects unknown selection slots through public configuration" {
 }
 
 /// Stable metadata for both built-in and compiled project rules.
-pub const Definition = struct { id: Rule, name: []const u8, group: Group, purpose: []const u8, version: u32 = 1 };
+pub const Definition = struct { id: Rule, name: []const u8, group: Group, purpose: []const u8, version: u32 = 1, report_only: bool = false, exception: enum { generic, aegis } = .generic };
 /// Metadata is shared by suppression, reporting and project rule registration.
 pub fn definition(id: Rule, project: []const Definition) ?Definition {
     for (std.meta.tags(Rule)) |builtin| if (builtin == id) return .{ .id = id, .name = @tagName(builtin), .group = builtin.group(), .purpose = builtin.purpose(), .version = 3 };

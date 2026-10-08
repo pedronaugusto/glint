@@ -146,7 +146,10 @@ fn validateRules(config: rules.Config, definitions: []const rules.Definition) er
         for (definition.name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidSelection;
         for (definitions[0..i]) |earlier| if (earlier.id == definition.id or std.mem.eql(u8, earlier.name, definition.name)) return error.InvalidSelection;
     }
-    for (config.selections) |selection| if (rules.definition(selection.rule, definitions) == null) return error.InvalidSelection;
+    for (config.selections) |selection| {
+        const metadata = rules.definition(selection.rule, definitions) orelse return error.InvalidSelection;
+        if (metadata.report_only and selection.level == .gate) return error.InvalidSelection;
+    }
 }
 
 test "core diagnostics distinguish invalid parsing and unused imports" {

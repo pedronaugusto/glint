@@ -59,3 +59,46 @@ The build helper invokes the compiled linter through a build-only caller, with a
 Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks.
 
 Published aegis `fcff07ba18628efc639f527c579d4138fc9cebda` supplies glint's typed IDs and checked byte counts. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. No A4/A5/SecretBytes/Choice branch pin or ABI waiver is used. G3 owns the later paired type/rule and heuristic escape-warning pack; no verifier is pursued.
+
+
+## Published aegis reports (G3)
+
+The optional `AegisPack.rules` uses the public compiled-rule API. The standalone CLI registers
+its IDs but never enables them by default; select `--enable A001` (through A005), or pass
+report selections and the pack descriptors to `runConfigured`. Gate selection is rejected.
+Generic defaults, Z026/Z012 reports and the deferred D001 admission are unchanged.
+
+Recognition follows lexical declarations, explicit module mappings and exact source digests of
+published aegis `313e0a81a497fdec936ba7462e872fb300f5881c`. It covers Secret, SecretBytes,
+Guarded/Guard, ids, units and integer factories; it does not infer a secret or lock from a name.
+Copies of template/type aliases are excluded. Code changed from that operation contract is
+unrecognized. A clean run does not establish security, ownership or complete coverage.
+
+| ID/version | Obligation and supported report predicate | Prevention limit |
+|---|---|---|
+| A001/1 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
+| A002/1 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases/type aliases excluded; lifetimes, live status, retained callers and field copies are undecided. |
+| A003/1 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. | Only straight-line direct cleanup/defer/address discard. Other calls, error exits, transfers, branches, loops and aliases are undecided. No missing-errdefer allegation from proximity. |
+| A004/1 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
+| A005/1 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free. Every recognized adoption records that uncertainty. |
+
+Each selected rule records its unsupported generic/reflection/hook/alias/interprocedural coverage.
+Front-end rejection and budget exhaustion still make execution incomplete independently of
+findings acceptance. The exact published implementation files are safe-type internals by declaration
+identity; other source requires the same explicit site policy as consumers. Wiping inline padding
+and full byte capacity, cleanup before free, borrow invalidation on successful reserve, one semantic
+owner/guard and same-execution release remain runtime/caller obligations. Lint is not erasure proof.
+
+Pack suppression is one real comment/site:
+`// glint-ignore: A001 -- safe-type-internals: source-or-design-reference; site-specific reason`.
+Accepted categories are `no-danger`, `design`, `measured-boundary`, `safe-type-internals`, and
+`c-os-boundary`. Both a nonempty reference and written reason are required; the comment does
+not prove either. Suppression cannot erase undecided coverage or certify incomplete execution.
+
+These are configurable exploratory reports, pending real-corpus bug admission and consumer
+adoption. No new correctness gate follows from synthetic fixtures or zero production hits.
+Raw unadopted secrets/locks/domain integers are outside recognized declaration identity; a general
+raw replacement rule needs evidence of actual danger, operation effects and complete triage first.
+Unpublished constant-time Choice/Order/Confined/bounded/own/scope contracts are excluded.
+Aegis scalar ABI guarantees cover non-exhaustive enums over 8–64-bit and native-size integers;
+128-bit values remain Zig-only and are not included in that C ABI guarantee.

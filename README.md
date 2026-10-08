@@ -77,3 +77,8 @@ Run `zig build check`, `zig build lint`, and targeted tests such as `zig build t
 `zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Measurement rows live beside their driver in private trials. No speed guarantee is claimed.
 
 MIT. See [LICENSE](LICENSE).
+
+G3 adds optional exploratory aegis reports A001–A005 for the published Secret, SecretBytes,
+Guarded, id, units and integer contracts. Select them explicitly; gates are rejected.
+Work remains in progress: generic/flow coverage, real-defect admission and consumer adoption
+are incomplete. See [design](docs/design.md#published-aegis-reports-g3).

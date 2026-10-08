@@ -175,7 +175,7 @@ fn optionsConfigured(a: std.mem.Allocator, io: std.Io, args: []const []const u8,
 }
 
 pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer) !u8 {
-    return executeConfigured(gpa, io, args, writer, &.{});
+    return executeConfigured(gpa, io, args, writer, &glint.AegisPack.rules);
 }
 /// Standalone CLI for compiled project rules. Same completion and output contract.
 pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, project_rules: []const glint.ProjectRule) !u8 {

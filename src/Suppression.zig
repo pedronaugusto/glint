@@ -28,6 +28,17 @@ pub fn parseConfigured(a: std.mem.Allocator, file: *const File, definitions: []c
         const rule = rules.parseConfigured(id, definitions) orelse return error.UnknownRule;
         const reason = std.mem.trim(u8, rest[separator + 4 ..], " \t");
         if (reason.len == 0) return error.MalformedSuppression;
+        if (rules.definition(rule, definitions).?.exception == .aegis) {
+            const colon = std.mem.findScalar(u8, reason, ':') orelse return error.MalformedSuppression;
+            var category = false;
+            for ([_][]const u8{ "no-danger", "design", "measured-boundary", "safe-type-internals", "c-os-boundary" }) |name| if (std.mem.eql(u8, reason[0..colon], name)) {
+                category = true;
+            };
+            if (!category) return error.MalformedSuppression;
+            const rest_reason = reason[colon + 1 ..];
+            const semicolon = std.mem.findScalar(u8, rest_reason, ';') orelse return error.MalformedSuppression;
+            if (std.mem.trim(u8, rest_reason[0..semicolon], " \t").len == 0 or std.mem.trim(u8, rest_reason[semicolon + 1 ..], " \t").len == 0) return error.MalformedSuppression;
+        }
         const before = std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t\r");
         var site = comment.line;
         if (before.len == 0) {

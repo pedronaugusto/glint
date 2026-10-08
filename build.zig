@@ -22,6 +22,9 @@ pub fn build(b: *std.Build) !void {
     const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
     tests.root_module.addImport("aegis", aegis);
     tests.root_module.addImport("glint", module);
+    for ([_][]const u8{ "secret", "guarded", "bytes", "int", "scalar" }, [_][]const u8{ "Secret", "Guarded", "SecretBytes", "int", "scalar" }) |name, file| {
+        tests.root_module.addAnonymousImport(b.fmt("aegis-{s}", .{name}), .{ .root_source_file = aegis_dependency.path(b.fmt("src/{s}.zig", .{file})), .target = target });
+    }
     var needed: error{LazyDependencyNeeded}!void = {};
     if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |dep| {
         tests.root_module.addImport("shakedown", dep.module("shakedown"));
@@ -42,6 +45,9 @@ pub fn build(b: *std.Build) !void {
     const project_smoke = addLint(b, project_linter, .{ .sources = &.{b.path("examples/report.zig")}, .directories = &.{b.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
     const source_policy = addLint(b, executable, .{
         .sources = &.{
+            b.path("src/AegisContract.zig"),
+            b.path("src/AegisPack.zig"),
+            b.path("src/AegisPack_test.zig"),
             b.path("src/BuildGate.zig"),
             b.path("src/Builtins.zig"),
             b.path("src/Completion.zig"),

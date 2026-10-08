@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in, report-only published aegis operation checks A001–A005 through the compiled-rule API.
+- Require categorized, referenced site reasons for pack exceptions; reject pack gate selections.
+- Pin published aegis A4 and green published tooling.
+
+
 All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
