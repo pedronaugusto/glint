@@ -18,7 +18,7 @@ Zig style is limited to [the language guide](https://ziglang.org/documentation/0
 | Z009 | Zig style | 0 | 0 | Caller-supplied file-struct label with fields uses TitleCase. No path or directory rule. |
 | Z010 | removed | 0 | — | Explicit initializer types are legal, often clarify coercion; no Zig style mandate. |
 | Z011 | correctness | 56 | 56 | Resolved deprecated call and declaration witness: stale API migration. Warning, with reasoned site exceptions; not a runtime defect claim. |
-| Z012 | removed | 11 | — | Private signature types are legal and may be inferred. Requiring public helper types broadens the public surface without a demonstrated bug. |
+| Z012 | family policy | 11 | superseded | G2 restores the report: concrete private signature types without a public alias cannot be named by callers. Explicit selection; site-written reasons. |
 | Z013 | correctness | 4 | 2 | Unused private import binding after lexical and resolved member identity checks; unknown same-name member use is coverage, not a dead-binding claim. |
 | Z014 | Zig style | 0 | 0 | Named error-set types use TitleCase. |
 | Z015 | removed | 0 | — | Named private error sets in public functions are legal; no demonstrated bug, merged sets remain valid. |
@@ -32,7 +32,7 @@ Zig style is limited to [the language guide](https://ziglang.org/documentation/0
 | Z023 | removed | 236 | — | Receiver/comptime/Allocator/Io ranking is not an argument misuse proof or Zig style requirement. |
 | Z024 | Zig style | 7424 | 17572 | Aim for 100 bytes, use judgment. Configurable readability report; no universal line-length gate. |
 | Z025 | removed | 0 | — | Captured error propagation is legal; spelling redundancy is not a bug. |
-| Z026 | removed | 168 | — | Best-effort cleanup and cancellation may intentionally discard errors. No effect/intent contract supports a blanket gate. |
+| Z026 | family policy | 168 | superseded | G2 restores empty-catch reporting, including cleanup: every discarded error carries a site-written reason. Report before gate adoption. |
 | Z027 | removed | 0 | — | Static access through an instance is legal; no demonstrated misuse. |
 | Z028 | removed | 13 | — | Local/test imports are legal organization choices, not correctness. |
 | Z029 | removed | 1 | — | Overlaps Z018, itself removed; no second coercion detector. |
@@ -47,7 +47,7 @@ Z008 has no implementation and remains absent. G1 compatibility ports remain rec
 
 | Candidate | Group | Counted probe / decision |
 |---|---|---|
-| Dead private declarations | correctness, withheld | 4,772 lexical zero-reference candidates. Member calls, compiler hooks and reflection make these an upper screen, not resolved dead declarations. Broad admission is refused; Z013 remains the concrete import case. |
+| Dead private declarations | correctness, withheld | 4,772 lexical zero-reference candidates. Member calls, compiler hooks and reflection make these an upper screen, not resolved dead declarations. G2 admission is deferred until actual ZIR semantics resolve member calls, compiler hooks and reflection; Z013 remains the concrete import case. |
 | Configurable disallowed declarations | family policy, withheld | 3,338 Mutex/print spelling sites demonstrate why text bans are rejected. The contract is resolved declaration identity per entry, with reason/replacement. Implement through the subsequent public rule seam; no blanket raw-mutex or writer ban. |
 | Untrusted recursion without a bound | correctness, withheld | 194 resolved direct self-call sites; no claimed mutual-call closure, Untrusted reachability or bound contract. Read examples include depth-bounded generators. Await the admitted aegis pack; report first, hardened profile may later gate. |
 | Cast and safety-off reasons | family policy, migration retained | 12,027 actual conversion tokens, 11,151 lacking same-line nonempty real safe comments, 11 safety-toggle sites. Includes tests/baselines; these are obligations, not unsafe-access findings. G2 must preserve every owner-required cast/safety-off reason and existing narrower predicates, exceptions and scopes through the public rule API. |

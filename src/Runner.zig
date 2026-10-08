@@ -57,6 +57,7 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
         if (file.status == .parsed) {
             try runner.unusedImports();
             try runner.priorityRules();
+            try runner.amendedPolicies();
             try runner.syntaxRules();
             try runner.contextRules();
             try runner.unknownCoverage();
@@ -203,6 +204,66 @@ fn priorityRules(self: *Runner) RunError!void {
             const value = try self.facts.resolve(self.file, call.ast.fn_expr);
             try self.unknown(.Z011, call.ast.fn_expr, if (value == .unknown) value.unknown else .unsupported);
         }
+    }
+}
+
+fn amendedPolicies(self: *Runner) RunError!void {
+    if (!self.selected(&.{ .Z012, .Z026 })) return;
+    const index = @backingInt(self.file); // safe: validated file identity indexes its frozen project.
+    const tree = &self.project.files[index].tree;
+    if (self.config.has(.Z012)) for (self.project.models[index].declarations) |decl| {
+        if (decl.kind != .function or !decl.public) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const function = tree.fullFnProto(&buffer, decl.node).?;
+        if (function.ast.return_type.unwrap()) |t| try self.privateType(t, decl.token, 0);
+        var it = function.iterate(tree);
+        while (it.next()) |param| if (param.type_expr) |t| try self.privateType(t, decl.token, 0);
+    };
+    if (self.config.has(.Z026)) for (tree.nodes.items(.tag), 0..) |tag, n| {
+        if (tag != .@"catch") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded std AST indexes fit u32.
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.blockStatements(&buffer, tree.nodeData(node).node_and_node[1])) |statements| {
+            if (statements.len == 0) try self.at(.Z026, tree.nodeMainToken(node), "empty catch discards an error; write a reason at this site");
+        }
+    };
+}
+
+fn privateType(self: *Runner, node: Ast.Node.Index, site: Ast.TokenIndex, depth: usize) RunError!void {
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: validated source identity.
+    if (depth >= 128) return self.unknown(.Z012, node, .budget);
+    if (tree.fullPtrType(node)) |pointer| return self.privateType(pointer.ast.child_type, site, depth + 1);
+    switch (tree.nodeTag(node)) {
+        .identifier, .field_access => {
+            const definition = (try self.facts.definition(self.file, node)) orelse {
+                const value = try self.facts.resolve(self.file, node);
+                if (value == .unknown) try self.unknown(.Z012, node, value.unknown);
+                return;
+            };
+            const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index]; // safe: resolved declaration belongs to frozen model.
+            if (decl.kind == .parameter or decl.public or decl.exported) return;
+            const value = try self.facts.resolve(self.file, node);
+            if (value == .unknown) return self.unknown(.Z012, node, value.unknown);
+            // A primitive alias can be named as the primitive; error-set policy is not Z012.
+            if (value != .container) return;
+            if (value.container.scope == decl.scope) return; // An enclosing @This receiver is nameable through its public owner.
+            if (try self.facts.origin(definition)) |origin| {
+                const original = self.project.models[@backingInt(origin.file)].declarations[origin.index]; // safe: resolved alias provenance.
+                if (original.public or original.exported) return;
+            }
+            // A public alias to this same concrete container makes the type nameable.
+            for (self.project.models[@backingInt(definition.file)].declarations, 0..) |alias, i| {
+                if (!alias.public or alias.kind != .variable) continue;
+                const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @intCast(i) }); // safe: bounded declaration inventory.
+                if (exposed == .container and std.meta.eql(exposed.container, value.container)) return;
+            }
+            try self.atDefinition(.Z012, site, try self.a.print("public signature exposes private type '{s}'", .{decl.name}), definition);
+        },
+        .optional_type => try self.privateType(tree.nodeData(node).node, site, depth + 1),
+        .error_union => try self.privateType(tree.nodeData(node).node_and_node[1], site, depth + 1),
+        .grouped_expression => try self.privateType(tree.nodeData(node).node_and_token[0], site, depth + 1),
+        .call, .call_one, .call_comma, .call_one_comma => try self.unknown(.Z012, node, .comptime_dependent),
+        else => {},
     }
 }
 

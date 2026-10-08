@@ -162,3 +162,31 @@ test "review private imports used through the actual file identity are not dead"
     try check(.Z013, "const Self = @This(); const object = @import(\"dep\"); pub const exports = struct { pub const exposed = Self.object; };", 0);
     try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 1);
 }
+
+test "G2 Z026 family reason policy includes cleanup and distinguishes handled errors" {
+    try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch {}; defer fallible() catch {}; }", 2);
+    try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch { return; }; }", 0);
+    try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch {}; } // glint-ignore: Z026 -- best-effort cleanup; no recovery available\n", 0);
+    try check(.Z026, "const text = \"catch {} // glint-ignore: Z026 -- fake\"; pub fn f() void { _ = text; }", 0);
+}
+
+test "G2 Z012 family API report respects public aliases receivers and suppression" {
+    try check(.Z012, "const Hidden = struct {}; pub fn create() Hidden { return .{}; }", 1);
+    try check(.Z012, "const Hidden = struct {}; pub fn create() ?*Hidden { return null; }", 1);
+    try check(.Z012, "const Hidden = struct {}; pub const Visible = Hidden; pub fn create() Hidden { return .{}; }", 0);
+    try check(.Z012, "pub const Visible = struct { pub fn read(self: @This()) void { _ = self; } };", 0);
+    try check(.Z012, "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
+}
+
+test "G2 amended policies are explicit family choices and count suppressed sites" {
+    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012));
+    try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026));
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory\npub fn create() Hidden { return .{}; }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z012, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.suppressed); // safe: expected count fits usize.
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
+}

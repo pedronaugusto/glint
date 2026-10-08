@@ -8,17 +8,19 @@ pub const Rule = enum(u16) {
     Z006 = 6,
     Z009 = 9,
     Z011 = 11,
+    Z012 = 12,
     Z013 = 13,
     Z014 = 14,
     Z016 = 16,
     Z024 = 24,
+    Z026 = 26,
     Z031 = 31,
     Z032 = 32,
 
     pub fn group(self: Rule) Group {
         return switch (self) {
             .Z003, .Z011, .Z013 => .correctness,
-            .Z016 => .family_policy,
+            .Z012, .Z016, .Z026 => .family_policy,
             else => .zig_style,
         };
     }
@@ -27,6 +29,8 @@ pub const Rule = enum(u16) {
             .Z003 => "syntax incompatibility",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
+            .Z012 => "public API type cannot be named by its caller",
+            .Z026 => "discarded error needs a site-written reason",
             .Z016 => "assertion failure localization (advisory)",
             else => "Zig style naming or readability (no runtime bug claimed)",
         };
@@ -82,15 +86,15 @@ pub const Config = struct {
 };
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 12), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 14), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
     try std.testing.expect(Rule.parse("Z013-extra") == null);
-    for ([_][]const u8{ "Z002", "Z004", "Z012", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);
+    for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 
 test "inventory rejects unknown selection slots through public configuration" {
     var config = Config.none();
-    config.enabled[12] = true;
+    config.enabled[8] = true;
     try std.testing.expectError(error.InvalidSelection, config.validate());
 }
