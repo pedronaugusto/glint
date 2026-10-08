@@ -6,14 +6,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
-- Std-only immutable project model using std AST, AstGen and ZIR, lexical scopes/references and explicit partial semantic coverage.
+- Immutable project model using std AST, AstGen and ZIR, lexical scopes/references and explicit partial semantic coverage.
 - Twelve reviewed rule identities, separated into correctness, Zig style and family policy. Naming uses resolved kinds and reports unknown facts.
 - Standalone text/JSON/SARIF CLI, reasoned one-site suppression and a versioned completion receipt tied to invocation, exit class and exact successful output.
 - Public consumer, ownership/allocation, semantic, rule and interrupted/error-output contracts; own benchmarks and counted family differential evidence.
 
 ### Development status
 
-- G0/G1/G1r only. Family integration, new safety adoption and predecessor retirement remain pending; no lifetime verifier is pursued and this is not a release-complete claim.
+- G2 API implementation; consumer adoption remains open. Family integration, new safety adoption and predecessor retirement remain pending; no lifetime verifier is pursued and this is not a release-complete claim.
 
 ### Changed (G1r, 2026-10-08)
 
@@ -23,3 +23,11 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - Raw G1 evidence moved to immutable private trials; tests, benchmarks and the consumer fixture remain here. Published green preflight/shakedown pins refreshed, and CI uses the canonical planner.
 
 [Unreleased]: https://github.com/pedronaugusto/glint/commits/main
+
+### Changed (G2, 2026-10-08)
+
+- Breaking: distinct aegis-backed file/node/token IDs and rule metadata version 3; explicit reviewed selection expands to 21 IDs. Generic defaults stay Z003/Z013; JSON/SARIF and completion versions remain unchanged.
+- Restore Z012/Z026 as explicit family reports with site reasons. Add configured cast/safety-off/length/unreachable/debug-print/disallowed predicates and a conservative dead-private report which withholds unresolved projects.
+- Public compiled-rule API, per-source levels/options, native input build helper and complete-output verification before accepting reports; shared frozen Zig projection for architecture consumers.
+- Pin published green aegis for typed identities and checked byte accounting. Planned Untrusted/bounded leaves and broad dead-private family admission remain open; consumer repos are unchanged.
+- Lasting contracts moved to docs/design.md; raw scans and timings remain in private trials.

@@ -81,7 +81,16 @@ pub const LinterOptions = struct { name: []const u8 = "project-lint", source: st
 /// Declares exact source/config and caller-selected directory-content inputs.
 /// The directory inputs only invalidate the build; they never select files for glint.
 pub fn addLint(b: *std.Build, executable: *std.Build.Step.Compile, options: LintOptions) *std.Build.Step.Run {
-    const run = b.addRunArtifact(executable);
+    const module = executable.root_module.import_table.get("glint") orelse @panic("linter must import glint");
+    const gate = b.addExecutable(.{ .name = "glint-build-gate", .root_module = b.createModule(.{
+        .root_source_file = module.root_source_file.?.dirname().path(b, "BuildGate.zig"),
+        .target = b.graph.host,
+        .optimize = .fast,
+        .imports = &.{.{ .name = "glint", .module = module }},
+    }) });
+    const run = b.addRunArtifact(gate);
+    run.addArtifactArg(executable);
+    run.addDirectoryArg(b.tmpPath());
     if (options.config) |config| {
         run.addArg("--config");
         run.addFileArg(config);

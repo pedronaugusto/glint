@@ -106,3 +106,22 @@ test "contract deprecation diagnostic carries its resolved declaration span" {
         }
     }
 }
+
+test "contract G2 allocation failures release projection and dead-private owners" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var project = try glint.Project.init(a, &.{.{ .name = "model", .bytes = "fn unused() void {} pub fn live() void {}" }}, &.{}, .{});
+            defer project.deinit();
+            var projection = try glint.Projection.init(a, &project, 1000);
+            defer projection.deinit();
+            var config = glint.Config.none();
+            config.set(.D001, true);
+            var report = try glint.run(a, &project, config);
+            defer report.deinit();
+            try std.testing.expect(report.complete);
+            try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: known private unused fixture function.
+        }
+    };
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Case.run, .{});
+}

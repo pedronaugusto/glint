@@ -1,5 +1,6 @@
 //! Package test entry.
 test {
+    _ = @import("build_gate_test.zig");
     _ = @import("glint");
     _ = @import("cli.zig");
     _ = @import("cli_test.zig");

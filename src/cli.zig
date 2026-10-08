@@ -209,7 +209,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const configured = try optionsConfigured(a, io, args, definitions);
     if (configured.help) {
         record.outcome = .output_failure;
-        try writer.writeAll("glint [--only Znnn | --reviewed] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;
         record.completed = false;
