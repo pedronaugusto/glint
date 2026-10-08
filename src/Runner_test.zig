@@ -203,3 +203,21 @@ test "compatibility function-pointer parameter labels cannot shadow fields or im
     try check(.Z027, "const S = struct { context: usize, call: *const fn (context: usize) void, pub fn f(self: S) void { self.call(self.context); } };", 0);
     try check(.Z013, "const dep = @import(\"dep\"); const S = struct { call: *const fn (dep: u8) void, pub fn f(self: S) void { self.call(dep.value); } };", 0);
 }
+
+test "compatibility Z010 needs a known literal context and keeps generic explicit types" {
+    try check(.Z010, "const S = struct {}; fn g(x: anytype) void { _ = x; } pub fn f() void { g(S{}); }", 0);
+    try check(.Z010, "const S = struct {}; fn g(x: S) void { _ = x; } pub fn f() void { g(S{}); }", 1);
+}
+
+test "compatibility public signature retains imported alias provenance" {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = "const d = @import(\"dep\"); const Alias = d.Errors; pub fn f() Alias!void {}" },
+        .{ .name = "dep", .selected = false, .bytes = "pub const Errors = error{Bad};" },
+    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "dep" }}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z015, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+}
