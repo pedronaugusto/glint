@@ -2,6 +2,7 @@
 const std = @import("std");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 const Usage = @This();
 arena: std.heap.ArenaAllocator,
@@ -13,9 +14,12 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, facts: *Facts) Fact
     errdefer arena.deinit();
     const a = arena.allocator();
     const used = try a.alloc([]bool, project.files.len);
+    const retained = try a.alloc([]bool, project.files.len);
     for (project.models, 0..) |model, i| {
         used[i] = try a.alloc(bool, model.declarations.len);
         @memset(used[i], false);
+        retained[i] = try a.alloc(bool, model.scopes.len);
+        @memset(retained[i], false);
     }
     var undecided = false;
     for (project.files, 0..) |*file, i| {
@@ -28,19 +32,7 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, facts: *Facts) Fact
         for (model.import_nodes) |node| if ((try facts.resolve(id, node)) == .unknown) {
             undecided = true;
         };
-        for (model.references) |reference| if (reference.declaration) |d| {
-            used[i][d] = true;
-            const declaration = model.declarations[d];
-            if (model.scopes[declaration.scope].kind != .file and model.scopes[declaration.scope].kind != .container) continue;
-            var witnessed = false;
-            for (model.zir_references) |lowered| if (lowered.token == reference.token and lowered.declaration == d) {
-                witnessed = true;
-                break;
-            };
-            if (!witnessed) undecided = true;
-        } else if (reference.unknown != null and reference.unknown.? != .primitive) {
-            undecided = true;
-        };
+        if (try lexicalUses(a, file.tree.tokens.len, model, used[i])) undecided = true;
         for (model.declarations, 0..) |decl, d| {
             if (decl.kind == .function) {
                 var function_buffer: [1]Ast.Node.Index = undefined;
@@ -60,15 +52,15 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, facts: *Facts) Fact
                 const function = file.tree.fullFnProto(&function_buffer, decl.node).?;
                 if (function.ast.return_type.unwrap()) |ret| {
                     const value = try facts.resolve(id, ret);
-                    if (value == .unknown) undecided = true else retain(used, value, project);
+                    if (value == .unknown) undecided = true else retain(retained, value, project);
                 }
                 var parameters = function.iterate(&file.tree);
                 while (parameters.next()) |parameter| if (parameter.type_expr) |node| {
                     const value = try facts.resolve(id, node);
-                    if (value == .unknown) undecided = true else retain(used, value, project);
+                    if (value == .unknown) undecided = true else retain(retained, value, project);
                 };
             }
-            if (decl.kind == .variable) retain(used, try facts.declaration(.{ .file = id, .index = @intCast(d) }), project); // safe: checked declaration inventory.
+            if (decl.kind == .variable) retain(retained, try facts.declaration(.{ .file = id, .index = @intCast(d) }), project); // safe: checked declaration inventory.
         }
         for (file.tree.nodes.items(.tag), 0..) |tag, n| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: checked AST inventory.
@@ -104,7 +96,7 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, facts: *Facts) Fact
                         undecided = true;
                         continue;
                     }
-                    retain(used, parameter, project);
+                    retain(retained, parameter, project);
                 }
             }
             var buffer: [2]Ast.Node.Index = undefined;
@@ -122,36 +114,58 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, facts: *Facts) Fact
                     continue;
                 }
                 const value = try facts.resolve(id, args[0]);
-                if (value == .unknown or (value == .container and value.container.symbolic)) undecided = true else retain(used, value, project);
+                if (value == .unknown or (value == .container and value.container.symbolic)) undecided = true else retain(retained, value, project);
             } else if (std.mem.eql(u8, name, "@call") or std.mem.eql(u8, name, "@Type") or std.mem.eql(u8, name, "@export") or std.mem.eql(u8, name, "@extern")) undecided = true;
         }
     }
+    expandRetention(project, used, retained);
     return .{ .arena = arena, .referenced = used, .complete = !undecided };
 }
 pub fn deinit(self: *Usage) void {
     self.arena.deinit();
     self.* = undefined;
 }
-fn retain(used: [][]bool, value: Facts.Value, project: *const Project) void {
+fn retain(retained: [][]bool, value: Facts.Value, project: *const Project) void {
     const container = switch (value) {
         .container, .instance => |c| c,
-        .pointer, .optional, .error_union => |child| return retain(used, child.*, project),
+        .pointer, .optional, .error_union => |child| return retain(retained, child.*, project),
         else => return,
     };
-    for (project.models[container.file.raw()].declarations, 0..) |decl, i| if (decl.scope == container.scope) {
-        used[container.file.raw()][i] = true;
+    retained[container.file.raw()][container.scope] = true;
+}
+
+// One exact token/declaration index over actual lowered witnesses.
+fn lexicalUses(a: std.mem.Allocator, tokens: usize, model: *const Model, used: []bool) std.mem.Allocator.Error!bool {
+    const witnesses = try a.alloc(?u32, tokens);
+    @memset(witnesses, null);
+    var undecided = false;
+    for (model.zir_references) |lowered| if (lowered.declaration) |d| {
+        if (witnesses[lowered.token]) |previous| if (previous != d) {
+            undecided = true;
+        };
+        witnesses[lowered.token] = d;
     };
-    // A container can expose nested namespaces to a compiler hook. Retain all
-    // descendant declarations instead of guessing which hook traverses them.
-    const model = &project.models[container.file.raw()];
-    for (model.declarations, 0..) |decl, i| {
+    for (model.references) |reference| if (reference.declaration) |d| {
+        used[d] = true;
+        const declaration = model.declarations[d];
+        if (model.scopes[declaration.scope].kind != .file and model.scopes[declaration.scope].kind != .container) continue;
+        if (witnesses[reference.token] != d) undecided = true;
+    } else if (reference.unknown != null and reference.unknown.? != .primitive) {
+        undecided = true;
+    };
+    return undecided;
+}
+
+// Expand each retained namespace once, including its nested compiler hooks.
+fn expandRetention(project: *const Project, used: [][]bool, retained: []const []const bool) void {
+    for (project.models, 0..) |model, file| for (model.declarations, 0..) |decl, d| {
         var scope: ?u32 = decl.scope;
         while (scope) |s| {
-            if (s == container.scope) {
-                used[container.file.raw()][i] = true;
+            if (retained[file][s]) {
+                used[file][d] = true;
                 break;
             }
             scope = model.scopes[s].parent;
         }
-    }
+    };
 }
