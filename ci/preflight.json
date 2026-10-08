@@ -1,0 +1,6 @@
+{
+  "sources": ["src"],
+  "test_roots": ["src/tests.zig"],
+  "test_dependencies": ["shakedown"],
+  "extra_checks": [["zig", "build", "check-consumer"]]
+}
