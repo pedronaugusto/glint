@@ -233,6 +233,27 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
     return null;
 }
 
+/// Follows only declaration aliases, keeping the final declaration's provenance.
+/// Cycles, computed expressions and unsupported comptime retain uncertainty.
+pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
+    var current = start;
+    var visited: [128]Decl = undefined;
+    var count: usize = 0;
+    while (count < visited.len) {
+        for (visited[0..count]) |earlier| if (std.meta.eql(earlier, current)) return null;
+        visited[count] = current;
+        count += 1;
+        const record = self.project.models[@backingInt(current.file)].declarations[current.index]; // safe: declaration identities index their owning frozen model.
+        if (record.kind != .variable) return current;
+        const tree = &self.project.files[@backingInt(current.file)].tree; // safe: declaration identities index their owning frozen file table.
+        const variable = tree.fullVarDecl(record.node).?;
+        const expr = variable.ast.init_node.unwrap() orelse return current;
+        if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) return current;
+        current = (try self.definition(current.file, expr)) orelse return null;
+    }
+    return null;
+}
+
 fn instance(value: Value) Value {
     return switch (value) {
         .container => |c| .{ .instance = c },

@@ -15,12 +15,12 @@ inputs: []const Input,
 /// Private: explicit module resolution. There is no filesystem or path policy here.
 imports: []const Import,
 /// Private: distinguishes handles from separate snapshots, even at the same index.
-identity: *const u8,
+identity: u64,
 
 /// A source index within one project.
 pub const FileId = enum(u32) { _ };
 /// A source handle that cannot silently identify a replacement snapshot.
-pub const Handle = struct { file: FileId, snapshot: *const u8 };
+pub const Handle = struct { file: FileId, snapshot: u64 };
 /// Explicit source data. `name` is a diagnostic label; `stem` is Zig file-struct naming input.
 pub const Input = struct {
     name: []const u8,
@@ -34,7 +34,7 @@ pub const Import = struct { from: FileId, spelling: []const u8, target: FileId }
 /// Per-source limits for front-end work.
 pub const Options = struct { limits: File.Limits = .{}, files: usize = 4096, bytes: usize = 128 * 1024 * 1024 };
 /// Construction errors always propagate; no unread/allocation failure is clean.
-pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded };
+pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded, SnapshotLimit };
 /// A handle from another snapshot is invalid.
 pub const QueryError = error{InvalidHandle};
 
@@ -69,8 +69,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
         mapping.spelling = try a.dupe(u8, mapping.spelling);
     }
-    const identity = try a.create(u8);
-    identity.* = 0;
+    const identity = try nextIdentity();
     return .{ .arena = arena, .files = files, .models = models, .inputs = copied, .imports = mappings, .identity = identity };
 }
 
@@ -91,6 +90,15 @@ pub fn handle(self: *const Project, file: FileId) QueryError!Handle {
 pub fn references(self: *const Project, source_handle: Handle) QueryError![]const Model.Reference {
     const index = try self.checkedIndex(source_handle);
     return self.models[index].references;
+}
+
+/// Returns indexed std-ZIR references. Consult loweredCoverage; this is a partial index.
+pub fn loweredReferences(self: *const Project, source_handle: Handle) QueryError![]const Model.LoweredReference {
+    return self.models[try self.checkedIndex(source_handle)].zir_references;
+}
+/// Reports the bounds of the std-ZIR reference index without implying type checking.
+pub fn loweredCoverage(self: *const Project, source_handle: Handle) QueryError!@FieldType(Model, "lowered_coverage") {
+    return self.models[try self.checkedIndex(source_handle)].lowered_coverage;
 }
 
 /// Returns source declarations, including lazy declarations and public/export provenance.
@@ -114,6 +122,16 @@ pub fn source(self: *const Project, source_handle: Handle) QueryError![]const u8
 pub fn imported(self: *const Project, from: FileId, spelling: []const u8) ?FileId {
     for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) return mapping.target;
     return null;
+}
+
+// Process-local identities are monotonic; allocator reuse cannot revive stale handles.
+var last_identity: std.atomic.Value(u64) = .init(0);
+fn nextIdentity() error{SnapshotLimit}!u64 {
+    var previous = last_identity.load(.monotonic);
+    while (true) {
+        if (previous == std.math.maxInt(u64)) return error.SnapshotLimit;
+        if (last_identity.cmpxchgWeak(previous, previous + 1, .monotonic, .monotonic)) |observed| previous = observed else return previous + 1;
+    }
 }
 
 fn checkedIndex(self: *const Project, source_handle: Handle) QueryError!usize {
@@ -153,7 +171,7 @@ test "project allocation failures release partially initialized files" {
     try std.testing.checkAllAllocationFailures(allocation.allocator(), Helper.run, .{});
 }
 
- test "project stale handles survive allocator address reuse without aliasing" {
+test "project stale handles survive allocator address reuse without aliasing" {
     var storage: [262144]u8 = undefined;
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     var first = try init(allocator.allocator(), &.{.{ .name = "one", .bytes = "const x = 1;" }}, &.{}, .{});

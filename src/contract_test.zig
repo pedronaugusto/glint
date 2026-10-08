@@ -12,7 +12,10 @@ test "contract allocation failures release project and report owners" {
             defer report.deinit();
             var output: std.Io.Writer.Allocating = .init(a);
             defer output.deinit();
-            report.write(&output.writer, &project, .json) catch return error.OutOfMemory; // Allocating has no failure other than allocation.
+            report.write(&output.writer, &project, .json) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            }; // Allocating has no failure other than allocation.
         }
     };
     var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
@@ -66,4 +69,12 @@ test "contract a report cannot silently render against another project snapshot"
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try std.testing.expectError(error.InvalidProject, report.write(&output.writer, &other, .json));
+}
+
+test "contract public lowered references disclose partial std ZIR coverage" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const x = 1; pub fn f() u32 { return x; }" }}, &.{}, .{});
+    defer project.deinit();
+    const handle = try project.handle(@fromBackingInt(0)); // safe: source zero exists in this fixture.
+    try std.testing.expectEqual(.partial, try project.loweredCoverage(handle));
+    try std.testing.expect((try project.loweredReferences(handle)).len != 0);
 }

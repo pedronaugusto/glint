@@ -1,6 +1,7 @@
 //! Own benchmark: parsing, std lowering, cold project/binding and shared rules.
 const std = @import("std");
 const glint = @import("glint");
+const Stats = @import("allocations.zig");
 const smoke = @import("builtin").mode == .debug;
 
 pub fn main(init: std.process.Init) !void {
@@ -57,6 +58,15 @@ pub fn main(init: std.process.Init) !void {
         }
         try row(writer, if (all) "warm_compatibility" else "warm_core", elapsed(init.io, rules_start, small), rounds, findings);
     }
+    var stats: Stats = .{ .backing = init.gpa };
+    {
+        var measured = try glint.Project.init(stats.allocator(), inputs, &.{}, .{});
+        defer measured.deinit();
+        var report = try glint.run(stats.allocator(), &measured, .{});
+        defer report.deinit();
+    }
+    if (stats.live != 0) return error.LeakedBenchmarkOwner;
+    try writer.print("row=cold_core_memory allocations={d} peak_requested_bytes={d} live_after={d}\n", .{ stats.allocations, stats.peak, stats.live });
     try writer.flush();
 }
 

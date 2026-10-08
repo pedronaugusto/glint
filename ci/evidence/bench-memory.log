@@ -1,0 +1,7 @@
+version=1 bytes=24868 files=1 declarations=256 rounds=15 optimize=fast
+row=parse total_ns=1268292 rounds=15 observed=3073
+row=lower total_ns=7722791 rounds=15 observed=4097
+row=cold_core total_ns=14086084 rounds=15 observed=4097
+row=warm_core total_ns=30833 rounds=15 observed=0
+row=warm_compatibility total_ns=4284708 rounds=15 observed=0
+row=cold_core_memory allocations=8 peak_requested_bytes=1292082 live_after=0

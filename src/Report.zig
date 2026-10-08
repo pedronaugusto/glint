@@ -5,7 +5,7 @@ const rules = @import("Rule.zig");
 const Report = @This();
 
 arena: std.heap.ArenaAllocator,
-snapshot: *const u8,
+snapshot: u64,
 diagnostics: []const Diagnostic,
 coverage: []const Coverage,
 suppressed: usize,
@@ -76,7 +76,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                     .locations = .{.{
                         .physicalLocation = .{
                             .artifactLocation = .{ .uri = project.inputs[@backingInt(d.span.file)].name }, // safe: enum identities index their owning frozen tables without narrowing.
-                            .region = .{ .startLine = d.span.line, .startColumn = d.span.column, .byteOffset = d.span.start, .byteLength = d.span.end - d.span.start },
+                            .region = .{ .startLine = d.span.line, .byteOffset = d.span.start, .byteLength = d.span.end - d.span.start },
                         },
                     }},
                     .properties = .{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class },

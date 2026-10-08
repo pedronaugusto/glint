@@ -15,9 +15,11 @@ pub const Limits = struct {
     bytes: usize = 16 * 1024 * 1024,
     nodes: usize = 1_000_000,
     instructions: usize = 2_000_000,
+    nesting: usize = 256,
+    expression_tokens: usize = 1024,
 };
 pub const Comment = struct { start: u32, end: u32, line: u32 };
-pub const InitError = std.mem.Allocator.Error || error{SourceTooLarge};
+pub const InitError = std.mem.Allocator.Error || error{ SourceTooLarge, SourceTooComplex };
 
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError!File {
     if (bytes.len > limits.bytes or bytes.len > std.math.maxInt(u32)) return error.SourceTooLarge;
@@ -25,6 +27,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError
     errdefer arena.deinit();
     const a = arena.allocator();
     const source = try a.dupeSentinel(u8, bytes, 0);
+    try sourceComplexity(source, limits);
     const tree = try std.zig.Ast.parse(a, source, .{});
     var status: Status = if (tree.errors.len == 0) .parsed else .invalid_syntax;
     var zir: ?std.zig.Zir = null;
@@ -42,6 +45,35 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError
     };
     const comment_list = try scanComments(a, source, lines.items);
     return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = try lines.toOwnedSlice(a), .comments = comment_list };
+}
+
+fn sourceComplexity(source: [:0]const u8, limits: Limits) InitError!void {
+    // Lexical resource budgets, not syntax or type judgments. They keep std's
+    // recursive parse/lowering work bounded even on malformed input.
+    var lexer: std.zig.Tokenizer = .init(source);
+    var depth: usize = 0;
+    var expression: usize = 0;
+    while (true) {
+        const token = lexer.next();
+        if (token.tag == .eof) return;
+        switch (token.tag) {
+            .l_paren, .l_bracket, .l_brace => {
+                depth += 1;
+                if (depth > limits.nesting) return error.SourceTooComplex;
+                expression = 0;
+            },
+            .r_paren, .r_bracket, .r_brace => {
+                depth -|= 1;
+                expression = 0;
+            },
+            .semicolon, .comma => expression = 0,
+            .doc_comment, .container_doc_comment => {},
+            else => {
+                expression += 1;
+                if (expression > limits.expression_tokens) return error.SourceTooComplex;
+            },
+        }
+    }
 }
 
 pub fn deinit(self: *File) void {

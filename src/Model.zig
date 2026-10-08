@@ -13,6 +13,8 @@ node_parents: []const ?Ast.Node.Index,
 zir_declarations: []const LoweredDeclaration,
 zir_references: []const LoweredReference,
 unknown_references: usize,
+/// The std-ZIR reference index is partial; lexical references remain a separate query.
+lowered_coverage: enum { partial, invalid_front_end, budget_exhausted },
 
 pub const Kind = enum { file, container, function, block, branch, loop, @"test", @"comptime" };
 pub const Scope = struct {
@@ -57,7 +59,8 @@ pub fn init(file: *File) InitError!Model {
     const tree = &file.tree;
     var scopes: std.ArrayList(Scope) = .empty;
     try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) }); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
-    if (tree.errors.len == 0) try collectScopes(a, tree, &scopes);
+    const node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0);
+    if (tree.errors.len == 0) try collectScopes(a, tree, node_parents, &scopes);
     std.mem.sort(Scope, scopes.items[1..], {}, scopeLess);
     const token_scopes = try a.alloc(u32, tree.tokens.len);
     try assignScopes(a, scopes.items, token_scopes);
@@ -79,7 +82,7 @@ pub fn init(file: *File) InitError!Model {
     for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)]; // safe: enum identities index their owning frozen tables without narrowing.
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);
-    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0), .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0 };
+    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
     var references: std.ArrayList(Reference) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (tag != .identifier) continue;
@@ -135,8 +138,11 @@ fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.I
     return result;
 }
 
-fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir.Inst.Index, baseline: Ast.TokenIndex, tree: *const Ast, model: *const Model, visited: []bool, refs: *std.ArrayList(LoweredReference), depth: usize) InitError!void {
-    if (depth >= 128) return;
+fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir.Inst.Index, baseline: Ast.TokenIndex, tree: *const Ast, model: *Model, visited: []bool, refs: *std.ArrayList(LoweredReference), depth: usize) InitError!void {
+    if (depth >= 128) {
+        model.lowered_coverage = .budget_exhausted;
+        return;
+    }
     const Inst = std.zig.Zir.Inst;
     for (body) |instruction| {
         const i = @backingInt(instruction); // safe: enum identities index their owning frozen tables without narrowing.
@@ -205,7 +211,7 @@ fn addScope(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope),
     try list.append(a, .{ .kind = kind, .node = node, .first = tree.firstToken(node), .last = tree.lastToken(node) });
 }
 
-fn collectScopes(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope)) InitError!void {
+fn collectScopes(a: std.mem.Allocator, tree: *const Ast, node_parents: []const ?Ast.Node.Index, list: *std.ArrayList(Scope)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
@@ -213,6 +219,11 @@ fn collectScopes(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Sc
         if (tree.fullContainerDecl(&container_buffer, node) != null) {
             try addScope(a, tree, list, node, .container);
             continue;
+        }
+        var fn_buffer: [1]Ast.Node.Index = undefined;
+        if (tag != .fn_decl and tree.fullFnProto(&fn_buffer, node) != null) {
+            const p = node_parents[index];
+            if (p == null or tree.nodeTag(p.?) != .fn_decl) try addScope(a, tree, list, node, .function);
         }
         switch (tag) {
             .fn_decl => try addScope(a, tree, list, node, .function),

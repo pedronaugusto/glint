@@ -23,9 +23,10 @@ stale: usize = 0,
 complete: bool = true,
 file: Project.FileId = @fromBackingInt(0), // safe: validated file identities and budgeted std source indexes fit u32.
 
-pub const RunError = Suppression.ParseError || Facts.ResolveError;
+pub const RunError = Suppression.ParseError || Facts.ResolveError || error{InvalidSelection};
 
 pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config) RunError!Report {
+    try config.validate();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -41,7 +42,17 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
             .invalid_syntax => .invalid_syntax,
             .invalid_lowering => .invalid_lowering,
             .budget_exhausted => .budget_exhausted,
+        }, .detail = switch (file.status) {
+            .parsed => "std AST and AstGen/ZIR lowered; no compiler type checking or generic evaluation",
+            .invalid_syntax => "std parser rejected source; semantic rules skipped",
+            .invalid_lowering => "std AstGen rejected source; semantic rules skipped",
+            .budget_exhausted => "front-end work budget exhausted; semantic rules skipped",
         } });
+        if (file.status == .parsed) {
+            const lowered_coverage = project.models[index].lowered_coverage;
+            try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
+            if (lowered_coverage == .budget_exhausted) runner.complete = false;
+        }
         try runner.parser();
         try runner.lineLength();
         if (file.status == .parsed) {
@@ -221,6 +232,10 @@ fn privateType(self: *Runner, node: std.zig.Ast.Node.Index, site: std.zig.Ast.To
             const definition = (try self.facts.definition(self.file, node)) orelse return;
             const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index]; // safe: enum identities index their owning frozen tables without narrowing.
             if (decl.kind == .parameter or decl.public or decl.exported or definition.file != self.file) return;
+            if (try self.facts.origin(definition)) |origin| {
+                const original = self.project.models[@backingInt(origin.file)].declarations[origin.index]; // safe: resolved origin indexes its own frozen declaration table.
+                if (origin.file != self.file or original.public or original.exported) return;
+            }
             const value = try self.facts.resolve(self.file, node);
             if (value == .unknown) {
                 try self.unknown(if (error_position) .Z015 else .Z012, node, value.unknown);
@@ -401,15 +416,15 @@ fn syntaxRules(self: *Runner) RunError!void {
         }
         if (tag == .@"return") if (tree.nodeData(node).opt_node.unwrap()) |expr| {
             if (tree.nodeTag(expr) == .@"try") try self.at(.Z017, tree.nodeMainToken(node), "hoist try before returning; preserve return coercion");
-            try self.redundantType(expr, true);
             if (self.enclosingFunction(node)) |fn_node| {
                 var fb: [1]Ast.Node.Index = undefined;
                 const f = tree.fullFnProto(&fb, fn_node).?;
-                if (f.ast.return_type.unwrap()) |t| try self.redundantAs(.Z018, t, self.file, expr, tree.nodeMainToken(node));
+                if (f.ast.return_type.unwrap()) |t| {
+                    try self.redundantType(expr, .{ .file = self.file, .node = t }, true);
+                    try self.redundantAs(.Z018, t, self.file, expr, tree.nodeMainToken(node));
+                }
             }
         };
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&call_buffer, node)) |call| for (call.ast.params) |arg| try self.redundantType(arg, false);
         if (tag == .@"catch") {
             const pair = tree.nodeData(node).node_and_node;
             var bb: [2]Ast.Node.Index = undefined;
@@ -436,18 +451,30 @@ fn enclosingFunction(self: *const Runner, node: Ast.Node.Index) ?Ast.Node.Index 
     return null;
 }
 
-fn redundantType(self: *Runner, node: Ast.Node.Index, fields: bool) RunError!void {
+fn sameType(expected: Facts.Value, actual: Facts.Value) bool {
+    if (expected == .primitive and actual == .primitive) return std.mem.eql(u8, expected.primitive, actual.primitive);
+    return expected == .container and actual == .container and !expected.container.symbolic and !actual.container.symbolic and std.meta.eql(expected.container, actual.container);
+}
+
+fn redundantType(self: *Runner, node: Ast.Node.Index, expected: Facts.Key, fields: bool) RunError!void {
     if (!self.config.has(.Z010)) return;
-    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: the runner's file identity was validated by project construction.
     var b: [2]Ast.Node.Index = undefined;
+    var context = try self.facts.resolve(expected.file, expected.node);
+    while (context == .optional or context == .error_union) context = if (context == .optional) context.optional.* else context.error_union.*;
     if (tree.fullStructInit(&b, node)) |value| {
-        if (value.ast.type_expr.unwrap()) |t| try self.at(.Z010, tree.nodeMainToken(t), "context supplies this initializer type");
+        if (value.ast.type_expr.unwrap()) |t| {
+            const actual = try self.facts.resolve(self.file, t);
+            if (sameType(context, actual)) try self.at(.Z010, tree.nodeMainToken(t), "known context supplies this initializer type") else if (context == .unknown) try self.unknown(.Z010, t, context.unknown);
+        }
     } else if (fields and tree.nodeTag(node) == .field_access) {
         const pair = tree.nodeData(node).node_and_token;
-        if (tree.nodeTag(pair[0]) != .identifier or !names.isPascalCase(tree.tokenSlice(tree.nodeMainToken(pair[0])))) return;
-        const value = try self.facts.resolve(self.file, pair[0]);
-        if (value == .error_set) return;
-        try self.at(.Z010, tree.nodeMainToken(pair[0]), "context may supply this enum literal type (selected style policy)");
+        const actual = try self.facts.resolve(self.file, pair[0]);
+        if (!sameType(context, actual) or actual != .container) return;
+        const c = actual.container;
+        const target = &self.project.files[@backingInt(c.file)].tree; // safe: resolved container belongs to this frozen project.
+        const record = self.project.models[@backingInt(c.file)].scopes[c.scope]; // safe: the fact carries the originating file's validated scope.
+        if (target.tokenTag(target.nodeMainToken(record.node)) == .keyword_enum) try self.at(.Z010, tree.nodeMainToken(pair[0]), "known enum context supplies this literal type");
     }
 }
 
@@ -459,8 +486,9 @@ fn redundantAs(self: *Runner, rule: rules.Rule, expected: Ast.Node.Index, expect
     if (args.len != 2 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@as")) return;
     const expected_value = try self.facts.resolve(expected_file, expected);
     const actual_value = try self.facts.resolve(self.file, args[0]);
-    if (expected_value == .primitive and actual_value == .primitive and std.mem.eql(u8, expected_value.primitive, actual_value.primitive)) try self.at(rule, site, "context already supplies the @as type");
-    if (expected_value == .container and actual_value == .container and !expected_value.container.symbolic and !actual_value.container.symbolic and std.meta.eql(expected_value.container, actual_value.container)) try self.at(rule, site, "context already supplies the @as type");
+    if (sameType(expected_value, actual_value)) try self.at(rule, site, "context already supplies the @as type");
+    if (expected_value == .unknown) try self.unknown(rule, value, expected_value.unknown);
+    if (actual_value == .unknown) try self.unknown(rule, value, actual_value.unknown);
 }
 
 fn thisRules(self: *Runner, node: Ast.Node.Index, top_fields: bool) RunError!void {
@@ -517,7 +545,7 @@ fn importRule(self: *Runner, node: Ast.Node.Index) RunError!void {
 }
 
 fn contextRules(self: *Runner) RunError!void {
-    if (!self.selected(&.{ .Z016, .Z027, .Z029 })) return;
+    if (!self.selected(&.{ .Z010, .Z016, .Z027, .Z029 })) return;
     const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
@@ -536,7 +564,7 @@ fn contextRules(self: *Runner) RunError!void {
                     }
                 };
             }
-            if (self.config.has(.Z029)) {
+            if (self.selected(&.{ .Z010, .Z029 })) {
                 const value = try self.facts.resolve(self.file, call.ast.fn_expr);
                 if (value == .function) {
                     const d = value.function;
@@ -554,7 +582,10 @@ fn contextRules(self: *Runner) RunError!void {
                     }
                     for (call.ast.params) |arg| {
                         const param = it.next() orelse break;
-                        if (param.type_expr) |t| try self.redundantAs(.Z029, t, d.file, arg, tree.nodeMainToken(arg));
+                        if (param.type_expr) |t| {
+                            try self.redundantType(arg, .{ .file = d.file, .node = t }, false);
+                            try self.redundantAs(.Z029, t, d.file, arg, tree.nodeMainToken(arg));
+                        }
                     }
                 }
             }

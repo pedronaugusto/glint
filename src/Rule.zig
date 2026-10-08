@@ -53,6 +53,10 @@ pub const Config = struct {
         break :blk selection;
     };
 
+    /// Unknown/removed IDs cannot silently enter a library configuration.
+    pub fn validate(self: Config) error{InvalidSelection}!void {
+        if (self.enabled[0] or self.enabled[8]) return error.InvalidSelection;
+    }
     /// An empty selection for callers migrating explicit policy.
     pub fn none() Config {
         return .{ .enabled = @splat(false) };
@@ -79,4 +83,10 @@ test "inventory preserves exactly 32 IDs without Z008" {
     try std.testing.expect(Rule.parse("Z013-extra") == null);
     try std.testing.expect(!Config.compatibility().has(.Z033));
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
+}
+
+test "inventory rejects unknown selection slots through public configuration" {
+    var config = Config.none();
+    config.enabled[8] = true;
+    try std.testing.expectError(error.InvalidSelection, config.validate());
 }
