@@ -56,7 +56,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .rule = @tagName(d.rule), .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[@backingInt(d.span.file)].name, .span = d.span, .message = d.message, .bug_class = d.bug_class, .related = Related{ .project = project, .spans = d.related } }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                try jsonDiagnostic(writer, project, d); // safe: enum identities index their owning frozen tables without narrowing.
             }
             try writer.writeAll("],\"coverage\":[");
             for (self.coverage, 0..) |c, i| {
@@ -69,19 +69,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.writeAll("{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"glint\",\"version\":\"0.1.0\"}},\"results\":[");
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{
-                    .ruleId = @tagName(d.rule),
-                    .level = @tagName(d.severity),
-                    .message = .{ .text = d.message },
-                    .locations = .{.{
-                        .physicalLocation = .{
-                            .artifactLocation = .{ .uri = UriLabel{ .bytes = project.inputs[@backingInt(d.span.file)].name } }, // safe: enum identities index their owning frozen tables without narrowing.
-                            .region = .{ .startLine = d.span.line, .byteOffset = d.span.start, .byteLength = d.span.end - d.span.start },
-                        },
-                    }},
-                    .relatedLocations = Related{ .project = project, .spans = d.related, .sarif = true },
-                    .properties = .{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class },
-                }, .{}, writer);
+                try sarifDiagnostic(writer, project, d);
             }
             try writer.print("],\"properties\":{{\"analysisComplete\":{s},\"suppressed\":{d},\"staleSuppressions\":{d},\"coverage\":", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
             try std.json.Stringify.value(self.coverage, .{}, writer);
@@ -90,28 +78,75 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
     }
 }
 
-const UriLabel = struct {
-    bytes: []const u8,
-    pub fn jsonStringify(self: UriLabel, stream: *std.json.Stringify) std.json.Stringify.Error!void {
-        try stream.beginWriteRaw();
-        try stream.writer.writeByte('"');
-        try (std.Uri.Component{ .raw = self.bytes }).formatPath(stream.writer);
-        try stream.writer.writeByte('"');
-        stream.endWriteRaw();
+fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {
+    var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    const record = .{ .rule = @tagName(d.rule), .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[@backingInt(d.span.file)].name, .span = d.span, .message = d.message, .bug_class = d.bug_class }; // safe: the span belongs to this report's verified project.
+    try stream.beginObject();
+    inline for (@typeInfo(@TypeOf(record)).@"struct".field_names) |name| {
+        try stream.objectField(name);
+        try stream.write(@field(record, name));
     }
-};
-const Related = struct {
-    project: *const Project,
-    spans: []const Span,
-    sarif: bool = false,
-    pub fn jsonStringify(self: Related, stream: *std.json.Stringify) std.json.Stringify.Error!void {
-        try stream.beginArray();
-        for (self.spans, 0..) |span, index| {
-            const name = self.project.inputs[@backingInt(span.file)].name; // safe: related spans belong to the report's verified frozen project.
-            if (self.sarif) {
-                try stream.write(.{ .id = index + 1, .physicalLocation = .{ .artifactLocation = .{ .uri = UriLabel{ .bytes = name } }, .region = .{ .startLine = span.line, .byteOffset = span.start, .byteLength = span.end - span.start } } });
-            } else try stream.write(.{ .source = name, .span = span });
-        }
-        try stream.endArray();
+    try stream.objectField("related");
+    try relatedLocations(&stream, project, d.related, false);
+    try stream.endObject();
+}
+
+fn writeUri(stream: *std.json.Stringify, label: []const u8) std.Io.Writer.Error!void {
+    try stream.beginWriteRaw();
+    try stream.writer.writeByte('"');
+    try (std.Uri.Component{ .raw = label }).formatPath(stream.writer);
+    try stream.writer.writeByte('"');
+    stream.endWriteRaw();
+}
+
+fn physicalLocation(stream: *std.json.Stringify, project: *const Project, span: Span) std.Io.Writer.Error!void {
+    try stream.beginObject();
+    try stream.objectField("artifactLocation");
+    try stream.beginObject();
+    try stream.objectField("uri");
+    try writeUri(stream, project.inputs[@backingInt(span.file)].name); // safe: the span belongs to this report's verified project.
+    try stream.endObject();
+    try stream.objectField("region");
+    // Byte offsets stay precise for non-ASCII and invalid UTF-8 source. A byte
+    // column is not mislabeled as SARIF's default UTF-16 column.
+    try stream.write(.{ .startLine = span.line, .byteOffset = span.start, .byteLength = span.end - span.start });
+    try stream.endObject();
+}
+
+fn relatedLocations(stream: *std.json.Stringify, project: *const Project, spans: []const Span, sarif: bool) std.Io.Writer.Error!void {
+    try stream.beginArray();
+    for (spans, 0..) |span, index| {
+        if (sarif) {
+            try stream.beginObject();
+            try stream.objectField("id");
+            try stream.write(index + 1);
+            try stream.objectField("physicalLocation");
+            try physicalLocation(stream, project, span);
+            try stream.endObject();
+        } else try stream.write(.{ .source = project.inputs[@backingInt(span.file)].name, .span = span }); // safe: related spans index this report's verified project.
     }
-};
+    try stream.endArray();
+}
+
+fn sarifDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {
+    var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    try stream.beginObject();
+    try stream.objectField("ruleId");
+    try stream.write(@tagName(d.rule));
+    try stream.objectField("level");
+    try stream.write(@tagName(d.severity));
+    try stream.objectField("message");
+    try stream.write(.{ .text = d.message });
+    try stream.objectField("locations");
+    try stream.beginArray();
+    try stream.beginObject();
+    try stream.objectField("physicalLocation");
+    try physicalLocation(&stream, project, d.span);
+    try stream.endObject();
+    try stream.endArray();
+    try stream.objectField("relatedLocations");
+    try relatedLocations(&stream, project, d.related, true);
+    try stream.objectField("properties");
+    try stream.write(.{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class });
+    try stream.endObject();
+}

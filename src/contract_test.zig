@@ -80,7 +80,7 @@ test "contract public lowered references disclose partial std ZIR coverage" {
 }
 
 test "contract private API diagnostic carries its resolved declaration span" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const Hidden = struct { value: u8 }; pub fn f(v: Hidden) void { _ = v; }" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture label", .bytes = "const Hidden = struct { value: u8 }; pub fn f(v: Hidden) void { _ = v; }" }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z012, true);
@@ -89,4 +89,20 @@ test "contract private API diagnostic carries its resolved declaration span" {
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: expected single fixture diagnostic fits usize.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics[0].related.len); // safe: expected single declaration span fits usize.
     try std.testing.expectEqual(@as(u32, 6), report.diagnostics[0].related[0].start); // safe: the declaration name begins at byte six of the fixed fixture.
+    for ([_]glint.Report.Format{ .json, .sarif }) |format| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try report.write(&output.writer, &project, format);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+        defer parsed.deinit();
+        if (format == .json) {
+            const related = parsed.value.object.get("diagnostics").?.array.items[0].object.get("related").?.array.items[0];
+            try std.testing.expectEqualStrings("fixture label", related.object.get("source").?.string);
+        } else {
+            const diagnostic = parsed.value.object.get("runs").?.array.items[0].object.get("results").?.array.items[0];
+            const location = diagnostic.object.get("relatedLocations").?.array.items[0].object.get("physicalLocation").?;
+            try std.testing.expectEqualStrings("fixture%20label", location.object.get("artifactLocation").?.object.get("uri").?.string);
+            try std.testing.expectEqual(@as(i64, 6), location.object.get("region").?.object.get("byteOffset").?.integer); // safe: byte six of the fixed fixture fits i64.
+        }
+    }
 }
