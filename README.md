@@ -11,7 +11,7 @@ git clone https://github.com/pedronaugusto/glint.git
 cd glint
 zig build -Doptimize=fast
 ./zig-out/bin/glint src/example.zig
-./zig-out/bin/glint --format json --only Z011 --only Z012 src/example.zig
+./zig-out/bin/glint --format json --only Z011 --only Z013 src/example.zig
 ./zig-out/bin/glint --format sarif --reviewed src/example.zig
 ```
 
@@ -55,7 +55,7 @@ The caller supplies bytes, opaque file identities, diagnostic labels, classifica
 
 ## Diagnostics and suppression
 
-Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for deprecation and named-signature checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic.
+Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for resolved deprecation checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic.
 
 ```zig
 // glint-ignore: Z013 -- reserved import retained for this documented migration
@@ -68,11 +68,11 @@ One real comment suppresses one rule at one logical site, either inline or immed
 
 std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Naming rules use known value kinds; computed and unmapped facts remain coverage. Established external ABI function names are preserved. Escape analysis and the aegis rule pack await later admission; no safety proof is claimed.
 
-Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint owns source analysis; G2 integration and G3 adoption are not implemented here. The [dated results note](docs/results.md) cites private G1 evidence. G1r records rule contracts and removals in the review; G2 integration and G3 safety adoption are still work in progress.
+Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint owns source analysis; G2 integration and G3 adoption are not implemented here. The [dated results note](docs/results.md) cites private G1/G1r evidence. G1r records rule contracts and removals in the review; G2 integration and G3 safety adoption are still work in progress.
 
 ## Development
 
-Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=compatibility`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
+Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=review`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
 `zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse, std lowering, cold project/core analysis, warm core and reviewed-rule runs, requested allocations, mapped deprecation and private-import checks. `--smoke` checks small fixtures without timing. [Retained measurements](https://github.com/pedronaugusto/trials/blob/f501b66f9679760f5fadd118b95bfb36670a891b/glint/g1/paired-core.json) and the [import-index correction](https://github.com/pedronaugusto/trials/blob/f501b66f9679760f5fadd118b95bfb36670a891b/glint/g1/paired-import-index.json) expose costs and scope; G0's unavailable compatibility rules are never a valid speed baseline. Private comparative drivers and dated records live in [trials](https://github.com/pedronaugusto/trials/tree/f501b66f9679760f5fadd118b95bfb36670a891b/glint).
 

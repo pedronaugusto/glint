@@ -13,9 +13,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Development status
 
-- G0/G1 only. Family integration, new safety adoption and predecessor retirement remain pending; no lifetime verifier is pursued and this is not a release-complete claim.
-
-[Unreleased]: https://github.com/pedronaugusto/glint/commits/main
+- G0/G1/G1r only. Family integration, new safety adoption and predecessor retirement remain pending; no lifetime verifier is pursued and this is not a release-complete claim.
 
 ### Changed (G1r, 2026-10-08)
 
@@ -23,3 +21,5 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - Breaking: diagnostic rule version 2 names correctness, zig_style and family_policy groups; JSON version 1 and the independent completion contract remain unchanged.
 - Z024 defaults to a 100-byte readability report; it is not a universal line-length gate. Split assertion suggestions preserve evaluation effects and stay advisory.
 - Raw G1 evidence moved to immutable private trials; tests, benchmarks and the consumer fixture remain here. Published green preflight/shakedown pins refreshed, and CI uses the canonical planner.
+
+[Unreleased]: https://github.com/pedronaugusto/glint/commits/main
