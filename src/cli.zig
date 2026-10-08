@@ -1,6 +1,7 @@
 //! Filesystem front end for explicit inputs. No globs, build execution or hidden cache.
 const std = @import("std");
 const glint = @import("glint.zig");
+const Result = @import("Result.zig");
 const Cli = @This();
 
 const Module = struct { name: []const u8, path: []const u8 };
@@ -143,6 +144,8 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
             const equals = std.mem.findScalar(u8, mapping, '=') orelse return error.InvalidModule;
             if (equals == 0 or equals + 1 == mapping.len) return error.InvalidModule;
             try result.modules.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
+        } else if (std.mem.eql(u8, arg, "--result") or std.mem.eql(u8, arg, "--run-id")) {
+            _ = try value(args, &i);
         } else if (std.mem.eql(u8, arg, "--files-from")) {
             const list = try std.Io.Dir.cwd().readFileAlloc(io, try value(args, &i), a, .limited(4 * 1024 * 1024));
             var lines = std.mem.splitScalar(u8, list, '\n');
@@ -159,12 +162,34 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    const requested = try Result.request(args);
+    var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .completed = false, .outcome = .running };
+    try Result.publish(a, io, requested, record);
+    const status = executeInner(gpa, a, io, args, writer, &record) catch |err| {
+        if (err == error.Canceled) record.outcome = .canceled;
+        if (err == error.OutOfMemory) record.outcome = .tool_failure;
+        try Result.publish(a, io, requested, record);
+        return err;
+    };
+    try Result.publish(a, io, requested, record);
+    return status;
+}
+
+fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, record: *Result.Record) !u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    record.outcome = .argument_failure;
     const configured = try options(a, io, args);
     if (configured.help) {
-        try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--strict-suppressions] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.flush();
+        record.outcome = .help;
+        record.completed = false;
         return 0;
     }
     if (configured.files.items.len == 0) return error.MissingSource;
+    record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
@@ -177,12 +202,28 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, module.path, a);
         try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
     }
+    record.outcome = .traversal_failure;
     try loader.imports();
+    record.outcome = .tool_failure;
     var project = try glint.Project.init(gpa, loader.inputs.items, loader.mappings.items, .{});
     defer project.deinit();
     var report = try glint.run(gpa, &project, configured.config);
     defer report.deinit();
-    try report.write(writer, &project, configured.format);
+    record.outcome = .output_failure;
+    var rendered: std.Io.Writer.Allocating = .init(a);
+    try report.write(&rendered.writer, &project, configured.format);
+    const bytes = rendered.written();
+    try writer.writeAll(bytes);
+    try writer.flush();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    record.output_bytes = bytes.len;
+    record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+    record.sources = configured.files.items.len;
+    record.findings = report.diagnostics.len;
+    record.suppressed = report.suppressed;
+    record.completed = report.complete;
+    record.outcome = if (!report.complete) .analysis_incomplete else if (report.diagnostics.len != 0) .findings else .clean;
     return if (!report.complete) 2 else if (report.diagnostics.len != 0) 1 else 0;
 }
 

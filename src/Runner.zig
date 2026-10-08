@@ -38,9 +38,15 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
             .invalid_lowering => .invalid_lowering,
             .budget_exhausted => .budget_exhausted,
         } });
+        for (std.meta.tags(rules.Rule)) |rule| {
+            if (rule != .Z003 and rule != .Z013 and config.has(rule)) {
+                runner.complete = false;
+                try runner.coverage.append(a, .{ .file = runner.file, .rule = rule, .reason = .unsupported, .detail = "compatibility port not implemented yet" });
+            }
+        }
         try runner.parser();
         if (file.status == .parsed) try runner.unusedImports();
-        if (file.status == .invalid_lowering or file.status == .budget_exhausted) runner.complete = false;
+        if (file.status != .parsed) runner.complete = false;
         for (runner.suppressions) |suppression| if (!suppression.used) {
             runner.stale += 1;
         };

@@ -51,7 +51,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             if (self.stale_suppressions != 0) try writer.print("suppression: {d} stale site records\n", .{self.stale_suppressions});
         },
         .json => {
-            try writer.print("{{\"version\":1,\"complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
+            try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .rule = @tagName(d.rule), .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[@backingInt(d.span.file)].name, .span = d.span, .message = d.message, .bug_class = d.bug_class, .related = d.related }, .{}, writer);
@@ -72,7 +72,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                     .region = .{ .startLine = d.span.line, .startColumn = d.span.column, .byteOffset = d.span.start, .byteLength = d.span.end - d.span.start },
                 } }}, .properties = .{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class } }, .{}, writer);
             }
-            try writer.print("],\"invocations\":[{{\"executionSuccessful\":{s}}}],\"properties\":{{\"suppressed\":{d},\"staleSuppressions\":{d},\"coverage\":", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
+            try writer.print("],\"properties\":{{\"analysisComplete\":{s},\"suppressed\":{d},\"staleSuppressions\":{d},\"coverage\":", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
             try std.json.Stringify.value(self.coverage, .{}, writer);
             try writer.writeAll("}}]}\n");
         },

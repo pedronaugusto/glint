@@ -142,5 +142,7 @@ test "project allocation failures release partially initialized files" {
             defer project.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});
+    const shakedown = @import("shakedown");
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Helper.run, .{});
 }
