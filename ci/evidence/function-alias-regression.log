@@ -1,14 +1,24 @@
 test
-+- run test
-   +- compile test debug native 1 errors
-src/Runner_test.zig:226:23: error: use of undeclared identifier 'Project'
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const S = struct { pub const read = readImpl; }; fn readImpl(_: S) void {} pub fn f(s: S) void { s.read(); }" }}, &.{}, .{});
-                      ^~~~~~~
-error: 1 compilation errors
-failed command: /Users/gusto/.local/zig/0.17.0/zig test -Odebug --dep shakedown --dep preflight_timings --dep preflight_order --dep preflight_runner_options --dep preflight_default_test_runner -Mroot=src/tests.zig -Odebug -Mshakedown=zig-pkg/shakedown-0.1.0-BR8U441oDgBA_guQJ481zswN7jK3G8X4nKygC9-IuaxT/src/shakedown.zig -Mpreflight_timings=zig-pkg/preflight-0.1.0-LX1ZwsWpBgALd07i_vgcbSkkKQ71JAHcV3xcZN8SyG3r/src/timings.zig -Mpreflight_order=zig-pkg/preflight-0.1.0-LX1ZwsWpBgALd07i_vgcbSkkKQ71JAHcV3xcZN8SyG3r/src/order.zig -Mpreflight_runner_options=.zig-cache/o/463caaec1b426f72fbe04871c30fadeb/options.zig -Mpreflight_default_test_runner=/Users/gusto/.local/zig/0.17.0/lib/compiler/test_runner.zig --test-filter "compatibility Z027 excludes resolved" --test-runner zig-pkg/preflight-0.1.0-LX1ZwsWpBgALd07i_vgcbSkkKQ71JAHcV3xcZN8SyG3r/src/runner.zig --cache-dir .zig-cache --global-cache-dir .zig-cache/global --build-root . --name test --zig-lib-dir /Users/gusto/.local/zig/0.17.0/lib/ --listen=-
++- run test 2 pass, 1 fail (3 total)
+error: 'Runner_test.test.compatibility Z027 excludes resolved function aliases used as methods' failed:
+       preflight: test seed 1036004673 (reproduce with PREFLIGHT_TEST_SEED=1036004673)
+       expected 0, found 1
+       Runner_test.test.compatibility Z027 excludes resolved function aliases used as methods: TestExpectedEqual; seed 1036004673
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:93:17: 0x104415927 in expectEqualInner__func_1181 (test)
+                       return error.TestExpectedEqual;
+                       ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:57:5: 0x104415c63 in expectEqual (test)
+           return expectEqualInner(T, expected, actual);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:12:5: 0x104415ceb in check (test)
+           try std.testing.expectEqual(expected, report.diagnostics.len);
+           ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Runner_test.zig:226:5: 0x104415e1b in test.compatibility Z027 excludes resolved function aliases used as methods (test)
+           try check(.Z027, "const S = struct { pub const read = readImpl; }; fn readImpl(_: S) void {} pub fn f(s: S) void { s.read(); }", 0);
+           ^
+failed command: ./.zig-cache/o/f0ee20e09529174515a5032753a8e396/test --cache-dir=./.zig-cache --seed=0x3dc02d41 --listen=-
 
-Build Summary: 4/7 steps succeeded (1 failed)
+Build Summary: 5/7 steps succeeded (1 failed); 2/3 tests passed (1 failed)
 test transitive failure
-+- run test transitive failure
-   +- compile test debug native 1 errors
++- run test 2 pass, 1 fail (3 total)
 
