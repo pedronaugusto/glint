@@ -65,18 +65,18 @@ pub const Config = struct {
     }
     /// Selects a stable rule ID.
     pub fn set(self: *Config, rule: Rule, enabled: bool) void {
-        self.enabled[@backingInt(rule)] = enabled;
+        self.enabled[@backingInt(rule)] = enabled; // safe: enum identities index their owning frozen tables without narrowing.
     }
     /// Whether a rule was selected.
     pub fn has(self: Config, rule: Rule) bool {
-        return self.enabled[@backingInt(rule)];
+        return self.enabled[@backingInt(rule)]; // safe: enum identities index their owning frozen tables without narrowing.
     }
 };
 
 test "inventory preserves exactly 32 IDs without Z008" {
-    try std.testing.expectEqual(@as(usize, 32), std.meta.tags(Rule).len);
+    try std.testing.expectEqual(@as(usize, 32), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
     try std.testing.expect(Rule.parse("Z013-extra") == null);
     try std.testing.expect(!Config.compatibility().has(.Z033));
-    try std.testing.expect(!@as(Config, .{}).has(.Z011));
+    try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.
 }

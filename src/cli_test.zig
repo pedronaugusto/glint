@@ -20,7 +20,7 @@ fn completionCase(findings: bool) !void {
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
     const status = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "test-run", input }, &output.writer);
-    try std.testing.expectEqual(@as(u8, if (findings) 1 else 0), status);
+    try std.testing.expectEqual(@as(u8, if (findings) 1 else 0), status); // safe: explicit compile-time type selection; the value is representable in that type.
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "result.json", a, .limited(65536));
     defer a.free(bytes);
     const json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
@@ -28,7 +28,7 @@ fn completionCase(findings: bool) !void {
     try std.testing.expect(json.value.object.get("completed").?.bool);
     try std.testing.expectEqualStrings(if (findings) "findings" else "clean", json.value.object.get("outcome").?.string);
     try std.testing.expectEqualStrings("test-run", json.value.object.get("run_id").?.string);
-    try std.testing.expectEqual(@as(i64, @intCast(output.written().len)), json.value.object.get("output_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(output.written().len)), json.value.object.get("output_bytes").?.integer); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(output.written(), &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(&digest, .lower), json.value.object.get("output_sha256").?.string);
@@ -118,4 +118,27 @@ test "completion canceled input publishes failure and cannot inherit old success
     defer fault.deinit();
     try std.testing.expectError(error.Canceled, cli.execute(a, fault.io(), &.{ "glint", "--result", result, "--run-id", "canceled", input }, &output.writer));
     try expectOutcome(&tmp, "canceled");
+}
+
+test "completion flush failure after buffering every byte cannot certify success" {
+    const Failing = struct {
+        buffer: [4096]u8 = undefined,
+        writer: std.Io.Writer,
+        fn drain(_: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
+            return error.WriteFailed;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "const d = @import(\"dep\");" });
+    const input = try resultPath(a, &tmp, "input.zig");
+    defer a.free(input);
+    const result = try resultPath(a, &tmp, "result.json");
+    defer a.free(result);
+    var failing: Failing = .{ .writer = undefined };
+    failing.writer = .{ .vtable = &.{ .drain = Failing.drain }, .buffer = &failing.buffer };
+    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "flush", input }, &failing.writer));
+    try std.testing.expect(failing.writer.end > 0);
+    try expectOutcome(&tmp, "output_failure");
 }

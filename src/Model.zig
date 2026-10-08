@@ -56,7 +56,7 @@ pub fn init(file: *File) InitError!Model {
     const a = file.arena.allocator();
     const tree = &file.tree;
     var scopes: std.ArrayList(Scope) = .empty;
-    try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) });
+    try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) }); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
     if (tree.errors.len == 0) try collectScopes(a, tree, &scopes);
     std.mem.sort(Scope, scopes.items[1..], {}, scopeLess);
     const token_scopes = try a.alloc(u32, tree.tokens.len);
@@ -65,7 +65,7 @@ pub fn init(file: *File) InitError!Model {
     var lowered: std.ArrayList(LoweredDeclaration) = .empty;
     if (file.zir) |zir| for (zir.instructions.items(.tag), 0..) |tag, index| {
         if (tag != .declaration) continue;
-        const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index));
+        const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         const decl = zir.getDeclaration(instruction);
         try lowered.append(a, .{ .instruction = instruction, .node = decl.src_node, .name = zir.nullTerminatedString(decl.name), .public = decl.is_pub, .type_body = decl.type_body, .value_body = decl.value_body });
     };
@@ -73,17 +73,17 @@ pub fn init(file: *File) InitError!Model {
     const by_node = try a.alloc(?std.zig.Zir.Inst.Index, tree.nodes.len);
     @memset(by_node, null);
     for (lowered.items) |decl| {
-        by_node[@backingInt(decl.node)] = decl.instruction;
-        if (tree.nodeTag(decl.node) == .fn_decl) by_node[@backingInt(tree.nodeData(decl.node).node_and_node[0])] = decl.instruction;
+        by_node[@backingInt(decl.node)] = decl.instruction; // safe: enum identities index their owning frozen tables without narrowing.
+        if (tree.nodeTag(decl.node) == .fn_decl) by_node[@backingInt(tree.nodeData(decl.node).node_and_node[0])] = decl.instruction; // safe: enum identities index their owning frozen tables without narrowing.
     }
-    for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)];
+    for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)]; // safe: enum identities index their owning frozen tables without narrowing.
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);
     var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0), .zir_declarations = lowered.items, .zir_references = &.{}, .unknown_references = 0 };
     var references: std.ArrayList(Reference) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         const token = tree.nodeMainToken(node);
         const name = try identifier(a, tree.tokenSlice(token));
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
@@ -93,7 +93,7 @@ pub fn init(file: *File) InitError!Model {
             ref_record.unknown = if (primitive(name)) .primitive else .unresolved;
             if (ref_record.unknown.? != .primitive) model.unknown_references += 1;
         }
-        node_references[index] = @intCast(references.items.len);
+        node_references[index] = @intCast(references.items.len); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         try references.append(a, ref_record);
     }
     model.references = references.items;
@@ -115,13 +115,13 @@ fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.I
     const Span = struct { node: Ast.Node.Index, first: Ast.TokenIndex, last: Ast.TokenIndex };
     const ordered = try a.alloc(Span, tree.nodes.len - 1);
     for (ordered, 1..) |*span, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         span.* = .{ .node = node, .first = tree.firstToken(node), .last = tree.lastToken(node) };
     }
     std.mem.sort(Span, ordered, {}, struct {
         fn less(_: void, l: Span, r: Span) bool {
             if (l.first != r.first) return l.first < r.first;
-            return if (l.last != r.last) l.last > r.last else @backingInt(l.node) > @backingInt(r.node);
+            return if (l.last != r.last) l.last > r.last else @backingInt(l.node) > @backingInt(r.node); // safe: enum identities index their owning frozen tables without narrowing.
         }
     }.less);
     const result = try a.alloc(?Ast.Node.Index, tree.nodes.len);
@@ -129,7 +129,7 @@ fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.I
     var stack: std.ArrayList(Span) = .empty;
     for (ordered) |span| {
         while (stack.items.len != 0 and stack.items[stack.items.len - 1].last < span.last) _ = stack.pop();
-        result[@backingInt(span.node)] = if (stack.items.len != 0) stack.items[stack.items.len - 1].node else .root;
+        result[@backingInt(span.node)] = if (stack.items.len != 0) stack.items[stack.items.len - 1].node else .root; // safe: enum identities index their owning frozen tables without narrowing.
         try stack.append(a, span);
     }
     return result;
@@ -139,7 +139,7 @@ fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir
     if (depth >= 128) return;
     const Inst = std.zig.Zir.Inst;
     for (body) |instruction| {
-        const i = @backingInt(instruction);
+        const i = @backingInt(instruction); // safe: enum identities index their owning frozen tables without narrowing.
         if (visited[i]) continue;
         visited[i] = true;
         const tag = zir.instructions.items(.tag)[i];
@@ -194,7 +194,7 @@ pub fn lookup(self: *const Model, start: u32, name: []const u8, token: Ast.Token
 }
 
 pub fn reference(self: *const Model, node: Ast.Node.Index) ?Reference {
-    return if (self.node_references[@backingInt(node)]) |index| self.references[index] else null;
+    return if (self.node_references[@backingInt(node)]) |index| self.references[index] else null; // safe: enum identities index their owning frozen tables without narrowing.
 }
 
 fn scopeLess(_: void, lhs: Scope, rhs: Scope) bool {
@@ -208,7 +208,7 @@ fn addScope(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope),
 fn collectScopes(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         var container_buffer: [2]Ast.Node.Index = undefined;
         if (tree.fullContainerDecl(&container_buffer, node) != null) {
             try addScope(a, tree, list, node, .container);
@@ -229,6 +229,8 @@ fn collectScopes(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Sc
             try addScope(a, tree, list, value.ast.then_expr, .loop);
             if (value.ast.else_expr.unwrap()) |other| try addScope(a, tree, list, other, .branch);
         }
+        if (tag == .@"catch") try addScope(a, tree, list, tree.nodeData(node).node_and_node[1], .branch);
+        if (tree.fullSwitchCase(node)) |value| try addScope(a, tree, list, value.ast.target_expr, .branch);
         if (tree.fullFor(node)) |value| {
             try addScope(a, tree, list, value.ast.then_expr, .loop);
         }
@@ -243,7 +245,7 @@ fn assignScopes(a: std.mem.Allocator, scopes: []Scope, tokens: []u32) InitError!
         while (stack.items.len > 1 and scopes[stack.items[stack.items.len - 1]].last < token) _ = stack.pop();
         while (next < scopes.len and scopes[next].first == token) : (next += 1) {
             scopes[next].parent = stack.items[stack.items.len - 1];
-            try stack.append(a, @intCast(next));
+            try stack.append(a, @intCast(next)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         }
         out.* = stack.items[stack.items.len - 1];
     }
@@ -253,7 +255,7 @@ fn addDeclaration(a: std.mem.Allocator, tree: *const Ast, scopes: []Scope, list:
     var value = decl;
     value.name = try identifier(a, tree.tokenSlice(decl.token));
     if (std.mem.eql(u8, value.name, "_")) return;
-    const index: u32 = @intCast(list.items.len);
+    const index: u32 = @intCast(list.items.len); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
     try list.append(a, value);
     if (value.kind != .field) try scopes[value.scope].names.put(a, value.name, index);
 }
@@ -278,7 +280,7 @@ fn declarationScope(scopes: []const Scope, start: u32) u32 {
 fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const u32, scopes: []Scope, list: *std.ArrayList(Declaration)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         if (tree.fullVarDecl(node)) |value| {
             const token = value.ast.mut_token + 1;
             try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = node, .token = token, .scope = tokens[token], .kind = .variable, .public = value.visib_token != null, .exported = if (value.extern_export_token) |t| tree.tokenTag(t) == .keyword_export else false });
@@ -307,6 +309,17 @@ fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const u
             if (value.payload_token) |token| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(value.ast.then_expr)], node);
             if (value.error_token) |token| if (value.ast.else_expr.unwrap()) |body| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(body)], node);
         }
+        if (tag == .@"catch") {
+            const token = tree.nodeMainToken(node);
+            const body = tree.nodeData(node).node_and_node[1];
+            if (tree.tokenTag(token + 1) == .pipe) try capture(a, tree, scopes, list, token + 2, tokens[tree.firstToken(body)], node);
+        }
+        if (tree.fullSwitchCase(node)) |value| if (value.payload_token) |token| {
+            const scope = tokens[tree.firstToken(value.ast.target_expr)];
+            try capture(a, tree, scopes, list, token, scope, node);
+            const name = if (tree.tokenTag(token) == .asterisk) token + 1 else token;
+            if (tree.tokenTag(name + 1) == .comma) try capture(a, tree, scopes, list, name + 2, scope, node);
+        };
         if (tree.fullFor(node)) |value| {
             var token = value.payload_token;
             while (tree.tokenTag(token) != .pipe) : (token += 1) {
@@ -345,8 +358,8 @@ test "binding resolves declarations rather than fields or strings" {
     var file = try File.init(std.testing.allocator, "const unused = @import(\"unused\"); const used = @import(\"used\"); pub fn f() void { _ = used; _ = .unused; _ = \"unused\"; }", .{});
     defer file.deinit();
     const model = try init(&file);
-    try std.testing.expectEqual(@as(u32, 0), model.declarations[0].references);
-    try std.testing.expectEqual(@as(u32, 1), model.declarations[1].references);
+    try std.testing.expectEqual(@as(u32, 0), model.declarations[0].references); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(u32, 1), model.declarations[1].references); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(model.zir_declarations.len >= 3);
 }
 
@@ -357,10 +370,10 @@ test "binding keeps enclosing containers and captures" {
     var captured = false;
     for (model.declarations) |decl| if (decl.kind == .capture) {
         captured = true;
-        try std.testing.expectEqual(@as(u32, 1), decl.references);
+        try std.testing.expectEqual(@as(u32, 1), decl.references); // safe: explicit compile-time type selection; the value is representable in that type.
     };
     try std.testing.expect(captured);
-    try std.testing.expectEqual(@as(usize, 0), model.unknown_references);
+    try std.testing.expectEqual(@as(usize, 0), model.unknown_references); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 
 test "binding isolates catch and switch captures from outside scopes" {
@@ -370,8 +383,21 @@ test "binding isolates catch and switch captures from outside scopes" {
     var captures: usize = 0;
     for (model.declarations) |decl| if (decl.kind == .capture) {
         captures += 1;
-        try std.testing.expectEqual(@as(u32, 1), decl.references);
+        try std.testing.expectEqual(@as(u32, 1), decl.references); // safe: explicit compile-time type selection; the value is representable in that type.
     };
-    try std.testing.expectEqual(@as(usize, 2), captures);
-    try std.testing.expectEqual(@as(usize, 0), model.unknown_references);
+    try std.testing.expectEqual(@as(usize, 2), captures); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 0), model.unknown_references); // safe: explicit compile-time type selection; the value is representable in that type.
+}
+
+test "binding destructuring declares separate locals and tracks mutation references" {
+    var file = try File.init(std.testing.allocator, "pub fn f() u8 { const a, var b = .{ @as(u8, 1), @as(u8, 2) }; b += 1; return a + b; }", .{});
+    defer file.deinit();
+    const model = try init(&file);
+    var locals: usize = 0;
+    for (model.declarations) |decl| if (decl.kind == .variable) {
+        locals += 1;
+        try std.testing.expectEqual(@as(u32, if (std.mem.eql(u8, decl.name, "b")) 2 else 1), decl.references); // safe: explicit compile-time type selection; the value is representable in that type.
+    };
+    try std.testing.expectEqual(@as(usize, 2), locals); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 0), model.unknown_references); // safe: explicit compile-time type selection; the value is representable in that type.
 }

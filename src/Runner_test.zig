@@ -42,13 +42,13 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = source },
         .{ .name = "dep", .selected = false, .bytes = "/// Deprecated: use modern.\npub fn old() u8 { return 1; } pub fn modern(x: u8) u8 { return x; }" },
-    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{});
+    }, &.{.{ .from = @fromBackingInt(0), .spelling = "dep", .target = @fromBackingInt(1) }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z011, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 7), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 7), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
 }
 
@@ -90,7 +90,7 @@ test "compatibility byte line length counts CRLF content and file-struct stem" {
     config.max_line_length = 10;
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(glint.Rule.Z009, report.diagnostics[0].rule);
     try std.testing.expect(report.complete);
 }
@@ -100,13 +100,13 @@ test "compatibility Z016 splits only conjunction of the mapped standard assertio
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = root },
         .{ .name = "standard", .bytes = "pub const debug = struct { pub fn assert(ok: bool) void { _ = ok; } };", .selected = false },
-    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "std" }}, .{});
+    }, &.{.{ .from = @fromBackingInt(0), .target = @fromBackingInt(1), .spelling = "std" }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z016, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(report.complete);
     try check(.Z016, "const std = struct { const debug = struct { fn assert(ok: bool) void { _ = ok; } }; }; pub fn f(a: bool, b: bool) void { std.debug.assert(a and b); }", 0);
 }
@@ -145,8 +145,8 @@ test "compatibility Z024 reports bytes exceeding the configured boundary" {
     config.max_line_length = 10;
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
-    try std.testing.expectEqual(@as(u32, 10), report.diagnostics[0].span.start);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(u32, 10), report.diagnostics[0].span.start); // safe: explicit compile-time type selection; the value is representable in that type.
 }
 
 test "compatibility strict stale suppressions and exhausted facts are incomplete" {
@@ -156,7 +156,7 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
     try std.testing.expect(!report.complete);
-    try std.testing.expectEqual(@as(usize, 1), report.stale_suppressions);
+    try std.testing.expectEqual(@as(usize, 1), report.stale_suppressions); // safe: explicit compile-time type selection; the value is representable in that type.
     config.strict_suppressions = false;
     config.fact_budget = 0;
     var exhausted = try glint.run(std.testing.allocator, &project, config);
@@ -172,7 +172,7 @@ test "compatibility unknown receiver and callee record uncertainty without inven
     config.set(.Z023, true);
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     var unknown_callee = false;
     var unknown_receiver = false;
     for (report.coverage) |coverage| {

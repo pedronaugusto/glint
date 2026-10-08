@@ -32,14 +32,20 @@ pub const Input = struct {
 /// A module edge selected and resolved by the caller, never by a path hash.
 pub const Import = struct { from: FileId, spelling: []const u8, target: FileId };
 /// Per-source limits for front-end work.
-pub const Options = struct { limits: File.Limits = .{} };
+pub const Options = struct { limits: File.Limits = .{}, files: usize = 4096, bytes: usize = 128 * 1024 * 1024 };
 /// Construction errors always propagate; no unread/allocation failure is clean.
-pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping };
+pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded };
 /// A handle from another snapshot is invalid.
 pub const QueryError = error{InvalidHandle};
 
 /// Copies all source inputs and lowers each valid file through std AstGen/ZIR.
 pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Import, options: Options) InitError!Project {
+    if (inputs.len > options.files or inputs.len > std.math.maxInt(u32)) return error.ProjectBudgetExceeded;
+    var remaining_bytes = options.bytes;
+    for (inputs) |input| {
+        if (input.bytes.len > remaining_bytes) return error.ProjectBudgetExceeded;
+        remaining_bytes -= input.bytes.len;
+    }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();

@@ -9,8 +9,9 @@ line: u32,
 comment: File.Comment,
 reason: []const u8,
 used: bool = false,
+matched_start: ?u32 = null,
 
-pub const ParseError = std.mem.Allocator.Error || error{ MalformedSuppression, UnknownRule };
+pub const ParseError = std.mem.Allocator.Error || error{ MalformedSuppression, AmbiguousSuppression, UnknownRule };
 
 pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
     var result: std.ArrayList(Suppression) = .empty;
@@ -27,9 +28,9 @@ pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
         var site = comment.line;
         if (before.len == 0) {
             var token: usize = 0;
-            while (token < file.tree.tokens.len and file.tree.tokenStart(@intCast(token)) < comment.end) token += 1;
-            if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return error.MalformedSuppression;
-            site = file.line(file.tree.tokenStart(@intCast(token)));
+            while (token < file.tree.tokens.len and file.tree.tokenStart(@intCast(token)) < comment.end) token += 1; // safe: token indexes are bounded by the already budget-checked source.
+            if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return error.MalformedSuppression; // safe: token indexes are bounded by the already budget-checked source.
+            site = file.line(file.tree.tokenStart(@intCast(token))); // safe: token indexes are bounded by the already budget-checked source.
             if (site > comment.line + 1) return error.MalformedSuppression;
         }
         try result.append(a, .{ .rule = rule, .line = site, .comment = comment, .reason = reason });
@@ -37,8 +38,10 @@ pub fn parse(a: std.mem.Allocator, file: *const File) ParseError![]Suppression {
     return result.toOwnedSlice(a);
 }
 
-pub fn matches(self: *Suppression, rule: rules.Rule, line: u32) bool {
+pub fn matches(self: *Suppression, rule: rules.Rule, line: u32, start: u32) error{AmbiguousSuppression}!bool {
     if (self.rule != rule or self.line != line) return false;
+    if (self.matched_start) |previous| if (previous != start) return error.AmbiguousSuppression;
+    self.matched_start = start;
     self.used = true;
     return true;
 }
@@ -47,10 +50,18 @@ test "suppression requires exact ID and reason from a real comment" {
     var file = try File.init(std.testing.allocator, "// glint-ignore: Z013 -- public fixture below\nconst unused = @import(\"unused\");\n", .{});
     defer file.deinit();
     const parsed = try parse(file.arena.allocator(), &file);
-    try std.testing.expectEqual(@as(usize, 1), parsed.len);
-    try std.testing.expect(parsed[0].matches(.Z013, 1));
-    try std.testing.expect(!parsed[0].matches(.Z003, 1));
+    try std.testing.expectEqual(@as(usize, 1), parsed.len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expect(try parsed[0].matches(.Z013, 1, 6));
+    try std.testing.expect(!try parsed[0].matches(.Z003, 1, 6));
     var invalid = try File.init(std.testing.allocator, "// glint-ignore: Z013\nconst x = 1;", .{});
     defer invalid.deinit();
     try std.testing.expectError(error.MalformedSuppression, parse(invalid.arena.allocator(), &invalid));
+}
+
+test "suppression one reason cannot suppress distinct sites on one line" {
+    var file = try File.init(std.testing.allocator, "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one justified site\n", .{});
+    defer file.deinit();
+    const parsed = try parse(file.arena.allocator(), &file);
+    try std.testing.expect(try parsed[0].matches(.Z013, 0, 6));
+    try std.testing.expectError(error.AmbiguousSuppression, parsed[0].matches(.Z013, 0, 31));
 }

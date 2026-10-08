@@ -21,9 +21,9 @@ suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: usize = 0,
 complete: bool = true,
-file: Project.FileId = @fromBackingInt(0),
+file: Project.FileId = @fromBackingInt(0), // safe: validated file identities and budgeted std source indexes fit u32.
 
-pub const RunError = Suppression.ParseError || std.mem.Allocator.Error;
+pub const RunError = Suppression.ParseError || Facts.ResolveError;
 
 pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config) RunError!Report {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -33,7 +33,7 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
     defer runner.facts.deinit();
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
-        runner.file = @fromBackingInt(@intCast(index));
+        runner.file = @fromBackingInt(@intCast(index)); // safe: validated file identities and budgeted std source indexes fit u32.
         const file = &project.files[index];
         runner.suppressions = try Suppression.parse(a, file);
         try runner.coverage.append(a, .{ .file = runner.file, .reason = switch (file.status) {
@@ -43,6 +43,7 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
             .budget_exhausted => .budget_exhausted,
         } });
         try runner.parser();
+        try runner.lineLength();
         if (file.status == .parsed) {
             try runner.unusedImports();
             try runner.priorityRules();
@@ -62,21 +63,21 @@ pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config
     }
     if (config.strict_suppressions and runner.stale != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale, .complete = runner.complete };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale, .complete = runner.complete };
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {
-    const order = std.mem.order(u8, project.inputs[@backingInt(lhs.span.file)].name, project.inputs[@backingInt(rhs.span.file)].name);
+    const order = std.mem.order(u8, project.inputs[@backingInt(lhs.span.file)].name, project.inputs[@backingInt(rhs.span.file)].name); // safe: enum identities index their owning frozen tables without narrowing.
     if (order != .eq) return order == .lt;
     if (lhs.span.start != rhs.span.start) return lhs.span.start < rhs.span.start;
-    return @backingInt(lhs.rule) < @backingInt(rhs.rule);
+    return @backingInt(lhs.rule) < @backingInt(rhs.rule); // safe: enum identities index their owning frozen tables without narrowing.
 }
 
 fn emit(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8) RunError!void {
     if (!self.config.has(rule)) return;
-    const file = &self.project.files[@backingInt(self.file)];
+    const file = &self.project.files[@backingInt(self.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     const line = file.line(start);
-    for (self.suppressions) |*suppression| if (suppression.matches(rule, line)) {
+    for (self.suppressions) |*suppression| if (try suppression.matches(rule, line, start)) {
         self.suppressed += 1;
         return;
     };
@@ -93,14 +94,14 @@ fn emit(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const 
 }
 
 fn at(self: *Runner, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8) RunError!void {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const start = tree.tokenStart(token);
-    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message);
+    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message); // safe: validated file identities and budgeted std source indexes fit u32.
 }
 
 fn parser(self: *Runner) RunError!void {
     if (!self.config.has(.Z003)) return;
-    const file = &self.project.files[@backingInt(self.file)];
+    const file = &self.project.files[@backingInt(self.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     for (file.tree.errors) |err| {
         if (err.is_note) continue;
         var writer: std.Io.Writer.Allocating = .init(self.a);
@@ -112,7 +113,7 @@ fn parser(self: *Runner) RunError!void {
 
 fn unusedImports(self: *Runner) RunError!void {
     if (!self.config.has(.Z013)) return;
-    const file_index = @backingInt(self.file);
+    const file_index = @backingInt(self.file); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[file_index].tree;
     for (self.project.models[file_index].declarations) |decl| {
         if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
@@ -126,8 +127,21 @@ fn unusedImports(self: *Runner) RunError!void {
     }
 }
 
+fn selected(self: *const Runner, selection: []const rules.Rule) bool {
+    for (selection) |rule| if (self.config.has(rule)) return true;
+    return false;
+}
+
+fn unknown(self: *Runner, rule: rules.Rule, node: Ast.Node.Index, reason: Facts.Unknown) RunError!void {
+    if (!self.config.has(rule)) return;
+    if (reason == .budget) self.complete = false;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    try self.coverage.append(self.a, .{ .file = self.file, .rule = rule, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = if (reason == .budget) .budget_exhausted else .unresolved, .detail = @tagName(reason) });
+}
+
 fn priorityRules(self: *Runner) RunError!void {
-    const index = @backingInt(self.file);
+    if (!self.selected(&.{ .Z011, .Z012, .Z015, .Z023 })) return;
+    const index = @backingInt(self.file); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[index].tree;
     for (self.project.models[index].declarations) |decl| {
         if (decl.kind != .function) continue;
@@ -146,9 +160,15 @@ fn priorityRules(self: *Runner) RunError!void {
                 const t = param.type_expr orelse continue;
                 if (first) {
                     first = false;
+                    var receiver_value = try self.facts.resolve(self.file, t);
+                    while (receiver_value == .pointer) receiver_value = receiver_value.pointer.*;
+                    if (receiver_value == .unknown) {
+                        try self.unknown(.Z023, t, receiver_value.unknown);
+                        continue;
+                    }
                     if (try self.receiver(t, decl.scope)) continue;
                 }
-                const order = try self.parameterOrder(t, param.comptime_noalias);
+                const order = (try self.parameterOrder(t, param.comptime_noalias)) orelse continue;
                 if (order < maximum) try self.at(.Z023, param.name_token orelse tree.nodeMainToken(t), "parameter follows a later-ranked parameter");
                 maximum = @max(maximum, order);
             }
@@ -157,7 +177,7 @@ fn priorityRules(self: *Runner) RunError!void {
     if (!self.config.has(.Z011)) return;
     // Node-table enumeration covers every expression position exactly once.
     for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (try self.facts.definition(self.file, call.ast.fn_expr)) |definition| {
@@ -167,13 +187,16 @@ fn priorityRules(self: *Runner) RunError!void {
                 if (value == .function) is_deprecated = self.deprecated(value.function);
             }
             if (is_deprecated) try self.at(.Z011, if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.nodeData(call.ast.fn_expr).node_and_token[1] else tree.nodeMainToken(call.ast.fn_expr), "call uses a deprecated declaration");
+        } else {
+            const value = try self.facts.resolve(self.file, call.ast.fn_expr);
+            try self.unknown(.Z011, call.ast.fn_expr, if (value == .unknown) value.unknown else .unsupported);
         }
     }
 }
 
 fn deprecated(self: *const Runner, definition: Facts.Decl) bool {
-    const tree = &self.project.files[@backingInt(definition.file)].tree;
-    const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index];
+    const tree = &self.project.files[@backingInt(definition.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index]; // safe: enum identities index their owning frozen tables without narrowing.
     var token = tree.firstToken(decl.node);
     while (token > 0) {
         token -= 1;
@@ -187,18 +210,23 @@ fn deprecated(self: *const Runner, definition: Facts.Decl) bool {
 }
 
 fn privateType(self: *Runner, node: std.zig.Ast.Node.Index, site: std.zig.Ast.TokenIndex, error_position: bool, depth: usize) RunError!void {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     if (depth >= 128) {
+        self.complete = false;
         try self.coverage.append(self.a, .{ .file = self.file, .reason = .budget_exhausted, .start = tree.tokenStart(site), .detail = "API type shape depth limit" });
         return;
     }
     switch (tree.nodeTag(node)) {
         .identifier => {
             const definition = (try self.facts.definition(self.file, node)) orelse return;
-            const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index];
+            const decl = self.project.models[@backingInt(definition.file)].declarations[definition.index]; // safe: enum identities index their owning frozen tables without narrowing.
             if (decl.kind == .parameter or decl.public or decl.exported or definition.file != self.file) return;
             const value = try self.facts.resolve(self.file, node);
-            if (value == .container and value.container.scope == decl.scope) return; // @This alias.
+            if (value == .unknown) {
+                try self.unknown(if (error_position) .Z015 else .Z012, node, value.unknown);
+                return;
+            }
+            if (value == .container and (value.container.file != self.file or value.container.scope == decl.scope)) return; // @This alias.
             try self.at(if (error_position) .Z015 else .Z012, site, try self.a.print("public signature exposes private '{s}'", .{decl.name}));
         },
         .optional_type => try self.privateType(tree.nodeData(node).node, site, error_position, depth + 1),
@@ -216,7 +244,7 @@ fn receiver(self: *Runner, node: std.zig.Ast.Node.Index, scope: u32) RunError!bo
     var value = try self.facts.resolve(self.file, node);
     while (value == .pointer) value = value.pointer.*;
     if (value != .container or value.container.file != self.file) return false;
-    const model = &self.project.models[@backingInt(self.file)];
+    const model = &self.project.models[@backingInt(self.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     var enclosing: ?u32 = scope;
     while (enclosing) |s| {
         if (model.scopes[s].kind == .container or model.scopes[s].kind == .file) return value.container.scope == s;
@@ -225,11 +253,15 @@ fn receiver(self: *Runner, node: std.zig.Ast.Node.Index, scope: u32) RunError!bo
     return false;
 }
 
-fn parameterOrder(self: *Runner, node: std.zig.Ast.Node.Index, modifier: ?std.zig.Ast.TokenIndex) RunError!u8 {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+fn parameterOrder(self: *Runner, node: std.zig.Ast.Node.Index, modifier: ?std.zig.Ast.TokenIndex) RunError!?u8 {
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const value = try self.facts.resolve(self.file, node);
     if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return 0;
     if (modifier) |t| if (tree.tokenTag(t) == .keyword_comptime) return 1;
+    if (value == .unknown) {
+        try self.unknown(.Z023, node, value.unknown);
+        return null;
+    }
     if (value == .container) {
         for (self.project.imports) |mapping| {
             if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
@@ -253,11 +285,11 @@ fn standardContainer(self: *Runner, root: Facts.Container, path_parts: []const [
 }
 
 fn parent(self: *const Runner, node: Ast.Node.Index) ?Ast.Node.Index {
-    return self.project.models[@backingInt(self.file)].node_parents[@backingInt(node)];
+    return self.project.models[@backingInt(self.file)].node_parents[@backingInt(node)]; // safe: enum identities index their owning frozen tables without narrowing.
 }
 
 fn under(self: *const Runner, node: Ast.Node.Index, kind: enum { cleanup, test_scope, function }) bool {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var cursor = self.parent(node);
     while (cursor) |p| {
         const tag = tree.nodeTag(p);
@@ -304,10 +336,19 @@ fn functionAliasPolicy(tree: *const Ast, node: Ast.Node.Index) bool {
     return name.len != 0 and std.ascii.isLower(name[0]) and std.mem.findScalar(u8, name, '_') == null;
 }
 
+fn lineLength(self: *Runner) RunError!void {
+    const file = &self.project.files[@backingInt(self.file)]; // safe: enum identities index their owning frozen tables without narrowing.
+    if (self.config.has(.Z024)) for (file.lines, 0..) |start, l| {
+        var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len); // safe: validated file identities and budgeted std source indexes fit u32.
+        if (end > start and file.source[end - 1] == '\r') end -= 1;
+        if (end - start > self.config.max_line_length) try self.emit(.Z024, start + self.config.max_line_length, end, "line exceeds configured byte length");
+    };
+}
+
 fn syntaxRules(self: *Runner) RunError!void {
-    const index = @backingInt(self.file);
-    const file = &self.project.files[index];
-    const tree = &file.tree;
+    if (!self.selected(&.{ .Z001, .Z002, .Z004, .Z005, .Z006, .Z007, .Z009, .Z010, .Z014, .Z017, .Z018, .Z019, .Z020, .Z021, .Z022, .Z024, .Z025, .Z026, .Z028, .Z031, .Z032, .Z033 })) return;
+    const index = @backingInt(self.file); // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[index].tree;
     var imports: std.StringHashMapUnmanaged(void) = .empty;
     defer imports.deinit(self.a);
     var top_fields = false;
@@ -315,14 +356,9 @@ fn syntaxRules(self: *Runner) RunError!void {
         top_fields = true;
     };
     if (top_fields and !names.isPascalCase(self.project.inputs[index].stem)) try self.emit(.Z009, 0, 0, "file struct stem must be PascalCase");
-    if (self.config.has(.Z024)) for (file.lines, 0..) |start, l| {
-        var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len);
-        if (end > start and file.source[end - 1] == '\r') end -= 1;
-        if (end - start > self.config.max_line_length) try self.emit(.Z024, start + self.config.max_line_length, end, "line exceeds configured byte length");
-    };
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         if (n == 0) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
         var buffer: [2]Ast.Node.Index = undefined;
         if (tree.fullVarDecl(node)) |v| {
             const token = v.ast.mut_token + 1;
@@ -391,7 +427,7 @@ fn syntaxRules(self: *Runner) RunError!void {
 }
 
 fn enclosingFunction(self: *const Runner, node: Ast.Node.Index) ?Ast.Node.Index {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var cursor = self.parent(node);
     while (cursor) |p| {
         if (tree.nodeTag(p) == .fn_decl) return p;
@@ -402,7 +438,7 @@ fn enclosingFunction(self: *const Runner, node: Ast.Node.Index) ?Ast.Node.Index 
 
 fn redundantType(self: *Runner, node: Ast.Node.Index, fields: bool) RunError!void {
     if (!self.config.has(.Z010)) return;
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var b: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&b, node)) |value| {
         if (value.ast.type_expr.unwrap()) |t| try self.at(.Z010, tree.nodeMainToken(t), "context supplies this initializer type");
@@ -417,18 +453,18 @@ fn redundantType(self: *Runner, node: Ast.Node.Index, fields: bool) RunError!voi
 
 fn redundantAs(self: *Runner, rule: rules.Rule, expected: Ast.Node.Index, expected_file: Project.FileId, value: Ast.Node.Index, site: Ast.TokenIndex) RunError!void {
     if (!self.config.has(rule)) return;
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, value, &buffer);
     if (args.len != 2 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@as")) return;
     const expected_value = try self.facts.resolve(expected_file, expected);
     const actual_value = try self.facts.resolve(self.file, args[0]);
     if (expected_value == .primitive and actual_value == .primitive and std.mem.eql(u8, expected_value.primitive, actual_value.primitive)) try self.at(rule, site, "context already supplies the @as type");
-    if (expected_value == .container and actual_value == .container and std.meta.eql(expected_value.container, actual_value.container)) try self.at(rule, site, "context already supplies the @as type");
+    if (expected_value == .container and actual_value == .container and !expected_value.container.symbolic and !actual_value.container.symbolic and std.meta.eql(expected_value.container, actual_value.container)) try self.at(rule, site, "context already supplies the @as type");
 }
 
 fn thisRules(self: *Runner, node: Ast.Node.Index, top_fields: bool) RunError!void {
-    const index = @backingInt(self.file);
+    const index = @backingInt(self.file); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[index].tree;
     const p = self.parent(node) orelse return;
     var cb: [1]Ast.Node.Index = undefined;
@@ -460,7 +496,7 @@ fn thisRules(self: *Runner, node: Ast.Node.Index, top_fields: bool) RunError!voi
 
 fn importRule(self: *Runner, node: Ast.Node.Index) RunError!void {
     if (!self.config.has(.Z028)) return;
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var cursor = node;
     while (self.parent(cursor)) |p| {
         if (tree.nodeTag(p) == .field_access) {
@@ -468,7 +504,7 @@ fn importRule(self: *Runner, node: Ast.Node.Index) RunError!void {
             continue;
         }
         if (tree.fullVarDecl(p)) |v| {
-            const scope = self.project.models[@backingInt(self.file)].token_scopes[v.ast.mut_token];
+            const scope = self.project.models[@backingInt(self.file)].token_scopes[v.ast.mut_token]; // safe: enum identities index their owning frozen tables without narrowing.
             if (tree.tokenTag(v.ast.mut_token) == .keyword_const and v.ast.init_node.unwrap() == cursor and (scope == 0 or self.under(p, .test_scope))) return;
         }
         if (tree.nodeTag(p) == .assign and self.under(p, .test_scope)) {
@@ -481,9 +517,10 @@ fn importRule(self: *Runner, node: Ast.Node.Index) RunError!void {
 }
 
 fn contextRules(self: *Runner) RunError!void {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    if (!self.selected(&.{ .Z016, .Z027, .Z029 })) return;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
         var b: [2]Ast.Node.Index = undefined;
         var cb: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&cb, node)) |call| {
@@ -503,8 +540,8 @@ fn contextRules(self: *Runner) RunError!void {
                 const value = try self.facts.resolve(self.file, call.ast.fn_expr);
                 if (value == .function) {
                     const d = value.function;
-                    const target = &self.project.files[@backingInt(d.file)].tree;
-                    const decl = self.project.models[@backingInt(d.file)].declarations[d.index];
+                    const target = &self.project.files[@backingInt(d.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+                    const decl = self.project.models[@backingInt(d.file)].declarations[d.index]; // safe: enum identities index their owning frozen tables without narrowing.
                     var fb: [1]Ast.Node.Index = undefined;
                     const function = target.fullFnProto(&fb, decl.node).?;
                     var it = function.iterate(target);
@@ -528,7 +565,7 @@ fn contextRules(self: *Runner) RunError!void {
             while (value == .pointer) value = value.pointer.*;
             if (value == .instance) {
                 if (self.facts.member(value.instance, tree.tokenSlice(pair[1]))) |decl| {
-                    const record = self.project.models[@backingInt(decl.file)].declarations[decl.index];
+                    const record = self.project.models[@backingInt(decl.file)].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
                     if (record.kind != .field and record.kind != .function) try self.at(.Z027, pair[1], "access container declaration through its type");
                 }
             }
@@ -560,8 +597,8 @@ fn contextRules(self: *Runner) RunError!void {
                     if (first < 2 or tree.tokenTag(first - 1) != .equal) continue;
                     const name = tree.tokenSlice(first - 2);
                     const decl = self.facts.member(c, name) orelse continue;
-                    const target = &self.project.files[@backingInt(decl.file)].tree;
-                    const record = self.project.models[@backingInt(decl.file)].declarations[decl.index];
+                    const target = &self.project.files[@backingInt(decl.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
+                    const record = self.project.models[@backingInt(decl.file)].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
                     if (record.kind != .field) continue;
                     if (target.fullContainerField(record.node).?.ast.type_expr.unwrap()) |t| try self.redundantAs(.Z029, t, decl.file, field_value, tree.nodeMainToken(field_value));
                 };
@@ -572,9 +609,13 @@ fn contextRules(self: *Runner) RunError!void {
 
 fn poisonRule(self: *Runner) RunError!void {
     if (!self.config.has(.Z030)) return;
-    for (self.project.models[@backingInt(self.file)].declarations) |decl| {
+    for (self.project.models[@backingInt(self.file)].declarations) |decl| { // safe: enum identities index their owning frozen tables without narrowing.
         switch (try Poison.analyze(self.a, self.project, self.file, decl)) {
             .irrelevant, .accepted => {},
+            .budget => {
+                self.complete = false;
+                try self.coverage.append(self.a, .{ .file = self.file, .rule = .Z030, .reason = .budget_exhausted, .detail = "Z030 instruction/depth budget exhausted" });
+            },
             .warning => |message| try self.at(.Z030, decl.token, message),
             .unknown => |detail| try self.coverage.append(self.a, .{ .file = self.file, .rule = .Z030, .reason = .unsupported, .detail = detail }),
         }
@@ -582,9 +623,9 @@ fn poisonRule(self: *Runner) RunError!void {
 }
 
 fn unknownCoverage(self: *Runner) RunError!void {
-    const tree = &self.project.files[@backingInt(self.file)].tree;
+    const tree = &self.project.files[@backingInt(self.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
@@ -601,7 +642,7 @@ test "core diagnostics distinguish invalid parsing and unused imports" {
     defer project.deinit();
     var report = try run(std.testing.allocator, &project, .{});
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(rules.Rule.Z013, report.diagnostics[0].rule);
     try std.testing.expectEqual(rules.Rule.Z003, report.diagnostics[1].rule);
 }

@@ -14,7 +14,7 @@ remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 pub const Decl = struct { file: Project.FileId, index: u32 };
-pub const Container = struct { file: Project.FileId, scope: u32 };
+pub const Container = struct { file: Project.FileId, scope: u32, symbolic: bool = false };
 pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported };
 pub const Value = union(enum) {
     unknown: Unknown,
@@ -32,7 +32,7 @@ pub const Value = union(enum) {
         return self != .unknown;
     }
 };
-pub const ResolveError = std.mem.Allocator.Error;
+pub const ResolveError = Model.InitError;
 
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
@@ -41,7 +41,7 @@ pub fn deinit(self: *Facts) void {
 }
 
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    if (self.project.files[@backingInt(file)].status != .parsed) return .{ .unknown = .invalid_front_end };
+    if (self.project.files[@backingInt(file)].status != .parsed) return .{ .unknown = .invalid_front_end }; // safe: enum identities index their owning frozen tables without narrowing.
     const key: Key = .{ .file = file, .node = node };
     if (self.cache.get(key)) |value| return value;
     if (self.remaining == 0 or self.active.count() >= 128) return .{ .unknown = .budget };
@@ -62,7 +62,7 @@ fn boxed(self: *Facts, value: Value) ResolveError!*const Value {
 }
 
 fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    const index = @backingInt(file);
+    const index = @backingInt(file); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[index].tree;
     const model = &self.project.models[index];
     const tag = tree.nodeTag(node);
@@ -77,7 +77,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
             const lhs = try self.resolve(file, data[0]);
-            const name = tree.tokenSlice(data[1]);
+            const name = try self.memberName(tree.tokenSlice(data[1]));
             const container = switch (lhs) {
                 .container, .instance => |c| c,
                 .pointer => |p| switch (p.*) {
@@ -98,7 +98,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
     if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) {
-        for (model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } };
+        for (model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
     }
     switch (tag) {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
@@ -129,13 +129,29 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const callee = try self.resolve(file, call.ast.fn_expr);
             if (callee == .function) {
                 const decl = callee.function;
-                const declaration_record = self.project.models[@backingInt(decl.file)].declarations[decl.index];
-                const target_tree = &self.project.files[@backingInt(decl.file)].tree;
+                const declaration_record = self.project.models[@backingInt(decl.file)].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+                const target_tree = &self.project.files[@backingInt(decl.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
                 var fn_buffer: [1]Ast.Node.Index = undefined;
                 const function = target_tree.fullFnProto(&fn_buffer, declaration_record.node).?;
                 const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
                 const result = try self.resolve(decl.file, result_node);
-                if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) return .{ .unknown = .comptime_dependent };
+                if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) {
+                    // A sole, direct returned container retains template identity.
+                    // This is not execution or a concrete generic instantiation.
+                    const lowered = declaration_record.lowered orelse return .{ .unknown = .comptime_dependent };
+                    var fn_node = self.project.files[@backingInt(decl.file)].zir.?.getDeclaration(lowered).src_node; // safe: enum identities index their owning frozen tables without narrowing.
+                    if (target_tree.nodeTag(fn_node) != .fn_decl) fn_node = self.project.models[@backingInt(decl.file)].node_parents[@backingInt(fn_node)] orelse return .{ .unknown = .comptime_dependent }; // safe: enum identities index their owning frozen tables without narrowing.
+                    if (target_tree.nodeTag(fn_node) != .fn_decl) return .{ .unknown = .comptime_dependent };
+                    var body_buffer: [2]Ast.Node.Index = undefined;
+                    const statements = target_tree.blockStatements(&body_buffer, target_tree.nodeData(fn_node).node_and_node[1]) orelse return .{ .unknown = .comptime_dependent };
+                    if (statements.len != 1 or target_tree.nodeTag(statements[0]) != .@"return") return .{ .unknown = .comptime_dependent };
+                    const returned = target_tree.nodeData(statements[0]).opt_node.unwrap() orelse return .{ .unknown = .comptime_dependent };
+                    var container_buffer: [2]Ast.Node.Index = undefined;
+                    if (target_tree.fullContainerDecl(&container_buffer, returned) == null) return .{ .unknown = .comptime_dependent };
+                    var value = try self.resolve(decl.file, returned);
+                    if (value == .container) value.container.symbolic = function.ast.params.len != 0;
+                    return value;
+                }
                 return instance(result);
             }
             return .{ .unknown = .unresolved };
@@ -159,11 +175,15 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
 }
 
 pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
-    const model = &self.project.models[@backingInt(decl.file)];
+    const model = &self.project.models[@backingInt(decl.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     const declaration_record = model.declarations[decl.index];
-    const tree = &self.project.files[@backingInt(decl.file)].tree;
+    const tree = &self.project.files[@backingInt(decl.file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     if (declaration_record.kind == .function) return .{ .function = decl };
-    if (declaration_record.kind == .parameter) return instance(try self.resolve(decl.file, declaration_record.node));
+    if (declaration_record.kind == .parameter) {
+        const value = try self.resolve(decl.file, declaration_record.node);
+        if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return .{ .unknown = .comptime_dependent };
+        return instance(value);
+    }
     if (declaration_record.kind == .capture) return .{ .unknown = .comptime_dependent };
     if (declaration_record.kind == .field) {
         const field = tree.fullContainerField(declaration_record.node).?;
@@ -180,17 +200,21 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     return .{ .unknown = .unsupported };
 }
 
+fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
+    return Model.identifier(self.gpa, raw);
+}
+
 pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl {
-    const model = &self.project.models[@backingInt(container.file)];
+    const model = &self.project.models[@backingInt(container.file)]; // safe: enum identities index their owning frozen tables without narrowing.
     if (model.scopes[container.scope].names.get(name)) |decl| return .{ .file = container.file, .index = decl };
-    for (model.declarations, 0..) |decl, i| if (decl.kind == .field and decl.scope == container.scope and std.mem.eql(u8, decl.name, name)) return .{ .file = container.file, .index = @intCast(i) };
+    for (model.declarations, 0..) |decl, i| if (decl.kind == .field and decl.scope == container.scope and std.mem.eql(u8, decl.name, name)) return .{ .file = container.file, .index = @intCast(i) }; // safe: scope indexes come from the bounded frozen per-file model.
     return null;
 }
 
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
-    const tree = &self.project.files[@backingInt(file)].tree;
+    const tree = &self.project.files[@backingInt(file)].tree; // safe: enum identities index their owning frozen tables without narrowing.
     if (tree.nodeTag(node) == .identifier) {
-        const ref = self.project.models[@backingInt(file)].reference(node) orelse return null;
+        const ref = self.project.models[@backingInt(file)].reference(node) orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
         return if (ref.declaration) |decl| .{ .file = file, .index = decl } else null;
     }
     if (tree.nodeTag(node) == .field_access) {
@@ -204,7 +228,7 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
             },
             else => return null,
         };
-        return self.member(container, tree.tokenSlice(data[1]));
+        return self.member(container, try self.memberName(tree.tokenSlice(data[1])));
     }
     return null;
 }
@@ -242,7 +266,7 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     const first = project.files[0].tree.fullVarDecl(project.models[0].declarations[0].node).?.ast.init_node.unwrap().?;
-    try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(@fromBackingInt(0), first)).unknown);
+    try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(@fromBackingInt(0), first)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
     const dep = project.files[0].tree.fullVarDecl(project.models[0].declarations[2].node).?.ast.init_node.unwrap().?;
-    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(@fromBackingInt(0), dep)).unknown);
+    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(@fromBackingInt(0), dep)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
 }

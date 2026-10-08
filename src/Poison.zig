@@ -6,7 +6,7 @@ const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 
-pub const Verdict = union(enum) { irrelevant, accepted, warning: []const u8, unknown: []const u8 };
+pub const Verdict = union(enum) { irrelevant, accepted, warning: []const u8, unknown: []const u8, budget };
 const Scan = struct {
     tree: *const Ast,
     model: *const Model,
@@ -16,6 +16,7 @@ const Scan = struct {
     remaining: usize = 100_000,
     warning: ?[]const u8 = null,
     unknown: bool = false,
+    exhausted: bool = false,
 
     fn receiverNode(self: *const Scan, node: Ast.Node.Index) bool {
         const ref = self.model.reference(node) orelse return false;
@@ -36,18 +37,18 @@ const Scan = struct {
     }
     fn body(self: *Scan, instructions: []const Zir.Inst.Index, initial: u3, depth: usize) u3 {
         if (depth >= 128) {
-            self.unknown = true;
+            self.exhausted = true;
             return initial;
         }
         var states = initial;
         for (instructions) |inst| {
             if (self.remaining == 0) {
-                self.unknown = true;
+                self.exhausted = true;
                 return states;
             }
             self.remaining -= 1;
             if (states == 0) break;
-            const i = @backingInt(inst);
+            const i = @backingInt(inst); // safe: enum identities index their owning frozen tables without narrowing.
             const tag = self.zir.instructions.items(.tag)[i];
             const data = self.zir.instructions.items(.data)[i];
             switch (tag) {
@@ -90,7 +91,7 @@ const Scan = struct {
 
 pub fn analyze(a: std.mem.Allocator, project: *const Project, file: Project.FileId, decl: Model.Declaration) std.mem.Allocator.Error!Verdict {
     if (decl.kind != .function or !std.mem.eql(u8, decl.name, "deinit")) return .irrelevant;
-    const index = @backingInt(file);
+    const index = @backingInt(file); // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &project.files[index].tree;
     const model = &project.models[index];
     var buffer: [1]Ast.Node.Index = undefined;
@@ -108,6 +109,7 @@ pub fn analyze(a: std.mem.Allocator, project: *const Project, file: Project.File
     const fn_inst = contents.func_decl orelse return .{ .unknown = "deinit body unavailable" };
     var scan: Scan = .{ .tree = tree, .model = model, .zir = zir, .baseline = zir.getDeclaration(lowered).src_node, .receiver = receiver };
     const remaining = scan.body(zir.getFnInfo(fn_inst).body, 1, 0);
+    if (scan.exhausted) return .budget;
     if (scan.unknown) return .{ .unknown = "Z030 structured shape unsupported or budget exhausted" };
     if (scan.warning) |warning| return .{ .warning = warning };
     if (remaining & 1 != 0) return .{ .warning = "deinit fallthrough lacks receiver poisoning or destroy shape" };

@@ -4,17 +4,7 @@ const Result = @This();
 
 pub const Outcome = @import("Completion.zig").Outcome;
 pub const Request = struct { path: []const u8, run_id: []const u8 };
-pub const Record = struct {
-    version: u32 = 1,
-    run_id: []const u8,
-    completed: bool,
-    outcome: Outcome,
-    sources: usize = 0,
-    findings: usize = 0,
-    suppressed: usize = 0,
-    output_bytes: usize = 0,
-    output_sha256: []const u8 = "",
-};
+pub const Record = @import("Completion.zig").Record;
 
 pub fn request(args: []const []const u8) !?Request {
     var path: ?[]const u8 = null;

@@ -1,9 +1,9 @@
 //! Public contracts: allocation failures, arbitrary parser input and rendering.
 const std = @import("std");
 const glint = @import("glint.zig");
+const shakedown = @import("shakedown");
 
 test "contract allocation failures release project and report owners" {
-    const shakedown = @import("shakedown");
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
             var project = try glint.Project.init(a, &.{.{ .name = "fixture", .bytes = "const d = @import(\"dep\"); pub fn f() void {}" }}, &.{}, .{});
@@ -20,7 +20,6 @@ test "contract allocation failures release project and report owners" {
 }
 
 test "contract seeded arbitrary bytes parse with bounded public ownership" {
-    const shakedown = @import("shakedown");
     const Property = struct {
         fn run(_: void, case: *shakedown.Case) !void {
             var bytes: [128]u8 = undefined;

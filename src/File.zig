@@ -38,7 +38,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError
     var lines: std.ArrayList(u32) = .empty;
     try lines.append(a, 0);
     for (source, 0..) |byte, offset| if (byte == '\n') {
-        try lines.append(a, @intCast(offset + 1));
+        try lines.append(a, @intCast(offset + 1)); // safe: the checked source byte budget bounds offsets below u32.
     };
     const comment_list = try scanComments(a, source, lines.items);
     return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = try lines.toOwnedSlice(a), .comments = comment_list };
@@ -60,7 +60,7 @@ fn lineIndex(lines: []const u32, offset: u32) u32 {
         const mid = lo + (hi - lo) / 2;
         if (lines[mid] <= offset) lo = mid + 1 else hi = mid;
     }
-    return @intCast(lo - 1);
+    return @intCast(lo - 1); // safe: the checked source byte budget bounds offsets below u32.
 }
 
 fn scanComments(a: std.mem.Allocator, source: [:0]const u8, lines: []const u32) InitError![]const Comment {
@@ -76,11 +76,11 @@ fn scanComments(a: std.mem.Allocator, source: [:0]const u8, lines: []const u32) 
             if (source[cursor] == '/' and cursor + 1 < token.loc.start and source[cursor + 1] == '/') {
                 const start = cursor;
                 while (cursor < token.loc.start and source[cursor] != '\n') cursor += 1;
-                try result.append(a, .{ .start = @intCast(start), .end = @intCast(cursor), .line = lineIndex(lines, @intCast(start)) });
+                try result.append(a, .{ .start = @intCast(start), .end = @intCast(cursor), .line = lineIndex(lines, @intCast(start)) }); // safe: the checked source byte budget bounds offsets below u32.
             } else cursor += 1;
         }
         if (token.tag == .doc_comment or token.tag == .container_doc_comment) {
-            try result.append(a, .{ .start = @intCast(token.loc.start), .end = @intCast(token.loc.end), .line = lineIndex(lines, @intCast(token.loc.start)) });
+            try result.append(a, .{ .start = @intCast(token.loc.start), .end = @intCast(token.loc.end), .line = lineIndex(lines, @intCast(token.loc.start)) }); // safe: the checked source byte budget bounds offsets below u32.
         }
         end = token.loc.end;
         if (token.tag == .eof) break;
@@ -108,6 +108,10 @@ test "front end invalid syntax and lowering are distinct" {
 test "comment parser rejects string lookalikes" {
     var file = try init(std.testing.allocator, "const s = \"// glint-ignore: Z013 -- fake\"; // real\n// next\n", .{});
     defer file.deinit();
-    try std.testing.expectEqual(@as(usize, 2), file.comments.len);
+    try std.testing.expectEqual(@as(usize, 2), file.comments.len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqualStrings("// real", file.source[file.comments[0].start..file.comments[0].end]);
+}
+
+test "front end rejects bytes before parsing beyond the caller budget" {
+    try std.testing.expectError(error.SourceTooLarge, init(std.testing.allocator, "pub const x = 1;", .{ .bytes = 4 }));
 }

@@ -29,7 +29,7 @@ const Loader = struct {
     fn load(self: *Loader, path: []const u8, selected: bool) !glint.Project.FileId {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.a);
         if (self.paths.get(canonical)) |id| {
-            if (selected) self.inputs.items[@backingInt(id)].selected = true;
+            if (selected) self.inputs.items[@backingInt(id)].selected = true; // safe: enum identities index their owning frozen tables without narrowing.
             return id;
         }
         if (self.inputs.items.len >= 4096) return error.FileBudgetExceeded;
@@ -44,7 +44,7 @@ const Loader = struct {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(self.io, canonical, self.a, .limited(16 * 1024 * 1024), .@"1", 0);
         self.bytes += bytes.len;
         if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
-        const id: glint.Project.FileId = @fromBackingInt(@intCast(self.inputs.items.len));
+        const id: glint.Project.FileId = @fromBackingInt(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
         const basename = std.fs.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected });
@@ -56,7 +56,7 @@ const Loader = struct {
     fn imports(self: *Loader) !void {
         var cursor: usize = 0;
         while (cursor < self.inputs.items.len) : (cursor += 1) {
-            const from: glint.Project.FileId = @fromBackingInt(@intCast(cursor));
+            const from: glint.Project.FileId = @fromBackingInt(@intCast(cursor)); // safe: the loader bounds source count to 4096 before creating u32 identities.
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
             var lexer: std.zig.Tokenizer = .init(sentinel);
@@ -124,10 +124,12 @@ fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options 
             result.config.set(rule, true);
         } else if (std.mem.eql(u8, arg, "--compatibility")) {
             result.config = glint.Config.compatibility();
-            selected = true;
+            selected = false;
         } else if (std.mem.eql(u8, arg, "--enable") or std.mem.eql(u8, arg, "--disable")) {
             const rule = glint.Rule.parse(try value(args, &i)) orelse return error.UnknownRule;
             result.config.set(rule, std.mem.eql(u8, arg, "--enable"));
+        } else if (std.mem.eql(u8, arg, "--fact-budget")) {
+            result.config.fact_budget = try std.fmt.parseInt(usize, try value(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--max-line-length")) {
             result.config.max_line_length = try std.fmt.parseInt(u32, try value(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--strict-suppressions")) {
@@ -160,7 +162,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
     defer arena.deinit();
     const a = arena.allocator();
     const requested = try Result.request(args);
-    var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .completed = false, .outcome = .running };
+    var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .version = 1, .completed = false, .outcome = .running, .sources = 0, .findings = 0, .suppressed = 0, .output_bytes = 0, .output_sha256 = "" };
     try Result.publish(a, io, requested, record);
     const status = executeInner(gpa, a, io, args, writer, &record) catch |err| {
         if (err == error.Canceled) record.outcome = .canceled;
@@ -179,7 +181,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .argument_failure;
     const configured = try options(a, io, args);
     if (configured.help) {
-        try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only Znnn | --compatibility] [--format text|json|sarif]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;
         record.completed = false;
@@ -191,7 +193,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
         const id = try loader.load(path, true);
-        const canonical = loader.canonical_paths.items[@backingInt(id)];
+        const canonical = loader.canonical_paths.items[@backingInt(id)]; // safe: enum identities index their owning frozen tables without narrowing.
         try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
