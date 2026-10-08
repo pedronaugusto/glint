@@ -221,3 +221,13 @@ test "compatibility public signature retains imported alias provenance" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
 }
+
+test "compatibility Z027 excludes resolved function aliases used as methods" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const S = struct { pub const read = readImpl; }; fn readImpl(_: S) void {} pub fn f(s: S) void { s.read(); }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = rules.Config.none();
+    config.set(.Z027, true);
+    var report = try Runner.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected zero fixture diagnostics fits usize.
+}
