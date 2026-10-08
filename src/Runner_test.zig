@@ -133,7 +133,7 @@ test "compatibility Z030 is deinit poisoning hygiene, including cleanup and dest
 
 test "compatibility deprecation follows aliases and symbolic returned containers" {
     try check(.Z011, "/// Deprecated: use fresh.\nfn old() void {} const alias = old; pub fn run() void { alias(); }", 1);
-    try check(.Z011, "fn Factory(comptime T: type) type { return struct { value: T, /// Deprecated: use fresh.\n pub fn old() void {} }; } const S = Factory(u8); pub fn run() void { S.old(); }", 1);
+    try check(.Z011, "fn Factory(comptime T: type) type { return struct { value: T,\n /// Deprecated: use fresh.\n pub fn old() void {} }; } const S = Factory(u8); pub fn run() void { S.old(); }", 1);
     try check(.Z011, "/// Not deprecated.\nfn old() void {} pub fn run() void { old(); _ = \"Deprecated: string\"; }", 0);
 }
 
@@ -147,4 +147,37 @@ test "compatibility Z024 reports bytes exceeding the configured boundary" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
     try std.testing.expectEqual(@as(u32, 10), report.diagnostics[0].span.start);
+}
+
+test "compatibility strict stale suppressions and exhausted facts are incomplete" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "// glint-ignore: Z013 -- stale regression site\npub const x = 1;" }}, &.{}, .{});
+    defer project.deinit();
+    var config: glint.Config = .{ .strict_suppressions = true };
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.stale_suppressions);
+    config.strict_suppressions = false;
+    config.fact_budget = 0;
+    var exhausted = try glint.run(std.testing.allocator, &project, config);
+    defer exhausted.deinit();
+    try std.testing.expect(!exhausted.complete);
+}
+
+test "compatibility unknown receiver and callee record uncertainty without invented facts" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const Self = @import(\"unmapped\").S; pub fn f(self: *Self, comptime T: type) void { _ = self; _ = T; @import(\"unmapped\").old(); }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z011, true);
+    config.set(.Z023, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var unknown_callee = false;
+    var unknown_receiver = false;
+    for (report.coverage) |coverage| {
+        if (coverage.rule == .Z011) unknown_callee = true;
+        if (coverage.rule == .Z023) unknown_receiver = true;
+    }
+    try std.testing.expect(unknown_callee and unknown_receiver);
 }
