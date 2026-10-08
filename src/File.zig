@@ -17,9 +17,10 @@ pub const Limits = struct {
     instructions: usize = 2_000_000,
 };
 pub const Comment = struct { start: u32, end: u32, line: u32 };
-pub const InitError = std.mem.Allocator.Error;
+pub const InitError = std.mem.Allocator.Error || error{SourceTooLarge};
 
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError!File {
+    if (bytes.len > limits.bytes or bytes.len > std.math.maxInt(u32)) return error.SourceTooLarge;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();

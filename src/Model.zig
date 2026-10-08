@@ -72,7 +72,10 @@ pub fn init(file: *File) InitError!Model {
     if (tree.errors.len == 0) try collectDeclarations(a, tree, token_scopes, scopes.items, &declarations);
     const by_node = try a.alloc(?std.zig.Zir.Inst.Index, tree.nodes.len);
     @memset(by_node, null);
-    for (lowered.items) |decl| by_node[@backingInt(decl.node)] = decl.instruction;
+    for (lowered.items) |decl| {
+        by_node[@backingInt(decl.node)] = decl.instruction;
+        if (tree.nodeTag(decl.node) == .fn_decl) by_node[@backingInt(tree.nodeData(decl.node).node_and_node[0])] = decl.instruction;
+    }
     for (declarations.items) |*decl| decl.lowered = by_node[@backingInt(decl.node)];
     const node_references = try a.alloc(?u32, tree.nodes.len);
     @memset(node_references, null);

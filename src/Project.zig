@@ -34,7 +34,7 @@ pub const Import = struct { from: FileId, spelling: []const u8, target: FileId }
 /// Per-source limits for front-end work.
 pub const Options = struct { limits: File.Limits = .{} };
 /// Construction errors always propagate; no unread/allocation failure is clean.
-pub const InitError = Model.InitError || error{ InvalidMapping, DuplicateMapping };
+pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping };
 /// A handle from another snapshot is invalid.
 pub const QueryError = error{InvalidHandle};
 

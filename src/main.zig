@@ -13,6 +13,5 @@ pub fn main(init: std.process.Init) void {
         errors.interface.flush() catch std.process.exit(2);
         std.process.exit(2);
     };
-    output.interface.flush() catch std.process.exit(2);
     if (status != 0) std.process.exit(status);
 }

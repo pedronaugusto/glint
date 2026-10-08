@@ -71,10 +71,7 @@ const Loader = struct {
                 const spelling = try std.zig.string_literal.parseAlloc(self.a, sentinel[literal.loc.start..literal.loc.end]);
                 if (lexer.next().tag != .r_paren) continue;
                 const target_path = try self.importPath(cursor, spelling) orelse continue;
-                const target = self.load(target_path, false) catch |err| switch (err) {
-                    error.FileNotFound => continue, // Retained as absent mapping by the semantic model.
-                    else => return err,
-                };
+                const target = try self.load(target_path, false);
                 var duplicate = false;
                 for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
                     duplicate = true;
@@ -99,7 +96,7 @@ const Loader = struct {
 };
 
 fn within(root: []const u8, path: []const u8) bool {
-    return std.mem.eql(u8, root, path) or (std.mem.startsWith(u8, path, root) and path.len > root.len and std.fs.path.isSep(path[root.len]));
+    return std.mem.eql(u8, root, path) or (root.len == 1 and std.fs.path.isSep(root[0]) and std.fs.path.isAbsolute(path)) or (std.mem.startsWith(u8, path, root) and path.len > root.len and std.fs.path.isSep(path[root.len]));
 }
 
 fn value(args: []const []const u8, index: *usize) ![]const u8 {
@@ -193,8 +190,8 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
-        _ = try loader.load(path, true);
-        const canonical = loader.canonical_paths.items[loader.canonical_paths.items.len - 1];
+        const id = try loader.load(path, true);
+        const canonical = loader.canonical_paths.items[@backingInt(id)];
         try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
@@ -219,7 +216,9 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     record.output_bytes = bytes.len;
     record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
-    record.sources = configured.files.items.len;
+    for (loader.inputs.items) |input| if (input.selected) {
+        record.sources += 1;
+    };
     record.findings = report.diagnostics.len;
     record.suppressed = report.suppressed;
     record.completed = report.complete;
