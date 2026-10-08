@@ -78,3 +78,15 @@ test "contract public lowered references disclose partial std ZIR coverage" {
     try std.testing.expectEqual(.partial, try project.loweredCoverage(handle));
     try std.testing.expect((try project.loweredReferences(handle)).len != 0);
 }
+
+test "contract private API diagnostic carries its resolved declaration span" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const Hidden = struct { value: u8 }; pub fn f(v: Hidden) void { _ = v; }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.Z012, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: expected single fixture diagnostic fits usize.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics[0].related.len); // safe: expected single declaration span fits usize.
+    try std.testing.expectEqual(@as(u32, 6), report.diagnostics[0].related[0].start); // safe: the declaration name begins at byte six of the fixed fixture.
+}
