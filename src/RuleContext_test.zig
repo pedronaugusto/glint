@@ -31,7 +31,19 @@ test "G2 compiled project rules share metadata rendering and written site suppre
         defer output.deinit();
         try report.write(&output.writer, &project, format);
         try std.testing.expect(std.mem.find(u8, output.written(), "CUSTOM_API") != null);
+        if (format == .sarif) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+            defer parsed.deinit();
+            const properties = parsed.value.object.get("runs").?.array.items[0].object.get("results").?.array.items[0].object.get("properties").?;
+            try std.testing.expectEqualStrings("report", properties.object.get("policyLevel").?.string);
+            try std.testing.expectEqual(@as(i64, 7), properties.object.get("ruleVersion").?.integer); // safe: exact custom metadata version.
+        }
     }
+    var gated = try glint.runConfigured(std.testing.allocator, &project, configuration(.gate), .{ .project_rules = &.{rule} });
+    defer gated.deinit();
+    try std.testing.expect(gated.complete);
+    try std.testing.expectEqual(@as(usize, 1), gated.gateFindings()); // safe: one gate finding, separate from one reasoned site.
+    try std.testing.expectEqual(@as(usize, 0), report.gateFindings()); // safe: reports do not gate.
 }
 test "G2 incomplete required project rule stays incomplete with every finding allowed" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- intentionally exported test contract\npub const allowed = 2;" }}, &.{}, .{});

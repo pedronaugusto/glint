@@ -156,7 +156,7 @@ fn sarifDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnosti
     try stream.objectField("relatedLocations");
     try relatedLocations(&stream, project, d.related, true);
     try stream.objectField("properties");
-    try stream.write(.{ .ruleVersion = d.rule_version, .class = d.class, .bugClass = d.bug_class });
+    try stream.write(.{ .ruleVersion = d.rule_version, .class = d.class, .policyLevel = d.level, .bugClass = d.bug_class });
     try stream.endObject();
 }
 
