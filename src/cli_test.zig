@@ -29,7 +29,8 @@ fn completionCase(findings: bool) !void {
     try std.testing.expectEqualStrings(if (findings) "findings" else "clean", json.value.object.get("outcome").?.string);
     try std.testing.expectEqualStrings("test-run", json.value.object.get("run_id").?.string);
     try std.testing.expectEqual(@as(i64, @intCast(output.written().len)), json.value.object.get("output_bytes").?.integer);
-    const digest = std.crypto.hash.sha2.Sha256.hash(output.written(), .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output.written(), &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(&digest, .lower), json.value.object.get("output_sha256").?.string);
 }
 
