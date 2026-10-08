@@ -152,3 +152,15 @@ test "project allocation failures release partially initialized files" {
     var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(allocation.allocator(), Helper.run, .{});
 }
+
+ test "project stale handles survive allocator address reuse without aliasing" {
+    var storage: [262144]u8 = undefined;
+    var allocator = std.heap.FixedBufferAllocator.init(&storage);
+    var first = try init(allocator.allocator(), &.{.{ .name = "one", .bytes = "const x = 1;" }}, &.{}, .{});
+    const stale = try first.handle(@fromBackingInt(0)); // safe: source zero exists in this single-source fixture.
+    first.deinit();
+    allocator.reset();
+    var replacement = try init(allocator.allocator(), &.{.{ .name = "two", .bytes = "const x = 2;" }}, &.{}, .{});
+    defer replacement.deinit();
+    try std.testing.expectError(error.InvalidHandle, replacement.source(stale));
+}

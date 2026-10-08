@@ -1,0 +1,18 @@
+test
++- run test 2 pass, 1 fail (3 total)
+error: 'Project.test.project stale handles survive allocator address reuse without aliasing' failed:
+       preflight: test seed 1662190898 (reproduce with PREFLIGHT_TEST_SEED=1662190898)
+       expected error.InvalidHandle, found { 99, 111, 110, 115, 116, 32, 120, 32, 61, 32, 50, 59 }
+       Project.test.project stale handles survive allocator address reuse without aliasing: TestExpectedError; seed 1662190898
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:634:9: 0x104585963 in expectError__func_1181 (test)
+               return error.TestExpectedError;
+               ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/Project.zig:165:5: 0x104585e2b in test.project stale handles survive allocator address reuse without aliasing (test)
+           try std.testing.expectError(error.InvalidHandle, replacement.source(stale));
+           ^
+failed command: ./.zig-cache/o/0acc9c7ff8b39403bd329be9e14477b3/test --cache-dir=./.zig-cache --seed=0x63130532 --listen=-
+
+Build Summary: 5/7 steps succeeded (1 failed); 2/3 tests passed (1 failed)
+test transitive failure
++- run test 2 pass, 1 fail (3 total)
+
