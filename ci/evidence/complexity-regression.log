@@ -1,0 +1,67 @@
+test
++- run test 2 pass, 1 fail (3 total); 2 leaks
+error: 'File.test.front end rejects excessive nesting and expression work before std recursion' failed:
+       preflight: test seed 800014154 (reproduce with PREFLIGHT_TEST_SEED=800014154)
+       expected error.SourceTooComplex, found .{ .arena = .{ .child_allocator = .{ .ptr = anyopaque@104fbe880, .vtable = .{ ... } }, .state = .{ .used_list = .{ ... }, .free_list = null } }, .source = { 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40 }, .tree = .{ .source = { 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40 }, .tokens = .{ .ptrs = { ... }, .len = 258, .capacity = 263 }, .nodes = .{ .ptrs = { ... }, .len = 1, .capacity = 205 }, .extra_data = {  }, .mode = .zig, .errors = { .{ ... } } }, .zir = null, .status = .invalid_syntax, .comments = {  }, .lines = { 0 } }
+       File.test.front end rejects excessive nesting and expression work before std recursion: TestExpectedError; seed 800014154
+       /Users/gusto/.local/zig/0.17.0/lib/std/testing.zig:634:9: 0x104d2598f in expectError__func_1198 (test)
+               return error.TestExpectedError;
+               ^
+       /Users/gusto/work/tycho/.wt/glint-g1/src/File.zig:124:5: 0x104d25c2b in test.front end rejects excessive nesting and expression work before std recursion (test)
+           try std.testing.expectError(error.SourceTooComplex, init(a, nested, .{}));
+           ^
+       [SafeAllocator] (err): leaked [addr: 109bcc1a0, len: 5252 (0x1484) align: 8] allocated at: 
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:147:26: 0x104bde583 in rawAlloc (test)
+           return a.vtable.alloc(a.ptr, len, alignment, ret_addr);
+                                ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:311:34: 0x104bde277 in allocWithSizeAndAlignment__func_210 (test)
+           return self.allocBytesAligned(alignment, byte_count, return_address);
+                                        ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:299:89: 0x104bde0d3 in allocAdvancedWithRetAddr (test)
+           const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
+                                                                                               ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:545:51: 0x104d61423 in setCapacity (test)
+                   const new_bytes = try gpa.alignedAlloc(u8, sizes.big_align, capacityInBytes(new_capacity));
+                                                         ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:519:36: 0x104d612db in ensureTotalCapacity (test)
+                   return self.setCapacity(gpa, growCapacity(new_capacity));
+                                          ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:537:44: 0x104d61247 in ensureUnusedCapacity (test)
+                   return self.ensureTotalCapacity(gpa, self.len + additional_count);
+                                                  ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:277:42: 0x104d60ccf in append (test)
+                   try self.ensureUnusedCapacity(gpa, 1);
+                                                ^
+       (additional stack frames may have been skipped...)
+       
+       [SafeAllocator] (err): leaked [addr: 109bc4000, len: 13136 (0x3350) align: 8] allocated at 
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:147:26: 0x104bde583 in rawAlloc (test)
+           return a.vtable.alloc(a.ptr, len, alignment, ret_addr);
+                                ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:311:34: 0x104bde277 in allocWithSizeAndAlignment__func_210 (test)
+           return self.allocBytesAligned(alignment, byte_count, return_address);
+                                        ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/mem/Allocator.zig:299:89: 0x104bde0d3 in allocAdvancedWithRetAddr (test)
+           const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
+                                                                                               ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:545:51: 0x104d605a7 in setCapacity (test)
+                   const new_bytes = try gpa.alignedAlloc(u8, sizes.big_align, capacityInBytes(new_capacity));
+                                                         ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/multi_array_list.zig:519:36: 0x104d60427 in ensureTotalCapacity (test)
+                   return self.setCapacity(gpa, growCapacity(new_capacity));
+                                          ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/zig/Ast.zig:197:41: 0x104d2f247 in parseTokens (test)
+           try parser.nodes.ensureTotalCapacity(gpa, estimated_node_count);
+                                               ^
+       /Users/gusto/.local/zig/0.17.0/lib/std/zig/Ast.zig:169:23: 0x104d2edbf in parse (test)
+           return parseTokens(gpa, source, tokens_slice, options);
+                             ^
+       (additional stack frames may have been skipped...)
+       
+       preflight: failed test File.test.front end rejects excessive nesting and expression work before std recursion; seed 800014154
+failed command: ./.zig-cache/o/bce3fec93b01e8aa2c05526a928724e0/test --cache-dir=./.zig-cache --seed=0x2faf3f4a --listen=-
+
+Build Summary: 5/7 steps succeeded (1 failed); 2/3 tests passed (1 failed)
+test transitive failure
++- run test 2 pass, 1 fail (3 total); 2 leaks
+

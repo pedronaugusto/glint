@@ -115,3 +115,15 @@ test "comment parser rejects string lookalikes" {
 test "front end rejects bytes before parsing beyond the caller budget" {
     try std.testing.expectError(error.SourceTooLarge, init(std.testing.allocator, "pub const x = 1;", .{ .bytes = 4 }));
 }
+
+test "front end rejects excessive nesting and expression work before std recursion" {
+    const a = std.testing.allocator;
+    const nested = try a.alloc(u8, 257);
+    defer a.free(nested);
+    @memset(nested, '(');
+    try std.testing.expectError(error.SourceTooComplex, init(a, nested, .{}));
+    const chain = try a.alloc(u8, 1025);
+    defer a.free(chain);
+    @memset(chain, '!');
+    try std.testing.expectError(error.SourceTooComplex, init(a, chain, .{}));
+}
