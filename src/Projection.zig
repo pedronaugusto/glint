@@ -50,12 +50,17 @@ pub fn init(gpa: std.mem.Allocator, project: *const Project, budget: usize) Init
         for (file.tree.nodes.items(.tag), 0..) |tag, n| {
             const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: budgeted AST inventory.
             const ctx = try context(project, id, file.tree.nodeMainToken(node));
-            if (tag == .identifier or tag == .field_access) {
+            if (tag == .identifier or tag == .field_access or tag == .enum_literal or tag == .test_decl) {
                 if (tag == .identifier and Model.primitive(file.tree.tokenSlice(file.tree.nodeMainToken(node)))) continue;
                 const definition = try facts.definition(id, node);
                 const value = if (definition == null) try facts.resolve(id, node) else Facts.Value.scalar;
                 const unknown: ?Facts.Unknown = if (definition == null and value == .unknown) value.unknown else null;
                 try references.append(a, .{ .file = id, .node = Project.NodeId.fromRaw(@backingInt(node)), .definition = definition, .context = ctx, .unknown = unknown }); // safe: std AST node identity fits u32.
+            }
+
+            if (std.mem.eql(u8, file.tree.tokenSlice(file.tree.nodeMainToken(node)), "@field") or std.mem.eql(u8, file.tree.tokenSlice(file.tree.nodeMainToken(node)), "@hasDecl")) {
+                const definition = try facts.reflected(id, node);
+                try references.append(a, .{ .file = id, .node = Project.NodeId.fromRaw(@backingInt(node)), .definition = definition, .context = ctx, .unknown = if (definition == null) .unresolved else null }); // safe: frozen AST index.
             }
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
             const call = file.tree.fullCall(&buffer, node) orelse continue;

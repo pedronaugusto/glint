@@ -1,5 +1,6 @@
 //! Package test entry.
 test {
+    _ = @import("Token_test.zig");
     _ = @import("AegisPack_test.zig");
     _ = @import("build_gate_test.zig");
     _ = @import("glint");

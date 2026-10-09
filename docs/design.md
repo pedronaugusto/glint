@@ -1,10 +1,10 @@
 # Glint contracts
 
-Work in progress. G2 supplies source rules and projection APIs; consumer migration and the later aegis/heuristic escape pack remain separate work. Runtime closure is glint → published aegis → std. No LLVM, compiler Sema, lifetime verifier or checked-program execution is required.
+Work in progress. Glint supplies token facts, source rules and semantic projection APIs; consumers own graph and execution policy. Runtime closure is glint → published aegis → std. No LLVM, compiler Sema, lifetime verifier or checked-program execution is required.
 
 ## One immutable model
 
-`Project.init` takes explicit source bytes, opaque labels, production/test classification, selected flags and import mappings. Glint opens no paths. Snapshots own AST, std-generated ZIR, scopes, declarations, lexical references, comments and a separately identified partial lowered operation/reference index. File, node and token identities use distinct published aegis ID domains. Handles check snapshot/generation; std AST/ZIR indexes remain the compiler's own types. Checked source-byte accounting bounds construction. Queries return const storage valid until project destruction; reports and projections have separate owners and cannot be rendered against a replacement snapshot.
+`Project.init` takes explicit source bytes, opaque labels, production/test classification, selected flags and import mappings. Glint opens no paths. `Options.lowering = false` omits std AstGen and explicitly records `not_requested` lowered coverage. The default remains lowered analysis. Snapshots own AST, optional std-generated ZIR, scopes, declarations, lexical references, comments and a separately identified partial lowered operation/reference index. Declaration `node` is the variable declaration, function prototype (not its enclosing `fn_decl`), container field or capture syntax node; a parameter uses its type expression, or its function prototype when no type expression exists. `token` is always the declaration name token. Declaration/reference arrays retain std AST node-index order, not source-offset sorting. File, node and token identities use distinct published aegis ID domains. Handles check snapshot/generation; std AST/ZIR indexes remain the compiler's own types. Checked source-byte accounting bounds construction. Queries return const storage valid until project destruction; reports and projections have separate owners and cannot be rendered against a replacement snapshot.
 
 `Project.syntax`, `lowered`, `declarations`, `scopes`, `references`, `operations` and import queries expose this same model. Source-mapped ZIR calls/member operations/reflection witnesses support conservative semantic facts. Missing imports, symbolic generics, cycles, unsupported structures and exhausted budgets remain explicitly unknown. There is no heuristic fallback that upgrades unknown to deadness or an exact graph.
 
@@ -38,7 +38,7 @@ The context provides immutable checked model handles, conservative value/declara
 
 Z008 is absent. Removed Z002/Z004/Z007/Z010/Z015/Z017–Z023/Z025/Z027–Z030/Z033 remain rejected; no numeric alias or compatibility profile restores them. Breaking G2: typed public identities, rule metadata version 3, expanded explicit reviewed selection. JSON spans retain numeric file identities; JSON/SARIF and completion versions stay unchanged.
 
-One actual inline or immediately preceding `// glint-ignore: ID -- site-written reason` suppresses one logical site. Malformed/unknown/ambiguous directives fail; strings cannot be reasons. Suppressed and stale counts are separate; strict stale policy is incomplete. Safety comments satisfy the configured source obligation, not proof of safety or a measured exception. The later aegis pack must validate its five owner-approved exception classes and references when its paired types/rules are admitted; G2 introduces no speculative pack.
+One actual inline or immediately preceding `// glint-ignore: ID -- site-written reason` suppresses one logical site. Malformed/unknown/ambiguous directives fail; strings cannot be reasons. Suppressed and stale counts are separate; strict stale policy is incomplete. Safety comments satisfy the configured source obligation, not proof of safety or a measured exception. The aegis pack validates its five documented exception classes and references; suppression cannot erase undecided coverage.
 
 Operation and lexical-witness indexes scale with the bounded AST/ZIR inventory. Dead-private usage is computed once per project: one token/declaration witness index, retained-scope marks and one expansion over declarations and their scope ancestors. Resolution is shared and budgeted; unsupported work remains coverage. Projection owns a separate walk/output over the same frozen model, without reparsing. These are architecture cost bounds, not latency guarantees.
 
@@ -52,39 +52,47 @@ Standalone exit classes remain 0 complete/clean, 1 complete/findings, 2 incomple
 
 The build helper invokes the compiled linter through a build-only caller, with an unpredictable nonce and private scratch receipt. It verifies the unchanged receipt against child exit and captured JSON before accepting report-only diagnostics. Gate findings fail the build; every incomplete/signal/malformed/truncated/output failure fails independently of accepted findings. Receipt cleanup is best effort after consumption. It never treats a clean allowed-finding list as completed analysis.
 
+## Two fact tiers
+
+`dependency.module("glint_token")` exports the `Token.zig` API independently of aegis, AST, ZIR and semantic module mappings. `glint.Token` exports the same API from the full module. `scan(arena, bytes, observer)` copies a zero sentinel; `scanSentinel(arena, sentinel_bytes, observer)` borrows the caller's source. Fact arrays and decoded spellings live in the caller's arena, and unescaped spellings borrow source bytes. The caller keeps both alive until all facts are consumed.
+
+Fast facts include literal imports, direct member spellings, simple private `const`/`var` import aliases, named test targets, ranges and conservative lazy declaration liveness. No import mapping is needed to recover a literal spelling. Computed import operands are explicit `unsupported` facts. A spelling is never promoted to a resolved declaration or type identity. Base imports appear in source order, with a direct member immediately after its base; alias-member uses follow in source order. Test ranges are disjoint, ordered inclusive byte offsets. The optional observer receives token prefixes for caller-owned token policies; ordinary graph scans retain no public token array. Invalid literals, allocation failure and input limits are returned errors, never clean coverage.
+
+Semantic callers construct `Project` only when they need ownership, declaration or call facts. Named test targets and literal `@field`/`@hasDecl` references are indexed. An untyped declaration literal retains conservative lexical liveness but its semantic identity remains explicitly unknown. Actual lexical aliases of `@import("builtin")` classify positive test arms and negated else arms; an unrelated value named `builtin` does not. Missing mappings remain required semantic coverage rather than blocking literal token facts. Source rejection (including a truncated UTF-8 character literal), absent required lowering and budget exhaustion cannot satisfy a semantic gate.
+
 ## Projection and adopter handoff
 
-`Projection.init` owns imports, resolved references/calls, actual call ZIR witnesses and production/test/comptime/may-be-production contexts from the same snapshot. Escaped literals, named mappings, nested tests, reexports and lazy source retain their importing-use context. Unknown imports/calls make `complete` false; reference-level unknowns are separately explicit and consumers must reject any required unresolved reference. This is a conservative source projection, not an exact evaluated dependency graph.
+`Projection.init` owns imports, resolved references/calls, actual call ZIR witnesses and production/test/comptime/may-be-production contexts from the same snapshot. Escaped literals, named mappings, nested tests, reexports and lazy source retain their importing-use context. Unknown imports/calls make `complete` false; reference-level unknowns are separately explicit and consumers must reject any required unresolved reference. This is a conservative source projection, not an exact evaluated dependency graph. File identities follow input order; projection arrays follow that file order and standard AST node-index order. They do not promise source-offset sorting.
 
-Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks.
+Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks. Embedded public-module tests import no shakedown; fault/allocation drivers belong to the package test root. Preflight adoption is externally owned: pin the published Glint main, use the full module for compiled rules and the completion/build-helper contract, and use `glint_token` for token facts. Glint pins green Preflight `e80b9a631956b1b7b7a7c6ebc69ec7e495ad623d` and Shakedown `e99eccb269dfeeb4569bce843743ec80c6e094c3` for its own CI/tests.
 
-Published aegis `313e0a81a497fdec936ba7462e872fb300f5881c` supplies glint's typed IDs and checked byte counts, and the published operation contracts used by the optional G3 pack. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. SecretBytes is published at this pin; unfinished Choice/Order/Confined/own/bounded/scope branches are excluded. The pack uses AST/std ZIR heuristics; no verifier is pursued.
+Published aegis `a5d17d0f346d8edacce34b86eea953eb096931da` supplies glint's typed IDs and checked byte counts, and the published operation contracts used by the optional G3 pack. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. SecretBytes is published at this pin; unfinished Choice/Order/Confined/own/bounded/scope branches are excluded. The pack uses AST/std ZIR heuristics; no verifier is pursued.
 
 
 ## Published aegis reports (G3)
 
 The optional `AegisPack.rules` uses the public compiled-rule API. The standalone CLI registers
 its IDs but never enables them by default; select `--enable A001` (through A005), or pass
-report selections and the pack descriptors to `runConfigured`. Gate selection is rejected.
+report or gate selections and the pack descriptors to `runConfigured`. Explicit gate selection is accepted; an undecided required site still makes execution incomplete.
 Generic defaults, Z026/Z012 reports and the deferred D001 admission are unchanged.
 
 The rule context caches `sourceDigest(file)` once per immutable source per run, with caller-owned
 scratch lifetime and handle validation. Operation contracts share that identity without global caches.
 Recognition follows lexical declarations, explicit module mappings and exact source digests of
-published aegis `313e0a81a497fdec936ba7462e872fb300f5881c`. It covers Secret, SecretBytes,
+published aegis `a5d17d0f346d8edacce34b86eea953eb096931da`. It covers Secret, SecretBytes,
 Guarded/Guard, ids, units and integer factories; it does not infer a secret or lock from a name.
 Copies of template/type aliases are excluded. Code changed from that operation contract is
 unrecognized. A clean run does not establish security, ownership or complete coverage.
 
 | ID/version | Obligation and supported report predicate | Prevention limit |
 |---|---|---|
-| A001/1 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
-| A002/1 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases/type aliases excluded; lifetimes, live status, retained callers and field copies are undecided. |
-| A003/1 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. | Only straight-line direct cleanup/defer/address discard. Other calls, error exits, transfers, branches, loops and aliases are undecided. No missing-errdefer allegation from proximity. |
-| A004/1 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
-| A005/1 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free. Every recognized adoption records that uncertainty. |
+| A001/2 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
+| A002/2 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases/type aliases excluded; lifetimes, live status, retained callers and field copies are undecided. |
+| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. | Only straight-line direct cleanup/defer/address discard. Other calls, error exits, transfers, branches, loops and aliases are undecided. No missing-errdefer allegation from proximity. |
+| A004/2 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
+| A005/2 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free. Every recognized adoption records that uncertainty. |
 
-Each selected rule records its unsupported generic/reflection/hook/alias/interprocedural coverage.
+Required unknown receivers and unsupported acquisition/cleanup or adoption sites record undecided coverage. General prevention limits describe the rule boundary; they are not unconditional per-file incompleteness.
 Front-end rejection and budget exhaustion still make execution incomplete independently of
 findings acceptance. The exact published implementation files are safe-type internals by declaration
 identity; other source requires the same explicit site policy as consumers. Wiping inline padding
@@ -97,8 +105,7 @@ Accepted categories are `no-danger`, `design`, `measured-boundary`, `safe-type-i
 `c-os-boundary`. Both a nonempty reference and written reason are required; the comment does
 not prove either. Suppression cannot erase undecided coverage or certify incomplete execution.
 
-These are configurable exploratory reports, pending real-corpus bug admission and consumer
-adoption. No new correctness gate follows from synthetic fixtures or zero production hits.
+These are explicitly adopted operation checks. Gate selection does not claim general security, flow or lifetime proof, and generic defaults remain unchanged.
 Raw unadopted secrets/locks/domain integers are outside recognized declaration identity; a general
 raw replacement rule needs evidence of actual danger, operation effects and complete triage first.
 Unpublished constant-time Choice/Order/Confined/bounded/own/scope contracts are excluded.

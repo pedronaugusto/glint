@@ -1,0 +1,97 @@
+[
+  {
+    "repo": "strand",
+    "sha": "857565788e597fdf91a82505349e9dc95b81ecd8",
+    "files": 67
+  },
+  {
+    "repo": "chronicle",
+    "sha": "84f998ccf6232988be54cd9fa0b543d0d3baab20",
+    "files": 21
+  },
+  {
+    "repo": "conduit",
+    "sha": "9285ab037ab505db9f58c5ed5145944367ab58b2",
+    "files": 67
+  },
+  {
+    "repo": "morse",
+    "sha": "01a971d526f351e7ea001c8a3dea1d55ef0751d1",
+    "files": 39
+  },
+  {
+    "repo": "lookout",
+    "sha": "1efb14692f7f6e764afaadd2e658088c009c6457",
+    "files": 52
+  },
+  {
+    "repo": "visor",
+    "sha": "bf0a44e4d58294172c9f005ee52b787b531071ca",
+    "files": 80
+  },
+  {
+    "repo": "relic",
+    "sha": "67077cb2293a8ce3489da007186bc2964e4ef3d9",
+    "files": 287
+  },
+  {
+    "repo": "gantry",
+    "sha": "42b0db74234827b95f28ce95a59afee80e66d4bd",
+    "files": 94
+  },
+  {
+    "repo": "preflight",
+    "sha": "e80b9a631956b1b7b7a7c6ebc69ec7e495ad623d",
+    "files": 60
+  },
+  {
+    "repo": "airlock",
+    "sha": "2353ec6a8ea4e44338a6e806da104d5200806055",
+    "files": 30
+  },
+  {
+    "repo": "sweep",
+    "sha": "9b85ef76542a28903851bfe33e876f542b48147a",
+    "files": 60
+  },
+  {
+    "repo": "parallax",
+    "sha": "d3a176b3ae371efa67beee4c6c05d2c02ef16df9",
+    "files": 47
+  },
+  {
+    "repo": "uplink",
+    "sha": "04e8155cdfbd201090c96be472a842bf858090be",
+    "files": 75
+  },
+  {
+    "repo": "warp",
+    "sha": "491e62b865e27e296509fbc7bba1f392f224f565",
+    "files": 123
+  },
+  {
+    "repo": "reactor",
+    "sha": "46f6da8cba6b20ac3bc8e4cd6cba1d35861f19e4",
+    "files": 110
+  },
+  {
+    "repo": "shakedown",
+    "sha": "e99eccb269dfeeb4569bce843743ec80c6e094c3",
+    "files": 76
+  },
+  {
+    "repo": "aegis",
+    "sha": "a5d17d0f346d8edacce34b86eea953eb096931da",
+    "files": 93
+  },
+  {
+    "repo": "glint",
+    "sha": "fbe7bb7405c0164837258588c97a684329f13be6",
+    "files": 39
+  },
+  {
+    "repo": "cloak",
+    "sha": "e2d98e19d5a221a7285eaa854256491e28af8148",
+    "files": 108
+  }
+]

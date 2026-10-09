@@ -1,4 +1,4 @@
-//! Optional report-only published-type obligations. No security or lifetime proof.
+//! Optional explicitly adopted published-type obligations. No security or lifetime proof.
 const std = @import("std");
 const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
@@ -12,28 +12,25 @@ pub const cleanup: Rule = @fromBackingInt(@intCast(1102)); // safe: compiled pac
 pub const scalar: Rule = @fromBackingInt(@intCast(1103)); // safe: compiled pack identities are reserved stable u16 values.
 pub const capacity: Rule = @fromBackingInt(@intCast(1104)); // safe: compiled pack identities are reserved stable u16 values.
 pub const rules = [_]Context.Rule{
-    .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .report_only = true, .exception = .aegis }, .check = checkAccess },
-    .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .report_only = true, .exception = .aegis }, .check = checkCopies },
-    .{ .definition = .{ .id = cleanup, .name = "A003", .group = .family_policy, .purpose = "missing owner cleanup or use after cleanup/transfer on a supported local path", .report_only = true, .exception = .aegis }, .check = checkCleanup },
-    .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .report_only = true, .exception = .aegis }, .check = checkScalar },
-    .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .report_only = true, .exception = .aegis }, .check = checkCapacity },
+    .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
+    .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },
+    .{ .definition = .{ .id = cleanup, .name = "A003", .group = .family_policy, .purpose = "missing owner cleanup or use after cleanup/transfer on a supported local path", .version = 2, .exception = .aegis }, .check = checkCleanup },
+    .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .version = 2, .exception = .aegis }, .check = checkScalar },
+    .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .version = 2, .exception = .aegis }, .check = checkCapacity },
 };
 fn internal(c: *Context) Context.Error!bool {
     return try Contract.source(c, c.file) != null;
 }
-fn limits(c: *Context, rule: Rule) Context.Error!void {
-    try c.undecided(rule, 0, .unsupported, "published-source identities and direct AST shapes over std ZIR only; generic evaluation, reflection, hooks, retained aliases and interprocedural flow remain undecided");
-}
 fn checkAccess(c: *Context) Context.Error!void {
     if (try internal(c)) return;
-    try limits(c, access);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .field_access) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
         const data = tree.nodeData(node).node_and_token;
-        const k = (try Contract.owner(c, data[0])) orelse continue;
         const name = tree.tokenSlice(data[1]);
+        if (!backingName(name)) continue;
+        const k = (try requiredOwner(c, data[0], access, data[1])) orelse continue;
         const backing = switch (k) {
             .secret => std.mem.eql(u8, name, "material"),
             .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
@@ -44,16 +41,28 @@ fn checkAccess(c: *Context) Context.Error!void {
         if (backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
 }
+fn backingName(name: []const u8) bool {
+    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "owner" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
+    if (try Contract.owner(c, node)) |k| return k;
+    const value = try c.facts.resolve(c.file, node);
+    if (value == .unknown) {
+        const tree = try c.project.syntax(try c.source());
+        try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
+    }
+    return null;
+}
 fn checkCopies(c: *Context) Context.Error!void {
     if (try internal(c)) return;
-    try limits(c, copies);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
             if (tree.nodeTag(init) != .identifier) continue;
-            const k = (try Contract.owner(c, init)) orelse continue;
+            const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
             if (k != .scalar) {
                 if (!try ownedValue(c, init, 0)) continue;
                 try c.at(copies, tree.nodeMainToken(node), "copy of a recognized live owner/capability requires explicit transfer; lifetime and publication are undecided");
@@ -70,6 +79,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     const tree = try c.project.syntax(try c.source());
     const index = Contract.local(c, node) orelse return false;
     const decl = c.project.models[c.file.raw()].declarations[index];
+    if (decl.kind == .parameter) return tree.fullPtrType(decl.node) == null and try Contract.owner(c, decl.node) != null;
     const v = tree.fullVarDecl(decl.node) orelse return false;
     if (v.ast.type_node.unwrap()) |t| {
         if (tree.fullPtrType(t) != null) return false;
@@ -92,13 +102,13 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const call = tree.fullCall(&buffer, node) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const k = (try Contract.owner(c, data[0])) orelse return false;
     const name = tree.tokenSlice(data[1]);
+    if (!std.mem.eql(u8, name, "expose") and !std.mem.eql(u8, name, "exposeMut") and !std.mem.eql(u8, name, "value")) return false;
+    const k = (try requiredOwner(c, data[0], copies, data[1])) orelse return false;
     return ((k == .secret or k == .bytes) and (std.mem.eql(u8, name, "expose") or std.mem.eql(u8, name, "exposeMut"))) or (k == .guard and std.mem.eql(u8, name, "value"));
 }
 fn checkCleanup(c: *Context) Context.Error!void {
     if (try internal(c)) return;
-    try limits(c, cleanup);
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
     for (model.declarations) |decl| {
@@ -112,7 +122,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
         const operation = tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]);
         if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !std.mem.eql(u8, operation, "acquire")) continue;
-        const k = (try Contract.owner(c, acquisition)) orelse continue;
+        const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (k != .secret and k != .bytes and k != .guard) continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, model.scopes[decl.scope].node) orelse continue;
@@ -172,11 +182,11 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const call = tree.fullCall(&buffer, node) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 0) return false;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    return std.mem.eql(u8, tree.tokenSlice(data[1]), "raw") and try Contract.owner(c, data[0]) == .scalar;
+    if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "raw")) return false;
+    return try requiredOwner(c, data[0], scalar, data[1]) == .scalar;
 }
 fn checkScalar(c: *Context) Context.Error!void {
     if (try internal(c)) return;
-    try limits(c, scalar);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
@@ -197,7 +207,6 @@ fn checkScalar(c: *Context) Context.Error!void {
 }
 fn checkCapacity(c: *Context) Context.Error!void {
     if (try internal(c)) return;
-    try limits(c, capacity);
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
@@ -205,7 +214,8 @@ fn checkCapacity(c: *Context) Context.Error!void {
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "adopt") or try Contract.owner(c, data[0]) != .bytes or call.ast.params.len != 3) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "adopt") or call.ast.params.len != 3) continue;
+        if (try requiredOwner(c, data[0], capacity, data[1]) != .bytes) continue;
         if (tree.fullSlice(call.ast.params[1])) |slice| {
             if (slice.ast.end.unwrap() != null) try c.at(capacity, tree.nodeMainToken(node), "SecretBytes.adopt receives an explicitly bounded slice: full allocator capacity/exclusive ownership must be retained; extent is undecided");
         }

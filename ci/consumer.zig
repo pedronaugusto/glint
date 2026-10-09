@@ -1,7 +1,12 @@
 const std = @import("std");
 const glint = @import("glint");
+const token = @import("glint_token");
 
 pub fn main() !void {
+    var tokens = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer tokens.deinit();
+    const facts = try token.scan(tokens.allocator(), "pub const d = @import(\"unmapped\").read;", null);
+    if (facts.imports.len != 2 or !std.mem.eql(u8, facts.imports[0].name, "unmapped")) return error.MissingTokenFact;
     var project = try glint.Project.init(std.heap.page_allocator, &.{.{ .name = "consumer", .bytes = "const dependency = @import(\"dependency\");" }}, &.{}, .{});
     defer project.deinit();
     const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: the fixture creates source zero.

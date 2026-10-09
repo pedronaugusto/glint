@@ -22,6 +22,10 @@ pub const Comment = struct { start: u32, end: u32, line: u32 };
 pub const InitError = std.mem.Allocator.Error || error{ SourceTooLarge, SourceTooComplex };
 
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError!File {
+    return initWithLowering(gpa, bytes, limits, true);
+}
+
+pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits, lower: bool) InitError!File {
     if (bytes.len > limits.bytes or bytes.len > std.math.maxInt(u32)) return error.SourceTooLarge;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -33,7 +37,9 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError
     var zir: ?std.zig.Zir = null;
     if (bytes.len > limits.bytes or tree.nodes.len > limits.nodes) {
         status = .budget_exhausted;
-    } else if (status == .parsed) {
+    } else if (status == .parsed and !safeCharacters(&tree)) {
+        status = .invalid_lowering;
+    } else if (status == .parsed and lower) {
         zir = try std.zig.AstGen.generate(a, tree);
         if (zir.?.hasCompileErrors()) status = .invalid_lowering;
         if (zir.?.instructions.len > limits.instructions) status = .budget_exhausted;
@@ -45,6 +51,18 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError
     };
     const comment_list = try scanComments(a, source, lines.items);
     return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = try lines.toOwnedSlice(a), .comments = comment_list };
+}
+
+// std's char-literal lowering assumes a complete UTF8 sequence. Check its
+// exact token operands before calling AstGen, including parser-accepted cut bytes.
+fn safeCharacters(tree: *const std.zig.Ast) bool {
+    for (tree.tokens.items(.tag), 0..) |tag, i| {
+        if (tag != .char_literal) continue;
+        const raw = tree.tokenSlice(@intCast(i)); // safe: bounded AST token inventory.
+        if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return false;
+        if (raw[1] != '\\' and !std.unicode.utf8ValidateSlice(raw[1 .. raw.len - 1])) return false;
+    }
+    return true;
 }
 
 fn sourceComplexity(source: [:0]const u8, limits: Limits) InitError!void {
@@ -158,4 +176,11 @@ test "front end rejects excessive nesting and expression work before std recursi
     defer a.free(chain);
     @memset(chain, '!');
     try std.testing.expectError(error.SourceTooComplex, init(a, chain, .{}));
+}
+
+test "morning cut UTF8 character literal never reaches unsafe std lowering" {
+    const bytes = "const c = '\xe2';";
+    var file = try init(std.testing.allocator, bytes, .{});
+    defer file.deinit();
+    try std.testing.expect(file.status != .parsed);
 }

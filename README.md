@@ -55,7 +55,7 @@ The caller supplies bytes, opaque file identities, diagnostic labels, classifica
 
 ## Diagnostics and suppression
 
-Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for resolved deprecation checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic.
+Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for resolved deprecation checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic. Literal dependency scans can use the independent `glint_token` module; semantic users opt into `Project`. See [the two fact tiers](docs/design.md#two-fact-tiers).
 
 ```zig
 // glint-ignore: Z013 -- reserved import retained for this documented migration
@@ -66,7 +66,7 @@ One real comment suppresses one rule at one logical site, either inline or immed
 
 ## Limits and ownership
 
-std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Naming rules use known value kinds; computed and unmapped facts remain coverage. Established external ABI function names are preserved. Escape analysis and the aegis rule pack await later admission; no safety proof is claimed.
+std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Naming rules use known value kinds; computed and unmapped facts remain coverage. Established external ABI function names are preserved. Escape analysis remains pending. Adopted aegis operation checks accept explicit gates with required unknown sites incomplete; no safety proof is claimed.
 
 Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint exposes the shared rule and projection APIs; consumer writers own adoption. [Design and handoff](docs/design.md) specify exact policy/configuration, compiled-rule helpers, completion and dependency order. Remaining coverage is explicit in the design.
 
@@ -74,11 +74,11 @@ Gantry owns path dialect and cross-file architecture policy. Preflight orchestra
 
 Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=review`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
-`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Measurement rows live beside their driver in private trials. No speed guarantee is claimed.
+`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token driver, frozen corpus pins and alternating rows are in `bench/`; [token costs](docs/token-costs.md) record exact parity and the remaining corpus speed miss. No speed guarantee is claimed.
 
 MIT. See [LICENSE](LICENSE).
 
 G3 adds optional exploratory aegis reports A001–A005 for the published Secret, SecretBytes,
-Guarded, id, units and integer contracts. Select them explicitly; gates are rejected.
+Guarded, id, units and integer contracts. Select reports or gates explicitly; required unknown sites remain incomplete.
 Work remains in progress: generic/flow coverage, real-defect admission and consumer adoption
 are incomplete. See [design](docs/design.md#published-aegis-reports-g3).

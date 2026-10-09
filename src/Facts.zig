@@ -78,7 +78,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
     const model = &self.project.models[index];
     const tag = tree.nodeTag(node);
     switch (tag) {
-        .identifier => {
+        .identifier, .test_decl => {
             const ref = model.reference(node) orelse return .{ .unknown = .unresolved };
             if (ref.declaration) |decl| return self.declaration(.{ .file = file, .index = decl });
             const name = tree.tokenSlice(ref.token);
@@ -103,7 +103,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         .error_union => return .{ .error_union = try self.boxed(try self.resolve(file, tree.nodeData(node).node_and_node[1])) },
         .error_set_decl, .merge_error_sets => return .error_set,
-        .number_literal, .string_literal, .char_literal, .enum_literal => return .scalar,
+        .enum_literal => return .{ .unknown = .comptime_dependent },
+        .number_literal, .string_literal, .char_literal => return .scalar,
         else => {},
     }
     if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
@@ -229,7 +230,7 @@ pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl 
 
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    if (tree.nodeTag(node) == .identifier) {
+    if (tree.nodeTag(node) == .identifier or tree.nodeTag(node) == .test_decl) {
         const ref = self.project.models[file.raw()].reference(node) orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
         return if (ref.declaration) |decl| .{ .file = file, .index = decl } else null;
     }

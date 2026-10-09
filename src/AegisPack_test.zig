@@ -78,10 +78,13 @@ test "aegis pack local end without cleanup contrasts deferred owner" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.cleanup)); // safe: fixture count is representable.
 }
-test "aegis pack rejects gates and uncategorized exceptions" {
+test "aegis pack accepts adopted gates and rejects uncategorized exceptions" {
     var project = try fixture("const S = @import(\"secret\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }");
     defer project.deinit();
-    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &project, .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules }));
+    var gated = try glint.runConfigured(std.testing.allocator, &project, .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer gated.deinit();
+    try std.testing.expect(gated.complete);
+    try std.testing.expectEqual(glint.Config.Level.gate, gated.diagnostics[0].level);
     var invalid = try fixture("const S = @import(\"secret\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // glint-ignore: A001 -- test\n");
     defer invalid.deinit();
     try std.testing.expectError(error.MalformedSuppression, glint.runConfigured(std.testing.allocator, &invalid, config, .{ .project_rules = &pack.rules }));
@@ -108,13 +111,15 @@ test "aegis pack unrelated spelling and explicit exposure do not allege backing 
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.copies)); // safe: fixture count is representable.
 }
 
-test "aegis pack report acceptance never completes invalid input or accepts file gates" {
+test "aegis pack report acceptance never completes invalid input even with file gates" {
     var project = try fixture("pub fn bad() void { const broken = ; }");
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(!report.complete);
-    try std.testing.expectError(error.InvalidSelection, glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules, .files = &.{.{ .file = P.FileId.fromRaw(0), .config = .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} } }} }));
+    var gated = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules, .files = &.{.{ .file = P.FileId.fromRaw(0), .config = .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} } }} });
+    defer gated.deinit();
+    try std.testing.expect(!gated.complete);
 }
 
 test "aegis pack direct cleanup twice and use after cleanup have local witnesses" {
@@ -140,4 +145,67 @@ test "aegis pack type factory is not acquisition and repeated defers have witnes
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 2), count(report, pack.cleanup)); // safe: two explicit repeated cleanup witnesses, no type-template obligation.
     for (report.diagnostics) |d| try std.testing.expect(d.span.line != 2);
+}
+
+test "morning adopted aegis gate accepts selection and preserves finding levels" {
+    var project = try fixture("const S = @import(\"secret\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }");
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one direct backing access.
+    try std.testing.expectEqual(glint.Config.Level.gate, report.diagnostics[0].level);
+}
+
+test "morning adopted scalar gate reports bypasses and blocks unresolved receivers" {
+    var project = try fixture("const Checked = @import(\"ints\").Checked; pub fn f() void { const v = Checked(u32).init(1); _ = v.raw() + 2; }");
+    defer project.deinit();
+    const gated: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, gated, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one raw arithmetic bypass.
+    try std.testing.expectEqual(glint.Config.Level.gate, report.diagnostics[0].level);
+    var unknown = try fixture("pub fn f(v: anytype) void { _ = v.raw() + 2; }");
+    defer unknown.deinit();
+    var incomplete = try glint.runConfigured(std.testing.allocator, &unknown, gated, .{ .project_rules = &pack.rules });
+    defer incomplete.deinit();
+    try std.testing.expect(!incomplete.complete);
+}
+
+test "adopted gates retain unresolved obligations and known unrelated receivers" {
+    const cases = .{
+        .{ pack.access, "pub fn f(v: anytype) void { _ = v.material; }" },
+        .{ pack.copies, "pub fn f(v: anytype) void { const copy = v; _ = copy; }" },
+        .{ pack.copies, "pub fn f(v: anytype) *const u32 { return v.expose(); }" },
+        .{ pack.cleanup, "pub fn f(T: type) void { var v = T.init(1); _ = &v; }" },
+        .{ pack.capacity, "pub fn f(T: type, gpa: anytype, bytes: []u8) void { _ = T.adopt(gpa, bytes, 0); }" },
+    };
+    inline for (cases) |case| {
+        var project = try fixture(case[1]);
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expect(!report.complete);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: unresolved ownership records coverage rather than an allegation.
+    }
+    var plain = try fixture("const Plain = struct { material: u32 }; pub fn f(v: Plain) void { _ = v.material; }");
+    defer plain.deinit();
+    var clean = try glint.runConfigured(std.testing.allocator, &plain, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer clean.deinit();
+    try std.testing.expect(clean.complete);
+    try std.testing.expectEqual(@as(usize, 0), clean.diagnostics.len); // safe: resolved unrelated containers carry no published operation obligation.
+}
+
+test "owner value parameter copy differs from borrowed pointer alias" {
+    var project = try fixture(
+        \\const S = @import("secret").Secret;
+        \\pub fn value(v: S(u32)) void { const copy = v; _ = copy; }
+        \\pub fn borrow(v: *S(u32)) void { const alias = v; _ = alias; }
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.copies, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the value copy is the sole ownership witness.
+    try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line); // safe: the fixture value-copy line fits u32.
 }

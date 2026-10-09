@@ -5,8 +5,10 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
     const aegis = aegis_dependency.module("aegis");
+    const token_module = b.addModule("glint_token", .{ .root_source_file = b.path("src/Token.zig"), .target = target, .optimize = optimize });
     const module = b.addModule("glint", .{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("aegis", aegis);
+    module.addImport("glint_token", token_module);
     const cli_module = b.addModule("glint_cli", .{ .root_source_file = b.path("src/cli.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis", .module = aegis } } });
 
     const executable = b.addExecutable(.{ .name = "glint", .root_module = b.createModule(.{
@@ -28,7 +30,6 @@ pub fn build(b: *std.Build) !void {
     var needed: error{LazyDependencyNeeded}!void = {};
     if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |dep| {
         tests.root_module.addImport("shakedown", dep.module("shakedown"));
-        module.addImport("shakedown", dep.module("shakedown"));
     } else |err| needed = err;
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
     test_step.dependOn(&b.addRunArtifact(tests).step);
@@ -58,6 +59,11 @@ pub fn build(b: *std.Build) !void {
             b.path("src/Project.zig"),
             b.path("src/Projection.zig"),
             b.path("src/Projection_test.zig"),
+            b.path("src/Token.zig"),
+            b.path("src/Token/liveness.zig"),
+            b.path("src/Token/store.zig"),
+            b.path("src/Token/data.zig"),
+            b.path("src/Token_test.zig"),
             b.path("src/Report.zig"),
             b.path("src/Result.zig"),
             b.path("src/Rule.zig"),
@@ -97,13 +103,14 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         } });
-        preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig"), .packages = &.{aegis_dependency} });
+        preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig"), .modules = &.{ "glint", "glint_token" }, .packages = &.{aegis_dependency} });
     }
     return needed;
 }
 
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const module = b.createModule(.{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
+    module.addImport("glint_token", b.createModule(.{ .root_source_file = b.path("src/Token.zig"), .target = target, .optimize = optimize }));
     module.addImport("aegis", b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
     const secret_source = b.createModule(.{ .root_source_file = b.dependency("aegis", .{ .target = target, .optimize = optimize }).path("src/Secret.zig"), .target = target });
     return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis-secret", .module = secret_source } }) catch @panic("OOM");

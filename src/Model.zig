@@ -18,7 +18,7 @@ unknown_references: usize,
 /// Import expressions indexed once for repeated coverage queries.
 import_nodes: []const Ast.Node.Index,
 /// The std-ZIR reference index is partial; lexical references remain a separate query.
-lowered_coverage: enum { partial, invalid_front_end, budget_exhausted },
+lowered_coverage: enum { partial, not_requested, invalid_front_end, budget_exhausted },
 
 pub const Kind = enum { file, container, function, block, branch, loop, @"test", @"comptime" };
 pub const Scope = struct {
@@ -44,7 +44,7 @@ pub const Reference = struct {
     token: Ast.TokenIndex,
     node: Ast.Node.Index,
     declaration: ?u32,
-    unknown: ?enum { primitive, unresolved, invalid_lowering, before_declaration } = null,
+    unknown: ?enum { primitive, unresolved, invalid_lowering, before_declaration, literal_context } = null,
 };
 pub const Operation = struct {
     instruction: std.zig.Zir.Inst.Index,
@@ -78,7 +78,7 @@ pub fn init(file: *File) InitError!Model {
     var lowered: std.ArrayList(LoweredDeclaration) = .empty;
     // AstGen can leave uninitialized declaration payloads after rejection.
     // Preserve the failed frontend and never inspect that partial instruction stream.
-    if (file.status == .parsed) for (file.zir.?.instructions.items(.tag), 0..) |tag, index| {
+    if (file.status == .parsed and file.zir != null) for (file.zir.?.instructions.items(.tag), 0..) |tag, index| {
         const zir = file.zir.?;
         if (tag != .declaration) continue;
         const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index)); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
@@ -98,7 +98,7 @@ pub fn init(file: *File) InitError!Model {
     const node_operations = try a.alloc(?u32, tree.nodes.len);
     @memset(node_operations, null);
     var operations: std.ArrayList(Operation) = .empty;
-    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .operations = &.{}, .node_operations = node_operations, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status == .parsed) .partial else .invalid_front_end };
+    var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .operations = &.{}, .node_operations = node_operations, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status != .parsed) .invalid_front_end else if (file.zir == null) .not_requested else .partial };
     var references: std.ArrayList(Reference) = .empty;
     var import_nodes: std.ArrayList(Ast.Node.Index) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
@@ -107,13 +107,16 @@ pub fn init(file: *File) InitError!Model {
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) try import_nodes.append(a, node),
             else => {},
         }
-        if (tag != .identifier) continue; // safe: std node/token/instruction indexes and bounded table lengths fit u32.
-        const token = tree.nodeMainToken(node);
+        if (tag != .identifier and tag != .enum_literal and tag != .test_decl) continue; // safe: std node/token/instruction indexes and bounded table lengths fit u32.
+        const token = if (tag == .test_decl) tree.nodeData(node).opt_token_and_node[0].unwrap() orelse continue else tree.nodeMainToken(node);
+        if (tree.tokenTag(token) != .identifier) continue;
         const name = try identifier(a, tree.tokenSlice(token));
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
         const decl = model.lookup(token_scopes[token], name, token);
         var ref_record: Reference = .{ .token = token, .node = node, .declaration = decl };
+        if (tag == .enum_literal) ref_record.unknown = .literal_context;
         if (decl) |d| model.declarations[d].references += 1 else {
+            if (tag == .enum_literal) continue;
             ref_record.unknown = if (primitive(name)) .primitive else .unresolved;
             if (ref_record.unknown.? != .primitive) model.unknown_references += 1;
         }
@@ -122,7 +125,7 @@ pub fn init(file: *File) InitError!Model {
     }
     model.references = references.items;
     model.import_nodes = import_nodes.items;
-    if (file.status == .parsed) {
+    if (file.status == .parsed and file.zir != null) {
         var zir_refs: std.ArrayList(LoweredReference) = .empty;
         const visited = try a.alloc(bool, file.zir.?.instructions.len);
         @memset(visited, false);
@@ -135,7 +138,69 @@ pub fn init(file: *File) InitError!Model {
         model.operations = operations.items;
         for (operations.items, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i); // safe: bounded std index inventory.
     }
+
+    try classifyTests(a, tree, &model);
     return model;
+}
+
+fn classifyTests(a: std.mem.Allocator, tree: *const Ast, model: *Model) InitError!void {
+    for (model.scopes) |*scope| {
+        if (scope.kind != .branch) continue;
+        var parent = model.node_parents[@backingInt(scope.node)]; // safe: frozen scope AST node.
+        while (parent) |node| {
+            if (tree.fullIf(node)) |condition| {
+                const polarity = try testCondition(a, tree, model, condition.ast.cond_expr, 0) orelse break;
+                if ((polarity and scope.node == condition.ast.then_expr) or (!polarity and condition.ast.else_expr.unwrap() == scope.node)) scope.kind = .@"test";
+                break;
+            }
+            parent = model.node_parents[@backingInt(node)]; // safe: frozen AST parent table.
+        }
+    }
+}
+
+// Only a real builtin import (possibly through lexical aliases) establishes test context.
+fn testCondition(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!?bool {
+    if (depth >= 32) return null;
+    switch (tree.nodeTag(node)) {
+        .bool_not => return if (try testCondition(a, tree, model, tree.nodeData(node).node, depth + 1)) |v| !v else null,
+        .grouped_expression => return testCondition(a, tree, model, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"comptime" => return testCondition(a, tree, model, tree.nodeData(node).node, depth + 1),
+        .field_access => {
+            const data = tree.nodeData(node).node_and_token;
+            if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "is_test")) return null;
+            return if (try builtinAlias(a, tree, model, data[0], depth + 1)) true else null;
+        },
+        else => return null,
+    }
+}
+fn builtinAlias(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!bool {
+    if (depth >= 32) return false;
+    if (tree.nodeTag(node) == .identifier) {
+        const ref = model.reference(node) orelse return false;
+        const d = ref.declaration orelse return false;
+        const v = tree.fullVarDecl(model.declarations[d].node) orelse return false;
+        return if (v.ast.init_node.unwrap()) |init_node| builtinAlias(a, tree, model, init_node, depth + 1) else false;
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args: []const Ast.Node.Index = switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            const pair = tree.nodeData(node).opt_node_and_opt_node;
+            var count: usize = 0;
+            inline for (pair) |arg| if (arg.unwrap()) |n| {
+                buffer[count] = n;
+                count += 1;
+            };
+            break :blk buffer[0..count];
+        },
+        .builtin_call, .builtin_call_comma => tree.extraDataSlice(tree.nodeData(node).extra_range, Ast.Node.Index),
+        else => return false,
+    };
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import") or args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return false;
+    const value = std.zig.string_literal.parseAlloc(a, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return std.mem.eql(u8, value, "builtin");
 }
 
 fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.Index {
@@ -413,11 +478,11 @@ pub fn primitive(name: []const u8) bool {
     }).has(name);
 }
 
-test "binding resolves declarations rather than fields or strings" {
+test "binding distinguishes strings and conservatively retains declaration literals" {
     var file = try File.init(std.testing.allocator, "const unused = @import(\"unused\"); const used = @import(\"used\"); pub fn f() void { _ = used; _ = .unused; _ = \"unused\"; }", .{});
     defer file.deinit();
     const model = try init(&file);
-    try std.testing.expectEqual(@as(u32, 0), model.declarations[0].references); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(u32, 1), model.declarations[0].references); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(@as(u32, 1), model.declarations[1].references); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(model.zir_declarations.len >= 3);
 }
@@ -459,4 +524,11 @@ test "binding destructuring declares separate locals and tracks mutation referen
     };
     try std.testing.expectEqual(@as(usize, 2), locals); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expectEqual(@as(usize, 0), model.unknown_references); // safe: explicit compile-time type selection; the value is representable in that type.
+}
+
+test "morning named tests retain declaration references" {
+    var file = try File.init(std.testing.allocator, "fn target() void {} test target {}", .{});
+    defer file.deinit();
+    const model = try init(&file);
+    try std.testing.expectEqual(@as(u32, 1), model.declarations[0].references); // safe: one named test reference.
 }

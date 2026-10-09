@@ -48,5 +48,8 @@ pub const Scope = @import("Model.zig").Scope;
 pub const Reference = @import("Model.zig").Reference;
 pub const RuleGroup = @import("Rule.zig").Group;
 
-/// Optional report-only obligations for the published aegis contract.
+/// Optional configurable obligations for the published aegis contract.
 pub const AegisPack = @import("AegisPack.zig");
+
+/// Fast std-tokenizer imports, spellings and test liveness without parsing or lowering.
+pub const Token = @import("glint_token");

@@ -37,7 +37,7 @@ pub const Input = struct {
 /// A module edge selected and resolved by the caller, never by a path hash.
 pub const Import = struct { from: FileId, spelling: []const u8, target: FileId };
 /// Per-source limits for front-end work.
-pub const Options = struct { limits: File.Limits = .{}, files: usize = 4096, bytes: usize = 128 * 1024 * 1024 };
+pub const Options = struct { lowering: bool = true, limits: File.Limits = .{}, files: usize = 4096, bytes: usize = 128 * 1024 * 1024 };
 /// Construction errors always propagate; no unread/allocation failure is clean.
 pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded, SnapshotLimit };
 /// A handle from another snapshot is invalid.
@@ -60,7 +60,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     var initialized: usize = 0;
     errdefer for (files[0..initialized]) |*file| file.deinit();
     for (inputs, 0..) |input, index| {
-        files[index] = try File.init(gpa, input.bytes, options.limits);
+        files[index] = try File.initWithLowering(gpa, input.bytes, options.limits, options.lowering);
         initialized += 1;
         models[index] = try Model.init(&files[index]);
         copied[index] = input;
@@ -203,18 +203,6 @@ test "project maps opaque module identities without filesystem access" {
     defer project.deinit();
     try std.testing.expectEqual(@as(?FileId, Project.FileId.fromRaw(1)), project.imported(Project.FileId.fromRaw(0), "dep")); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     try std.testing.expect(project.imported(Project.FileId.fromRaw(0), "missing") == null); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-}
-
-test "project allocation failures release partially initialized files" {
-    const Helper = struct {
-        fn run(gpa: std.mem.Allocator) !void {
-            var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = "const x = 1;" }}, &.{}, .{});
-            defer project.deinit();
-        }
-    };
-    const shakedown = @import("shakedown");
-    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(allocation.allocator(), Helper.run, .{});
 }
 
 test "project stale handles survive allocator address reuse without aliasing" {

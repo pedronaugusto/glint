@@ -1,6 +1,7 @@
 //! Source layers, lowest first; tests are outside the production graph.
 const gantry = @import("gantry");
 pub const layers: []const gantry.rules.Layer = &.{
+    .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**" } },
     .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
@@ -16,7 +17,7 @@ pub const layers: []const gantry.rules.Layer = &.{
 pub const required = [_][]const u8{ "src/glint.zig", "src/Project.zig", "src/main.zig" };
 pub const entries: []const []const u8 = &.{ "src/main.zig", "src/BuildGate.zig" };
 pub const references: []const gantry.rules.ReferenceRule = &.{
-    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "shakedown", "aegis" } },
+    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "glint_token", "shakedown", "aegis" } },
 };
 
 pub const modules: []const gantry.NamedModule = &.{};

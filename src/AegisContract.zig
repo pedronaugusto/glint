@@ -1,10 +1,10 @@
-//! Declaration identity for the published 313e0a8 operation contract, never name taint.
+//! Declaration identity for the published operation contract, never name taint.
 const std = @import("std");
 const Project = @import("Project.zig");
 const Context = @import("RuleContext.zig");
 const Ast = std.zig.Ast;
 pub const Kind = enum { secret, bytes, guarded, guard, scalar };
-pub const pinned = "313e0a81a497fdec936ba7462e872fb300f5881c";
+pub const pinned = "a5d17d0f346d8edacce34b86eea953eb096931da";
 const hashes = [_][]const u8{
     "8570c4d9a306526ac74ddb07ce0ca84e36936f713e83d43aee39e72fb8a7a87a",
     "941fc6878aaa56603a12c52c67a9e612203f44088c1838c67f1f910e18a5c770",

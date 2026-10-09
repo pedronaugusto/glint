@@ -138,3 +138,58 @@ test "contract invalid lowering never indexes partial ZIR declaration payloads" 
     defer valid.deinit();
     try std.testing.expect(valid.models[0].zir_declarations.len != 0);
 }
+
+test "project allocation failures release partially initialized files" {
+    const Helper = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var project = try glint.Project.init(gpa, &.{.{ .name = "root", .bytes = "const x = 1;" }}, &.{}, .{});
+            defer project.deinit();
+        }
+    };
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Helper.run, .{});
+}
+
+test "morning token allocation failures and arbitrary input release all owners" {
+    const Property = struct {
+        fn run(_: void, case: *shakedown.Case) !void {
+            var bytes: [256]u8 = undefined;
+            const n = shakedown.gen.intRange(case.source, usize, 0, bytes.len);
+            for (bytes[0..n]) |*byte| byte.* = shakedown.gen.int(case.source, u8);
+            var arena = std.heap.ArenaAllocator.init(case.gpa);
+            defer arena.deinit();
+            const facts = glint.Token.scan(arena.allocator(), bytes[0..n], null) catch |err| switch (err) {
+                error.InvalidLiteral => return,
+                else => return err,
+            };
+            for (facts.imports) |imp| try std.testing.expect(imp.offset <= n);
+        }
+        fn allocations(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            _ = try glint.Token.scan(arena.allocator(), "const d = @import(\"dep\"); pub fn f() void { _ = d.read; }", null);
+        }
+    };
+    try shakedown.check(std.testing.allocator, {}, Property.run, .{ .cases = 256 });
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Property.allocations, .{});
+}
+
+test "token allocation failures cover bounded temporary buffer spilling" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var bytes: [1024]u8 = undefined;
+            var source: std.Io.Writer = .fixed(&bytes);
+            try source.writeAll("pub fn f() void {");
+            for (0..70) |_| try source.writeAll("_ = 0; ");
+            try source.writeAll("_ = @import(\"dep\"); }");
+            const facts = try glint.Token.scan(arena.allocator(), source.buffered(), null);
+            try std.testing.expectEqual(@as(usize, 1), facts.imports.len); // safe: dense short source contains one import after temporary storage spills.
+            try std.testing.expect(!facts.imports[0].dead);
+        }
+    };
+    var allocation: shakedown.alloc.NoResize = .init(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(allocation.allocator(), Case.run, .{});
+}

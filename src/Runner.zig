@@ -72,14 +72,15 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             .invalid_lowering => .invalid_lowering,
             .budget_exhausted => .budget_exhausted,
         }, .detail = switch (file.status) {
-            .parsed => "std AST and AstGen/ZIR lowered; no compiler type checking or generic evaluation",
+            .parsed => if (file.zir == null) "std AST parsed; optional AstGen/ZIR lowering not requested" else "std AST and AstGen/ZIR lowered; no compiler type checking or generic evaluation",
             .invalid_syntax => "std parser rejected source; semantic rules skipped",
             .invalid_lowering => "std AstGen rejected source; semantic rules skipped",
             .budget_exhausted => "front-end work budget exhausted; semantic rules skipped",
         } });
         if (file.status == .parsed) {
+            if (file.zir == null) runner.complete = false;
             const lowered_coverage = project.models[index].lowered_coverage;
-            try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
+            try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
         var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .usage = if (usage) |*value| value else null, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage } };

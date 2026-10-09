@@ -1,0 +1,74 @@
+const std = @import("std");
+const token = @import("glint").Token;
+
+test "morning token literals aliases ranges named tests and conditional tests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const facts = try token.scan(arena.allocator(),
+        \\const builtin = @import("builtin");
+        \\const dep = @import("dep.zig");
+        \\const bound = @import("bound.zig");
+        \\fn target() void { _ = @import("target.zig"); }
+        \\test target {}
+        \\pub fn run() void {
+        \\    _ = dep.read;
+        \\    _ = (0..bound);
+        \\    if (builtin.is_test) { _ = @import("test.zig"); }
+        \\    _ = "@import(\"fake\")";
+        \\    // @import("comment.zig")
+        \\}
+    , null);
+    try std.testing.expectEqual(@as(usize, 7), facts.imports.len); // safe: five import operands and two alias members.
+    for (facts.imports) |imp| {
+        if (std.mem.eql(u8, imp.name, "target.zig") or std.mem.eql(u8, imp.name, "test.zig")) try std.testing.expectEqual(.@"test", imp.kind);
+        if (std.mem.eql(u8, imp.name, "bound.zig")) try std.testing.expect(!imp.dead);
+        try std.testing.expect(!std.mem.eql(u8, imp.name, "fake"));
+    }
+}
+
+test "morning token computed import is incomplete and escaped names decode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const facts = try token.scan(arena.allocator(), "pub const dep = @import(\"d\\x65p\").@\"read\"; pub const unknown = @import(name);", null);
+    try std.testing.expectEqual(@as(usize, 2), facts.imports.len); // safe: base and direct member facts.
+    try std.testing.expectEqualStrings("dep", facts.imports[0].name);
+    try std.testing.expectEqualStrings("read", facts.imports[1].member.?);
+    try std.testing.expectEqual(@as(usize, 1), facts.unsupported.len); // safe: one computed operand.
+}
+
+test "morning token reflection and decl literal keep lazy imports live" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const facts = try token.scan(arena.allocator(), "const Self = @This(); fn selected() void { _ = @import(\"selected.zig\"); } fn reflected() void { _ = @import(\"reflected.zig\"); } pub fn run() void { _ = .selected; _ = @hasDecl(Self, \"reflected\"); }", null);
+    for (facts.imports) |imp| try std.testing.expect(!imp.dead);
+}
+
+test "token observer retains exact escaped spans and range punctuation" {
+    const Capture = struct {
+        const Self = @This();
+        calls: usize = 0,
+        boundaries: usize = 0,
+        dots: usize = 0,
+        fn boundary(raw: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
+            self.boundaries += 1;
+        }
+        fn see(raw: *anyopaque, stream: []const token.Token) error{OutOfMemory}!void {
+            const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
+            self.calls += 1;
+            if (stream[stream.len - 1].is(".")) self.dots += 1;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var capture: Capture = .{};
+    const bytes = "const @\"escaped\\x20name\" = @import(\"dep\"); pub fn f() void { _ = 0..4; _ = 'x'; }";
+    const facts = try token.scan(arena.allocator(), bytes, .{ .context = &capture, .punctuation = true, .boundary = Capture.boundary, .token = Capture.see });
+    try std.testing.expectEqual(facts.tokens.len, capture.calls);
+    try std.testing.expectEqual(@as(usize, 2), capture.dots); // safe: the range consists of two dot tokens.
+    try std.testing.expectEqual(@as(usize, 1), capture.boundaries); // safe: one character literal interrupts policy observation.
+    for (facts.tokens) |t| {
+        try std.testing.expect(t.offset < t.end() and t.end() <= bytes.len);
+        if (std.mem.eql(u8, t.text, "escaped name")) try std.testing.expectEqualStrings("@\"escaped\\x20name\"", bytes[t.offset..t.end()]);
+    }
+}

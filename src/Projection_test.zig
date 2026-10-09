@@ -44,3 +44,47 @@ test "G2 projection context validates caller source and token identities" {
     try std.testing.expectError(error.InvalidHandle, glint.Projection.context(&project, glint.Project.FileId.fromRaw(0), 1000));
     try std.testing.expectEqual(.production, try glint.Projection.context(&project, glint.Project.FileId.fromRaw(0), 1));
 }
+
+test "morning builtin is_test marks only the test branch without import mappings" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const b = @import(\"builtin\"); pub fn f() void { if (b.is_test) { _ = @import(\"test.zig\"); } else { _ = @import(\"prod.zig\"); } }" }}, &.{}, .{});
+    defer project.deinit();
+    var projection = try glint.Projection.init(std.testing.allocator, &project, 1000);
+    defer projection.deinit();
+    for (projection.imports) |imp| if (imp.spelling) |name| {
+        if (std.mem.eql(u8, name, "test.zig")) try std.testing.expectEqual(glint.Projection.Context.@"test", imp.context);
+        if (std.mem.eql(u8, name, "prod.zig")) try std.testing.expect(imp.context != .@"test");
+    };
+}
+
+test "morning semantic reflection named tests and declaration literals supply identities" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "fn target() void {} test target {} const Self = @This(); pub fn f() void { _ = .target; _ = @field(Self, \"target\"); _ = @hasDecl(Self, \"target\"); }" }}, &.{}, .{});
+    defer project.deinit();
+    var projection = try glint.Projection.init(std.testing.allocator, &project, 1000);
+    defer projection.deinit();
+    var matches: usize = 0;
+    for (projection.references) |ref| if (ref.definition) |d| {
+        const h = try project.handle(d.file);
+        if (std.mem.eql(u8, (try project.declarations(h))[d.index].name, "target")) matches += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), matches); // safe: named test and two reflection strings; untyped literals remain undecided.
+}
+
+test "morning syntax model without lowering retains imports without mappings" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "pub const dep = @import(\"unmapped\");" }}, &.{}, .{ .lowering = false });
+    defer project.deinit();
+    const h = try project.handle(glint.Project.FileId.fromRaw(0));
+    try std.testing.expect((try project.lowered(h)) == null);
+    try std.testing.expectEqual(.not_requested, try project.loweredCoverage(h));
+    try std.testing.expectEqual(@as(usize, 1), (try project.declarations(h)).len); // safe: one declaration.
+}
+
+test "morning grouped negated builtin conditions classify the else arm and preserve lookalikes" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const b = @import(\"builtin\"); pub fn f() void { if (!(b.is_test)) { _ = @import(\"prod.zig\"); } else { _ = @import(\"test.zig\"); } }" }}, &.{}, .{});
+    defer project.deinit();
+    var projection = try glint.Projection.init(std.testing.allocator, &project, 1000);
+    defer projection.deinit();
+    for (projection.imports) |imp| if (imp.spelling) |name| {
+        if (std.mem.eql(u8, name, "test.zig")) try std.testing.expectEqual(glint.Projection.Context.@"test", imp.context);
+        if (std.mem.eql(u8, name, "prod.zig")) try std.testing.expect(imp.context != .@"test");
+    };
+}
