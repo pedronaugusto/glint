@@ -79,7 +79,7 @@ fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]co
                 } else for (raw, 0..) |_, i| {
                     // Ranges retain distinct dots. Policy observers receive every punctuation
                     // byte; ordinary graph scans can keep other std operators compact.
-                    try emit(storage, &out, initToken(Element, .period, .punctuation, raw[i .. i + 1], token.loc.start + i, token.loc.start + i + 1), seen, source.len); // safe: checked source length bounds std tokenizer byte offsets below u32.
+                    try emit(storage, &out, initToken(Element, if (raw[i] == '.') .period else .asterisk, .punctuation, raw[i .. i + 1], token.loc.start + i, token.loc.start + i + 1), seen, source.len); // safe: checked source length bounds std tokenizer byte offsets below u32.
                 }
             },
         }

@@ -48,11 +48,19 @@ fn backingName(name: []const u8) bool {
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
     if (try Contract.owner(c, node)) |k| return k;
     const value = try c.facts.resolve(c.file, node);
-    if (value == .unknown) {
+    if (unresolved(value, 0)) {
         const tree = try c.project.syntax(try c.source());
         try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
     }
     return null;
+}
+fn unresolved(value: Facts.Value, depth: usize) bool {
+    if (depth == 64) return true;
+    return switch (value) {
+        .unknown => true,
+        .pointer, .optional, .error_union => |payload| unresolved(payload.*, depth + 1),
+        else => false,
+    };
 }
 fn checkCopies(c: *Context) Context.Error!void {
     if (try internal(c)) return;

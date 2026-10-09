@@ -72,3 +72,11 @@ test "token observer retains exact escaped spans and range punctuation" {
         if (std.mem.eql(u8, t.text, "escaped name")) try std.testing.expectEqualStrings("@\"escaped\\x20name\"", bytes[t.offset..t.end()]);
     }
 }
+
+test "pointer dereference does not become a second range dot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const facts = try token.scan(arena.allocator(), "fn hidden() void { _ = @import(\"hidden\"); } pub fn f(v: anytype) void { _ = v.*.hidden; }", null);
+    try std.testing.expectEqual(@as(usize, 1), facts.imports.len); // safe: one lazy import.
+    try std.testing.expect(facts.imports[0].dead);
+}

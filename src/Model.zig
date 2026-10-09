@@ -114,9 +114,11 @@ pub fn init(file: *File) InitError!Model {
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
         const decl = model.lookup(token_scopes[token], name, token);
         var ref_record: Reference = .{ .token = token, .node = node, .declaration = decl };
-        if (tag == .enum_literal) ref_record.unknown = .literal_context;
-        if (decl) |d| model.declarations[d].references += 1 else {
-            if (tag == .enum_literal) continue;
+        if (tag == .enum_literal) {
+            ref_record.unknown = .literal_context;
+            model.unknown_references += 1;
+            if (decl) |d| model.declarations[d].references += 1;
+        } else if (decl) |d| model.declarations[d].references += 1 else {
             ref_record.unknown = if (primitive(name)) .primitive else .unresolved;
             if (ref_record.unknown.? != .primitive) model.unknown_references += 1;
         }
@@ -510,7 +512,7 @@ test "binding isolates catch and switch captures from outside scopes" {
         try std.testing.expectEqual(@as(u32, 1), decl.references); // safe: explicit compile-time type selection; the value is representable in that type.
     };
     try std.testing.expectEqual(@as(usize, 2), captures); // safe: explicit compile-time type selection; the value is representable in that type.
-    try std.testing.expectEqual(@as(usize, 0), model.unknown_references); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 2), model.unknown_references); // safe: two declaration literals retain unknown type context; captures remain resolved.
 }
 
 test "binding destructuring declares separate locals and tracks mutation references" {

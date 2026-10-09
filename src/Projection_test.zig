@@ -88,3 +88,13 @@ test "morning grouped negated builtin conditions classify the else arm and prese
         if (std.mem.eql(u8, name, "prod.zig")) try std.testing.expect(imp.context != .@"test");
     };
 }
+
+test "unresolved declaration literals remain indexed unknown references" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "pub const value = .unmapped;" }}, &.{}, .{});
+    defer project.deinit();
+    const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: fixture creates one source.
+    const references = try project.references(handle);
+    try std.testing.expectEqual(@as(usize, 1), references.len); // safe: the unmatched literal still supplies one lexical reference.
+    try std.testing.expect(references[0].declaration == null);
+    try std.testing.expectEqual(.literal_context, references[0].unknown.?);
+}

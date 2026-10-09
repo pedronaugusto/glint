@@ -175,6 +175,7 @@ test "morning adopted scalar gate reports bypasses and blocks unresolved receive
 test "adopted gates retain unresolved obligations and known unrelated receivers" {
     const cases = .{
         .{ pack.access, "pub fn f(v: anytype) void { _ = v.material; }" },
+        .{ pack.access, "pub fn f(comptime T: type, v: *T) void { _ = v.material; }" },
         .{ pack.copies, "pub fn f(v: anytype) void { const copy = v; _ = copy; }" },
         .{ pack.copies, "pub fn f(v: anytype) *const u32 { return v.expose(); }" },
         .{ pack.cleanup, "pub fn f(T: type) void { var v = T.init(1); _ = &v; }" },

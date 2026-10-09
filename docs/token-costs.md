@@ -18,8 +18,8 @@ pair's candidate/baseline ratio; latency columns are separate medians, not a sel
 
 | Workload | Baseline median | Glint median | Paired ratio |
 |---|---:|---:|---:|
-| 61-byte input, two facts, 2,000 repetitions per pair | 459 ns/file | 420 ns/file | 0.911 |
-| 1,528 files, 23,078,900 bytes, 74,752 facts | 84.62 ms/pass | 97.88 ms/pass | 1.156 |
+| 61-byte input, two facts, 2,000 repetitions per pair | 454 ns/file | 406 ns/file | 0.891 |
+| 1,528 files, 23,078,900 bytes, 74,752 facts | 83.77 ms/pass | 96.83 ms/pass | 1.161 |
 
 Untimed counting uses the same arena owner and records requested backing allocations, not
 RSS or the operating system's physical memory. Live requested bytes return to zero after
