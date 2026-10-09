@@ -87,7 +87,7 @@ fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]co
         // identifiers/numbers need no second string dispatch during emission.
         if (@TypeOf(builder) != void) switch (token.tag) {
             .keyword_test, .l_paren, .r_paren, .l_bracket, .r_bracket, .l_brace, .r_brace => try builder.token(arena, out.items[out.items.len - 1], out.items),
-            .identifier => if (std.mem.eql(u8, raw, "is_test")) try builder.token(arena, out.items[out.items.len - 1], out.items),
+            .identifier => if (out.items[out.items.len - 1].is("is_test")) try builder.token(arena, out.items[out.items.len - 1], out.items),
             .builtin => if (std.mem.eql(u8, raw, "@import")) try builder.imported(arena, out.items.len - 2),
             else => {},
         };

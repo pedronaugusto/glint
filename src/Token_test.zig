@@ -80,3 +80,11 @@ test "pointer dereference does not become a second range dot" {
     try std.testing.expectEqual(@as(usize, 1), facts.imports.len); // safe: one lazy import.
     try std.testing.expect(facts.imports[0].dead);
 }
+
+test "escaped builtin test member spelling keeps test-only imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const facts = try token.scan(arena.allocator(), "pub fn f() void { if (@import(\"builtin\").@\"is_test\") { _ = @import(\"test-only\"); } }", null);
+    try std.testing.expectEqual(@as(usize, 3), facts.imports.len); // safe: builtin base/member plus the guarded import.
+    try std.testing.expectEqual(.@"test", facts.imports[2].kind);
+}
