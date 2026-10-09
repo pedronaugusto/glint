@@ -81,7 +81,7 @@ scratch lifetime and handle validation. Operation contracts share that identity 
 Recognition follows lexical declarations, explicit module mappings and exact source digests of
 published aegis `a5d17d0f346d8edacce34b86eea953eb096931da`. It covers Secret, SecretBytes,
 Guarded/Guard, ids, units and integer factories; it does not infer a secret or lock from a name.
-Copies of template/type aliases are excluded. Code changed from that operation contract is
+Escaped member spellings use the same identifier decoder as ordinary facts; quoting an operation does not change its obligations. Copies of template/type aliases are excluded. Code changed from that operation contract is
 unrecognized. A clean run does not establish security, ownership or complete coverage.
 
 | ID/version | Obligation and supported report predicate | Prevention limit |

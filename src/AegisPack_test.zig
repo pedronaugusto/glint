@@ -210,3 +210,72 @@ test "owner value parameter copy differs from borrowed pointer alias" {
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the value copy is the sole ownership witness.
     try std.testing.expectEqual(@as(u32, 2), report.diagnostics[0].span.line); // safe: the fixture value-copy line fits u32.
 }
+
+test "adopted aegis gates preserve escaped operation spellings" {
+    const operations = [_][]const u8{ "material", "init", "deinit", "raw", "adopt", "acquire", "owner", "data", "allocation" };
+    const source =
+        \\const Secret = @import("secret").Secret;
+        \\const Guarded = @import("guarded").Guarded;
+        \\const Bytes = @import("bytes");
+        \\const Checked = @import("ints").Checked;
+        \\pub fn f(gpa: anytype, allocation: []u8, n: usize) !void {
+        \\    var s = Secret(u32).init(9);
+        \\    defer s.deinit();
+        \\    _ = s.material;
+        \\    const copy = s;
+        \\    _ = copy;
+        \\    var g = Guarded(u32).init(0);
+        \\    _ = g.data;
+        \\    var held = g.acquire();
+        \\    defer held.deinit();
+        \\    _ = held.owner;
+        \\    const a = Checked(u32).init(1);
+        \\    _ = a.raw() + 2;
+        \\    _ = @as(u8, @intCast(a.raw()));
+        \\    var b = try Bytes.adopt(gpa, allocation[0..n], n);
+        \\    defer b.deinit();
+        \\    _ = b.allocation;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var escaped: []const u8 = source;
+    for (operations) |operation| {
+        escaped = try std.mem.replaceOwned(u8, a, escaped, try a.print(".{s}", .{operation}), try a.print(".@\"{s}\"", .{operation}));
+    }
+    var adopted = config;
+    var selections = config.selections[0..5].*;
+    for (&selections) |*selection| selection.level = .gate;
+    adopted.selections = &selections;
+    var plain_project = try fixture(source);
+    defer plain_project.deinit();
+    var escaped_project = try fixture(escaped);
+    defer escaped_project.deinit();
+    try std.testing.expectEqual(.parsed, plain_project.files[0].status);
+    try std.testing.expectEqual(.parsed, escaped_project.files[0].status);
+    var plain = try glint.runConfigured(std.testing.allocator, &plain_project, adopted, .{ .project_rules = &pack.rules });
+    defer plain.deinit();
+    var quoted = try glint.runConfigured(std.testing.allocator, &escaped_project, adopted, .{ .project_rules = &pack.rules });
+    defer quoted.deinit();
+    for (adopted.selections) |selection| try std.testing.expectEqual(count(plain, selection.rule), count(quoted, selection.rule));
+    try std.testing.expectEqual(plain.complete, quoted.complete);
+    try std.testing.expectEqual(plain.coverage.len, quoted.coverage.len);
+}
+
+test "escaped acquisition cleanup and guard type keep direct gate witnesses" {
+    const cases = .{
+        .{ pack.cleanup, "const S = @import(\"secret\").Secret; pub fn f() void { var s = S(u32).@\"init\"(1); _ = &s; }" },
+        .{ pack.cleanup, "const S = @import(\"secret\").Secret; pub fn f() void { var s = S(u32).@\"init\"(1); s.@\"deinit\"(); s.@\"deinit\"(); }" },
+        .{ pack.access, "const G = @import(\"guarded\").Guarded; pub fn f(g: *G(u32).@\"Guard\") void { _ = g.@\"owner\"; }" },
+    };
+    inline for (cases) |case| {
+        var project = try fixture(case[1]);
+        defer project.deinit();
+        try std.testing.expectEqual(.parsed, project.files[0].status);
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(@as(usize, 1), count(report, case[0])); // safe: each source has one direct obligation witness.
+    }
+}

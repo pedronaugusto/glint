@@ -1,5 +1,6 @@
 //! Declaration identity for the published operation contract, never name taint.
 const std = @import("std");
+const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Context = @import("RuleContext.zig");
 const Ast = std.zig.Ast;
@@ -45,7 +46,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
         .@"try", .address_of, .deref => return kind(c, file, tree.nodeData(node).node, depth + 1),
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
-            if (std.mem.eql(u8, tree.tokenSlice(data[1]), "Guard") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
+            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "Guard") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             const value = try c.facts.resolve(file, node);
             const container = switch (value) {
                 .container, .instance => |v| v,
@@ -62,7 +63,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             const call = tree.fullCall(&buffer, node).?;
             if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
                 const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-                const name = tree.tokenSlice(data[1]);
+                const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
                 if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
                 if (std.mem.eql(u8, name, "acquire") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             }

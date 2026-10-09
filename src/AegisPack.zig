@@ -1,5 +1,6 @@
 //! Optional explicitly adopted published-type obligations. No security or lifetime proof.
 const std = @import("std");
+const Model = @import("Model.zig");
 const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
@@ -28,7 +29,7 @@ fn checkAccess(c: *Context) Context.Error!void {
         if (tag != .field_access) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
         const data = tree.nodeData(node).node_and_token;
-        const name = tree.tokenSlice(data[1]);
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
         if (!backingName(name)) continue;
         const k = (try requiredOwner(c, data[0], access, data[1])) orelse continue;
         const backing = switch (k) {
@@ -100,7 +101,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, init) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+    const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
     return std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "adopt") or std.mem.eql(u8, name, "acquire");
 }
 
@@ -110,7 +111,7 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const call = tree.fullCall(&buffer, node) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const name = tree.tokenSlice(data[1]);
+    const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
     if (!std.mem.eql(u8, name, "expose") and !std.mem.eql(u8, name, "exposeMut") and !std.mem.eql(u8, name, "value")) return false;
     const k = (try requiredOwner(c, data[0], copies, data[1])) orelse return false;
     return ((k == .secret or k == .bytes) and (std.mem.eql(u8, name, "expose") or std.mem.eql(u8, name, "exposeMut"))) or (k == .guard and std.mem.eql(u8, name, "value"));
@@ -128,7 +129,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         const acquisition = if (tree.nodeTag(init) == .@"try") tree.nodeData(init).node else init;
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
         if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
-        const operation = tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]);
+        const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
         if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !std.mem.eql(u8, operation, "acquire")) continue;
         const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (k != .secret and k != .bytes and k != .guard) continue;
@@ -182,7 +183,7 @@ fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Err
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
     const index = Contract.local(c, data[0]) orelse return false;
-    return c.project.models[c.file.raw()].declarations[index].token == token and std.mem.eql(u8, tree.tokenSlice(data[1]), "deinit");
+    return c.project.models[c.file.raw()].declarations[index].token == token and std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "deinit");
 }
 fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
@@ -190,7 +191,7 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const call = tree.fullCall(&buffer, node) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 0) return false;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "raw")) return false;
+    if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "raw")) return false;
     return try requiredOwner(c, data[0], scalar, data[1]) == .scalar;
 }
 fn checkScalar(c: *Context) Context.Error!void {
@@ -222,7 +223,7 @@ fn checkCapacity(c: *Context) Context.Error!void {
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "adopt") or call.ast.params.len != 3) continue;
+        if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") or call.ast.params.len != 3) continue;
         if (try requiredOwner(c, data[0], capacity, data[1]) != .bytes) continue;
         if (tree.fullSlice(call.ast.params[1])) |slice| {
             if (slice.ast.end.unwrap() != null) try c.at(capacity, tree.nodeMainToken(node), "SecretBytes.adopt receives an explicitly bounded slice: full allocator capacity/exclusive ownership must be retained; extent is undecided");
