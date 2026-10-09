@@ -15,9 +15,6 @@ pub const Token = struct {
         return (t.kind() == .word or t.kind() == .keyword or t.kind() == .punctuation) and std.mem.eql(u8, t.text, spelling);
     }
 };
-comptime {
-    std.debug.assert(@sizeOf(Token) == 24);
-}
 pub const Observer = struct {
     context: *anyopaque,
     punctuation: bool = false,

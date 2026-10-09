@@ -46,6 +46,3 @@ pub const Token = struct {
         return init(.identifier, bytes, start, finish);
     }
 };
-comptime {
-    std.debug.assert(@sizeOf(Token) == 24);
-}

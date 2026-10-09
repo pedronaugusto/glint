@@ -293,3 +293,24 @@ test "G2 complete cast inventory includes boolean and volatile conversion reason
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit narrower migration selection.
 }
+
+test "private import references through reflection strings preserve declaration identity" {
+    try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @field(Self, \"dep\"); }", 0);
+    try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @hasDecl(Self, \"dep\"); }", 0);
+    try check(.Z013, "const dep = @import(\"dep\"); const Other = struct { pub const dep = 1; }; pub fn run() void { _ = @field(Other, \"dep\"); }", 1);
+}
+
+test "private import gates retain required dynamic reflection uncertainty" {
+    const sources = [_][]const u8{
+        "const dep = @import(\"dep\"); pub fn run(comptime T: type) void { _ = @field(T, \"dep\"); }",
+        "const Self = @This(); const dep = @import(\"dep\"); pub fn run(name: []const u8) void { _ = @field(Self, name); }",
+    };
+    for (sources) |bytes| {
+        var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = bytes }}, &.{}, .{});
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = .Z013, .level = .gate }} }, .{});
+        defer report.deinit();
+        try std.testing.expect(!report.complete);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: unknown reflection cannot support a dead-import allegation.
+    }
+}

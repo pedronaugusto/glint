@@ -62,8 +62,11 @@ fn unusedImports(self: *Context) RunError!void {
     defer undecided.deinit(self.allocator);
     // One pass for all candidates: spelling filters work, declaration identity decides usage.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
-        if (tag != .field_access) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded AST node table fits u32.
+        if (tag != .field_access) {
+            try reflectedImport(self, node, candidates, indexes.items, used, &undecided);
+            continue;
+        }
         const pair = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
         if (!candidates.contains(name)) continue;
@@ -79,6 +82,45 @@ fn unusedImports(self: *Context) RunError!void {
         const decl = declarations[index];
         if (!used[index] and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
     }
+}
+
+fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringHashMapUnmanaged(void), indexes: []const u32, used: []bool, undecided: *std.StringHashMapUnmanaged(void)) RunError!void {
+    const tree = &self.project.files[self.file.raw()].tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return;
+    const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+    if (!std.mem.eql(u8, builtin, "@field") and !std.mem.eql(u8, builtin, "@hasDecl")) return;
+    var name: ?[]const u8 = null;
+    if (tree.nodeTag(args[1]) == .string_literal) {
+        name = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        if (!candidates.contains(name.?)) return;
+        if (try self.facts.reflected(self.file, node)) |definition| {
+            if (definition.file.eql(self.file)) used[definition.index] = true;
+            return;
+        }
+    }
+    const value = try self.facts.resolve(self.file, args[0]);
+    const container: ?Facts.Container = switch (value) {
+        .container, .instance => |v| v,
+        else => null,
+    };
+    if (container) |known| if (!known.symbolic) {
+        // A literal missing member, or a foreign namespace, cannot use this file's import.
+        if (name != null or !known.file.eql(self.file)) return;
+    };
+    var affected = false;
+    for (indexes) |index| {
+        const decl = self.project.models[self.file.raw()].declarations[index];
+        if (name) |literal| if (!std.mem.eql(u8, literal, decl.name)) continue;
+        if (container) |known| if (!known.symbolic and (!known.file.eql(self.file) or known.scope != decl.scope)) continue;
+        try undecided.put(self.allocator, decl.name, {});
+        affected = true;
+    }
+    if (affected) try unknown(self, .Z013, node, if (value == .unknown) value.unknown else .comptime_dependent);
 }
 
 fn selected(self: *const Context, selection: []const rules.Rule) bool {

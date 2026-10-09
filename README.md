@@ -72,7 +72,7 @@ Gantry owns path dialect and cross-file architecture policy. Preflight orchestra
 
 ## Development
 
-Run `zig build check`, `zig build lint`, and targeted tests such as `zig build test -Dtest-filter=review`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
+Run `zig build check`, `zig build lint`, `zig build check-token-portable`, and targeted tests such as `zig build test -Dtest-filter=review`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
 `zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token driver, frozen corpus pins and alternating rows are in `bench/`; [token costs](docs/token-costs.md) record exact parity and the remaining corpus speed miss. No speed guarantee is claimed.
 

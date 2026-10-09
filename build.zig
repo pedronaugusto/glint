@@ -20,6 +20,15 @@ pub fn build(b: *std.Build) !void {
     executable.root_module.addImport("aegis", aegis);
     b.installArtifact(executable);
     if (b.pkg_hash.len != 0) return;
+    const portable = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const portable_tokens = b.createModule(.{ .root_source_file = b.path("src/Token.zig"), .target = portable, .optimize = .small });
+    const portable_contract = b.addObject(.{ .name = "token-portable", .root_module = b.createModule(.{
+        .root_source_file = b.path("ci/token_portable.zig"),
+        .target = portable,
+        .optimize = .small,
+        .imports = &.{.{ .name = "glint_token", .module = portable_tokens }},
+    }) });
+    b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
     const filter = b.option([]const u8, "test-filter", "Select tests by name");
     const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
     tests.root_module.addImport("aegis", aegis);

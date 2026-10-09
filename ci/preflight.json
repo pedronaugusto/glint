@@ -29,6 +29,11 @@
       "zig",
       "build",
       "check-source-policy"
+    ],
+    [
+      "zig",
+      "build",
+      "check-token-portable"
     ]
   ],
   "shipped": {

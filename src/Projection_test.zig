@@ -98,3 +98,11 @@ test "unresolved declaration literals remain indexed unknown references" {
     try std.testing.expect(references[0].declaration == null);
     try std.testing.expectEqual(.literal_context, references[0].unknown.?);
 }
+
+test "semantic builtin context normalizes escaped member spellings" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "pub fn f() void { if (@import(\"builtin\").@\"is_test\") { _ = @import(\"test-only\"); } }" }}, &.{}, .{});
+    defer project.deinit();
+    var projection = try glint.Projection.init(std.testing.allocator, &project, 1000);
+    defer projection.deinit();
+    for (projection.imports) |imp| if (imp.spelling) |name| if (std.mem.eql(u8, name, "test-only")) try std.testing.expectEqual(glint.Projection.Context.@"test", imp.context);
+}

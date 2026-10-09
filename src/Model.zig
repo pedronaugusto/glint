@@ -169,7 +169,7 @@ fn testCondition(a: std.mem.Allocator, tree: *const Ast, model: *const Model, no
         .@"comptime" => return testCondition(a, tree, model, tree.nodeData(node).node, depth + 1),
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
-            if (!std.mem.eql(u8, tree.tokenSlice(data[1]), "is_test")) return null;
+            if (!std.mem.eql(u8, try identifier(a, tree.tokenSlice(data[1])), "is_test")) return null;
             return if (try builtinAlias(a, tree, model, data[0], depth + 1)) true else null;
         },
         else => return null,
