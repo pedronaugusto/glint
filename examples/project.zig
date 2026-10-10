@@ -1,7 +1,7 @@
 //! Standalone compiled project rules use glint's model and CLI completion contract.
 const std = @import("std");
 const glint = @import("glint");
-const cli = @import("glint_cli");
+const cli = glint.cli;
 const local_export: glint.Rule = @fromBackingInt(1000); // safe: this example owns extension ID 1000, validated by glint.
 const rules = [_]glint.ProjectRule{.{ .definition = .{ .id = local_export, .name = "LOCAL_EXPORT", .group = .family_policy, .purpose = "project public constants require an explicit export contract" }, .check = check }};
 fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {

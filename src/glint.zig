@@ -20,6 +20,8 @@ test {
     _ = @import("Suppression.zig");
     _ = @import("Runner.zig");
     _ = @import("Facts.zig");
+    _ = token;
+    _ = cli;
 }
 
 /// Public compiled-rule context, shared with built-ins.
@@ -55,4 +57,6 @@ pub const Library = @import("Library.zig").Library;
 pub const AegisPack = @import("AegisPack.zig");
 
 /// Fast std-tokenizer imports, spellings and test liveness without parsing or lowering.
-pub const Token = @import("glint_token");
+pub const token = @import("Token.zig");
+/// The filesystem command-line driver a project's own linter calls with its compiled rules.
+pub const cli = @import("cli.zig");

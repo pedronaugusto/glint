@@ -1,5 +1,5 @@
 const std = @import("std");
-const token = @import("glint").Token;
+const token = @import("glint").token;
 
 test "morning token literals aliases ranges named tests and conditional tests" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

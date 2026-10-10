@@ -5,11 +5,8 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
     const aegis = aegis_dependency.module("aegis");
-    const token_module = b.addModule("glint_token", .{ .root_source_file = b.path("src/Token.zig"), .target = target, .optimize = optimize });
     const module = b.addModule("glint", .{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("aegis", aegis);
-    module.addImport("glint_token", token_module);
-    const cli_module = b.addModule("glint_cli", .{ .root_source_file = b.path("src/cli.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis", .module = aegis } } });
 
     const executable = b.addExecutable(.{ .name = "glint", .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -26,7 +23,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("ci/token_portable.zig"),
         .target = portable,
         .optimize = .small,
-        .imports = &.{.{ .name = "glint_token", .module = portable_tokens }},
+        .imports = &.{.{ .name = "token", .module = portable_tokens }},
     }) });
     b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
     const filter = b.option([]const u8, "test-filter", "Select tests by name");
@@ -46,7 +43,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("examples/project.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "glint", .module = module }, .{ .name = "glint_cli", .module = cli_module } },
+        .imports = &.{.{ .name = "glint", .module = module }},
     }) });
     const project_check = b.step("check-project", "Compile a standalone linter with project-owned rules");
     project_check.dependOn(&project_linter.step);
@@ -112,14 +109,13 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         } });
-        preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig"), .modules = &.{ "glint", "glint_token" }, .packages = &.{aegis_dependency} });
+        preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig"), .modules = &.{"glint"}, .packages = &.{aegis_dependency} });
     }
     return needed;
 }
 
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const module = b.createModule(.{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
-    module.addImport("glint_token", b.createModule(.{ .root_source_file = b.path("src/Token.zig"), .target = target, .optimize = optimize }));
     const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
     module.addImport("aegis", aegis_dependency.module("aegis"));
     return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, module, aegis_dependency, target) } }) catch @panic("OOM");
@@ -151,7 +147,7 @@ pub fn addLinter(b: *std.Build, dependency: *std.Build.Dependency, options: Lint
         .root_source_file = options.source,
         .target = options.target,
         .optimize = options.optimize,
-        .imports = &.{ .{ .name = "glint", .module = dependency.module("glint") }, .{ .name = "glint_cli", .module = dependency.module("glint_cli") } },
+        .imports = &.{.{ .name = "glint", .module = dependency.module("glint") }},
     }) });
 }
 pub const LinterOptions = struct { name: []const u8 = "project-lint", source: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize = .debug };

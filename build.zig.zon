@@ -10,6 +10,6 @@
             .hash = "aegis-0.0.0-rsxoumTEBQDYZ_f1VkY9n5KqhcRp5HcTcYyNpkvBlID5",
         },
         .preflight = .{ .url = "git+https://github.com/pedronaugusto/preflight#c04e49d329eaa1cb985cdb6ee07f906dd7d84743", .hash = "preflight-0.1.0-LX1ZwjczCQDSSG7aH5c5oWXPdmltZQH2SCPUEKCdr6oG", .lazy = true },
-        .shakedown = .{ .url = "git+https://github.com/pedronaugusto/shakedown#a3db7b9c9b60b76dafe1d6f2fa9aab9a8cde3c95", .hash = "shakedown-0.1.0-BR8U4zMOEgCECMxdaaSV5AdzkdaiM8oJVsq6fb9t6tMo", .lazy = true },
+        .shakedown = .{ .url = "git+https://github.com/pedronaugusto/shakedown#99418acb02deacefe8cc555c4205dce98f54ef68", .hash = "shakedown-0.1.0-BR8U409YEgCLU7igVgkutLKZ1u5FzuaC6geo-4n84d_G", .lazy = true },
     },
 }

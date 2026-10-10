@@ -4,6 +4,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed (one module, 2026-10-10)
+
+- Breaking: the `glint_token` and `glint_cli` build modules are gone. Neither had a dependency or link of its own, so they were namespaces held apart: the token facts are `glint.token` (was `glint.Token` and `@import("glint_token")`) and the CLI driver is `glint.cli` (was `@import("glint_cli")`). `addLinter` now imports only `glint`. The `glint` module is the only module; the executable is unchanged.
+- The CLI driver and its completion sidecar import the files they use directly and sit below the public root in the layer order, which `ci/layers.zig` enforces.
+- Updated the green shakedown pin.
+
 ### Changed (aegis by published names, 2026-10-10)
 
 - Added `Library(Role)`, `RuleContext.role`, `RuleContext.inLibrary` and `RuleContext.drift`: a pack finds a library's declarations through the module a program imports it by and the public paths it publishes. The aegis pack uses them, so A001–A005 recognize aegis at any revision that keeps its public names (checked on four: the first published, f199c0d, b77c659 and 586602b). Before, the pack recognized the sources of one aegis commit by digest and every other revision came back "no resolved operation contract" with the gates quiet.

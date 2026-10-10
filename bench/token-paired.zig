@@ -1,6 +1,6 @@
 //! Exact frozen-baseline parity and alternating timing pairs; IO/loading stays outside timing.
 const std = @import("std");
-const fast = @import("glint_token");
+const fast = @import("glint").token;
 const old = @import("baseline");
 const Stats = @import("allocations.zig");
 

@@ -33,7 +33,7 @@ Library callers can use `glint.Completion.verify(allocator, result_bytes, invoca
 
 ## Library
 
-Expose the `glint` module from a commit-pinned package dependency with `dependency.module("glint")`. The consumer build does not load the repository's CI or test dependencies.
+Expose the `glint` module from a commit-pinned package dependency with `dependency.module("glint")`. It is the only module: `glint.token` (standard-tokenizer facts) and `glint.cli` (the driver a project's own linter calls) are namespaces of it, since neither has a dependency or link of its own and Zig analyzes only what a program uses. The consumer build does not load the repository's CI or test dependencies.
 
 ```zig
 const std = @import("std");
@@ -55,7 +55,7 @@ The caller supplies bytes, opaque file identities, diagnostic labels, classifica
 
 ## Diagnostics and suppression
 
-Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for resolved deprecation checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic. Literal dependency scans can use the independent `glint_token` module; semantic users opt into `Project`. See [the two fact tiers](docs/design.md#two-fact-tiers).
+Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule versions, severity/class and coverage. JSON/SARIF include related declaration witnesses for resolved deprecation checks. Text/JSON columns are byte columns; SARIF uses byte regions and URI-encoded labels without mislabeling byte columns as UTF-16 columns. Output ordering is deterministic. Literal dependency scans use `glint.token`, which needs only std; semantic users opt into `Project`. See [the two fact tiers](docs/design.md#two-fact-tiers).
 
 ```zig
 // glint-ignore: Z013 -- reserved import retained for this documented migration

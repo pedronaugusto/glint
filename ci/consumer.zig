@@ -1,6 +1,6 @@
 const std = @import("std");
 const glint = @import("glint");
-const token = @import("glint_token");
+const token = glint.token;
 
 pub fn main() !void {
     var tokens = std.heap.ArenaAllocator.init(std.heap.page_allocator);

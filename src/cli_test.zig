@@ -1,7 +1,7 @@
 //! Completed-run evidence is separate from analysis coverage and process status.
 const std = @import("std");
 const glint = @import("glint");
-const cli = @import("cli.zig");
+const cli = glint.cli;
 
 fn resultPath(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]const u8 {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
