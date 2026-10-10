@@ -488,3 +488,14 @@ test "scalar receivers are known through a type another file of the program name
     defer project.deinit();
     try std.testing.expectEqual(@as(usize, 2), try scalarFindings(&project)); // safe: two raw comparisons, decided.
 }
+
+test "a scalar receiver is known through an unwrapped optional" {
+    var project = try fixture(
+        \\const Index = @import("aegis").id.Id(struct {}, u16);
+        \\pub fn f(maybe: ?Index, limit: u16) bool {
+        \\    return maybe.?.raw() < limit;
+        \\}
+    );
+    defer project.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try scalarFindings(&project)); // safe: one raw comparison, decided.
+}

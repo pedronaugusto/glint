@@ -84,7 +84,8 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 if (v.ast.init_node.unwrap()) |init| return kind(c, file, init, depth + 1);
             }
         },
-        .@"try", .address_of, .deref, .optional_type, .unwrap_optional => return kind(c, file, tree.nodeData(node).node, depth + 1),
+        .@"try", .address_of, .deref, .optional_type => return kind(c, file, tree.nodeData(node).node, depth + 1),
+        .unwrap_optional => return kind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
         .@"orelse", .@"catch" => return kind(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         .error_union => return kind(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .field_access => {
