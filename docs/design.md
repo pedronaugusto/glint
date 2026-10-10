@@ -64,10 +64,15 @@ Semantic callers construct `Project` only when they need ownership, declaration 
 
 `Projection.init` owns imports, resolved references/calls, actual call ZIR witnesses and production/test/comptime/may-be-production contexts from the same snapshot. Escaped literals, named mappings, nested tests, reexports and lazy source retain their importing-use context. Unknown imports/calls make `complete` false; reference-level unknowns are separately explicit and consumers must reject any required unresolved reference. This is a conservative source projection, not an exact evaluated dependency graph. File identities follow input order; projection arrays follow that file order and standard AST node-index order. They do not promise source-offset sorting.
 
-Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks. Embedded public-module tests import no shakedown; fault/allocation drivers belong to the package test root. Preflight adoption is externally owned: pin the published Glint main, use the full module for compiled rules and the completion/build-helper contract, and use `glint_token` for token facts. Glint pins green Preflight `e80b9a631956b1b7b7a7c6ebc69ec7e495ad623d` and Shakedown `e99eccb269dfeeb4569bce843743ec80c6e094c3` for its own CI/tests.
+Gantry alone adapts these facts to its graph and owns architecture/layers/ownership/token-sequence/path policy. Its writer must run old/new fixture parity before deleting the independent Zig scanner. No adapter should copy scope or resolver algorithms. Preflight alone selects files/config through gantry's dialect, executes tools and verifies completion, owns layout/format/snippets/tests/CI, and removes its duplicate code predicates after equivalent adoption. G2 provides the glint APIs and exact handoff; neither consumer repo is modified here. Pin dependency order standalone glint → gantry → preflight, without reciprocal build/test pins or disabled closure checks. Embedded public-module tests import no shakedown; fault/allocation drivers belong to the package test root. Preflight adoption is externally owned: pin the published Glint main, use the full module for compiled rules and the completion/build-helper contract, and use `glint_token` for token facts. Glint pins green Preflight `c04e49d329eaa1cb985cdb6ee07f906dd7d84743` and Shakedown `a3db7b9c9b60b76dafe1d6f2fa9aab9a8cde3c95` for its own CI/tests.
 
-Published aegis `a5d17d0f346d8edacce34b86eea953eb096931da` supplies glint's typed IDs and checked byte counts, and the published operation contracts used by the optional G3 pack. Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. SecretBytes is published at this pin; unfinished Choice/Order/Confined/own/bounded/scope branches are excluded. The pack uses AST/std ZIR heuristics; no verifier is pursued.
+Published aegis `586602b1326fd5fda53a1a252dd3f7e1ae5ee359` supplies glint's typed IDs and checked byte counts. The optional G3 pack does not depend on that pin: it recognizes aegis in the checked program at whatever revision the program uses (see [Libraries and published roles](#libraries-and-published-roles)). Untrusted source bytes and bounded-budget leaves are not in this published API; their adoption remains a concrete later type dependency. The pack uses AST/std ZIR heuristics; no verifier is pursued.
 
+## Libraries and published roles
+
+A pack that checks a library's types must know which declaration is the library's. Glint answers by where the library publishes it, never by file bytes, file names or a revision list. `Library(Role)` is plain data: the modules a program imports the library by (`@import("aegis")`, `@import("aegis.id")`), and for each module the public paths that carry a role (`Secret`, `units.Bytes`). Glint finds each module's root in the project's import mappings, walks every path through the library's public namespaces the way a program writes it, and records the declaration it reaches. `RuleContext.role(library, value)` then answers, for any resolved value, which role it plays: a function the library publishes, or a type or instance of the container such a function returns, through pointers, optionals and error unions.
+
+Consequences a pack author can rely on. Any revision that keeps the public names is recognized, wherever its files live and however its bytes change. A copy of the same source under another module name is another library. Two revisions in one project are both recognized. A required member that does not resolve in a module the file imports (a renamed or removed declaration, or an unmapped namespace) is *drift*: `RuleContext.drift` returns it with its reason and import site, and a rule reports it as coverage, so an API change makes a gate incomplete instead of quiet. A member marked `required = false` is simply absent from older revisions. The library's own files, those its roots import, are `RuleContext.inLibrary`: a rule skips them as safe-type internals. A type function is recognized at its calls by the declaration it names; its container is also recognized when its body is one `return` of that container after any comptime checks, and a body with several returns has no single container, so instances of it are not recognized (its calls still are). The library value must outlive the run, because the resolver remembers it by address.
 
 ## Published aegis reports (G3)
 
@@ -76,13 +81,13 @@ its IDs but never enables them by default; select `--enable A001` (through A005)
 report or gate selections and the pack descriptors to `runConfigured`. Explicit gate selection is accepted; an undecided required site still makes execution incomplete.
 Generic defaults, Z026/Z012 reports and the deferred D001 admission are unchanged.
 
-The rule context caches `sourceDigest(file)` once per immutable source per run, with caller-owned
-scratch lifetime and handle validation. Operation contracts share that identity without global caches.
-Recognition follows lexical declarations, explicit module mappings and exact source digests of
-published aegis `a5d17d0f346d8edacce34b86eea953eb096931da`. It covers Secret, SecretBytes,
-Guarded/Guard, ids, units and integer factories; it does not infer a secret or lock from a name.
-Escaped member spellings use the same identifier decoder as ordinary facts; quoting an operation does not change its obligations. Copies of template/type aliases are excluded. Code changed from that operation contract is
-unrecognized. A clean run does not establish security, ownership or complete coverage.
+Recognition follows lexical declarations and the `aegis` module mapping, through the published names of
+`AegisPack.library` (Secret, SecretBytes, Guarded and its Guard, and the id, unit and integer factories, from
+the root and from each `aegis.<namespace>` module). It does not infer a secret or lock from a name, and a
+type that merely looks like one, or the same source under another module name, is not aegis. A caller maps
+the root under `aegis` and, for revisions that build their namespaces as modules, each namespace under the
+name its own build gives it. Escaped member spellings use the same identifier decoder as ordinary facts; quoting an operation does not change its obligations. Copies of template/type aliases are excluded.
+Operation names (`init`, `acquire`, `deinit`, `raw`, `material`, ...) are the pack's vocabulary for these types: a revision that renames one is not detected by the library, only by the family's own use. A clean run does not establish security, ownership or complete coverage.
 
 | ID/version | Obligation and supported report predicate | Prevention limit |
 |---|---|---|
@@ -94,8 +99,7 @@ unrecognized. A clean run does not establish security, ownership or complete cov
 
 Required unknown receivers and unsupported acquisition/cleanup or adoption sites record undecided coverage. General prevention limits describe the rule boundary; they are not unconditional per-file incompleteness.
 Front-end rejection and budget exhaustion still make execution incomplete independently of
-findings acceptance. The exact published implementation files are safe-type internals by declaration
-identity; other source requires the same explicit site policy as consumers. Wiping inline padding
+findings acceptance. The library's own files, those its `aegis` root imports, are safe-type internals; other source requires the same explicit site policy as consumers. Wiping inline padding
 and full byte capacity, cleanup before free, borrow invalidation on successful reserve, one semantic
 owner/guard and same-execution release remain runtime/caller obligations. Lint is not erasure proof.
 

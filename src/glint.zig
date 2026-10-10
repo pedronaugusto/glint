@@ -48,6 +48,9 @@ pub const Scope = @import("Model.zig").Scope;
 pub const Reference = @import("Model.zig").Reference;
 pub const RuleGroup = @import("Rule.zig").Group;
 
+/// A library's published roles, found through the module a program imports it by.
+pub const Library = @import("Library.zig").Library;
+
 /// Optional configurable obligations for the published aegis contract.
 pub const AegisPack = @import("AegisPack.zig");
 

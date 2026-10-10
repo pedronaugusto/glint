@@ -33,9 +33,7 @@ pub fn build(b: *std.Build) !void {
     const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
     tests.root_module.addImport("aegis", aegis);
     tests.root_module.addImport("glint", module);
-    for ([_][]const u8{ "secret", "guarded", "bytes", "int", "scalar" }, [_][]const u8{ "Secret", "Guarded", "SecretBytes", "int", "scalar" }) |name, file| {
-        tests.root_module.addAnonymousImport(b.fmt("aegis-{s}", .{name}), .{ .root_source_file = aegis_dependency.path(b.fmt("src/{s}.zig", .{file})), .target = target });
-    }
+    tests.root_module.addImport("aegis_sources", aegisSources(b, module, aegis_dependency, target));
     var needed: error{LazyDependencyNeeded}!void = {};
     if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |dep| {
         tests.root_module.addImport("shakedown", dep.module("shakedown"));
@@ -64,6 +62,8 @@ pub fn build(b: *std.Build) !void {
             b.path("src/DeadDeclarations.zig"),
             b.path("src/Facts.zig"),
             b.path("src/File.zig"),
+            b.path("src/Library.zig"),
+            b.path("src/Library_test.zig"),
             b.path("src/Model.zig"),
             b.path("src/Project.zig"),
             b.path("src/Projection.zig"),
@@ -120,9 +120,29 @@ pub fn build(b: *std.Build) !void {
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const module = b.createModule(.{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
     module.addImport("glint_token", b.createModule(.{ .root_source_file = b.path("src/Token.zig"), .target = target, .optimize = optimize }));
-    module.addImport("aegis", b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
-    const secret_source = b.createModule(.{ .root_source_file = b.dependency("aegis", .{ .target = target, .optimize = optimize }).path("src/Secret.zig"), .target = target });
-    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis-secret", .module = secret_source } }) catch @panic("OOM");
+    const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
+    module.addImport("aegis", aegis_dependency.module("aegis"));
+    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, module, aegis_dependency, target) } }) catch @panic("OOM");
+}
+
+/// The pinned aegis files that publish the pack's members, embedded as sources to analyze.
+fn aegisSources(b: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
+    const sources = b.createModule(.{ .root_source_file = b.path("ci/aegis_sources.zig"), .target = target });
+    sources.addImport("glint", glint);
+    const files = [_][2][]const u8{
+        .{ "aegis-root", "src/root.zig" },
+        .{ "aegis-secret", "src/secret.zig" },
+        .{ "aegis-secret-inline", "src/secret/inline.zig" },
+        .{ "aegis-secret-bytes", "src/secret/SecretBytes.zig" },
+        .{ "aegis-sync", "src/sync.zig" },
+        .{ "aegis-guarded", "src/Guarded.zig" },
+        .{ "aegis-int", "src/int.zig" },
+        .{ "aegis-id", "src/id.zig" },
+        .{ "aegis-units", "src/units.zig" },
+        .{ "aegis-scalar", "src/scalar.zig" },
+    };
+    for (files) |file| sources.addAnonymousImport(file[0], .{ .root_source_file = aegis_dependency.path(file[1]), .target = target });
+    return sources;
 }
 
 /// Builds a project's linter with statically compiled Zig rules and the standalone CLI.

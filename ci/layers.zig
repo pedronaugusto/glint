@@ -5,7 +5,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
-    .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Report.zig" } },
+    .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Library.zig", "src/Report.zig" } },
     .{ .name = "projection and usage", .patterns = &.{ "src/Projection.zig", "src/Usage.zig" } },
     .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
     .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/AegisContract.zig", "src/AegisPack.zig" } },
@@ -17,7 +17,7 @@ pub const layers: []const gantry.rules.Layer = &.{
 pub const required = [_][]const u8{ "src/glint.zig", "src/Project.zig", "src/main.zig" };
 pub const entries: []const []const u8 = &.{ "src/main.zig", "src/BuildGate.zig" };
 pub const references: []const gantry.rules.ReferenceRule = &.{
-    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "glint_token", "shakedown", "aegis" } },
+    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "glint_token", "shakedown", "aegis", "aegis_sources" } },
 };
 
 pub const modules: []const gantry.NamedModule = &.{};

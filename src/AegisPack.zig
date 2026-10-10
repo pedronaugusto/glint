@@ -6,7 +6,6 @@ const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
-pub const pinned = Contract.pinned;
 pub const access: Rule = @fromBackingInt(@intCast(1100)); // safe: compiled pack identities are reserved stable u16 values.
 pub const copies: Rule = @fromBackingInt(@intCast(1101)); // safe: compiled pack identities are reserved stable u16 values.
 pub const cleanup: Rule = @fromBackingInt(@intCast(1102)); // safe: compiled pack identities are reserved stable u16 values.
@@ -19,11 +18,19 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .version = 2, .exception = .aegis }, .check = checkScalar },
     .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .version = 2, .exception = .aegis }, .check = checkCapacity },
 };
-fn internal(c: *Context) Context.Error!bool {
-    return try Contract.source(c, c.file) != null;
+/// Starts a check of this file. The library's own files are its safe-type internals, and a
+/// published member that no longer resolves is reported where the library is imported, so a
+/// renamed declaration cannot make a gate quietly stop seeing it.
+fn begin(c: *Context, rule: Rule) Context.Error!bool {
+    if (try c.inLibrary(Contract.library, c.file)) return false;
+    if (try c.drift(Contract.library)) |gap| {
+        const detail = try c.allocator.print("published member {s} of {s} does not resolve ({t}); its operations are not recognized in this file", .{ gap.path, gap.module, gap.why });
+        try c.undecided(rule, gap.start, .unresolved, detail);
+    }
+    return true;
 }
 fn checkAccess(c: *Context) Context.Error!void {
-    if (try internal(c)) return;
+    if (!try begin(c, access)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .field_access) continue;
@@ -64,13 +71,15 @@ fn unresolved(value: Facts.Value, depth: usize) bool {
     };
 }
 fn checkCopies(c: *Context) Context.Error!void {
-    if (try internal(c)) return;
+    if (!try begin(c, copies)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
             if (tree.nodeTag(init) != .identifier) continue;
+            // `undefined`, `true`, `false` and `null` are values, not references to an owner.
+            if (c.project.models[c.file.raw()].reference(init) == null) continue; // safe: the checked source handle indexes this frozen model.
             const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
             if (k != .scalar) {
                 if (!try ownedValue(c, init, 0)) continue;
@@ -117,7 +126,7 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return ((k == .secret or k == .bytes) and (std.mem.eql(u8, name, "expose") or std.mem.eql(u8, name, "exposeMut"))) or (k == .guard and std.mem.eql(u8, name, "value"));
 }
 fn checkCleanup(c: *Context) Context.Error!void {
-    if (try internal(c)) return;
+    if (!try begin(c, cleanup)) return;
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
     for (model.declarations) |decl| {
@@ -195,7 +204,7 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return try requiredOwner(c, data[0], scalar, data[1]) == .scalar;
 }
 fn checkScalar(c: *Context) Context.Error!void {
-    if (try internal(c)) return;
+    if (!try begin(c, scalar)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
@@ -215,7 +224,7 @@ fn checkScalar(c: *Context) Context.Error!void {
     }
 }
 fn checkCapacity(c: *Context) Context.Error!void {
-    if (try internal(c)) return;
+    if (!try begin(c, capacity)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.

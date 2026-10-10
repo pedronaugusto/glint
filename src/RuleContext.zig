@@ -32,10 +32,36 @@ pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
 pub fn resolve(self: *RuleContext, node: Project.NodeId) Error!Facts.Value {
     return self.facts.resolve(self.file, try self.project.node(try self.source(), node));
 }
-/// Content identity of one frozen source; computed at most once per rule run.
-pub fn sourceDigest(self: *RuleContext, file: Project.FileId) Error![32]u8 {
+/// The role `library` publishes for a resolved value: a function it declares, or a type or
+/// instance of a container it declares, seen through pointers, optionals and error unions.
+/// Null when the value is none of its published declarations; recognition follows the module
+/// the program imports the library by, never file bytes or names.
+pub fn role(self: *RuleContext, library: anytype, value: Facts.Value) Error!?@TypeOf(library).Role {
+    return self.facts.role(library, value);
+}
+/// Whether `file` is one of the library's own files, reached from its module roots.
+pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Error!bool {
     _ = try self.project.handle(file);
-    return self.facts.sourceDigest(file);
+    const found = try self.facts.publication(library);
+    for (found.files) |own| if (own.eql(file)) return true;
+    return false;
+}
+/// A required library member that did not resolve, at the first import of its module in this
+/// file. Recognition of that library is incomplete here, so a rule reports it as coverage.
+pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unknown, start: u32 };
+pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
+    const found = try self.facts.publication(library);
+    const tree = try self.project.syntax(try self.source());
+    const model = &self.project.models[self.file.raw()]; // safe: the checked handle indexes this frozen file.
+    for (found.gaps) |gap| for (model.import_nodes) |node| {
+        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
+        const literal = tree.tokenSlice(tree.nodeMainToken(args[0]));
+        if (literal.len != gap.module.len + 2 or !std.mem.eql(u8, literal[1 .. literal.len - 1], gap.module)) continue;
+        return .{ .module = gap.module, .path = gap.path, .why = gap.why, .start = tree.tokenStart(tree.nodeMainToken(node)) };
+    };
+    return null;
 }
 
 /// Reports one site; common runner supplies ordering, metadata and reason suppression.

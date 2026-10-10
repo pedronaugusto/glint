@@ -10,12 +10,25 @@ project: *const Project,
 gpa: std.mem.Allocator,
 cache: std.AutoHashMapUnmanaged(Key, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Key, void) = .empty,
-source_digests: std.AutoHashMapUnmanaged(Project.FileId, [32]u8) = .empty,
+publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
+templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 pub const Decl = struct { file: Project.FileId, index: u32 };
 pub const Container = struct { file: Project.FileId, scope: u32, symbolic: bool = false };
+/// A library's declarations in this project, found through its modules' roots. Roles are the
+/// caller's enum values; the resolver never interprets them.
+pub const Publication = struct {
+    entries: []const Entry,
+    /// Required members that did not resolve: drift or a missing module mapping, never silence.
+    gaps: []const Gap,
+    /// Every file the library's own roots reach, std and builtin aside.
+    files: []const Project.FileId,
+};
+pub const Entry = struct { role: u32, target: Target };
+pub const Target = union(enum) { function: Decl, container: Container };
+pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
 pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported };
 pub const Value = union(enum) {
     unknown: Unknown,
@@ -38,17 +51,103 @@ pub const ResolveError = Model.InitError;
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.active.deinit(self.gpa);
-    self.source_digests.deinit(self.gpa);
+    self.publications.deinit(self.gpa);
+    self.templates.deinit(self.gpa);
     self.* = undefined;
 }
 
-/// Cached identity of immutable input bytes, shared by compiled operation contracts.
-pub fn sourceDigest(self: *Facts, file: Project.FileId) ResolveError![32]u8 {
-    if (self.source_digests.get(file)) |digest| return digest;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(self.project.inputs[file.raw()].bytes, &digest, .{});
-    try self.source_digests.put(self.gpa, file, digest);
-    return digest;
+/// Finds what `library` publishes: each module's root is every file the project maps that
+/// module's name to, and each member is the declaration its path names from that root. Found
+/// once per run and shared by every rule.
+pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
+    const key = @intFromPtr(library.modules.ptr); // safe: the address names the library only for this run, which the caller keeps alive.
+    if (self.publications.get(key)) |found| return found;
+    var entries: std.ArrayList(Entry) = .empty;
+    var gaps: std.ArrayList(Gap) = .empty;
+    const reached = try self.gpa.alloc(bool, self.project.count());
+    @memset(reached, false);
+    for (library.modules) |module| {
+        for (self.project.imports, 0..) |mapping, index| {
+            if (!std.mem.eql(u8, mapping.spelling, module.name)) continue;
+            // Many files import one root; its members are found once.
+            var repeated = false;
+            for (self.project.imports[0..index]) |earlier| if (std.mem.eql(u8, earlier.spelling, module.name) and earlier.target.eql(mapping.target)) {
+                repeated = true;
+            };
+            if (repeated) continue;
+            reached[mapping.target.raw()] = true; // safe: validated mapping targets index the frozen file table.
+            for (module.members) |listed| switch (try self.published(mapping.target, listed.path)) {
+                .found => |target| {
+                    const role_value: u32 = @intCast(@backingInt(listed.role)); // safe: a role enum's values are small by construction.
+                    try entries.append(self.gpa, .{ .role = role_value, .target = target });
+                    // The container a type function returns is also its type: instances declared with it are the role's.
+                    if (target == .function) if (try self.template(target.function)) |returned| if (returned == .container) {
+                        try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = returned.container.file, .scope = returned.container.scope } } });
+                    };
+                },
+                .gap => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why }),
+            };
+        }
+    }
+    var growing = true;
+    while (growing) {
+        growing = false;
+        for (self.project.imports) |mapping| {
+            if (!reached[mapping.from.raw()] or reached[mapping.target.raw()]) continue; // safe: validated mapping identities index the frozen file table.
+            if (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root")) continue;
+            reached[mapping.target.raw()] = true; // safe: validated mapping identities index the frozen file table.
+            growing = true;
+        }
+    }
+    var files: std.ArrayList(Project.FileId) = .empty;
+    for (reached, 0..) |in_library, index| if (in_library) try files.append(self.gpa, Project.FileId.fromRaw(@intCast(index))); // safe: the project bounds its file count to u32 identities.
+    const result = try self.gpa.create(Publication);
+    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
+    try self.publications.put(self.gpa, key, result);
+    return result;
+}
+
+const Found = union(enum) { found: Target, gap: Unknown };
+/// Walks public namespaces from a module root, the way a program names the declaration.
+fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!Found {
+    var current: Value = .{ .container = .{ .file = root, .scope = 0 } };
+    var names = std.mem.splitScalar(u8, path, '.');
+    while (names.next()) |name| {
+        const container = switch (current) {
+            .container, .instance => |c| c,
+            .unknown => |why| return .{ .gap = why },
+            else => return .{ .gap = .unsupported },
+        };
+        const decl = self.member(container, name) orelse return .{ .gap = .unresolved };
+        if (!self.project.models[decl.file.raw()].declarations[decl.index].public) return .{ .gap = .unresolved }; // safe: enum identities index their owning frozen tables without narrowing.
+        current = try self.declaration(decl);
+    }
+    return switch (current) {
+        .function => |decl| .{ .found = .{ .function = decl } },
+        .container => |c| .{ .found = .{ .container = .{ .file = c.file, .scope = c.scope } } },
+        .unknown => |why| .{ .gap = why },
+        else => .{ .gap = .unsupported },
+    };
+}
+
+/// The role `library` publishes for a function declaration, or a type or instance of a
+/// published container, seen through pointers, optionals and error unions.
+pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(library).Role {
+    const Role = @TypeOf(library).Role;
+    const found = try self.publication(library);
+    var current = value;
+    while (true) switch (current) {
+        .pointer, .optional, .error_union => |inner| current = inner.*,
+        .function => |decl| {
+            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role))); // safe: the entry holds a role value of this enum.
+            return null;
+        },
+        .container, .instance => |c| {
+            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(c.file) and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role))); // safe: the entry holds a role value of this enum.
+            return null;
+        },
+        else => return null,
+    };
 }
 
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
@@ -153,19 +252,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
                 const result = try self.resolve(decl.file, result_node);
                 if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) {
-                    // A sole, direct returned container retains template identity.
-                    // This is not execution or a concrete generic instantiation.
-                    const lowered = declaration_record.lowered orelse return .{ .unknown = .comptime_dependent };
-                    var fn_node = self.project.files[decl.file.raw()].zir.?.getDeclaration(lowered).src_node; // safe: enum identities index their owning frozen tables without narrowing.
-                    if (target_tree.nodeTag(fn_node) != .fn_decl) fn_node = self.project.models[decl.file.raw()].node_parents[@backingInt(fn_node)] orelse return .{ .unknown = .comptime_dependent }; // safe: enum identities index their owning frozen tables without narrowing.
-                    if (target_tree.nodeTag(fn_node) != .fn_decl) return .{ .unknown = .comptime_dependent };
-                    var body_buffer: [2]Ast.Node.Index = undefined;
-                    const statements = target_tree.blockStatements(&body_buffer, target_tree.nodeData(fn_node).node_and_node[1]) orelse return .{ .unknown = .comptime_dependent };
-                    if (statements.len != 1 or target_tree.nodeTag(statements[0]) != .@"return") return .{ .unknown = .comptime_dependent };
-                    const returned = target_tree.nodeData(statements[0]).opt_node.unwrap() orelse return .{ .unknown = .comptime_dependent };
-                    var container_buffer: [2]Ast.Node.Index = undefined;
-                    if (target_tree.fullContainerDecl(&container_buffer, returned) == null) return .{ .unknown = .comptime_dependent };
-                    var value = try self.resolve(decl.file, returned);
+                    var value = try self.template(decl) orelse return .{ .unknown = .comptime_dependent };
                     if (value == .container) value.container.symbolic = function.ast.params.len != 0;
                     return value;
                 }
@@ -189,6 +276,40 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         else => return .{ .unknown = .unsupported },
     }
+}
+
+/// The container a type function returns when its body ends in one `return` of that container,
+/// whatever comptime checks come before. This is the template, not an instantiation: no
+/// arguments are evaluated.
+pub fn template(self: *Facts, decl: Decl) ResolveError!?Value {
+    if (self.templates.get(decl)) |known| return known;
+    const found = try self.findTemplate(decl);
+    try self.templates.put(self.gpa, decl, found);
+    return found;
+}
+fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
+    const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const lowered = record.lowered orelse return null;
+    var fn_node = self.project.files[decl.file.raw()].zir.?.getDeclaration(lowered).src_node; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.nodeTag(fn_node) != .fn_decl) fn_node = self.project.models[decl.file.raw()].node_parents[@backingInt(fn_node)] orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.nodeTag(fn_node) != .fn_decl) return null;
+    const body = tree.nodeData(fn_node).node_and_node[1];
+    var body_buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&body_buffer, body) orelse return null;
+    if (statements.len == 0 or tree.nodeTag(statements[statements.len - 1]) != .@"return") return null;
+    const last = statements[statements.len - 1];
+    // Only the final statement may return. A `return` in the checks before it, in a branch or a
+    // nested block, could return something else. Those after it are inside the returned container,
+    // where only nested functions can contain one.
+    for (tree.firstToken(body)..tree.nodeMainToken(last)) |token| {
+        if (tree.tokenTag(@intCast(token)) == .keyword_return) return null; // safe: the body's token range lies inside the file's token table.
+    }
+    const returned = tree.nodeData(last).opt_node.unwrap() orelse return null;
+    var container_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&container_buffer, returned) == null) return null;
+    const value = try self.resolve(decl.file, returned);
+    return value;
 }
 
 pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {

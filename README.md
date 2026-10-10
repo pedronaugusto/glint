@@ -79,6 +79,8 @@ Run `zig build check`, `zig build lint`, `zig build check-token-portable`, and t
 MIT. See [LICENSE](LICENSE).
 
 G3 adds optional exploratory aegis reports A001–A005 for the published Secret, SecretBytes,
-Guarded, id, units and integer contracts. Select reports or gates explicitly; required unknown sites remain incomplete.
+Guarded, id, units and integer contracts. They find aegis by its published names under the module `aegis`,
+at any revision (`--module aegis=path/to/src/root.zig`, and each namespace module a revision builds), and
+report a published name that no longer resolves. Select reports or gates explicitly; required unknown sites remain incomplete.
 Work remains in progress: generic/flow coverage, real-defect admission and consumer adoption
 are incomplete. See [design](docs/design.md#published-aegis-reports-g3).

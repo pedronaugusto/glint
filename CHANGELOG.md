@@ -4,6 +4,15 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed (aegis by published names, 2026-10-10)
+
+- Added `Library(Role)`, `RuleContext.role`, `RuleContext.inLibrary` and `RuleContext.drift`: a pack finds a library's declarations through the module a program imports it by and the public paths it publishes. The aegis pack uses them, so A001–A005 recognize aegis at any revision that keeps its public names (checked on four: the first published, f199c0d, b77c659 and 586602b). Before, the pack recognized the sources of one aegis commit by digest and every other revision came back "no resolved operation contract" with the gates quiet.
+- A published member that does not resolve in a module a file imports is reported as coverage, so renaming or dropping an aegis declaration makes a gate incomplete instead of quiet.
+- Breaking: removed `AegisPack.pinned` and `RuleContext.sourceDigest`. The pack recognizes aegis only under the module name `aegis` (and `aegis.<namespace>`); a caller that mapped aegis's files under other names maps the root as `aegis`. Rule versions are unchanged.
+- A type function whose body is one `return` of its container after comptime checks now resolves to that container, so instances such as `Secret(u32)` and `Bytes(usize)` are recognized through fields and parameters; a body with several returns still has none. No reviewed-rule diagnostic changed on the family.
+- A002 no longer asks about `undefined`, `true`, `false` and `null` initializers, which are values and not owners; they were most of its unresolved coverage.
+- Updated green aegis, preflight and shakedown pins.
+
 ### Changed (token tier, 2026-10-09)
 
 - Added independent `glint_token` standard-tokenizer facts, with optional policy observation made in the same pass, one token at a time; semantic AST/ZIR work is requested separately.

@@ -1,6 +1,7 @@
-//! Optional pack cost on pinned operation sources; fixtures are not admission evidence.
+//! Optional pack cost on the pinned aegis sources; fixtures are not admission evidence.
 const std = @import("std");
 const glint = @import("glint");
+const sources = @import("aegis_sources");
 const pack = glint.AegisPack;
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -8,12 +9,9 @@ pub fn main(init: std.process.Init) !void {
     const core = args.len > 3 and std.mem.eql(u8, args[3], "core");
     const n: usize = if (args.len > 1 and std.mem.eql(u8, args[1], "--smoke")) 4 else 128;
     var source: std.Io.Writer.Allocating = .init(init.arena.allocator());
-    try source.writer.writeAll("const S = @import(\"secret\").Secret;\n");
+    try source.writer.writeAll("const S = @import(\"aegis\").Secret;\n");
     for (0..n) |i| try source.writer.print("pub fn site{d}(s: *S(u32)) void {{ _ = s.material; }}\n", .{i});
-    var project = try glint.Project.init(init.gpa, &.{
-        .{ .name = "sites", .bytes = source.written() },
-        .{ .name = "secret", .bytes = @embedFile("aegis-secret"), .selected = false },
-    }, &.{.{ .from = glint.Project.FileId.fromRaw(0), .spelling = "secret", .target = glint.Project.FileId.fromRaw(1) }}, .{});
+    var project = try sources.project(init.gpa, source.written());
     defer project.deinit();
     const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{
         .{ .rule = pack.access, .level = .report },   .{ .rule = pack.copies, .level = .report },
