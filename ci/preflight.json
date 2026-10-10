@@ -2,6 +2,14 @@
   "sources": [
     "src"
   ],
+  "glint_paths": [
+    "src",
+    "examples/project.zig",
+    "examples/report.zig",
+    "ci",
+    "bench",
+    "build.zig"
+  ],
   "test_roots": [
     "src/tests.zig",
     "src/glint.zig"

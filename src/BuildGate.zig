@@ -30,7 +30,7 @@ fn execute(init: std.process.Init) !u8 {
     var random: [16]u8 = undefined;
     init.io.random(&random);
     const nonce = std.fmt.bytesToHex(&random, .lower);
-    const receipt_path = try std.fs.path.join(a, &.{ args[2], &nonce });
+    const receipt_path = try std.Io.Dir.path.join(a, &.{ args[2], &nonce });
     defer std.Io.Dir.cwd().deleteFile(init.io, receipt_path) catch {}; // glint-ignore: Z026 -- scratch receipt removal is best effort after its verified consumption
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, args[1]);

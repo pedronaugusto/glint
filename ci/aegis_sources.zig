@@ -30,20 +30,21 @@ const units = 9;
 const scalar = 10;
 
 /// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
-fn imports() [18]Project.Import {
+fn imports() [19]Project.Import {
     return .{
-        .{ .from = file(root), .spelling = "secret", .target = file(secret) },
-        .{ .from = file(root), .spelling = "sync", .target = file(sync) },
-        .{ .from = file(root), .spelling = "int", .target = file(int) },
-        .{ .from = file(root), .spelling = "id", .target = file(id) },
-        .{ .from = file(root), .spelling = "units", .target = file(units) },
+        .{ .from = file(root), .spelling = "secret.zig", .target = file(secret) },
+        .{ .from = file(root), .spelling = "sync.zig", .target = file(sync) },
+        .{ .from = file(root), .spelling = "int.zig", .target = file(int) },
+        .{ .from = file(root), .spelling = "id.zig", .target = file(id) },
+        .{ .from = file(root), .spelling = "units.zig", .target = file(units) },
         .{ .from = file(secret), .spelling = "secret/inline.zig", .target = file(secret_inline) },
         .{ .from = file(secret), .spelling = "secret/SecretBytes.zig", .target = file(secret_bytes) },
         .{ .from = file(sync), .spelling = "Guarded.zig", .target = file(guarded) },
-        .{ .from = file(int), .spelling = "scalar", .target = file(scalar) },
-        .{ .from = file(id), .spelling = "scalar", .target = file(scalar) },
-        .{ .from = file(units), .spelling = "scalar", .target = file(scalar) },
-        .{ .from = file(units), .spelling = "int", .target = file(int) },
+        .{ .from = file(int), .spelling = "scalar.zig", .target = file(scalar) },
+        .{ .from = file(id), .spelling = "scalar.zig", .target = file(scalar) },
+        .{ .from = file(id), .spelling = "units.zig", .target = file(units) },
+        .{ .from = file(units), .spelling = "scalar.zig", .target = file(scalar) },
+        .{ .from = file(units), .spelling = "int.zig", .target = file(int) },
         .{ .from = file(0), .spelling = "aegis", .target = file(root) },
         .{ .from = file(0), .spelling = "aegis.secret", .target = file(secret) },
         .{ .from = file(0), .spelling = "aegis.sync", .target = file(sync) },

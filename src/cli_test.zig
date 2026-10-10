@@ -6,7 +6,7 @@ const cli = glint.cli;
 fn resultPath(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]const u8 {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(path);
-    return std.fs.path.join(a, &.{ path, name });
+    return std.Io.Dir.path.join(a, &.{ path, name });
 }
 
 fn completionCase(findings: bool) !void {
@@ -198,7 +198,7 @@ test "G2 completion rejects incomplete analysis despite every finding being allo
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.zig", .data = "// glint-ignore: Z012 -- intentionally inference-only factory\npub fn make() Unknown { return .{}; }" });
     const input = try tmp.dir.realPathFileAlloc(std.testing.io, "input.zig", a);
     defer a.free(input);
-    const result = try std.fs.path.join(a, &.{ input[0 .. input.len - 9], "result.json" });
+    const result = try std.Io.Dir.path.join(a, &.{ input[0 .. input.len - 9], "result.json" });
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();

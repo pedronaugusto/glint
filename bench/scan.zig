@@ -2,7 +2,7 @@
 const std = @import("std");
 const glint = @import("glint");
 const Stats = @import("allocations.zig");
-const smoke = @import("builtin").mode == .debug;
+const smoke = @import("builtin").optimize == .debug;
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const writer = &output.interface;
-    try writer.print("version=1 bytes={d} files=1 declarations={d} rounds={d} optimize={s}\n", .{ source.len, count, rounds, @tagName(@import("builtin").mode) });
+    try writer.print("version=1 bytes={d} files=1 declarations={d} rounds={d} optimize={s}\n", .{ source.len, count, rounds, @tagName(@import("builtin").optimize) });
     const start = now(init.io, small);
     var nodes: usize = 0;
     for (0..rounds) |_| {

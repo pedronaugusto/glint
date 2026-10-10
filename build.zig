@@ -162,8 +162,8 @@ pub fn addLint(b: *std.Build, executable: *std.Build.Step.Compile, options: Lint
         .imports = &.{.{ .name = "glint", .module = module }},
     }) });
     const run = b.addRunArtifact(gate);
-    run.addArtifactArg(executable);
-    run.addDirectoryArg(b.tmpPath());
+    run.addArtifactArg2(executable, .{});
+    run.addDirectoryArg2(b.tmpPath(), .{});
     if (options.config) |config| {
         run.addArg("--config");
         run.addFileArg(config);
@@ -171,7 +171,7 @@ pub fn addLint(b: *std.Build, executable: *std.Build.Step.Compile, options: Lint
     for (options.sources) |source| run.addFileArg(source);
     for (options.directories) |directory| {
         run.addArg("--input-directory");
-        run.addDirectoryArg(directory);
+        run.addDirectoryArg2(directory, .{});
     }
     for (options.inputs) |input| run.addFileInput(input);
     run.addArgs(options.args);

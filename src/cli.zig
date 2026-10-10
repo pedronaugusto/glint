@@ -50,7 +50,7 @@ const Loader = struct {
         self.bytes += bytes.len;
         if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
         const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
-        const basename = std.fs.path.basename(path);
+        const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected });
         try self.canonical_paths.append(self.a, canonical);
@@ -90,18 +90,18 @@ const Loader = struct {
     fn importPath(self: *Loader, from: usize, spelling: []const u8) !?[]const u8 {
         if (std.mem.eql(u8, spelling, "std")) {
             const lib = self.options.zig_lib_path orelse return null;
-            const path = try std.fs.path.join(self.a, &.{ lib, "std", "std.zig" });
+            const path = try std.Io.Dir.path.join(self.a, &.{ lib, "std", "std.zig" });
             return path;
         }
         for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling, module.name)) return module.path;
         if (!std.mem.endsWith(u8, spelling, ".zig")) return null;
-        const path = try std.fs.path.join(self.a, &.{ std.fs.path.dirname(self.canonical_paths.items[from]) orelse ".", spelling });
+        const path = try std.Io.Dir.path.join(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[from]) orelse ".", spelling });
         return path;
     }
 };
 
 fn within(root: []const u8, path: []const u8) bool {
-    return std.mem.eql(u8, root, path) or (root.len == 1 and std.fs.path.isSep(root[0]) and std.fs.path.isAbsolute(path)) or (std.mem.startsWith(u8, path, root) and path.len > root.len and std.fs.path.isSep(path[root.len]));
+    return std.mem.eql(u8, root, path) or (root.len == 1 and std.Io.Dir.path.isSep(root[0]) and std.Io.Dir.path.isAbsolute(path)) or (std.mem.startsWith(u8, path, root) and path.len > root.len and std.Io.Dir.path.isSep(path[root.len]));
 }
 
 fn value(args: []const []const u8, index: *usize) ![]const u8 {
@@ -227,12 +227,12 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     for (configured.files.items) |path| {
         const id = try loader.load(path, true);
         const canonical = loader.canonical_paths.items[id.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
-        try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
+        try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
     for (configured.modules.items) |module| {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, module.path, a);
-        try loader.roots.append(a, std.fs.path.dirname(canonical) orelse canonical);
+        try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
     }
     record.outcome = .traversal_failure;
     try loader.imports();
