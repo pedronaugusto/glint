@@ -64,3 +64,19 @@ pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
     return Project.init(gpa, &inputs, &imports(), .{});
 }
+
+/// `project`, with a second source of the program's own, imported by the consumer as `lib`
+/// and importing aegis as `aegis`: a module a program reaches its types through.
+pub fn projectWith(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8) !glint.Project {
+    var inputs: [sources.len + 2]Project.Input = undefined;
+    inputs[0] = .{ .name = "consumer", .bytes = consumer };
+    for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib };
+    const lib_file = file(sources.len + 1);
+    const mapped = imports();
+    var all: [mapped.len + 2]Project.Import = undefined;
+    @memcpy(all[0..mapped.len], &mapped);
+    all[mapped.len] = .{ .from = file(0), .spelling = "lib", .target = lib_file };
+    all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = file(root) };
+    return Project.init(gpa, &inputs, &all, .{});
+}

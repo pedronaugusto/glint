@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed (aegis types the program names, 2026-10-10)
+
+- The aegis scalar gate decides a receiver whose type the program reaches through a module import or another file's alias (`lib.Length`, `cellmod.Index`), through a method of a type a type function returns (`link.index()` declared `?Index`), through the payload of `if (x) |name|` and `while (x) |name|`, and through `orelse`, `catch`, `.?` and `try`. They were undecided, which made a gating run incomplete.
+
 ### Changed (one module, 2026-10-10)
 
 - Breaking: the `glint_token` and `glint_cli` build modules are gone. Neither had a dependency or link of its own, so they were namespaces held apart: the token facts are `glint.token` (was `glint.Token` and `@import("glint_token")`) and the CLI driver is `glint.cli` (was `@import("glint_cli")`). `addLinter` now imports only `glint`. The `glint` module is the only module; the executable is unchanged.

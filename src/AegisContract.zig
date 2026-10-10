@@ -74,6 +74,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             const index = ref.declaration orelse return null;
             const decl = model.declarations[index];
             if (decl.kind == .parameter) return kind(c, file, decl.node, depth + 1);
+            if (decl.kind == .capture) return captured(c, file, decl.node, decl.token, depth + 1);
             if (decl.kind == .field) {
                 const field = tree.fullContainerField(decl.node).?;
                 if (field.ast.type_expr.unwrap()) |t| return kind(c, file, t, depth + 1);
@@ -83,11 +84,29 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 if (v.ast.init_node.unwrap()) |init| return kind(c, file, init, depth + 1);
             }
         },
-        .@"try", .address_of, .deref => return kind(c, file, tree.nodeData(node).node, depth + 1),
+        .@"try", .address_of, .deref, .optional_type, .unwrap_optional => return kind(c, file, tree.nodeData(node).node, depth + 1),
+        .@"orelse", .@"catch" => return kind(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        .error_union => return kind(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
             if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "Guard") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
-            return typeRole(c, try c.facts.resolve(file, node));
+            if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
+            // A member reached through a module import or another file's alias names its own
+            // declaration: its type expression is read where it is written, which a value
+            // resolved through a type function's call cannot always be.
+            const decl = (try c.facts.definition(file, node)) orelse return null;
+            const record = c.project.models[decl.file.raw()].declarations[decl.index];
+            const written = &c.project.files[decl.file.raw()].tree;
+            if (record.kind == .field) {
+                const field = written.fullContainerField(record.node).?;
+                if (field.ast.type_expr.unwrap()) |t| return kind(c, decl.file, t, depth + 1);
+                return null;
+            }
+            if (written.fullVarDecl(record.node)) |v| {
+                if (v.ast.type_node.unwrap()) |t| if (try kind(c, decl.file, t, depth + 1)) |k| return k;
+                if (v.ast.init_node.unwrap()) |init| return kind(c, decl.file, init, depth + 1);
+            }
+            return null;
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return typeRole(c, try c.facts.resolve(file, node)),
         .call_one, .call_one_comma, .call, .call_comma => {
@@ -101,9 +120,34 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             }
             const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return null;
             const origin = (try c.facts.origin(decl)) orelse return null;
-            return c.role(library, .{ .function = origin });
+            if (try c.role(library, .{ .function = origin })) |k| return k;
+            // A function of the program's own is what its declared result says, whether it is
+            // an ordinary function or a method of a type a type function returns.
+            const record = c.project.models[origin.file.raw()].declarations[origin.index];
+            if (record.kind != .function) return null;
+            const written = &c.project.files[origin.file.raw()].tree;
+            var proto_buffer: [1]Ast.Node.Index = undefined;
+            const proto = written.fullFnProto(&proto_buffer, record.node) orelse return null;
+            const result = proto.ast.return_type.unwrap() orelse return null;
+            return kind(c, origin.file, result, depth + 1);
         },
         else => {},
+    }
+    return null;
+}
+/// What a name bound by `if (x) |name|` or `while (x) |name|` holds: the payload of `x`, which
+/// is `x`'s own kind seen through its optional or error union. Other captures stay unknown.
+fn captured(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: Ast.TokenIndex, depth: usize) Context.Error!?Kind {
+    const tree = &c.project.files[file.raw()].tree;
+    if (tree.fullIf(node)) |branch| {
+        const payload = branch.payload_token orelse return null;
+        if (payload != name and payload + 1 != name) return null;
+        return kind(c, file, branch.ast.cond_expr, depth + 1);
+    }
+    if (tree.fullWhile(node)) |branch| {
+        const payload = branch.payload_token orelse return null;
+        if (payload != name and payload + 1 != name) return null;
+        return kind(c, file, branch.ast.cond_expr, depth + 1);
     }
     return null;
 }

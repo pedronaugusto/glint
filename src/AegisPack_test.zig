@@ -435,3 +435,56 @@ test "aegis's own files are its safe-type internals" {
     // Only the consumer is checked: the guard's own `owner.lock` and the secret's `material` are not findings.
     try expectEverySite(report);
 }
+
+fn scalarFindings(project: *P) !usize {
+    const gated: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} };
+    var report = try glint.runConfigured(std.testing.allocator, project, gated, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    return count(report, pack.scalar);
+}
+
+test "scalar receivers are known through a type function's method, a captured payload and an orelse" {
+    var project = try fixture(
+        \\const Id = @import("aegis").id.Id;
+        \\const Index = Id(struct {}, u16);
+        \\fn Handle(comptime checked: bool) type {
+        \\    return enum(if (checked) u64 else u16) {
+        \\        none = 0,
+        \\        _,
+        \\        pub fn index(h: @This()) ?Index {
+        \\            return if (@backingInt(h) == 0) null else .fromRaw(1);
+        \\        }
+        \\    };
+        \\}
+        \\const Link = Handle(true);
+        \\pub fn f(link: Link, limit: u16) bool {
+        \\    if (link.index()) |i| {
+        \\        if (i.raw() < limit) return true;
+        \\    }
+        \\    const j = link.index() orelse return false;
+        \\    return j.raw() == limit;
+        \\}
+    );
+    defer project.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try scalarFindings(&project)); // safe: two raw comparisons, both decided.
+}
+
+test "scalar receivers are known through a type another file of the program names" {
+    var project = try aegis_sources.projectWith(std.testing.allocator,
+        \\const lib = @import("lib");
+        \\pub fn f(len: lib.Length, plain: u16) bool {
+        \\    const offset: lib.Offset = .fromRaw(plain);
+        \\    return len.raw() != 12 or offset.raw() != 0;
+        \\}
+    ,
+        \\const deps = struct {
+        \\    pub const aegis = @import("aegis");
+        \\};
+        \\const Tag = struct {};
+        \\pub const Length = deps.aegis.units.Bytes(u16);
+        \\pub const Offset = deps.aegis.id.Id(Tag, u32);
+    );
+    defer project.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try scalarFindings(&project)); // safe: two raw comparisons, decided.
+}
