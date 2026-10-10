@@ -6,7 +6,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Changed (token tier, 2026-10-09)
 
-- Added independent `glint_token` standard-tokenizer facts, with optional policy observation; semantic AST/ZIR work is requested separately.
+- Added independent `glint_token` standard-tokenizer facts, with optional policy observation made in the same pass, one token at a time; semantic AST/ZIR work is requested separately.
 - Fixed cut UTF-8 character lowering, optional lowering, named-test/declaration-literal/reflection references and actual builtin test contexts.
 - A001–A005 version 2 accept explicit gate adoption while preserving undecided required sites. Generic defaults are unchanged.
 - Updated green aegis, preflight and shakedown pins; embedded public-module tests no longer require a hidden shakedown import.

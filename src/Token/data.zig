@@ -19,7 +19,7 @@ pub const Observer = struct {
     context: *anyopaque,
     punctuation: bool = false,
     boundary: ?*const fn (*anyopaque) void = null,
-    token: *const fn (*anyopaque, []const Token) error{OutOfMemory}!void,
+    token: *const fn (*anyopaque, Token) error{OutOfMemory}!void,
 };
 pub const Import = struct {
     name: []const u8,
@@ -31,5 +31,5 @@ pub const Import = struct {
 pub const Unsupported = struct { offset: usize, expression: enum { zig_import } = .zig_import };
 /// Inclusive source byte offsets.
 pub const Range = struct { first: u32, last: u32 };
-pub const Facts = struct { tokens: []const Token, imports: []const Import, unsupported: []const Unsupported, tests: []const Range };
+pub const Facts = struct { imports: []const Import, unsupported: []const Unsupported, tests: []const Range };
 pub const Error = error{ InvalidLiteral, SourceTooLarge, OutOfMemory };

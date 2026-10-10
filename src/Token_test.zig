@@ -43,34 +43,47 @@ test "morning token reflection and decl literal keep lazy imports live" {
     for (facts.imports) |imp| try std.testing.expect(!imp.dead);
 }
 
-test "token observer retains exact escaped spans and range punctuation" {
+test "token observer sees exact escaped spans and range punctuation as the pass reaches them" {
     const Capture = struct {
         const Self = @This();
         calls: usize = 0,
         boundaries: usize = 0,
         dots: usize = 0,
+        escaped: bool = false,
+        bytes: []const u8,
         fn boundary(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
             self.boundaries += 1;
         }
-        fn see(raw: *anyopaque, stream: []const token.Token) error{OutOfMemory}!void {
+        fn see(raw: *anyopaque, t: token.Token) error{OutOfMemory}!void {
             const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
             self.calls += 1;
-            if (stream[stream.len - 1].is(".")) self.dots += 1;
+            if (t.is(".")) self.dots += 1;
+            std.debug.assert(t.offset < t.end());
+            std.debug.assert(t.end() <= self.bytes.len);
+            if (std.mem.eql(u8, t.text, "escaped name")) {
+                self.escaped = true;
+                std.debug.assert(std.mem.eql(u8, "@\"escaped\\x20name\"", self.bytes[t.offset..t.end()]));
+            }
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var capture: Capture = .{};
-    const bytes = "const @\"escaped\\x20name\" = @import(\"dep\"); pub fn f() void { _ = 0..4; _ = 'x'; }";
-    const facts = try token.scan(arena.allocator(), bytes, .{ .context = &capture, .punctuation = true, .boundary = Capture.boundary, .token = Capture.see });
-    try std.testing.expectEqual(facts.tokens.len, capture.calls);
+    const bytes = "const @\"escaped\\x20name\" = @import(\"dep\"); pub fn f() void { _ = 0..4; _ = 'x'; _ = a == b; }";
+    var capture: Capture = .{ .bytes = bytes };
+    const observed = try token.scan(arena.allocator(), bytes, .{ .context = &capture, .punctuation = true, .boundary = Capture.boundary, .token = Capture.see });
     try std.testing.expectEqual(@as(usize, 2), capture.dots); // safe: the range consists of two dot tokens.
     try std.testing.expectEqual(@as(usize, 1), capture.boundaries); // safe: one character literal interrupts policy observation.
-    for (facts.tokens) |t| {
-        try std.testing.expect(t.offset < t.end() and t.end() <= bytes.len);
-        if (std.mem.eql(u8, t.text, "escaped name")) try std.testing.expectEqualStrings("@\"escaped\\x20name\"", bytes[t.offset..t.end()]);
-    }
+    try std.testing.expect(capture.escaped);
+    // Every punctuation byte of `==` arrives, and without punctuation none does.
+    var plain: Capture = .{ .bytes = bytes };
+    const quiet = try token.scan(arena.allocator(), bytes, .{ .context = &plain, .boundary = Capture.boundary, .token = Capture.see });
+    try std.testing.expectEqual(@as(usize, 0), plain.dots); // safe: punctuation is not observed.
+    try std.testing.expect(plain.calls < capture.calls);
+    // Observing changes no fact.
+    const unobserved = try token.scan(arena.allocator(), bytes, null);
+    try std.testing.expectEqualDeep(unobserved, observed);
+    try std.testing.expectEqualDeep(unobserved, quiet);
 }
 
 test "pointer dereference does not become a second range dot" {
