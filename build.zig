@@ -1,9 +1,8 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) !void {
-    // lazyImport compares every package of the dependency tree at comptime;
-    // a large tree runs past the default quota of 1000 branches.
-    @setEvalBranchQuota(100_000);
+/// What a project that depends on glint builds: the `glint` module, the `glint`
+/// program, and `addLinter` and `addLint` for a project's own linter.
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
@@ -19,79 +18,90 @@ pub fn build(b: *std.Build) !void {
     }) });
     executable.root_module.addImport("aegis", aegis);
     b.installArtifact(executable);
-    if (b.pkg_hash.len != 0) return;
+}
+
+/// glint's development: its tests, checks, linter examples and benchmarks under
+/// preflight's gate, with shakedown bound to glint's aegis. Run through bay.
+pub fn dev(b: *std.Build, tools: type) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const filter = b.option([]const u8, "test-filter", "Select tests by name");
+    const package = b.dependency("glint", .{ .target = target, .optimize = optimize });
+    const p = package.builder;
+    const module = package.module("glint");
+    const executable = package.artifact("glint");
+    const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
+    const aegis = aegis_dependency.module("aegis");
     const portable = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const portable_tokens = b.createModule(.{ .root_source_file = b.path("src/Token.zig"), .target = portable, .optimize = .small });
+    const portable_tokens = b.createModule(.{ .root_source_file = p.path("src/Token.zig"), .target = portable, .optimize = .small });
     const portable_contract = b.addObject(.{ .name = "token-portable", .root_module = b.createModule(.{
-        .root_source_file = b.path("ci/token_portable.zig"),
+        .root_source_file = p.path("ci/token_portable.zig"),
         .target = portable,
         .optimize = .small,
         .imports = &.{.{ .name = "token", .module = portable_tokens }},
     }) });
     b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
-    const filter = b.option([]const u8, "test-filter", "Select tests by name");
-    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
+    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
     tests.root_module.addImport("aegis", aegis);
     tests.root_module.addImport("glint", module);
-    tests.root_module.addImport("aegis_sources", aegisSources(b, module, aegis_dependency, target));
-    var needed: error{LazyDependencyNeeded}!void = {};
-    if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |dep| {
-        tests.root_module.addImport("shakedown", dep.module("shakedown"));
-    } else |err| needed = err;
+    tests.root_module.addImport("aegis_sources", aegisSources(b, p, module, aegis_dependency, target));
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
+    tools.shakedown.useAegis(shakedown, aegis);
+    tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     const project_linter = b.addExecutable(.{ .name = "glint-project-example", .root_module = b.createModule(.{
-        .root_source_file = b.path("examples/project.zig"),
+        .root_source_file = p.path("examples/project.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "glint", .module = module }},
     }) });
     const project_check = b.step("check-project", "Compile a standalone linter with project-owned rules");
     project_check.dependOn(&project_linter.step);
-    const project_smoke = addLint(b, project_linter, .{ .sources = &.{b.path("examples/report.zig")}, .directories = &.{b.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
+    const project_smoke = addLint(b, project_linter, .{ .sources = &.{p.path("examples/report.zig")}, .directories = &.{p.path("examples")}, .args = &.{ "--only", "LOCAL_EXPORT" } });
     const source_policy = addLint(b, executable, .{
         .sources = &.{
-            b.path("src/AegisContract.zig"),
-            b.path("src/AegisPack.zig"),
-            b.path("src/AegisPack_test.zig"),
-            b.path("src/BuildGate.zig"),
-            b.path("src/Builtins.zig"),
-            b.path("src/Completion.zig"),
-            b.path("src/DeadDeclarations.zig"),
-            b.path("src/Facts.zig"),
-            b.path("src/File.zig"),
-            b.path("src/Library.zig"),
-            b.path("src/Library_test.zig"),
-            b.path("src/Model.zig"),
-            b.path("src/Project.zig"),
-            b.path("src/Projection.zig"),
-            b.path("src/Projection_test.zig"),
-            b.path("src/Token.zig"),
-            b.path("src/Token/liveness.zig"),
-            b.path("src/Token/store.zig"),
-            b.path("src/Token/data.zig"),
-            b.path("src/Token_test.zig"),
-            b.path("src/Report.zig"),
-            b.path("src/Result.zig"),
-            b.path("src/Rule.zig"),
-            b.path("src/RuleContext.zig"),
-            b.path("src/RuleContext_test.zig"),
-            b.path("src/Runner.zig"),
-            b.path("src/Runner_test.zig"),
-            b.path("src/Suppression.zig"),
-            b.path("src/Usage.zig"),
-            b.path("src/build_gate_test.zig"),
-            b.path("src/cli.zig"),
-            b.path("src/cli_test.zig"),
-            b.path("src/contract_test.zig"),
-            b.path("src/glint.zig"),
-            b.path("src/main.zig"),
-            b.path("src/names.zig"),
-            b.path("src/tests.zig"),
+            p.path("src/AegisContract.zig"),
+            p.path("src/AegisPack.zig"),
+            p.path("src/AegisPack_test.zig"),
+            p.path("src/BuildGate.zig"),
+            p.path("src/Builtins.zig"),
+            p.path("src/Completion.zig"),
+            p.path("src/DeadDeclarations.zig"),
+            p.path("src/Facts.zig"),
+            p.path("src/File.zig"),
+            p.path("src/Library.zig"),
+            p.path("src/Library_test.zig"),
+            p.path("src/Model.zig"),
+            p.path("src/Project.zig"),
+            p.path("src/Projection.zig"),
+            p.path("src/Projection_test.zig"),
+            p.path("src/Token.zig"),
+            p.path("src/Token/liveness.zig"),
+            p.path("src/Token/store.zig"),
+            p.path("src/Token/data.zig"),
+            p.path("src/Token_test.zig"),
+            p.path("src/Report.zig"),
+            p.path("src/Result.zig"),
+            p.path("src/Rule.zig"),
+            p.path("src/RuleContext.zig"),
+            p.path("src/RuleContext_test.zig"),
+            p.path("src/Runner.zig"),
+            p.path("src/Runner_test.zig"),
+            p.path("src/Suppression.zig"),
+            p.path("src/Usage.zig"),
+            p.path("src/build_gate_test.zig"),
+            p.path("src/cli.zig"),
+            p.path("src/cli_test.zig"),
+            p.path("src/contract_test.zig"),
+            p.path("src/glint.zig"),
+            p.path("src/main.zig"),
+            p.path("src/names.zig"),
+            p.path("src/tests.zig"),
         },
-        .directories = &.{b.path("src")},
+        .directories = &.{p.path("src")},
         .args = &.{ "--only", "P001", "--only", "P002", "--only", "P003", "--gate", "P001", "--gate", "P002", "--gate", "P003" },
     });
     b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
@@ -99,34 +109,36 @@ pub fn build(b: *std.Build) !void {
     helper_check.dependOn(&project_smoke.step);
     const portable_smoke = b.addRunArtifact(project_linter);
     portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/input.zig" });
-    portable_smoke.addFileInput(b.path("examples/input.zig"));
+    portable_smoke.addFileInput(p.path("examples/input.zig"));
     test_step.dependOn(&portable_smoke.step);
     const check = b.step("check", "Compile CLI and tests");
     check.dependOn(&tests.step);
     check.dependOn(&executable.step);
     check.dependOn(&project_linter.step);
-    if (b.lazyImport(@This(), "preflight")) |preflight| {
-        preflight.addCi(b, .{ .tests = test_step, .portable_tests = true, .bench = .{
-            .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
-            .imports = benchImports,
-            .target = target,
-            .optimize = optimize,
-        } });
-        preflight.addConsumerCheck(b, .{ .package = "glint", .program = b.path("ci/consumer.zig"), .modules = &.{"glint"}, .packages = &.{aegis_dependency} });
-    }
-    return needed;
+    tools.preflight.addCi(b, p, .{ .tests = test_step, .portable_tests = true, .bench = .{
+        .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
+        .imports = benchImports,
+        .target = target,
+        .optimize = optimize,
+    } });
+    tools.preflight.addConsumerCheck(b, p, .{ .package = "glint", .program = p.path("ci/consumer.zig"), .modules = &.{"glint"}, .packages = &.{aegis_dependency} });
 }
 
+/// `b` is the development build.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
-    const module = b.createModule(.{ .root_source_file = b.path("src/glint.zig"), .target = target, .optimize = optimize });
-    const aegis_dependency = b.dependency("aegis", .{ .target = target, .optimize = optimize });
+    const p = b.dependency("glint", .{ .target = target, .optimize = optimize }).builder;
+    const module = b.createModule(.{ .root_source_file = p.path("src/glint.zig"), .target = target, .optimize = optimize });
+    const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
     module.addImport("aegis", aegis_dependency.module("aegis"));
-    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, module, aegis_dependency, target) } }) catch @panic("OOM");
+    // The same binding as `useAegis`, which only a `dev` has the tools for: one aegis is linked.
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
+    shakedown.module("shakedown").addImport("aegis", aegis_dependency.module("aegis"));
+    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "shakedown", .module = shakedown.module("shakedown") }, .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
 }
 
 /// The pinned aegis files that publish the pack's members, embedded as sources to analyze.
-fn aegisSources(b: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
-    const sources = b.createModule(.{ .root_source_file = b.path("ci/aegis_sources.zig"), .target = target });
+fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
+    const sources = b.createModule(.{ .root_source_file = p.path("ci/aegis_sources.zig"), .target = target });
     sources.addImport("glint", glint);
     const files = [_][2][]const u8{
         .{ "aegis-root", "src/root.zig" },

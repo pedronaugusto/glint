@@ -9,7 +9,7 @@ Requires Zig 0.17.0. Runtime dependencies are published aegis and Zig std; prefl
 ```sh
 git clone https://github.com/pedronaugusto/glint.git
 cd glint
-zig build -Doptimize=fast
+bay -Doptimize=fast
 ./zig-out/bin/glint src/example.zig
 ./zig-out/bin/glint --format json --only Z011 --only Z013 src/example.zig
 ./zig-out/bin/glint --format sarif --reviewed src/example.zig
@@ -72,9 +72,9 @@ Gantry owns path dialect and cross-file architecture policy. Preflight orchestra
 
 ## Development
 
-Run `zig build check`, `zig build lint`, `zig build check-token-portable`, and targeted tests such as `zig build test -Dtest-filter=review`. `zig build plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
+Run `bay check`, `bay lint`, `bay check-token-portable`, and targeted tests such as `bay test -Dtest-filter=review`. `bay plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
-`zig build bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token drivers and frozen corpus pins are in `bench/`; their measured rows live in private trials. No speed guarantee is claimed.
+`bay bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token drivers and frozen corpus pins are in `bench/`; their measured rows live in private trials. No speed guarantee is claimed.
 
 MIT. See [LICENSE](LICENSE).
 
