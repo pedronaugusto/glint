@@ -2,14 +2,14 @@
 
 Work in progress: G2 provides a Zig AST/ZIR source model, configurable built-in and compiled project rules, architecture projection and a standalone CLI. Consumer adoption, broader dead-private admission, later safety rules and predecessor retirement remain open. This is an unreleased development package.
 
-Requires Zig 0.17.0. Runtime dependencies are published aegis and Zig std; preflight and shakedown are lazy build/test dependencies.
+Requires Zig 0.17.0. Runtime dependencies are published aegis and Zig std; preflight and shakedown are dev dependencies through [bay](https://github.com/pedronaugusto/bay), which a project that depends on glint never sees.
 
 ## CLI
 
 ```sh
 git clone https://github.com/pedronaugusto/glint.git
 cd glint
-bay -Doptimize=fast
+zig build -Doptimize=fast
 ./zig-out/bin/glint src/example.zig
 ./zig-out/bin/glint --format json --only Z011 --only Z013 src/example.zig
 ./zig-out/bin/glint --format sarif --reviewed src/example.zig
