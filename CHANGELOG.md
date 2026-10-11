@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-11
+
 ### Breaking
 
 - glint is developed with [bay](https://github.com/pedronaugusto/bay): preflight and shakedown are dev dependencies, and the tests, checks and benchmarks are the development build's (`bay test`, `bay bench`). What a project that depends on glint builds is unchanged: the `glint` module, the `glint` program, `addLinter` and `addLint`.
