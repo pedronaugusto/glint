@@ -17,7 +17,7 @@ pub const layers: []const gantry.rules.Layer = &.{
 pub const required = [_][]const u8{ "src/glint.zig", "src/Project.zig", "src/main.zig" };
 pub const entries: []const []const u8 = &.{ "src/main.zig", "src/BuildGate.zig" };
 pub const references: []const gantry.rules.ReferenceRule = &.{
-    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "shakedown", "aegis", "aegis_sources" } },
+    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "std", "builtin", "glint", "shakedown", "aegis", "aegis_sources", "release" } },
 };
 
 pub const modules: []const gantry.NamedModule = &.{};

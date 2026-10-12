@@ -1,4 +1,6 @@
 //! Zig std front-end model and code rules. Runtime closure: aegis and std.
+/// The version of glint, as its manifest names it.
+pub const version: []const u8 = @import("release").version;
 /// An owned, immutable project constructed from explicit source inputs.
 pub const Project = @import("Project.zig");
 /// Verifies CLI completion independently of finding acceptance.

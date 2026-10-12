@@ -1,5 +1,6 @@
 //! Owned diagnostics and independent coverage. Rendering cannot alter model results.
 const std = @import("std");
+const release = @import("release");
 const Project = @import("Project.zig");
 const rules = @import("Rule.zig");
 const Report = @This();
@@ -70,7 +71,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.writeAll("]}\n");
         },
         .sarif => {
-            try writer.writeAll("{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"glint\",\"version\":\"0.1.0\"}},\"results\":[");
+            try writer.writeAll("{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"glint\",\"version\":\"" ++ release.version ++ "\"}},\"results\":[");
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
                 try sarifDiagnostic(writer, project, d);

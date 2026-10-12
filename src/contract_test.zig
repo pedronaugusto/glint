@@ -59,6 +59,21 @@ test "contract JSON and SARIF preserve stable IDs and reasoned suppressions" {
     }
 }
 
+test "contract SARIF names the version of glint the manifest gives" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "pub const x = 1;" }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.run(std.testing.allocator, &project, .{});
+    defer report.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try report.write(&output.writer, &project, .sarif);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    const driver = parsed.value.object.get("runs").?.array.items[0].object.get("tool").?.object.get("driver").?.object;
+    try std.testing.expectEqualStrings(glint.version, driver.get("version").?.string);
+    _ = try std.SemanticVersion.parse(glint.version);
+}
+
 test "contract a report cannot silently render against another project snapshot" {
     var first = try glint.Project.init(std.testing.allocator, &.{.{ .name = "first", .bytes = "const d = @import(\"dep\");" }}, &.{}, .{});
     defer first.deinit();

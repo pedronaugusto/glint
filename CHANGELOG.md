@@ -4,6 +4,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `glint.version`: the version of glint, as its manifest names it.
+
+### Fixed
+
+- SARIF names the version of glint that wrote it, as its manifest gives it; it named 0.1.0 whatever the version.
+
 ## [0.2.0] - 2026-10-11
 
 ### Breaking
