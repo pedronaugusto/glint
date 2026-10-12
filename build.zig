@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// glint's development: its tests, checks, linter examples and benchmarks under
-/// preflight's gate, with shakedown bound to glint's aegis. Run through bay.
+/// preflight's gate. Run through bay.
 pub fn dev(b: *std.Build, tools: type) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -47,8 +47,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     tests.root_module.addImport("aegis", aegis);
     tests.root_module.addImport("glint", module);
     tests.root_module.addImport("aegis_sources", aegisSources(b, p, module, aegis_dependency, target));
-    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
-    tools.shakedown.useAegis(shakedown, aegis);
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize });
     tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
     test_step.dependOn(&b.addRunArtifact(tests).step);
@@ -141,9 +140,7 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
     const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
     module.addImport("aegis", aegis_dependency.module("aegis"));
     module.addImport("release", release(p));
-    // The same binding as `useAegis`, which only a `dev` has the tools for: one aegis is linked.
-    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
-    shakedown.module("shakedown").addImport("aegis", aegis_dependency.module("aegis"));
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize });
     return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "shakedown", .module = shakedown.module("shakedown") }, .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
 }
 
