@@ -4,6 +4,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-12
+
+### Changed
+
+- Pins preflight 0.3.4 and shakedown 0.2.5.
+
 ## [0.2.1] - 2026-10-12
 
 ### Added
