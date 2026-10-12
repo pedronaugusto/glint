@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-12
+
 ### Added
 
 - `glint.version`: the version of glint, as its manifest names it.
