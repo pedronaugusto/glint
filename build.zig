@@ -140,8 +140,7 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
     const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
     module.addImport("aegis", aegis_dependency.module("aegis"));
     module.addImport("release", release(p));
-    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize });
-    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "shakedown", .module = shakedown.module("shakedown") }, .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
+    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
 }
 
 /// The pinned aegis files that publish the pack's members, embedded as sources to analyze.
