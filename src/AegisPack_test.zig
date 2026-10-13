@@ -185,6 +185,48 @@ test "adopted gates retain unresolved obligations and known unrelated receivers"
     try std.testing.expectEqual(@as(usize, 0), clean.diagnostics.len); // safe: resolved unrelated containers carry no published operation obligation.
 }
 
+test "a copy of plain data is decided by what the copy or its source declares" {
+    var project = try fixture(
+        \\const S = @import("aegis").Secret;
+        \\fn Unwrapped(comptime F: type) type {
+        \\    return switch (@typeInfo(F)) {
+        \\        .optional => |o| o.child,
+        \\        else => F,
+        \\    };
+        \\}
+        \\fn width(bytes: []const u8) usize {
+        \\    return bytes.len;
+        \\}
+        \\pub fn f(v: anytype, comptime F: type, rows: *[3][4]usize) usize {
+        \\    const now: ?bool = v;
+        \\    const left = comptime width("ab");
+        \\    var col: usize = left;
+        \\    col += 1;
+        \\    const Child = Unwrapped(F);
+        \\    const Value = Child;
+        \\    const before = &rows[0];
+        \\    const spent = before;
+        \\    var out: [2]u8 = "ab".*;
+        \\    out[0] = 'c';
+        \\    const final = out;
+        \\    _ = now;
+        \\    _ = Value;
+        \\    return col + spent[0] + final[0];
+        \\}
+        \\pub fn g(v: S(u32)) void {
+        \\    const kept: S(u32) = v;
+        \\    _ = kept;
+        \\}
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.copies, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    // The owner copied into a declared owner is still the one witness.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one owner copy in the fixture.
+    try std.testing.expectEqual(@as(u32, 28), report.diagnostics[0].span.line); // safe: the fixture's owner-copy line fits u32.
+}
+
 test "owner value parameter copy differs from borrowed pointer alias" {
     var project = try fixture(
         \\const S = @import("aegis").Secret;

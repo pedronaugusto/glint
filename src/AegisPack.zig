@@ -1,6 +1,7 @@
 //! Optional explicitly adopted published-type obligations. No security or lifetime proof.
 const std = @import("std");
 const Model = @import("Model.zig");
+const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
@@ -80,6 +81,9 @@ fn checkCopies(c: *Context) Context.Error!void {
             if (tree.nodeTag(init) != .identifier) continue;
             // `undefined`, `true`, `false` and `null` are values, not references to an owner.
             if (c.project.models[c.file.raw()].reference(init) == null) continue; // safe: the checked source handle indexes this frozen model.
+            // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
+            if (v.ast.type_node.unwrap()) |t| if (try plainType(c, c.file, t, 0)) continue;
+            if (try plainValue(c, c.file, init, 0)) continue;
             const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
             if (k != .scalar) {
                 if (!try ownedValue(c, init, 0)) continue;
@@ -92,6 +96,60 @@ fn checkCopies(c: *Context) Context.Error!void {
         }
     }
 }
+/// Whether a type expression is plain data: a primitive type (`usize`, `bool`, `type`), or an array,
+/// slice, pointer, optional or error union of plain data. No aegis owner or capability is such a value.
+fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    if (depth == 64) return false;
+    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
+    if (tree.fullPtrType(node)) |ptr| return plainType(c, file, ptr.ast.child_type, depth + 1);
+    if (tree.fullArrayType(node)) |array| return plainType(c, file, array.ast.elem_type, depth + 1);
+    return switch (tree.nodeTag(node)) {
+        .optional_type => plainType(c, file, tree.nodeData(node).node, depth + 1),
+        .error_union => plainType(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
+        .identifier => try c.facts.resolve(file, node) == .primitive,
+        else => false,
+    };
+}
+
+/// Whether a value is plain data by what is written where it comes from: a literal, a local or
+/// parameter declared plain or initialized with plain data, an element or the address of plain data,
+/// or the result of a function declared to return plain data.
+fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    if (depth == 64) return false;
+    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
+    const model = &c.project.models[file.raw()]; // safe: the file handle indexes the frozen project table.
+    switch (tree.nodeTag(node)) {
+        .number_literal, .char_literal, .string_literal => return true,
+        .@"comptime", .@"try", .address_of => return plainValue(c, file, tree.nodeData(node).node, depth + 1),
+        .grouped_expression => return plainValue(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .array_access => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        .identifier => {
+            const ref = model.reference(node) orelse return false;
+            const index = ref.declaration orelse return false;
+            const decl = model.declarations[index];
+            if (decl.kind == .parameter) return plainType(c, file, decl.node, depth + 1);
+            const v = tree.fullVarDecl(decl.node) orelse return false;
+            if (v.ast.type_node.unwrap()) |t| return plainType(c, file, t, depth + 1);
+            const init = v.ast.init_node.unwrap() orelse return false;
+            return plainValue(c, file, init, depth + 1);
+        },
+        .call_one, .call_one_comma, .call, .call_comma => {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node).?;
+            const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
+            const origin = (try c.facts.origin(decl)) orelse return false;
+            const record = c.project.models[origin.file.raw()].declarations[origin.index]; // safe: the origin indexes its own frozen model.
+            if (record.kind != .function) return false;
+            const written = &c.project.files[origin.file.raw()].tree; // safe: the origin indexes the frozen project table.
+            var proto_buffer: [1]Ast.Node.Index = undefined;
+            const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
+            const result = proto.ast.return_type.unwrap() orelse return false;
+            return plainType(c, origin.file, result, depth + 1);
+        },
+        else => return false,
+    }
+}
+
 fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
     const tree = try c.project.syntax(try c.source());

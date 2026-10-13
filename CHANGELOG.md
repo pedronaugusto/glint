@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A002 decides a copy of plain data instead of leaving it undecided: a copy declared with a primitive type (`usize`, `?bool`, `type`) or an array, slice, pointer, optional or error union of one, or whose source is declared so, is a literal, or is the result of a function declared to return one, copies no owner. Gated, such a copy made the run incomplete, so a package that copies plain data in code that also uses aegis could not gate A002.
+
 ## [0.2.3] - 2026-10-12
 
 ### Changed
