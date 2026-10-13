@@ -4,6 +4,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- The aegis rules decide a receiver by the type it resolves to, where they left it undecided: the payloads `if`, `while`, `switch` prongs and `for` bind, locals initialised from fields and calls, `!T` results, `catch`, `orelse`, `.?` and grouped expressions, a `switch` or `if` choosing between types (a platform's choice of struct, a `@compileError` branch left out), a function returning its `comptime T: type` parameter, a method of a container a type function made (its parameters read as that call's arguments), a slice's `len` and `ptr`, C's integer types, and numbers from operators no aegis type takes. A resolved type that is not aegis is no candidate; a type nested in a published one, such as a guard, stays undecided. On reactor's sources the undecided sites fall from 81 to 8.
+- A002 leaves out a copy of a pointer or an optional pointer, whatever it points at: an alias, which the rule already excluded by declared type.
+- A003 follows a release through the branches of an `if` (a release before a `return`, a fallthrough that releases later), a `defer` of the release followed by any statements but another release or a transfer, and a loop's own `break` and `continue`, where it stopped at the first statement after the acquisition.
+
 ## [0.2.5] - 2026-10-13
 
 ### Changed

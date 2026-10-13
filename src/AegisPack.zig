@@ -56,19 +56,46 @@ fn backingName(name: []const u8) bool {
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
     if (try Contract.owner(c, node)) |k| return k;
-    const value = try c.facts.resolve(c.file, node);
-    if (unresolved(value, 0)) {
-        const tree = try c.project.syntax(try c.source());
-        try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
+    switch (try typed(c, try c.facts.resolve(c.file, node), 0)) {
+        .owner => |k| return k,
+        .other => return null,
+        .unknown => {
+            const tree = try c.project.syntax(try c.source());
+            try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
+            return null;
+        },
     }
-    return null;
 }
-fn unresolved(value: Facts.Value, depth: usize) bool {
-    if (depth == 64) return true;
+const Typed = union(enum) { owner: Contract.Kind, other, unknown };
+/// Whether `container` is declared inside a published aegis type, as a guarded value's guard
+/// is: its own operations belong to that type's contract.
+fn nestedInPublished(c: *Context, container: Facts.Container) Context.Error!bool {
+    const found = try c.facts.publication(Contract.library);
+    const scopes = c.project.models[container.file.raw()].scopes; // safe: a resolved container's file indexes the frozen model table.
+    var scope = scopes[container.scope].parent;
+    while (scope) |s| : (scope = scopes[s].parent) {
+        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return true;
+    }
+    return false;
+}
+/// What a resolved value's type says: a published aegis type, a type that is not aegis, or
+/// unknown. A type nested in a published one that the contract does not list stays unknown
+/// rather than counted out, as does a choice between types that disagree.
+fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
+    if (depth == 64) return .unknown;
     return switch (value) {
-        .unknown => true,
-        .pointer, .optional, .error_union => |payload| unresolved(payload.*, depth + 1),
-        else => false,
+        .unknown => .unknown,
+        .pointer, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
+        .alternatives => |each| blk: {
+            const first = try typed(c, each[0], depth + 1);
+            for (each[1..]) |one| if (!std.meta.eql(first, try typed(c, one, depth + 1))) break :blk .unknown;
+            break :blk first;
+        },
+        .container, .instance => |container| blk: {
+            if (try c.role(Contract.library, value)) |k| break :blk .{ .owner = k };
+            break :blk if (try nestedInPublished(c, container)) .unknown else .other;
+        },
+        else => .other,
     };
 }
 fn checkCopies(c: *Context) Context.Error!void {
@@ -84,6 +111,8 @@ fn checkCopies(c: *Context) Context.Error!void {
             // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
             if (v.ast.type_node.unwrap()) |t| if (try plainType(c, c.file, t, 0)) continue;
             if (try plainValue(c, c.file, init, 0)) continue;
+            // A copied pointer is an alias, which this rule leaves out, whatever it points at.
+            if (pointerShaped(try c.facts.resolve(c.file, init))) continue;
             const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
             if (k != .scalar) {
                 if (!try ownedValue(c, init, 0)) continue;
@@ -150,6 +179,13 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
     }
 }
 
+fn pointerShaped(value: Facts.Value) bool {
+    return switch (value) {
+        .pointer => true,
+        .optional => |inner| inner.* == .pointer,
+        else => false,
+    };
+}
 fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
     const tree = try c.project.syntax(try c.source());
@@ -202,47 +238,182 @@ fn checkCleanup(c: *Context) Context.Error!void {
         if (k != .secret and k != .bytes and k != .guard) continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, model.scopes[decl.scope].node) orelse continue;
-        var found = false;
-        var normal_cleanup = false;
-        var released = false;
-        var uncertain = false;
-        for (statements) |stmt| {
-            if (stmt == decl.node) {
-                found = true;
-                continue;
-            }
-            if (!found) continue;
-            const tag = tree.nodeTag(stmt);
-            if (tag == .@"defer") {
-                if (try release(c, tree.nodeData(stmt).node, decl.token)) {
-                    if (released or normal_cleanup) try c.at(cleanup, tree.nodeMainToken(stmt), "same local capability has repeated cleanup scheduled on this straight-line path");
-                    normal_cleanup = true;
-                    continue;
-                }
-            }
-            if (try release(c, stmt, decl.token)) {
-                if (released or normal_cleanup) try c.at(cleanup, tree.nodeMainToken(stmt), "same local capability is cleaned twice on this straight-line path");
-                released = true;
-                continue;
-            }
-            // A discard of this owner's address has no retaining call or mutation.
-            if (tag == .assign) {
-                const data = tree.nodeData(stmt).node_and_node;
-                if (tree.nodeTag(data[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(data[0])), "_") and tree.nodeTag(data[1]) == .address_of) {
-                    const target = tree.nodeData(data[1]).node;
-                    if (Contract.local(c, target)) |index| if (model.declarations[index].token == decl.token) {
-                        if (released) try c.at(cleanup, tree.nodeMainToken(target), "same local owner used after cleanup on this straight-line path");
-                        continue;
-                    };
-                }
-            }
-            uncertain = true;
-            break;
+        const at = for (statements, 0..) |stmt, i| {
+            if (stmt == decl.node) break i + 1;
+        } else continue;
+        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token };
+        switch (try flow.walk(statements[at..], .live)) {
+            .falls => |state| if (state == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
+            .ends => {},
+            .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
-        if (uncertain) try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed") else if (!normal_cleanup and !released) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation");
     }
 }
 
+/// The paths of a block after a local acquisition, statement by statement. The owner is live
+/// until a direct `deinit` releases it or a `defer` schedules one; an `if` is followed into
+/// its branches. Undecided: an exit (`return`, `try`, a `break` or `continue` that leaves the
+/// block) while live, an `if` whose branches leave the owner in different states, any use of
+/// the owner but its members (its address, a copy, an argument: a transfer or an alias), a
+/// release nested where the walk does not follow, a use after release. Findings: a second
+/// direct cleanup, the owner's address discarded after release.
+const Flow = struct {
+    c: *Context,
+    tree: *const Ast,
+    model: *const Model,
+    token: Ast.TokenIndex,
+
+    const State = enum { live, released, deferred };
+    const Outcome = union(enum) { falls: State, ends, uncertain };
+
+    fn walk(f: Flow, statements: []const Ast.Node.Index, start: State) Context.Error!Outcome {
+        var state = start;
+        for (statements) |stmt| {
+            const tag = f.tree.nodeTag(stmt);
+            const deferred = tag == .@"defer" and try release(f.c, f.tree.nodeData(stmt).node, f.token);
+            if (deferred or try release(f.c, stmt, f.token)) {
+                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), if (deferred) "same local capability has repeated cleanup scheduled on this straight-line path" else "same local capability is cleaned twice on this straight-line path");
+                state = if (deferred) .deferred else .released;
+                continue;
+            }
+            // A discard of the owner's address has no retaining call or mutation.
+            if (f.discardedAddress(stmt)) {
+                if (state == .released) try f.c.at(cleanup, f.tree.nodeMainToken(f.tree.nodeData(f.tree.nodeData(stmt).node_and_node[1]).node), "same local owner used after cleanup on this straight-line path");
+                continue;
+            }
+            if (state == .released) {
+                if (try f.reacquired(stmt)) {
+                    state = .live;
+                    continue;
+                }
+                if (try f.uses(stmt) != .none) return .uncertain;
+                continue;
+            }
+            if (state == .live) if (f.tree.fullIf(stmt)) |branch| {
+                const then_outcome = try f.walkBranch(branch.ast.then_expr);
+                const else_outcome: Outcome = if (branch.ast.else_expr.unwrap()) |other| try f.walkBranch(other) else .{ .falls = .live };
+                if (try f.uses(branch.ast.cond_expr) != .none or f.exits(branch.ast.cond_expr)) return .uncertain;
+                switch (try join(then_outcome, else_outcome)) {
+                    .falls => |next| state = next,
+                    .ends => return .ends,
+                    .uncertain => return .uncertain,
+                }
+                continue;
+            };
+            // Deferred, the release runs on every exit; live, an exit would skip it.
+            switch (try f.uses(stmt)) {
+                .none, .members => {},
+                .other => return .uncertain,
+            }
+            if (state == .live and f.exits(stmt)) return .uncertain;
+        }
+        return .{ .falls = state };
+    }
+
+    fn walkBranch(f: Flow, node: Ast.Node.Index) Context.Error!Outcome {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
+        var outcome = try f.walk(statements, .live);
+        // A cleanup a branch defers runs as the branch ends.
+        if (outcome == .falls and outcome.falls == .deferred) outcome = .{ .falls = .released };
+        // A branch that ends in an exit after releasing ends there.
+        if (outcome == .falls and outcome.falls != .live and statements.len != 0 and endsInExit(f.tree, statements[statements.len - 1])) return .ends;
+        return outcome;
+    }
+
+    fn join(a: Outcome, b: Outcome) Context.Error!Outcome {
+        if (a == .uncertain or b == .uncertain) return .uncertain;
+        if (a == .ends) return b;
+        if (b == .ends) return a;
+        return if (a.falls == b.falls) a else .uncertain;
+    }
+
+    const Use = enum { none, members, other };
+    /// How `node` uses the owner: not at all, only through its members (a nested `deinit`
+    /// counts as other), or otherwise.
+    fn uses(f: Flow, node: Ast.Node.Index) Context.Error!Use {
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        var found: Use = .none;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = f.tree.nodeMainToken(candidate);
+            if (main < first or main > last) continue;
+            const ref = f.model.reference(candidate) orelse continue;
+            const index = ref.declaration orelse continue;
+            if (f.model.declarations[index].token != f.token) continue;
+            const parent = f.model.node_parents[i] orelse return .other;
+            if (f.tree.nodeTag(parent) != .field_access or f.tree.nodeData(parent).node_and_token[0] != candidate) return .other;
+            if (std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(parent).node_and_token[1])), "deinit")) return .other;
+            found = .members;
+        }
+        return found;
+    }
+
+    /// Whether `node` can leave the block the owner lives in: a `return`, a `try`, or a
+    /// `break` or `continue` that is labeled or not inside a loop within `node`.
+    fn exits(f: Flow, node: Ast.Node.Index) bool {
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        for (first..last + 1) |raw_token| {
+            const token: Ast.TokenIndex = @intCast(raw_token); // safe: bounded by the node's own token range.
+            switch (f.tree.tokenTag(token)) {
+                .keyword_return, .keyword_try => return true,
+                .keyword_break, .keyword_continue => {
+                    if (f.tree.tokenTag(token + 1) == .colon) return true;
+                    if (!f.insideLoop(token, node)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn insideLoop(f: Flow, token: Ast.TokenIndex, root: Ast.Node.Index) bool {
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"break" and tag != .@"continue") continue;
+            if (f.tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue; // safe: AST node table supplies bounded indexes.
+            var at = f.model.node_parents[i];
+            while (at) |parent| : (at = f.model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+                if (f.tree.fullWhile(parent) != null or f.tree.fullFor(parent) != null) return true;
+                if (parent == root) return false;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// `owner = x.init(...)`, `x.adopt(...)` or `x.acquire()`: live again.
+    fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        if (f.tree.nodeTag(stmt) != .assign) return false;
+        const data = f.tree.nodeData(stmt).node_and_node;
+        const index = Contract.local(f.c, data[0]) orelse return false;
+        if (f.model.declarations[index].token != f.token) return false;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const value = if (f.tree.nodeTag(data[1]) == .@"try") f.tree.nodeData(data[1]).node else data[1];
+        const call = f.tree.fullCall(&call_buffer, value) orelse return false;
+        if (f.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+        const operation = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(call.ast.fn_expr).node_and_token[1]));
+        return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or std.mem.eql(u8, operation, "acquire");
+    }
+
+    /// `_ = &owner;`
+    fn discardedAddress(f: Flow, stmt: Ast.Node.Index) bool {
+        if (f.tree.nodeTag(stmt) != .assign) return false;
+        const data = f.tree.nodeData(stmt).node_and_node;
+        if (f.tree.nodeTag(data[0]) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(data[0])), "_") or f.tree.nodeTag(data[1]) != .address_of) return false;
+        const index = Contract.local(f.c, f.tree.nodeData(data[1]).node) orelse return false;
+        return f.model.declarations[index].token == f.token;
+    }
+};
+
+fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(stmt)) {
+        .@"return", .@"break", .@"continue", .unreachable_literal => true,
+        else => false,
+    };
+}
 fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     var buffer: [1]Ast.Node.Index = undefined;

@@ -16,7 +16,15 @@ remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 pub const Decl = struct { file: Project.FileId, index: u32 };
-pub const Container = struct { file: Project.FileId, scope: u32, symbolic: bool = false };
+pub const Container = struct {
+    file: Project.FileId,
+    scope: u32,
+    symbolic: bool = false,
+    /// For a container a type function made: the call that made it, whose arguments its
+    /// methods' results may name. Identity is `file` and `scope` alone.
+    made_by: ?*const Made = null,
+};
+pub const Made = struct { function: Decl, file: Project.FileId, call: Ast.Node.Index };
 /// A library's declarations in this project, found through its modules' roots. Roles are the
 /// caller's enum values; the resolver never interprets them.
 pub const Publication = struct {
@@ -41,6 +49,9 @@ pub const Value = union(enum) {
     error_union: *const Value,
     error_set,
     scalar,
+    /// One of several, each known: a `switch` or `if` whose branches differ, such as a type
+    /// chosen per target. Never holds an unknown or another `alternatives`.
+    alternatives: []const Value,
 
     pub fn known(self: Value) bool {
         return self != .unknown;
@@ -188,18 +199,24 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const data = tree.nodeData(node).node_and_token;
             const lhs = try self.resolve(file, data[0]);
             const name = try self.memberName(tree.tokenSlice(data[1]));
-            const container = switch (lhs) {
-                .container, .instance => |c| c,
-                .pointer => |p| switch (p.*) {
-                    .instance, .container => |c| c,
-                    else => return .{ .unknown = .unsupported },
-                },
-                else => return .{ .unknown = .unresolved },
-            };
-            if (self.member(container, name)) |decl| return self.declaration(decl);
-            return .{ .unknown = .unresolved };
+            return self.map(lhs, name, memberValue);
         },
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
+        // A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the
+        // payload's type (Zig requires the other side to coerce to it), as `x.?` has.
+        .@"catch" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .error_union),
+        .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
+        .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
+        .@"switch", .switch_comma, .@"if" => if (try self.branches(file, node)) |value| return value,
+        .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
+        // Operators no aegis type takes: Zig has no operator overloading, and every aegis value
+        // is a struct or an enum. Their results are numbers or booleans.
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => return .scalar,
+        // `+` and `-` also move many-item pointers: a number only from a number.
+        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => {
+            const lhs = try self.resolve(file, tree.nodeData(node).node_and_node[0]);
+            return if (lhs == .scalar or lhs == .primitive) .scalar else .{ .unknown = .unsupported };
+        },
         .error_union => return .{ .error_union = try self.boxed(try self.resolve(file, tree.nodeData(node).node_and_node[1])) },
         .error_set_decl, .merge_error_sets => return .error_set,
         .enum_literal => return .{ .unknown = .comptime_dependent },
@@ -236,46 +253,384 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
                 return self.declaration(target);
             }
-            if (std.mem.eql(u8, name, "@as") and args.len == 2) return instance(try self.resolve(file, args[0]));
+            if (std.mem.eql(u8, name, "@as") and args.len == 2) return self.instance(try self.resolve(file, args[0]));
             return .{ .unknown = .comptime_dependent };
         },
         .call_one, .call_one_comma, .call, .call_comma => {
             var call_buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&call_buffer, node).?;
             const callee = try self.resolve(file, call.ast.fn_expr);
+            if (callee == .alternatives) return self.map(callee, {}, callResult);
             if (callee == .function) {
-                const decl = callee.function;
-                const declaration_record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
-                const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-                var fn_buffer: [1]Ast.Node.Index = undefined;
-                const function = target_tree.fullFnProto(&fn_buffer, declaration_record.node).?;
-                const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
-                const result = try self.resolve(decl.file, result_node);
-                if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) {
-                    var value = try self.template(decl) orelse return .{ .unknown = .comptime_dependent };
-                    if (value == .container) value.container.symbolic = function.ast.params.len != 0;
-                    return value;
+                if (try self.typeArgument(file, call, callee.function)) |argument| return self.instance(argument);
+                if (try self.madeResult(file, call, callee.function)) |value| return value;
+                var result = try self.callResult(callee, {});
+                if (result == .container and result.container.symbolic) {
+                    const made = try self.gpa.create(Made);
+                    made.* = .{ .function = callee.function, .file = file, .call = node };
+                    result.container.made_by = made;
                 }
-                return instance(result);
+                return result;
             }
-            return .{ .unknown = .unresolved };
+            return self.callResult(callee, {});
         },
         .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma => {
             const value = tree.fullStructInit(&buffer, node).?;
-            if (value.ast.type_expr.unwrap()) |t| return instance(try self.resolve(file, t));
+            if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
             return .{ .unknown = .unsupported };
         },
         .address_of => return .{ .pointer = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
-        .deref => {
-            const lhs = try self.resolve(file, tree.nodeData(node).node);
-            return if (lhs == .pointer) lhs.pointer.* else .{ .unknown = .unsupported };
-        },
-        .@"try" => {
-            const lhs = try self.resolve(file, tree.nodeData(node).node);
-            return if (lhs == .error_union) lhs.error_union.* else .{ .unknown = .unsupported };
-        },
+        .deref => return self.pointee(try self.resolve(file, tree.nodeData(node).node), {}),
+        .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),
         else => return .{ .unknown = .unsupported },
     }
+}
+
+fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
+    const container = switch (lhs) {
+        .container, .instance => |c| c,
+        .pointer => |p| switch (p.*) {
+            .instance, .container => |c| if (self.member(c, name)) |decl| return self.declaration(decl) else return sequence(lhs, name),
+            .alternatives => return self.map(p.*, name, memberValue),
+            else => return sequence(lhs, name),
+        },
+        .unknown => return lhs,
+        else => return .{ .unknown = .unresolved },
+    };
+    if (self.member(container, name)) |decl| return self.declaration(decl);
+    return .{ .unknown = .unresolved };
+}
+
+/// A pointer's `len` or `ptr` where what it points at has no such member: a slice's or an
+/// array's length, a number, and its many-item pointer.
+fn sequence(pointer: Value, name: []const u8) Value {
+    if (std.mem.eql(u8, name, "len")) return .scalar;
+    if (std.mem.eql(u8, name, "ptr")) return pointer;
+    return .{ .unknown = .unsupported };
+}
+
+/// A call to a function whose result is one of its own `comptime T: type` parameters, such as
+/// `std.mem.zeroes(T)`, returns a `T`: the type the call passes there. Only a call through a
+/// namespace or by name, where arguments and parameters line up.
+fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const lhs = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        if (lhs != .container) return null;
+    } else if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
+    const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const function = target_tree.fullFnProto(&fn_buffer, model.declarations[decl.index].node) orelse return null;
+    const result_node = function.ast.return_type.unwrap() orelse return null;
+    if (target_tree.nodeTag(result_node) != .identifier) return null;
+    const ref = model.reference(result_node) orelse return null;
+    const index = ref.declaration orelse return null;
+    const parameter = model.declarations[index];
+    if (parameter.kind != .parameter) return null;
+    var it = function.iterate(target_tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (param.name_token != parameter.token) continue;
+        const comptime_token = param.comptime_noalias orelse return null;
+        if (target_tree.tokenTag(comptime_token) != .keyword_comptime) return null;
+        const type_expr = param.type_expr orelse return null;
+        if (target_tree.nodeTag(type_expr) != .identifier or !std.mem.eql(u8, target_tree.tokenSlice(target_tree.nodeMainToken(type_expr)), "type")) return null;
+        if (position >= call.ast.params.len) return null;
+        return try self.resolve(file, call.ast.params[position]);
+    }
+    return null;
+}
+
+/// A method of a container a type function made, called on a value of it: its declared result
+/// with the type function's parameters read as the arguments of the call that made it, as
+/// `Inbox(Message).takeAll` returning `?*T` returns `?*Message`.
+fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    const receiver = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+    const container = switch (receiver) {
+        .instance => |c| c,
+        .pointer => |p| switch (p.*) {
+            .instance, .container => |c| c,
+            else => return null,
+        },
+        else => return null,
+    };
+    const made = container.made_by orelse return null;
+    const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    if (!decl.file.eql(container.file) or record.scope != container.scope) return null;
+    const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const function = target_tree.fullFnProto(&fn_buffer, record.node) orelse return null;
+    const result_node = function.ast.return_type.unwrap() orelse return null;
+    var result = try self.substituted(decl.file, result_node, made, 0);
+    if (result == .unknown) return null;
+    // A container declared inside the made one, such as its guard, is made by the same call.
+    if (result == .container and self.within(result.container, container)) result.container.made_by = made;
+    if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(try self.instance(result)) };
+    return try self.instance(result);
+}
+
+fn within(self: *const Facts, inner: Container, outer: Container) bool {
+    if (!inner.file.eql(outer.file)) return false;
+    const scopes = self.project.models[inner.file.raw()].scopes; // safe: enum identities index their owning frozen tables without narrowing.
+    var scope: ?u32 = scopes[inner.scope].parent;
+    while (scope) |s| : (scope = scopes[s].parent) if (s == outer.scope) return true;
+    return false;
+}
+
+/// A type expression written inside a type function's container, its parameters read as the
+/// arguments of the call that made it.
+fn substituted(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *const Made, depth: usize) ResolveError!Value {
+    if (depth == 16) return .{ .unknown = .budget };
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.fullPtrType(node)) |ptr| {
+        const child = try self.substituted(file, ptr.ast.child_type, made, depth + 1);
+        if (child == .unknown) return child;
+        return .{ .pointer = try self.boxed(child) };
+    }
+    switch (tree.nodeTag(node)) {
+        .optional_type => {
+            const child = try self.substituted(file, tree.nodeData(node).node, made, depth + 1);
+            if (child == .unknown) return child;
+            return .{ .optional = try self.boxed(child) };
+        },
+        .identifier => if (try self.argumentFor(file, node, made)) |argument| return argument,
+        else => {},
+    }
+    return self.resolve(file, node);
+}
+
+/// The argument the call `made` passed for the parameter `node` names, when it names one of
+/// the type function's parameters.
+fn argumentFor(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *const Made) ResolveError!?Value {
+    if (!file.eql(made.function.file)) return null;
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const ref = model.reference(node) orelse return null;
+    const index = ref.declaration orelse return null;
+    const parameter = model.declarations[index];
+    if (parameter.kind != .parameter) return null;
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const function = tree.fullFnProto(&fn_buffer, model.declarations[made.function.index].node) orelse return null;
+    var it = function.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (param.name_token != parameter.token) continue;
+        const call_tree = &self.project.files[made.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = call_tree.fullCall(&call_buffer, made.call) orelse return null;
+        if (position >= call.ast.params.len) return null;
+        return try self.resolve(made.file, call.ast.params[position]);
+    }
+    return null;
+}
+
+/// What calling `callee` returns: its declared result, or the container a type function makes.
+fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
+    if (callee == .function) {
+        const decl = callee.function;
+        const declaration_record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+        const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+        var fn_buffer: [1]Ast.Node.Index = undefined;
+        const function = target_tree.fullFnProto(&fn_buffer, declaration_record.node).?;
+        const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
+        // `!T`: an error union whose error set the body infers.
+        if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) {
+            const payload_value = try self.resolve(decl.file, result_node);
+            if (payload_value == .unknown) return payload_value;
+            return .{ .error_union = try self.boxed(try self.instance(payload_value)) };
+        }
+        const result = try self.resolve(decl.file, result_node);
+        if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) {
+            var value = try self.template(decl) orelse return .{ .unknown = .comptime_dependent };
+            if (value == .container) value.container.symbolic = function.ast.params.len != 0;
+            return value;
+        }
+        return self.instance(result);
+    }
+    return .{ .unknown = .unresolved };
+}
+
+/// The payload of an optional or error union `value` is.
+fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveError!Value {
+    return switch (value) {
+        .optional => |inner| if (wrapper == .optional) inner.* else .{ .unknown = .unsupported },
+        .error_union => |inner| if (wrapper == .error_union) inner.* else .{ .unknown = .unsupported },
+        .alternatives => self.map(value, wrapper, payload),
+        .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
+    return switch (value) {
+        .pointer => |inner| inner.*,
+        .alternatives => self.map(value, {}, pointee),
+        .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+/// A `switch` or `if`-`else` expression: what its branches give, chosen as one. A branch
+/// that gives no value of its own (`@compileError`, `unreachable`, `undefined`) is left out.
+fn branches(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var values: std.ArrayList(Value) = .empty;
+    if (tree.fullSwitch(node)) |whole| {
+        for (whole.ast.cases) |case| {
+            const branch = tree.fullSwitchCase(case).?.ast.target_expr;
+            if (never(tree, branch)) continue;
+            try values.append(self.gpa, try self.resolve(file, branch));
+        }
+    } else if (tree.fullIf(node)) |whole| {
+        const otherwise = whole.ast.else_expr.unwrap() orelse return null;
+        for ([_]Ast.Node.Index{ whole.ast.then_expr, otherwise }) |branch| {
+            if (never(tree, branch)) continue;
+            try values.append(self.gpa, try self.resolve(file, branch));
+        }
+    } else return null;
+    return try self.choose(values.items);
+}
+
+fn never(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .unreachable_literal => true,
+        // `undefined` takes the type of the other branches.
+        .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined"),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@compileError"),
+        else => false,
+    };
+}
+
+/// What a capture binds, where its source resolves: an `if` or `while` payload is its
+/// condition's optional or error-union payload and its error capture an error; a `catch`
+/// capture is an error; a switch prong's payload is the field of the subject's union that
+/// every item of the prong names, or the subject itself when it is no union; a `for` capture
+/// is its input's element, or a number for a range. A `|*x|` capture points at it. Anything
+/// else stays unknown: an `else` prong of a union, a prong's tag capture, an input that is not
+/// a slice.
+fn captured(self: *Facts, decl: Decl) ResolveError!Value {
+    const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const node = record.node;
+    const name = record.token;
+    const by_pointer = tree.tokenTag(name - 1) == .asterisk;
+    const bound: Value = if (tree.fullIf(node)) |branch|
+        try self.conditional(decl.file, branch.payload_token, branch.error_token, branch.ast.cond_expr, name)
+    else if (tree.fullWhile(node)) |loop|
+        try self.conditional(decl.file, loop.payload_token, loop.error_token, loop.ast.cond_expr, name)
+    else if (tree.nodeTag(node) == .@"catch")
+        .error_set
+    else if (tree.fullSwitchCase(node)) |case|
+        try self.switchPayload(decl.file, node, case, name)
+    else if (tree.fullFor(node)) |loop|
+        try self.element(decl.file, loop, name)
+    else
+        .{ .unknown = .unsupported };
+    if (bound == .unknown or !by_pointer) return bound;
+    return .{ .pointer = try self.boxed(bound) };
+}
+
+fn conditional(self: *Facts, file: Project.FileId, payload_token: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, condition: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!Value {
+    if (error_token) |token| if (token == name) return .error_set;
+    const first = payload_token orelse return .{ .unknown = .unsupported };
+    if (first != name and first + 1 != name) return .{ .unknown = .unsupported };
+    const value = try self.resolve(file, condition);
+    return switch (value) {
+        .optional, .error_union => |inner| inner.*,
+        .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+fn switchPayload(self: *Facts, file: Project.FileId, case_node: Ast.Node.Index, full: Ast.full.SwitchCase, name: Ast.TokenIndex) ResolveError!Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    // The payload is the first capture; a second is the prong's tag.
+    const first = full.payload_token orelse return .{ .unknown = .unsupported };
+    if (first != name and first + 1 != name) return .{ .unknown = .unsupported };
+    const parent = self.project.models[file.raw()].node_parents[@backingInt(case_node)] orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
+    const whole = tree.fullSwitch(parent) orelse return .{ .unknown = .unsupported };
+    const subject = try self.resolve(file, whole.ast.condition);
+    // A pointer's target resolves as its type: a dereferenced subject is a container here.
+    const container = switch (subject) {
+        .instance, .container => |c| c,
+        .unknown => return subject,
+        // A number, a boolean or an error: the capture is the subject's value.
+        .scalar, .primitive, .error_set => return subject,
+        else => return .{ .unknown = .unsupported },
+    };
+    if (!self.isUnion(container)) return .{ .instance = container };
+    if (full.ast.values.len == 0) return .{ .unknown = .unsupported };
+    var found: ?Value = null;
+    for (full.ast.values) |item| {
+        if (tree.nodeTag(item) != .enum_literal) return .{ .unknown = .unsupported };
+        const field_name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(item)));
+        const field = self.member(container, field_name) orelse return .{ .unknown = .unresolved };
+        if (self.project.models[field.file.raw()].declarations[field.index].kind != .field) return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
+        const value = try self.declaration(field);
+        if (value == .unknown) return value;
+        if (found) |earlier| {
+            if (!same(earlier, value, 0)) return .{ .unknown = .unsupported };
+        } else found = value;
+    }
+    return found.?;
+}
+
+fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.TokenIndex) ResolveError!Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var position: usize = 0;
+    var token = loop.payload_token;
+    while (tree.tokenTag(token) != .pipe) : (token += 1) {
+        if (tree.tokenTag(token) != .identifier) continue;
+        if (token == name) break;
+        position += 1;
+    } else return .{ .unknown = .unsupported };
+    if (position >= loop.ast.inputs.len) return .{ .unknown = .unsupported };
+    const input = loop.ast.inputs[position];
+    if (tree.nodeTag(input) == .for_range) return .scalar;
+    // A `for` takes slices, arrays and pointers to arrays, never a single item: a resolved
+    // pointer input is a slice, whose element is what it points at.
+    const value = try self.resolve(file, input);
+    return switch (value) {
+        .pointer => |inner| inner.*,
+        .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+fn isUnion(self: *const Facts, container: Container) bool {
+    const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[container.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const scope = model.scopes[container.scope];
+    if (scope.kind != .container) return false;
+    return tree.tokenTag(tree.nodeMainToken(scope.node)) == .keyword_union;
+}
+
+fn same(a: Value, b: Value, depth: usize) bool {
+    if (depth == 64) return false;
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .pointer, .optional, .error_union => |inner| same(inner.*, switch (b) {
+            .pointer, .optional, .error_union => |other| other.*,
+            else => unreachable,
+        }, depth + 1),
+        .container, .instance => |c| blk: {
+            const other = switch (b) {
+                .container, .instance => |o| o,
+                else => unreachable,
+            };
+            break :blk c.file.eql(other.file) and c.scope == other.scope;
+        },
+        .primitive => |p| std.mem.eql(u8, p, b.primitive),
+        .function => |f| std.meta.eql(f, b.function),
+        .alternatives => |each| each.len == b.alternatives.len and for (each, b.alternatives) |x, y| {
+            if (!same(x, y, depth + 1)) break false;
+        } else true,
+        .unknown => false,
+        .error_set, .scalar => true,
+    };
 }
 
 /// The container a type function returns when its body ends in one `return` of that container,
@@ -320,18 +675,18 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     if (declaration_record.kind == .parameter) {
         const value = try self.resolve(decl.file, declaration_record.node);
         if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return .{ .unknown = .comptime_dependent };
-        return instance(value);
+        return self.instance(value);
     }
-    if (declaration_record.kind == .capture) return .{ .unknown = .comptime_dependent };
+    if (declaration_record.kind == .capture) return self.captured(decl);
     if (declaration_record.kind == .field) {
         const field = tree.fullContainerField(declaration_record.node).?;
-        if (field.ast.type_expr.unwrap()) |t| return instance(try self.resolve(decl.file, t));
+        if (field.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(decl.file, t));
         return .{ .unknown = .unsupported };
     }
     if (tree.fullVarDecl(declaration_record.node)) |variable| {
         if (variable.ast.type_node.unwrap()) |t| {
             const type_value = try self.resolve(decl.file, t);
-            if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return instance(type_value);
+            if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return self.instance(type_value);
         }
         if (variable.ast.init_node.unwrap()) |value| return self.resolve(decl.file, value);
     }
@@ -411,11 +766,42 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
     return null;
 }
 
-fn instance(value: Value) Value {
+fn instance(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .container => |c| .{ .instance = c },
+        .alternatives => |each| blk: {
+            const mapped = try self.gpa.alloc(Value, each.len);
+            for (each, mapped) |one, *out| out.* = try self.instance(one);
+            break :blk .{ .alternatives = mapped };
+        },
         else => value,
     };
+}
+
+/// One value of `values`, each resolved: an unknown if any is, the value if they agree, else
+/// the alternatives.
+fn choose(self: *Facts, values: []const Value) ResolveError!Value {
+    var kept: std.ArrayList(Value) = .empty;
+    for (values) |value| {
+        if (value == .unknown) return value;
+        const parts: []const Value = if (value == .alternatives) value.alternatives else &.{value};
+        for (parts) |part| {
+            for (kept.items) |earlier| {
+                if (same(earlier, part, 0)) break;
+            } else try kept.append(self.gpa, part);
+        }
+    }
+    if (kept.items.len == 0) return .{ .unknown = .unsupported };
+    if (kept.items.len == 1) return kept.items[0];
+    return .{ .alternatives = kept.items };
+}
+
+/// `f(value)` for each alternative of `value`, chosen as one.
+fn map(self: *Facts, value: Value, context: anytype, comptime f: fn (*Facts, Value, @TypeOf(context)) ResolveError!Value) ResolveError!Value {
+    if (value != .alternatives) return f(self, value, context);
+    const mapped = try self.gpa.alloc(Value, value.alternatives.len);
+    for (value.alternatives, mapped) |one, *out| out.* = try f(self, one, context);
+    return self.choose(mapped);
 }
 
 pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {

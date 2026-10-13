@@ -129,6 +129,10 @@ fn retain(retained: [][]bool, value: Facts.Value, project: *const Project) void 
     const container = switch (value) {
         .container, .instance => |c| c,
         .pointer, .optional, .error_union => |child| return retain(retained, child.*, project),
+        .alternatives => |each| {
+            for (each) |one| retain(retained, one, project);
+            return;
+        },
         else => return,
     };
     retained[container.file.raw()][container.scope] = true;

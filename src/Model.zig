@@ -474,9 +474,11 @@ pub fn primitive(name: []const u8) bool {
         return true;
     }
     return std.StaticStringMap(void).initComptime(.{
-        .{ "bool", {} },      .{ "void", {} },         .{ "noreturn", {} },       .{ "type", {} },  .{ "anyerror", {} },
-        .{ "anyopaque", {} }, .{ "comptime_int", {} }, .{ "comptime_float", {} }, .{ "usize", {} }, .{ "isize", {} },
-        .{ "f16", {} },       .{ "f32", {} },          .{ "f64", {} },            .{ "f80", {} },   .{ "f128", {} },
+        .{ "bool", {} },      .{ "void", {} },         .{ "noreturn", {} },       .{ "type", {} },        .{ "anyerror", {} },
+        .{ "anyopaque", {} }, .{ "comptime_int", {} }, .{ "comptime_float", {} }, .{ "usize", {} },       .{ "isize", {} },
+        .{ "f16", {} },       .{ "f32", {} },          .{ "f64", {} },            .{ "f80", {} },         .{ "f128", {} },
+        .{ "c_char", {} },    .{ "c_short", {} },      .{ "c_ushort", {} },       .{ "c_int", {} },       .{ "c_uint", {} },
+        .{ "c_long", {} },    .{ "c_ulong", {} },      .{ "c_longlong", {} },     .{ "c_ulonglong", {} }, .{ "c_longdouble", {} },
     }).has(name);
 }
 

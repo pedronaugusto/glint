@@ -200,7 +200,7 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
             for (self.project.models[definition.file.raw()].declarations, 0..) |alias, i| {
                 if (!alias.public or alias.kind != .variable) continue;
                 const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @intCast(i) }); // safe: bounded declaration inventory.
-                if (exposed == .container and std.meta.eql(exposed.container, value.container)) return;
+                if (exposed == .container and exposed.container.file.eql(value.container.file) and exposed.container.scope == value.container.scope and exposed.container.symbolic == value.container.symbolic) return;
             }
             try self.atDefinition(.Z012, site, try self.allocator.print("public signature exposes private type '{s}'", .{decl.name}), definition);
         },
@@ -291,6 +291,11 @@ fn syntaxRules(self: *Context) RunError!void {
                         value = .scalar;
                     }
                 }
+                // A choice between types names a type; any other choice is undecided here.
+                if (value == .alternatives) value = for (value.alternatives) |one| switch (one) {
+                    .container, .primitive, .error_set, .pointer, .optional, .error_union => {},
+                    else => break .{ .unknown = .unsupported },
+                } else value.alternatives[0];
                 switch (value) {
                     .unknown => |reason| {
                         try unknown(self, .Z006, expr, reason);

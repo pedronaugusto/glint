@@ -541,3 +541,81 @@ test "a scalar receiver is known through an unwrapped optional" {
     defer project.deinit();
     try std.testing.expectEqual(@as(usize, 1), try scalarFindings(&project)); // safe: one raw comparison, decided.
 }
+
+/// One rule gated over `source`: whether the run decided every site, and how many findings.
+fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findings: usize } {
+    var project = try fixture(source);
+    defer project.deinit();
+    try std.testing.expectEqual(.parsed, project.files[0].status);
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    return .{ .complete = report.complete, .findings = count(report, rule) };
+}
+fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    const got = try judged(source, rule);
+    try std.testing.expectEqual(complete, got.complete);
+    try std.testing.expectEqual(findings, got.findings);
+}
+
+test "receivers bound by captures are decided by what they bind" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, lock: u32 };\n";
+    // A switch prong's payload is the union field its item names.
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *const U) void { switch (u.*) { .a => |p| _ = p.data, .b => {} } }", pack.access, true, 0);
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *U) void { switch (u.*) { .a => {}, .b => |*g| _ = g.data } }", pack.access, true, 1);
+    // Prong items whose payloads differ, and an `else` prong of a union, stay undecided.
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: U) void { switch (u) { .a, .b => |x| _ = x.data } }", pack.access, false, 0);
+    // A `for` capture is its slice's element; a range's is a number.
+    try expectJudged(head ++ "pub fn f(items: []Plain) void { for (items, 0..) |item, i| { _ = item.data; _ = i; } }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(items: []G(u32)) void { for (items) |*item| _ = item.data; }", pack.access, true, 1);
+    // An `if` or `while` payload is its condition's optional or error-union payload.
+    try expectJudged(head ++ "fn next() ?*Plain { return null; }\npub fn f() void { while (next()) |p| _ = p.lock; }", pack.access, true, 0);
+    try expectJudged(head ++ "fn next() ?*G(u32) { return null; }\npub fn f() void { if (next()) |g| _ = g.lock; }", pack.access, true, 1);
+}
+
+test "receivers through locals, unwrapping, branches and generic results are decided" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, lock: u32 };\nconst Holder = struct { plain: Plain, guarded: G(u32) };\n";
+    // A local initialised from a field.
+    try expectJudged(head ++ "pub fn f(h: *Holder) void { const p = h.plain; _ = p.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(h: *Holder) void { const g = &h.guarded; _ = g.data; }", pack.access, true, 1);
+    // `catch`, `orelse` and `.?` give the payload; `!T` results are error unions.
+    try expectJudged(head ++ "fn make() !Plain { return .{ .data = 0, .lock = 0 }; }\npub fn f() void { const p = make() catch return; _ = p.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "fn make() !G(u32) { return .init(0); }\npub fn f() void { const g = make() catch return; _ = g.data; }", pack.access, true, 1);
+    try expectJudged(head ++ "fn find() ?*Plain { return null; }\npub fn f() void { _ = (find() orelse return).data; _ = find().?.lock; }", pack.access, true, 0);
+    // A `switch` choosing between types is each of them: decided when they agree.
+    try expectJudged(head ++ "const os = @import(\"builtin\").os.tag;\nconst E = switch (os) { .linux => Plain, .macos => struct { data: i64 }, else => @compileError(\"no\") };\npub fn f(e: *const E) void { _ = e.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "const os = @import(\"builtin\").os.tag;\nconst E = switch (os) { .linux => Plain, else => G(u32) };\npub fn f(e: *E) void { _ = e.data; }", pack.access, false, 0);
+    // A generic function returning its `comptime T: type` parameter returns that type.
+    try expectJudged(head ++ "fn zeroes(comptime T: type) T { return undefined; }\npub fn f() void { const p = zeroes(Plain); _ = p.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "fn zeroes(comptime T: type) T { return undefined; }\npub fn f() void { const g = zeroes(G(u32)); _ = g.data; }", pack.access, true, 1);
+    // A method of a container a type function made reads its parameters as the call's arguments.
+    const boxes = "fn Box(comptime T: type) type { return struct { item: T, pub fn get(self: *@This()) *T { return &self.item; } }; }\n";
+    try expectJudged(head ++ boxes ++ "pub fn f(b: *Box(Plain)) void { _ = b.get().data; }", pack.access, true, 0);
+    try expectJudged(head ++ boxes ++ "pub fn f(b: *Box(G(u32))) void { _ = b.get().data; }", pack.access, true, 1);
+    // A number from operators no aegis type takes.
+    try expectJudged(head ++ "pub fn f(bytes: []const u8) void { const n = bytes.len - 1; var m = n; _ = &m; }", pack.copies, true, 0);
+}
+
+test "a copied pointer is an alias, an owner copy is still found" {
+    const head = "const S = @import(\"aegis\").Secret;\n";
+    try expectJudged(head ++ "pub fn f(s: ?*S(u32)) void { var p = s; _ = &p; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = S(u32).init(1); defer s.deinit(); const copy = s; _ = copy; }", pack.copies, true, 1);
+}
+
+test "cleanup paths through branches, deferred releases and loops are decided" {
+    const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn hand(_: anytype) void {}\n";
+    // Released in a branch that returns, and at the end of the fallthrough.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) { held.deinit(); return; } held.value().* += 1; held.deinit(); }", pack.cleanup, true, 0);
+    // Deferred: every exit runs it, and a loop's own `break` does not leave the block.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) u32 { var held = g.acquire(); defer held.deinit(); while (true) { if (ready()) break; } for (0..3) |i| if (i == held.value().*) return 1; return 0; }", pack.cleanup, true, 0);
+    // Released again after a deferred release: a witness.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); defer held.deinit(); held.deinit(); }", pack.cleanup, true, 1);
+    // A return while held, a hand-off of its address, a release nested where the walk does not
+    // follow: undecided, never a claim.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) return; held.deinit(); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); while (ready()) held.deinit(); }", pack.cleanup, false, 0);
+    // Branches that leave it in different states.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) held.deinit(); }", pack.cleanup, false, 0);
+    // Released, then acquired again into the same local and released.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); held = g.acquire(); held.deinit(); }", pack.cleanup, true, 0);
+}

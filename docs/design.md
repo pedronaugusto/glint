@@ -92,11 +92,19 @@ Operation names (`init`, `acquire`, `deinit`, `raw`, `material`, ...) are the pa
 | ID/version | Obligation and supported report predicate | Prevention limit |
 |---|---|---|
 | A001/2 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
-| A002/2 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases/type aliases excluded; a copy whose type or source is declared plain data (primitives, and arrays, slices, pointers, optionals and error unions of them, a literal, a call declared to return one) is decided as no owner; lifetimes, live status, retained callers and field copies are undecided. |
-| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. | Only straight-line direct cleanup/defer/address discard. Other calls, error exits, transfers, branches, loops and aliases are undecided. No missing-errdefer allegation from proximity. |
+| A002/2 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases (a copy of a value that resolves to a pointer or an optional pointer, whatever it points at) and type aliases excluded; a copy whose type or source is declared plain data (primitives, and arrays, slices, pointers, optionals and error unions of them, a literal, a call declared to return one) is decided as no owner; lifetimes, live status, retained callers and field copies are undecided. |
+| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. | The walk follows the block's statements and the branches of an `if`: a direct `deinit`, a `defer` of one (after which every exit runs it), member uses, a release before a `return` in a branch, a loop's own `break`. An exit while held, branches that disagree, a nested release it does not follow, and any use but a member (an address, a copy, an argument: a transfer or alias) are undecided. No missing-errdefer allegation from proximity. |
 | A004/2 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
 | A005/2 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free. Every recognized adoption records that uncertainty. |
 
+A receiver is decided by the type it resolves to: a published aegis type is a candidate, a type
+nested in one (a guarded value's guard) stays unknown, and any other resolved type is not a
+candidate. Resolution follows declarations, fields, calls and their `!T` results, `try`,
+`catch`, `orelse` and `.?`, the payloads `if`, `while`, `switch` prongs and `for` bind, a
+`switch` or `if` choosing between types (each branch, a `@compileError` branch left out),
+a function returning its `comptime T: type` parameter, and a method of a container a type
+function made, whose parameters read as that call's arguments. Reflection (`@typeInfo`,
+`@TypeOf`), `anytype` and a type function's own parameters inside its body stay unknown.
 Required unknown receivers and unsupported acquisition/cleanup or adoption sites record undecided coverage. General prevention limits describe the rule boundary; they are not unconditional per-file incompleteness.
 Front-end rejection and budget exhaustion still make execution incomplete independently of
 findings acceptance. The library's own files, those its `aegis` root imports, are safe-type internals; other source requires the same explicit site policy as consumers. Wiping inline padding
