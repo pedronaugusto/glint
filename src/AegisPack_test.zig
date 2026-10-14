@@ -619,3 +619,21 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     // Released, then acquired again into the same local and released.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); held = g.acquire(); held.deinit(); }", pack.cleanup, true, 0);
 }
+
+test "receivers through elements, slices, joined arrays and generic results written around T are decided" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst S = @import(\"aegis\").Secret;\nconst Plain = struct { data: u32, lock: u32 };\nconst Event = union(enum) { data: struct { bytes: []const u8 }, other: void };\n";
+    // An element of an array, of an optional's array, of a pointer to an array or of a slice.
+    try expectJudged(head ++ "pub fn f(es: [2]?Event) void { _ = es[0].?.data.bytes; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(ps: *const [2]Plain, qs: []const Plain) void { _ = ps[0].data; _ = qs[1].lock; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(gs: []G(u32)) void { _ = gs[0].data; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f() void { var gs: [2]G(u32) = undefined; _ = &gs; _ = gs[1].lock; }", pack.access, true, 1);
+    // A slice of an array, dereferenced, is an array of its elements.
+    try expectJudged(head ++ "pub fn f() void { var ps: [2]Plain = undefined; _ = &ps; const kept = ps[0..1].*; var copies: [1]Plain = kept; _ = &copies; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(ss: []S(u32)) void { const window = ss[1..]; _ = window[0].material; }", pack.access, true, 1);
+    // Literals joined are plain data.
+    try expectJudged(head ++ "pub fn f() void { const text = \"ab\" ++ \"cd\"; const copy = text; _ = copy; }", pack.copies, true, 0);
+    // A method generic in `T` that returns `E!*T`, called on a value, returns a pointer to the argument.
+    const allocator = "const A = struct { pub fn create(a: A, comptime T: type) error{OutOfMemory}!*T { _ = a; return undefined; } };\n";
+    try expectJudged(head ++ allocator ++ "pub fn f(gpa: A) !void { const p = try gpa.create(Plain); _ = p.data; }", pack.access, true, 0);
+    try expectJudged(head ++ allocator ++ "pub fn f(gpa: A) !void { const g = try gpa.create(G(u32)); _ = g.data; }", pack.access, true, 1);
+}

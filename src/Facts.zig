@@ -45,6 +45,9 @@ pub const Value = union(enum) {
     instance: Container,
     function: Decl,
     pointer: *const Value,
+    /// An array of the element: `[N]T`. A slice or many-item pointer is a `pointer` to its
+    /// element, as Zig indexes both the same way.
+    array: *const Value,
     optional: *const Value,
     error_union: *const Value,
     error_set,
@@ -148,7 +151,7 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
     const found = try self.publication(library);
     var current = value;
     while (true) switch (current) {
-        .pointer, .optional, .error_union => |inner| current = inner.*,
+        .pointer, .array, .optional, .error_union => |inner| current = inner.*,
         .function => |decl| {
             for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role))); // safe: the entry holds a role value of this enum.
             return null;
@@ -218,12 +221,26 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             return if (lhs == .scalar or lhs == .primitive) .scalar else .{ .unknown = .unsupported };
         },
         .error_union => return .{ .error_union = try self.boxed(try self.resolve(file, tree.nodeData(node).node_and_node[1])) },
+        // An element of an array, a pointer to one, a slice or a many-item pointer.
+        .array_access => return self.indexed(try self.resolve(file, tree.nodeData(node).node_and_node[0]), {}),
+        // A slice of an array is a pointer to the elements (a pointer to an array when the bounds
+        // are known, a slice when not: indexed alike); a slice of a slice or pointer is the same.
+        .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolve(file, tree.fullSlice(node).?.ast.sliced), {}),
+        // `++` joins arrays: the left side's kind, a string for a literal.
+        .array_cat => {
+            const lhs = try self.resolve(file, tree.nodeData(node).node_and_node[0]);
+            return switch (lhs) {
+                .scalar, .array, .unknown => lhs,
+                else => .{ .unknown = .unsupported },
+            };
+        },
         .error_set_decl, .merge_error_sets => return .error_set,
         .enum_literal => return .{ .unknown = .comptime_dependent },
         .number_literal, .string_literal, .char_literal => return .scalar,
         else => {},
     }
     if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
+    if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolve(file, array.ast.elem_type)) };
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) {
         for (model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
@@ -262,7 +279,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const callee = try self.resolve(file, call.ast.fn_expr);
             if (callee == .alternatives) return self.map(callee, {}, callResult);
             if (callee == .function) {
-                if (try self.typeArgument(file, call, callee.function)) |argument| return self.instance(argument);
+                if (try self.typeArgument(file, call, callee.function)) |result| return result;
                 if (try self.madeResult(file, call, callee.function)) |value| return value;
                 var result = try self.callResult(callee, {});
                 if (result == .container and result.container.symbolic) {
@@ -309,26 +326,70 @@ fn sequence(pointer: Value, name: []const u8) Value {
     return .{ .unknown = .unsupported };
 }
 
-/// A call to a function whose result is one of its own `comptime T: type` parameters, such as
-/// `std.mem.zeroes(T)`, returns a `T`: the type the call passes there. Only a call through a
-/// namespace or by name, where arguments and parameters line up.
+/// A call to a function whose result is written in terms of one of its own `comptime T: type`
+/// parameters, such as `std.mem.zeroes(T)` or `gpa.create(T)`, returns that result with `T` the
+/// type the call passes there. A call through a namespace or by name, or a method called on a
+/// value, whose first parameter that value is.
 fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    // A method called on a value takes that value as its first parameter.
+    var receiver: usize = 0;
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const lhs = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
-        if (lhs != .container) return null;
+        switch (try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+            .container => {},
+            .instance => receiver = 1,
+            .pointer => |p| if (p.* == .instance) {
+                receiver = 1;
+            } else return null,
+            else => return null,
+        }
     } else if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
     const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, model.declarations[decl.index].node) orelse return null;
     const result_node = function.ast.return_type.unwrap() orelse return null;
-    if (target_tree.nodeTag(result_node) != .identifier) return null;
-    const ref = model.reference(result_node) orelse return null;
+    const generic: Generic = .{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver };
+    const result = (try self.written(generic, result_node, 0)) orelse return null;
+    // `!T`: an error union whose error set the body infers.
+    if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(result) };
+    return result;
+}
+
+/// A generic function called: where, how and what it declares.
+const Generic = struct { file: Project.FileId, call: Ast.full.Call, decl: Decl, function: Ast.full.FnProto, receiver: usize };
+
+/// A result type written in terms of a `comptime T: type` parameter (`T`, `*T`, `?T`, `[]T`,
+/// `[N]T`, `E!*T`), with the call's argument for `T`; null for any other result.
+fn written(self: *Facts, generic: Generic, node: Ast.Node.Index, depth: usize) ResolveError!?Value {
+    if (depth == 16) return null;
+    const model = &self.project.models[generic.decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const target_tree = &self.project.files[generic.decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (target_tree.fullPtrType(node)) |ptr| {
+        const child = (try self.written(generic, ptr.ast.child_type, depth + 1)) orelse return null;
+        return .{ .pointer = try self.boxed(child) };
+    }
+    if (target_tree.fullArrayType(node)) |array| {
+        const child = (try self.written(generic, array.ast.elem_type, depth + 1)) orelse return null;
+        return .{ .array = try self.boxed(child) };
+    }
+    switch (target_tree.nodeTag(node)) {
+        .optional_type => {
+            const child = (try self.written(generic, target_tree.nodeData(node).node, depth + 1)) orelse return null;
+            return .{ .optional = try self.boxed(child) };
+        },
+        .error_union => {
+            const child = (try self.written(generic, target_tree.nodeData(node).node_and_node[1], depth + 1)) orelse return null;
+            return .{ .error_union = try self.boxed(child) };
+        },
+        .identifier => {},
+        else => return null,
+    }
+    const ref = model.reference(node) orelse return null;
     const index = ref.declaration orelse return null;
     const parameter = model.declarations[index];
     if (parameter.kind != .parameter) return null;
-    var it = function.iterate(target_tree);
+    var it = generic.function.iterate(target_tree);
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
         if (param.name_token != parameter.token) continue;
@@ -336,8 +397,8 @@ fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: D
         if (target_tree.tokenTag(comptime_token) != .keyword_comptime) return null;
         const type_expr = param.type_expr orelse return null;
         if (target_tree.nodeTag(type_expr) != .identifier or !std.mem.eql(u8, target_tree.tokenSlice(target_tree.nodeMainToken(type_expr)), "type")) return null;
-        if (position >= call.ast.params.len) return null;
-        return try self.resolve(file, call.ast.params[position]);
+        if (position < generic.receiver or position - generic.receiver >= generic.call.ast.params.len) return null;
+        return try self.instance(try self.resolve(generic.file, generic.call.ast.params[position - generic.receiver]));
     }
     return null;
 }
@@ -389,6 +450,11 @@ fn substituted(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *
         const child = try self.substituted(file, ptr.ast.child_type, made, depth + 1);
         if (child == .unknown) return child;
         return .{ .pointer = try self.boxed(child) };
+    }
+    if (tree.fullArrayType(node)) |array| {
+        const child = try self.substituted(file, array.ast.elem_type, made, depth + 1);
+        if (child == .unknown) return child;
+        return .{ .array = try self.boxed(child) };
     }
     switch (tree.nodeTag(node)) {
         .optional_type => {
@@ -469,6 +535,30 @@ fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
         .pointer => |inner| inner.*,
         .alternatives => self.map(value, {}, pointee),
         .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+/// An element of `value`: of an array, a pointer to an array, a slice or a many-item pointer.
+fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
+    return switch (value) {
+        .array => |inner| inner.*,
+        .pointer => |inner| switch (inner.*) {
+            .array => |elements| elements.*,
+            else => inner.*,
+        },
+        .alternatives => self.map(value, {}, indexed),
+        .unknown => value,
+        else => .{ .unknown = .unsupported },
+    };
+}
+
+/// A slice of `value`: a pointer to an array's elements, or the slice or pointer itself.
+fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
+    return switch (value) {
+        .array => .{ .pointer = try self.boxed(value) },
+        .pointer, .unknown => value,
+        .alternatives => self.map(value, {}, sliced),
         else => .{ .unknown = .unsupported },
     };
 }
@@ -590,14 +680,9 @@ fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.Tok
     if (position >= loop.ast.inputs.len) return .{ .unknown = .unsupported };
     const input = loop.ast.inputs[position];
     if (tree.nodeTag(input) == .for_range) return .scalar;
-    // A `for` takes slices, arrays and pointers to arrays, never a single item: a resolved
+    // A `for` takes arrays, pointers to arrays and slices, never a single item: a resolved
     // pointer input is a slice, whose element is what it points at.
-    const value = try self.resolve(file, input);
-    return switch (value) {
-        .pointer => |inner| inner.*,
-        .unknown => value,
-        else => .{ .unknown = .unsupported },
-    };
+    return self.indexed(try self.resolve(file, input), {});
 }
 
 fn isUnion(self: *const Facts, container: Container) bool {
@@ -612,8 +697,8 @@ fn same(a: Value, b: Value, depth: usize) bool {
     if (depth == 64) return false;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .pointer, .optional, .error_union => |inner| same(inner.*, switch (b) {
-            .pointer, .optional, .error_union => |other| other.*,
+        .pointer, .array, .optional, .error_union => |inner| same(inner.*, switch (b) {
+            .pointer, .array, .optional, .error_union => |other| other.*,
             else => unreachable,
         }, depth + 1),
         .container, .instance => |c| blk: {

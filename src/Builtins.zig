@@ -293,7 +293,7 @@ fn syntaxRules(self: *Context) RunError!void {
                 }
                 // A choice between types names a type; any other choice is undecided here.
                 if (value == .alternatives) value = for (value.alternatives) |one| switch (one) {
-                    .container, .primitive, .error_set, .pointer, .optional, .error_union => {},
+                    .container, .primitive, .error_set, .pointer, .array, .optional, .error_union => {},
                     else => break .{ .unknown = .unsupported },
                 } else value.alternatives[0];
                 switch (value) {
@@ -301,7 +301,7 @@ fn syntaxRules(self: *Context) RunError!void {
                         try unknown(self, .Z006, expr, reason);
                         if (names.acronymIssue(name)) try unknown(self, .Z032, expr, reason);
                     },
-                    .container, .primitive, .error_set, .pointer, .optional, .error_union => {
+                    .container, .primitive, .error_set, .pointer, .array, .optional, .error_union => {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     },
                     .function => |definition| {

@@ -85,7 +85,7 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
     if (depth == 64) return .unknown;
     return switch (value) {
         .unknown => .unknown,
-        .pointer, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
+        .pointer, .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
         .alternatives => |each| blk: {
             const first = try typed(c, each[0], depth + 1);
             for (each[1..]) |one| if (!std.meta.eql(first, try typed(c, one, depth + 1))) break :blk .unknown;
@@ -151,6 +151,11 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
         .number_literal, .char_literal, .string_literal => return true,
         .@"comptime", .@"try", .address_of => return plainValue(c, file, tree.nodeData(node).node, depth + 1),
         .grouped_expression => return plainValue(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        // Arrays joined: plain when what they are made of is.
+        .array_cat => {
+            const sides = tree.nodeData(node).node_and_node;
+            return try plainValue(c, file, sides[0], depth + 1) and try plainValue(c, file, sides[1], depth + 1);
+        },
         .array_access => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         .identifier => {
             const ref = model.reference(node) orelse return false;
