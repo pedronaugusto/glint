@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-14
+
 ### Changed
 
 - The aegis rules decide a receiver reached through an array: an element of an array, a pointer to one, a slice or a many-item pointer (`events[1].?.data`), a slice of an array (`segments[0..n].*` is an array of its elements), a `for` over an array value, and `[N]T` as a type. A generic function's result written around its `comptime T: type` parameter (`*T`, `?T`, `[]T`, `[N]T`, `E!*T`) is that result with the call's argument, and a method called on a value counts the value as its first parameter, so `gpa.create(T)` returns `*T`. Literals joined with `++` are plain data, for A002 and as a receiver. On uplink's sources the seven A001 and A002 sites 0.2.6 left undecided are decided.
