@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- A002 decides more copies of plain data: a `@Vector` of plain lanes, the payload `orelse` or `catch` gives of plain data, an `if` expression whose branches are plain, and a labeled block whose every `break` gives plain data. warp's three undecided sites are decided; a labeled block that gives an owner stays undecided, never plain.
+
 ## [0.2.7] - 2026-10-14
 
 ### Changed

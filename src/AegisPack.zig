@@ -136,6 +136,13 @@ fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usi
         .optional_type => plainType(c, file, tree.nodeData(node).node, depth + 1),
         .error_union => plainType(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .identifier => try c.facts.resolve(file, node) == .primitive,
+        // `@Vector(n, T)`: lanes of plain data.
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@Vector")) break :blk false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            break :blk args.len == 2 and try plainType(c, file, args[1], depth + 1);
+        },
         else => false,
     };
 }
@@ -157,6 +164,14 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             return try plainValue(c, file, sides[0], depth + 1) and try plainValue(c, file, sides[1], depth + 1);
         },
         .array_access => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        // The payload of plain data is plain: Zig requires the other side to coerce to it.
+        .@"orelse", .@"catch" => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(node).?;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return try plainValue(c, file, branch.ast.then_expr, depth + 1) and try plainValue(c, file, otherwise, depth + 1);
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return plainBreaks(c, file, node, depth + 1),
         .identifier => {
             const ref = model.reference(node) orelse return false;
             const index = ref.declaration orelse return false;
@@ -182,6 +197,31 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
         },
         else => return false,
     }
+}
+
+/// Whether every `break` out of the labeled block `node` gives plain data; false for a block
+/// with no label, which gives no value.
+fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
+    const lbrace = tree.nodeMainToken(node);
+    if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon or tree.tokenTag(lbrace - 2) != .identifier) return false;
+    const label = tree.tokenSlice(lbrace - 2);
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var found = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const at = tree.nodeMainToken(brk);
+        if (at < first or at > last) continue;
+        const data = tree.nodeData(brk).opt_token_and_opt_node;
+        const target = data[0].unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(target), label)) continue;
+        const value = data[1].unwrap() orelse return false;
+        if (!try plainValue(c, file, value, depth)) return false;
+        found = true;
+    }
+    return found;
 }
 
 fn pointerShaped(value: Facts.Value) bool {

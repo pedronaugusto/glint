@@ -637,3 +637,12 @@ test "receivers through elements, slices, joined arrays and generic results writ
     try expectJudged(head ++ allocator ++ "pub fn f(gpa: A) !void { const p = try gpa.create(Plain); _ = p.data; }", pack.access, true, 0);
     try expectJudged(head ++ allocator ++ "pub fn f(gpa: A) !void { const g = try gpa.create(G(u32)); _ = g.data; }", pack.access, true, 1);
 }
+
+test "copies of vectors, payloads, if expressions and labeled blocks of plain data are decided" {
+    const head = "const S = @import(\"aegis\").Secret;\nfn size(n: usize) ?usize { return n; }\nfn ready() bool { return true; }\n";
+    try expectJudged(head ++ "pub fn f(v: @Vector(4, u8)) void { const w: @Vector(4, u16) = v; const copy = w; _ = copy; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(n: usize) ?usize { const o = size(n) orelse return null; var p = o; _ = &p; return p; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(n: usize) ?usize { var o = if (ready()) blk: { if (n == 0) break :blk 1; break :blk size(n) orelse return null; } else size(n + 1) orelse return null; const at = o; o += 1; return at; }", pack.copies, true, 0);
+    // A labeled block that breaks with an owner is no plain data: its copy is left undecided.
+    try expectJudged(head ++ "pub fn f() void { var s = blk: { break :blk S(u32).init(1); }; defer s.deinit(); const copy = s; _ = copy; }", pack.copies, false, 0);
+}
