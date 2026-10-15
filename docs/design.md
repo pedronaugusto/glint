@@ -27,7 +27,7 @@ The context provides immutable checked model handles, conservative value/declara
 | Z013 | Dead private import binding after lexical/member identity checks; unknown same-name members are not dead. |
 | Z016 | Resolved std assertion conjunction advisory; no rewrite or evaluation-effect claim. |
 | Z024 | Configurable byte-line readability report, default 100; never a universal gate. |
-| Z026 | Explicit family report: every empty catch, including cleanup, needs a written site reason. Report before gate adoption. |
+| Z026 | Correctness: every empty catch, including cleanup, needs a written site reason, since a discarded error is a result nobody read. Not in the generic default selection; preflight's default policy gates it. |
 | P001 | Cast-site reasons. `casts = all` covers 22 std builtin conversion/integer/float/enum/error/pointer/backing-int tags, including boolean and volatile conversion; `pointer` preserves the predecessor's four `@constCast`, `@ptrCast`, `@alignCast`, `@intFromPtr` predicates. Real same-line `// safe: <reason>` required. `cast_scope = all` includes tests; explicit production scope preserves narrower migration policy. |
 | P002 | Literal runtime-safety-off site needs a real same-line safe reason; computed toggles are undecided. A comment does not establish the invariant or measured hot-loop evidence. |
 | P003 | Function length: default 120 inclusive declaration lines, subtract the largest contained returned type body for literal `type` constructors. Includes tests. Per-source named exceptions have a bounded line limit and nonempty reason; stale exceptions are coverage and required stale policy is incomplete. |
@@ -79,7 +79,7 @@ Consequences a pack author can rely on. Any revision that keeps the public names
 The optional `AegisPack.rules` uses the public compiled-rule API. The standalone CLI registers
 its IDs but never enables them by default; select `--enable A001` (through A005), or pass
 report or gate selections and the pack descriptors to `runConfigured`. Explicit gate selection is accepted; an undecided required site still makes execution incomplete.
-Generic defaults, Z026/Z012 reports and the deferred D001 admission are unchanged.
+Generic defaults, the Z012 report and the deferred D001 admission are unchanged.
 
 Recognition follows lexical declarations and the `aegis` module mapping, through the published names of
 `AegisPack.library` (Secret, SecretBytes, Guarded and its Guard, and the id, unit and integer factories, from

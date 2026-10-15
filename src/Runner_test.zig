@@ -168,6 +168,8 @@ test "G2 Z026 family reason policy includes cleanup and distinguishes handled er
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch { return; }; }", 0);
     try check(.Z026, "fn fallible() error{Failure}!void {}\npub fn f() void { fallible() catch {}; } // glint-ignore: Z026 -- best-effort cleanup; no recovery available\n", 0);
     try check(.Z026, "const text = \"catch {} // glint-ignore: Z026 -- fake\"; pub fn f() void { _ = text; }", 0);
+    // A discarded error is a result nobody read: a correctness finding.
+    try std.testing.expectEqual(glint.RuleGroup.correctness, glint.Rule.Z026.group());
 }
 
 test "G2 Z012 family API report respects public aliases receivers and suppression" {

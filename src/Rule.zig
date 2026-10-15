@@ -27,8 +27,8 @@ pub const Rule = enum(u16) {
 
     pub fn group(self: Rule) Group {
         return switch (self) {
-            .Z003, .Z011, .Z013, .D001 => .correctness,
-            .Z012, .Z016, .Z026, .P001, .P002, .P003, .P004, .P005, .P006 => .family_policy,
+            .Z003, .Z011, .Z013, .Z026, .D001 => .correctness,
+            .Z012, .Z016, .P001, .P002, .P003, .P004, .P005, .P006 => .family_policy,
             else => .zig_style,
         };
     }
