@@ -26,7 +26,12 @@ const secret_members = [_]Lib.Member{
     .{ .path = "Secret", .role = .secret },
     .{ .path = "SecretBytes", .role = .bytes },
 };
-const sync_members = [_]Lib.Member{.{ .path = "Guarded", .role = .guarded }};
+const sync_members = [_]Lib.Member{
+    .{ .path = "Guarded", .role = .guarded },
+    .{ .path = "BlockingGuarded", .role = .guarded },
+    .{ .path = "RwGuarded", .role = .guarded },
+    .{ .path = "SpinRwGuarded", .role = .guarded },
+};
 const int_members = [_]Lib.Member{
     .{ .path = "Checked", .role = .scalar },
     .{ .path = "Saturating", .role = .scalar },
@@ -48,6 +53,9 @@ const root_members = [_]Lib.Member{
     .{ .path = "Secret", .role = .secret },
     .{ .path = "SecretBytes", .role = .bytes },
     .{ .path = "Guarded", .role = .guarded },
+    .{ .path = "BlockingGuarded", .role = .guarded },
+    .{ .path = "RwGuarded", .role = .guarded },
+    .{ .path = "SpinRwGuarded", .role = .guarded },
     .{ .path = "int.Checked", .role = .scalar },
     .{ .path = "int.Saturating", .role = .scalar },
     .{ .path = "int.Ranged", .role = .scalar },
@@ -90,7 +98,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
         .error_union => return kind(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .field_access => {
             const data = tree.nodeData(node).node_and_token;
-            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "Guard") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
+            if (guardType(try Model.identifier(c.allocator, tree.tokenSlice(data[1]))) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             if (try typeRole(c, try c.facts.resolve(file, node))) |k| return k;
             // A member reached through a module import or another file's alias names its own
             // declaration: its type expression is read where it is written, which a value
@@ -117,7 +125,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 const data = tree.nodeData(call.ast.fn_expr).node_and_token;
                 const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
                 if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
-                if (std.mem.eql(u8, name, "acquire") and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
+                if (acquisition(name) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             }
             const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return null;
             const origin = (try c.facts.origin(decl)) orelse return null;
@@ -136,6 +144,19 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
     }
     return null;
 }
+/// The guard types a guarded owner declares: one guard, or a reader's and a writer's.
+fn guardType(name: []const u8) bool {
+    for ([_][]const u8{ "Guard", "ReadGuard", "WriteGuard" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+/// The operations by which a guarded owner gives a guard: every acquire, blocking or
+/// spinning, cancelable or not, tried or waited for, and a reader's or a writer's.
+pub fn acquisition(name: []const u8) bool {
+    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "read", "write", "readUncancelable", "writeUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
 /// What a name bound by `if (x) |name|` or `while (x) |name|` holds: the payload of `x`, which
 /// is `x`'s own kind seen through its optional or error union. Other captures stay unknown.
 fn captured(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: Ast.TokenIndex, depth: usize) Context.Error!?Kind {

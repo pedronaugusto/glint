@@ -43,7 +43,9 @@ fn checkAccess(c: *Context) Context.Error!void {
         const backing = switch (k) {
             .secret => std.mem.eql(u8, name, "material"),
             .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
-            .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock"),
+            // The guarded value and the lock state of every guarded owner: a spin flag, a
+            // blocking mutex, a reader-writer lock and its admission count.
+            .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted"),
             .guard => std.mem.eql(u8, name, "owner"),
             .scalar => false,
         };
@@ -51,7 +53,7 @@ fn checkAccess(c: *Context) Context.Error!void {
     }
 }
 fn backingName(name: []const u8) bool {
-    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "owner" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
@@ -278,7 +280,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
         if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
         const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
-        if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !std.mem.eql(u8, operation, "acquire")) continue;
+        if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !Contract.acquisition(operation)) continue;
         const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (k != .secret and k != .bytes and k != .guard) continue;
         var buffer: [2]Ast.Node.Index = undefined;

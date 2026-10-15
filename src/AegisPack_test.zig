@@ -713,3 +713,39 @@ test "fields of a made container, choices without members and reflection over ch
     // An enum's field of the function's name is no use of the function.
     try expectJudged(base ++ "const Kind = enum { look, other };\nfn look(p: anytype) void { _ = p.owner; }\npub fn f(s: *PortScratch) Kind { look(s); return .look; }", pack.access, true, 0);
 }
+
+test "every guarded owner's backing state and guard are its contract's, whichever lock it holds" {
+    var project = try fixture(
+        \\const aegis = @import("aegis");
+        \\pub fn f(io: anytype) !void {
+        \\    var b = aegis.BlockingGuarded(u32).init(0);
+        \\    _ = b.data;
+        \\    _ = b.mutex;
+        \\    var held = try b.acquire(io);
+        \\    defer held.deinit(io);
+        \\    _ = held.owner;
+        \\    var rw = aegis.RwGuarded(u32).init(0);
+        \\    _ = rw.admitted;
+        \\    var reading = try rw.read(io);
+        \\    defer reading.deinit(io);
+        \\    _ = reading.owner;
+        \\    var spin = aegis.SpinRwGuarded(u32).init(0);
+        \\    _ = spin.state;
+        \\    var writing = spin.write();
+        \\    defer writing.deinit();
+        \\    _ = writing.value();
+        \\}
+        \\pub fn leak(io: anytype) void {
+        \\    var b = aegis.BlockingGuarded(u32).init(0);
+        \\    var g = b.acquireUncancelable(io);
+        \\    _ = &g;
+        \\}
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    // b.data, b.mutex, held.owner, rw.admitted, reading.owner, spin.state.
+    try std.testing.expectEqual(@as(usize, 6), count(report, pack.access)); // safe: fixture counts are representable.
+    // A guard acquired and never released.
+    try std.testing.expectEqual(@as(usize, 1), count(report, pack.cleanup)); // safe: fixture counts are representable.
+}
