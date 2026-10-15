@@ -646,3 +646,70 @@ test "copies of vectors, payloads, if expressions and labeled blocks of plain da
     // A labeled block that breaks with an owner is no plain data: its copy is left undecided.
     try expectJudged(head ++ "pub fn f() void { var s = blk: { break :blk S(u32).init(1); }; defer s.deinit(); const copy = s; _ = copy; }", pack.copies, false, 0);
 }
+
+test "generic parameters are what the project's own calls pass, when no consumer can call by name" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, owner: u32 };\n";
+    // A private generic: its `anytype` is the union of what its callers pass.
+    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f(x: *Plain) void { look(x); }", pack.access, true, 0);
+    // Callers that disagree, one passing an owner: undecided, as any choice between types that disagree.
+    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.data; }\npub fn f(x: *Plain, g: *G(u32)) void { look(x); look(g); }", pack.access, false, 0);
+    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.data; }\npub fn f(g: *G(u32)) void { look(g); }", pack.access, true, 1);
+    // Through a method of a container, and a caller that is itself generic.
+    try expectJudged(head ++ "const Box = struct { fn look(_: *const Box, p: anytype) void { _ = p.owner; } };\nfn pass(b: *const Box, p: anytype) void { b.look(p); }\npub fn f(b: *const Box, x: *Plain) void { pass(b, x); }", pack.access, true, 0);
+    // A `comptime` type parameter of a private type function.
+    try expectJudged(head ++ "fn Holder(comptime T: type) type { return struct { pub fn get(t: *T) void { _ = t.data; } }; }\npub fn f(x: *Plain) void { Holder(Plain).get(x); }", pack.access, true, 0);
+    // A method's own generic, called on a pointer the caller's generic was given.
+    try expectJudged(head ++ "const Sched = struct { processors: []Plain, monitor: ?*Monitor };\nconst Monitor = struct {\n    samples: []u32,\n    pub fn run(m: *Monitor, s: anytype) void { for (s.processors, m.samples) |*p, *sample| { _ = m.look(s, p, sample); } }\n    fn look(m: *Monitor, s: anytype, p: anytype, sample: *u32) bool { _ = m; _ = s; _ = sample; _ = p.owner; return false; }\n};\npub fn go(s: *Sched) void { s.monitor.?.run(s); }", pack.access, true, 0);
+    // Taken other than by a call, its arguments are not all known: undecided.
+    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f() void { const taken = look; _ = taken; }", pack.access, false, 0);
+}
+
+test "a type function's result written with reflection is read at its call" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Op = struct { owner: u32 };\n";
+    const reflect =
+        \\const Sink = struct { pub fn complete(s: *Sink, o: *Op) void { _ = s; _ = o; } };
+        \\fn OpOf(comptime SinkPtr: type) type {
+        \\    const S = @typeInfo(SinkPtr).pointer.child;
+        \\    return @typeInfo(@typeInfo(@TypeOf(S.complete)).@"fn".param_types[1].?).pointer.child;
+        \\}
+        \\fn dispatch(sink: anytype, address: usize) void { const o: *OpOf(@TypeOf(sink)) = @ptrFromInt(address); _ = o.owner; }
+        \\fn poll(sink: anytype) void { dispatch(sink, 0); }
+        \\pub fn run(s: *Sink) void { poll(s); }
+        \\
+    ;
+    try expectJudged(head ++ reflect, pack.access, true, 0);
+    // The result type of a function another reaches through `@typeInfo(@TypeOf(f)).@"fn".return_type`.
+    const future =
+        \\fn Future(comptime Result: type) type { return struct { result: Result, pub fn await(future: *@This()) Result { return future.result; } }; }
+        \\fn start(function: anytype) Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) { return undefined; }
+        \\const Message = struct { data: u32 };
+        \\fn receive() Message { return undefined; }
+        \\pub fn f() void { var pending = start(receive); const message = pending.await(); _ = message.data; }
+        \\
+    ;
+    try expectJudged(head ++ future, pack.access, true, 0);
+}
+
+test "fields of a made container, choices without members and reflection over choices are decided" {
+    const base =
+        \\const builtin = @import("builtin");
+        \\fn State(comptime S: type) type { return struct { storage: Storage = undefined, pub const Storage = union { node: u32, scratch: S }; }; }
+        \\const PortScratch = struct { owner: *u32 };
+        \\const Scratch = union { port: if (builtin.os.tag == .windows) PortScratch else void, other: void };
+        \\const Op = struct { state: State(Scratch) = .{} };
+        \\const Counted = struct { pub fn complete(c: *Counted, o: *Op) void { _ = c; _ = o; } };
+        \\const Pressure = struct { pub fn complete(p: *Pressure, o: *Op) void { _ = p; _ = o; } };
+        \\fn OpOf(comptime SinkPtr: type) type {
+        \\    const Sink = @typeInfo(SinkPtr).pointer.child;
+        \\    return @typeInfo(@typeInfo(@TypeOf(Sink.complete)).@"fn".param_types[1].?).pointer.child;
+        \\}
+        \\
+    ;
+    // A field of `State(Scratch)` is of the type the call passed; a `void` choice has no `owner`
+    // and is a build where the access does not compile.
+    try expectJudged(base ++ "pub fn f(o: *Op) void { const s = &o.state.storage.scratch.port; _ = s.owner; }", pack.access, true, 0);
+    // Two sinks: each is reflected on its own and both give the same operation type.
+    try expectJudged(base ++ "fn dispatch(sink: anytype, address: usize) void { const o: *OpOf(@TypeOf(sink)) = @ptrFromInt(address); const s = &o.state.storage.scratch.port; _ = s.owner; }\npub fn f(c: *Counted, p: *Pressure) void { dispatch(c, 0); dispatch(p, 0); }", pack.access, true, 0);
+    // An enum's field of the function's name is no use of the function.
+    try expectJudged(base ++ "const Kind = enum { look, other };\nfn look(p: anytype) void { _ = p.owner; }\npub fn f(s: *PortScratch) Kind { look(s); return .look; }", pack.access, true, 0);
+}

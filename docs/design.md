@@ -102,9 +102,19 @@ nested in one (a guarded value's guard) stays unknown, and any other resolved ty
 candidate. Resolution follows declarations, fields, calls and their `!T` results, `try`,
 `catch`, `orelse` and `.?`, the payloads `if`, `while`, `switch` prongs and `for` bind, a
 `switch` or `if` choosing between types (each branch, a `@compileError` branch left out),
-a function returning its `comptime T: type` parameter, and a method of a container a type
-function made, whose parameters read as that call's arguments. Reflection (`@typeInfo`,
-`@TypeOf`), `anytype` and a type function's own parameters inside its body stay unknown.
+a function returning its `comptime T: type` parameter, a method or field of a container a type
+function made, whose parameters read as that call's arguments, and a generic call's result
+read with its parameters bound to the call's arguments: a type function returning an
+expression, or a result type written in terms of its parameters. `@TypeOf` gives a value's
+type; `@typeInfo` reads a type's `.pointer.child`, `.optional.child`, `.array.child`,
+`.error_union.payload` and a function's `.@"fn".return_type` and `.param_types[i]`. Inside a
+generic function, an `anytype` or `type` parameter is the union of what the project's calls
+pass, when every use of the function is such a call and its container is not reached by name
+from a module root the project imports (a consumer could call it with anything); a member call
+through a path of declarations from a module import reaches only exported names, and one whose
+argument count the function cannot take is another function. A member of a choice between
+types leaves out the choices without members (`void`, a number): a build in which the access
+does not compile. Anything else stays unknown.
 Required unknown receivers and unsupported acquisition/cleanup or adoption sites record undecided coverage. General prevention limits describe the rule boundary; they are not unconditional per-file incompleteness.
 Front-end rejection and budget exhaustion still make execution incomplete independently of
 findings acceptance. The library's own files, those its `aegis` root imports, are safe-type internals; other source requires the same explicit site policy as consumers. Wiping inline padding

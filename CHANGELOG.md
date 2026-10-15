@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- The aegis rules decide receivers inside generics. An `anytype` or `type` parameter is the union of what the project's own calls pass, when every use of its function is a call and no consumer can call it by name (its container is not reached through public declarations from a module root). A generic call's result is read with its parameters bound to the call's arguments: a type function returning an expression, a result type written in terms of its parameters, a container it makes (whose fields, now as its methods, read the call's arguments). `@TypeOf` gives a value's type and `@typeInfo` a type's pointer, optional, array and error-union parts and a function's return and parameter types, so `Future(@typeInfo(@TypeOf(f)).@"fn".return_type.?)` and an operation type reflected from a sink's `complete` resolve. A member of a compile-time choice of types leaves out the choices without members (`void`): a build where the access does not compile. Five of reactor's eight undecided A001-A003 sites are decided this way (`Monitor.look`, readiness's `Poller`, `afd.setOption`, a test's `io.concurrent` future, Iocp's operation type with a typed local).
+
 ## [0.2.9] - 2026-10-15
 
 ### Changed
