@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-15
+
 ### Changed
 
 - Z026, an empty `catch` without a written reason, is a correctness rule (its group `correctness`, where it was `family_policy`): a discarded error is a result nobody read. It stays out of the generic default selection; preflight's default policy gates it. glint gates it in its own lint.
