@@ -47,7 +47,7 @@ fn checkAccess(c: *Context) Context.Error!void {
             // blocking mutex, a reader-writer lock and its admission count.
             .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted"),
             .guard => std.mem.eql(u8, name, "owner"),
-            .scalar => false,
+            .scalar, .condition => false,
         };
         if (backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
@@ -274,9 +274,14 @@ fn checkCleanup(c: *Context) Context.Error!void {
         if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) continue;
         const v = tree.fullVarDecl(decl.node) orelse continue;
         const init = v.ast.init_node.unwrap() orelse continue;
-        // Only actual acquisition expressions, never an owner alias or type alias.
+        // Only actual acquisition expressions, never an owner alias or type alias. One that
+        // fails holds nothing: `try` and `catch` leave the acquisition itself.
         var call_buffer: [1]Ast.Node.Index = undefined;
-        const acquisition = if (tree.nodeTag(init) == .@"try") tree.nodeData(init).node else init;
+        const acquisition = switch (tree.nodeTag(init)) {
+            .@"try" => tree.nodeData(init).node,
+            .@"catch" => tree.nodeData(init).node_and_node[0],
+            else => init,
+        };
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
         if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
         const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
@@ -301,7 +306,8 @@ fn checkCleanup(c: *Context) Context.Error!void {
 /// until a direct `deinit` releases it or a `defer` schedules one; an `if` is followed into
 /// its branches. Undecided: an exit (`return`, `try`, a `break` or `continue` that leaves the
 /// block) while live, an `if` whose branches leave the owner in different states, any use of
-/// the owner but its members (its address, a copy, an argument: a transfer or an alias), a
+/// the owner but its members or a loan (its address, a copy, an argument: a transfer or an
+/// alias), a
 /// release nested where the walk does not follow, a use after release. Findings: a second
 /// direct cleanup, the owner's address discarded after release.
 const Flow = struct {
@@ -339,7 +345,7 @@ const Flow = struct {
             if (state == .live) if (f.tree.fullIf(stmt)) |branch| {
                 const then_outcome = try f.walkBranch(branch.ast.then_expr);
                 const else_outcome: Outcome = if (branch.ast.else_expr.unwrap()) |other| try f.walkBranch(other) else .{ .falls = .live };
-                if (try f.uses(branch.ast.cond_expr) != .none or f.exits(branch.ast.cond_expr)) return .uncertain;
+                if (try f.uses(branch.ast.cond_expr) == .other or exits(f.tree, f.model, branch.ast.cond_expr)) return .uncertain;
                 switch (try join(then_outcome, else_outcome)) {
                     .falls => |next| state = next,
                     .ends => return .ends,
@@ -352,7 +358,7 @@ const Flow = struct {
                 .none, .members => {},
                 .other => return .uncertain,
             }
-            if (state == .live and f.exits(stmt)) return .uncertain;
+            if (state == .live and exits(f.tree, f.model, stmt)) return .uncertain;
         }
         return .{ .falls = state };
     }
@@ -391,44 +397,16 @@ const Flow = struct {
             const index = ref.declaration orelse continue;
             if (f.model.declarations[index].token != f.token) continue;
             const parent = f.model.node_parents[i] orelse return .other;
+            // Lent to a call that holds it again on every return: a borrow.
+            if (f.tree.nodeTag(parent) == .address_of and try lent(f.c, f.c.file, parent, 0)) {
+                found = .members;
+                continue;
+            }
             if (f.tree.nodeTag(parent) != .field_access or f.tree.nodeData(parent).node_and_token[0] != candidate) return .other;
             if (std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(parent).node_and_token[1])), "deinit")) return .other;
             found = .members;
         }
         return found;
-    }
-
-    /// Whether `node` can leave the block the owner lives in: a `return`, a `try`, or a
-    /// `break` or `continue` that is labeled or not inside a loop within `node`.
-    fn exits(f: Flow, node: Ast.Node.Index) bool {
-        const first = f.tree.firstToken(node);
-        const last = f.tree.lastToken(node);
-        for (first..last + 1) |raw_token| {
-            const token: Ast.TokenIndex = @intCast(raw_token); // safe: bounded by the node's own token range.
-            switch (f.tree.tokenTag(token)) {
-                .keyword_return, .keyword_try => return true,
-                .keyword_break, .keyword_continue => {
-                    if (f.tree.tokenTag(token + 1) == .colon) return true;
-                    if (!f.insideLoop(token, node)) return true;
-                },
-                else => {},
-            }
-        }
-        return false;
-    }
-
-    fn insideLoop(f: Flow, token: Ast.TokenIndex, root: Ast.Node.Index) bool {
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .@"break" and tag != .@"continue") continue;
-            if (f.tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue; // safe: AST node table supplies bounded indexes.
-            var at = f.model.node_parents[i];
-            while (at) |parent| : (at = f.model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
-                if (f.tree.fullWhile(parent) != null or f.tree.fullFor(parent) != null) return true;
-                if (parent == root) return false;
-            }
-            return false;
-        }
-        return false;
     }
 
     /// `owner = x.init(...)`, `x.adopt(...)` or `x.acquire()`: live again.
@@ -454,6 +432,245 @@ const Flow = struct {
         return f.model.declarations[index].token == f.token;
     }
 };
+
+/// Whether `argument`, a guard's address or a pointer to a guard, is lent by the call it is an
+/// argument of: to an aegis condition's `wait` or `waitUncancelable`, which release the guard
+/// while they wait and hold it again on every return, or to a function of the program's own
+/// that hands it back held on every path (`Loan`).
+fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const call_node = model.node_parents[@backingInt(argument)] orelse return false; // safe: an AST node index reads its own parent table
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return false;
+    const position = for (call.ast.params, 0..) |param, i| {
+        if (param == argument) break i;
+    } else return false;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const data = tree.nodeData(call.ast.fn_expr).node_and_token;
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
+        if (std.mem.eql(u8, name, "wait") or std.mem.eql(u8, name, "waitUncancelable")) {
+            const k = (try Contract.kind(c, file, data[0], 0)) orelse switch (try typed(c, try c.facts.resolve(file, data[0]), 0)) {
+                .owner => |owned| owned,
+                .other, .unknown => null,
+            };
+            if (k == .condition) return true;
+        }
+    }
+    if (depth == 8) return false;
+    const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
+    const function = (try c.facts.origin(decl)) orelse return false;
+    if (try c.inLibrary(Contract.library, function.file)) return false;
+    const record = c.project.models[function.file.raw()].declarations[function.index];
+    if (record.kind != .function) return false;
+    const written = &c.project.files[function.file.raw()].tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
+    // The declaration's node is its prototype, or the whole declaration; its body is the latter's.
+    const whole = if (written.nodeTag(record.node) == .fn_decl) record.node else c.project.models[function.file.raw()].node_parents[@backingInt(record.node)] orelse return false; // safe: an AST node index reads its own parent table
+    if (written.nodeTag(whole) != .fn_decl) return false;
+    var params: [32]Ast.TokenIndex = undefined;
+    var count: usize = 0;
+    var it = proto.iterate(written);
+    while (it.next()) |param| {
+        if (count == params.len) return false;
+        params[count] = param.name_token orelse return false;
+        count += 1;
+    }
+    // A method called on a value takes the value as its first parameter.
+    const skip: usize = if (count == call.ast.params.len + 1) 1 else if (count == call.ast.params.len) 0 else return false;
+    const loan: Loan = .{ .c = c, .file = function.file, .tree = written, .model = &c.project.models[function.file.raw()], .token = params[position + skip], .depth = depth + 1 };
+    const body = written.nodeData(whole).node_and_node[1];
+    var block_buffer: [2]Ast.Node.Index = undefined;
+    const statements = written.blockStatements(&block_buffer, body) orelse return false;
+    return switch (try loan.walk(statements, .live)) {
+        .falls => |state| state == .live,
+        .ends => true,
+        .fails => false,
+    };
+}
+
+/// A function that borrows a guard through its parameter `token`: whether every path hands it
+/// back held. The guard starts held; `p.deinit(...)` releases it and `p.* = x.acquire...(...)`
+/// holds it again; a return, a `try` or the end while released fails, as does any use while
+/// released, a deferred release, or a use but its members or a loan on. A loop's body must
+/// leave it as it found it held; a `break` or `continue` while released fails.
+const Loan = struct {
+    c: *Context,
+    file: Project.FileId,
+    tree: *const Ast,
+    model: *const Model,
+    token: Ast.TokenIndex,
+    depth: u8,
+
+    const State = enum { live, released };
+    const Outcome = union(enum) { falls: State, ends, fails };
+
+    fn walk(l: Loan, statements: []const Ast.Node.Index, start: State) Context.Error!Outcome {
+        var state = start;
+        for (statements) |stmt| {
+            const tag = l.tree.nodeTag(stmt);
+            if (state == .released) {
+                if (try l.reacquired(stmt)) {
+                    state = .live;
+                    continue;
+                }
+                if (try l.uses(stmt) != .none or exits(l.tree, l.model, stmt)) return .fails;
+                continue;
+            }
+            if (tag == .@"defer" or tag == .@"errdefer") {
+                if (try l.uses(l.tree.nodeData(stmt).node) != .none) return .fails;
+                continue;
+            }
+            if (l.releases(stmt)) {
+                state = .released;
+                continue;
+            }
+            if (l.tree.fullIf(stmt)) |branch| {
+                if (try l.uses(branch.ast.cond_expr) == .other or exits(l.tree, l.model, branch.ast.cond_expr)) return .fails;
+                const then_outcome = try l.walkBranch(branch.ast.then_expr);
+                const else_outcome: Outcome = if (branch.ast.else_expr.unwrap()) |other| try l.walkBranch(other) else .{ .falls = .live };
+                switch (join(then_outcome, else_outcome)) {
+                    .falls => |next| state = next,
+                    .ends => return .ends,
+                    .fails => return .fails,
+                }
+                continue;
+            }
+            if (l.tree.fullWhile(stmt)) |loop| {
+                if (try l.uses(loop.ast.cond_expr) == .other) return .fails;
+                if (loop.ast.cont_expr.unwrap()) |cont| if (try l.uses(cont) == .other) return .fails;
+                if (try l.loopBody(loop.ast.then_expr) == .fails) return .fails;
+                if (loop.ast.else_expr.unwrap()) |other| if (try l.uses(other) == .other) return .fails;
+                continue;
+            }
+            if (l.tree.fullFor(stmt)) |loop| {
+                for (loop.ast.inputs) |input| if (try l.uses(input) == .other) return .fails;
+                if (try l.loopBody(loop.ast.then_expr) == .fails) return .fails;
+                if (loop.ast.else_expr.unwrap()) |other| if (try l.uses(other) == .other) return .fails;
+                continue;
+            }
+            // Held, it may be read, lent, returned with or left by an exit.
+            if (try l.uses(stmt) == .other) return .fails;
+        }
+        return .{ .falls = state };
+    }
+
+    fn walkBranch(l: Loan, node: Ast.Node.Index) Context.Error!Outcome {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = l.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
+        const outcome = try l.walk(statements, .live);
+        if (outcome == .falls and outcome.falls == .released and statements.len != 0 and endsInExit(l.tree, statements[statements.len - 1])) return .fails;
+        if (outcome == .falls and outcome.falls == .live and statements.len != 0 and endsInExit(l.tree, statements[statements.len - 1])) return .ends;
+        return outcome;
+    }
+
+    /// A loop's body: held when it starts, it must be held when it ends or loops again.
+    fn loopBody(l: Loan, node: Ast.Node.Index) Context.Error!Outcome {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = l.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
+        return switch (try l.walk(statements, .live)) {
+            .falls => |state| if (state == .live) .{ .falls = .live } else .fails,
+            .ends => .{ .falls = .live },
+            .fails => .fails,
+        };
+    }
+
+    fn join(a: Outcome, b: Outcome) Outcome {
+        if (a == .fails or b == .fails) return .fails;
+        if (a == .ends) return b;
+        if (b == .ends) return a;
+        return if (a.falls == b.falls) a else .fails;
+    }
+
+    fn mine(l: Loan, node: Ast.Node.Index) bool {
+        if (l.tree.nodeTag(node) != .identifier) return false;
+        const ref = l.model.reference(node) orelse return false;
+        const index = ref.declaration orelse return false;
+        return l.model.declarations[index].token == l.token;
+    }
+
+    /// `p.deinit(...)`.
+    fn releases(l: Loan, stmt: Ast.Node.Index) bool {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = l.tree.fullCall(&buffer, stmt) orelse return false;
+        if (l.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+        const data = l.tree.nodeData(call.ast.fn_expr).node_and_token;
+        return l.mine(data[0]) and std.mem.eql(u8, l.tree.tokenSlice(data[1]), "deinit");
+    }
+
+    /// `p.* = x.acquire...(...)`.
+    fn reacquired(l: Loan, stmt: Ast.Node.Index) Context.Error!bool {
+        if (l.tree.nodeTag(stmt) != .assign) return false;
+        const data = l.tree.nodeData(stmt).node_and_node;
+        if (l.tree.nodeTag(data[0]) != .deref or !l.mine(l.tree.nodeData(data[0]).node)) return false;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const value = if (l.tree.nodeTag(data[1]) == .@"try") l.tree.nodeData(data[1]).node else data[1];
+        const call = l.tree.fullCall(&call_buffer, value) orelse return false;
+        if (l.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+        return Contract.acquisition(try Model.identifier(l.c.allocator, l.tree.tokenSlice(l.tree.nodeData(call.ast.fn_expr).node_and_token[1])));
+    }
+
+    const Use = enum { none, members, other };
+    /// How `node` uses the borrowed guard: not at all, through its members or by lending it on
+    /// (a nested `deinit` is other), or otherwise.
+    fn uses(l: Loan, node: Ast.Node.Index) Context.Error!Use {
+        const first = l.tree.firstToken(node);
+        const last = l.tree.lastToken(node);
+        var found: Use = .none;
+        for (l.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = l.tree.nodeMainToken(candidate);
+            if (main < first or main > last or !l.mine(candidate)) continue;
+            const parent = l.model.node_parents[i] orelse return .other;
+            if (l.tree.nodeTag(parent) == .field_access and l.tree.nodeData(parent).node_and_token[0] == candidate) {
+                if (std.mem.eql(u8, l.tree.tokenSlice(l.tree.nodeData(parent).node_and_token[1]), "deinit")) return .other;
+                found = .members;
+                continue;
+            }
+            if (try lent(l.c, l.file, candidate, l.depth)) {
+                found = .members;
+                continue;
+            }
+            return .other;
+        }
+        return found;
+    }
+};
+
+/// Whether `node` can leave the block it is in: a `return`, a `try`, or a `break` or `continue`
+/// that is labeled or not inside a loop within `node`.
+fn exits(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (first..last + 1) |raw_token| {
+        const token: Ast.TokenIndex = @intCast(raw_token); // safe: bounded by the node's own token range.
+        switch (tree.tokenTag(token)) {
+            .keyword_return, .keyword_try => return true,
+            .keyword_break, .keyword_continue => {
+                if (tree.tokenTag(token + 1) == .colon) return true;
+                if (!insideLoop(tree, model, token, node)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn insideLoop(tree: *const Ast, model: *const Model, token: Ast.TokenIndex, root: Ast.Node.Index) bool {
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break" and tag != .@"continue") continue;
+        if (tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue; // safe: AST node table supplies bounded indexes.
+        var at = model.node_parents[i];
+        while (at) |parent| : (at = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+            if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return true;
+            if (parent == root) return false;
+        }
+        return false;
+    }
+    return false;
+}
 
 fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {
     return switch (tree.nodeTag(stmt)) {

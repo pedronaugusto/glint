@@ -293,6 +293,11 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
             return .{ .unknown = .unsupported };
         },
+        .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
+            const value = tree.fullArrayInit(&buffer, node).?;
+            if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
+            return .{ .unknown = .unsupported };
+        },
         .address_of => return .{ .pointer = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         .deref => return self.pointee(try self.resolve(file, tree.nodeData(node).node), {}),
         .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),

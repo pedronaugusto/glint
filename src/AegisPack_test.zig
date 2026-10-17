@@ -567,6 +567,9 @@ test "receivers bound by captures are decided by what they bind" {
     // A `for` capture is its slice's element; a range's is a number.
     try expectJudged(head ++ "pub fn f(items: []Plain) void { for (items, 0..) |item, i| { _ = item.data; _ = i; } }", pack.access, true, 0);
     try expectJudged(head ++ "pub fn f(items: []G(u32)) void { for (items) |*item| _ = item.data; }", pack.access, true, 1);
+    // An array written in place, its element type named: a capture is that type.
+    try expectJudged(head ++ "pub fn f() void { const Case = struct { state: u8, data: u8 }; for ([_]Case{ .{ .state = 0, .data = 1 } }) |case| { _ = case.state; _ = case.data; } }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(a: G(u32), b: G(u32)) void { for ([_]G(u32){ a, b }) |g| _ = g.data; }", pack.access, true, 1);
     // An `if` or `while` payload is its condition's optional or error-union payload.
     try expectJudged(head ++ "fn next() ?*Plain { return null; }\npub fn f() void { while (next()) |p| _ = p.lock; }", pack.access, true, 0);
     try expectJudged(head ++ "fn next() ?*G(u32) { return null; }\npub fn f() void { if (next()) |g| _ = g.lock; }", pack.access, true, 1);
@@ -612,7 +615,9 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     // A return while held, a hand-off of its address, a release nested where the walk does not
     // follow: undecided, never a claim.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) return; held.deinit(); }", pack.cleanup, false, 0);
-    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, false, 0);
+    // Lent to a function that hands it back held, it is still the caller's to release.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); while (ready()) held.deinit(); }", pack.cleanup, false, 0);
     // Branches that leave it in different states.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) held.deinit(); }", pack.cleanup, false, 0);
@@ -748,4 +753,36 @@ test "every guarded owner's backing state and guard are its contract's, whicheve
     try std.testing.expectEqual(@as(usize, 6), count(report, pack.access)); // safe: fixture counts are representable.
     // A guard acquired and never released.
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.cleanup)); // safe: fixture counts are representable.
+}
+
+test "a guard read in a condition before its release, and one lent to a condition's wait, are decided" {
+    const head = "const aegis = @import(\"aegis\");\n";
+    // Read in an `if`'s condition and through its capture, then released.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } held.deinit(io); }", pack.cleanup, true, 0);
+    // Acquired by `try`, its release deferred, lent to a wait that holds it again on return.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) c.wait(io, &held, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, true, 0);
+    // Lent anywhere else, its release may move: undecided.
+    try expectJudged(head ++ "fn keep(g: anytype) void { _ = g; }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
+    // A guard never released is still a finding when it was read in a condition.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } }", pack.cleanup, true, 1);
+}
+
+test "a guard lent to the program's own function is a borrow when every path hands it back held" {
+    const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\n";
+    const owner = "pub fn f(io: anytype, b: *B, c: *aegis.Condition) void { var held = b.acquireUncancelable(io); defer held.deinit(io); give(io, b, c, &held); }";
+    // Released and held again, a wait on the way, a loan on to another that does the same.
+    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { held.deinit(io); held.* = b.acquireUncancelable(io); again(io, b, c, held); }\nfn again(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { while (held.value().* == 0) { held.deinit(io); held.* = b.acquireUncancelable(io); c.wait(io, held, .none) catch return; } }\n" ++ owner, pack.cleanup, true, 0);
+    // A method of the program's own, through its receiver.
+    try expectJudged(head ++ "const S = struct { b: *B, fn give(s: *S, io: anytype, held: anytype) void { if (held.value().* == 0) return; held.deinit(io); held.* = s.b.acquireUncancelable(io); } };\npub fn f(io: anytype, s: *S) void { var held = s.b.acquireUncancelable(io); defer held.deinit(io); s.give(io, &held); }", pack.cleanup, true, 0);
+    // One path returns with it released: no loan, undecided.
+    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { _ = c; held.deinit(io); if (held == held) return; held.* = b.acquireUncancelable(io); }\n" ++ owner, pack.cleanup, false, 0);
+    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { _ = b; _ = c; held.deinit(io); }\n" ++ owner, pack.cleanup, false, 0);
+    // A release it defers is no loan.
+    try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { _ = b; _ = c; defer held.deinit(io); }\n" ++ owner, pack.cleanup, false, 0);
+}
+
+test "an acquisition whose failure is caught is checked as one by `try` is" {
+    const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\n";
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; defer held.deinit(io); _ = held.value(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; _ = held.value(); }", pack.cleanup, true, 1);
 }

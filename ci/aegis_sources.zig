@@ -20,6 +20,7 @@ const sources = [_]Source{
     .{ .name = "src/BlockingGuarded.zig", .bytes = @embedFile("aegis-blocking-guarded") },
     .{ .name = "src/RwGuarded.zig", .bytes = @embedFile("aegis-rw-guarded") },
     .{ .name = "src/SpinRwGuarded.zig", .bytes = @embedFile("aegis-spin-rw-guarded") },
+    .{ .name = "src/Condition.zig", .bytes = @embedFile("aegis-condition") },
 };
 const root = 1;
 const secret = 2;
@@ -34,9 +35,10 @@ const scalar = 10;
 const blocking_guarded = 11;
 const rw_guarded = 12;
 const spin_rw_guarded = 13;
+const condition = 14;
 
 /// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
-fn imports() [22]Project.Import {
+fn imports() [23]Project.Import {
     return .{
         .{ .from = file(root), .spelling = "secret.zig", .target = file(secret) },
         .{ .from = file(root), .spelling = "sync.zig", .target = file(sync) },
@@ -49,6 +51,7 @@ fn imports() [22]Project.Import {
         .{ .from = file(sync), .spelling = "BlockingGuarded.zig", .target = file(blocking_guarded) },
         .{ .from = file(sync), .spelling = "RwGuarded.zig", .target = file(rw_guarded) },
         .{ .from = file(sync), .spelling = "SpinRwGuarded.zig", .target = file(spin_rw_guarded) },
+        .{ .from = file(sync), .spelling = "Condition.zig", .target = file(condition) },
         .{ .from = file(int), .spelling = "scalar.zig", .target = file(scalar) },
         .{ .from = file(id), .spelling = "scalar.zig", .target = file(scalar) },
         .{ .from = file(id), .spelling = "units.zig", .target = file(units) },
