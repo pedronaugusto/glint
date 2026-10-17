@@ -4,6 +4,16 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- A003 follows an owner through loops: a `while` or `for` loop's body must bring the owner back to its start (its end and each `continue`) in the state it entered in, and the loop goes on in the state its ways out agree on (each `break`, its condition failing, its `else`); a loop that never ends otherwise (`while (true)`) ends the path, as a release a body defers runs at the end of each pass. A guard released and acquired again around a wait, and one returned from inside a loop, are decided this way (reactor's lanes and spare threads); ways out in different states, and a jump to an outer loop of the walk, stay undecided.
+- A003 reads an owner returned held (`return held`) as its caller's to release, and the caller's local as an acquisition: a call to a function of the program's own whose result is an owner (not a pointer to one) is checked as `acquire` and `init` are.
+
+### Fixed
+
+- A003 read an acquisition into a released guard (`held = b.acquireUncancelable(io)`) as one only when the operation was named `acquire`; every guard acquisition counts now.
+- A003 decides an `if` whatever the owner's state, its branches walked as the block's own: a second release in a branch after a deferred one is found, where it was left undecided.
+
 ## [0.2.12] - 2026-10-17
 
 ### Added

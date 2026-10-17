@@ -416,8 +416,9 @@ fn checkCleanup(c: *Context) Context.Error!void {
         if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) continue;
         const v = tree.fullVarDecl(decl.node) orelse continue;
         const init = v.ast.init_node.unwrap() orelse continue;
-        // Only actual acquisition expressions, never an owner alias or type alias. One that
-        // fails holds nothing: `try` and `catch` leave the acquisition itself.
+        // Only actual acquisition expressions, never an owner alias or type alias: an owner's
+        // constructor, a guard's acquisition, or a function of the program's own that returns
+        // an owner. One that fails holds nothing: `try` and `catch` leave the acquisition itself.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const acquisition = switch (tree.nodeTag(init)) {
             .@"try" => tree.nodeData(init).node,
@@ -425,9 +426,11 @@ fn checkCleanup(c: *Context) Context.Error!void {
             else => init,
         };
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
-        if (tree.nodeTag(acquired.ast.fn_expr) != .field_access) continue;
-        const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
-        if (!std.mem.eql(u8, operation, "init") and !std.mem.eql(u8, operation, "adopt") and !Contract.acquisition(operation)) continue;
+        const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
+            const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
+            break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
+        };
+        if (!named and !try givesOwner(c, acquisition, acquired.ast.fn_expr)) continue;
         const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (k != .secret and k != .bytes and k != .guard) continue;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -435,35 +438,66 @@ fn checkCleanup(c: *Context) Context.Error!void {
         const at = for (statements, 0..) |stmt, i| {
             if (stmt == decl.node) break i + 1;
         } else continue;
-        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token };
+        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .scope = model.scopes[decl.scope].node };
         switch (try flow.walk(statements[at..], .live)) {
-            .falls => |state| if (state == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
-            .ends => {},
+            .paths => |paths| if (paths.falls == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
             .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
 }
 
+/// Whether `call` is to a function of the program's own whose result is an owner itself, not a
+/// pointer to one: the owner it returns held is the caller's to release (Flow's `return`).
+fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context.Error!bool {
+    const decl = (try c.facts.definition(c.file, callee)) orelse return false;
+    const function = (try c.facts.origin(decl)) orelse return false;
+    if (try c.inLibrary(Contract.library, function.file)) return false;
+    if (c.project.models[function.file.raw()].declarations[function.index].kind != .function) return false;
+    const result = switch (try c.facts.resolve(c.file, call)) {
+        .error_union => |payload| payload.*,
+        else => |value| value,
+    };
+    return result == .instance;
+}
+
 /// The paths of a block after a local acquisition, statement by statement. The owner is live
-/// until a direct `deinit` releases it, a `defer` schedules one, or a guard's `handOff` gives
-/// its release to the code the hand-off is passed to (a declared transfer); an `if` is followed into
-/// its branches. Undecided: an exit (`return`, `try`, a `break` or `continue` that leaves the
-/// block) while live, an `if` whose branches leave the owner in different states, any use of
-/// the owner but its members or a loan (its address, a copy, an argument: a transfer or an
-/// alias), a
-/// release nested where the walk does not follow, a use after release. Findings: a second
-/// direct cleanup, the owner's address discarded after release.
+/// until a direct `deinit` releases it, a `defer` schedules one, a guard's `handOff` gives its
+/// release to the code the hand-off is passed to (a declared transfer), or a `return` gives the
+/// owner itself to the caller. An `if` is followed into its branches and a loop into its body:
+/// the body must leave the owner at its back edge as it found it, and the loop goes on in the
+/// state its exits (its `break`s, and its condition when it can fail) agree on; a loop that
+/// never exits ends the path. A release a branch or a body defers runs as it ends. Undecided:
+/// an exit (`return`, `try`, a `break` or `continue` that leaves the walk) while live, paths
+/// that meet in different states, a jump to a loop or block of the walk other than the loop it
+/// is in, any use of the owner but its members or a loan (its address, a copy, an argument: a
+/// transfer or an alias), a release nested where the walk does not follow, a use after
+/// release. Findings: a second direct cleanup, the owner's address discarded after release.
 const Flow = struct {
     c: *Context,
     tree: *const Ast,
     model: *const Model,
     token: Ast.TokenIndex,
+    /// The block the owner is declared in.
+    scope: Ast.Node.Index,
+    /// The innermost loop the walk is in, whose `break`s and `continue`s it follows.
+    loop: ?Ast.Node.Index = null,
 
     const State = enum { live, released, deferred };
-    const Outcome = union(enum) { falls: State, ends, uncertain };
+    const States = std.EnumSet(State);
+    /// The ways on from a run of statements, by the state each leaves the owner in: past its
+    /// end, out of the walk's loop, and back to that loop's start. None: every path ends (a
+    /// return, or a way out of the walk while the owner is released or its release deferred).
+    const Paths = struct {
+        falls: ?State = null,
+        breaks: States = .empty,
+        continues: States = .empty,
+    };
+    const Outcome = union(enum) { paths: Paths, uncertain };
+    const ends: Outcome = .{ .paths = .{} };
 
     fn walk(f: Flow, statements: []const Ast.Node.Index, start: State) Context.Error!Outcome {
         var state = start;
+        var out: Paths = .{};
         for (statements) |stmt| {
             if (try f.handedOff(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
@@ -482,51 +516,243 @@ const Flow = struct {
                 if (state == .released) try f.c.at(cleanup, f.tree.nodeMainToken(f.tree.nodeData(f.tree.nodeData(stmt).node_and_node[1]).node), "same local owner used after cleanup on this straight-line path");
                 continue;
             }
-            if (state == .released) {
-                if (try f.reacquired(stmt)) {
-                    state = .live;
-                    continue;
-                }
-                if (try f.uses(stmt) != .none) return .uncertain;
+            if (state == .released and try f.reacquired(stmt)) {
+                state = .live;
                 continue;
             }
-            if (state == .live) if (f.tree.fullIf(stmt)) |branch| {
-                const then_outcome = try f.walkBranch(branch.ast.then_expr);
-                const else_outcome: Outcome = if (branch.ast.else_expr.unwrap()) |other| try f.walkBranch(other) else .{ .falls = .live };
-                if (try f.uses(branch.ast.cond_expr) == .other or exits(f.tree, f.model, branch.ast.cond_expr)) return .uncertain;
-                switch (try join(then_outcome, else_outcome)) {
-                    .falls => |next| state = next,
-                    .ends => return .ends,
-                    .uncertain => return .uncertain,
-                }
-                continue;
+            const next = switch (try f.step(stmt, state)) {
+                .paths => |paths| paths,
+                .uncertain => return .uncertain,
             };
-            // Deferred, the release runs on every exit; live, an exit would skip it.
-            switch (try f.uses(stmt)) {
-                .none, .members => {},
-                .other => return .uncertain,
-            }
-            if (state == .live and exits(f.tree, f.model, stmt)) return .uncertain;
+            out.breaks.setUnion(next.breaks);
+            out.continues.setUnion(next.continues);
+            state = next.falls orelse return .{ .paths = out };
         }
-        return .{ .falls = state };
+        out.falls = state;
+        return .{ .paths = out };
     }
 
-    fn walkBranch(f: Flow, node: Ast.Node.Index) Context.Error!Outcome {
+    /// A statement that neither releases nor acquires the owner again, from `state`.
+    fn step(f: Flow, stmt: Ast.Node.Index, state: State) Context.Error!Outcome {
+        switch (f.tree.nodeTag(stmt)) {
+            .@"return" => if (state == .live) if (f.tree.nodeData(stmt).opt_node.unwrap()) |value| {
+                // The owner itself, returned held: its release is the caller's.
+                if (f.mine(value)) return ends;
+            },
+            .unreachable_literal => return ends,
+            else => {},
+        }
+        if (f.tree.fullIf(stmt)) |branch| {
+            var out = switch (try f.leave(branch.ast.cond_expr, state)) {
+                .paths => |paths| paths,
+                .uncertain => return .uncertain,
+            };
+            const then_paths = switch (try f.block(branch.ast.then_expr, state)) {
+                .paths => |paths| paths,
+                .uncertain => return .uncertain,
+            };
+            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| switch (try f.block(other, state)) {
+                .paths => |paths| paths,
+                .uncertain => return .uncertain,
+            } else .{ .falls = state };
+            out.falls = meet(then_paths.falls, else_paths.falls) catch return .uncertain;
+            for ([_]Paths{ then_paths, else_paths }) |paths| {
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+            }
+            return .{ .paths = out };
+        }
+        if (f.tree.fullWhile(stmt) != null or f.tree.fullFor(stmt) != null) return f.repeat(stmt, state);
+        return f.leave(stmt, state);
+    }
+
+    /// A branch or a loop's body walked from `state`; a release it defers runs on every way
+    /// out of it.
+    fn block(f: Flow, node: Ast.Node.Index, state: State) Context.Error!Outcome {
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
-        var outcome = try f.walk(statements, .live);
-        // A cleanup a branch defers runs as the branch ends.
-        if (outcome == .falls and outcome.falls == .deferred) outcome = .{ .falls = .released };
-        // A branch that ends in an exit after releasing ends there.
-        if (outcome == .falls and outcome.falls != .live and statements.len != 0 and endsInExit(f.tree, statements[statements.len - 1])) return .ends;
+        var outcome = try f.walk(statements, state);
+        if (state == .deferred or outcome == .uncertain) return outcome;
+        const paths = &outcome.paths;
+        if (paths.falls == .deferred) paths.falls = .released;
+        for ([_]*States{ &paths.breaks, &paths.continues }) |set| if (set.contains(.deferred)) {
+            set.remove(.deferred);
+            set.insert(.released);
+        };
         return outcome;
     }
 
-    fn join(a: Outcome, b: Outcome) Context.Error!Outcome {
-        if (a == .uncertain or b == .uncertain) return .uncertain;
-        if (a == .ends) return b;
-        if (b == .ends) return a;
-        return if (a.falls == b.falls) a else .uncertain;
+    /// A `while` or `for` loop from `state`: its body must come back to its start in `state`,
+    /// and its ways out (its `break`s, its condition failing, its `else`) agree on where it goes on.
+    fn repeat(f: Flow, stmt: Ast.Node.Index, state: State) Context.Error!Outcome {
+        var inner = f;
+        inner.loop = stmt;
+        var heads: [2]Ast.Node.Index = undefined;
+        var head_count: usize = 0;
+        var body: Ast.Node.Index = undefined;
+        var otherwise: ?Ast.Node.Index = null;
+        var bounded = true;
+        var inputs: []const Ast.Node.Index = &.{};
+        if (f.tree.fullWhile(stmt)) |loop| {
+            heads[0] = loop.ast.cond_expr;
+            head_count = 1;
+            if (loop.ast.cont_expr.unwrap()) |cont| {
+                heads[1] = cont;
+                head_count = 2;
+            }
+            body = loop.ast.then_expr;
+            otherwise = loop.ast.else_expr.unwrap();
+            const cond = loop.ast.cond_expr;
+            bounded = loop.payload_token != null or f.tree.nodeTag(cond) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(cond)), "true");
+        } else {
+            const loop = f.tree.fullFor(stmt).?;
+            inputs = loop.ast.inputs;
+            body = loop.ast.then_expr;
+            otherwise = loop.ast.else_expr.unwrap();
+        }
+        var out: Paths = .{};
+        for (heads[0..head_count]) |head| switch (try f.leave(head, state)) {
+            .paths => |paths| {
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+            },
+            .uncertain => return .uncertain,
+        };
+        for (inputs) |input| switch (try f.leave(input, state)) {
+            .paths => |paths| {
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+            },
+            .uncertain => return .uncertain,
+        };
+        const looped = switch (try inner.block(body, state)) {
+            .paths => |paths| paths,
+            .uncertain => return .uncertain,
+        };
+        if (looped.falls) |back| if (back != state) return .uncertain;
+        if (!looped.continues.subsetOf(.initOne(state))) return .uncertain;
+        var ways = looped.breaks;
+        if (bounded) {
+            if (otherwise) |node| switch (try f.block(node, state)) {
+                .paths => |paths| {
+                    if (paths.falls) |next| ways.insert(next);
+                    out.breaks.setUnion(paths.breaks);
+                    out.continues.setUnion(paths.continues);
+                },
+                .uncertain => return .uncertain,
+            } else ways.insert(state);
+        }
+        var it = ways.iterator();
+        out.falls = it.next();
+        if (it.next() != null) return .uncertain;
+        return .{ .paths = out };
+    }
+
+    fn meet(a: ?State, b: ?State) error{Differ}!?State {
+        const x = a orelse return b;
+        const y = b orelse return a;
+        return if (x == y) x else error.Differ;
+    }
+
+    /// A statement or expression the walk does not enter, from `state`: how it uses the
+    /// owner, then where it can jump. A `break` or `continue` of the walk's loop goes there; a
+    /// `return`, a `try` or a jump out of the walk ends its path unless the owner is live; a
+    /// jump to another loop or block of the walk is not followed.
+    fn leave(f: Flow, node: Ast.Node.Index, state: State) Context.Error!Outcome {
+        switch (try f.uses(node)) {
+            .none => {},
+            .members => if (state == .released) return .uncertain,
+            .other => return .uncertain,
+        }
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        var out: Paths = .{ .falls = state };
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            switch (tag) {
+                .@"return", .@"try", .@"break", .@"continue" => {},
+                else => continue,
+            }
+            const jumping: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = f.tree.nodeMainToken(jumping);
+            if (main < first or main > last) continue;
+            const to: Jump = if (tag == .@"return" or tag == .@"try") .out else f.target(jumping, node);
+            switch (to) {
+                .inside => {},
+                .loop_break => out.breaks.insert(state),
+                .loop_continue => out.continues.insert(state),
+                .out => if (state == .live) return .uncertain,
+                .other => return .uncertain,
+            }
+        }
+        switch (f.tree.nodeTag(node)) {
+            .@"return", .@"break", .@"continue" => out.falls = null,
+            else => {},
+        }
+        return .{ .paths = out };
+    }
+
+    const Jump = enum { inside, loop_break, loop_continue, out, other };
+    /// Where `jumping`, a `break` or `continue` within `root`, goes: to a target within `root`,
+    /// out of or back to the walk's loop, out of the walk, or to another loop or block of it.
+    fn target(f: Flow, jumping: Ast.Node.Index, root: Ast.Node.Index) Jump {
+        const token = f.tree.nodeMainToken(jumping);
+        const label: ?[]const u8 = if (f.tree.tokenTag(token + 1) == .colon) f.tree.tokenSlice(token + 2) else null;
+        const again = f.tree.nodeTag(jumping) == .@"continue";
+        var passed = jumping == root;
+        var child = jumping;
+        var at = f.model.node_parents[@backingInt(jumping)]; // safe: an AST node index reads its own parent table
+        while (at) |parent| : ({
+            child = parent;
+            at = f.model.node_parents[@backingInt(parent)]; // safe: an AST node index reads its own parent table
+        }) {
+            if (f.targets(parent, child, label, again)) {
+                if (!passed) return .inside;
+                if (f.loop == parent) return if (again) .loop_continue else .loop_break;
+                return if (f.within(parent)) .other else .out;
+            }
+            if (parent == root) passed = true;
+        }
+        return .out;
+    }
+
+    /// Whether a jump from `child` with `label` lands at `node`: an unlabeled one at the loop
+    /// whose body or continue expression it is in, a labeled one at the loop, block or switch
+    /// of that label.
+    fn targets(f: Flow, node: Ast.Node.Index, child: Ast.Node.Index, label: ?[]const u8, again: bool) bool {
+        if (f.tree.fullWhile(node)) |loop| {
+            const name = label orelse return child == loop.ast.then_expr or child == loop.ast.cont_expr.unwrap();
+            return if (loop.label_token) |t| std.mem.eql(u8, f.tree.tokenSlice(t), name) else false;
+        }
+        if (f.tree.fullFor(node)) |loop| {
+            const name = label orelse return child == loop.ast.then_expr;
+            return if (loop.label_token) |t| std.mem.eql(u8, f.tree.tokenSlice(t), name) else false;
+        }
+        const name = label orelse return false;
+        if (f.tree.fullSwitch(node)) |s| return if (s.label_token) |t| std.mem.eql(u8, f.tree.tokenSlice(t), name) else false;
+        if (again) return false;
+        switch (f.tree.nodeTag(node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                const brace = f.tree.nodeMainToken(node);
+                return brace >= 2 and f.tree.tokenTag(brace - 1) == .colon and f.tree.tokenTag(brace - 2) == .identifier and std.mem.eql(u8, f.tree.tokenSlice(brace - 2), name);
+            },
+            else => return false,
+        }
+    }
+
+    /// Whether `node` is inside the block the owner is declared in.
+    fn within(f: Flow, node: Ast.Node.Index) bool {
+        var at = f.model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
+        while (at) |parent| : (at = f.model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+            if (parent == f.scope) return true;
+        }
+        return false;
+    }
+
+    fn mine(f: Flow, node: Ast.Node.Index) bool {
+        if (f.tree.nodeTag(node) != .identifier) return false;
+        const ref = f.model.reference(node) orelse return false;
+        const index = ref.declaration orelse return false;
+        return f.model.declarations[index].token == f.token;
     }
 
     const Use = enum { none, members, other };
@@ -557,7 +783,7 @@ const Flow = struct {
         return found;
     }
 
-    /// `owner = x.init(...)`, `x.adopt(...)` or `x.acquire()`: live again.
+    /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again.
     fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         if (f.tree.nodeTag(stmt) != .assign) return false;
         const data = f.tree.nodeData(stmt).node_and_node;
@@ -568,7 +794,7 @@ const Flow = struct {
         const call = f.tree.fullCall(&call_buffer, value) orelse return false;
         if (f.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
         const operation = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(call.ast.fn_expr).node_and_token[1]));
-        return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or std.mem.eql(u8, operation, "acquire");
+        return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
     }
 
     /// `owner.handOff()` kept in a local or assigned: the guard's release passes to the code

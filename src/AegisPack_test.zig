@@ -625,6 +625,35 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); held = g.acquire(); held.deinit(); }", pack.cleanup, true, 0);
 }
 
+test "a guard through a loop is decided by the states its back edge and its exits agree on" {
+    const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\nfn ready() bool { return true; }\nfn wait() void {}\n";
+    // Released and acquired again around a wait, left released by a return: a spare's wait.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) u32 { var held = b.acquireUncancelable(io); const value = held.value(); while (true) { if (value.* != 0) { const v = value.*; held.deinit(io); return v; } else {} held.deinit(io); wait(); held = b.acquireUncancelable(io); } }", pack.cleanup, true, 0);
+    // Returned held from inside a loop that never ends otherwise: the caller's to release.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) B.Guard { var held = b.acquireUncancelable(io); if (!ready()) return held; _ = held.value(); while (true) { if (ready()) return held; wait(); } }", pack.cleanup, true, 0);
+    // Its caller holds what it returns: released, or a finding.
+    const give = "fn give(io: anytype, b: *B) B.Guard { var held = b.acquireUncancelable(io); _ = held.value(); return held; }\n";
+    try expectJudged(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); defer held.deinit(io); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); _ = held.value(); }", pack.cleanup, true, 1);
+    try expectJudged("const S = @import(\"aegis\").Secret;\nfn make() !S(u32) { return S(u32).init(1); }\npub fn f() !void { var s = try make(); _ = s.expose(); }", pack.cleanup, true, 1);
+    // A pointer to an owner is no owner of the caller's.
+    try expectJudged(head ++ "fn at(held: *B.Guard) *B.Guard { return held; }\npub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); defer held.deinit(io); const p = at(&held); _ = p; }", pack.cleanup, false, 0);
+    // Released inside, left by `break`, released again after: decided, and a second release a witness.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (ready()) { held.deinit(io); if (ready()) break; held = b.acquireUncancelable(io); } else held.deinit(io); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) { held.deinit(io); break; } } held.deinit(io); }", pack.cleanup, true, 1);
+    // Every way out of the loop held, and no release after it: a finding.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) break; _ = held.value(); wait(); } }", pack.cleanup, true, 1);
+    // Ways out in different states, or a body that comes back released: undecided.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (ready()) { if (ready()) { held.deinit(io); break; } } held.deinit(io); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); for (0..2) |_| { held.deinit(io); continue; } }", pack.cleanup, false, 0);
+    // A release the body defers runs as each pass ends.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { while (ready()) { var held = b.acquireUncancelable(io); defer held.deinit(io); if (ready()) continue; } }", pack.cleanup, true, 0);
+    // A jump to an outer loop of the walk is not followed.
+    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); outer: while (ready()) { while (ready()) { if (ready()) continue :outer; } } held.deinit(io); }", pack.cleanup, false, 0);
+    // A `break` of the walk's loop inside an expression is one of its ways out.
+    try expectJudged(head ++ "fn next() ?u32 { return null; }\npub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); defer held.deinit(io); while (true) { const n = next() orelse break; _ = n; } }", pack.cleanup, true, 0);
+}
+
 test "a guard's release handed off is a declared transfer" {
     const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn park(_: anytype) void {}\n";
     // Handed to a callback's context: decided, as a futex wait parks its task.
