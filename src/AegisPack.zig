@@ -303,7 +303,8 @@ fn checkCleanup(c: *Context) Context.Error!void {
 }
 
 /// The paths of a block after a local acquisition, statement by statement. The owner is live
-/// until a direct `deinit` releases it or a `defer` schedules one; an `if` is followed into
+/// until a direct `deinit` releases it, a `defer` schedules one, or a guard's `handOff` gives
+/// its release to the code the hand-off is passed to (a declared transfer); an `if` is followed into
 /// its branches. Undecided: an exit (`return`, `try`, a `break` or `continue` that leaves the
 /// block) while live, an `if` whose branches leave the owner in different states, any use of
 /// the owner but its members or a loan (its address, a copy, an argument: a transfer or an
@@ -322,6 +323,11 @@ const Flow = struct {
     fn walk(f: Flow, statements: []const Ast.Node.Index, start: State) Context.Error!Outcome {
         var state = start;
         for (statements) |stmt| {
+            if (try f.handedOff(stmt)) {
+                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
+                state = .released;
+                continue;
+            }
             const tag = f.tree.nodeTag(stmt);
             const deferred = tag == .@"defer" and try release(f.c, f.tree.nodeData(stmt).node, f.token);
             if (deferred or try release(f.c, stmt, f.token)) {
@@ -421,6 +427,23 @@ const Flow = struct {
         if (f.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
         const operation = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(call.ast.fn_expr).node_and_token[1]));
         return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or std.mem.eql(u8, operation, "acquire");
+    }
+
+    /// `owner.handOff()` kept in a local or assigned: the guard's release passes to the code
+    /// the hand-off is given, a transfer declared where it happens, so the walk need not
+    /// follow it there. Discarded (`_ = owner.handOff()`), it releases nothing.
+    fn handedOff(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        const value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) blk: {
+            const data = f.tree.nodeData(stmt).node_and_node;
+            if (f.tree.nodeTag(data[0]) == .identifier and std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(data[0])), "_")) return false;
+            break :blk data[1];
+        } else return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = f.tree.fullCall(&buffer, value) orelse return false;
+        if (f.tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 0) return false;
+        const data = f.tree.nodeData(call.ast.fn_expr).node_and_token;
+        const index = Contract.local(f.c, data[0]) orelse return false;
+        return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
     }
 
     /// `_ = &owner;`

@@ -625,6 +625,19 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); held = g.acquire(); held.deinit(); }", pack.cleanup, true, 0);
 }
 
+test "a guard's release handed off is a declared transfer" {
+    const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn park(_: anytype) void {}\n";
+    // Handed to a callback's context: decided, as a futex wait parks its task.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) { held.deinit(); return; } held.value().* += 1; var handoff = held.handOff(); park(&handoff); if (ready()) return; }", pack.cleanup, true, 0);
+    // Handed off in one branch, released in the other.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff: G(u32).Handoff = undefined; if (ready()) { handoff = held.handOff(); park(&handoff); } else held.deinit(); }", pack.cleanup, true, 0);
+    // Released after the hand-off, or handed off after release: a witness each.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff = held.handOff(); park(&handoff); held.deinit(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); var handoff = held.handOff(); park(&handoff); }", pack.cleanup, true, 1);
+    // A hand-off thrown away hands nothing: the lock reaches the block's end held.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); _ = held.handOff(); }", pack.cleanup, true, 1);
+}
+
 test "receivers through elements, slices, joined arrays and generic results written around T are decided" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst S = @import(\"aegis\").Secret;\nconst Plain = struct { data: u32, lock: u32 };\nconst Event = union(enum) { data: struct { bytes: []const u8 }, other: void };\n";
     // An element of an array, of an optional's array, of a pointer to an array or of a slice.
