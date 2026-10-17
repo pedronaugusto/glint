@@ -690,8 +690,8 @@ test "copies of vectors, payloads, if expressions and labeled blocks of plain da
     try expectJudged(head ++ "pub fn f(v: @Vector(4, u8)) void { const w: @Vector(4, u16) = v; const copy = w; _ = copy; }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f(n: usize) ?usize { const o = size(n) orelse return null; var p = o; _ = &p; return p; }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f(n: usize) ?usize { var o = if (ready()) blk: { if (n == 0) break :blk 1; break :blk size(n) orelse return null; } else size(n + 1) orelse return null; const at = o; o += 1; return at; }", pack.copies, true, 0);
-    // A labeled block that breaks with an owner is no plain data: its copy is left undecided.
-    try expectJudged(head ++ "pub fn f() void { var s = blk: { break :blk S(u32).init(1); }; defer s.deinit(); const copy = s; _ = copy; }", pack.copies, false, 0);
+    // A labeled block that breaks with an owner gives that owner: its copy is found.
+    try expectJudged(head ++ "pub fn f() void { var s = blk: { break :blk S(u32).init(1); }; defer s.deinit(); const copy = s; _ = copy; }", pack.copies, true, 1);
 }
 
 test "generic parameters are what the project's own calls pass, when no consumer can call by name" {
@@ -879,4 +879,25 @@ test "a backing field's name on a receiver nothing resolves is decided by what t
     try expectJudged(head ++ "pub fn f(s: unknown.Span) bool { return !s.data; }", pack.access, false, 0);
     // A literal naming only fields an aegis type has: undecided.
     try expectJudged(head ++ "var proxy: unknown.Layer = .{ .state = 0 };\npub fn f() *anyopaque { return &proxy.state; }", pack.access, false, 0);
+}
+
+test "receivers through a list's items, an if or switch expression's capture and a labeled block's breaks are decided" {
+    const head = "const G = @import(\"aegis\").Guarded;\n";
+    // A list as std makes one: public, so no caller settles its element; its items a slice of
+    // the element whatever the alignment, which a check passes on as null by calling the
+    // function again.
+    const list = "pub const Alignment = enum(u8) { one = 1 };\npub fn Aligned(comptime T: type, comptime alignment: ?Alignment) type { if (alignment) |a| { if (@intFromEnum(a) == @alignOf(T)) return Aligned(T, null); } return struct { items: Slice = &.{}, pub const Slice = if (alignment) |a| ([]align(@intFromEnum(a)) T) else []T; }; }\npub fn List(comptime T: type) type { return Aligned(T, null); }\n";
+    try expectJudged(head ++ list ++ "const L = struct { mutex: u32 };\npub const H = struct { listeners: List(*L) = .{} };\npub fn f(h: *H) void { for (h.listeners.items) |l| _ = l.mutex; }", pack.access, true, 0);
+    try expectJudged(head ++ list ++ "const L = struct { guarded: G(u32) };\npub const H = struct { listeners: List(*L) = .{}, plain: Aligned(L, .one) = .{} };\npub fn f(h: *H) void { for (h.listeners.items) |l| _ = l.guarded.data; _ = h.plain.items[0].guarded.data; }", pack.access, true, 2);
+    // A function that calls itself again with another type is not read past that call.
+    try expectJudged(head ++ "pub fn Box(comptime T: type) type { if (@sizeOf(T) == 0) return Box(G(u32)); return struct { item: T }; }\nconst L = struct { mutex: u32 };\npub fn f(b: *Box(L)) void { _ = b.item.mutex; }", pack.access, false, 0);
+    // An `if` expression whose other branch does not return a value.
+    try expectJudged(head ++ "const T = struct { mutex: u32 };\nconst S = struct { table: ?T };\npub fn f(s: *S) void { const table = if (s.table) |*t| t else return; _ = table.mutex; }", pack.access, true, 0);
+    // A `switch` expression's capture, its other prongs leaving.
+    try expectJudged(head ++ "const Input = struct { state: u32 };\nconst Reply = union(enum) { input: Input, done: u32 };\nconst Server = struct { fn handle(_: *Server) !Reply { return .{ .done = 0 }; } };\nconst C = struct { server: *Server };\npub fn f(c: *C) !void { const reply = try c.server.handle(); const ir = switch (reply) { .input => |ir| ir, else => return }; _ = ir.state; }", pack.access, true, 0);
+    // A labeled block's value is what its breaks give; `null` among them makes it optional.
+    try expectJudged(head ++ "const Handler = struct { context: u32, fn read(h: Handler) !u32 { return h.context; } };\nconst R = struct { handler: Handler };\npub fn f(items: []*R) !void { const handler = found: { for (items) |r| if (r.handler.context == 0) break :found r.handler; break :found null; } orelse return; const got = try handler.read(); _ = got; }", pack.cleanup, true, 0);
+    // A call through a function pointer field returns what its function type says.
+    try expectJudged(head ++ "const Result = struct { mutex: u32 };\nconst Handler = struct { read: *const fn () error{Failed}!Result };\npub fn f(h: Handler) !void { var got = try h.read(); _ = &got; _ = got.mutex; }", pack.access, true, 0);
+    try expectJudged(head ++ "const T = struct { mutex: u32 };\npub fn f(t: *T, ok: bool) void { const maybe = if (ok) t else null; _ = maybe.?.mutex; }", pack.access, true, 0);
 }

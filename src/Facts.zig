@@ -210,6 +210,10 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
     const tag = tree.nodeTag(node);
     switch (tag) {
         .identifier, .test_decl => {
+            // A literal no aegis type is: `null`, and the booleans.
+            if (tag == .identifier) for ([_][]const u8{ "null", "true", "false" }) |literal| {
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), literal)) return .scalar;
+            };
             const ref = model.reference(node) orelse return .{ .unknown = .unresolved };
             if (ref.declaration) |decl| return self.declaration(.{ .file = file, .index = decl });
             const name = tree.tokenSlice(ref.token);
@@ -229,6 +233,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(file, node)) |value| return value,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
         // Operators no aegis type takes: Zig has no operator overloading, and every aegis value
         // is a struct or an enum. Their results are numbers or booleans.
@@ -286,6 +291,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
                 }
                 return result;
             }
+            if (try self.throughPointer(file, call.ast.fn_expr)) |value| return value;
             return self.callResult(callee, {});
         },
         .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma => {
@@ -530,7 +536,50 @@ fn substituted(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *
             if (child == .unknown) return child;
             return .{ .optional = try self.boxed(child) };
         },
-        .identifier => if (try self.argumentFor(file, node, made)) |argument| return argument,
+        .identifier => {
+            if (try self.argumentFor(file, node, made)) |argument| return argument;
+            // A constant the type function declares, such as a list's `Slice`, is what
+            // initialises it, read with the same arguments.
+            const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+            if (file.eql(made.function.file)) if (model.reference(node)) |ref| if (ref.declaration) |index| {
+                const record = model.declarations[index];
+                if (record.kind == .variable and self.inside(file, record.scope, self.scopeNode(made.function))) {
+                    const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
+                    if (variable.ast.type_node.unwrap()) |t| {
+                        const type_value = try self.substituted(file, t, made, depth + 1);
+                        if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return self.instance(type_value);
+                    }
+                    if (variable.ast.init_node.unwrap()) |init| return self.substituted(file, init, made, depth + 1);
+                }
+            };
+        },
+        .grouped_expression => return self.substituted(file, tree.nodeData(node).node_and_token[0], made, depth + 1),
+        .@"if", .@"switch", .switch_comma => {
+            var values: std.ArrayList(Value) = .empty;
+            var buffer: [2]Ast.Node.Index = undefined;
+            var arms: []const Ast.Node.Index = &.{};
+            if (tree.fullIf(node)) |whole| {
+                buffer = .{ whole.ast.then_expr, whole.ast.else_expr.unwrap() orelse return self.resolve(file, node) };
+                arms = &buffer;
+            }
+            var cases: std.ArrayList(Ast.Node.Index) = .empty;
+            if (tree.fullSwitch(node)) |whole| {
+                for (whole.ast.cases) |case| try cases.append(self.gpa, tree.fullSwitchCase(case).?.ast.target_expr);
+                arms = cases.items;
+            }
+            var nullable = false;
+            for (arms) |arm| {
+                if (never(tree, arm)) continue;
+                if (isNull(tree, arm)) {
+                    nullable = true;
+                    continue;
+                }
+                try values.append(self.gpa, try self.substituted(file, arm, made, depth + 1));
+            }
+            const chosen = try self.choose(values.items);
+            if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
+            return .{ .optional = try self.boxed(chosen) };
+        },
         else => {},
     }
     return self.resolve(file, node);
@@ -552,6 +601,9 @@ fn argumentFor(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
         if (param.name_token != parameter.token) continue;
+        // A parameter the function passes on changed when it calls itself again is not the
+        // call's argument on that path.
+        if (try self.passedOnChanged(made.function, position)) return .{ .unknown = .comptime_dependent };
         const call_tree = &self.project.files[made.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = call_tree.fullCall(&call_buffer, made.call) orelse return null;
@@ -560,6 +612,18 @@ fn argumentFor(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *
         return try self.resolve(made.file, call.ast.params[position]);
     }
     return null;
+}
+
+fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveError!bool {
+    const tree = &self.project.files[function.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const fn_node = self.scopeNode(function);
+    if (tree.nodeTag(fn_node) != .fn_decl) return false;
+    const body = tree.nodeData(fn_node).node_and_node[1];
+    var body_buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&body_buffer, body) orelse return false;
+    if (statements.len == 0) return false;
+    const changed = self.recursion(function, body, statements[statements.len - 1]) orelse return false;
+    return position < 64 and changed & (@as(u64, 1) << @intCast(position)) != 0; // safe: bounded by the check before it.
 }
 
 /// What calling `callee` returns: its declared result, or the container a type function makes.
@@ -633,32 +697,100 @@ fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
 }
 
 /// A `switch` or `if`-`else` expression: what its branches give, chosen as one. A branch
-/// that gives no value of its own (`@compileError`, `unreachable`, `undefined`) is left out.
+/// that gives no value of its own (`@compileError`, `unreachable`, `undefined`) or never
+/// completes (`return`, `break`, `continue`, `@panic`, `@trap`) is left out; a `null` one
+/// makes the others optional.
 fn branches(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var values: std.ArrayList(Value) = .empty;
+    var nullable = false;
     if (tree.fullSwitch(node)) |whole| {
         for (whole.ast.cases) |case| {
             const branch = tree.fullSwitchCase(case).?.ast.target_expr;
             if (never(tree, branch)) continue;
+            if (isNull(tree, branch)) {
+                nullable = true;
+                continue;
+            }
             try values.append(self.gpa, try self.resolve(file, branch));
         }
     } else if (tree.fullIf(node)) |whole| {
         const otherwise = whole.ast.else_expr.unwrap() orelse return null;
         for ([_]Ast.Node.Index{ whole.ast.then_expr, otherwise }) |branch| {
             if (never(tree, branch)) continue;
+            if (isNull(tree, branch)) {
+                nullable = true;
+                continue;
+            }
             try values.append(self.gpa, try self.resolve(file, branch));
         }
     } else return null;
-    return try self.choose(values.items);
+    const chosen = try self.choose(values.items);
+    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
+    return .{ .optional = try self.boxed(chosen) };
+}
+
+/// A labeled block: what its `break`s give it, chosen as one, as a `switch`'s branches are.
+fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const brace = tree.nodeMainToken(node);
+    if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return null;
+    // Zig refuses a label that shadows another, so the name finds this block's breaks.
+    const label = tree.tokenSlice(brace - 2);
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var values: std.ArrayList(Value) = .empty;
+    var nullable = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const at = tree.nodeMainToken(jump);
+        if (at < first or at > last) continue;
+        const data = tree.nodeData(jump).opt_token_and_opt_node;
+        const token = data[0].unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(token), label)) continue;
+        const operand = data[1].unwrap() orelse return null;
+        if (never(tree, operand)) continue;
+        if (isNull(tree, operand)) {
+            nullable = true;
+            continue;
+        }
+        try values.append(self.gpa, try self.resolve(file, operand));
+    }
+    const chosen = try self.choose(values.items);
+    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
+    return .{ .optional = try self.boxed(chosen) };
+}
+
+/// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
+/// the pointer's function type returns.
+fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) ResolveError!?Value {
+    const decl = (try self.definition(file, callee)) orelse return null;
+    const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    if (record.kind != .field) return null;
+    const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var declared = (tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    if (tree.fullPtrType(declared)) |ptr| declared = ptr.ast.child_type;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const signature = tree.fullFnProto(&buffer, declared) orelse return null;
+    const result = signature.ast.return_type.unwrap() orelse return null;
+    const value = try self.resolve(decl.file, result);
+    if (value == .unknown) return null;
+    return try self.valueOf(value);
+}
+
+fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null");
 }
 
 fn never(tree: *const Ast, node: Ast.Node.Index) bool {
     return switch (tree.nodeTag(node)) {
-        .unreachable_literal => true,
+        .unreachable_literal, .@"return", .@"break", .@"continue" => true,
         // `undefined` takes the type of the other branches.
         .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined"),
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@compileError"),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => for ([_][]const u8{ "@compileError", "@panic", "@trap" }) |name| {
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name)) break true;
+        } else false,
         else => false,
     };
 }
@@ -809,12 +941,11 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
     const statements = tree.blockStatements(&body_buffer, body) orelse return null;
     if (statements.len == 0 or tree.nodeTag(statements[statements.len - 1]) != .@"return") return null;
     const last = statements[statements.len - 1];
-    // Only the final statement may return. A `return` in the checks before it, in a branch or a
-    // nested block, could return something else. Those after it are inside the returned container,
-    // where only nested functions can contain one.
-    for (tree.firstToken(body)..tree.nodeMainToken(last)) |token| {
-        if (tree.tokenTag(@intCast(token)) == .keyword_return) return null; // safe: the body's token range lies inside the file's token table.
-    }
+    // Only the final statement may return something else: a `return` before it, in a check, a
+    // branch or a nested block, gives this function's own container only by calling it again
+    // (`Aligned(T, null)` for a list's natural alignment). Those after it are inside the
+    // returned container, where only nested functions can contain one.
+    _ = self.recursion(decl, body, last) orelse return null;
     const returned = tree.nodeData(last).opt_node.unwrap() orelse return null;
     var container_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&container_buffer, returned) == null) return null;
@@ -1117,6 +1248,44 @@ fn valueOf(self: *Facts, value: Value) ResolveError!Value {
         .optional => |inner| .{ .optional = try self.boxed(try self.valueOf(inner.*)) },
         else => self.instance(value),
     };
+}
+
+/// The parameters a type function passes on changed where a `return` before its final one
+/// (`body`'s `last` statement) calls it again: a bit per position whose argument is not that
+/// same parameter. Null when an earlier `return` gives anything but such a call.
+fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Node.Index) ?u64 {
+    const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&fn_buffer, model.declarations[decl.index].node) orelse return null;
+    var params: [64]Ast.TokenIndex = undefined;
+    var count: usize = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        if (count == params.len) return null;
+        params[count] = param.name_token orelse return null;
+        count += 1;
+    }
+    var changed: u64 = 0;
+    const first = tree.firstToken(body);
+    const end = tree.nodeMainToken(last);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const early: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const at = tree.nodeMainToken(early);
+        if (at < first or at >= end) continue;
+        const operand = tree.nodeData(early).opt_node.unwrap() orelse return null;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, operand) orelse return null;
+        if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
+        const callee = (model.reference(call.ast.fn_expr) orelse return null).declaration orelse return null;
+        if (callee != decl.index or call.ast.params.len != count) return null;
+        for (call.ast.params, 0..) |arg, position| {
+            const same_parameter = tree.nodeTag(arg) == .identifier and if (model.reference(arg)) |ref| if (ref.declaration) |index| model.declarations[index].token == params[position] else false else false;
+            if (!same_parameter) changed |= @as(u64, 1) << @intCast(position); // safe: at most 64 parameters, checked above.
+        }
+    }
+    return changed;
 }
 
 /// The operand of a function body's one `return`, its final statement.

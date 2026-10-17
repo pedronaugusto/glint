@@ -259,7 +259,8 @@ fn checkCopies(c: *Context) Context.Error!void {
             if (pointerShaped(try c.facts.resolve(c.file, init))) continue;
             const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
             if (k != .scalar) {
-                if (!try ownedValue(c, init, 0)) continue;
+                // An owner itself, resolved so or written so where it comes from.
+                if (try c.facts.resolve(c.file, init) != .instance and !try ownedValue(c, init, 0)) continue;
                 try c.at(copies, tree.nodeMainToken(node), "copy of a recognized live owner/capability requires explicit transfer; lifetime and publication are undecided");
             }
         }
