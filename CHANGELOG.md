@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-10-17
+
 ### Added
 
 - A003 follows an owner through loops: a `while` or `for` loop's body must bring the owner back to its start (its end and each `continue`) in the state it entered in, and the loop goes on in the state its ways out agree on (each `break`, its condition failing, its `else`); a loop that never ends otherwise (`while (true)`) ends the path, as a release a body defers runs at the end of each pass. A guard released and acquired again around a wait, and one returned from inside a loop, are decided this way (reactor's lanes and spare threads); ways out in different states, and a jump to an outer loop of the walk, stay undecided.
