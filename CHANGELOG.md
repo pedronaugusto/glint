@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-10-17
+
 ### Added
 
 - A003 reads a guard's `handOff()` (aegis's `Guarded(T).Guard.handOff`, kept in a local or assigned) as a declared transfer: the release passes to the code the hand-off is given, so the acquiring function is decided without following it there, as a release through a callback's erased context stayed undecided (reactor's futex park). A cleanup after the hand-off, a hand-off after cleanup, and a hand-off discarded with `_ =` are found.
