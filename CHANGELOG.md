@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-17
+
 ### Added
 
 - The aegis contract admits five private fields that waited (a staged payload's `payload`, a scope's `index`, a reference's `pointer`, a secondary map's `entries`, unparsed input's `value`) and covers `sync.Atomic` (`cell`; a copy is a second cell), the task contexts `Order(...).Context` and `InitContext` (a copy is a second context), `Order(...).Ordered` (`base`; its ordered acquisitions give guards released by `deinit`), and `id.Counter` as an issuer like `Domain` (a copy issues its ids twice). A runtime machine's `state` still waits (docs/design.md).
