@@ -6,7 +6,7 @@ const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Library = @import("Library.zig").Library;
 const Ast = std.zig.Ast;
-pub const Kind = enum { secret, bytes, guarded, guard, scalar, condition };
+pub const Kind = enum { secret, bytes, guarded, guard, scalar, condition, once, confined };
 
 /// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
 /// module root reaches it, so recognition survives any revision that keeps its public names and
@@ -32,6 +32,9 @@ const sync_members = [_]Lib.Member{
     .{ .path = "RwGuarded", .role = .guarded },
     .{ .path = "SpinRwGuarded", .role = .guarded },
     .{ .path = "Condition", .role = .condition },
+    .{ .path = "Once", .role = .once },
+    .{ .path = "Lazy", .role = .once },
+    .{ .path = "Confined", .role = .confined },
 };
 const int_members = [_]Lib.Member{
     .{ .path = "Checked", .role = .scalar },
@@ -58,6 +61,9 @@ const root_members = [_]Lib.Member{
     .{ .path = "RwGuarded", .role = .guarded },
     .{ .path = "SpinRwGuarded", .role = .guarded },
     .{ .path = "Condition", .role = .condition },
+    .{ .path = "Once", .role = .once },
+    .{ .path = "Lazy", .role = .once },
+    .{ .path = "Confined", .role = .confined },
     .{ .path = "int.Checked", .role = .scalar },
     .{ .path = "int.Saturating", .role = .scalar },
     .{ .path = "int.Ranged", .role = .scalar },

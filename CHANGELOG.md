@@ -7,6 +7,11 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Added
 
 - A003 reads a guard's `handOff()` (aegis's `Guarded(T).Guard.handOff`, kept in a local or assigned) as a declared transfer: the release passes to the code the hand-off is given, so the acquiring function is decided without following it there, as a release through a callback's erased context stayed undecided (reactor's futex park). A cleanup after the hand-off, a hand-off after cleanup, and a hand-off discarded with `_ =` are found.
+- aegis's `Once`, `Lazy` and `Confined` join the contract: their publication state, election lock, waiters and value, and a `Confined`'s value and checked owner, are A001's to keep behind their operations, and a copy of one its constructor made is A002's.
+
+### Fixed
+
+- A001 left a field access undecided whenever its receiver did not resolve and its name was a backing field's of some aegis type: 0.2.11's new names (`state`, `admitted`) left 25 of reactor's sites undecided (`o.state.storage` on a generic operation). A candidate is now decided not aegis's when, for every published type with a backing field of that name, the program reads a member of it the field's declared type lacks, or the receiver is a variable whose literal initializer names a field the type lacks.
 
 ## [0.2.11] - 2026-10-17
 

@@ -799,3 +799,50 @@ test "an acquisition whose failure is caught is checked as one by `try` is" {
     try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; defer held.deinit(io); _ = held.value(); }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; _ = held.value(); }", pack.cleanup, true, 1);
 }
+
+test "values initialized once and values one task owns keep their state behind their operations" {
+    const head = "const aegis = @import(\"aegis\");\n";
+    // A Once's and a Lazy's publication state, election lock, waiters and value.
+    try expectJudged(head ++ "pub fn f(o: *aegis.Once(u32)) void { _ = o.state; _ = o.mutex; _ = o.changed; _ = o.data; }", pack.access, true, 4);
+    try expectJudged(head ++ "pub fn f(l: *aegis.Lazy(u32)) void { _ = l.state; _ = l.data; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(l: *aegis.sync.Lazy(u32)) ?aegis.Lazy(u32).Ref { return l.get(); }", pack.access, true, 0);
+    // A Confined value and the identity it checks.
+    try expectJudged(head ++ "pub fn f(c: *aegis.Confined(u32)) void { _ = c.data; _ = c.owner; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(c: *aegis.Confined(u32), id: aegis.TaskIdentity) u32 { return c.value(id).*; }", pack.access, true, 0);
+    // A copy of one made by its constructor duplicates its lock or its owner.
+    try expectJudged(head ++ "pub fn f() void { var l = aegis.Lazy(u32).init(); const copy = l; _ = copy; _ = &l; }", pack.copies, true, 1);
+    // Fields of the program's own of the same names are its own.
+    try expectJudged(head ++ "const Mine = struct { state: u8, data: u8, owner: u8 };\npub fn f(m: *Mine) void { _ = m.state; _ = m.data; _ = m.owner; }", pack.access, true, 0);
+}
+
+test "a field of a container another module's type function makes is that container's" {
+    var project = try aegis_sources.projectWith(std.testing.allocator,
+        \\const lib = @import("lib");
+        \\const Proxy = lib.Layer(u8, .{});
+        \\var proxy: Proxy = .{ .state = 0, .base = 0 };
+        \\pub const userdata: *anyopaque = &proxy.state;
+    ,
+        \\pub const Overrides = struct { read: ?u8 = null };
+        \\pub fn Layer(comptime State: type, comptime overrides: Overrides) type {
+        \\    comptime if (@sizeOf(State) == 0) @compileError("a layer keeps state");
+        \\    _ = overrides;
+        \\    return struct { state: State, base: u32 };
+        \\}
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 0), count(report, pack.access)); // safe: fixture count is representable.
+}
+
+test "a backing field's name on a receiver nothing resolves is decided by what the program does with it" {
+    const head = "const aegis = @import(\"aegis\");\nconst unknown = @import(\"unmapped\");\n";
+    // A literal naming a field no aegis type with `state` has.
+    try expectJudged(head ++ "var proxy: unknown.Layer = .{ .state = 0, .base = 1 };\npub fn f() *anyopaque { return &proxy.state; }", pack.access, true, 0);
+    // A member read off the field is weighed against the field's declared type, which std
+    // declares for these (an atomic, a mutex): with std unmapped here, undecided.
+    try expectJudged(head ++ "pub fn f(o: unknown.Op) void { _ = o.state.storage; }", pack.access, false, 0);
+    // A literal naming only fields an aegis type has: undecided.
+    try expectJudged(head ++ "var proxy: unknown.Layer = .{ .state = 0 };\npub fn f() *anyopaque { return &proxy.state; }", pack.access, false, 0);
+}

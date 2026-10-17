@@ -162,6 +162,9 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
         .{ "aegis-rw-guarded", "src/RwGuarded.zig" },
         .{ "aegis-spin-rw-guarded", "src/SpinRwGuarded.zig" },
         .{ "aegis-condition", "src/Condition.zig" },
+        .{ "aegis-once", "src/Once.zig" },
+        .{ "aegis-lazy", "src/Lazy.zig" },
+        .{ "aegis-confined", "src/Confined.zig" },
     };
     for (files) |file| sources.addAnonymousImport(file[0], .{ .root_source_file = aegis_dependency.path(file[1]), .target = target });
     return sources;

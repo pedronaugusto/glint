@@ -39,21 +39,120 @@ fn checkAccess(c: *Context) Context.Error!void {
         const data = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
         if (!backingName(name)) continue;
+        if (try refuted(c, node, name)) continue;
         const k = (try requiredOwner(c, data[0], access, data[1])) orelse continue;
-        const backing = switch (k) {
-            .secret => std.mem.eql(u8, name, "material"),
-            .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
-            // The guarded value and the lock state of every guarded owner: a spin flag, a
-            // blocking mutex, a reader-writer lock and its admission count.
-            .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted"),
-            .guard => std.mem.eql(u8, name, "owner"),
-            .scalar, .condition => false,
-        };
-        if (backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+        const is_backing = backing(k, name);
+        if (is_backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
 }
+/// Whether `field` (`x.name`, a backing field's name) cannot be an aegis owner's backing field,
+/// whatever `x` is, because of what the program does with it. For every published type with a
+/// backing field of that name, one of: the program reads a member of `x.name` that the field's
+/// declared type lacks (`o.state.storage` is no atomic's), or `x` is a variable whose literal
+/// initializer names a field the type lacks (`.{ .state = 0, .base = io }`). Undecided when any
+/// such type is not refuted.
+fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.models[c.file.raw()];
+    // What the program reads of `x.name`.
+    var member: ?[]const u8 = null;
+    if (model.node_parents[@backingInt(field)]) |parent| { // safe: an AST node index reads its own parent table
+        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == field)
+            member = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
+    }
+    // The fields `x`'s literal initializer names.
+    var literal_buffer: [2]Ast.Node.Index = undefined;
+    var literal: ?Ast.full.StructInit = null;
+    const receiver = tree.nodeData(field).node_and_token[0];
+    if (tree.nodeTag(receiver) == .identifier) if (model.reference(receiver)) |ref| if (ref.declaration) |index| {
+        if (tree.fullVarDecl(model.declarations[index].node)) |v| if (v.ast.init_node.unwrap()) |init| {
+            if (tree.fullStructInit(&literal_buffer, init)) |value| if (value.ast.type_expr == .none) {
+                literal = value;
+            };
+        };
+    };
+    if (member == null and literal == null) return false;
+    const found = try c.facts.publication(Contract.library);
+    var any = false;
+    for (found.entries) |entry| {
+        const k: Contract.Kind = @fromBackingInt(@intCast(entry.role)); // safe: the entry holds a role value of this enum.
+        if (!backing(k, name)) continue;
+        const container = (try publishedContainer(c, entry.target)) orelse return false;
+        // A published type of this kind without such a field is no candidate.
+        const decl = c.facts.member(container, name) orelse continue;
+        const record = c.project.models[decl.file.raw()].declarations[decl.index];
+        if (record.kind != .field) continue;
+        any = true;
+        if (literal) |value| {
+            const lacks = for (value.ast.fields) |init| {
+                const label = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(init) - 2));
+                const named = c.facts.member(container, label) orelse break true;
+                if (c.project.models[named.file.raw()].declarations[named.index].kind != .field) break true;
+            } else false;
+            if (lacks) continue;
+        }
+        const read = member orelse return false;
+        const written = &c.project.files[decl.file.raw()].tree;
+        const type_expr = written.fullContainerField(record.node).?.ast.type_expr.unwrap() orelse return false;
+        const holder = switch (try c.facts.resolve(decl.file, type_expr)) {
+            .container, .instance => |held| held,
+            .pointer => |to| switch (to.*) {
+                .container, .instance => |held| held,
+                else => return false,
+            },
+            else => return false,
+        };
+        if (c.facts.member(holder, read) != null) return false;
+    }
+    return any;
+}
+
+/// The container a published target is: the type itself, or the one a type function returns,
+/// the first container declared in its body.
+fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Container {
+    switch (target) {
+        .container => |container| return container,
+        .function => |function| {
+            const model = &c.project.models[function.file.raw()];
+            const tree = &c.project.files[function.file.raw()].tree;
+            const record = model.declarations[function.index];
+            const whole = if (tree.nodeTag(record.node) == .fn_decl) record.node else model.node_parents[@backingInt(record.node)] orelse return null; // safe: an AST node index reads its own parent table
+            for (model.scopes, 0..) |scope, i| {
+                if (scope.kind != .container) continue;
+                var at = scope.parent;
+                while (at) |p| : (at = model.scopes[p].parent) {
+                    if (model.scopes[p].kind == .container) break;
+                    if (model.scopes[p].kind == .function) {
+                        if (model.scopes[p].node == whole or model.scopes[p].node == record.node) return .{ .file = function.file, .scope = @intCast(i) }; // safe: scope indexes come from the bounded frozen per-file model.
+                        break;
+                    }
+                }
+            }
+            return null;
+        },
+    }
+}
+
+/// Whether `name` is a backing field of a published type of kind `k`.
+fn backing(k: Contract.Kind, name: []const u8) bool {
+    return switch (k) {
+        .secret => std.mem.eql(u8, name, "material"),
+        .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
+        // The guarded value and the lock state of every guarded owner: a spin flag, a
+        // blocking mutex, a reader-writer lock and its admission count.
+        .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted"),
+        .guard => std.mem.eql(u8, name, "owner"),
+        // A value initialized once: its publication state, its election lock and waiters,
+        // and the value itself before the state says it is there.
+        .once => std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "changed") or std.mem.eql(u8, name, "data"),
+        // A value one logical task owns: the value and the identity that is checked.
+        .confined => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "owner"),
+        .scalar, .condition => false,
+    };
+}
+
 fn backingName(name: []const u8) bool {
-    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
