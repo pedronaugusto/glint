@@ -4,6 +4,13 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- The aegis pack knows every guarded owner: `BlockingGuarded`, `RwGuarded` and `SpinRwGuarded`, their guards (`Guard`, `ReadGuard`, `WriteGuard`) and every way one is acquired, blocking or spinning, cancelable or not, tried, a reader's or a writer's. Their backing state (`data`, `lock`, `mutex`, `state`, `admitted`) and a guard's `owner` are A001's; a guard is A003's to release.
+- aegis's `Condition` joins the contract: a guard whose address goes to its `wait` or `waitUncancelable`, which hold it again on every return, is lent, not handed off (A003).
+- A003 follows a guard lent to a function of the program's own: when every path of the function hands it back held (each release followed by an acquisition into it, never released at a return, never released by a `defer`, lent on only to calls that do the same), the call is a loan, and the guard stays the caller's to release. An acquisition whose failure is caught (`x.acquire(io) catch return`) is checked as one by `try` is, and a guard read through its members in an `if`'s condition is decided as it is elsewhere. uplink's six undecided sites are decided this way.
+- A001 reads an array literal with its element type named (`[_]T{ ... }`) as an array of `T`, so a `for` capture over one is decided.
+
 ## [0.2.10] - 2026-10-15
 
 ### Added
