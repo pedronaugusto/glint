@@ -1016,6 +1016,8 @@ test "a member read of a backing field that is an array, a slice or a number is 
 
 test "receivers through comptime values, struct literals, calls by @call and a choice behind a pointer are decided" {
     const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32, values: []const u8 = &.{} };\n";
+    // `++` of two slices is an array of their elements.
+    try expectJudged(head ++ "const Opt = struct { index: usize };\nconst Info = struct { options: []const Opt, positionals: []const Opt };\npub fn f(comptime info: Info) usize { var n: usize = 0; inline for (info.options ++ info.positionals) |o| n += o.index; return n; }", pack.access, true, 0);
     // `comptime x` has `x`'s type.
     try expectJudged(head ++ "fn all(comptime T: type) []const Plain { _ = T; return &.{}; }\npub fn f() usize { const ps = comptime all(u8); var n: usize = 0; inline for (ps) |p| n += p.values.len; return n; }", pack.access, true, 0);
     // A block's value given by an untyped struct literal is that literal's anonymous struct.
@@ -1058,13 +1060,4 @@ test "a reservation consumed is discharged" {
     try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
     // Kept past its success, the reservation leaves with the result: no claim either way.
     try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
-}
-
-test "the private fields of staged payloads, machines, scopes, references, secondary maps and unparsed input" {
-    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
-    try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.payload; _ = r.state; _ = r.payload; }", pack.access, true, 2);
-    try expectJudged(head ++ "pub fn f(s: aegis.scope.Table(Tag).Scope, r: aegis.scope.Ref(Tag, *u32)) void { _ = s.index; _ = r.ptr; }", pack.access, true, 2);
-    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(aegis.handle.Index(Tag, u32), u8), u: aegis.input.Untrusted([]const u8)) void { _ = m.entries; _ = u.value; }", pack.access, true, 2);
-    // The same names on other types are not these fields.
-    try expectJudged(head ++ "const P = struct { payload: u8, state: u8, index: u8, ptr: u8, entries: u8, value: u8 };\npub fn f(p: P) void { _ = p.payload; _ = p.state; _ = p.index; _ = p.ptr; _ = p.entries; _ = p.value; }", pack.access, true, 0);
 }

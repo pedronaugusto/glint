@@ -271,13 +271,15 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .owned => &.{ "data", "state" },
         .must_use => &.{ "data", "pending", "live" },
         .shared => &.{ "block", "live" },
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries" },
-        .stage => &.{ "live", "payload" },
-        .machine => &.{"state"},
+        // Not yet admitted, while family receivers glint does not resolve read fields of these
+        // names (glint-complete): a secondary map's `entries`, a staged payload's `payload`, a
+        // runtime machine's `state`, a scope's `index`, a reference's `ptr` and an unparsed
+        // input's `value`.
+        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head" },
+        .stage => &.{"live"},
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "generation", "index" },
-        .ref => &.{ "slot", "generation", "ptr" },
-        .untrusted => &.{"value"},
+        .scope => &.{ "table", "generation" },
+        .ref => &.{ "slot", "generation" },
         .choice => &.{"bit"},
         else => &.{},
     };

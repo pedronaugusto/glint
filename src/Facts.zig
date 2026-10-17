@@ -275,11 +275,17 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         // A slice of an array is a pointer to the elements (a pointer to an array when the bounds
         // are known, a slice when not: indexed alike); a slice of a slice or pointer is the same.
         .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolve(file, tree.fullSlice(node).?.ast.sliced), {}),
-        // `++` joins arrays: the left side's kind, a string for a literal.
+        // `++` joins arrays: the left side's kind, a string for a literal, and an array of the
+        // elements for slices and pointers to arrays, whose lengths are known at compile time.
         .array_cat => {
             const lhs = try self.resolve(file, tree.nodeData(node).node_and_node[0]);
             return switch (lhs) {
                 .scalar, .array, .unknown => lhs,
+                .pointer => |to| switch (to.*) {
+                    .array => to.*,
+                    .unknown => to.*,
+                    else => .{ .array = to },
+                },
                 else => .{ .unknown = .unsupported },
             };
         },

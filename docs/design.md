@@ -153,18 +153,18 @@ The contract covers aegis's published types past the guards too, each by what it
 | `own.Owned`, `OwnedIo` | `data`, `state` | yes | `deinit`, or `take`/`moveInto` |
 | `own.MustUse` | `data`, `pending`, `live` | yes | `take` or `acknowledge` (its `deinit` checks that one ran) |
 | `Shared` | `block`, `live` | yes: a copy with `=` is a handle never retained | `release` (each handle, `create`d or `retain`ed) |
-| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `free_head`, `entries` | yes | `deinit` |
+| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `free_head` | yes | `deinit` |
 | `handle.Domain` | none | yes: both issue the same instances | none |
 | `handle.Index` | a scalar: A004 | no | none |
-| `state.Machine.At` | `payload`, `live` | yes | none (a payload leaves by `take` or a transition) |
-| `state.Machine.Runtime` | `state` | yes: one driver owns a machine | none |
+| `state.Machine.At` | `live` | yes | none (a payload leaves by `take` or a transition) |
+| `state.Machine.Runtime` | none yet | yes: one driver owns a machine | none |
 | `scope.Table` | `slots`, `free_head`, `used_up`, `open_count` | yes | `deinit` |
-| `Table.Scope` | `table`, `index`, `generation` | no | `end` |
-| `scope.Ref` | `ptr`, `slot`, `generation` | no | none |
-| `input.Untrusted` | `value` | no | none |
+| `Table.Scope` | `table`, `generation` | no | `end` |
+| `scope.Ref` | `slot`, `generation` | no | none |
+| `input.Untrusted` | none yet | no | none |
 | `secret.Choice` | `bit` | no | none |
 
-An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A call that gives a type aegis declares and the contract does not list (a guard's `Handoff`) owes nothing: the contract names every type that carries an obligation. A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. `Atomic`, `Order`, `InitContext`, `TaskIdentity` and `err` stay outside the contract.
+An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A call that gives a type aegis declares and the contract does not list (a guard's `Handoff`) owes nothing: the contract names every type that carries an obligation. Six private fields wait for glint to resolve the receivers of family code that reads fields of the same names: a staged payload's `payload`, a runtime machine's `state`, a scope's `index`, a reference's `ptr`, a secondary map's `entries` and unparsed input's `value`. A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. `Atomic`, `Order`, `InitContext`, `TaskIdentity` and `err` stay outside the contract.
 
 A005 decides an adoption of a whole byte allocation: the allocation is a local initialized by `a.alloc(u8, n)` (through `try` or `catch`) from the allocator the adoption is given, written the same way, and no use of the local follows the adoption or waits in a `defer` or `errdefer`. The extent is then the allocation's and the alignment a byte's, and the owner holds it alone; every other shape stays a review site.
 Aegis scalar ABI guarantees cover non-exhaustive enums over 8–64-bit and native-size integers;
