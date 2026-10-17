@@ -33,6 +33,11 @@ pub const Input = struct {
     stem: []const u8 = "",
     selected: bool = true,
     classification: enum { production, @"test", generated } = .production,
+    /// Module names the build binds in no module that compiles this file. Zig compiles an
+    /// `@import` of one only where the build would fail, so code that needs one is not part of
+    /// this build. The caller states this from the build's own configuration; a name merely
+    /// left unmapped stays unknown.
+    absent: []const []const u8 = &.{},
 };
 /// A module edge selected and resolved by the caller, never by a path hash.
 pub const Import = struct { from: FileId, spelling: []const u8, target: FileId };
@@ -67,6 +72,9 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         copied[index].bytes = files[index].source;
         copied[index].name = try a.dupe(u8, input.name);
         copied[index].stem = try a.dupe(u8, input.stem);
+        const names = try a.alloc([]const u8, input.absent.len);
+        for (names, input.absent) |*out, name| out.* = try a.dupe(u8, name);
+        copied[index].absent = names;
     }
     const mappings = try a.dupe(Import, imports);
     for (mappings, 0..) |*mapping, index| {
@@ -132,6 +140,12 @@ pub fn source(self: *const Project, source_handle: Handle) QueryError![]const u8
 pub fn imported(self: *const Project, from: FileId, spelling: []const u8) ?FileId {
     for (self.imports) |mapping| if (mapping.from.eql(from) and std.mem.eql(u8, mapping.spelling, spelling)) return mapping.target;
     return null;
+}
+
+/// Whether the build binds no module named `spelling` for `from` (its input's `absent`).
+pub fn absent(self: *const Project, from: FileId, spelling: []const u8) bool {
+    for (self.inputs[from.raw()].absent) |name| if (std.mem.eql(u8, name, spelling)) return true; // safe: enum identities index their owning frozen tables without narrowing.
+    return false;
 }
 
 /// Number of source inputs, including unselected dependencies.

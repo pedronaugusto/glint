@@ -19,6 +19,11 @@ callers: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// The containers a package's consumers reach by name through public declarations from its
 /// module roots, found once.
 exported: ?std.AutoHashMapUnmanaged(Container, void) = null,
+/// The names some container in the project declares as `comptime` fields, found once.
+comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
+/// The declarations the program dereferences (`p.*`), found per file once.
+dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
+dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -52,7 +57,9 @@ pub const Publication = struct {
 pub const Entry = struct { role: u32, target: Target };
 pub const Target = union(enum) { function: Decl, container: Container };
 pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported };
+/// Why a value is unknown. `absent`: it comes from a module the build does not have for this
+/// file (Project.Input.absent), so the code that needs it is not compiled in this build.
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent };
 pub const Value = union(enum) {
     unknown: Unknown,
     primitive: []const u8,
@@ -71,6 +78,10 @@ pub const Value = union(enum) {
     /// chosen per target. Never holds an unknown or another `alternatives`.
     alternatives: []const Value,
     reflected: Reflected,
+    /// A struct literal with no type of its own where nothing gives it one (`.{ .a = x }` as a
+    /// block's value or an `anytype` argument): an anonymous struct whose fields are the ones
+    /// the literal names, with the values it gives them.
+    literal: Key,
 
     pub fn known(self: Value) bool {
         return self != .unknown;
@@ -85,6 +96,9 @@ pub fn deinit(self: *Facts) void {
     self.templates.deinit(self.gpa);
     self.callers.deinit(self.gpa);
     if (self.exported) |*set| set.deinit(self.gpa);
+    if (self.comptime_fields) |*names| names.deinit(self.gpa);
+    self.dereferences.deinit(self.gpa);
+    self.dereferences_found.deinit(self.gpa);
     self.* = undefined;
 }
 
@@ -241,6 +255,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"switch", .switch_comma, .@"if" => if (try self.branches(file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
+        // `comptime x` and `nosuspend x` have `x`'s type.
+        .@"comptime", .@"nosuspend" => return self.resolve(file, tree.nodeData(node).node),
         // Operators no aegis type takes: Zig has no operator overloading, and every aegis value
         // is a struct or an enum. Their results are numbers or booleans.
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => return .scalar,
@@ -300,10 +316,10 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             if (try self.throughPointer(file, call.ast.fn_expr)) |value| return value;
             return self.callResult(callee, {});
         },
-        .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma => {
+        .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma => {
             const value = tree.fullStructInit(&buffer, node).?;
             if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
-            return .{ .unknown = .unsupported };
+            return .{ .literal = .{ .file = file, .node = node } };
         },
         .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
             const value = tree.fullArrayInit(&buffer, node).?;
@@ -331,7 +347,7 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidLiteral => return .{ .unknown = .computed_import },
         };
-        const target = self.project.imported(file, spelling) orelse return .{ .unknown = .missing_mapping };
+        const target = self.project.imported(file, spelling) orelse return .{ .unknown = if (self.project.absent(file, spelling)) .absent else .missing_mapping };
         return .{ .container = .{ .file = target, .scope = 0 } };
     }
     if (std.mem.eql(u8, name, "@This")) {
@@ -354,6 +370,8 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
 
 fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     if (lhs == .reflected) return self.reflectedMember(lhs.reflected, name);
+    if (lhs == .literal) return self.literalField(lhs.literal, name);
+    if (lhs == .pointer and lhs.pointer.* == .literal) return self.literalField(lhs.pointer.literal, name);
     if (lhs == .pointer and lhs.pointer.* == .alternatives) return self.memberOfChoice(lhs.pointer.alternatives, name);
     if (lhs == .alternatives) return self.memberOfChoice(lhs.alternatives, name);
     const container = switch (lhs) {
@@ -367,6 +385,18 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
         else => return .{ .unknown = .unresolved },
     };
     if (self.member(container, name)) |decl| return self.memberOf(container, decl);
+    return .{ .unknown = .unresolved };
+}
+
+/// A field of an anonymous struct literal: the value the literal gives it.
+fn literalField(self: *Facts, literal: Key, name: []const u8) ResolveError!Value {
+    const tree = &self.project.files[literal.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullStructInit(&buffer, literal.node) orelse return .{ .unknown = .unsupported };
+    for (full.ast.fields) |field| {
+        const label = try self.memberName(tree.tokenSlice(tree.firstToken(field) - 2));
+        if (std.mem.eql(u8, label, name)) return self.resolve(literal.file, field);
+    }
     return .{ .unknown = .unresolved };
 }
 
@@ -923,6 +953,8 @@ fn same(a: Value, b: Value, depth: usize) bool {
         .unknown => false,
         .error_set, .scalar => true,
         .reflected => false,
+        // One literal is one anonymous type; two literals are two.
+        .literal => |l| std.meta.eql(l, b.literal),
     };
 }
 
@@ -1368,6 +1400,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .unwrap_optional => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"try" => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node), .error_union),
         .grouped_expression => return self.resolveIn(env, file, tree.nodeData(node).node_and_token[0]),
+        .@"comptime", .@"nosuspend" => return self.resolveIn(env, file, tree.nodeData(node).node),
         .optional_type => return .{ .optional = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
         .error_union => return .{ .error_union = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[1])) },
         .array_access => {
@@ -1475,9 +1508,22 @@ fn scopeNode(self: *const Facts, function: Decl) Ast.Node.Index {
 /// and its consumers cannot call it by name. Anything else stays unknown.
 fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!Value {
     const function = self.functionOf(parameter) orelse return .{ .unknown = .comptime_dependent };
-    const values = (try self.callArguments(function, position)) orelse return .{ .unknown = .comptime_dependent };
-    if (values.len == 0) return .{ .unknown = .comptime_dependent };
-    return self.choose(values);
+    const found = (try self.callArguments(function, position)) orelse return .{ .unknown = .comptime_dependent };
+    // A call that passes something from a module the build does not have is not compiled.
+    var values: std.ArrayList(Value) = .empty;
+    for (found) |value| if (!absent(value)) try values.append(self.gpa, value);
+    if (values.items.len == 0) return .{ .unknown = .comptime_dependent };
+    return self.choose(values.items);
+}
+
+/// Whether a value comes from a module the build does not have, itself or through what
+/// wraps it.
+fn absent(value: Value) bool {
+    return switch (value) {
+        .unknown => |why| why == .absent,
+        .pointer, .array, .optional, .error_union => |inner| absent(inner.*),
+        else => false,
+    };
 }
 
 /// The arguments every call of `function` in the project passes at `position`, or null when
@@ -1515,11 +1561,18 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
             // `@TypeOf(f)` asks its type: no use of it that passes it on.
             if (isTypeQuery(tree, parent)) continue;
             var receiver: usize = 0;
+            // Whether this use calls what it names. A value's method is reached only by a call:
+            // Zig has no bound methods, so a value's member used otherwise is its field.
+            var callee_buffer: [1]Ast.Node.Index = undefined;
+            var tuple_buffer: [2]Ast.Node.Index = undefined;
+            const callee = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) != null;
+            // A member written to or read as a number is a field: a function is neither.
+            if (tag == .field_access and !callee and fieldUse(tree, parent, node)) continue;
             if (tag == .field_access) {
                 const target = try self.resolve(id, tree.nodeData(node).node_and_token[0]);
                 // What the name is a member of: each alternative that can have members. One
                 // that does not resolve may be this function's container.
-                const parts: []const Value = if (target == .alternatives) target.alternatives else &.{target};
+                const parts = try self.holders(target);
                 var calls_it = false;
                 for (parts) |part| {
                     const container: Container, const on_value = switch (part) {
@@ -1528,12 +1581,12 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
                         // A pointer is a value: its method takes it as the first parameter.
                         .pointer => |pointed| switch (pointed.*) {
                             .instance, .container => |c| .{ c, true },
-                            .unknown => if (try self.cannotBe(tree, parent, node, function)) continue else return null,
+                            .unknown => if (!callee or try self.cannotBe(tree, parent, node, function)) continue else return null,
                             else => continue,
                         },
                         // A path of declarations from a module's root reaches only what the
                         // module exports by name, which this function's container is not.
-                        .unknown => if (try self.cannotBe(tree, parent, node, function) or self.throughModule(id, tree.nodeData(node).node_and_token[0])) continue else return null,
+                        .unknown => if (try self.cannotBe(tree, parent, node, function) or self.throughModule(id, tree.nodeData(node).node_and_token[0]) or (!callee and try self.runtimeValue(id, tree.nodeData(node).node_and_token[0], 0))) continue else return null,
                         // `void`, a number or an error has no member to call.
                         else => continue,
                     };
@@ -1544,18 +1597,141 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
                 }
                 if (!calls_it) continue;
             }
-            var call_buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&call_buffer, parent) orelse return null;
-            if (call.ast.fn_expr != node) return null;
+            const params = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) orelse return null;
             if (position < receiver) {
                 try values.append(self.gpa, try self.resolve(id, tree.nodeData(node).node_and_token[0]));
                 continue;
             }
-            if (position - receiver >= call.ast.params.len) return null;
-            try values.append(self.gpa, try self.resolve(id, call.ast.params[position - receiver]));
+            if (position - receiver >= params.len) return null;
+            try values.append(self.gpa, try self.resolve(id, params[position - receiver]));
         }
     }
     return values.items;
+}
+
+/// The arguments `parent` passes when it calls what `node` names: `f(a, b)`, or
+/// `@call(modifier, f, .{ a, b })`. Null when `parent` does not call it.
+fn callParams(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index, call_buffer: *[1]Ast.Node.Index, tuple_buffer: *[2]Ast.Node.Index) ?[]const Ast.Node.Index {
+    if (tree.fullCall(call_buffer, parent)) |call| return if (call.ast.fn_expr == node) call.ast.params else null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, parent, &buffer);
+    if (args.len != 3 or args[1] != node or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@call")) return null;
+    const tuple = tree.fullArrayInit(tuple_buffer, args[2]) orelse return null;
+    if (tuple.ast.type_expr != .none) return null;
+    return tuple.ast.elements;
+}
+
+/// Whether `parent` uses its operand `node` as only a field can be used: as the target of an
+/// assignment, or as an operand of arithmetic, a comparison or a logical operator.
+fn fieldUse(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(parent)) {
+        .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => tree.nodeData(parent).node_and_node[0] == node,
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => true,
+        else => false,
+    };
+}
+
+/// What a member access's receiver can be, one by one: each alternative, and a pointer to a
+/// choice as a pointer to each of its alternatives.
+fn holders(self: *Facts, value: Value) ResolveError![]const Value {
+    var list: std.ArrayList(Value) = .empty;
+    const outer: []const Value = if (value == .alternatives) value.alternatives else &.{value};
+    for (outer) |one| {
+        if (one == .pointer and one.pointer.* == .alternatives) {
+            for (one.pointer.alternatives) |inner| try list.append(self.gpa, .{ .pointer = try self.boxed(inner) });
+        } else try list.append(self.gpa, one);
+    }
+    return list.items;
+}
+
+/// Whether `node` is a value the program holds at run time, never a type or a namespace: an
+/// address taken, a `var`, a parameter declared with a type other than `type`, a `const`
+/// declared with such a type or initialized by such a value, or a field of one. A field of a
+/// value is a value unless a `comptime` field holds it, so a name some container in the
+/// project declares as a `comptime` field is left unknown.
+fn runtimeValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!bool {
+    if (depth == 32) return false;
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    switch (tree.nodeTag(node)) {
+        .address_of => return true,
+        .grouped_expression => return self.runtimeValue(file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .field_access => {
+            const data = tree.nodeData(node).node_and_token;
+            if (try self.comptimeField(try self.memberName(tree.tokenSlice(data[1])))) return false;
+            return self.runtimeValue(file, data[0], depth + 1);
+        },
+        .identifier => {
+            const ref = model.reference(node) orelse return false;
+            const record = model.declarations[ref.declaration orelse return false];
+            switch (record.kind) {
+                .parameter => {
+                    const function = self.functionOf(.{ .file = file, .index = ref.declaration.? }) orelse return false;
+                    var fn_buffer: [1]Ast.Node.Index = undefined;
+                    const proto = tree.fullFnProto(&fn_buffer, model.declarations[function.index].node) orelse return false;
+                    var it = proto.iterate(tree);
+                    while (it.next()) |param| {
+                        if (param.name_token != record.token) continue;
+                        // `anytype` binds a value or a type; dereferenced, it is a pointer.
+                        const type_expr = param.type_expr orelse return self.dereferenced(.{ .file = file, .index = ref.declaration.? });
+                        return !typeKeyword(tree, type_expr);
+                    }
+                    return false;
+                },
+                .variable => {
+                    const variable = tree.fullVarDecl(record.node) orelse return false;
+                    if (variable.comptime_token != null) return false;
+                    if (variable.ast.type_node.unwrap()) |t| return !typeKeyword(tree, t);
+                    if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return true;
+                    const init = variable.ast.init_node.unwrap() orelse return false;
+                    return self.runtimeValue(file, init, depth + 1);
+                },
+                else => return false,
+            }
+        },
+        else => return false,
+    }
+}
+
+/// Whether the program dereferences the declaration `decl` somewhere in its file (`p.*`),
+/// which only a pointer allows.
+fn dereferenced(self: *Facts, decl: Decl) ResolveError!bool {
+    const done = try self.dereferences_found.getOrPut(self.gpa, decl.file);
+    if (!done.found_existing) {
+        const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+        const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .deref) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const operand = tree.nodeData(node).node;
+            if (tree.nodeTag(operand) != .identifier) continue;
+            const ref = model.reference(operand) orelse continue;
+            const index = ref.declaration orelse continue;
+            try self.dereferences.put(self.gpa, .{ .file = decl.file, .index = index }, {});
+        }
+    }
+    return self.dereferences.contains(decl);
+}
+
+fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
+}
+
+/// Whether any container in the project declares a `comptime` field named `name`.
+fn comptimeField(self: *Facts, name: []const u8) ResolveError!bool {
+    if (self.comptime_fields == null) {
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.project.files, self.project.models) |*file, *model| {
+            if (file.status != .parsed) continue;
+            for (model.declarations) |d| {
+                if (d.kind != .field) continue;
+                const field = file.tree.fullContainerField(d.node) orelse continue;
+                if (field.comptime_token != null) try names.put(self.gpa, d.name, {});
+            }
+        }
+        self.comptime_fields = names;
+    }
+    return self.comptime_fields.?.contains(name);
 }
 
 /// Whether the call `parent` makes through the member access `node` cannot be `function`:
@@ -1680,4 +1856,25 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(Project.FileId.fromRaw(0), first)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
     const dep = project.files[0].tree.fullVarDecl(project.models[0].declarations[2].node).?.ast.init_node.unwrap().?;
     try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(Project.FileId.fromRaw(0), dep)).unknown); // safe: scope indexes come from the bounded frozen per-file model.
+}
+
+test "a call that passes what a module the build does not have gives binds nothing" {
+    const source = "const k = @import(\"kernels\");\nconst S = struct { used: usize };\nfn local() S { return .{ .used = 0 }; }\nfn folded(comptime fold: anytype) usize { const f = fold(); return f.used; }\npub fn a() usize { return folded(local); }\npub fn b() usize { return folded(k.fold); }";
+    for ([_]bool{ false, true }) |absent_kernels| {
+        const names: []const []const u8 = if (absent_kernels) &.{"kernels"} else &.{};
+        var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source, .absent = names }}, &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const model = &project.models[0];
+        const f = for (model.declarations) |d| {
+            if (d.kind == .variable and std.mem.eql(u8, d.name, "f")) break d;
+        } else unreachable; // unreachable: the source declares `f`
+        const init = project.files[0].tree.fullVarDecl(f.node).?.ast.init_node.unwrap().?;
+        const value = try facts.resolve(Project.FileId.fromRaw(0), init); // safe: one source.
+        // Unmapped, `k.fold` is unknown and so is the binding; absent, its call is not compiled.
+        try std.testing.expectEqual(absent_kernels, value == .instance);
+    }
 }

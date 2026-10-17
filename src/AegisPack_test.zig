@@ -1013,3 +1013,58 @@ test "a member read of a backing field that is an array, a slice or a number is 
     try expectJudged(head ++ "pub fn f(o: *unknown.Op) void { o.held.storage.scratch = 0; _ = o.held.storage.len; }", pack.access, false, 0);
     try expectJudged(head ++ "pub fn f(o: *unknown.Op) void { o.held.storage.scratch = 0; }", pack.access, true, 0);
 }
+
+test "receivers through comptime values, struct literals, calls by @call and a choice behind a pointer are decided" {
+    const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32, values: []const u8 = &.{} };\n";
+    // `comptime x` has `x`'s type.
+    try expectJudged(head ++ "fn all(comptime T: type) []const Plain { _ = T; return &.{}; }\npub fn f() usize { const ps = comptime all(u8); var n: usize = 0; inline for (ps) |p| n += p.values.len; return n; }", pack.access, true, 0);
+    // A block's value given by an untyped struct literal is that literal's anonymous struct.
+    try expectJudged(head ++ "const built = blk: { var t: [2]u8 = undefined; t[0] = 1; break :blk .{ .count = 1, .table = t }; };\npub fn f() u8 { return built.table[0]; }", pack.access, true, 0);
+    // `@call` passes its tuple's elements as the arguments.
+    try expectJudged(head ++ "fn run(c: anytype) u32 { return c.data; }\npub fn f(p: *Plain) u32 { return @call(.auto, run, .{p}); }", pack.access, true, 0);
+    // A receiver that is a pointer to a type chosen per build, `void` where the build lacks it.
+    try expectJudged(head ++ "const has = @import(\"builtin\").os.tag == .linux;\nconst Ring = struct { fn poll(_: *Ring, sink: anytype) u32 { return sink.data; } };\nconst Backend = union(enum) { ring: if (has) *Ring else void, none };\nfn poll(b: Backend, sink: anytype) u32 { return switch (b) { .ring => |r| if (has) r.poll(sink) else 0, .none => 0 }; }\npub fn f(b: Backend, p: *Plain) u32 { return poll(b, p); }", pack.access, true, 0);
+    // A member of a choice that only one alternative has is that alternative's.
+    try expectJudged(head ++ "const Full = struct { primary: u32 = 0 };\nconst State = struct { uring: if (@import(\"builtin\").os.tag == .linux) Full else struct { timed_out: bool = false } = .{} };\nconst Op = struct { state: State, data: u32 };\nfn settle(o: anytype) u32 { const ownership = &o.state.uring; return ownership.primary; }\npub fn f(o: *Op) u32 { return settle(o); }", pack.access, true, 0);
+}
+
+test "a function's callers are found past members of values that only fields can be" {
+    const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32 };\nfn run(c: anytype) u32 { return c.data; }\npub fn f(p: *Plain) u32 { return run(p); }\n";
+    // Zig has no bound methods: a member of a value used other than by a call is a field.
+    try expectJudged(head ++ "pub fn g(o: anytype) void { const s = &o.request; _ = &s.run; }", pack.access, true, 0);
+    // A member written to, or read as a number, is a field.
+    try expectJudged(head ++ "pub fn g(o: anytype, n: u32) void { o.run = n; if (o.run > 1) o.run -= 1; }", pack.access, true, 0);
+    // An `anytype` parameter dereferenced is a pointer: its member passed on is a field.
+    try expectJudged(head ++ "fn take(_: anytype) void {}\npub fn g(o: anytype) void { const T = @TypeOf(o.*); _ = T; take(o.run); }", pack.access, true, 0);
+    // A receiver that may be a type may name the function itself: undecided.
+    try expectJudged(head ++ "fn take(_: anytype) void {}\npub fn g(o: anytype) void { take(o.run); }", pack.access, false, 0);
+}
+
+test "an owner moved into a local aggregate is that aggregate's obligation" {
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\nconst Set = struct { storage: Bytes, n: usize, view: []const u8 = &.{} };\nconst Answer = union(enum) { set: Set, refused };\nconst E = error{ OutOfMemory, Refused };\nfn refused() E { return error.Refused; }\n";
+    // Moved into a literal, the aggregate given to the caller: decided.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) E!Set { var storage = Bytes.init(gpa, 4) catch return error.OutOfMemory; storage.resizeWithinCapacity(4) catch unreachable; var set: Set = .{ .storage = storage, .n = 4 }; @field(set, \"view\") = set.storage.expose(); return set; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) E!Answer { var storage = Bytes.init(gpa, 4) catch return error.OutOfMemory; errdefer storage.deinit(); const set: Set = .{ .storage = storage, .n = 4 }; return .{ .set = set }; }", pack.cleanup, true, 0);
+    // The aggregate dropped: a finding.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) E!void { const storage = Bytes.init(gpa, 4) catch return error.OutOfMemory; const set: Set = .{ .storage = storage, .n = 4 }; _ = set.n; }", pack.cleanup, true, 1);
+    // The owner named again after the move, or held by something other than a field: undecided.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) E!Set { var storage = Bytes.init(gpa, 4) catch return error.OutOfMemory; const set: Set = .{ .storage = storage, .n = storage.len() }; return set; }", pack.cleanup, false, 0);
+    // An error a call maps is an error exit, which an `errdefer` covers.
+    try expectJudged(head ++ "fn ready() bool { return true; }\npub fn f(gpa: std.mem.Allocator) E!Bytes { var out = Bytes.init(gpa, 4) catch return error.OutOfMemory; errdefer out.deinit(); while (true) { if (ready()) return out; if (ready()) return refused(); } }", pack.cleanup, true, 0);
+}
+
+test "a reservation consumed is discharged" {
+    const head = "const std = @import(\"std\");\nconst Budget = @import(\"aegis\").bounded.Budget(usize);\n";
+    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
+    // Kept past its success, the reservation leaves with the result: no claim either way.
+    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
+}
+
+test "the private fields of staged payloads, machines, scopes, references, secondary maps and unparsed input" {
+    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
+    try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.payload; _ = r.state; _ = r.payload; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(s: aegis.scope.Table(Tag).Scope, r: aegis.scope.Ref(Tag, *u32)) void { _ = s.index; _ = r.ptr; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(aegis.handle.Index(Tag, u32), u8), u: aegis.input.Untrusted([]const u8)) void { _ = m.entries; _ = u.value; }", pack.access, true, 2);
+    // The same names on other types are not these fields.
+    try expectJudged(head ++ "const P = struct { payload: u8, state: u8, index: u8, ptr: u8, entries: u8, value: u8 };\npub fn f(p: P) void { _ = p.payload; _ = p.state; _ = p.index; _ = p.ptr; _ = p.entries; _ = p.value; }", pack.access, true, 0);
+}

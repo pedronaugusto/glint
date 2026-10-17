@@ -271,15 +271,13 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .owned => &.{ "data", "state" },
         .must_use => &.{ "data", "pending", "live" },
         .shared => &.{ "block", "live" },
-        // Not yet admitted, while family receivers glint does not resolve read fields of these
-        // names (glint-complete): a secondary map's `entries`, a staged payload's `payload`, a
-        // runtime machine's `state`, a scope's `index`, a reference's `ptr` and an unparsed
-        // input's `value`.
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head" },
-        .stage => &.{"live"},
+        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries" },
+        .stage => &.{ "live", "payload" },
+        .machine => &.{"state"},
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "generation" },
-        .ref => &.{ "slot", "generation" },
+        .scope => &.{ "table", "generation", "index" },
+        .ref => &.{ "slot", "generation", "ptr" },
+        .untrusted => &.{"value"},
         .choice => &.{"bit"},
         else => &.{},
     };
@@ -307,7 +305,7 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
     return switch (k) {
         .secret, .bytes => &.{ "deinit", "moveInto" },
         .guard, .buffer, .slots, .table => &.{"deinit"},
-        .reservation => &.{ "release", "moveInto" },
+        .reservation => &.{ "release", "consume", "moveInto" },
         .owned => &.{ "deinit", "take", "moveInto" },
         // A result obligation is discharged by taking it or acknowledging it with a reason;
         // its `deinit` checks that it was.
@@ -604,6 +602,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
             break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
         };
         if (!named and !try givesOwner(c, acquisition, acquired.ast.fn_expr)) continue;
+        if (try unlisted(c, acquisition)) continue;
         const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (releases(k) == null) continue;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -617,6 +616,23 @@ fn checkCleanup(c: *Context) Context.Error!void {
             .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
+}
+
+/// Whether `call` gives a value of a type the library declares and the contract does not list
+/// (a guard's `Handoff`), a guard aside: the contract names every type that carries an
+/// obligation, so such a result owes no release here.
+fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
+    if (try Contract.owner(c, call) != null) return false;
+    const value = switch (try c.facts.resolve(c.file, call)) {
+        .error_union => |payload| payload.*,
+        else => |value| value,
+    };
+    const container = switch (value) {
+        .instance => |container| container,
+        else => return false,
+    };
+    if (try c.role(Contract.library, value) != null) return false;
+    return c.inLibrary(Contract.library, container.file);
 }
 
 /// Whether `call` gives an owner itself, not a pointer to one: an operation of a published type
@@ -659,6 +675,10 @@ const Flow = struct {
     loop: ?Ast.Node.Index = null,
     /// Whether an `errdefer` releases the owner: an error leaving the walk does not leak it.
     errdeferred: bool = false,
+    /// Whether the owner has moved into a local aggregate, which `token` now names: its
+    /// obligation is the aggregate's, discharged only by giving the aggregate to the caller,
+    /// as glint does not read the aggregate's own release.
+    aggregate: bool = false,
 
     const State = enum { live, released, deferred };
     const States = std.EnumSet(State);
@@ -678,8 +698,13 @@ const Flow = struct {
         var state = start;
         var out: Paths = .{};
         for (statements) |stmt| {
+            if (state == .live and !f.aggregate) if (try f.movedInto(stmt)) |aggregate| {
+                f.token = aggregate;
+                f.aggregate = true;
+                continue;
+            };
             // `errdefer owner.deinit()`: the owner is released on the error exits that follow.
-            if (f.tree.nodeTag(stmt) == .@"errdefer" and state == .live and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind)) {
+            if (f.tree.nodeTag(stmt) == .@"errdefer" and state == .live and !f.aggregate and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind)) {
                 f.errdeferred = true;
                 continue;
             }
@@ -689,8 +714,8 @@ const Flow = struct {
                 continue;
             }
             const tag = f.tree.nodeTag(stmt);
-            const deferred = tag == .@"defer" and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind);
-            if (deferred or try release(f.c, stmt, f.token, f.kind)) {
+            const deferred = !f.aggregate and tag == .@"defer" and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind);
+            if (deferred or (!f.aggregate and try release(f.c, stmt, f.token, f.kind))) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), if (deferred) "same local capability has repeated cleanup scheduled on this straight-line path" else "same local capability is cleaned twice on this straight-line path");
                 state = if (deferred) .deferred else .released;
                 continue;
@@ -882,7 +907,7 @@ const Flow = struct {
                 .inside => {},
                 .loop_break => out.breaks.insert(state),
                 .loop_continue => out.continues.insert(state),
-                .out => if (state == .live and !(f.errdeferred and failing(f.tree, jumping))) return .uncertain,
+                .out => if (state == .live and !(f.errdeferred and try failing(f.c, f.tree, jumping))) return .uncertain,
                 .other => return .uncertain,
             }
         }
@@ -975,11 +1000,43 @@ const Flow = struct {
             switch (f.tree.nodeTag(parent)) {
                 .address_of => return false,
                 .field_access => if (f.tree.nodeData(parent).node_and_token[0] == candidate) continue,
-                else => {},
+                else => if (fieldOf(f.tree, parent, candidate)) continue,
             }
             found = true;
         }
         return found;
+    }
+
+    /// The local a statement of the owner's own block moves the owner into: a declaration
+    /// whose initializer is a struct literal that holds the owner as a field's value, nowhere
+    /// else, with the owner named nowhere after it. Its obligation is then that local's.
+    fn movedInto(f: Flow, stmt: Ast.Node.Index) Context.Error!?Ast.TokenIndex {
+        if (f.model.node_parents[@backingInt(stmt)] != f.scope) return null; // safe: an AST node index reads its own parent table
+        const variable = f.tree.fullVarDecl(stmt) orelse return null;
+        const init = variable.ast.init_node.unwrap() orelse return null;
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (f.tree.fullStructInit(&buffer, init) == null) return null;
+        const first = f.tree.firstToken(init);
+        const last = f.tree.lastToken(init);
+        var held = false;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            if (!f.mine(candidate)) continue;
+            const main = f.tree.nodeMainToken(candidate);
+            if (main > last) return null;
+            if (main < first) continue;
+            // A field's value of this literal or of one nested in it.
+            const parent = f.model.node_parents[i] orelse return null;
+            var literal_buffer: [2]Ast.Node.Index = undefined;
+            const literal = f.tree.fullStructInit(&literal_buffer, parent) orelse return null;
+            for (literal.ast.fields) |field| {
+                if (field == candidate) break;
+            } else return null;
+            held = true;
+        }
+        if (!held) return null;
+        return variable.ast.mut_token + 1;
     }
 
     fn mine(f: Flow, node: Ast.Node.Index) bool {
@@ -1007,6 +1064,10 @@ const Flow = struct {
             const parent = f.model.node_parents[i] orelse return .other;
             // Lent to a call that holds it again on every return: a borrow.
             if (f.tree.nodeTag(parent) == .address_of and try lent(f.c, f.c.file, parent, 0)) {
+                found = .members;
+                continue;
+            }
+            if (fieldOf(f.tree, parent, candidate)) {
                 found = .members;
                 continue;
             }
@@ -1057,6 +1118,13 @@ const Flow = struct {
         return f.model.declarations[index].token == f.token;
     }
 };
+
+/// Whether `parent` is `@field(node, name)`: a member of `node` named at compile time.
+fn fieldOf(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, parent, &buffer);
+    return args.len == 2 and args[0] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@field");
+}
 
 /// Whether `argument`, a guard's address or a pointer to a guard, is lent by the call it is an
 /// argument of: to an aegis condition's `wait` or `waitUncancelable`, which release the guard
@@ -1297,12 +1365,14 @@ fn insideLoop(tree: *const Ast, model: *const Model, token: Ast.TokenIndex, root
     return false;
 }
 
-/// Whether `jumping`, a `return` or a `try`, leaves by an error: a `try`, or a `return` of
-/// `error.Name`.
-fn failing(tree: *const Ast, jumping: Ast.Node.Index) bool {
+/// Whether `jumping`, a `return` or a `try`, leaves by an error, which an `errdefer` sees: a
+/// `try`, or a `return` of an error (`error.Name`, or a value of an error set, such as a call
+/// that maps one).
+fn failing(c: *Context, tree: *const Ast, jumping: Ast.Node.Index) Context.Error!bool {
     if (tree.nodeTag(jumping) == .@"try") return true;
     const value = tree.nodeData(jumping).opt_node.unwrap() orelse return false;
-    return tree.nodeTag(value) == .error_value;
+    if (tree.nodeTag(value) == .error_value) return true;
+    return try c.facts.resolve(c.file, value) == .error_set;
 }
 
 fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {

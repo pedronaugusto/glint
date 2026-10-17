@@ -4,7 +4,7 @@ Work in progress. Glint supplies token facts, source rules and semantic projecti
 
 ## One immutable model
 
-`Project.init` takes explicit source bytes, opaque labels, production/test classification, selected flags and import mappings. Glint opens no paths. `Options.lowering = false` omits std AstGen and explicitly records `not_requested` lowered coverage. The default remains lowered analysis. Snapshots own AST, optional std-generated ZIR, scopes, declarations, lexical references, comments and a separately identified partial lowered operation/reference index. Declaration `node` is the variable declaration, function prototype (not its enclosing `fn_decl`), container field or capture syntax node; a parameter uses its type expression, or its function prototype when no type expression exists. `token` is always the declaration name token. Declarations follow construction while visiting std AST nodes by index; function parameters and syntax captures are appended when their enclosing node is visited. References follow std AST node-index order. Neither array promises source-offset sorting. File, node and token identities use distinct published aegis ID domains. Handles check snapshot/generation; std AST/ZIR indexes remain the compiler's own types. Checked source-byte accounting bounds construction. Queries return const storage valid until project destruction; reports and projections have separate owners and cannot be rendered against a replacement snapshot.
+`Project.init` takes explicit source bytes, opaque labels, production/test classification, selected flags, import mappings and, per file, the module names its build binds in no module that compiles it (`absent`: code that needs one is not compiled in this build; an unmapped name the caller does not state absent stays unknown). Glint opens no paths. `Options.lowering = false` omits std AstGen and explicitly records `not_requested` lowered coverage. The default remains lowered analysis. Snapshots own AST, optional std-generated ZIR, scopes, declarations, lexical references, comments and a separately identified partial lowered operation/reference index. Declaration `node` is the variable declaration, function prototype (not its enclosing `fn_decl`), container field or capture syntax node; a parameter uses its type expression, or its function prototype when no type expression exists. `token` is always the declaration name token. Declarations follow construction while visiting std AST nodes by index; function parameters and syntax captures are appended when their enclosing node is visited. References follow std AST node-index order. Neither array promises source-offset sorting. File, node and token identities use distinct published aegis ID domains. Handles check snapshot/generation; std AST/ZIR indexes remain the compiler's own types. Checked source-byte accounting bounds construction. Queries return const storage valid until project destruction; reports and projections have separate owners and cannot be rendered against a replacement snapshot.
 
 `Project.syntax`, `lowered`, `declarations`, `scopes`, `references`, `operations` and import queries expose this same model. Source-mapped ZIR calls/member operations/reflection witnesses support conservative semantic facts. Missing imports, symbolic generics, cycles, unsupported structures and exhausted budgets remain explicitly unknown. There is no heuristic fallback that upgrades unknown to deadness or an exact graph.
 
@@ -93,7 +93,7 @@ Operation names (`init`, `acquire`, `deinit`, `raw`, `material`, ...) are the pa
 |---|---|---|
 | A001/2 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
 | A002/2 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases (a copy of a value that resolves to a pointer or an optional pointer, whatever it points at) and type aliases excluded; a copy whose type or source is declared plain data (primitives, and arrays, slices, pointers, optionals and error unions of them, a literal, a call declared to return one) is decided as no owner; lifetimes, live status, retained callers and field copies are undecided. |
-| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. A recognized acquisition is an owner's constructor, a guard's acquisition, or a call to the program's own function whose result is an owner by value. | The walk follows the block's statements, the branches of an `if` and the bodies of `while` and `for` loops: a direct `deinit`, a `defer` of one (after which every exit runs it; one a branch or body defers runs as it ends), member uses, a release before a `return`, a guard's `handOff()`, the owner returned held or carried by value in what is returned (its caller's to release), an `errdefer` release covering the error exits after it (a `try`, a `return error.X`), and a `catch` or `orelse` handler walked as a branch. A loop's body must bring the owner back to its start in the state it entered in, and the loop goes on in the state its `break`s, failing condition and `else` agree on; one that never ends otherwise ends the path. An exit while held, paths that meet in different states, a jump to an outer loop of the walk, a nested release it does not follow, and any use but a member (an address, a copy, an argument: a transfer or alias) are undecided. No missing-errdefer allegation from proximity. |
+| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. A recognized acquisition is an owner's constructor, a guard's acquisition, or a call to the program's own function whose result is an owner by value. | The walk follows the block's statements, the branches of an `if` and the bodies of `while` and `for` loops: a direct `deinit`, a `defer` of one (after which every exit runs it; one a branch or body defers runs as it ends), member uses, a release before a `return`, a guard's `handOff()`, the owner returned held or carried by value in what is returned (its caller's to release), the owner moved into a local aggregate (a field's value of the struct literal that declares it, the owner named nowhere after), whose obligation is then that local's and is discharged only by giving it to the caller, an `errdefer` release covering the error exits after it (a `try`, a `return error.X`, a `return` of a value of an error set), `@field(owner, name)` read as a member use, and a `catch` or `orelse` handler walked as a branch. A loop's body must bring the owner back to its start in the state it entered in, and the loop goes on in the state its `break`s, failing condition and `else` agree on; one that never ends otherwise ends the path. An exit while held, paths that meet in different states, a jump to an outer loop of the walk, a nested release it does not follow, and any use but a member (an address, a copy, an argument: a transfer or alias) are undecided. No missing-errdefer allegation from proximity. |
 | A004/2 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
 | A005/2 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free: an adoption is decided only when it takes a whole `alloc(u8, n)` local from the same allocator that nothing uses afterwards (below); every other one records that uncertainty. |
 
@@ -112,9 +112,20 @@ generic function, an `anytype` or `type` parameter is the union of what the proj
 pass, when every use of the function is such a call and its container is not reached by name
 from a module root the project imports (a consumer could call it with anything); a member call
 through a path of declarations from a module import reaches only exported names, and one whose
-argument count the function cannot take is another function. A member of a choice between
-types leaves out the choices without members (`void`, a number): a build in which the access
-does not compile. Anything else stays unknown.
+argument count the function cannot take is another function. A use of the function's name as a
+value's member, other than a call, is a field and no use of the function: Zig has no bound
+methods. A value here is what cannot be a type: an address taken, a `var`, a parameter declared
+with a type other than `type`, an `anytype` parameter the program dereferences, a `const` of one
+of these, a field of one (unless some container in the project declares a `comptime` field of
+that name), and a member assigned to or used as a number. `@call(modifier, f, .{ ... })` passes
+the tuple's elements. A call that passes something from a module the build does not have for
+its file (`Project.Input.absent`) is not compiled in this build and is left out of the union.
+A member of a choice between types leaves out the choices without that member (`void`, a
+number, a type that does not declare it): a build in which the access does not compile, and a
+receiver that is a pointer to a choice is a pointer to each of its alternatives. `comptime x`
+has `x`'s type, and a struct literal with no type where nothing gives it one (a block's value,
+an `anytype` argument) is an anonymous struct whose fields are what it gives them. Anything
+else stays unknown.
 Required unknown receivers and unsupported acquisition/cleanup or adoption sites record undecided coverage. General prevention limits describe the rule boundary; they are not unconditional per-file incompleteness.
 Front-end rejection and budget exhaustion still make execution incomplete independently of
 findings acceptance. The library's own files, those its `aegis` root imports, are safe-type internals; other source requires the same explicit site policy as consumers. Wiping inline padding
@@ -138,22 +149,22 @@ The contract covers aegis's published types past the guards too, each by what it
 | `bounded.Buffer`, `RingBuffer`/`QueueBuffer` | `storage`, `gpa`, `maximum`, `used`, `head` | yes | `deinit` |
 | `bounded.Limit` | `maximum` | no | none |
 | `bounded.Budget` | `ceiling`, `taken` | yes: the copy keeps its own count | none |
-| `Budget.Reservation` | `budget`, `amount`, `live` | yes | `release`, or `moveInto` |
+| `Budget.Reservation` | `budget`, `amount`, `live` | yes | `release`, `consume` (its amount kept as consumed work), or `moveInto` |
 | `own.Owned`, `OwnedIo` | `data`, `state` | yes | `deinit`, or `take`/`moveInto` |
 | `own.MustUse` | `data`, `pending`, `live` | yes | `take` or `acknowledge` (its `deinit` checks that one ran) |
 | `Shared` | `block`, `live` | yes: a copy with `=` is a handle never retained | `release` (each handle, `create`d or `retain`ed) |
-| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `free_head` | yes | `deinit` |
+| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `free_head`, `entries` | yes | `deinit` |
 | `handle.Domain` | none | yes: both issue the same instances | none |
 | `handle.Index` | a scalar: A004 | no | none |
-| `state.Machine.At` | `live` | yes | none (a payload leaves by `take` or a transition) |
-| `state.Machine.Runtime` | none yet | yes: one driver owns a machine | none |
+| `state.Machine.At` | `payload`, `live` | yes | none (a payload leaves by `take` or a transition) |
+| `state.Machine.Runtime` | `state` | yes: one driver owns a machine | none |
 | `scope.Table` | `slots`, `free_head`, `used_up`, `open_count` | yes | `deinit` |
-| `Table.Scope` | `table`, `generation` | no | `end` |
-| `scope.Ref` | `slot`, `generation` | no | none |
-| `input.Untrusted` | none yet | no | none |
+| `Table.Scope` | `table`, `index`, `generation` | no | `end` |
+| `scope.Ref` | `ptr`, `slot`, `generation` | no | none |
+| `input.Untrusted` | `value` | no | none |
 | `secret.Choice` | `bit` | no | none |
 
-An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. Six private fields wait for glint to resolve the receivers of family code that reads fields of the same names: a staged payload's `payload`, a runtime machine's `state`, a scope's `index`, a reference's `ptr`, a secondary map's `entries` and unparsed input's `value`. `Atomic`, `Order`, `InitContext`, `TaskIdentity` and `err` stay outside the contract.
+An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A call that gives a type aegis declares and the contract does not list (a guard's `Handoff`) owes nothing: the contract names every type that carries an obligation. A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. `Atomic`, `Order`, `InitContext`, `TaskIdentity` and `err` stay outside the contract.
 
 A005 decides an adoption of a whole byte allocation: the allocation is a local initialized by `a.alloc(u8, n)` (through `try` or `catch`) from the allocator the adoption is given, written the same way, and no use of the local follows the adoption or waits in a `defer` or `errdefer`. The extent is then the allocation's and the alignment a byte's, and the owner holds it alone; every other shape stays a review site.
 Aegis scalar ABI guarantees cover non-exhaustive enums over 8–64-bit and native-size integers;
