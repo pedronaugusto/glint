@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-10-17
+
 ### Added
 
 - The aegis contract covers every published type past the guards: bounded storage (`Array`, `Ring`/`Queue`, `Buffer`, `RingBuffer`/`QueueBuffer`, `Limit`, `Budget` and its `Reservation`), `own.Owned`, `OwnedIo` and `MustUse`, `Shared`, generational storage (`Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap`, `Domain`, `Index`), typestate (`Machine.At`, `Machine.Runtime`), scopes (`Table`, `Table.Scope`, `Ref`), `input.Untrusted` and `secret.Choice`. A001 keeps each one's private state behind its operations, A002 finds a copy of each that is an owner (a reservation released twice, a shared handle copied with `=`, a domain issuing its instances twice, a machine with two drivers), A003 checks that a local one is released by what releases it (`release`, `end`, `deinit`, a `MustUse` taken or acknowledged), or moved into storage the caller names (`moveInto`, `take`), and `Index` is a scalar for A004.
