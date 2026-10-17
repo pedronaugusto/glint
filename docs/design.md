@@ -93,9 +93,9 @@ Operation names (`init`, `acquire`, `deinit`, `raw`, `material`, ...) are the pa
 |---|---|---|
 | A001/2 | Recognized secret backing or Guarded lock/data/capability field access must follow exposure and live-guard contracts. | Initialization, publication, intended safe internals and public-only secret components require review. No race/disclosure proof. |
 | A002/2 | Direct lexical owner/capability copies require transfer; directly returned expose/value borrows require a lifetime mechanism. | Pointer aliases (a copy of a value that resolves to a pointer or an optional pointer, whatever it points at) and type aliases excluded; a copy whose type or source is declared plain data (primitives, and arrays, slices, pointers, optionals and error unions of them, a literal, a call declared to return one) is decided as no owner; lifetimes, live status, retained callers and field copies are undecided. |
-| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. A recognized acquisition is an owner's constructor, a guard's acquisition, or a call to the program's own function whose result is an owner by value. | The walk follows the block's statements, the branches of an `if` and the bodies of `while` and `for` loops: a direct `deinit`, a `defer` of one (after which every exit runs it; one a branch or body defers runs as it ends), member uses, a release before a `return`, a guard's `handOff()`, the owner returned held (its caller's to release). A loop's body must bring the owner back to its start in the state it entered in, and the loop goes on in the state its `break`s, failing condition and `else` agree on; one that never ends otherwise ends the path. An exit while held, paths that meet in different states, a jump to an outer loop of the walk, a nested release it does not follow, and any use but a member (an address, a copy, an argument: a transfer or alias) are undecided. No missing-errdefer allegation from proximity. |
+| A003/2 | Local recognized acquisition at block end requires cleanup; direct cleanup twice or address use after cleanup is a local witness. A recognized acquisition is an owner's constructor, a guard's acquisition, or a call to the program's own function whose result is an owner by value. | The walk follows the block's statements, the branches of an `if` and the bodies of `while` and `for` loops: a direct `deinit`, a `defer` of one (after which every exit runs it; one a branch or body defers runs as it ends), member uses, a release before a `return`, a guard's `handOff()`, the owner returned held or carried by value in what is returned (its caller's to release), an `errdefer` release covering the error exits after it (a `try`, a `return error.X`), and a `catch` or `orelse` handler walked as a branch. A loop's body must bring the owner back to its start in the state it entered in, and the loop goes on in the state its `break`s, failing condition and `else` agree on; one that never ends otherwise ends the path. An exit while held, paths that meet in different states, a jump to an outer loop of the walk, a nested release it does not follow, and any use but a member (an address, a copy, an argument: a transfer or alias) are undecided. No missing-errdefer allegation from proximity. |
 | A004/2 | Immediate `raw()` arithmetic/comparison or narrowing/reconstruction cast must retain domain/unit/all-build failure semantics. | Raw boundaries can be intentional; no generic argument equality or raw value taint. Does not prove a mixed clock/domain or integer overflow. |
-| A005/2 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free. Every recognized adoption records that uncertainty. |
+| A005/2 | SecretBytes.adopt requires full allocator extent/exclusive ownership; explicit end-bounded slice is a review site. | Slice syntax cannot prove allocation extent, provenance, alignment, successful transfer or wipe/free: an adoption is decided only when it takes a whole `alloc(u8, n)` local from the same allocator that nothing uses afterwards (below); every other one records that uncertainty. |
 
 A receiver is decided by the type it resolves to: a published aegis type is a candidate, a type
 nested in one (a guarded value's guard) stays unknown, and any other resolved type is not a
@@ -130,6 +130,31 @@ not prove either. Suppression cannot erase undecided coverage or certify incompl
 These are explicitly adopted operation checks. Gate selection does not claim general security, flow or lifetime proof, and generic defaults remain unchanged.
 Raw unadopted secrets/locks/domain integers are outside recognized declaration identity; a general
 raw replacement rule needs evidence of actual danger, operation effects and complete triage first.
-Unpublished constant-time Choice/Order/Confined/bounded/own/scope contracts are excluded.
+The contract covers aegis's published types past the guards too, each by what its source keeps behind its operations and what it owes:
+
+| Types | A001 private state | A002 copy is a second owner | A003 obligation of a local acquisition |
+|---|---|---|---|
+| `bounded.Array`, `Ring`/`Queue` | `storage`, `used`, `head` | no: a copy is its elements' (A002 does not read the element type) | none |
+| `bounded.Buffer`, `RingBuffer`/`QueueBuffer` | `storage`, `gpa`, `maximum`, `used`, `head` | yes | `deinit` |
+| `bounded.Limit` | `maximum` | no | none |
+| `bounded.Budget` | `ceiling`, `taken` | yes: the copy keeps its own count | none |
+| `Budget.Reservation` | `budget`, `amount`, `live` | yes | `release`, or `moveInto` |
+| `own.Owned`, `OwnedIo` | `data`, `state` | yes | `deinit`, or `take`/`moveInto` |
+| `own.MustUse` | `data`, `pending`, `live` | yes | `take` or `acknowledge` (its `deinit` checks that one ran) |
+| `Shared` | `block`, `live` | yes: a copy with `=` is a handle never retained | `release` (each handle, `create`d or `retain`ed) |
+| `handle.Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap` | `slots`, `storage`, `primary`, `values`, `keys`, `entries`, `free_head` | yes | `deinit` |
+| `handle.Domain` | none | yes: both issue the same instances | none |
+| `handle.Index` | a scalar: A004 | no | none |
+| `state.Machine.At` | `payload`, `live` | yes | none (a payload leaves by `take` or a transition) |
+| `state.Machine.Runtime` | `state` | yes: one driver owns a machine | none |
+| `scope.Table` | `slots`, `free_head`, `used_up`, `open_count` | yes | `deinit` |
+| `Table.Scope` | `table`, `index`, `generation` | no | `end` |
+| `scope.Ref` | `ptr`, `slot`, `generation` | no | none |
+| `input.Untrusted` | `value` | no | none |
+| `secret.Choice` | `bit` | no | none |
+
+An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. `Atomic`, `Order`, `InitContext`, `TaskIdentity` and `err` stay outside the contract.
+
+A005 decides an adoption of a whole byte allocation: the allocation is a local initialized by `a.alloc(u8, n)` (through `try` or `catch`) from the allocator the adoption is given, written the same way, and no use of the local follows the adoption or waits in a `defer` or `errdefer`. The extent is then the allocation's and the alignment a byte's, and the owner holds it alone; every other shape stays a review site.
 Aegis scalar ABI guarantees cover non-exhaustive enums over 8–64-bit and native-size integers;
 128-bit values remain Zig-only and are not included in that C ABI guarantee.

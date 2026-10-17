@@ -4,6 +4,19 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- The aegis contract covers every published type past the guards: bounded storage (`Array`, `Ring`/`Queue`, `Buffer`, `RingBuffer`/`QueueBuffer`, `Limit`, `Budget` and its `Reservation`), `own.Owned`, `OwnedIo` and `MustUse`, `Shared`, generational storage (`Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap`, `Domain`, `Index`), typestate (`Machine.At`, `Machine.Runtime`), scopes (`Table`, `Table.Scope`, `Ref`), `input.Untrusted` and `secret.Choice`. A001 keeps each one's private state behind its operations, A002 finds a copy of each that is an owner (a reservation released twice, a shared handle copied with `=`, a domain issuing its instances twice, a machine with two drivers), A003 checks that a local one is released by what releases it (`release`, `end`, `deinit`, a `MustUse` taken or acknowledged), or moved into storage the caller names (`moveInto`, `take`), and `Index` is a scalar for A004.
+- A003 takes as an acquisition any call that gives an owner by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`), reads an `errdefer` release as covering the error exits after it (a `try`, a `return error.X`), walks a `catch` or `orelse` handler as a branch, and reads an owner carried by value in what is returned (a field of a returned literal, an argument of the call that makes it) as the caller's.
+- A002 reads a copy of a guard, a shared handle, a reservation or another owner that moves by assignment as a move when nothing reads the source again (`var guard = free;` out of an `if` capture); a secret's copy, which leaves its bytes unwiped, is still found.
+- A005 decides an adoption of a whole byte allocation: a local made by `a.alloc(u8, n)` from the allocator the adoption is given, which nothing uses after the adoption or in a `defer` or `errdefer`.
+- A library member's path can name a type a type function declares (`Budget.Reservation`), and a type function that returns another's call (`Owned` returning `Owner(...)`) makes that one's container.
+
+### Fixed
+
+- The result of a call declared `E!T`, `?T` or `*T`, where `T` is a container, is a value of `T` inside the wrapper, not the type `T`: a copy of a `Shared` handle `create` returned was not seen as an owner.
+- A001 left `x.name()` undecided when `x` did not resolve and `name` was a backing field's; a call needs a function, which no backing field of that name holds.
+
 ## [0.2.13] - 2026-10-17
 
 ### Added

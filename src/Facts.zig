@@ -147,6 +147,12 @@ fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!
     while (names.next()) |name| {
         const container = switch (current) {
             .container, .instance => |c| c,
+            // A member of a type function's container, as `Budget.Reservation` names the
+            // reservation every budget declares.
+            .function => |function| switch ((try self.template(function)) orelse return .{ .gap = .unsupported }) {
+                .container, .instance => |c| c,
+                else => return .{ .gap = .unsupported },
+            },
             .unknown => |why| return .{ .gap = why },
             else => return .{ .gap = .unsupported },
         };
@@ -925,6 +931,9 @@ fn same(a: Value, b: Value, depth: usize) bool {
 /// arguments are evaluated.
 pub fn template(self: *Facts, decl: Decl) ResolveError!?Value {
     if (self.templates.get(decl)) |known| return known;
+    // A type function that returns another's call is read through it; one that reaches itself
+    // again that way makes no container.
+    try self.templates.put(self.gpa, decl, null);
     const found = try self.findTemplate(decl);
     try self.templates.put(self.gpa, decl, found);
     return found;
@@ -948,7 +957,16 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
     _ = self.recursion(decl, body, last) orelse return null;
     const returned = tree.nodeData(last).opt_node.unwrap() orelse return null;
     var container_buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullContainerDecl(&container_buffer, returned) == null) return null;
+    if (tree.fullContainerDecl(&container_buffer, returned) == null) {
+        // `return Owner(T, false, cleanup);`: the container another type function makes, the
+        // same template whatever arguments this one passes it.
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, returned) orelse return null;
+        const callee = (try self.definition(decl.file, call.ast.fn_expr)) orelse return null;
+        const function = (try self.origin(callee)) orelse return null;
+        if (self.project.models[function.file.raw()].declarations[function.index].kind != .function) return null; // safe: a declaration identity indexes its own frozen model.
+        return self.template(function);
+    }
     const value = try self.resolve(decl.file, returned);
     return value;
 }
@@ -1053,9 +1071,16 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
     return null;
 }
 
+/// A value of the type `value` names: an instance of a container, and through a pointer,
+/// optional, error union or array type, the same wrapper around an instance of its payload
+/// (`E!Self` gives an error union whose payload is a `Self`).
 fn instance(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .container => |c| .{ .instance = c },
+        .pointer => |inner| .{ .pointer = try self.boxed(try self.instance(inner.*)) },
+        .optional => |inner| .{ .optional = try self.boxed(try self.instance(inner.*)) },
+        .error_union => |inner| .{ .error_union = try self.boxed(try self.instance(inner.*)) },
+        .array => |inner| .{ .array = try self.boxed(try self.instance(inner.*)) },
         .alternatives => |each| blk: {
             const mapped = try self.gpa.alloc(Value, each.len);
             for (each, mapped) |one, *out| out.* = try self.instance(one);

@@ -6,7 +6,44 @@ const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Library = @import("Library.zig").Library;
 const Ast = std.zig.Ast;
-pub const Kind = enum { secret, bytes, guarded, guard, scalar, condition, once, confined };
+pub const Kind = enum {
+    secret,
+    bytes,
+    guarded,
+    guard,
+    scalar,
+    condition,
+    once,
+    confined,
+    /// Inline bounded storage: `Array`, `Ring` (`Queue`).
+    inline_store,
+    /// Bounded storage over a caller's or an allocated buffer: `Buffer`, `RingBuffer` (`QueueBuffer`).
+    buffer,
+    limit,
+    budget,
+    /// A budget's reservation, released once.
+    reservation,
+    /// `Owned` and `OwnedIo`.
+    owned,
+    must_use,
+    shared,
+    /// Generational storage: `Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap`.
+    slots,
+    /// `handle.Domain`, which issues instances.
+    issuer,
+    /// A typestate machine's staged payload, `Machine.At`.
+    stage,
+    /// A typestate machine's payload beside its state, `Machine.Runtime`.
+    machine,
+    /// `scope.Table`, the creator's record of its scopes.
+    table,
+    /// One open scope, `Table.Scope`.
+    scope,
+    /// A reference made in a scope, `scope.Ref`.
+    ref,
+    untrusted,
+    choice,
+};
 
 /// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
 /// module root reaches it, so recognition survives any revision that keeps its public names and
@@ -25,6 +62,7 @@ const modules = [_]Lib.Module{
 const secret_members = [_]Lib.Member{
     .{ .path = "Secret", .role = .secret },
     .{ .path = "SecretBytes", .role = .bytes },
+    .{ .path = "Choice", .role = .choice, .required = false },
 };
 const sync_members = [_]Lib.Member{
     .{ .path = "Guarded", .role = .guarded },
@@ -35,6 +73,7 @@ const sync_members = [_]Lib.Member{
     .{ .path = "Once", .role = .once },
     .{ .path = "Lazy", .role = .once },
     .{ .path = "Confined", .role = .confined },
+    .{ .path = "Shared", .role = .shared, .required = false },
 };
 const int_members = [_]Lib.Member{
     .{ .path = "Checked", .role = .scalar },
@@ -75,6 +114,32 @@ const root_members = [_]Lib.Member{
     .{ .path = "units.Bits", .role = .scalar },
     .{ .path = "units.Duration", .role = .scalar },
     .{ .path = "units.Instant", .role = .scalar },
+    .{ .path = "secret.Choice", .role = .choice },
+    .{ .path = "Shared", .role = .shared },
+    .{ .path = "bounded.Array", .role = .inline_store },
+    .{ .path = "bounded.Ring", .role = .inline_store },
+    .{ .path = "bounded.Queue", .role = .inline_store },
+    .{ .path = "bounded.Buffer", .role = .buffer },
+    .{ .path = "bounded.RingBuffer", .role = .buffer },
+    .{ .path = "bounded.QueueBuffer", .role = .buffer },
+    .{ .path = "bounded.Limit", .role = .limit },
+    .{ .path = "bounded.Budget", .role = .budget },
+    .{ .path = "bounded.Budget.Reservation", .role = .reservation },
+    .{ .path = "own.Owned", .role = .owned },
+    .{ .path = "own.OwnedIo", .role = .owned },
+    .{ .path = "own.MustUse", .role = .must_use },
+    .{ .path = "handle.Pool", .role = .slots },
+    .{ .path = "handle.SlotMap", .role = .slots },
+    .{ .path = "handle.DenseSlotMap", .role = .slots },
+    .{ .path = "handle.SecondaryMap", .role = .slots },
+    .{ .path = "handle.Domain", .role = .issuer },
+    .{ .path = "handle.Index", .role = .scalar },
+    .{ .path = "state.Machine.At", .role = .stage },
+    .{ .path = "state.Machine.Runtime", .role = .machine },
+    .{ .path = "scope.Table", .role = .table },
+    .{ .path = "scope.Table.Scope", .role = .scope },
+    .{ .path = "scope.Ref", .role = .ref },
+    .{ .path = "input.Untrusted", .role = .untrusted },
 };
 
 /// Finds known owners through lexical aliases, declared types and exact constructors.
