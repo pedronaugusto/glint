@@ -39,12 +39,27 @@ fn checkAccess(c: *Context) Context.Error!void {
         const data = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
         if (!backingName(name)) continue;
+        if (try typeValue(c, data[0])) continue;
         if (try refuted(c, node, name)) continue;
         const k = (try requiredOwner(c, data[0], access, data[1])) orelse continue;
         const is_backing = backing(k, name);
         if (is_backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
 }
+/// Whether `node` is a type, whose members are declarations and never a value's fields: a
+/// container named as such, or a parameter or constant declared `type` (`V.maximum` of a
+/// `comptime V: type`).
+fn typeValue(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    if (try c.facts.resolve(c.file, node) == .container) return true;
+    const tree = try c.project.syntax(try c.source());
+    if (tree.nodeTag(node) != .identifier) return false;
+    const model = &c.project.models[c.file.raw()];
+    const index = (model.reference(node) orelse return false).declaration orelse return false;
+    const decl = model.declarations[index];
+    const declared = if (decl.kind == .parameter) decl.node else if (tree.fullVarDecl(decl.node)) |v| v.ast.type_node.unwrap() orelse return false else return false;
+    return tree.nodeTag(declared) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(declared)), "type");
+}
+
 /// Whether `field` (`x.name`, a backing field's name) cannot be an aegis owner's backing field,
 /// whatever `x` is, because of what the program does with it. For every published type with a
 /// backing field of that name, one of: the program reads a member of `x.name` that the field's
@@ -108,10 +123,29 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
         if (member == null and !operand) return false;
         const declared = try c.facts.resolve(decl.file, type_expr);
         if (member) |read| {
+            // An array, a slice or a number has no members but a length (and a slice's pointer).
+            const sequence = std.mem.eql(u8, read, "len") or std.mem.eql(u8, read, "ptr");
+            // Written as a slice or an array, whatever its element is.
+            const slice = if (written.fullPtrType(type_expr)) |ptr| ptr.size == .slice else false;
+            if (slice or written.fullArrayType(type_expr) != null) {
+                if (sequence) return false;
+                continue;
+            }
+            // A type chosen per build (a Debug-only witness): no choice has the member.
+            if (declared == .alternatives) {
+                for (declared.alternatives) |one| switch (one) {
+                    .container, .instance => |held| if (c.facts.member(held, read) != null) return false,
+                    else => return false,
+                };
+                continue;
+            }
             const holder = switch (declared) {
                 .container, .instance => |held| held,
+                .array => if (sequence) return false else continue,
+                .primitive, .scalar => continue,
                 .pointer => |to| switch (to.*) {
                     .container, .instance => |held| held,
+                    .array, .primitive, .scalar => if (sequence) return false else continue,
                     else => return false,
                 },
                 else => return false,
@@ -237,13 +271,15 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .owned => &.{ "data", "state" },
         .must_use => &.{ "data", "pending", "live" },
         .shared => &.{ "block", "live" },
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "entries", "free_head" },
-        .stage => &.{ "payload", "live" },
-        .machine => &.{"state"},
+        // Not yet admitted, while family receivers glint does not resolve read fields of these
+        // names (glint-complete): a secondary map's `entries`, a staged payload's `payload`, a
+        // runtime machine's `state`, a scope's `index`, a reference's `ptr` and an unparsed
+        // input's `value`.
+        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head" },
+        .stage => &.{"live"},
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "index", "generation" },
-        .ref => &.{ "ptr", "slot", "generation" },
-        .untrusted => &.{"value"},
+        .scope => &.{ "table", "generation" },
+        .ref => &.{ "slot", "generation" },
         .choice => &.{"bit"},
         else => &.{},
     };

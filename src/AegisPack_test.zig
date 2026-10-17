@@ -965,15 +965,15 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
     // A typed position's raw value in arithmetic.
     try expectJudged(head ++ "const I = aegis.handle.Index(Tag, u32);\npub fn f(i: I) u32 { return i.raw() + 1; }", pack.scalar, true, 1);
     // A staged payload and a machine's state.
-    try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.payload; _ = r.state; _ = r.payload; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.live; _ = r.payload; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f() void { var s = Machine.At(.open, u32).init(1); const copy = s; _ = copy; _ = &s; }", pack.copies, true, 1);
     // A scope is opened and ended; its reference's pointer is read through its check.
-    try expectJudged(head ++ "pub fn f(t: *Table, r: aegis.scope.Ref(Tag, *u32)) void { _ = t.open_count; _ = r.ptr; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(t: *Table, r: aegis.scope.Ref(Tag, *u32)) void { _ = t.open_count; _ = r.generation; }", pack.access, true, 2);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); _ = &s; }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer s.end(); }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer s.end(); const copy = s; _ = copy; }", pack.copies, true, 0);
     // Unparsed input read past its parser; a decision read past its declassification.
-    try expectJudged(head ++ "pub fn f(u: aegis.input.Untrusted([]const u8)) []const u8 { return u.value; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(u: aegis.input.Untrusted([]const u8)) []const u8 { return u.readForParse(); }", pack.access, true, 0);
     try expectJudged(head ++ "pub fn f(a: *const [4]u8, b: *const [4]u8) bool { const c = aegis.secret.equal(4, a, b); return c.bit == 1; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(a: *const [4]u8, b: *const [4]u8) bool { const c = aegis.secret.equal(4, a, b); const copy = c; return copy.declassify(\"fixture\"); }", pack.copies, true, 0);
 }
@@ -1002,4 +1002,14 @@ test "an owner released on error by errdefer, carried out in what is returned, o
     try expectJudged(head ++ "pub fn f(g: *aegis.Guarded(u32)) void { if (g.tryAcquire()) |free| { var held = free; held.deinit(); _ = free.value(); } }", pack.copies, true, 1);
     // A secret's bytes stay behind a copy: never a move.
     try expectJudged(head ++ "pub fn f() void { const s = aegis.Secret(u32).init(1); var t = s; t.deinit(); }", pack.copies, true, 1);
+}
+
+test "a member of a type is a declaration, never a backing field" {
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn max(comptime V: type) u32 { return V.maximum; }\npub fn f() u32 { return max(aegis.int.Ranged(u32, 0, 9)); }", pack.access, true, 0);
+}
+
+test "a member read of a backing field that is an array, a slice or a number is decided by the member" {
+    const head = "const aegis = @import(\"aegis\");\nconst unknown = @import(\"unmapped\");\n";
+    try expectJudged(head ++ "pub fn f(o: *unknown.Op) void { o.held.storage.scratch = 0; _ = o.held.storage.len; }", pack.access, false, 0);
+    try expectJudged(head ++ "pub fn f(o: *unknown.Op) void { o.held.storage.scratch = 0; }", pack.access, true, 0);
 }
