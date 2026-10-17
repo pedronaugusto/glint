@@ -4,6 +4,19 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- The aegis contract admits five private fields that waited (a staged payload's `payload`, a scope's `index`, a reference's `pointer`, a secondary map's `entries`, unparsed input's `value`) and covers `sync.Atomic` (`cell`; a copy is a second cell), the task contexts `Order(...).Context` and `InitContext` (a copy is a second context), `Order(...).Ordered` (`base`; its ordered acquisitions give guards released by `deinit`), and `id.Counter` as an issuer like `Domain` (a copy issues its ids twice). A runtime machine's `state` still waits (docs/design.md).
+- Receivers glint left unknown: `@typeInfo` of a type that does not resolve is still type information, and a switch on it captures the part its prong names; the bytes of `@errorName`, `@tagName`, `@typeName`, `@embedFile` and the numbers of the counting and converting builtins; a slice of a string literal; `const a, const b = x` of a tuple or an array; a loop used as a value (its breaks and `else`); a choice of types per build leaves out `noreturn`, alternatives that lack the member read, and alternatives an unwrap (`.?`, `catch`) does not apply to; a guarded owner's guard recognized by its resolved type, as when passed to an `anytype` parameter.
+
+### Changed
+
+- aegis 0.1.14 (`scope.Ref`'s private `pointer`).
+
+### Fixed
+
+- A container written as a `switch` prong's or an `if` branch's value (`.windows => struct { ... }`) holds its own members: they were read as the branch's, so its fields did not resolve.
+
 ## [0.2.14] - 2026-10-17
 
 ### Added

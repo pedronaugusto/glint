@@ -43,8 +43,11 @@ pub const Made = struct { function: Decl, file: Project.FileId, call: Ast.Node.I
 pub const Env = struct { function: Decl, args: []const Value, depth: usize };
 /// A type seen through `@typeInfo`, and how far into its information a chain of fields has
 /// gone: `.pointer.child`, `.optional.child`, `.array.child`, `.error_union.payload`,
-/// `.@"fn".return_type` and `.@"fn".param_types[i]`.
-pub const Reflected = struct { of: *const Value, at: enum { info, pointer, optional, array, error_union, function, params } };
+/// `.@"fn".return_type` and `.@"fn".param_types[i]`. `part` is any other part of the
+/// information (`.@"struct".fields`, a field's `name`): a `std.builtin.Type` value whose own
+/// members are not followed. A type that does not resolve still has information: what it
+/// describes stays unknown, never what the information is.
+pub const Reflected = struct { of: *const Value, at: enum { info, pointer, optional, array, error_union, function, params, part } };
 /// A library's declarations in this project, found through its modules' roots. Roles are the
 /// caller's enum values; the resolver never interprets them.
 pub const Publication = struct {
@@ -254,6 +257,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(file, node)) |value| return value,
+        .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
         // `comptime x` and `nosuspend x` have `x`'s type.
         .@"comptime", .@"nosuspend" => return self.resolve(file, tree.nodeData(node).node),
@@ -371,8 +375,22 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
     if (std.mem.eql(u8, name, "@as") and args.len == 2) return self.instance(try self.resolve(file, args[0]));
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolve(file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolve(file, args[0]));
+    // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
+    for ([_][]const u8{ "@errorName", "@tagName", "@typeName", "@embedFile" }) |bytes| if (std.mem.eql(u8, name, bytes)) return .{ .pointer = try self.boxed(.{ .primitive = "u8" }) };
+    // A number or a truth value, whatever the arguments are.
+    for (numeric_builtins) |number| if (std.mem.eql(u8, name, number)) return .scalar;
     return .{ .unknown = .comptime_dependent };
 }
+
+/// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
+/// integers, bit counts, arithmetic and the queries that answer yes or no.
+const numeric_builtins = [_][]const u8{
+    "@sizeOf",       "@alignOf",       "@bitSizeOf",    "@offsetOf",     "@bitOffsetOf", "@intFromPtr", "@intFromBool", "@intFromEnum",
+    "@intFromError", "@intFromFloat",  "@clz",          "@ctz",          "@popCount",    "@byteSwap",   "@bitReverse",  "@divExact",
+    "@divFloor",     "@divTrunc",      "@mod",          "@rem",          "@shlExact",    "@shrExact",   "@min",         "@max",
+    "@abs",          "@sqrt",          "@floor",        "@ceil",         "@trunc",       "@round",      "@hasDecl",     "@hasField",
+    "@inComptime",   "@returnAddress", "@frameAddress", "@floatFromInt", "@mulAdd",      "@sin",        "@cos",         "@exp",
+};
 
 fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     if (lhs == .reflected) return self.reflectedMember(lhs.reflected, name);
@@ -394,6 +412,11 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     return .{ .unknown = .unresolved };
 }
 
+/// Whether a container written in the program declares no member `name`.
+fn lacks(self: *const Facts, container: Container, name: []const u8) bool {
+    return !container.symbolic and self.member(container, name) == null;
+}
+
 /// A field of an anonymous struct literal: the value the literal gives it.
 fn literalField(self: *Facts, literal: Key, name: []const u8) ResolveError!Value {
     const tree = &self.project.files[literal.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
@@ -412,6 +435,12 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
     var kept: std.ArrayList(Value) = .empty;
     for (choices) |choice| switch (choice) {
         .primitive, .scalar => continue,
+        // A type that declares no such member, likewise.
+        .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
+        .pointer => |to| switch (to.*) {
+            .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
+            else => try kept.append(self.gpa, try self.memberValue(choice, name)),
+        },
         else => try kept.append(self.gpa, try self.memberValue(choice, name)),
     };
     if (kept.items.len == 0) return .{ .unknown = .unresolved };
@@ -699,7 +728,14 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
     return switch (value) {
         .optional => |inner| if (wrapper == .optional) inner.* else .{ .unknown = .unsupported },
         .error_union => |inner| if (wrapper == .error_union) inner.* else .{ .unknown = .unsupported },
-        .alternatives => self.map(value, wrapper, payload),
+        // A choice that is not so wrapped (`void` off Linux) is a build in which this unwrap
+        // does not compile: it is left out.
+        .alternatives => |each| blk: {
+            var kept: std.ArrayList(Value) = .empty;
+            for (each) |one| if (one == wrapper or one == .unknown) try kept.append(self.gpa, try self.payload(one, wrapper));
+            if (kept.items.len == 0) break :blk .{ .unknown = .unsupported };
+            break :blk self.choose(kept.items);
+        },
         .unknown => value,
         else => .{ .unknown = .unsupported },
     };
@@ -732,7 +768,8 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
 fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .array => .{ .pointer = try self.boxed(value) },
-        .pointer, .unknown => value,
+        // A string literal's bytes stay plain bytes.
+        .pointer, .unknown, .scalar => value,
         .alternatives => self.map(value, {}, sliced),
         else => .{ .unknown = .unsupported },
     };
@@ -799,6 +836,55 @@ fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
         }
         try values.append(self.gpa, try self.resolve(file, operand));
     }
+    const chosen = try self.choose(values.items);
+    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
+    return .{ .optional = try self.boxed(chosen) };
+}
+
+/// A loop used as a value (`const e = for (xs) |x| { if (p(x)) break x; } else null;`): what
+/// its own breaks give, chosen with its `else` branch as a `switch`'s branches are. A break
+/// is the loop's own when it names the loop's label, or names none and no loop nested in this
+/// one encloses it.
+fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const parents = self.project.models[file.raw()].node_parents; // safe: enum identities index their owning frozen tables without narrowing.
+    const body: Ast.Node.Index, const otherwise: Ast.Node.Index, const label: ?[]const u8 = if (tree.fullFor(node)) |loop|
+        .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
+    else if (tree.fullWhile(node)) |loop|
+        .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
+    else
+        return null;
+    var values: std.ArrayList(Value) = .empty;
+    var nullable = false;
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const at = tree.nodeMainToken(jump);
+        if (at < first or at > last) continue;
+        const data = tree.nodeData(jump).opt_token_and_opt_node;
+        if (data[0].unwrap()) |token| {
+            if (label == null or !std.mem.eql(u8, tree.tokenSlice(token), label.?)) continue;
+        } else {
+            // The innermost loop around the break, short of this one, takes it.
+            var up = parents[@backingInt(jump)]; // safe: a node index indexes its own tree's parent table.
+            const inner = while (up) |p| : (up = parents[@backingInt(p)]) { // safe: a node index indexes its own tree's parent table.
+                if (p == node) break false;
+                if (tree.fullFor(p) != null or tree.fullWhile(p) != null) break true;
+            } else true;
+            if (inner) continue;
+        }
+        const operand = data[1].unwrap() orelse return null;
+        if (never(tree, operand)) continue;
+        if (isNull(tree, operand)) {
+            nullable = true;
+            continue;
+        }
+        try values.append(self.gpa, try self.resolve(file, operand));
+    }
+    if (isNull(tree, otherwise)) nullable = true else if (!never(tree, otherwise)) try values.append(self.gpa, try self.resolve(file, otherwise));
+    if (values.items.len == 0) return null;
     const chosen = try self.choose(values.items);
     if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
     return .{ .optional = try self.boxed(chosen) };
@@ -886,6 +972,11 @@ fn switchPayload(self: *Facts, file: Project.FileId, case_node: Ast.Node.Index, 
     const parent = self.project.models[file.raw()].node_parents[@backingInt(case_node)] orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
     const whole = tree.fullSwitch(parent) orelse return .{ .unknown = .unsupported };
     const subject = try self.resolve(file, whole.ast.condition);
+    // A switch on type information (`@typeInfo(T)`) captures the part its prong names.
+    if (subject == .reflected and subject.reflected.at == .info) {
+        if (full.ast.values.len != 1 or tree.nodeTag(full.ast.values[0]) != .enum_literal) return .{ .reflected = .{ .of = subject.reflected.of, .at = .part } };
+        return self.reflectedMember(subject.reflected, try self.memberName(tree.tokenSlice(tree.nodeMainToken(full.ast.values[0]))));
+    }
     // A pointer's target resolves as its type: a dereferenced subject is a container here.
     const container = switch (subject) {
         .instance, .container => |c| c,
@@ -1032,8 +1123,37 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
             if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return self.instance(type_value);
         }
         if (variable.ast.init_node.unwrap()) |value| return self.resolve(decl.file, value);
+        if (model.node_parents[@backingInt(declaration_record.node)]) |parent| if (tree.nodeTag(parent) == .assign_destructure) return self.destructured(decl.file, parent, declaration_record.node); // safe: a node index indexes its own tree's parent table.
     }
     return .{ .unknown = .unsupported };
+}
+
+/// The variable `variable` of `const a, const b = value;`: the field of a tuple at its
+/// position, or an element of an array.
+fn destructured(self: *Facts, file: Project.FileId, whole: Ast.Node.Index, variable: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const full = tree.assignDestructure(whole);
+    const position = std.mem.findScalar(Ast.Node.Index, full.ast.variables, variable) orelse return .{ .unknown = .unsupported };
+    const value = try self.resolve(file, full.ast.value_expr);
+    switch (value) {
+        .array => |each| return each.*,
+        .instance => |tuple| {
+            const model = &self.project.models[tuple.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+            const source = &self.project.files[tuple.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+            var buffer: [2]Ast.Node.Index = undefined;
+            const container = source.fullContainerDecl(&buffer, model.scopes[tuple.scope].node) orelse return .{ .unknown = .unsupported };
+            var at: usize = 0;
+            for (container.ast.members) |item| {
+                const field = source.fullContainerField(item) orelse continue;
+                if (!field.ast.tuple_like) return .{ .unknown = .unsupported };
+                if (at == position) return self.instance(try self.resolve(tuple.file, field.ast.type_expr.unwrap() orelse return .{ .unknown = .unsupported }));
+                at += 1;
+            }
+            return .{ .unknown = .unsupported };
+        },
+        .unknown => return value,
+        else => return .{ .unknown = .unsupported },
+    }
 }
 
 fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
@@ -1119,10 +1239,12 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
         .optional => |inner| .{ .optional = try self.boxed(try self.instance(inner.*)) },
         .error_union => |inner| .{ .error_union = try self.boxed(try self.instance(inner.*)) },
         .array => |inner| .{ .array = try self.boxed(try self.instance(inner.*)) },
+        // No value has type `noreturn`: a choice of types gives values of the others.
         .alternatives => |each| blk: {
-            const mapped = try self.gpa.alloc(Value, each.len);
-            for (each, mapped) |one, *out| out.* = try self.instance(one);
-            break :blk .{ .alternatives = mapped };
+            var mapped: std.ArrayList(Value) = .empty;
+            for (each) |one| if (one != .primitive or !std.mem.eql(u8, one.primitive, "noreturn")) try mapped.append(self.gpa, try self.instance(one));
+            if (mapped.items.len == 1) break :blk mapped.items[0];
+            break :blk .{ .alternatives = mapped.items };
         },
         else => value,
     };
@@ -1164,7 +1286,6 @@ fn typeOf(_: *Facts, value: Value, _: void) ResolveError!Value {
 }
 
 fn reflect(self: *Facts, of: Value) ResolveError!Value {
-    if (of == .unknown) return of;
     // Each of several types chosen at compile time is reflected on its own.
     if (of == .alternatives) {
         const each = try self.gpa.alloc(Value, of.alternatives.len);
@@ -1194,7 +1315,7 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
         .info => {
             const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "error_union", .error_union }, .{ "fn", .function } };
             inline for (kinds) |kind| if (std.mem.eql(u8, name, kind[0])) return .{ .reflected = .{ .of = r.of, .at = kind[1] } };
-            return unsupported;
+            return .{ .reflected = .{ .of = r.of, .at = .part } };
         },
         .pointer => return if (std.mem.eql(u8, name, "child")) self.pointee(r.of.*, {}) else unsupported,
         .optional => return if (std.mem.eql(u8, name, "child")) self.payload(r.of.*, .optional) else unsupported,
@@ -1209,7 +1330,7 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             if (result == .unknown) return result;
             return .{ .optional = try self.boxed(result) };
         },
-        .params => return unsupported,
+        .params, .part => return unsupported,
     }
 }
 

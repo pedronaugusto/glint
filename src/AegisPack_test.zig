@@ -1061,3 +1061,53 @@ test "a reservation consumed is discharged" {
     // Kept past its success, the reservation leaves with the result: no claim either way.
     try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
 }
+
+test "the private fields of staged payloads, machines, scopes, references, secondary maps and unparsed input" {
+    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
+    try expectJudged(head ++ "pub fn f(s: *Machine.At(.open, u32), r: *Machine.Runtime(u32)) void { _ = s.payload; _ = r.payload; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(s: aegis.scope.Table(Tag).Scope, r: aegis.scope.Ref(Tag, *u32)) void { _ = s.index; _ = r.pointer; }", pack.access, true, 2);
+    try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(aegis.handle.Index(Tag, u32), u8), u: aegis.input.Untrusted([]const u8)) void { _ = m.entries; _ = u.value; }", pack.access, true, 2);
+    // The same names on other types are not these fields.
+    try expectJudged(head ++ "const P = struct { payload: u8, state: u8, index: u8, pointer: u8, entries: u8, value: u8 };\npub fn f(p: P) void { _ = p.payload; _ = p.state; _ = p.index; _ = p.pointer; _ = p.entries; _ = p.value; }", pack.access, true, 0);
+}
+
+test "type information of a type that does not resolve is still type information" {
+    const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
+    // `@typeInfo` of an unbound type parameter: its parts are `std.builtin.Type` values.
+    try expectJudged(head ++ "pub fn F(comptime R: type) type { return @typeInfo(R).error_union.payload; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn F(comptime R: type) type { return switch (@typeInfo(R)) { .error_union => |eu| eu.payload, else => R }; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn F(comptime R: type) usize { return switch (@typeInfo(R)) { .@\"struct\" => |s| s.fields.len, .error_union, .optional => |x| @sizeOf(@TypeOf(x)), else => 0 }; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn F(comptime R: type) usize { const info = @typeInfo(R).@\"struct\"; return info.fields.len; }", pack.access, true, 0);
+}
+
+test "receivers through a guard's resolved type, builtins, destructuring, loop values and choices a build leaves out are decided" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst builtin = @import(\"builtin\");\nconst Shared = struct { closed: bool };\n";
+    // A guard passed to a private `anytype` parameter is a guard by its resolved type.
+    try expectJudged(head ++ "fn wait(held: anytype) void { _ = held.value().closed; }\npub fn f(g: *aegis.sync.BlockingGuarded(Shared), io: std.Io) void { var held = g.acquireUncancelable(io); defer held.release(); wait(&held); }", pack.access, true, 0);
+    // A builtin's bytes, a string literal sliced, a tuple and an array destructured.
+    try expectJudged(head ++ "pub fn f(err: anyerror) usize { return @intFromPtr(@errorName(err).ptr); }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f() usize { const in = \"abc\"; return @intFromPtr(in[0..2].ptr); }", pack.access, true, 0);
+    try expectJudged(head ++ "const State = struct { n: u8 };\nfn split(b: []u8) struct { []u8, *State } { return .{ b, undefined }; }\npub fn f(b: []u8) usize { const read, const state = split(b); _ = state; return @intFromPtr(read.ptr); }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(a: [2][]u8) usize { const x, const y = a; _ = y; return @intFromPtr(x.ptr); }", pack.access, true, 0);
+    // A type chosen per target: `noreturn` and alternatives without the member are other builds.
+    try expectJudged(head ++ "const D = switch (builtin.os.tag) { .wasi => noreturn, .windows => struct { in: []const u8 }, else => struct { out: []u8 } };\nconst Op = union(enum) { d: D, e: u8 };\npub fn f(o: Op) usize { return switch (o) { .d => |d| @intFromPtr(d.in.ptr), .e => 0 }; }", pack.access, true, 0);
+    try expectJudged(head ++ "const P = struct { index: u8 };\nconst S = struct { fixed: if (builtin.os.tag == .linux) ?[]P else void };\npub fn f(s: S) u8 { return s.fixed.?[0].index; }", pack.access, true, 0);
+    // A loop used as a value gives its breaks, or its `else`.
+    try expectJudged(head ++ "const P = struct { key: u8, value: []const u8 };\nconst E = struct { name: []const u8, params: []const P };\npub fn f(es: []const E, n: []const u8) usize { const entry = for (es) |e| { if (e.name.len == n.len) break e; } else null; if (entry) |e| { for (e.params) |p| return p.value.len; } return 0; }", pack.access, true, 0);
+}
+
+test "atomics, task contexts, ordered locks and counters are in the contract" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst O = aegis.sync.Order(&.{ .{ .name = \"a\" }, .{ .name = \"b\", .after = &.{0} } });\n";
+    // An atomic's cell is private; a copy is a second cell.
+    try expectJudged(head ++ "pub fn f(a: *aegis.sync.Atomic(u32)) void { _ = a.cell; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(a: aegis.sync.Atomic(u32)) u32 { const b = a; return a.load(.acquire) + b.load(.acquire); }", pack.copies, true, 1);
+    // A task's context: private stack, a copy is a second context.
+    try expectJudged(head ++ "pub fn f(c: *O.Context, i: *aegis.sync.InitContext) usize { return c.used + i.used; }", pack.access, true, 2);
+    try expectJudged(head ++ "fn use(_: *const O.Context) void {}\npub fn f(c: O.Context) void { var d = c; _ = &d; use(&c); }", pack.copies, true, 1);
+    // An ordered lock's base is private; its ordered acquisitions give guards released by `deinit`.
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L) void { _ = l.base; }", pack.access, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); g.value().* += 1; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); defer g.deinit(io); g.value().* += 1; }", pack.cleanup, true, 0);
+    // A counter issues ids: a copy issues them twice.
+    try expectJudged(head ++ "const C = aegis.id.Counter(struct {}, u32);\npub fn f(c: C) !void { var d = c; var e = c; _ = try d.next(); _ = try e.next(); }", pack.copies, true, 2);
+}

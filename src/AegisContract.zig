@@ -43,6 +43,10 @@ pub const Kind = enum {
     ref,
     untrusted,
     choice,
+    /// `Atomic`: one cell, shared by pointer.
+    atomic,
+    /// A logical task's diagnostic context: `Order(...).Context`, `InitContext`.
+    context,
 };
 
 /// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
@@ -74,6 +78,10 @@ const sync_members = [_]Lib.Member{
     .{ .path = "Lazy", .role = .once },
     .{ .path = "Confined", .role = .confined },
     .{ .path = "Shared", .role = .shared, .required = false },
+    .{ .path = "Atomic", .role = .atomic, .required = false },
+    .{ .path = "InitContext", .role = .context, .required = false },
+    .{ .path = "Order.Context", .role = .context, .required = false },
+    .{ .path = "Order.Ordered", .role = .guarded, .required = false },
 };
 const int_members = [_]Lib.Member{
     .{ .path = "Checked", .role = .scalar },
@@ -83,7 +91,7 @@ const int_members = [_]Lib.Member{
 const id_members = [_]Lib.Member{
     .{ .path = "Id", .role = .scalar },
     .{ .path = "NonZero", .role = .scalar },
-    .{ .path = "Counter", .role = .scalar },
+    .{ .path = "Counter", .role = .issuer },
 };
 const units_members = [_]Lib.Member{
     .{ .path = "Count", .role = .scalar },
@@ -108,7 +116,7 @@ const root_members = [_]Lib.Member{
     .{ .path = "int.Ranged", .role = .scalar },
     .{ .path = "id.Id", .role = .scalar },
     .{ .path = "id.NonZero", .role = .scalar },
-    .{ .path = "id.Counter", .role = .scalar },
+    .{ .path = "id.Counter", .role = .issuer },
     .{ .path = "units.Count", .role = .scalar },
     .{ .path = "units.Bytes", .role = .scalar },
     .{ .path = "units.Bits", .role = .scalar },
@@ -116,6 +124,10 @@ const root_members = [_]Lib.Member{
     .{ .path = "units.Instant", .role = .scalar },
     .{ .path = "secret.Choice", .role = .choice },
     .{ .path = "Shared", .role = .shared },
+    .{ .path = "Atomic", .role = .atomic },
+    .{ .path = "InitContext", .role = .context },
+    .{ .path = "Order.Context", .role = .context },
+    .{ .path = "Order.Ordered", .role = .guarded },
     .{ .path = "bounded.Array", .role = .inline_store },
     .{ .path = "bounded.Ring", .role = .inline_store },
     .{ .path = "bounded.Queue", .role = .inline_store },
@@ -218,7 +230,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
     return null;
 }
 /// The guard types a guarded owner declares: one guard, or a reader's and a writer's.
-fn guardType(name: []const u8) bool {
+pub fn guardType(name: []const u8) bool {
     for ([_][]const u8{ "Guard", "ReadGuard", "WriteGuard" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
@@ -226,7 +238,7 @@ fn guardType(name: []const u8) bool {
 /// The operations by which a guarded owner gives a guard: every acquire, blocking or
 /// spinning, cancelable or not, tried or waited for, and a reader's or a writer's.
 pub fn acquisition(name: []const u8) bool {
-    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "read", "write", "readUncancelable", "writeUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "read", "write", "readUncancelable", "writeUncancelable", "acquireOrdered", "acquireOrderedUncancelable", "readOrdered", "writeOrdered", "readOrderedUncancelable", "writeOrderedUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 

@@ -244,8 +244,10 @@ fn backing(k: Contract.Kind, name: []const u8) bool {
         .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
         // The guarded value and the lock state of every guarded owner: a spin flag, a
         // blocking mutex, a reader-writer lock and its admission count.
-        .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted"),
-        .guard => std.mem.eql(u8, name, "owner"),
+        // An ordered owner's base lock too.
+        .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted") or std.mem.eql(u8, name, "base"),
+        // A guard's owner; an ordered guard's base guard.
+        .guard => std.mem.eql(u8, name, "owner") or std.mem.eql(u8, name, "base"),
         // A value initialized once: its publication state, its election lock and waiters,
         // and the value itself before the state says it is there.
         .once => std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "changed") or std.mem.eql(u8, name, "data"),
@@ -271,22 +273,23 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .owned => &.{ "data", "state" },
         .must_use => &.{ "data", "pending", "live" },
         .shared => &.{ "block", "live" },
-        // Not yet admitted, while family receivers glint does not resolve read fields of these
-        // names (glint-complete): a secondary map's `entries`, a staged payload's `payload`, a
-        // runtime machine's `state`, a scope's `index`, a reference's `ptr` and an unparsed
-        // input's `value`.
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head" },
-        .stage => &.{"live"},
+        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries" },
+        .stage => &.{ "live", "payload" },
+        // A runtime machine's `state` waits while reactor's backends read `o.state` of `anytype`
+        // parameters every public caller can bind (glint-complete).
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
-        .scope => &.{ "table", "generation" },
-        .ref => &.{ "slot", "generation" },
+        .scope => &.{ "table", "generation", "index" },
+        .ref => &.{ "slot", "generation", "pointer" },
+        .untrusted => &.{"value"},
         .choice => &.{"bit"},
+        .atomic => &.{"cell"},
+        .context => &.{ "stack", "used", "suspended", "owners" },
         else => &.{},
     };
 }
 
 fn backingName(name: []const u8) bool {
-    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     for (std.enums.values(Contract.Kind)) |k| for (backingFields(k)) |field| if (std.mem.eql(u8, name, field)) return true;
     return false;
 }
@@ -335,19 +338,29 @@ fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.Token
     }
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
-/// Whether `container` is declared inside a published aegis type, as a guarded value's guard
-/// is: its own operations belong to that type's contract.
-fn nestedInPublished(c: *Context, container: Facts.Container) Context.Error!bool {
+/// The role of the published aegis type `container` is declared inside, as a guarded value's
+/// guard is: its own operations belong to that type's contract.
+fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Contract.Kind {
     const found = try c.facts.publication(Contract.library);
     const scopes = c.project.models[container.file.raw()].scopes; // safe: a resolved container's file indexes the frozen model table.
     var scope = scopes[container.scope].parent;
     while (scope) |s| : (scope = scopes[s].parent) {
-        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return true;
+        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role)); // safe: the entry holds a role value of this enum.
     }
-    return false;
+    return null;
+}
+/// The name a container is declared under (`pub const Guard = struct { ... }`), if any.
+fn containerName(c: *Context, container: Facts.Container) ?[]const u8 {
+    const model = &c.project.models[container.file.raw()];
+    const tree = &c.project.files[container.file.raw()].tree;
+    const node = model.scopes[container.scope].node;
+    if (node == .root) return null;
+    const parent = model.node_parents[@backingInt(node)] orelse return null; // safe: an AST node index reads its own parent table
+    const declared = tree.fullVarDecl(parent) orelse return null;
+    return tree.tokenSlice(declared.ast.mut_token + 1);
 }
 /// What a resolved value's type says: a published aegis type, a type that is not aegis, or
-/// unknown. A type nested in a published one that the contract does not list stays unknown
+/// unknown. A guarded owner's guard is the guard; another type nested in a published one that the contract does not list stays unknown
 /// rather than counted out, as does a choice between types that disagree.
 fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
     if (depth == 64) return .unknown;
@@ -361,7 +374,10 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         },
         .container, .instance => |container| blk: {
             if (try c.role(Contract.library, value)) |k| break :blk .{ .owner = k };
-            break :blk if (try nestedInPublished(c, container)) .unknown else .other;
+            const outer = (try enclosingPublished(c, container)) orelse break :blk .other;
+            // A guarded owner's guard, reached by its resolved type rather than its acquisition.
+            if (outer == .guarded and Contract.guardType(containerName(c, container) orelse "")) break :blk .{ .owner = .guard };
+            break :blk .unknown;
         },
         else => .other,
     };
@@ -402,7 +418,7 @@ fn checkCopies(c: *Context) Context.Error!void {
 /// reservations point at, an owner bound to its address in Debug).
 fn movable(k: Contract.Kind) bool {
     return switch (k) {
-        .guard, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer => true,
+        .guard, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
         else => false,
     };
 }

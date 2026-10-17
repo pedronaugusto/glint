@@ -319,7 +319,11 @@ pub fn reference(self: *const Model, node: Ast.Node.Index) ?Reference {
 }
 
 fn scopeLess(_: void, lhs: Scope, rhs: Scope) bool {
-    return if (lhs.first != rhs.first) lhs.first < rhs.first else lhs.last > rhs.last;
+    if (lhs.first != rhs.first) return lhs.first < rhs.first;
+    if (lhs.last != rhs.last) return lhs.last > rhs.last;
+    // A branch whose expression is a container (`.windows => struct { ... }`) spans the same
+    // tokens: the container is the inner scope, so its members are its own.
+    return lhs.kind != .container and rhs.kind == .container;
 }
 
 fn addScope(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope), node: Ast.Node.Index, kind: Kind) InitError!void {
