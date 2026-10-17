@@ -56,9 +56,12 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const model = &c.project.models[c.file.raw()];
     // What the program reads of `x.name`.
     var member: ?[]const u8 = null;
+    // Whether the program uses `x.name` as a truth value, a number or an operand of a comparison.
+    var operand = false;
     if (model.node_parents[@backingInt(field)]) |parent| { // safe: an AST node index reads its own parent table
         if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == field)
             member = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
+        operand = scalarOperand(tree, parent, field);
     }
     // The fields `x`'s literal initializer names.
     var literal_buffer: [2]Ast.Node.Index = undefined;
@@ -71,7 +74,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             };
         };
     };
-    if (member == null and literal == null) return false;
+    if (member == null and literal == null and !operand) return false;
     const found = try c.facts.publication(Contract.library);
     var any = false;
     for (found.entries) |entry| {
@@ -91,20 +94,60 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             } else false;
             if (lacks) continue;
         }
-        const read = member orelse return false;
+        if (member == null and !operand) return false;
         const written = &c.project.files[decl.file.raw()].tree;
         const type_expr = written.fullContainerField(record.node).?.ast.type_expr.unwrap() orelse return false;
-        const holder = switch (try c.facts.resolve(decl.file, type_expr)) {
-            .container, .instance => |held| held,
-            .pointer => |to| switch (to.*) {
+        const declared = try c.facts.resolve(decl.file, type_expr);
+        if (member) |read| {
+            const holder = switch (declared) {
+                .container, .instance => |held| held,
+                .pointer => |to| switch (to.*) {
+                    .container, .instance => |held| held,
+                    else => return false,
+                },
+                else => return false,
+            };
+            if (c.facts.member(holder, read) != null) return false;
+        } else {
+            // A struct (not packed) is no truth value, number or comparable operand: an
+            // atomic, a mutex or a condition used as one is not this field.
+            const held = switch (declared) {
                 .container, .instance => |held| held,
                 else => return false,
-            },
-            else => return false,
-        };
-        if (c.facts.member(holder, read) != null) return false;
+            };
+            if (!plainStruct(c, held)) return false;
+        }
     }
     return any;
+}
+
+/// Whether `parent` uses its child `field` as a truth value (a condition, an operand of
+/// `and`, `or` or `!`), an operand of a comparison or of arithmetic.
+fn scalarOperand(tree: *const Ast, parent: Ast.Node.Index, field: Ast.Node.Index) bool {
+    switch (tree.nodeTag(parent)) {
+        .bool_not, .negation => return true,
+        .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .add, .sub, .mul, .div, .mod => return true,
+        else => {},
+    }
+    if (tree.fullIf(parent)) |full| return full.ast.cond_expr == field and full.payload_token == null and full.error_token == null;
+    if (tree.fullWhile(parent)) |full| return full.ast.cond_expr == field and full.payload_token == null and full.error_token == null;
+    return false;
+}
+
+/// Whether a container is a struct with no packed layout (or an opaque): a type no
+/// comparison, arithmetic or condition accepts.
+fn plainStruct(c: *Context, container: Facts.Container) bool {
+    const model = &c.project.models[container.file.raw()];
+    const tree = &c.project.files[container.file.raw()].tree;
+    const node = model.scopes[container.scope].node;
+    if (node == .root) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullContainerDecl(&buffer, node) orelse return false;
+    return switch (tree.tokenTag(full.ast.main_token)) {
+        .keyword_struct => if (full.layout_token) |layout| tree.tokenTag(layout) != .keyword_packed else true,
+        .keyword_opaque => true,
+        else => false,
+    };
 }
 
 /// The container a published target is: the type itself, or the one a type function returns,

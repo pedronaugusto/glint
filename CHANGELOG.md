@@ -12,6 +12,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Fixed
 
 - A001 left a field access undecided whenever its receiver did not resolve and its name was a backing field's of some aegis type: 0.2.11's new names (`state`, `admitted`) left 25 of reactor's sites undecided (`o.state.storage` on a generic operation). A candidate is now decided not aegis's when, for every published type with a backing field of that name, the program reads a member of it the field's declared type lacks, or the receiver is a variable whose literal initializer names a field the type lacks.
+- A001 likewise decides `x.name` is not a backing field whose declared type is a struct when the program uses it as a truth value (an `if` or `while` condition, `and`, `or`, `!`), compares it or does arithmetic with it: no struct takes those. `changed` joining the backing names (a `Once`'s condition) would otherwise have left parallax's `span.changed` reads undecided.
 
 ## [0.2.11] - 2026-10-17
 

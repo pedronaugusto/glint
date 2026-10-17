@@ -843,6 +843,11 @@ test "a backing field's name on a receiver nothing resolves is decided by what t
     // A member read off the field is weighed against the field's declared type, which std
     // declares for these (an atomic, a mutex): with std unmapped here, undecided.
     try expectJudged(head ++ "pub fn f(o: unknown.Op) void { _ = o.state.storage; }", pack.access, false, 0);
+    // A field used as a truth value or compared: `changed` is only a Once's, a condition (a
+    // struct) no `if` or `==` takes.
+    try expectJudged(head ++ "pub fn f(s: unknown.Span, changed: bool) bool { if (s.changed) return true; return s.changed == changed and !s.changed; }", pack.access, true, 0);
+    // `data` is a generic owner's value, whatever it holds: undecided.
+    try expectJudged(head ++ "pub fn f(s: unknown.Span) bool { return !s.data; }", pack.access, false, 0);
     // A literal naming only fields an aegis type has: undecided.
     try expectJudged(head ++ "var proxy: unknown.Layer = .{ .state = 0 };\npub fn f() *anyopaque { return &proxy.state; }", pack.access, false, 0);
 }
