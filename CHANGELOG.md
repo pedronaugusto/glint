@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-10-17
+
 ### Added
 
 - The aegis pack knows every guarded owner: `BlockingGuarded`, `RwGuarded` and `SpinRwGuarded`, their guards (`Guard`, `ReadGuard`, `WriteGuard`) and every way one is acquired, blocking or spinning, cancelable or not, tried, a reader's or a writer's. Their backing state (`data`, `lock`, `mutex`, `state`, `admitted`) and a guard's `owner` are A001's; a guard is A003's to release.
