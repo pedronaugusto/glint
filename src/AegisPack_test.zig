@@ -1156,3 +1156,17 @@ test "A001 reads a runtime machine's state as its backing field" {
     try expectJudged(head ++ "pub fn f(m: *Machine.Runtime(void)) S { return m.state; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(m: *Machine.Runtime(void)) S { return m.current(); }", pack.access, true, 0);
 }
+
+test "A001 reads a literal's place through a field default and optional and error-union results" {
+    const head = "const err = @import(\"aegis\").err;\n";
+    try expectJudged(head ++ "const Holder = struct { source: err.PublicSource = .{ .bytes = \"\" } };\npub fn f() Holder { return .{}; }", pack.access, true, 1);
+    try expectJudged(head ++ "const R = struct { s: ?err.PublicSource = null };\npub fn f(b: []const u8) !R { return .{ .s = .{ .bytes = b } }; }", pack.access, true, 1);
+    try expectJudged(head ++ "const Raw = struct { bytes: []const u8 };\nconst R = struct { s: ?Raw = null };\npub fn f(b: []const u8) !R { var r: R = .{}; r.s = .{ .bytes = b }; return .{ .s = .{ .bytes = b } }; }", pack.access, true, 0);
+}
+
+test "A001 reads a literal's place through generic slices and a handler held in a local" {
+    const head = "const err = @import(\"aegis\").err;\nconst Raw = struct { bytes: []const u8 };\nfn keep(comptime T: type, items: []const T) void { _ = items; }\n";
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { keep(err.PublicSource, &.{.{ .bytes = b }}); }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { keep(Raw, &.{.{ .bytes = b }}); }", pack.access, true, 0);
+    try expectJudged(head ++ "const R = struct { s: ?Raw = null };\nconst Handlers = struct { make: ?*const fn () error{Bad}!R = null };\npub fn f(h: Handlers, b: []const u8) void { const g = h.make orelse return; var r = g() catch return; r.s = .{ .bytes = b }; }", pack.access, true, 0);
+}

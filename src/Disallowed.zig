@@ -59,7 +59,7 @@ pub fn check(self: *Context) Context.Error!void {
             applies = true;
         };
         if (!applies) continue;
-        const reached = try reach(self, node, tag, spelled);
+        const reached = try reach(self, node, tag, spelled, governed);
         const decls = switch (reached) {
             .unknown => |why| {
                 try self.unknown(.P006, node, why);
@@ -158,10 +158,12 @@ const Reached = union(enum) { decls: []const Facts.Decl, unknown: Facts.Unknown 
 
 /// What a site refers to: its declaration through aliases, or the member of each container its
 /// receiver may be.
-fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8) Context.Error!Reached {
+fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!Reached {
     const definition = if (tag == .identifier or tag == .field_access) try self.facts.definition(self.file, node) else try self.facts.reflected(self.file, node);
     if (definition) |decl| {
-        const origin = (try self.facts.origin(decl)) orelse return .{ .unknown = .cycle };
+        // An alias whose value does not resolve is the program's own declaration: its value is a
+        // site of its own.
+        const origin = (try self.facts.origin(decl)) orelse decl;
         return .{ .decls = try self.allocator.dupe(Facts.Decl, &.{ decl, origin }) };
     }
     if (tag == .identifier) {
@@ -174,7 +176,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
         break :blk Facts.builtinArgs(tree, node, &buffer)[0];
     };
     const receiver = try self.facts.resolve(self.file, receiver_node);
-    if (receiver == .unknown) return .{ .unknown = receiver.unknown };
+    if (receiver == .unknown) return if (try refuted(self, node, tag, spelled, governed)) .{ .decls = &.{} } else .{ .unknown = receiver.unknown };
     var options: std.ArrayList(Facts.Container) = .empty;
     try containers(self, receiver, &options);
     var decls: std.ArrayList(Facts.Decl) = .empty;
@@ -186,19 +188,13 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
     return .{ .decls = decls.items };
 }
 
-/// The symbol an `extern` function or variable binds: its name.
+/// The symbol an `extern` function binds: its name.
 fn externSymbol(project: *const Project, decl: Facts.Decl) ?[]const u8 {
     const record = project.models[decl.file.raw()].declarations[decl.index];
+    if (record.kind != .function) return null;
     const tree = &project.files[decl.file.raw()].tree;
-    const keyword: ?Ast.TokenIndex = switch (record.kind) {
-        .function => blk: {
-            var buffer: [1]Ast.Node.Index = undefined;
-            break :blk (tree.fullFnProto(&buffer, record.node) orelse return null).extern_export_inline_token;
-        },
-        .variable => (tree.fullVarDecl(record.node) orelse return null).extern_export_token,
-        else => return null,
-    };
-    const token = keyword orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const token = (tree.fullFnProto(&buffer, record.node) orelse return null).extern_export_inline_token orelse return null;
     if (tree.tokenTag(token) != .keyword_extern) return null;
     return record.name;
 }
@@ -216,4 +212,81 @@ fn memberName(self: *const Context, node: Ast.Node.Index) bool {
         .keyword_enum, .keyword_union => true,
         else => false,
     };
+}
+
+/// Whether no governed declaration spelled `spelled` can be what a member access with an
+/// unresolved receiver reaches, by what Zig allows there. Called, every candidate's parameters
+/// refuse the arguments, as a method (the receiver first) and as a namespace's function: by
+/// count, or a literal given where a struct is taken. Not called, its value is a declaration's
+/// that the file uses as a receiver of members, which no function and no number has. An
+/// external symbol is a function whose parameters are unknown.
+fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!bool {
+    if (tag != .field_access) return false;
+    const model = &self.project.models[self.file.raw()];
+    const tree = &self.project.files[self.file.raw()].tree;
+    const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const called: ?Ast.full.Call = if (tree.fullCall(&call_buffer, parent)) |call| (if (call.ast.fn_expr == node) call else null) else null;
+    if (called == null and !try usedAsReceiver(self, parent, node)) return false;
+    for (governed) |g| {
+        if (!std.mem.eql(u8, g.name, spelled)) continue;
+        if (g.symbol != null and g.decls.len == 0) {
+            if (called != null) return false;
+            continue;
+        }
+        for (g.decls) |decl| {
+            const value = try self.facts.declaration(decl);
+            if (value != .function and value != .scalar and value != .primitive) return false;
+            const call = called orelse continue;
+            if (value != .function) return false;
+            if (try accepts(self, decl, call, 1) or try accepts(self, decl, call, 0)) return false;
+        }
+    }
+    return true;
+}
+
+/// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the call's
+/// arguments: as many, and none a literal where a struct is taken.
+fn accepts(self: *Context, decl: Facts.Decl, call: Ast.full.Call, skip: usize) Context.Error!bool {
+    const target = &self.project.files[decl.file.raw()].tree;
+    const tree = &self.project.files[self.file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const function = target.fullFnProto(&buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return true;
+    var it = function.iterate(target);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) {
+        if (at < skip) continue;
+        const index = at - skip;
+        if (index >= call.ast.params.len) return false;
+        const argument = call.ast.params[index];
+        switch (tree.nodeTag(argument)) {
+            .enum_literal, .number_literal, .string_literal, .char_literal => {},
+            else => continue,
+        }
+        const written = param.type_expr orelse continue;
+        const kind = try self.facts.resolve(decl.file, written);
+        if (kind != .container) continue;
+        const scope_node = self.project.models[kind.container.file.raw()].scopes[kind.container.scope].node;
+        const owner = &self.project.files[kind.container.file.raw()].tree;
+        if (scope_node == .root or owner.tokenTag(owner.nodeMainToken(scope_node)) == .keyword_struct) return false;
+    }
+    return at - @min(at, skip) == call.ast.params.len;
+}
+
+/// Whether `node` is the value of a declaration that the file uses as a receiver of a member.
+fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
+    const model = &self.project.models[self.file.raw()];
+    const tree = &self.project.files[self.file.raw()].tree;
+    const variable = tree.fullVarDecl(parent) orelse return false;
+    if (variable.ast.init_node.unwrap() != node) return false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .field_access) continue;
+        const access: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: checked AST inventory.
+        const receiver = tree.nodeData(access).node_and_token[0];
+        if (tree.nodeTag(receiver) != .identifier) continue;
+        const ref = model.reference(receiver) orelse continue;
+        const index = ref.declaration orelse continue;
+        if (model.declarations[index].node == parent) return true;
+    }
+    return false;
 }

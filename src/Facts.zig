@@ -893,11 +893,24 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
 /// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
 /// the pointer's function type returns.
 fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) ResolveError!?Value {
-    const decl = (try self.definition(file, callee)) orelse return null;
-    const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    var decl = (try self.definition(file, callee)) orelse return null;
+    var record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    // A local holding the field, unwrapped: `const f = x.handler orelse return;`.
+    if (record.kind == .variable) {
+        const local = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+        var value = (local.fullVarDecl(record.node) orelse return null).ast.init_node.unwrap() orelse return null;
+        while (true) value = switch (local.nodeTag(value)) {
+            .@"orelse" => local.nodeData(value).node_and_node[0],
+            .unwrap_optional, .grouped_expression => local.nodeData(value).node_and_token[0],
+            else => break,
+        };
+        decl = (try self.definition(decl.file, value)) orelse return null;
+        record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    }
     if (record.kind != .field) return null;
     const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var declared = (tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    if (tree.nodeTag(declared) == .optional_type) declared = tree.nodeData(declared).node;
     if (tree.fullPtrType(declared)) |ptr| declared = ptr.ast.child_type;
     var buffer: [1]Ast.Node.Index = undefined;
     const signature = tree.fullFnProto(&buffer, declared) orelse return null;
@@ -2034,6 +2047,11 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         if (variable.ast.init_node.unwrap() != node) return .{ .unknown = .unsupported };
         return if (variable.ast.type_node.unwrap()) |t| try self.resolve(file, t) else .scalar;
     }
+    // A field's default value takes the field's type.
+    if (tree.fullContainerField(parent)) |field| {
+        if (field.ast.value_expr.unwrap() != node) return .{ .unknown = .unsupported };
+        return if (field.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else .{ .unknown = .unsupported };
+    }
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, parent)) |call| {
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .{ .unknown = .unsupported };
@@ -2044,8 +2062,15 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         const whole = try self.placeType(file, parent, depth + 1);
         if (whole == .unknown or whole == .scalar) return whole;
         const name = try self.memberName(tree.tokenSlice(tree.firstToken(node) - 2));
-        const container = switch (whole) {
+        // A literal coerces through an optional or an error union; `&.{}` gives a pointer to one.
+        var holder = whole;
+        while (true) holder = switch (holder) {
+            .optional, .error_union, .pointer => |inner| inner.*,
+            else => break,
+        };
+        const container = switch (holder) {
             .container, .instance => |c| c,
+            .unknown => return holder,
             else => return .{ .unknown = .unsupported },
         };
         const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
@@ -2054,14 +2079,15 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     if (tree.fullArrayInit(&parent_buffer, parent)) |array| {
         const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else try self.placeType(file, parent, depth + 1);
         return switch (whole) {
-            .array => |each| each.*,
+            // An array literal given where a slice is taken (`&.{ a, b }`) holds its elements.
+            .array, .pointer => |each| each.*,
             .unknown => whole,
             else => .{ .unknown = .unsupported },
         };
     }
     switch (tree.nodeTag(parent)) {
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
-        .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
+        .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
         .@"break" => {
             const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap() orelse return .{ .unknown = .unsupported };
             var at: ?Ast.Node.Index = model.node_parents[@backingInt(parent)]; // safe: a node index indexes its own tree's parent table.
@@ -2129,6 +2155,8 @@ fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, positi
         if (at != position + receiver) continue;
         const type_expr = param.type_expr orelse return .scalar;
         if (made) |m| return self.substituted(decl.file, type_expr, m, 0);
+        // Written in terms of a `comptime T: type` parameter: the call's argument for it.
+        if (try self.written(.{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver }, type_expr, 0)) |bound| return bound;
         return self.resolve(decl.file, type_expr);
     }
     return .{ .unknown = .unsupported };

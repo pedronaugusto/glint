@@ -491,3 +491,20 @@ test "metrics count assertion calls by the declaration their callee resolves to"
     try report.write(&text.writer, &project, .text);
     try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, aegis.assert.pre 1, aegis.assert.never 1), 1 assertion-like calls unresolved\n") != null);
 }
+
+test "P006 decides an unresolved receiver by what Zig allows at the site" {
+    // A configuration value named like a sync call, read from a generic database and used as
+    // a receiver, and a method given an enum literal where the governed one takes a struct.
+    var report = try ownershipRun(
+        \\pub fn a(db: anytype) void { const fsync = db.settings().fsync; fsync.sync(.pack); }
+        \\pub fn b(db: anytype) void { db.file().sync(); }
+    , &durability);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing resolved.
+    var undecided: usize = 0;
+    for (report.coverage) |note| if (note.rule != null and note.rule.? == .P006) {
+        undecided += 1;
+    };
+    // `db.file().sync()` may be File.sync: it stays undecided.
+    try std.testing.expectEqual(@as(usize, 1), undecided); // safe: one site cannot be refuted.
+}

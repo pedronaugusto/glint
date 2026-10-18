@@ -78,9 +78,8 @@ pub const Config = struct {
     /// import it (`std`, `aegis`), one no file imports being one nothing can reach; `declaration`
     /// is its path from there, through public namespaces from a module (`posix.fdatasync`), each
     /// per-build choice on the way read in every alternative. Null `source` names an external
-    /// function or variable by its symbol: every `extern` declaration of that symbol, std's or
-    /// the program's own, is the one the linker binds. A governed declaration that is itself
-    /// `extern` governs its symbol the same way.
+    /// function by its symbol: every `extern fn` of that symbol, std's or the program's own, is
+    /// the one the linker binds. A governed `extern fn` governs its symbol the same way.
     pub const Disallowed = struct {
         source: ?[]const u8 = null,
         declaration: []const u8,
