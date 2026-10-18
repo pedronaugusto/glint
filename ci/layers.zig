@@ -8,7 +8,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Library.zig", "src/Report.zig" } },
     .{ .name = "projection", .patterns = &.{"src/Projection.zig"} },
     .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
-    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Metrics.zig", "src/AegisContract.zig", "src/AegisPack.zig" } },
+    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Metrics.zig", "src/AegisContract.zig", "src/AegisRecursion.zig", "src/AegisPack.zig" } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
     .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },

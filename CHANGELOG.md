@@ -10,6 +10,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
+- A006 in the aegis pack: recursion reachable from untrusted input (a parameter of aegis's `input.Untrusted`, or a parser given to its `parse`) without a depth bound, a compared depth the cycle moves (`p + 1` passed on, a field moved by `+=`), reported with the cycle's calls.
 - Assertion metrics (`Config.metrics`, `--metrics`): per file and in total, functions, those that assert, and assertion calls by the declaration they resolve to (`std.debug.assert`, aegis's `assert` contracts), unresolved look-alikes apart; a `metrics:` line in text and a `metrics` object in JSON.
 
 ### Changed

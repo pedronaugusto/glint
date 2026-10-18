@@ -72,6 +72,7 @@ pub fn dev(b: *std.Build, tools: type) void {
             p.path("src/Completion.zig"),
             p.path("src/DeadDeclarations.zig"),
             p.path("src/Metrics.zig"),
+            p.path("src/AegisRecursion.zig"),
             p.path("src/Facts.zig"),
             p.path("src/File.zig"),
             p.path("src/Library.zig"),

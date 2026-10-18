@@ -1111,3 +1111,22 @@ test "atomics, task contexts, ordered locks and counters are in the contract" {
     // A counter issues ids: a copy issues them twice.
     try expectJudged(head ++ "const C = aegis.id.Counter(struct {}, u32);\npub fn f(c: C) !void { var d = c; var e = c; _ = try d.next(); _ = try e.next(); }", pack.copies, true, 2);
 }
+
+test "A006 reports recursion untrusted input reaches without a depth bound" {
+    const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
+    // Each level of nesting is a stack frame the input chooses.
+    try expectJudged(head ++ "pub fn read(text: Text) usize { return nest(text.readForParse()); }\nfn nest(bytes: []const u8) usize { if (bytes.len == 0 or bytes[0] != '[') return 0; return 1 + nest(bytes[1..]); }", pack.recursion, true, 1);
+    // A position held against the input's length grows with it.
+    try expectJudged(head ++ "pub fn read(text: Text) usize { return nest(text.readForParse(), 0); }\nfn nest(bytes: []const u8, at: usize) usize { if (at >= bytes.len) return 0; return 1 + nest(bytes, at + 1); }", pack.recursion, true, 1);
+    // Through a parser the untrusted value is given, and across two functions.
+    try expectJudged(head ++ "const Tree = struct { n: usize };\npub fn read(text: Text) error{Bad}!Tree { return text.parse({}, tree); }\nfn tree(_: void, bytes: []const u8) error{Bad}!Tree { return .{ .n = list(bytes) }; }\nfn list(bytes: []const u8) usize { return if (bytes.len == 0) 0 else item(bytes[1..]); }\nfn item(bytes: []const u8) usize { return list(bytes) + 1; }", pack.recursion, true, 1);
+}
+
+test "A006 accepts a depth the cycle moves and compares, and recursion no untrusted input reaches" {
+    const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { return nest(text.readForParse(), 0); }\nfn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (depth > 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 1); }", pack.recursion, true, 0);
+    try expectJudged(head ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { p.depth += 1; defer p.depth -= 1; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };\npub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }", pack.recursion, true, 0);
+    // Through a helper that keeps the depth.
+    try expectJudged(head ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn enter(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; }\n fn value(p: *Parser) error{TooDeep}!void { try p.enter(); if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };\npub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }", pack.recursion, true, 0);
+    try expectJudged(head ++ "pub fn count(bytes: []const u8) usize { return if (bytes.len == 0) 0 else 1 + count(bytes[1..]); }", pack.recursion, true, 0);
+}
