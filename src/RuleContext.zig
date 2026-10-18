@@ -96,6 +96,17 @@ pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Inde
     if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
     try self.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), if (reason == .budget) .budget_exhausted else .unresolved, @tagName(reason));
 }
+/// Whether a token is test code: a test input, or inside a `test` block.
+pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
+    if (self.project.inputs[self.file.raw()].classification == .@"test") return true;
+    const model = &self.project.models[self.file.raw()]; // safe: the checked file indexes its frozen model.
+    var scope: ?u32 = model.token_scopes[token];
+    while (scope) |index| {
+        if (model.scopes[index].kind == .@"test") return true;
+        scope = model.scopes[index].parent;
+    }
+    return false;
+}
 pub fn selected(self: *const RuleContext, selection: []const rules.Rule) bool {
     for (selection) |rule| if (self.config.has(rule)) return true;
     return false;

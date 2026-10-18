@@ -47,6 +47,9 @@ pub const Kind = enum {
     atomic,
     /// A logical task's diagnostic context: `Order(...).Context`, `InitContext`.
     context,
+    /// Runtime text classified public, `err.PublicSource`: made by `classify`, whose reason is
+    /// the review a literal skips.
+    public_source,
 };
 
 /// Aegis as programs import it. A declaration is aegis's when the path a program writes from the
@@ -152,6 +155,7 @@ const root_members = [_]Lib.Member{
     .{ .path = "scope.Table.Scope", .role = .scope },
     .{ .path = "scope.Ref", .role = .ref },
     .{ .path = "input.Untrusted", .role = .untrusted },
+    .{ .path = "err.PublicSource", .role = .public_source, .required = false },
 };
 
 /// Finds known owners through lexical aliases, declared types and exact constructors.

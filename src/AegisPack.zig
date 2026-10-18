@@ -39,9 +39,11 @@ fn begin(c: *Context, rule: Rule) Context.Error!bool {
 fn checkAccess(c: *Context) Context.Error!void {
     if (!try begin(c, access)) return;
     const tree = try c.project.syntax(try c.source());
+    const made_by_constructor = try constructed(c);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .field_access) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        if (made_by_constructor.len != 0) try checkLiteral(c, tree, node, made_by_constructor);
+        if (tag != .field_access) continue;
         const data = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
         if (!backingName(name)) continue;
@@ -51,6 +53,48 @@ fn checkAccess(c: *Context) Context.Error!void {
         const is_backing = backing(k, name);
         if (is_backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
+}
+/// The published types only their own constructor may make: `err.PublicSource`, whose
+/// `classify` takes the reviewed reason that a literal of it skips.
+fn constructed(c: *Context) Context.Error![]const Facts.Container {
+    const found = try c.facts.publication(Contract.library);
+    var out: std.ArrayList(Facts.Container) = .empty;
+    for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container); // safe: the entry holds a role value of this enum.
+    return out.items;
+}
+/// A struct literal of a type only its constructor makes, outside the library: a finding where
+/// its result type is one, undecided where it could be (it names exactly the type's fields,
+/// every one without a default among them) and its place does not resolve.
+fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []const Facts.Container) Context.Error!void {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const literal = tree.fullStructInit(&buffer, node) orelse return;
+    var fits = false;
+    for (targets) |target| fits = fits or try namesFields(c, tree, literal, target);
+    if (!fits) return;
+    switch (try typed(c, try c.facts.literalType(c.file, node), 0)) {
+        .owner => |k| if (k == .public_source) try c.at(access, tree.firstToken(node), "public text built by a literal skips its reviewed classification; use err.PublicSource.classify(reason, bytes)"),
+        .other => {},
+        .unknown => try c.undecided(access, tree.tokenStart(tree.firstToken(node)), .unresolved, "a literal that may be a public source has no resolved result type"),
+    }
+}
+/// Whether a literal could be a value of `container`: every field it names is one of the
+/// container's, and it names every field that has no default.
+fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, container: Facts.Container) Context.Error!bool {
+    const model = &c.project.models[container.file.raw()];
+    const own = &c.project.files[container.file.raw()].tree;
+    for (literal.ast.fields) |value| {
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2));
+        const field = c.facts.member(container, name) orelse return false;
+        if (model.declarations[field.index].kind != .field) return false;
+    }
+    for (model.declarations) |decl| {
+        if (decl.kind != .field or decl.scope != container.scope) continue;
+        if (own.fullContainerField(decl.node).?.ast.value_expr != .none) continue;
+        for (literal.ast.fields) |value| {
+            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2)), decl.name)) break;
+        } else return false;
+    }
+    return true;
 }
 /// Whether `node` is a type, whose members are declarations and never a value's fields: a
 /// container named as such, or a parameter or constant declared `type` (`V.maximum` of a
@@ -281,8 +325,7 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .shared => &.{ "block", "live" },
         .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries" },
         .stage => &.{ "live", "payload" },
-        // A runtime machine's `state` waits while reactor's backends read `o.state` of `anytype`
-        // parameters every public caller can bind (glint-complete).
+        .machine => &.{"state"},
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
         .scope => &.{ "table", "generation", "index" },
         .ref => &.{ "slot", "generation", "pointer" },
@@ -305,7 +348,7 @@ fn backingName(name: []const u8) bool {
 /// and inline storage, whose copy is its elements' (A002 does not read the element type).
 fn copiedOwner(k: Contract.Kind) bool {
     return switch (k) {
-        .scalar, .choice, .scope, .ref, .limit, .untrusted, .inline_store => false,
+        .scalar, .choice, .scope, .ref, .limit, .untrusted, .inline_store, .public_source => false,
         else => true,
     };
 }

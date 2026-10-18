@@ -2011,3 +2011,125 @@ test "a call that passes what a module the build does not have gives binds nothi
         try std.testing.expectEqual(absent_kernels, value == .instance);
     }
 }
+
+/// The type a struct literal takes from where it is written, as Zig gives it a result type: a
+/// typed literal's own; a declaration's written type; an assignment's target; a call's
+/// parameter, read with a made container's arguments for its methods; its function's result
+/// for a `return`; a typed literal's field or array's element; `@as`; and through a grouping,
+/// a branch or a block's `break`. `.scalar` where nothing gives it one (an untyped `const`, an
+/// `anytype` argument): it is then an anonymous struct. Unknown where the place does not
+/// resolve.
+pub fn literalType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    return self.placeType(file, node, 0);
+}
+
+fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!Value {
+    if (depth == 32) return .{ .unknown = .budget };
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |literal| if (literal.ast.type_expr.unwrap()) |t| return self.resolve(file, t);
+    const parent = model.node_parents[@backingInt(node)] orelse return .{ .unknown = .unsupported }; // safe: a node index indexes its own tree's parent table.
+    if (tree.fullVarDecl(parent)) |variable| {
+        if (variable.ast.init_node.unwrap() != node) return .{ .unknown = .unsupported };
+        return if (variable.ast.type_node.unwrap()) |t| try self.resolve(file, t) else .scalar;
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, parent)) |call| {
+        const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .{ .unknown = .unsupported };
+        return self.parameterType(file, call, position);
+    }
+    var parent_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&parent_buffer, parent) != null) {
+        const whole = try self.placeType(file, parent, depth + 1);
+        if (whole == .unknown or whole == .scalar) return whole;
+        const name = try self.memberName(tree.tokenSlice(tree.firstToken(node) - 2));
+        const container = switch (whole) {
+            .container, .instance => |c| c,
+            else => return .{ .unknown = .unsupported },
+        };
+        const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
+        return self.declaration(field);
+    }
+    if (tree.fullArrayInit(&parent_buffer, parent)) |array| {
+        const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else try self.placeType(file, parent, depth + 1);
+        return switch (whole) {
+            .array => |each| each.*,
+            .unknown => whole,
+            else => .{ .unknown = .unsupported },
+        };
+    }
+    switch (tree.nodeTag(parent)) {
+        .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
+        .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
+        .@"break" => {
+            const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap() orelse return .{ .unknown = .unsupported };
+            var at: ?Ast.Node.Index = model.node_parents[@backingInt(parent)]; // safe: a node index indexes its own tree's parent table.
+            while (at) |candidate| : (at = model.node_parents[@backingInt(candidate)]) { // safe: a node index indexes its own tree's parent table.
+                const tag = tree.nodeTag(candidate);
+                if (tag != .block and tag != .block_semicolon and tag != .block_two and tag != .block_two_semicolon) continue;
+                const first = tree.firstToken(candidate);
+                if (first >= 2 and tree.tokenTag(first - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(first - 2), tree.tokenSlice(label))) return self.placeType(file, candidate, depth + 1);
+            }
+            return .{ .unknown = .unsupported };
+        },
+        .@"return" => {
+            var at: ?Ast.Node.Index = model.node_parents[@backingInt(parent)]; // safe: a node index indexes its own tree's parent table.
+            while (at) |candidate| : (at = model.node_parents[@backingInt(candidate)]) { // safe: a node index indexes its own tree's parent table.
+                if (tree.nodeTag(candidate) != .fn_decl) continue;
+                var fn_buffer: [1]Ast.Node.Index = undefined;
+                const function = tree.fullFnProto(&fn_buffer, tree.nodeData(candidate).node_and_node[0]) orelse return .{ .unknown = .unsupported };
+                const result = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
+                return self.resolve(file, result);
+            }
+            return .{ .unknown = .unsupported };
+        },
+        else => {},
+    }
+    var args_buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, parent, &args_buffer);
+    if (args.len == 2 and args[1] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return self.resolve(file, args[0]);
+    return .{ .unknown = .unsupported };
+}
+
+/// The written type of a call's argument at `position`: the callee's parameter (a method's
+/// receiver first), a made container's method read with the arguments that made it.
+/// `.scalar` for `anytype`, which takes the argument's own type.
+fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, position: usize) ResolveError!Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const callee = try self.resolve(file, call.ast.fn_expr);
+    if (callee == .unknown) return callee;
+    if (callee != .function) return .{ .unknown = .unsupported };
+    const decl = callee.function;
+    var receiver: usize = 0;
+    var made: ?*const Made = null;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const on = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        const container: ?Container = switch (on) {
+            .instance => |c| c,
+            .pointer => |p| switch (p.*) {
+                .instance => |c| c,
+                else => null,
+            },
+            else => null,
+        };
+        if (container) |c| {
+            receiver = 1;
+            if (c.made_by) |m| if (decl.file.eql(c.file) and self.project.models[decl.file.raw()].declarations[decl.index].scope == c.scope) { // safe: enum identities index their owning frozen tables without narrowing.
+                made = m;
+            };
+        }
+    }
+    const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const function = target_tree.fullFnProto(&fn_buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
+    var it = function.iterate(target_tree);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) {
+        if (at != position + receiver) continue;
+        const type_expr = param.type_expr orelse return .scalar;
+        if (made) |m| return self.substituted(decl.file, type_expr, m, 0);
+        return self.resolve(decl.file, type_expr);
+    }
+    return .{ .unknown = .unsupported };
+}

@@ -159,12 +159,4 @@ fn g2Rows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, project: *
         if (!report.complete) return error.IncompleteFamilyScan;
     }
     try row(writer, "warm_family", elapsed(io, family_start, small), rounds, 20);
-    const projection_start = now(io, small);
-    var references: usize = 0;
-    for (0..rounds) |_| {
-        var projection = try glint.Projection.init(gpa, project, 100_000);
-        defer projection.deinit();
-        references = projection.references.len;
-    }
-    try row(writer, "projection", elapsed(io, projection_start, small), rounds, references);
 }

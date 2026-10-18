@@ -73,7 +73,22 @@ pub const Config = struct {
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };
     pub const FunctionException = struct { function: []const u8, lines: u32, reason: []const u8 };
-    pub const Disallowed = struct { source: []const u8, declaration: []const u8, reason: []const u8, replacement: []const u8 };
+    /// A declaration a project keeps out of its code (P006), named by what a reference reaches.
+    /// `source` is what `@import` takes: a `.zig` project input's name, or a module as programs
+    /// import it (`std`, `aegis`), one no file imports being one nothing can reach; `declaration`
+    /// is its path from there, through public namespaces from a module (`posix.fdatasync`), each
+    /// per-build choice on the way read in every alternative. Null `source` names an external
+    /// function or variable by its symbol: every `extern` declaration of that symbol, std's or
+    /// the program's own, is the one the linker binds. A governed declaration that is itself
+    /// `extern` governs its symbol the same way.
+    pub const Disallowed = struct {
+        source: ?[]const u8 = null,
+        declaration: []const u8,
+        reason: []const u8,
+        replacement: []const u8,
+        /// `production` leaves out test code: tests and test blocks.
+        scope: enum { all, production } = .all,
+    };
 
     const core = blk: {
         var selection: [64]bool = @splat(false);
@@ -90,9 +105,12 @@ pub const Config = struct {
         }
         for (self.function_exceptions) |exception| if (std.mem.trim(u8, exception.reason, " \t\r\n").len == 0 or exception.lines == 0) return error.InvalidSelection;
         for (self.disallowed) |entry| {
-            if (std.mem.trim(u8, entry.source, " \t\r\n").len == 0 or std.mem.trim(u8, entry.reason, " \t\r\n").len == 0 or std.mem.trim(u8, entry.replacement, " \t\r\n").len == 0) return error.InvalidSelection;
-            var parts = std.mem.splitScalar(u8, entry.declaration, '.');
-            while (parts.next()) |part| if (part.len == 0) return error.InvalidSelection;
+            if (std.mem.trim(u8, entry.reason, " \t\r\n").len == 0 or std.mem.trim(u8, entry.replacement, " \t\r\n").len == 0) return error.InvalidSelection;
+            if (entry.source) |source| {
+                if (std.mem.trim(u8, source, " \t\r\n").len == 0) return error.InvalidSelection;
+                var parts = std.mem.splitScalar(u8, entry.declaration, '.');
+                while (parts.next()) |part| if (part.len == 0) return error.InvalidSelection;
+            } else if (entry.declaration.len == 0 or std.mem.findScalar(u8, entry.declaration, '.') != null) return error.InvalidSelection;
         }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
         for (self.enabled, 0..) |enabled, index| {

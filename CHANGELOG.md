@@ -4,6 +4,19 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Breaking
+
+- `Projection` is gone: nothing consumed it, and the ownership policies it was kept for are P006 over the model every rule reads (docs/design.md, "Ownership policy and adopters").
+- `Config.Disallowed.source` is what `@import` takes: a module as programs import it (`std`), or a `.zig` input's name; null names an external symbol. A source without `.zig` that no file imports is nothing to check.
+- P006 resolves only the sites that spell a governed name: an alias is found where it is made, not at each use.
+
+### Added
+
+- P006 governs a module's declarations through public namespaces and every alternative of a per-build choice (`c.F.FULLFSYNC`), external symbols (every `extern` declaration of one, std's or the program's, is the function the linker binds; a governed `extern` declaration governs its symbol), `@field` with a written name, and `Disallowed.scope = .production` to leave test code out. A governed name that does not resolve is undecided; other unresolved references are not P006's.
+- A001 finds `err.PublicSource` built by a struct literal outside aegis, skipping `classify`'s reviewed reason, by the type the literal takes from its place: a declaration's written type, an assignment's target, a call's parameter (a made container's method read with its arguments), its function's result, a typed literal's field or array's element, `@as`, through groupings, branches and labeled breaks. A literal naming exactly its fields whose place does not resolve is undecided.
+- A001 reads a runtime machine's `state` (`state.Machine.Runtime`) as its backing field.
+- `RuleContext.inTest`.
+
 ## [0.3.0] - 2026-10-18
 
 ### Breaking

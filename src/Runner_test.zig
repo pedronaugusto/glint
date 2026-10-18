@@ -272,21 +272,123 @@ test "G2 function-length type constructors subtract returned container bodies" {
 }
 
 test "G2 disallowed policy follows qualified declaration identity and aliases" {
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy", .bytes = "const A = struct { fn raw() void {} }; const B = struct { fn raw() void {} }; const alias = A.raw; pub fn run() void { alias(); B.raw(); }" }}, &.{}, .{});
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "policy.zig", .bytes = "const A = struct { fn raw() void {} }; const B = struct { fn raw() void {} }; const alias = A.raw; pub fn run() void { alias(); B.raw(); }" }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.P006, true);
-    config.disallowed = &.{.{ .source = "policy", .declaration = "A.raw", .reason = "this project requires the guarded API", .replacement = "checked" }};
+    config.disallowed = &.{.{ .source = "policy.zig", .declaration = "A.raw", .reason = "this project requires the guarded API", .replacement = "checked" }};
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
-    // The alias definition and its call refer to A.raw; B.raw is a distinct declaration.
-    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: exact fixture identity uses.
-    config.disallowed = &.{.{ .source = "missing", .declaration = "A.raw", .reason = "requires guarded API", .replacement = "checked" }};
+    // The alias is made where it spells A.raw; its call and B.raw reach no governed declaration.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: exact fixture identity uses.
+    try std.testing.expect(report.complete);
+    config.disallowed = &.{.{ .source = "missing.zig", .declaration = "A.raw", .reason = "requires guarded API", .replacement = "checked" }};
     config.selections = &.{.{ .rule = .P006, .level = .gate }};
     var missing = try glint.run(std.testing.allocator, &project, config);
     defer missing.deinit();
     try std.testing.expect(!missing.complete);
     try std.testing.expectEqual(@as(usize, 0), missing.diagnostics.len); // safe: no invented missing declaration.
+}
+
+/// A program, a `lib` module standing for std, and its per-target namespace.
+fn ownershipRun(program: []const u8, disallowed: []const glint.Config.Disallowed) !glint.Report {
+    const P = glint.Project;
+    const inputs = [_]P.Input{
+        .{ .name = "program.zig", .bytes = program },
+        .{ .name = "lib.zig", .bytes =
+        \\pub const posix = @import("posix.zig");
+        \\pub const c = @import("c.zig");
+        \\pub const File = struct { handle: i32, pub fn sync(f: File) void { _ = f; } pub fn close(f: File) void { _ = f; } };
+        , .selected = false },
+        .{ .name = "posix.zig", .bytes = "pub fn fdatasync(fd: i32) void { _ = fd; }\npub fn read(fd: i32) void { _ = fd; }", .selected = false },
+        .{ .name = "c.zig", .bytes =
+        \\pub extern "c" fn fsync(fd: c_int) c_int;
+        \\pub const F = switch (@import("builtin").os.tag) { .macos => struct { pub const FULLFSYNC = 51; pub const GETFL = 3; }, else => struct { pub const GETFL = 3; } };
+        , .selected = false },
+    };
+    const imports = [_]P.Import{
+        .{ .from = P.FileId.fromRaw(0), .spelling = "lib", .target = P.FileId.fromRaw(1) },
+        .{ .from = P.FileId.fromRaw(1), .spelling = "posix.zig", .target = P.FileId.fromRaw(2) },
+        .{ .from = P.FileId.fromRaw(1), .spelling = "c.zig", .target = P.FileId.fromRaw(3) },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.selections = &.{.{ .rule = .P006, .level = .gate }};
+    config.disallowed = disallowed;
+    return glint.run(std.testing.allocator, &project, config);
+}
+
+const durability = [_]glint.Config.Disallowed{
+    .{ .source = "lib", .declaration = "posix.fdatasync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" },
+    .{ .source = "lib", .declaration = "c.fsync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" },
+    .{ .source = "lib", .declaration = "c.F.FULLFSYNC", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" },
+    .{ .source = "lib", .declaration = "File.sync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile", .scope = .production },
+    .{ .declaration = "FlushFileBuffers", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" },
+};
+
+test "P006 governs a module's declarations by what each reference reaches" {
+    var report = try ownershipRun(
+        \\const lib = @import("lib");
+        \\const posix = lib.posix;
+        \\const sync = posix.fdatasync;
+        \\pub fn a(fd: i32) void { posix.fdatasync(fd); posix.read(fd); sync(fd); }
+        \\pub fn b(f: lib.File) void { f.sync(); f.close(); }
+        \\pub fn c(fd: i32) void { _ = lib.c.fsync(fd); _ = lib.c.F.FULLFSYNC; _ = lib.c.F.GETFL; }
+        \\pub fn d() void { @field(lib.posix, "fdatasync")(0); }
+    , &durability);
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    // fdatasync called, where the alias is made and through `@field`; File.sync, c.fsync, F.FULLFSYNC.
+    try std.testing.expectEqual(@as(usize, 6), report.diagnostics.len); // safe: fixture sites counted by hand.
+}
+
+test "P006 binds an external symbol, the program's own declaration of it too" {
+    var report = try ownershipRun(
+        \\extern "c" fn fsync(fd: c_int) c_int;
+        \\extern "kernel32" fn FlushFileBuffers(handle: *anyopaque) c_int;
+        \\fn flush() void {}
+        \\pub fn a(h: *anyopaque) void { _ = fsync(0); _ = FlushFileBuffers(h); flush(); }
+    , &durability);
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: fixture sites counted by hand.
+}
+
+test "P006 leaves a governed name it cannot resolve undecided, and other names alone" {
+    var report = try ownershipRun(
+        \\pub const Kind = enum { sync, close };
+        \\pub const Op = union(enum) { sync, read: u32 };
+        \\pub fn a(f: anytype) void { f.sync(); f.flush(); }
+    , &durability);
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: nothing resolved.
+    var undecided: usize = 0;
+    for (report.coverage) |note| if (note.rule != null and note.rule.? == .P006) {
+        undecided += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), undecided); // safe: only `sync` is a governed name.
+}
+
+test "P006 production scope leaves test code out" {
+    var report = try ownershipRun(
+        \\const lib = @import("lib");
+        \\test { const f: lib.File = .{ .handle = 0 }; f.sync(); lib.posix.fdatasync(0); }
+    , &durability);
+    defer report.deinit();
+    // File.sync is governed in production only; fdatasync everywhere.
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: fixture sites counted by hand.
+}
+
+test "P006 configuration needs a symbol without dots, or a source and a path" {
+    var config = glint.Config.none();
+    config.disallowed = &.{.{ .declaration = "c.fsync", .reason = "durability", .replacement = "airlock" }};
+    try std.testing.expectError(error.InvalidSelection, config.validate());
+    config.disallowed = &.{.{ .source = " ", .declaration = "fsync", .reason = "durability", .replacement = "airlock" }};
+    try std.testing.expectError(error.InvalidSelection, config.validate());
+    config.disallowed = &.{.{ .declaration = "fsync", .reason = "durability", .replacement = "airlock" }};
+    try config.validate();
 }
 
 test "G2 policy configuration rejects blank reasons empty qualifiers and stale exceptions" {

@@ -1,6 +1,6 @@
 # glint
 
-Work in progress: G2 provides a Zig AST/ZIR source model, configurable built-in and compiled project rules, architecture projection and a standalone CLI. Consumer adoption, broader dead-private admission, later safety rules and predecessor retirement remain open. This is an unreleased development package.
+Work in progress: G2 provides a Zig AST/ZIR source model, configurable built-in and compiled project rules and a standalone CLI. Consumer adoption, broader dead-private admission, later safety rules and predecessor retirement remain open. This is an unreleased development package.
 
 Requires Zig 0.17.0. Runtime dependencies are published aegis and Zig std; preflight and shakedown are dev dependencies through [bay](https://github.com/pedronaugusto/bay), which a project that depends on glint never sees.
 
@@ -68,13 +68,13 @@ One real comment suppresses one rule at one logical site, either inline or immed
 
 std.zig.Ast and std.zig.AstGen/std.zig.Zir are the front end. Bounded lexical/resource checks precede parsing; selected source limits default to 16 MiB per file and 128 MiB/4096 files per project. This is a partial source engine, with no LLVM, compiler Sema, full generic evaluation, implicit cache, edit reuse or lifetime verifier. Naming rules use known value kinds; computed and unmapped facts remain coverage. Established external ABI function names are preserved. Escape analysis remains pending. Adopted aegis operation checks accept explicit gates with required unknown sites incomplete; no safety proof is claimed.
 
-Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint exposes the shared rule and projection APIs; consumer writers own adoption. [Design and handoff](docs/design.md) specify exact policy/configuration, compiled-rule helpers, completion and dependency order. Remaining coverage is explicit in the design.
+Gantry owns path dialect and cross-file architecture policy. Preflight orchestrates/configures tools. Glint exposes the shared rule API; consumer writers own adoption. [Design and handoff](docs/design.md) specify exact policy/configuration, compiled-rule helpers, completion and dependency order. Remaining coverage is explicit in the design.
 
 ## Development
 
 Run `bay check`, `bay lint`, `bay check-token-portable`, and targeted tests such as `bay test -Dtest-filter=review`. `bay plan -- --workflow .github/workflows/ci.yml` generates the pinned CI caller through preflight. Fast CI validates working candidates; merge CI validates the exact candidate on Linux, macOS and Windows before main advances.
 
-`bay bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, compiled project rules and projection. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token drivers and frozen corpus pins are in `bench/`; their measured rows live in private trials. No speed guarantee is claimed.
+`bay bench` runs only Glint's own ReleaseFast benchmarks. Rows cover parse/lower/cold and warm scans, matched G1r selections, requested allocations, mapped deprecation, private imports, and compiled project rules. CI compiles these; timing is manual. Earlier semantic measurement rows live in private trials. The token drivers and frozen corpus pins are in `bench/`; their measured rows live in private trials. No speed guarantee is claimed.
 
 MIT. See [LICENSE](LICENSE).
 

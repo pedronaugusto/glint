@@ -37,9 +37,6 @@ pub const runConfigured = @import("Runner.zig").runConfigured;
 /// Explicit source overrides: callers select these using their own path dialect.
 pub const FileConfig = @import("Runner.zig").FileConfig;
 
-/// Imports, resolved references/calls and source contexts for architecture consumers.
-pub const Projection = @import("Projection.zig");
-
 /// Parses a built-in or registered compiled-rule selection without numeric aliases.
 pub const parseRule = @import("Rule.zig").parseConfigured;
 

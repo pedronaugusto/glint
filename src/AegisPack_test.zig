@@ -1130,3 +1130,29 @@ test "A006 accepts a depth the cycle moves and compares, and recursion no untrus
     try expectJudged(head ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn enter(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; }\n fn value(p: *Parser) error{TooDeep}!void { try p.enter(); if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };\npub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }", pack.recursion, true, 0);
     try expectJudged(head ++ "pub fn count(bytes: []const u8) usize { return if (bytes.len == 0) 0 else 1 + count(bytes[1..]); }", pack.recursion, true, 0);
 }
+
+test "A001 finds public text built by a literal, by the type the literal takes from its place" {
+    const head = "const err = @import(\"aegis\").err;\nconst Other = struct { bytes: []const u8 };\nfn show(s: err.PublicSource) void { _ = s; }\nfn take(o: Other) void { _ = o; }\n";
+    // A declaration's written type, a call's parameter, a function's result, a typed literal,
+    // a typed literal's field, `@as`, a made container's method.
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { const s: err.PublicSource = .{ .bytes = b }; _ = s; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { show(.{ .bytes = b }); }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) !err.PublicSource { if (b.len == 0) return error.Empty; return .{ .bytes = b }; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { _ = err.PublicSource{ .bytes = b }; }", pack.access, true, 1);
+    try expectJudged(head ++ "const Holder = struct { source: err.PublicSource };\npub fn f(b: []const u8) void { const h: Holder = .{ .source = .{ .bytes = b } }; _ = h; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { _ = @as(err.PublicSource, .{ .bytes = b }); }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { _ = err.PublicText(8).copy(.{ .bytes = b }); }", pack.access, true, 1);
+    // `classify` is the way; a literal of another type with the same fields is not one, nor an
+    // anonymous one.
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { show(err.PublicSource.classify(\"a reviewed name\", b)); }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(b: []const u8) void { take(.{ .bytes = b }); const o: Other = .{ .bytes = b }; _ = o; const a = .{ .bytes = b }; _ = a; }", pack.access, true, 0);
+    // A literal naming other fields cannot be one; a place that does not resolve is undecided.
+    try expectJudged(head ++ "pub fn f(b: []const u8, sink: anytype) void { sink.put(.{ .bytes = b, .more = 1 }); }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(b: []const u8, sink: anytype) void { sink.put(.{ .bytes = b }); }", pack.access, false, 0);
+}
+
+test "A001 reads a runtime machine's state as its backing field" {
+    const head = "const aegis = @import(\"aegis\");\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
+    try expectJudged(head ++ "pub fn f(m: *Machine.Runtime(void)) S { return m.state; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Machine.Runtime(void)) S { return m.current(); }", pack.access, true, 0);
+}

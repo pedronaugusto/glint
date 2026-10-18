@@ -9,5 +9,4 @@ test {
     _ = @import("Runner_test.zig");
     _ = @import("contract_test.zig");
     _ = @import("RuleContext_test.zig");
-    _ = @import("Projection_test.zig");
 }

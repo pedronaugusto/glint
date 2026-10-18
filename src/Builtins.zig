@@ -5,9 +5,9 @@ const rules = @import("Rule.zig");
 const Model = @import("Model.zig");
 const names = @import("names.zig");
 const Ast = std.zig.Ast;
-const Project = @import("Project.zig");
 const Context = @import("RuleContext.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
+const Disallowed = @import("Disallowed.zig");
 const RunError = Context.Error;
 
 pub fn check(context: *Context) RunError!void {
@@ -21,7 +21,7 @@ pub fn check(context: *Context) RunError!void {
     try contextRules(context);
     try sourcePolicies(context);
     try functionLengths(context);
-    try disallowed(context);
+    try Disallowed.check(context);
     try DeadDeclarations.check(context);
     try unknownCoverage(context);
 }
@@ -361,16 +361,6 @@ fn unknownCoverage(self: *Context) RunError!void {
     }
 }
 
-fn inTest(self: *const Context, token: Ast.TokenIndex) bool {
-    if (self.project.inputs[self.file.raw()].classification == .@"test") return true;
-    const model = &self.project.models[self.file.raw()];
-    var scope: ?u32 = model.token_scopes[token];
-    while (scope) |index| {
-        if (model.scopes[index].kind == .@"test") return true;
-        scope = model.scopes[index].parent;
-    }
-    return false;
-}
 fn hasReason(self: *const Context, token: Ast.TokenIndex, prefix: []const u8, previous: bool) bool {
     const file = &self.project.files[self.file.raw()];
     const line = file.line(file.tree.tokenStart(token));
@@ -395,7 +385,7 @@ fn sourcePolicies(self: *Context) RunError!void {
     if (self.config.has(.P001)) for (tree.tokens.items(.tag), 0..) |tag, i| {
         if (tag != .builtin) continue;
         const token: Ast.TokenIndex = @intCast(i); // safe: std tokens fit the checked source inventory.
-        if (self.config.cast_scope == .production and inTest(self, token)) continue;
+        if (self.config.cast_scope == .production and self.inTest(token)) continue;
         if (isCast(tree.tokenSlice(token), self.config.casts == .all) and !hasReason(self, token, "safe:", false)) try self.at(.P001, token, "cast needs // safe: <site reason> on its line");
     };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -408,7 +398,7 @@ fn sourcePolicies(self: *Context) RunError!void {
                 if (!hasReason(self, token, "safe:", false)) try self.at(.P002, token, "safety-off site needs // safe: <boundary invariant and measured hot-loop evidence>");
             } else if (!(tree.nodeTag(args[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "true"))) try self.unknown(.P002, node, .comptime_dependent);
         }
-        if (inTest(self, token)) continue;
+        if (self.inTest(token)) continue;
         if (self.config.has(.P004) and tag == .@"catch") {
             var rhs = tree.nodeData(node).node_and_node[1];
             while (tree.nodeTag(rhs) == .grouped_expression) rhs = tree.nodeData(rhs).node_and_token[0];
@@ -467,51 +457,4 @@ fn functionLengths(self: *Context) RunError!void {
         if (count > limit) try self.at(.P003, function.name_token.?, try self.allocator.print("function has {d} lines (configured limit {d}); returned type body is subtracted", .{ count, limit }));
     }
     for (used) |hit| if (!hit) try self.undecided(.P003, 0, .unsupported, "stale function-length exception does not match a function");
-}
-fn disallowed(self: *Context) RunError!void {
-    if (!self.config.has(.P006) or self.config.disallowed.len == 0) return;
-    const targets = try self.allocator.alloc(?Facts.Decl, self.config.disallowed.len);
-    for (self.config.disallowed, 0..) |entry, e| {
-        targets[e] = null;
-        var source: ?Project.FileId = null;
-        for (self.project.inputs, 0..) |input, i| if (std.mem.eql(u8, input.name, entry.source)) {
-            if (source != null) return error.InvalidSelection;
-            source = Project.FileId.fromRaw(@intCast(i)); // safe: checked project inventory.
-        };
-        const id = source orelse {
-            try self.undecided(.P006, 0, .unresolved, "disallowed declaration source was not supplied");
-            continue;
-        };
-        var parts = std.mem.splitScalar(u8, entry.declaration, '.');
-        const first = parts.next().?;
-        var definition: ?Facts.Decl = if (self.project.models[id.raw()].scopes[0].names.get(first)) |d| .{ .file = id, .index = d } else null;
-        while (parts.next()) |part| {
-            const previous = definition orelse break;
-            const value = try self.facts.declaration(previous);
-            if (value != .container or value.container.symbolic) {
-                definition = null;
-                break;
-            }
-            definition = self.facts.member(value.container, part);
-        }
-        if (definition) |resolved| targets[e] = try self.facts.origin(resolved);
-        if (targets[e] == null) try self.undecided(.P006, 0, .unresolved, "disallowed declaration identity could not be resolved");
-    }
-    const tree = &self.project.files[self.file.raw()].tree;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier and tag != .field_access) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: checked AST inventory.
-        const definition = (try self.facts.definition(self.file, node)) orelse {
-            const value = try self.facts.resolve(self.file, node);
-            if (value == .unknown) try self.unknown(.P006, node, value.unknown);
-            continue;
-        };
-        const origin = (try self.facts.origin(definition)) orelse {
-            try self.unknown(.P006, node, .cycle);
-            continue;
-        };
-        for (targets, self.config.disallowed) |target, entry| if (target != null and std.meta.eql(target.?, origin)) {
-            try self.atDefinition(.P006, tree.nodeMainToken(node), try self.allocator.print("disallowed declaration: {s}; use {s}", .{ entry.reason, entry.replacement }), origin);
-        };
-    }
 }
