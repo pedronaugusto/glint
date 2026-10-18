@@ -4,6 +4,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Breaking
+
+- `RuleContext.usage` is gone with the project-wide reference relation it held: D001 no longer needs it.
+
+### Changed
+
+- D001 decides each file by Zig's own rule that a private declaration is usable only in its file (another file's member access and `@field` are refused, `@hasDecl` and type information see no private declaration, so no std hook calls a private `format`): a private function or variable its file names nowhere, counting every spelling as a use and withholding the file only for a `@field` with a computed name on a receiver that could be a type and does not resolve. The relation it waited on was never complete on real code, so D001 reported nothing; on the family's mains it now finds 169 dead declarations, every one named nowhere else. D001 joins the family profile at report.
+
 ## [0.2.15] - 2026-10-17
 
 ### Added

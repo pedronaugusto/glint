@@ -14,7 +14,7 @@ The public seam is `RuleContext`, `ProjectRule`, `RuleDefinition`, `runConfigure
 
 The context provides immutable checked model handles, conservative value/declaration resolution, primary/related diagnostic spans and explicit `undecided` coverage. The common runner copies temporary messages, orders diagnostics, applies real-comment suppression, and renders text, JSON version 1 and SARIF 2.1.0. Custom metadata appears in every format and coverage. Rule authors retain responsibility for their predicate; a callback cannot make unknown analysis complete by suppressing a finding.
 
-`Config.selections` chooses `off`, `report` or `gate`. `FileConfig` overrides code options for an explicit FileId; callers select these IDs with their path dialect. Generic defaults remain Z003/Z013. `reviewed()` reports 21 IDs; `family()` reports the same selection except D001. Neither profile asserts family-green adoption. Unknown facts required by a selected gate make the run incomplete. Severity/group and acceptance level are distinct.
+`Config.selections` chooses `off`, `report` or `gate`. `FileConfig` overrides code options for an explicit FileId; callers select these IDs with their path dialect. Generic defaults remain Z003/Z013. `reviewed()` reports 21 IDs; `family()` reports the same selection. Neither profile asserts family-green adoption. Unknown facts required by a selected gate make the run incomplete. Severity/group and acceptance level are distinct.
 
 ## Rules and policy options
 
@@ -34,7 +34,7 @@ The context provides immutable checked model handles, conservative value/declara
 | P004 | Production `catch unreachable` needs same/previous-line real `// unreachable: <invariant>`. Existing test exemption is preserved explicitly. |
 | P005 | Production use of the resolved mapped std.debug.print declaration; shadows/spelling lookalikes are not banned. Missing mapping is coverage. |
 | P006 | Configurable disallowed declaration identity, qualified source-label/declaration with reason/replacement. Follows aliases, distinguishes siblings, rejects missing required targets through coverage; no default ban list. |
-| D001 | Conservative private file/container declaration report on a completely resolved project use relation. Requires actual lowered lexical/member/call/reflection witnesses; public/exported or passed containers retain descendants for compiler hooks. Literal reflection resolves declarations; type-info retains containers. Dynamic reflection, generics, missing mappings, unsupported calls/hooks/lowering withhold every dead allegation. No reachability/SCC deletion inference. Default/family off; broad family admission remains undecided pending complete real-corpus resolution and triage. |
+| D001 | A private declaration (no `pub`, not exported, a function or variable at file or container level, an import aside: Z013) that its file names nowhere. Zig lets only the declaring file use one: another file's member access or `@field` is refused, `@hasDecl` sees no private declaration even in its own file, type information lists only public names, so no std hook calls a private `format`. Every spelling of the name in the file is a use (an identifier, a member access or declaration literal `.name`, `@field` with that name) unless the identifier resolves lexically to another declaration; a struct literal's field name and a use inside the declaration itself are not. A `@field` with a computed name reaches nothing on a run-time value (it names only fields there), every declaration of its receiver's container on a type, and withholds the file's findings when its receiver could be a type and does not resolve. A declaration inside a reported container is not reported again. No reachability: a declaration only dead code names is used. In the family profile at report (admitted 2026-10-18 on the family's mains: every finding a declaration named nowhere else, no false alarm). |
 
 Z008 is absent. Removed Z002/Z004/Z007/Z010/Z015/Z017–Z023/Z025/Z027–Z030/Z033 remain rejected; no numeric alias or compatibility profile restores them. Breaking G2: typed public identities, rule metadata version 3, expanded explicit reviewed selection. JSON spans retain numeric file identities; JSON/SARIF and completion versions stay unchanged.
 
@@ -79,7 +79,7 @@ Consequences a pack author can rely on. Any revision that keeps the public names
 The optional `AegisPack.rules` uses the public compiled-rule API. The standalone CLI registers
 its IDs but never enables them by default; select `--enable A001` (through A005), or pass
 report or gate selections and the pack descriptors to `runConfigured`. Explicit gate selection is accepted; an undecided required site still makes execution incomplete.
-Generic defaults, the Z012 report and the deferred D001 admission are unchanged.
+Generic defaults and the Z012 and D001 reports are unchanged.
 
 Recognition follows lexical declarations and the `aegis` module mapping, through the published names of
 `AegisPack.library` (Secret, SecretBytes, Guarded and its Guard, and the id, unit and integer factories, from

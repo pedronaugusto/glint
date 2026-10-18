@@ -5,14 +5,12 @@ const Facts = @import("Facts.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
 const RuleContext = @This();
-const Usage = @import("Usage.zig");
 
 allocator: std.mem.Allocator,
 project: *const Project,
 file: Project.FileId,
 config: rules.Config,
 facts: *Facts,
-usage: ?*const Usage = null,
 definitions: []const rules.Definition,
 sink: Sink,
 

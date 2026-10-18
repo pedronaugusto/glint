@@ -193,18 +193,47 @@ test "G2 amended policies are explicit family choices and count suppressed sites
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
 }
 
-test "G2 dead-private model resolves member calls hooks and literal reflection before counting" {
+test "D001 counts every spelling of a private name in its file as a use" {
     try check(.D001, "fn unused() void {} pub fn live() void {}", 1);
     try check(.D001, "const S = struct { fn read(self: S) u8 { _ = self; return 1; } }; pub fn live(s: S) u8 { return s.read(); }", 0);
     try check(.D001, "const S = struct { const needed = 1; }; pub fn live() void { _ = @field(S, \"needed\"); }", 0);
-    try check(.D001, "pub const S = struct { fn format(self: S) void { _ = self; } };", 0);
     try check(.D001, "fn retained() void {}\n// glint-ignore: D001 -- deliberate fixture declaration tests unused-name reporting\nfn unused() void {}\npub fn live() void { retained(); }", 0);
+    // A declaration literal names the declaration through its result type.
+    try check(.D001, "const S = struct { x: u8, const empty: S = .{ .x = 0 }; }; pub fn live() u8 { const s: S = .empty; return s.x; }", 0);
+    // A use only tests make is a use.
+    try check(.D001, "fn helper() u8 { return 1; } test { _ = helper(); }", 0);
+    try check(.D001, "const unknown = @import(\"external\"); fn used() void {} pub fn live() void { unknown.f(used); }", 0);
 }
 
-test "G2 dead-private never accuses dynamic reflection generics or unresolved calls" {
+test "D001 reports what only the declaration itself or a field of that name names" {
+    // A std hook cannot call a private method: it is not marked pub to another file.
+    try check(.D001, "pub const S = struct { fn format(self: S) void { _ = self; } };", 1);
+    try check(.D001, "fn Box(comptime T: type) type { return struct { value: T }; }", 1);
+    try check(.D001, "fn walk(n: u8) u8 { return if (n == 0) 0 else walk(n - 1); } pub fn live() void {}", 1);
+    // A struct literal's field name is a field, never the declaration.
+    try check(.D001, "const width = 3; pub const S = struct { width: u8 = 0 }; pub fn live() S { return .{ .width = 1 }; }", 1);
+    // An unknown import leaves the rest of the file decided.
+    try check(.D001, "const unknown = @import(\"external\"); fn unused() void {} pub fn live() void { unknown.f(); }", 1);
+    // A dead container is the finding, not each declaration inside it.
+    try check(.D001, "pub const Outer = struct { const Inner = struct { fn format() void {} const x = 1; }; };", 1);
+    // A lexical reference resolves to its own declaration, so a same-named one elsewhere stays dead.
+    try check(.D001, "fn helper() u8 { return 1; } const S = struct { fn helper() u8 { return 2; } }; pub fn live() u8 { return helper(); }", 1);
+}
+
+test "D001 reads a computed @field through its receiver and withholds an unresolved one" {
     try check(.D001, "const S = struct { const needed = 1; }; pub fn live(name: []const u8) void { _ = @field(S, name); }", 0);
-    try check(.D001, "fn Box(comptime T: type) type { return struct { value: T }; }", 0);
-    try check(.D001, "const unknown = @import(\"external\"); fn unused() void {} pub fn live() void { unknown.f(); }", 0);
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "fn unused() void {} pub fn live(x: anytype, comptime name: []const u8) void { _ = @field(x, name); }" }}, &.{}, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(.D001, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: the unresolved receiver withholds the file.
+    var withheld = false;
+    for (report.coverage) |item| if (item.rule) |rule| {
+        if (rule == .D001 and item.reason == .unresolved) withheld = true;
+    };
+    try std.testing.expect(withheld);
 }
 
 test "G2 casts safety-off catches and length follow configured code policy" {
@@ -240,10 +269,6 @@ test "G2 function-length type constructors subtract returned container bodies" {
     var report = try glint.run(std.testing.allocator, &project, config);
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: constructor and method each fit the limit.
-}
-
-test "G2 hook retention includes nested private namespaces" {
-    try check(.D001, "pub const Outer = struct { const Inner = struct { fn format() void {} }; };", 0);
 }
 
 test "G2 disallowed policy follows qualified declaration identity and aliases" {

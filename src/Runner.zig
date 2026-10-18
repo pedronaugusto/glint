@@ -7,7 +7,6 @@ const Report = @import("Report.zig");
 const Suppression = @import("Suppression.zig");
 const Runner = @This();
 const Context = @import("RuleContext.zig");
-const Usage = @import("Usage.zig");
 const Builtins = @import("Builtins.zig");
 
 a: std.mem.Allocator,
@@ -49,12 +48,6 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     try validateRules(config, definitions);
     var runner: Runner = .{ .a = a, .project = project, .config = config, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
-    var needs_usage = config.has(.D001);
-    for (options.files) |setting| if (setting.config.has(.D001)) {
-        needs_usage = true;
-    };
-    var usage: ?Usage = if (needs_usage) try Usage.init(gpa, project, &runner.facts) else null;
-    defer if (usage) |*value| value.deinit();
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
         runner.file = Project.FileId.fromRaw(@intCast(index)); // safe: validated file identities and budgeted std source indexes fit u32.
@@ -83,7 +76,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
-        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .usage = if (usage) |*value| value else null, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage } };
+        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage } };
         try Builtins.check(&context);
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (runner.config.has(rule.definition.id)) try rule.check(&context);

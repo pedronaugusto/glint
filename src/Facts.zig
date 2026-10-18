@@ -1771,6 +1771,12 @@ fn holders(self: *Facts, value: Value) ResolveError![]const Value {
     return list.items;
 }
 
+/// Whether `node` is a value the program holds at run time, never a type or a namespace (below).
+/// Zig's `@field` on such a value reaches only fields, never a declaration.
+pub fn runtime(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    return self.runtimeValue(file, node, 0);
+}
+
 /// Whether `node` is a value the program holds at run time, never a type or a namespace: an
 /// address taken, a `var`, a parameter declared with a type other than `type`, a `const`
 /// declared with such a type or initialized by such a value, or a field of one. A field of a

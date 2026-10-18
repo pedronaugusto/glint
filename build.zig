@@ -92,7 +92,6 @@ pub fn dev(b: *std.Build, tools: type) void {
             p.path("src/Runner.zig"),
             p.path("src/Runner_test.zig"),
             p.path("src/Suppression.zig"),
-            p.path("src/Usage.zig"),
             p.path("src/build_gate_test.zig"),
             p.path("src/cli.zig"),
             p.path("src/cli_test.zig"),

@@ -40,7 +40,7 @@ pub const Rule = enum(u16) {
             .P004 => "catch unreachable requires a written invariant",
             .P005 => "production debug print violates explicit project policy",
             .P006 => "resolved declaration is disallowed by project policy",
-            .D001 => "dead private declaration after complete reference resolution",
+            .D001 => "private declaration its file names nowhere",
             .Z003 => "syntax incompatibility",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
@@ -124,9 +124,7 @@ pub const Config = struct {
     }
     /// Explicit family reporting profile. Adoption and gating belong to the caller.
     pub fn family() Config {
-        var result = reviewed();
-        result.set(.D001, false); // Deadness is enabled only after the caller accepts admitted semantic coverage.
-        return result;
+        return reviewed();
     }
     /// Whether a rule was selected.
     pub fn has(self: Config, rule: Rule) bool {
