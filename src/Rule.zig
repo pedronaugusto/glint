@@ -67,6 +67,8 @@ pub const Config = struct {
     disallowed: []const Disallowed = &.{},
     selections: []const Selection = &.{},
     fact_budget: usize = 100_000,
+    /// Count each selected file's functions and assertion calls into the report.
+    metrics: bool = false,
 
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };

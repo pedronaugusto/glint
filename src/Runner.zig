@@ -8,6 +8,7 @@ const Suppression = @import("Suppression.zig");
 const Runner = @This();
 const Context = @import("RuleContext.zig");
 const Builtins = @import("Builtins.zig");
+const Metrics = @import("Metrics.zig");
 
 a: std.mem.Allocator,
 project: *const Project,
@@ -48,6 +49,8 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     try validateRules(config, definitions);
     var runner: Runner = .{ .a = a, .project = project, .config = config, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
+    var metrics: std.ArrayList(Report.Metrics.File) = .empty;
+    var total: Report.Metrics.Counts = .{};
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
         runner.file = Project.FileId.fromRaw(@intCast(index)); // safe: validated file identities and budgeted std source indexes fit u32.
@@ -78,6 +81,11 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         }
         var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage } };
         try Builtins.check(&context);
+        if (config.metrics) {
+            const counts = try Metrics.count(&context);
+            total.add(counts);
+            try metrics.append(a, .{ .file = runner.file, .counts = counts });
+        }
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (runner.config.has(rule.definition.id)) try rule.check(&context);
         };
@@ -95,7 +103,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale, .complete = runner.complete };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {

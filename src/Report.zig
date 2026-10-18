@@ -12,6 +12,64 @@ coverage: []const Coverage,
 suppressed: usize,
 stale_suppressions: usize,
 complete: bool,
+/// Assertion metrics, when the configuration asks for them (`Config.metrics`).
+metrics: ?Metrics = null,
+
+/// Per selected file, the functions it declares and the assertion calls in them, each counted
+/// by the declaration its callee resolves to. A report, never a proof or a gate.
+pub const Metrics = struct {
+    files: []const File,
+    total: Counts,
+
+    pub const File = struct { file: Project.FileId, counts: Counts };
+    /// An assertion call by the declaration it resolves to.
+    pub const Kind = enum {
+        /// `std.debug.assert`, checked in Debug and ReleaseSafe only.
+        std_assert,
+        invariant,
+        pre,
+        post,
+        never,
+        debug,
+        debug_check,
+
+        /// The declaration as a program names it.
+        pub fn label(self: Kind) []const u8 {
+            return switch (self) {
+                .std_assert => "std.debug.assert",
+                .invariant => "aegis.assert.invariant",
+                .pre => "aegis.assert.pre",
+                .post => "aegis.assert.post",
+                .never => "aegis.assert.never",
+                .debug => "aegis.assert.debug",
+                .debug_check => "aegis.assert.debugCheck",
+            };
+        }
+    };
+    /// One file's counts, or a sum of them.
+    pub const Counts = struct {
+        /// Functions with a body; test blocks are not functions.
+        functions: u32 = 0,
+        /// Functions whose own body makes at least one assertion call.
+        asserted: u32 = 0,
+        assertions: [std.meta.tags(Kind).len]u32 = @splat(0),
+        /// Calls spelled `assert`, `invariant`, `pre`, `post`, `never` or `debugCheck` whose
+        /// callee does not resolve: assertions the counts above may miss.
+        unresolved: u32 = 0,
+
+        pub fn add(self: *Counts, other: Counts) void {
+            self.functions += other.functions;
+            self.asserted += other.asserted;
+            for (&self.assertions, other.assertions) |*sum, n| sum.* += n;
+            self.unresolved += other.unresolved;
+        }
+        pub fn total(self: Counts) u32 {
+            var sum: u32 = 0;
+            for (self.assertions) |n| sum += n;
+            return sum;
+        }
+    };
+};
 
 pub const Span = struct { file: Project.FileId, start: u32, end: u32, line: u32, column: u32 };
 pub const Diagnostic = struct {
@@ -56,6 +114,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.print("coverage: {s}: {s}: {s}\n", .{ project.inputs[coverage.file.raw()].name, @tagName(coverage.reason), coverage.detail }); // safe: enum identities index their owning frozen tables without narrowing.
             };
             if (self.stale_suppressions != 0) try writer.print("suppression: {d} stale site records\n", .{self.stale_suppressions});
+            if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
             try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
@@ -68,7 +127,22 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .source = project.inputs[c.file.raw()].name, .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
             }
-            try writer.writeAll("]}\n");
+            try writer.writeByte(']');
+            if (self.metrics) |metrics| {
+                try writer.writeAll(",\"metrics\":{");
+                try jsonCounts(writer, metrics.total);
+                try writer.writeAll(",\"files\":[");
+                for (metrics.files, 0..) |entry, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writer.writeAll("{\"source\":");
+                    try std.json.Stringify.value(project.inputs[entry.file.raw()].name, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                    try writer.writeByte(',');
+                    try jsonCounts(writer, entry.counts);
+                    try writer.writeByte('}');
+                }
+                try writer.writeAll("]}");
+            }
+            try writer.writeAll("}\n");
         },
         .sarif => {
             try writer.writeAll("{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"glint\",\"version\":\"" ++ release.version ++ "\"}},\"results\":[");
@@ -86,6 +160,25 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.writeAll("}}]}\n");
         },
     }
+}
+
+fn textMetrics(writer: *std.Io.Writer, metrics: Metrics) std.Io.Writer.Error!void {
+    const t = metrics.total;
+    try writer.print("metrics: {d} files, {d} functions, {d} with an assertion, {d} assertions", .{ metrics.files.len, t.functions, t.asserted, t.total() });
+    var first = true;
+    for (std.meta.tags(Metrics.Kind), t.assertions) |kind, n| if (n != 0) {
+        try writer.print("{s}{s} {d}", .{ if (first) " (" else ", ", kind.label(), n });
+        first = false;
+    };
+    if (!first) try writer.writeByte(')');
+    if (t.unresolved != 0) try writer.print(", {d} assertion-like calls unresolved", .{t.unresolved});
+    try writer.writeByte('\n');
+}
+
+fn jsonCounts(writer: *std.Io.Writer, counts: Metrics.Counts) std.Io.Writer.Error!void {
+    try writer.print("\"functions\":{d},\"asserted\":{d},\"unresolved\":{d},\"assertions\":{{", .{ counts.functions, counts.asserted, counts.unresolved });
+    for (std.meta.tags(Metrics.Kind), counts.assertions, 0..) |kind, n, i| try writer.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", kind.label(), n });
+    try writer.writeByte('}');
 }
 
 fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {

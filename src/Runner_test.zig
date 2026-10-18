@@ -341,3 +341,51 @@ test "private import gates retain required dynamic reflection uncertainty" {
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: unknown reflection cannot support a dead-import allegation.
     }
 }
+
+test "metrics count assertion calls by the declaration their callee resolves to" {
+    const P = glint.Project;
+    const program =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const assert = std.debug.assert;
+        \\const contract = aegis.assert;
+        \\fn assertLocal(ok: bool) void { _ = ok; }
+        \\pub fn a(x: u8) u8 { assert(x < 9); contract.pre(x > 0, "positive"); return x; }
+        \\pub fn b(x: u8) u8 { std.debug.assert(x != 3); return if (x == 1) contract.never("one") else x; }
+        \\pub fn c(x: u8) void { assertLocal(x == 0); }
+        \\pub fn d(m: anytype) void { m.invariant(true, "unknown"); }
+        \\test { assert(true); }
+    ;
+    const inputs = [_]P.Input{
+        .{ .name = "program.zig", .bytes = program },
+        .{ .name = "std.zig", .bytes = "pub const debug = @import(\"debug.zig\");", .selected = false },
+        .{ .name = "debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }", .selected = false },
+        .{ .name = "aegis.zig", .bytes = "pub const assert = @import(\"assert.zig\");", .selected = false },
+        .{ .name = "assert.zig", .bytes = "pub fn pre(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false },
+    };
+    const imports = [_]P.Import{
+        .{ .from = P.FileId.fromRaw(0), .spelling = "std", .target = P.FileId.fromRaw(1) },
+        .{ .from = P.FileId.fromRaw(1), .spelling = "debug.zig", .target = P.FileId.fromRaw(2) },
+        .{ .from = P.FileId.fromRaw(0), .spelling = "aegis", .target = P.FileId.fromRaw(3) },
+        .{ .from = P.FileId.fromRaw(3), .spelling = "assert.zig", .target = P.FileId.fromRaw(4) },
+    };
+    var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.metrics = true;
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    const metrics = report.metrics.?;
+    try std.testing.expectEqual(@as(usize, 1), metrics.files.len); // safe: one selected file.
+    const t = metrics.total;
+    try std.testing.expectEqual(@as(u32, 5), t.functions); // safe: expected count fits u32.
+    try std.testing.expectEqual(@as(u32, 2), t.asserted); // safe: expected count fits u32.
+    try std.testing.expectEqual(@as(u32, 3), t.assertions[@backingInt(glint.Report.Metrics.Kind.std_assert)]); // safe: a kind indexes its own count table.
+    try std.testing.expectEqual(@as(u32, 1), t.assertions[@backingInt(glint.Report.Metrics.Kind.pre)]); // safe: a kind indexes its own count table.
+    try std.testing.expectEqual(@as(u32, 1), t.assertions[@backingInt(glint.Report.Metrics.Kind.never)]); // safe: a kind indexes its own count table.
+    try std.testing.expectEqual(@as(u32, 1), t.unresolved); // safe: expected count fits u32.
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    try report.write(&text.writer, &project, .text);
+    try std.testing.expect(std.mem.find(u8, text.written(), "metrics: 1 files, 5 functions, 2 with an assertion, 5 assertions (std.debug.assert 3, aegis.assert.pre 1, aegis.assert.never 1), 1 assertion-like calls unresolved\n") != null);
+}

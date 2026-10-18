@@ -154,6 +154,8 @@ fn optionsConfigured(a: std.mem.Allocator, io: std.Io, args: []const []const u8,
             result.config.max_line_length = try std.fmt.parseInt(u32, try value(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--strict-suppressions")) {
             result.config.strict_suppressions = true;
+        } else if (std.mem.eql(u8, arg, "--metrics")) {
+            result.config.metrics = true;
         } else if (std.mem.eql(u8, arg, "--zig-lib-path")) {
             result.zig_lib_path = try value(args, &i);
         } else if (std.mem.eql(u8, arg, "--root")) {
@@ -214,7 +216,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const configured = try optionsConfigured(a, io, args, definitions);
     if (configured.help) {
         record.outcome = .output_failure;
-        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--metrics]\n      [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;
         record.completed = false;
@@ -281,6 +283,7 @@ pub const Configuration = struct {
     function_exceptions: []const Rule.Config.FunctionException = &.{},
     disallowed: []const Rule.Config.Disallowed = &.{},
     strict_suppressions: bool = false,
+    metrics: bool = false,
     fact_budget: usize = 100_000,
     pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
 };
@@ -310,6 +313,7 @@ fn configure(a: std.mem.Allocator, bytes: []const u8, definitions: []const Rule.
     config.function_exceptions = document.function_exceptions;
     config.disallowed = document.disallowed;
     config.strict_suppressions = document.strict_suppressions;
+    config.metrics = document.metrics;
     config.fact_budget = document.fact_budget;
     for (document.rules, 0..) |setting, i| {
         for (document.rules[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;

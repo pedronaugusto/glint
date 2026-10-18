@@ -42,11 +42,15 @@ One actual inline or immediately preceding `// glint-ignore: ID -- site-written 
 
 Operation and lexical-witness indexes scale with the bounded AST/ZIR inventory. Dead-private usage is computed once per project: one token/declaration witness index, retained-scope marks and one expansion over declarations and their scope ancestors. Resolution is shared and budgeted; unsupported work remains coverage. Projection owns a separate walk/output over the same frozen model, without reparsing. These are architecture cost bounds, not latency guarantees.
 
+## Assertion metrics
+
+`Config.metrics` (CLI `--metrics`, config `metrics`) adds `Report.metrics`: per selected file and in total, the functions with a body (test blocks are not functions), how many make an assertion call in their own body, and the assertion calls by the declaration the callee resolves to: std's `debug.assert` and aegis's `assert.invariant`, `pre`, `post`, `never`, `debug` and `debugCheck`, found through the modules the program imports them by (`std`, `aegis`, `aegis.assert`) like any library role. A call spelled like one whose callee does not resolve is counted as unresolved, never as an assertion. Text prints one `metrics:` line; JSON adds a `metrics` object. A count is a report, never a gate or a proof: it says nothing about what an assertion checks.
+
 ## Build helper and completion
 
 A consumer imports this package's build module, obtains its pinned dependency, and calls `addLinter(b, dependency, .{ .source = b.path("project_rules.zig"), .target = b.graph.host })`. The entry calls `glint.cli.executeConfigured` with the static rule table; [the example](../examples/project.zig) is executable. `addLint(b, executable, .{ .sources = explicit_lazy_paths, .config = optional_json, .directories = caller_selected_directories, .inputs = other_exact_inputs })` declares native Zig file/config/directory-content dependencies. Directories invalidate the build; they never select glint files. Callers regenerate explicit source lists for additions/removals. There is no glob/path dialect here.
 
-CLI JSON configuration is strict: `profile` (`core`, `none`, `reviewed`, `family`), `rules` with `id`/`level`, `max_line_length`, `max_function_lines`, `casts`, `cast_scope`, `function_exceptions`, `disallowed`, `fact_budget`, `strict_suppressions`. Unknown/duplicate fields or IDs fail. Libraries additionally support per-file options; a caller-owned linter applies file selections without inventing a glint path language.
+CLI JSON configuration is strict: `profile` (`core`, `none`, `reviewed`, `family`), `rules` with `id`/`level`, `max_line_length`, `max_function_lines`, `casts`, `cast_scope`, `function_exceptions`, `disallowed`, `fact_budget`, `strict_suppressions`, `metrics`. Unknown/duplicate fields or IDs fail. Libraries additionally support per-file options; a caller-owned linter applies file selections without inventing a glint path language.
 
 Standalone exit classes remain 0 complete/clean, 1 complete/findings, 2 incomplete/input/tool/output/cancellation failure. Version-one completion records bind a fresh invocation ID, actual exit class, selected source count and exact flushed stdout length/hash. Output failure, input failure, interruption, truncation and incomplete-but-allowed findings cannot pass `Completion.verify`.
 
