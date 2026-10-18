@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
 ### Breaking
 
 - `RuleContext.usage` is gone with the project-wide reference relation it held: D001 no longer needs it.
