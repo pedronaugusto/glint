@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
 ### Breaking
 
 - `Projection` is gone: nothing consumed it, and the ownership policies it was kept for are P006 over the model every rule reads (docs/design.md, "Ownership policy and adopters").
