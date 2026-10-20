@@ -23,15 +23,15 @@
       },
       {
         "id": "A001",
-        "level": "gate"
+        "level": "report"
       },
       {
         "id": "A002",
-        "level": "gate"
+        "level": "report"
       },
       {
         "id": "A003",
-        "level": "gate"
+        "level": "report"
       }
     ]
   },
