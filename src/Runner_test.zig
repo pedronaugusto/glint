@@ -575,3 +575,19 @@ test "E001 leaves an intrusive waiter the function unlinks before it returns" {
         \\}
     , 0);
 }
+
+test "review Z006 accepts a name a generic reads on its type parameter that an outside type declares" {
+    const outside = "pub const Edwards = struct { pub const basePoint: Edwards = .{}; };";
+    const own = "const dep = @import(\"dep\");\npub const Point = struct { pub const basePoint: Point = .{}; pub const otherName: Point = .{}; };\nfn table(comptime P: type) P { return P.basePoint; }\npub fn f() void { _ = table(Point); _ = table(dep.Edwards); }";
+    for ([_]bool{ true, false }) |generic| {
+        const source = if (generic) own else "const dep = @import(\"dep\");\npub const Point = struct { pub const basePoint: Point = .{}; pub const otherName: Point = .{}; };\npub fn f() void { _ = dep; }";
+        var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "fixture", .stem = "Fixture", .bytes = source }, .{ .name = "dep", .stem = "Dep", .bytes = outside, .selected = false } }, &.{.{ .from = .fromRaw(0), .spelling = "dep", .target = .fromRaw(1) }}, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.set(.Z006, true);
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        // `otherName` no outside type declares; `basePoint` only where a generic reads it.
+        try std.testing.expectEqual(@as(usize, if (generic) 1 else 2), report.diagnostics.len); // safe: fixture counts are representable.
+    }
+}

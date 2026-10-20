@@ -321,11 +321,51 @@ fn syntaxRules(self: *Context) RunError!void {
                             if (!names.isPascalCase(name)) try self.at(.Z006, decl.token, "type-producing callable alias should use TitleCase");
                         } else if (!names.isValidFunctionName(name)) try self.at(.Z006, decl.token, "callable alias should use camelCase");
                     },
-                    else => try self.at(.Z006, decl.token, "value binding should use snake_case"),
+                    else => if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case"),
                 }
             }
         }
     }
+}
+
+/// Whether a container's declaration `name` spells a member a generic reads on its type
+/// parameter (`Point.identityElement` of a `comptime Point: type`) that a type outside the
+/// selected sources (std's, a dependency's) also declares in public: the generic takes both,
+/// so the outside type fixes the spelling.
+fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunError!bool {
+    const model = &self.project.models[self.file.raw()]; // safe: the checked file indexes its frozen model.
+    if (model.scopes[decl.scope].kind != .container and model.scopes[decl.scope].kind != .file) return false;
+    if (!try genericReads(self, name)) return false;
+    for (self.project.files, self.project.models, self.project.inputs) |*file, *other, input| {
+        if (input.selected or file.status != .parsed) continue;
+        for (other.declarations) |d| {
+            if (!d.public or !std.mem.eql(u8, d.name, name)) continue;
+            if (other.scopes[d.scope].kind == .container or other.scopes[d.scope].kind == .file) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a selected file reads `T.name` where `T` is a parameter that takes a type: declared
+/// `type` (comptime by necessity) or `anytype`.
+fn genericReads(self: *Context, name: []const u8) RunError!bool {
+    for (self.project.files, self.project.models, self.project.inputs) |*file, *model, input| {
+        if (!input.selected or file.status != .parsed) continue;
+        const tree = &file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .field_access) continue;
+            const data = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_token; // safe: AST node table supplies bounded indexes.
+            if (!std.mem.eql(u8, tree.tokenSlice(data[1]), name)) continue;
+            if (tree.nodeTag(data[0]) != .identifier) continue;
+            const index = (model.reference(data[0]) orelse continue).declaration orelse continue;
+            const parameter = model.declarations[index];
+            if (parameter.kind != .parameter) continue;
+            // `anytype` has no type expression of its own: the parameter's node is the keyword.
+            const typed = tree.nodeTag(parameter.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parameter.node)), "type");
+            if (typed or tree.tokenTag(parameter.token + 2) == .keyword_anytype) return true;
+        }
+    }
+    return false;
 }
 
 fn contextRules(self: *Context) RunError!void {
