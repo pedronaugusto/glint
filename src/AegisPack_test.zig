@@ -584,9 +584,10 @@ test "receivers through locals, unwrapping, branches and generic results are dec
     try expectJudged(head ++ "fn make() !Plain { return .{ .data = 0, .lock = 0 }; }\npub fn f() void { const p = make() catch return; _ = p.data; }", pack.access, true, 0);
     try expectJudged(head ++ "fn make() !G(u32) { return .init(0); }\npub fn f() void { const g = make() catch return; _ = g.data; }", pack.access, true, 1);
     try expectJudged(head ++ "fn find() ?*Plain { return null; }\npub fn f() void { _ = (find() orelse return).data; _ = find().?.lock; }", pack.access, true, 0);
-    // A `switch` choosing between types is each of them: decided when they agree.
+    // A `switch` choosing between types is each of them, one per build: decided when they
+    // agree, and an owner's backing field in the builds that choose the owner.
     try expectJudged(head ++ "const os = @import(\"builtin\").os.tag;\nconst E = switch (os) { .linux => Plain, .macos => struct { data: i64 }, else => @compileError(\"no\") };\npub fn f(e: *const E) void { _ = e.data; }", pack.access, true, 0);
-    try expectJudged(head ++ "const os = @import(\"builtin\").os.tag;\nconst E = switch (os) { .linux => Plain, else => G(u32) };\npub fn f(e: *E) void { _ = e.data; }", pack.access, false, 0);
+    try expectJudged(head ++ "const os = @import(\"builtin\").os.tag;\nconst E = switch (os) { .linux => Plain, else => G(u32) };\npub fn f(e: *E) void { _ = e.data; }", pack.access, true, 1);
     // A generic function returning its `comptime T: type` parameter returns that type.
     try expectJudged(head ++ "fn zeroes(comptime T: type) T { return undefined; }\npub fn f() void { const p = zeroes(Plain); _ = p.data; }", pack.access, true, 0);
     try expectJudged(head ++ "fn zeroes(comptime T: type) T { return undefined; }\npub fn f() void { const g = zeroes(G(u32)); _ = g.data; }", pack.access, true, 1);
@@ -698,8 +699,9 @@ test "generic parameters are what the project's own calls pass, when no consumer
     const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, owner: u32 };\n";
     // A private generic: its `anytype` is the union of what its callers pass.
     try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f(x: *Plain) void { look(x); }", pack.access, true, 0);
-    // Callers that disagree, one passing an owner: undecided, as any choice between types that disagree.
-    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.data; }\npub fn f(x: *Plain, g: *G(u32)) void { look(x); look(g); }", pack.access, false, 0);
+    // Callers that disagree, one passing an owner: the function is checked once per binding,
+    // and the owner's binding reads its backing field.
+    try expectJudged(head ++ "fn look(p: anytype) void { _ = p.data; }\npub fn f(x: *Plain, g: *G(u32)) void { look(x); look(g); }", pack.access, true, 1);
     try expectJudged(head ++ "fn look(p: anytype) void { _ = p.data; }\npub fn f(g: *G(u32)) void { look(g); }", pack.access, true, 1);
     // Through a method of a container, and a caller that is itself generic.
     try expectJudged(head ++ "const Box = struct { fn look(_: *const Box, p: anytype) void { _ = p.owner; } };\nfn pass(b: *const Box, p: anytype) void { b.look(p); }\npub fn f(b: *const Box, x: *Plain) void { pass(b, x); }", pack.access, true, 0);
@@ -1200,4 +1202,18 @@ test "A002 reads operators and a tuple written in place" {
     try expectJudged("pub fn f(comptime Int: type, a: Int, b: Int, g: fn () Int) void { const d = a - b; var x = if (a > b) g() + 1 else g(); const e = d; const y = x; _ = e; _ = y; _ = &x; }", pack.copies, true, 0);
     // An `inline for` over `.{ a, b }` takes each element in turn.
     try expectJudged("pub fn f() void { inline for (.{ @as(u8, 1), @as(u16, 2) }) |v| { var copy = v; _ = &copy; } }", pack.copies, true, 0);
+}
+
+test "a comptime condition settled on the path decides a receiver chosen by it" {
+    const head = "const aegis = @import(\"aegis\");\nconst Direct = struct { data: u64, lock: bool };\n";
+    // The direct side after `if (wrapped) return ...;`, in an `else`, or under `if (!wrapped)`.
+    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) { var held = owner.acquire(); defer held.deinit(); return held.value().*; } return owner.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) return 0 else return owner.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) { owner.lock = true; } return 0; }", pack.access, true, 0);
+    // Through a type function of the condition: `Owner(wrapped)` read with what the path settles.
+    try expectJudged(head ++ "fn Owner(comptime wrapped: bool) type { return if (wrapped) aegis.Guarded(u64) else Direct; }\npub fn f(comptime wrapped: bool, owner: *Owner(wrapped)) u64 { if (wrapped) return 0; return owner.data; }", pack.access, true, 0);
+    // A container a type function makes with the condition, its field chosen by it.
+    try expectJudged(head ++ "fn State(comptime wrapped: bool) type { return struct { m: if (wrapped) aegis.Guarded(u64) else Direct }; }\npub fn f(comptime wrapped: bool, s: *State(wrapped)) u64 { if (wrapped) return 0; const owner = &s.m; return owner.data; }", pack.access, true, 0);
+    // On the wrapped side the same access is the aegis owner's backing field.
+    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) return 0; return owner.data; }", pack.access, true, 1);
 }

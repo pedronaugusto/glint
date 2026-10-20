@@ -454,7 +454,13 @@ fn releaseName(k: Contract.Kind, name: []const u8) bool {
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
     if (try Contract.owner(c, node)) |k| return k;
-    switch (try typed(c, try c.facts.resolve(c.file, node), 0)) {
+    const value = try c.facts.resolve(c.file, node);
+    // A type chosen at compile time is one type per build: an operation on it is the
+    // owner's in the builds that choose the owner. Cleanup is owed along the paths of those
+    // builds, which are every path unless the function branches on a comptime condition
+    // (`if (wrapped) owner.deinit();`); then A003 leaves a choice that disagrees undecided.
+    const read = if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
+    switch (read) {
         .owner => |k| return k,
         .other => return null,
         .unknown => {
@@ -493,6 +499,27 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     return true;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
+/// What a value is in the builds that choose among types: the one published kind its
+/// alternatives are, the rest plain types, decided as that kind; any unknown alternative, or
+/// two kinds, leave it unknown.
+fn perBuild(c: *Context, value: Facts.Value) Context.Error!Typed {
+    var current = value;
+    while (true) current = switch (current) {
+        .pointer, .array, .optional, .error_union => |payload| payload.*,
+        else => break,
+    };
+    if (current != .alternatives) return typed(c, value, 0);
+    var found: Typed = .other;
+    for (current.alternatives) |one| switch (try typed(c, one, 0)) {
+        .unknown => return .unknown,
+        .other => {},
+        .owner => |k| switch (found) {
+            .owner => |earlier| if (earlier != k) return .unknown,
+            else => found = .{ .owner = k },
+        },
+    };
+    return found;
+}
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
 /// guard is: its own operations belong to that type's contract.
 fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Contract.Kind {
@@ -515,8 +542,12 @@ fn containerName(c: *Context, container: Facts.Container) ?[]const u8 {
     return tree.tokenSlice(declared.ast.mut_token + 1);
 }
 /// What a resolved value's type says: a published aegis type, a type that is not aegis, or
-/// unknown. A guarded owner's guard is the guard; another type nested in a published one that the contract does not list stays unknown
-/// rather than counted out, as does a choice between types that disagree.
+/// unknown. A guarded owner's guard is the guard. Another type declared inside a published one
+/// and not in the contract is plain data, as an unlisted type at a module's top is: the
+/// contract lists every type whose fields are private state (`Budget.Reservation`,
+/// `Table.Scope`), and the state such a type holds for its owner (a map's entries, a shared
+/// owner's block) is reached through the owner's backing field, which is read there. A choice
+/// between types that disagree stays unknown.
 fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
     if (depth == 64) return .unknown;
     return switch (value) {
@@ -532,7 +563,7 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             const outer = (try enclosingPublished(c, container)) orelse break :blk .other;
             // A guarded owner's guard, reached by its resolved type rather than its acquisition.
             if (outer == .guarded and Contract.guardType(containerName(c, container) orelse "")) break :blk .{ .owner = .guard };
-            break :blk .unknown;
+            break :blk .other;
         },
         else => .other,
     };

@@ -4,6 +4,13 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Facts read a comptime `bool` parameter's value where the path settles it: inside `if (wrapped)`'s branches, after `if (wrapped) return ...;` (or any branch that never completes), with `!`, `and` and `or`. Zig analyses such a branch only in the instantiations that take it, so a type chosen by the condition (`if (wrapped) *aegis.T else *Direct`, `Owner(wrapped)`, a made container's field) is the one the path takes, and a value carries through type functions' bindings.
+- The aegis pack reads a choice of types per build: an operation on it is the owner's in the builds that choose the owner, the other alternatives plain types. A001, A002, A004 and A005 so; A003 when the function does not branch on a comptime condition (its paths are then every build's). A private generic is checked once per binding.
+- A type declared inside a published aegis type and not in the contract is plain data to the pack, as an unlisted type at a module's top is (a guarded owner's guard aside): the contract lists every type whose fields are private state, and what such a type holds for its owner is reached through the owner's backing field.
+- A container a type function makes through another (`Owned(T, f)` returning `Owner(T, false, f)`) is read with the outer call's bindings; a call through the made type (`Held.initFrom(x)`) and a method's `Self` keep them. A field of a made container whose binding does not resolve takes the template's reading only where every instantiation agrees.
+
 ## [0.4.2] - 2026-10-20
 
 ### Added
