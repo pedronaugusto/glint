@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-20
+
 ### Added
 
 - `RuleContext.accepts`: whether a function's parameters can take a call's arguments by what Zig allows (as many; no literal where a struct is taken; no type where a value of a struct, a pointer or a number is taken). P006 and the aegis pack share it.
