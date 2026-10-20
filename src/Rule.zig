@@ -23,11 +23,12 @@ pub const Rule = enum(u16) {
     P005 = 44,
     P006 = 45,
     D001 = 46,
+    E001 = 47,
     _,
 
     pub fn group(self: Rule) Group {
         return switch (self) {
-            .Z003, .Z011, .Z013, .Z026, .D001 => .correctness,
+            .Z003, .Z011, .Z013, .Z026, .D001, .E001 => .correctness,
             .Z012, .Z016, .P001, .P002, .P003, .P004, .P005, .P006 => .family_policy,
             else => .zig_style,
         };
@@ -41,6 +42,7 @@ pub const Rule = enum(u16) {
             .P005 => "production debug print violates explicit project policy",
             .P006 => "resolved declaration is disallowed by project policy",
             .D001 => "private declaration its file names nowhere",
+            .E001 => "pointer into a function's own frame outlives the call (heuristic)",
             .Z003 => "syntax incompatibility",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
@@ -157,7 +159,7 @@ pub const Config = struct {
 };
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 21), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 22), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
     try std.testing.expect(Rule.parse("Z013-extra") == null);
     for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);

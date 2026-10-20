@@ -7,7 +7,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
     .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Library.zig", "src/Report.zig" } },
     .{ .name = "rule API", .patterns = &.{"src/RuleContext.zig"} },
-    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Disallowed.zig", "src/Metrics.zig", "src/AegisContract.zig", "src/AegisRecursion.zig", "src/AegisPack.zig" } },
+    .{ .name = "built-in rules", .patterns = &.{ "src/Builtins.zig", "src/DeadDeclarations.zig", "src/Disallowed.zig", "src/Escapes.zig", "src/Metrics.zig", "src/AegisContract.zig", "src/AegisRecursion.zig", "src/AegisPack.zig" } },
     .{ .name = "rules", .patterns = &.{"src/Runner.zig"} },
     .{ .name = "filesystem CLI", .patterns = &.{ "src/cli.zig", "src/Result.zig" } },
     .{ .name = "public", .patterns = &.{"src/glint.zig"} },
