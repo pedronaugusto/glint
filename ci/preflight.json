@@ -1,5 +1,28 @@
 {
-  "glint": {"rules": [{"id": "P001", "level": "gate"}, {"id": "P003", "level": "gate"}, {"id": "Z026", "level": "gate"}]},
+  "glint": {
+    "rules": [
+      {
+        "id": "P001",
+        "level": "gate"
+      },
+      {
+        "id": "P003",
+        "level": "gate"
+      },
+      {
+        "id": "Z026",
+        "level": "gate"
+      },
+      {
+        "id": "A004",
+        "level": "gate"
+      },
+      {
+        "id": "A005",
+        "level": "gate"
+      }
+    ]
+  },
   "fuzz": {
     "trusted": {
       "parse": "a rule's name, from the configuration the repository writes for itself, looked up in a table",
