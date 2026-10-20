@@ -8,6 +8,9 @@
 //! per-build choice, `@field` with a written name. Any reference to a declaration spells its
 //! name, and an alias spells it where it is made, so only sites spelling a governed name are
 //! resolved; one that does not resolve is undecided, never passed.
+//!
+//! An entry names the packages that own its declaration: in their files it is the designed use,
+//! and the entry does not govern them.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
@@ -28,6 +31,7 @@ const Governed = struct {
 pub fn check(self: *Context) Context.Error!void {
     if (!self.config.has(.P006) or self.config.disallowed.len == 0) return;
     const governed = try targets(self);
+    if (governed.len == 0) return;
     const tree = &self.project.files[self.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: checked AST inventory.
@@ -82,11 +86,15 @@ fn matches(self: *Context, g: Governed, decl: Facts.Decl) bool {
     return std.mem.eql(u8, own, symbol);
 }
 
-/// Each entry's declarations in this project. A source nothing names, or a path that does not
-/// resolve, leaves the run undecided: a policy that cannot be read is not a policy that passed.
+/// Each entry's declarations in this project, past those the file's package owns. A source
+/// nothing names, or a path that does not resolve, leaves the run undecided: a policy that
+/// cannot be read is not a policy that passed.
 fn targets(self: *Context) Context.Error![]const Governed {
-    const out = try self.allocator.alloc(Governed, self.config.disallowed.len);
-    for (self.config.disallowed, out) |entry, *g| {
+    var kept: std.ArrayList(Governed) = .empty;
+    const package = self.project.inputs[self.file.raw()].package;
+    for (self.config.disallowed) |entry| {
+        if (owned(entry, package)) continue;
+        const g = try kept.addOne(self.allocator);
         const last = if (std.mem.findScalarLast(u8, entry.declaration, '.')) |dot| entry.declaration[dot + 1 ..] else entry.declaration;
         g.* = .{ .entry = entry, .name = last, .decls = &.{}, .symbol = null };
         const source = entry.source orelse {
@@ -117,7 +125,14 @@ fn targets(self: *Context) Context.Error![]const Governed {
             g.symbol = symbol;
         };
     }
-    return out;
+    return kept.items;
+}
+
+/// Whether `package` is one of the entry's owners. An unknown package owns nothing.
+fn owned(entry: Disallowed, package: []const u8) bool {
+    if (package.len == 0) return false;
+    for (entry.owners) |owner| if (std.mem.eql(u8, owner, package)) return true;
+    return false;
 }
 
 /// The declarations a path names from its roots: through every alternative of a per-build

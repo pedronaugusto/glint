@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `Config.Disallowed.owners`: the packages that own a disallowed declaration. A site in a file of one of them is not governed by the entry, so an owner carries no suppression for its designed use. `Project.Input.package` states a file's package (the name its nearest `build.zig.zon` gives; empty when unknown, which owns nothing); the CLI takes `--package NAME=DIR`, the innermost directory naming a file's package.
+
 ## [0.4.0] - 2026-10-18
 
 ### Breaking

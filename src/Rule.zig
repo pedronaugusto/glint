@@ -87,6 +87,9 @@ pub const Config = struct {
         replacement: []const u8,
         /// `production` leaves out test code: tests and test blocks.
         scope: enum { all, production } = .all,
+        /// The packages that own the declaration (`Project.Input.package`): their files are
+        /// where it is meant to be used, so a site in one is not governed by this entry.
+        owners: []const []const u8 = &.{},
     };
 
     const core = blk: {
@@ -105,6 +108,7 @@ pub const Config = struct {
         for (self.function_exceptions) |exception| if (std.mem.trim(u8, exception.reason, " \t\r\n").len == 0 or exception.lines == 0) return error.InvalidSelection;
         for (self.disallowed) |entry| {
             if (std.mem.trim(u8, entry.reason, " \t\r\n").len == 0 or std.mem.trim(u8, entry.replacement, " \t\r\n").len == 0) return error.InvalidSelection;
+            for (entry.owners) |owner| if (std.mem.trim(u8, owner, " \t\r\n").len == 0) return error.InvalidSelection;
             if (entry.source) |source| {
                 if (std.mem.trim(u8, source, " \t\r\n").len == 0) return error.InvalidSelection;
                 var parts = std.mem.splitScalar(u8, entry.declaration, '.');

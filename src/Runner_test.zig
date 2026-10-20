@@ -292,9 +292,14 @@ test "G2 disallowed policy follows qualified declaration identity and aliases" {
 
 /// A program, a `lib` module standing for std, and its per-target namespace.
 fn ownershipRun(program: []const u8, disallowed: []const glint.Config.Disallowed) !glint.Report {
+    return ownershipRunIn(program, "", disallowed);
+}
+
+/// As `ownershipRun`, the program a file of `package`.
+fn ownershipRunIn(program: []const u8, package: []const u8, disallowed: []const glint.Config.Disallowed) !glint.Report {
     const P = glint.Project;
     const inputs = [_]P.Input{
-        .{ .name = "program.zig", .bytes = program },
+        .{ .name = "program.zig", .bytes = program, .package = package },
         .{ .name = "lib.zig", .bytes =
         \\pub const posix = @import("posix.zig");
         \\pub const c = @import("c.zig");
@@ -381,13 +386,33 @@ test "P006 production scope leaves test code out" {
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: fixture sites counted by hand.
 }
 
+test "P006 leaves an entry's owning packages alone, and only them" {
+    const owned = [_]glint.Config.Disallowed{
+        .{ .source = "lib", .declaration = "posix.fdatasync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile", .owners = &.{ "airlock", "reactor" } },
+        .{ .declaration = "fsync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile", .owners = &.{"airlock"} },
+    };
+    const program =
+        \\const lib = @import("lib");
+        \\extern "c" fn fsync(fd: c_int) c_int;
+        \\pub fn a() void { lib.posix.fdatasync(0); _ = fsync(0); }
+    ;
+    inline for (.{ .{ "airlock", 0 }, .{ "reactor", 1 }, .{ "shakedown", 2 }, .{ "", 2 } }) |case| {
+        var report = try ownershipRunIn(program, case[0], &owned);
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(@as(usize, case[1]), report.diagnostics.len); // safe: fixture sites counted by hand.
+    }
+}
+
 test "P006 configuration needs a symbol without dots, or a source and a path" {
     var config = glint.Config.none();
     config.disallowed = &.{.{ .declaration = "c.fsync", .reason = "durability", .replacement = "airlock" }};
     try std.testing.expectError(error.InvalidSelection, config.validate());
     config.disallowed = &.{.{ .source = " ", .declaration = "fsync", .reason = "durability", .replacement = "airlock" }};
     try std.testing.expectError(error.InvalidSelection, config.validate());
-    config.disallowed = &.{.{ .declaration = "fsync", .reason = "durability", .replacement = "airlock" }};
+    config.disallowed = &.{.{ .declaration = "fsync", .reason = "durability", .replacement = "airlock", .owners = &.{" "} }};
+    try std.testing.expectError(error.InvalidSelection, config.validate());
+    config.disallowed = &.{.{ .declaration = "fsync", .reason = "durability", .replacement = "airlock", .owners = &.{"airlock"} }};
     try config.validate();
 }
 

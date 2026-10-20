@@ -209,3 +209,37 @@ test "G2 completion rejects incomplete analysis despite every finding being allo
     try std.testing.expect(!try glint.Completion.verify(a, receipt, "incomplete-allowed", status, output.written()));
     try std.testing.expect(std.mem.find(u8, receipt, "analysis_incomplete") != null);
 }
+
+test "a package directory names its files' package, the innermost one winning" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "extern \"c\" fn fsync(fd: c_int) c_int;\npub fn f() void { _ = fsync(0); }\n";
+    try tmp.dir.createDirPath(std.testing.io, "owner/inner");
+    try tmp.dir.createDirPath(std.testing.io, "other");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "owner/a.zig", .data = source });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "owner/inner/b.zig", .data = source });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other/c.zig", .data = source });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"profile": "none", "rules": [{"id": "P006", "level": "gate"}],
+        \\ "disallowed": [{"declaration": "fsync", "reason": "durability belongs to airlock", "replacement": "airlock.syncFile", "owners": ["airlock"]}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const paths = [_][]const u8{ "config.json", "owner", "owner/inner", "owner/a.zig", "owner/inner/b.zig", "other/c.zig" };
+    var joined: [paths.len][]const u8 = undefined;
+    for (paths, &joined) |path, *out| out.* = try std.Io.Dir.path.join(a, &.{ root, path });
+    defer for (joined) |path| a.free(path);
+    const owner = try std.mem.concat(a, u8, &.{ "airlock=", joined[1] });
+    defer a.free(owner);
+    const inner = try std.mem.concat(a, u8, &.{ "nested=", joined[2] });
+    defer a.free(inner);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--package", owner, "--package", inner, joined[3], joined[4], joined[5] }, &output.writer);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: findings exit.
+    try std.testing.expect(std.mem.find(u8, output.written(), "a.zig:2") == null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "b.zig:2") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "c.zig:2") != null);
+    try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer));
+}

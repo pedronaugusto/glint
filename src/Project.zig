@@ -38,6 +38,10 @@ pub const Input = struct {
     /// this build. The caller states this from the build's own configuration; a name merely
     /// left unmapped stays unknown.
     absent: []const []const u8 = &.{},
+    /// The package whose tree holds this file: the name its nearest `build.zig.zon` gives, as
+    /// the caller states it. Empty when unknown. A policy names packages by it (an owner of a
+    /// disallowed declaration).
+    package: []const u8 = "",
 };
 /// A module edge selected and resolved by the caller, never by a path hash.
 pub const Import = struct { from: FileId, spelling: []const u8, target: FileId };
@@ -72,6 +76,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         copied[index].bytes = files[index].source;
         copied[index].name = try a.dupe(u8, input.name);
         copied[index].stem = try a.dupe(u8, input.stem);
+        copied[index].package = try a.dupe(u8, input.package);
         const names = try a.alloc([]const u8, input.absent.len);
         for (names, input.absent) |*out, name| out.* = try a.dupe(u8, name);
         copied[index].absent = names;

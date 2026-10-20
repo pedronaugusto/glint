@@ -15,6 +15,8 @@ const Options = struct {
     format: Report.Format = .text,
     files: std.ArrayList([]const u8) = .empty,
     modules: std.ArrayList(Module) = .empty,
+    /// Directories whose files belong to a named package (`Project.Input.package`).
+    packages: std.ArrayList(Module) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
     zig_lib_path: ?[]const u8 = null,
     help: bool = false,
@@ -29,6 +31,8 @@ const Loader = struct {
     paths: std.StringHashMapUnmanaged(Project.FileId) = .empty,
     canonical_paths: std.ArrayList([]const u8) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
+    /// Package directories, canonical.
+    packages: std.ArrayList(Module) = .empty,
     bytes: usize = 0,
 
     fn load(self: *Loader, path: []const u8, selected: bool) !Project.FileId {
@@ -52,10 +56,19 @@ const Loader = struct {
         const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
-        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected });
+        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = self.packageOf(canonical) });
         try self.canonical_paths.append(self.a, canonical);
         try self.paths.put(self.a, canonical, id);
         return id;
+    }
+
+    /// The package of the innermost directory holding `canonical`; empty when none does.
+    fn packageOf(self: *const Loader, canonical: []const u8) []const u8 {
+        var best: ?Module = null;
+        for (self.packages.items) |package| if (within(package.path, canonical)) {
+            if (best == null or package.path.len > best.?.path.len) best = package;
+        };
+        return if (best) |package| package.name else "";
     }
 
     fn imports(self: *Loader) !void {
@@ -165,6 +178,11 @@ fn optionsConfigured(a: std.mem.Allocator, io: std.Io, args: []const []const u8,
             const equals = std.mem.findScalar(u8, mapping, '=') orelse return error.InvalidModule;
             if (equals == 0 or equals + 1 == mapping.len) return error.InvalidModule;
             try result.modules.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
+        } else if (std.mem.eql(u8, arg, "--package")) {
+            const mapping = try value(args, &i);
+            const equals = std.mem.findScalar(u8, mapping, '=') orelse return error.InvalidPackage;
+            if (equals == 0 or equals + 1 == mapping.len) return error.InvalidPackage;
+            try result.packages.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
         } else if (std.mem.eql(u8, arg, "--result") or std.mem.eql(u8, arg, "--run-id")) {
             _ = try value(args, &i);
         } else if (std.mem.eql(u8, arg, "--input-directory")) {
@@ -216,7 +234,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     const configured = try optionsConfigured(a, io, args, definitions);
     if (configured.help) {
         record.outcome = .output_failure;
-        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--metrics]\n      [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
+        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--package NAME=DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--metrics]\n      [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
         try writer.flush();
         record.outcome = .help;
         record.completed = false;
@@ -225,6 +243,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
+    for (configured.packages.items) |package| try loader.packages.append(a, .{ .name = package.name, .path = try std.Io.Dir.cwd().realPathFileAlloc(io, package.path, a) });
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
         const id = try loader.load(path, true);
