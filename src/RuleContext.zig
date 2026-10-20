@@ -1,6 +1,7 @@
 //! Shared contract used by built-in and compiled project rules.
 const std = @import("std");
 const Project = @import("Project.zig");
+const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
@@ -43,6 +44,60 @@ pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Err
     const found = try self.facts.publication(library);
     for (found.files) |own| if (own.eql(file)) return true;
     return false;
+}
+/// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the
+/// arguments of `call` (written in the checked file), by what Zig allows: as many, none a
+/// literal where a struct is taken, and none a type where a value of a struct, a pointer or a
+/// number is taken (a type goes only to a `type` or `anytype` parameter).
+pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: usize) Error!bool {
+    const target = &self.project.files[decl.file.raw()].tree;
+    const tree = &self.project.files[self.file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const function = target.fullFnProto(&buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return true;
+    var it = function.iterate(target);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (position < skip) continue;
+        const index = position - skip;
+        if (index >= call.ast.params.len) return false;
+        const argument = call.ast.params[index];
+        const written = param.type_expr orelse continue;
+        const literal = switch (tree.nodeTag(argument)) {
+            .enum_literal, .number_literal, .string_literal, .char_literal => true,
+            else => false,
+        };
+        const given_type = !literal and try self.isType(argument);
+        if (!literal and !given_type) continue;
+        const kind = try self.facts.resolve(decl.file, written);
+        if (given_type) switch (kind) {
+            .container, .pointer, .optional => return false,
+            .primitive => |name| if (!std.mem.eql(u8, name, "type")) return false,
+            else => {},
+        };
+        if (literal and kind == .container) {
+            const scope_node = self.project.models[kind.container.file.raw()].scopes[kind.container.scope].node;
+            const owner = &self.project.files[kind.container.file.raw()].tree;
+            if (scope_node == .root or owner.tokenTag(owner.nodeMainToken(scope_node)) == .keyword_struct) return false;
+        }
+    }
+    return position - @min(position, skip) == call.ast.params.len;
+}
+/// Whether `node`, in the checked file, is a type: written as one (a pointer, array, optional or
+/// error union type, a container) or naming one.
+fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
+    const tree = &self.project.files[self.file.raw()].tree;
+    if (tree.fullPtrType(node) != null or tree.fullArrayType(node) != null) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&buffer, node) != null) return true;
+    switch (tree.nodeTag(node)) {
+        .optional_type, .error_union => return true,
+        .identifier, .field_access => return switch (try self.facts.resolve(self.file, node)) {
+            .container => true,
+            .primitive => |name| !std.mem.eql(u8, name, "type"),
+            else => false,
+        },
+        else => return false,
+    }
 }
 /// A required library member that did not resolve, at the first import of its module in this
 /// file. Recognition of that library is incomplete here, so a rule reports it as coverage.

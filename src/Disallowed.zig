@@ -231,8 +231,8 @@ fn memberName(self: *const Context, node: Ast.Node.Index) bool {
 
 /// Whether no governed declaration spelled `spelled` can be what a member access with an
 /// unresolved receiver reaches, by what Zig allows there. Called, every candidate's parameters
-/// refuse the arguments, as a method (the receiver first) and as a namespace's function: by
-/// count, or a literal given where a struct is taken. Not called, its value is a declaration's
+/// refuse the arguments, as a method (the receiver first) and as a namespace's function
+/// (`RuleContext.accepts`). Not called, its value is a declaration's
 /// that the file uses as a receiver of members, which no function and no number has. An
 /// external symbol is a function whose parameters are unknown.
 fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!bool {
@@ -254,38 +254,10 @@ fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []c
             if (value != .function and value != .scalar and value != .primitive) return false;
             const call = called orelse continue;
             if (value != .function) return false;
-            if (try accepts(self, decl, call, 1) or try accepts(self, decl, call, 0)) return false;
+            if (try self.accepts(decl, call, 1) or try self.accepts(decl, call, 0)) return false;
         }
     }
     return true;
-}
-
-/// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the call's
-/// arguments: as many, and none a literal where a struct is taken.
-fn accepts(self: *Context, decl: Facts.Decl, call: Ast.full.Call, skip: usize) Context.Error!bool {
-    const target = &self.project.files[decl.file.raw()].tree;
-    const tree = &self.project.files[self.file.raw()].tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const function = target.fullFnProto(&buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return true;
-    var it = function.iterate(target);
-    var at: usize = 0;
-    while (it.next()) |param| : (at += 1) {
-        if (at < skip) continue;
-        const index = at - skip;
-        if (index >= call.ast.params.len) return false;
-        const argument = call.ast.params[index];
-        switch (tree.nodeTag(argument)) {
-            .enum_literal, .number_literal, .string_literal, .char_literal => {},
-            else => continue,
-        }
-        const written = param.type_expr orelse continue;
-        const kind = try self.facts.resolve(decl.file, written);
-        if (kind != .container) continue;
-        const scope_node = self.project.models[kind.container.file.raw()].scopes[kind.container.scope].node;
-        const owner = &self.project.files[kind.container.file.raw()].tree;
-        if (scope_node == .root or owner.tokenTag(owner.nodeMainToken(scope_node)) == .keyword_struct) return false;
-    }
-    return at - @min(at, skip) == call.ast.params.len;
 }
 
 /// Whether `node` is the value of a declaration that the file uses as a receiver of a member.

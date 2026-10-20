@@ -4,6 +4,15 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `RuleContext.accepts`: whether a function's parameters can take a call's arguments by what Zig allows (as many; no literal where a struct is taken; no type where a value of a struct, a pointer or a number is taken). P006 and the aegis pack share it.
+
+### Changed
+
+- The aegis pack decides more receivers. A made container's members are read with the bindings of the call that made it through every expression (`E!?Line(T)`, a type function called inside another, `if`/`switch` arms), one reading for type functions and generic calls; a type the made container declares (`Record`, `Replay`) and a container behind a pointer, optional, error union or array is made by the same call. A001 refutes an unresolved receiver by the other members the file reads of the same expression (`p.name` beside `p.value`). A001-A003 refute an unresolved call `x.name(...)` no library function can be by its arguments (`access.read([]const u8)`: every aegis `read` takes an `Io` or nothing). A002 reads an operator's result and an `if` with one plain branch as plain data (peer types), and an `inline for` over `.{ a, b }` takes each element in turn.
+- glint gates A001-A003 in its own lint (A001-A005 in all).
+
 ## [0.4.1] - 2026-10-20
 
 ### Added

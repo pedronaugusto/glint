@@ -1170,3 +1170,34 @@ test "A001 reads a literal's place through generic slices and a handler held in 
     try expectJudged(head ++ "pub fn f(b: []const u8) void { keep(Raw, &.{.{ .bytes = b }}); }", pack.access, true, 0);
     try expectJudged(head ++ "const R = struct { s: ?Raw = null };\nconst Handlers = struct { make: ?*const fn () error{Bad}!R = null };\npub fn f(h: Handlers, b: []const u8) void { const g = h.make orelse return; var r = g() catch return; r.s = .{ .bytes = b }; }", pack.access, true, 0);
 }
+
+test "a made container's method result is read with the call's bindings through error unions and nested type functions" {
+    const head = "const aegis = @import(\"aegis\");\nfn Line(comptime T: type) type { return struct { number: u32, value: T }; }\nfn Reader(comptime T: type) type { return struct { const Self = @This(); pub const Record = struct { value: T }; pub fn next(self: *Self) error{Bad}!?Line(T) { _ = self; return null; } pub fn record(self: *Self) ?Record { _ = self; return null; } }; }\nconst Plain = struct { data: u32 };\n";
+    try expectJudged(head ++ "pub fn f(r: *Reader(Plain)) !void { while (try r.next()) |line| _ = line.value.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(r: *Reader(aegis.Guarded(u32))) !void { while (try r.next()) |line| _ = line.value.data; }", pack.access, true, 1);
+    // A type the made container declares is made by the same call.
+    try expectJudged(head ++ "pub fn f(r: *Reader(Plain)) void { if (r.record()) |rec| _ = rec.value.data; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(r: *Reader(aegis.Guarded(u32))) void { if (r.record()) |rec| _ = rec.value.data; }", pack.access, true, 1);
+}
+
+test "A001 refutes an unresolved receiver by the other members the file reads of the same expression" {
+    // `p.name` beside `p.value`: no aegis type with a `value` field has a `name`.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| { _ = p.name; _ = p.value; } }", pack.access, true, 0);
+    // Without another member the receiver stays undecided.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| _ = p.value; }", pack.access, false, 0);
+}
+
+test "A003 refutes an unresolved acquisition no aegis function can be by its arguments" {
+    // Every aegis `read` takes at most an `Io`: two arguments are more than any takes. (With
+    // std mapped, a type argument is refused too: `access.read([]const u8)`.)
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, true, 0);
+    // An argument a `read` could take leaves it undecided.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
+}
+
+test "A002 reads operators and a tuple written in place" {
+    // An operator gives no struct: a copy of its result copies no owner, nor an `if` one of whose branches is one.
+    try expectJudged("pub fn f(comptime Int: type, a: Int, b: Int, g: fn () Int) void { const d = a - b; var x = if (a > b) g() + 1 else g(); const e = d; const y = x; _ = e; _ = y; _ = &x; }", pack.copies, true, 0);
+    // An `inline for` over `.{ a, b }` takes each element in turn.
+    try expectJudged("pub fn f() void { inline for (.{ @as(u8, 1), @as(u16, 2) }) |v| { var copy = v; _ = &copy; } }", pack.copies, true, 0);
+}

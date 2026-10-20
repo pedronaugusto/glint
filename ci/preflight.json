@@ -20,6 +20,18 @@
       {
         "id": "A005",
         "level": "gate"
+      },
+      {
+        "id": "A001",
+        "level": "gate"
+      },
+      {
+        "id": "A002",
+        "level": "gate"
+      },
+      {
+        "id": "A003",
+        "level": "gate"
       }
     ]
   },

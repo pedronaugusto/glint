@@ -255,7 +255,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"catch" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .error_union),
         .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
-        .@"switch", .switch_comma, .@"if" => if (try self.branches(file, node)) |value| return value,
+        .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(file, node)) |value| return value,
         .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
@@ -453,14 +453,14 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
 fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
     const made = container.made_by orelse return self.declaration(decl);
     const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
-    if (record.kind != .field) return self.declaration(decl);
+    // A type it declares (`Replay`, `Record`) is made by the same call.
+    if (record.kind != .field) return self.madeWithin(try self.declaration(decl), container, made);
     const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const field = tree.fullContainerField(record.node) orelse return self.declaration(decl);
     const type_node = field.ast.type_expr.unwrap() orelse return self.declaration(decl);
-    var value = try self.substituted(decl.file, type_node, made, 0);
+    const value = try self.substituted(decl.file, type_node, made);
     if (value == .unknown) return self.declaration(decl);
-    if (value == .container and self.within(value.container, container)) value.container.made_by = made;
-    return self.valueOf(value);
+    return self.valueOf(try self.madeWithin(value, container, made));
 }
 
 /// A pointer's `len` or `ptr` where what it points at has no such member: a slice's or an
@@ -570,12 +570,26 @@ fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Dec
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, record.node) orelse return null;
     const result_node = function.ast.return_type.unwrap() orelse return null;
-    var result = try self.substituted(decl.file, result_node, made, 0);
+    var result = try self.substituted(decl.file, result_node, made);
     if (result == .unknown) return null;
-    // A container declared inside the made one, such as its guard, is made by the same call.
-    if (result == .container and self.within(result.container, container)) result.container.made_by = made;
+    result = try self.madeWithin(result, container, made);
     if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(try self.instance(result)) };
     return try self.instance(result);
+}
+
+/// `value` with every container declared inside `outer` (a made container's guard, its
+/// record type), also behind pointers, optionals, error unions and arrays, made by the same
+/// call as `outer`.
+fn madeWithin(self: *Facts, value: Value, outer: Container, made: *const Made) ResolveError!Value {
+    return switch (value) {
+        .container => |inner| if (self.within(inner, outer)) .{ .container = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
+        .instance => |inner| if (self.within(inner, outer)) .{ .instance = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
+        .pointer => |to| .{ .pointer = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        .optional => |to| .{ .optional = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        .error_union => |to| .{ .error_union = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        .array => |to| .{ .array = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        else => value,
+    };
 }
 
 fn within(self: *const Facts, inner: Container, outer: Container) bool {
@@ -587,102 +601,28 @@ fn within(self: *const Facts, inner: Container, outer: Container) bool {
 }
 
 /// A type expression written inside a type function's container, its parameters read as the
-/// arguments of the call that made it.
-fn substituted(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *const Made, depth: usize) ResolveError!Value {
-    if (depth == 16) return .{ .unknown = .budget };
-    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    if (tree.fullPtrType(node)) |ptr| {
-        const child = try self.substituted(file, ptr.ast.child_type, made, depth + 1);
-        if (child == .unknown) return child;
-        return .{ .pointer = try self.boxed(child) };
-    }
-    if (tree.fullArrayType(node)) |array| {
-        const child = try self.substituted(file, array.ast.elem_type, made, depth + 1);
-        if (child == .unknown) return child;
-        return .{ .array = try self.boxed(child) };
-    }
-    switch (tree.nodeTag(node)) {
-        .optional_type => {
-            const child = try self.substituted(file, tree.nodeData(node).node, made, depth + 1);
-            if (child == .unknown) return child;
-            return .{ .optional = try self.boxed(child) };
-        },
-        .identifier => {
-            if (try self.argumentFor(file, node, made)) |argument| return argument;
-            // A constant the type function declares, such as a list's `Slice`, is what
-            // initialises it, read with the same arguments.
-            const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
-            if (file.eql(made.function.file)) if (model.reference(node)) |ref| if (ref.declaration) |index| {
-                const record = model.declarations[index];
-                if (record.kind == .variable and self.inside(file, record.scope, self.scopeNode(made.function))) {
-                    const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
-                    if (variable.ast.type_node.unwrap()) |t| {
-                        const type_value = try self.substituted(file, t, made, depth + 1);
-                        if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return self.instance(type_value);
-                    }
-                    if (variable.ast.init_node.unwrap()) |init| return self.substituted(file, init, made, depth + 1);
-                }
-            };
-        },
-        .grouped_expression => return self.substituted(file, tree.nodeData(node).node_and_token[0], made, depth + 1),
-        .@"if", .@"switch", .switch_comma => {
-            var values: std.ArrayList(Value) = .empty;
-            var buffer: [2]Ast.Node.Index = undefined;
-            var arms: []const Ast.Node.Index = &.{};
-            if (tree.fullIf(node)) |whole| {
-                buffer = .{ whole.ast.then_expr, whole.ast.else_expr.unwrap() orelse return self.resolve(file, node) };
-                arms = &buffer;
-            }
-            var cases: std.ArrayList(Ast.Node.Index) = .empty;
-            if (tree.fullSwitch(node)) |whole| {
-                for (whole.ast.cases) |case| try cases.append(self.gpa, tree.fullSwitchCase(case).?.ast.target_expr);
-                arms = cases.items;
-            }
-            var nullable = false;
-            for (arms) |arm| {
-                if (never(tree, arm)) continue;
-                if (isNull(tree, arm)) {
-                    nullable = true;
-                    continue;
-                }
-                try values.append(self.gpa, try self.substituted(file, arm, made, depth + 1));
-            }
-            const chosen = try self.choose(values.items);
-            if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
-            return .{ .optional = try self.boxed(chosen) };
-        },
-        else => {},
-    }
-    return self.resolve(file, node);
+/// arguments of the call that made it: the same reading as a generic call's (`resolveIn`).
+fn substituted(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *const Made) ResolveError!Value {
+    return self.resolveIn(try self.madeEnv(made), file, node);
 }
 
-/// The argument the call `made` passed for the parameter `node` names, when it names one of
-/// the type function's parameters.
-fn argumentFor(self: *Facts, file: Project.FileId, node: Ast.Node.Index, made: *const Made) ResolveError!?Value {
-    if (!file.eql(made.function.file)) return null;
-    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
-    const ref = model.reference(node) orelse return null;
-    const index = ref.declaration orelse return null;
-    const parameter = model.declarations[index];
-    if (parameter.kind != .parameter) return null;
-    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    var fn_buffer: [1]Ast.Node.Index = undefined;
-    const function = tree.fullFnProto(&fn_buffer, model.declarations[made.function.index].node) orelse return null;
-    var it = function.iterate(tree);
-    var position: usize = 0;
-    while (it.next()) |param| : (position += 1) {
-        if (param.name_token != parameter.token) continue;
-        // A parameter the function passes on changed when it calls itself again is not the
-        // call's argument on that path.
-        if (try self.passedOnChanged(made.function, position)) return .{ .unknown = .comptime_dependent };
-        const call_tree = &self.project.files[made.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const call = call_tree.fullCall(&call_buffer, made.call) orelse return null;
-        if (position >= call.ast.params.len) return null;
-        if (made.env) |env| return try self.resolveIn(env, made.file, call.ast.params[position]);
-        return try self.resolve(made.file, call.ast.params[position]);
+/// The bindings of the call that made a container: the type function's parameters bound to its
+/// arguments (read with the bindings of the reading that made it, if any). A parameter the
+/// function passes on changed when it calls itself again is not the call's argument on that
+/// path, so it stays unknown.
+fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
+    const call_tree = &self.project.files[made.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = call_tree.fullCall(&call_buffer, made.call).?;
+    const args = try self.gpa.alloc(Value, call.ast.params.len);
+    for (call.ast.params, args, 0..) |param, *arg, position| {
+        arg.* = if (try self.passedOnChanged(made.function, position))
+            .{ .unknown = .comptime_dependent }
+        else if (made.env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param);
     }
-    return null;
+    const env = try self.gpa.create(Env);
+    env.* = .{ .function = made.function, .args = args, .depth = if (made.env) |e| e.depth + 1 else 0 };
+    return env;
 }
 
 fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveError!bool {
@@ -779,7 +719,7 @@ fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
 /// that gives no value of its own (`@compileError`, `unreachable`, `undefined`) or never
 /// completes (`return`, `break`, `continue`, `@panic`, `@trap`) is left out; a `null` one
 /// makes the others optional.
-fn branches(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var values: std.ArrayList(Value) = .empty;
     var nullable = false;
@@ -791,7 +731,7 @@ fn branches(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErr
                 nullable = true;
                 continue;
             }
-            try values.append(self.gpa, try self.resolve(file, branch));
+            try values.append(self.gpa, try self.resolveIn(env, file, branch));
         }
     } else if (tree.fullIf(node)) |whole| {
         const otherwise = whole.ast.else_expr.unwrap() orelse return null;
@@ -801,7 +741,7 @@ fn branches(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErr
                 nullable = true;
                 continue;
             }
-            try values.append(self.gpa, try self.resolve(file, branch));
+            try values.append(self.gpa, try self.resolveIn(env, file, branch));
         }
     } else return null;
     const chosen = try self.choose(values.items);
@@ -1027,6 +967,13 @@ fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.Tok
     if (position >= loop.ast.inputs.len) return .{ .unknown = .unsupported };
     const input = loop.ast.inputs[position];
     if (tree.nodeTag(input) == .for_range) return .scalar;
+    // An `inline for` over a tuple written in place (`.{ a, b }`): each element in turn.
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, input)) |list| if (list.ast.type_expr == .none) {
+        const each = try self.gpa.alloc(Value, list.ast.elements.len);
+        for (list.ast.elements, each) |item, *out| out.* = try self.resolve(file, item);
+        return self.choose(each);
+    };
     // A `for` takes arrays, pointers to arrays and slices, never a single item: a resolved
     // pointer input is a slice, whose element is what it points at.
     return self.indexed(try self.resolve(file, input), {});
@@ -1543,6 +1490,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .@"comptime", .@"nosuspend" => return self.resolveIn(env, file, tree.nodeData(node).node),
         .optional_type => return .{ .optional = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
         .error_union => return .{ .error_union = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[1])) },
+        .@"switch", .switch_comma, .@"if" => if (try self.branches(env, file, node)) |value| return value,
         .array_access => {
             const operands = tree.nodeData(node).node_and_node;
             const base = try self.resolveIn(env, file, operands[0]);
@@ -2155,7 +2103,7 @@ fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, positi
     while (it.next()) |param| : (at += 1) {
         if (at != position + receiver) continue;
         const type_expr = param.type_expr orelse return .scalar;
-        if (made) |m| return self.substituted(decl.file, type_expr, m, 0);
+        if (made) |m| return self.substituted(decl.file, type_expr, m);
         // Written in terms of a `comptime T: type` parameter: the call's argument for it.
         if (try self.written(.{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver }, type_expr, 0)) |bound| return bound;
         return self.resolve(decl.file, type_expr);

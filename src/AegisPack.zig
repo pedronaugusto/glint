@@ -96,6 +96,80 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
     }
     return true;
 }
+/// Whether no library container whose field `name` the rule would read as a backing field
+/// (by the kind `typed` gives a value of it, or a kind not known) has every member in
+/// `others`: `p.key` read beside `p.value`, and no aegis type whose `value` is backing state
+/// has a `key`.
+fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Context.Error!bool {
+    const found = try c.facts.publication(Contract.library);
+    for (found.files) |file| {
+        const model = &c.project.models[file.raw()];
+        for (model.declarations) |decl| {
+            if (decl.kind != .field or !std.mem.eql(u8, decl.name, name)) continue;
+            const holder: Facts.Container = .{ .file = file, .scope = decl.scope };
+            switch (try typed(c, .{ .instance = holder }, 0)) {
+                .owner => |k| if (!backing(k, name)) continue,
+                .other => continue,
+                .unknown => {},
+            }
+            for (others) |other| {
+                if (c.facts.member(holder, other) == null) break;
+            } else return false;
+        }
+    }
+    return true;
+}
+/// The members other than `name` the file reads of an expression written as `receiver` is: the
+/// same declaration reached through the same fields, unwraps, dereferences, `try`s, elements
+/// and argument-less calls. Zig types each such expression alike, wherever it is written.
+fn receiverMembers(c: *Context, tree: *const Ast, model: *const Model, receiver: Ast.Node.Index, name: []const u8) Context.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    if (!alikeRooted(tree, model, receiver, 0)) return names.items;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .field_access) continue;
+        const access_node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const data = tree.nodeData(access_node).node_and_token;
+        if (data[0] == receiver or !typedAlike(tree, model, data[0], receiver, 0)) continue;
+        const read = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
+        if (std.mem.eql(u8, read, name)) continue;
+        for (names.items) |earlier| {
+            if (std.mem.eql(u8, earlier, read)) break;
+        } else try names.append(c.allocator, read);
+    }
+    return names.items;
+}
+/// Whether `node` is an expression `typedAlike` compares: rooted at a declaration it names.
+fn alikeRooted(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) bool {
+    if (depth == 16) return false;
+    return switch (tree.nodeTag(node)) {
+        .identifier => if (model.reference(node)) |ref| ref.declaration != null else false,
+        .field_access, .unwrap_optional, .grouped_expression => alikeRooted(tree, model, tree.nodeData(node).node_and_token[0], depth + 1),
+        .deref, .@"try" => alikeRooted(tree, model, tree.nodeData(node).node, depth + 1),
+        .array_access => alikeRooted(tree, model, tree.nodeData(node).node_and_node[0], depth + 1),
+        .call_one, .call_one_comma => tree.nodeData(node).node_and_opt_node[1] == .none and alikeRooted(tree, model, tree.nodeData(node).node_and_opt_node[0], depth + 1),
+        else => false,
+    };
+}
+fn typedAlike(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.Node.Index, depth: usize) bool {
+    if (depth == 16) return false;
+    const tag = tree.nodeTag(a);
+    if (tag != tree.nodeTag(b)) return false;
+    return switch (tag) {
+        .identifier => blk: {
+            const x = (model.reference(a) orelse break :blk false).declaration orelse break :blk false;
+            const y = (model.reference(b) orelse break :blk false).declaration orelse break :blk false;
+            break :blk x == y;
+        },
+        .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(a).node_and_token[1]), tree.tokenSlice(tree.nodeData(b).node_and_token[1])) and
+            typedAlike(tree, model, tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1),
+        .unwrap_optional, .grouped_expression => typedAlike(tree, model, tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1),
+        .deref, .@"try" => typedAlike(tree, model, tree.nodeData(a).node, tree.nodeData(b).node, depth + 1),
+        .array_access => typedAlike(tree, model, tree.nodeData(a).node_and_node[0], tree.nodeData(b).node_and_node[0], depth + 1),
+        .call_one, .call_one_comma => tree.nodeData(a).node_and_opt_node[1] == .none and tree.nodeData(b).node_and_opt_node[1] == .none and
+            typedAlike(tree, model, tree.nodeData(a).node_and_opt_node[0], tree.nodeData(b).node_and_opt_node[0], depth + 1),
+        else => false,
+    };
+}
 /// Whether `node` is a type, whose members are declarations and never a value's fields: a
 /// container named as such, or a parameter or constant declared `type` (`V.maximum` of a
 /// `comptime V: type`).
@@ -114,8 +188,10 @@ fn typeValue(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 /// whatever `x` is, because of what the program does with it. For every published type with a
 /// backing field of that name, one of: the program reads a member of `x.name` that the field's
 /// declared type lacks (`o.state.storage` is no atomic's), or `x` is a variable whose literal
-/// initializer names a field the type lacks (`.{ .state = 0, .base = io }`). Undecided when any
-/// such type is not refuted.
+/// initializer names a field the type lacks (`.{ .state = 0, .base = io }`), or the program
+/// reads a member of `x` itself, anywhere in the file, that the type lacks (`p.key` beside
+/// `p.value`: `x` is the same expression, so of the same type, wherever it is written). Undecided
+/// when any such type is not refuted.
 fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
@@ -143,6 +219,8 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             };
         };
     };
+    const siblings = try receiverMembers(c, tree, model, receiver, name);
+    if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
     const found = try c.facts.publication(Contract.library);
     var any = false;
@@ -381,10 +459,38 @@ fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.Token
         .other => return null,
         .unknown => {
             const tree = try c.project.syntax(try c.source());
+            if (try noLibraryCall(c, tree, node)) return null;
             try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
             return null;
         },
     }
+}
+/// Whether `node` is a call `x.name(...)` that no function the library declares can be, by
+/// what Zig allows (`RuleContext.accepts`): `access.read([]const u8)` gives a type where every
+/// aegis `read` takes an `Io` or nothing. Whatever `x` is, the result is then no aegis owner
+/// an aegis operation gave.
+fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!bool {
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
+    const found = try c.facts.publication(Contract.library);
+    for (found.files) |file| {
+        const model = &c.project.models[file.raw()];
+        for (model.declarations, 0..) |decl, i| {
+            if (!std.mem.eql(u8, decl.name, name) or model.scopes[decl.scope].kind != .container) continue;
+            const candidate: Facts.Decl = .{ .file = file, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            // A constant or a field of no function's type is no callee; one that may hold a
+            // function (a pointer, or a type not known) may be.
+            switch (try c.facts.declaration(candidate)) {
+                .function => {},
+                .unknown, .pointer, .alternatives => return false,
+                else => continue,
+            }
+            if (try c.accepts(candidate, call, 1) or try c.accepts(candidate, call, 0)) return false;
+        }
+    }
+    return true;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
@@ -538,6 +644,9 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
     const model = &c.project.models[file.raw()]; // safe: the file handle indexes the frozen project table.
     switch (tree.nodeTag(node)) {
         .number_literal, .char_literal, .string_literal => return true,
+        // Zig has no operator overloading: an operator gives a number, a truth value, a vector or
+        // (`+`, `-` on a pointer) a pointer, never a struct an owner is.
+        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bit_not, .negation, .negation_wrap, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return true,
         .@"comptime", .@"try", .address_of => return plainValue(c, file, tree.nodeData(node).node, depth + 1),
         .grouped_expression => return plainValue(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
         // Arrays joined: plain when what they are made of is.
@@ -549,9 +658,11 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
         // The payload of plain data is plain: Zig requires the other side to coerce to it.
         .@"orelse", .@"catch" => return plainValue(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
         .@"if", .if_simple => {
+            // Peer types: a struct has none with a number, a truth value or a pointer, so one
+            // plain branch makes the whole plain (a branch that never ends gives nothing).
             const branch = tree.fullIf(node).?;
             const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-            return try plainValue(c, file, branch.ast.then_expr, depth + 1) and try plainValue(c, file, otherwise, depth + 1);
+            return try plainValue(c, file, branch.ast.then_expr, depth + 1) or try plainValue(c, file, otherwise, depth + 1);
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => return plainBreaks(c, file, node, depth + 1),
         .identifier => {
