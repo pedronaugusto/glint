@@ -1679,23 +1679,24 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         if (file.status != .parsed) continue;
         // A private function is used in its own file only; a file outside the package
         // reaches it only through a module's exported names, which this one is not among.
-        if (!record.public and raw != function.file.raw()) continue;
-        if (!self.project.inputs[raw].selected) continue;
         const id: Project.FileId = .fromRaw(@intCast(raw)); // safe: file indexes are bounded by the frozen project table.
+        const own = id.eql(function.file);
+        if (!record.public and !own) continue;
+        if (!self.project.inputs[raw].selected) continue;
         const tree = &file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
             const names_it = switch (tag) {
                 .identifier => blk: {
                     const ref = file_model.reference(node) orelse break :blk false;
-                    break :blk raw == function.file.raw() and ref.declaration != null and ref.declaration.? == function.index;
+                    break :blk own and ref.declaration != null and ref.declaration.? == function.index;
                 },
                 .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), name),
                 else => false,
             };
             if (!names_it) continue;
             // The declaration's own name token is no use of it, nor an enum's field of that name.
-            if (tag == .identifier and tree.nodeMainToken(node) == name_token and raw == function.file.raw()) continue;
+            if (tag == .identifier and tree.nodeMainToken(node) == name_token and own) continue;
             if (tag == .identifier and enumField(tree, file_model, node)) continue;
             const parent = file_model.node_parents[i] orelse return null;
             // `@TypeOf(f)` asks its type: no use of it that passes it on.
