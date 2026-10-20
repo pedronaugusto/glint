@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-20
+
 ### Added
 
 - E001, reported (a heuristic, designs/glint.md §6): a pointer into a function's own frame carried out of the call: a slice of a local array or a `var`'s address returned, in a returned struct literal, through a `const` alias, or stored through a parameter or into a container's variable. Zig refuses only `return &x` of these.
