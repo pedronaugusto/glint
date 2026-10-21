@@ -3037,8 +3037,9 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
             while (at) |candidate| : (at = model.node_parents[@backingInt(candidate)]) { // safe: a node index indexes its own tree's parent table.
                 const tag = tree.nodeTag(candidate);
                 if (tag != .block and tag != .block_semicolon and tag != .block_two and tag != .block_two_semicolon) continue;
-                const first = tree.firstToken(candidate);
-                if (first >= 2 and tree.tokenTag(first - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(first - 2), tree.tokenSlice(label))) return self.placeType(file, candidate, depth + 1);
+                // A labeled block's brace follows its label and a colon.
+                const brace = tree.nodeMainToken(candidate);
+                if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(brace - 2), tree.tokenSlice(label))) return self.placeType(file, candidate, depth + 1);
             }
             return .{ .unknown = .unsupported };
         },

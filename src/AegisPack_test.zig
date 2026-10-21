@@ -1251,6 +1251,9 @@ test "A001 finds public text built by a literal, by the type the literal takes f
     try expectJudged(head ++ "const Holder = struct { source: err.PublicSource };\npub fn f(b: []const u8) void { const h: Holder = .{ .source = .{ .bytes = b } }; _ = h; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(b: []const u8) void { _ = @as(err.PublicSource, .{ .bytes = b }); }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(b: []const u8) void { _ = err.PublicText(8).copy(.{ .bytes = b }); }", pack.access, true, 1);
+    // A labeled block's `break`, also through an `if` it gives, takes the block's place.
+    try expectJudged(head ++ "pub fn f(b: []const u8, n: u8) err.PublicSource { return switch (n) { 0 => blk: { break :blk if (b.len == 0) .{ .bytes = b } else .{ .bytes = b[1..] }; }, else => .{ .bytes = b } }; }", pack.access, true, 3);
+    try expectJudged(head ++ "const Event = union(enum) { text: Other, bytes: Other };\npub fn f(b: []const u8, n: u8) Other { return switch (n) { 0 => blk: { break :blk if (b.len == 0) .{ .bytes = b } else .{ .bytes = b[1..] }; }, else => .{ .bytes = b } }; }", pack.access, true, 0);
     // `classify` is the way; a literal of another type with the same fields is not one, nor an
     // anonymous one.
     try expectJudged(head ++ "pub fn f(b: []const u8) void { show(err.PublicSource.classify(\"a reviewed name\", b)); }", pack.access, true, 0);
