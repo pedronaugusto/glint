@@ -91,10 +91,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             if (runner.config.has(rule.definition.id)) try rule.check(&context);
         };
         if (file.status != .parsed) runner.complete = false;
-        if (runner.config.strict_suppressions) for (runner.suppressions) |suppression| if (!suppression.used) {
-            runner.complete = false;
-        };
-        for (runner.suppressions) |suppression| if (!suppression.used) {
+        // Only a rule that ran shows that a suppression of it suppresses nothing.
+        for (runner.suppressions) |suppression| if (!suppression.used and runner.config.has(suppression.rule)) {
+            if (runner.config.strict_suppressions) runner.complete = false;
             const start = suppression.comment.start;
             try runner.stale.append(a, .{ .name = (rules.definition(suppression.rule, definitions) orelse return error.InvalidSelection).name, .span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 } });
         };
