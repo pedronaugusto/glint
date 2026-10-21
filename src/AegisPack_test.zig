@@ -1406,6 +1406,12 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
+    // A function type written in place is reflected as a declared function is: a vtable's
+    // field types, each a function pointer, give their parameters' types (shakedown's
+    // simulated `Io` calls); one of them an owner makes a copy of the parameter a finding.
+    const vtable = "pub fn slot(comptime name: []const u8) @FieldType(VTable, name) {\n    const info = @typeInfo(@typeInfo(@FieldType(VTable, name)).pointer.child).@\"fn\";\n    const params = info.param_types;\n    return &struct {\n        fn f(u: ?*anyopaque, a: params[1].?) void {\n            _ = u;\n            keep(.{a});\n        }\n    }.f;\n}\n";
+    try expectJudged(head ++ "const VTable = struct { open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, P) void };\n" ++ vtable, pack.copies, true, 0);
+    try expectJudged(head ++ "const VTable = struct { open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, aegis.Secret(u32)) void };\n" ++ vtable, pack.copies, true, 1);
     // A field's type read by `@FieldType` of a made container is the making call's, also in a
     // generic's result written in terms of its `anytype` parameter (chronicle's journal state
     // seen through its owner).

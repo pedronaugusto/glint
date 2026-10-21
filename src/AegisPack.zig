@@ -547,6 +547,12 @@ fn copied(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         .pointer => .other,
         .array, .optional, .error_union => |payload| copied(c, payload.*, depth + 1),
         .reified => |built| copied(c, built.fields.*, depth + 1),
+        // Each part a copy of its own, per build as well.
+        .literal => |literal| blk: {
+            var found: Typed = .other;
+            for (try c.facts.literalParts(literal)) |part| found = joined(found, try copied(c, part, depth + 1));
+            break :blk found;
+        },
         .alternatives => |each| blk: {
             var found: Typed = .other;
             for (each) |one| found = joined(found, try copied(c, one, depth + 1));

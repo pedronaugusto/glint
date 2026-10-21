@@ -143,6 +143,9 @@ pub const Value = union(enum) {
     /// value of one: it holds what those types do, one or a choice among them. Its fields'
     /// names are computed as the program compiles.
     reified: Reified,
+    /// A function type written in place (`fn (?*anyopaque, Io.Dir) void`, a vtable field's
+    /// behind `*const`): its parameters' and result's types, as a declared function's are.
+    fn_type: Key,
 
     pub fn known(self: Value) bool {
         return self != .unknown;
@@ -936,12 +939,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .number_literal, .string_literal, .char_literal => return .scalar,
         else => {},
     }
-    if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
-    if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolve(file, array.ast.elem_type)) };
+    if (try self.typeWritten(file, node)) |value| return value;
     var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullContainerDecl(&buffer, node) != null) {
-        for (model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
-    }
     switch (tag) {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(null, file, node),
         .call_one, .call_one_comma, .call, .call_comma => {
@@ -983,6 +982,20 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),
         else => return .{ .unknown = .unsupported },
     }
+}
+
+/// A type written in place: a pointer, an array, a function type, a container.
+fn typeWritten(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
+    if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolve(file, array.ast.elem_type)) };
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.nodeTag(node) != .fn_decl and tree.fullFnProto(&proto_buffer, node) != null) return .{ .fn_type = .{ .file = file, .node = node } };
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&buffer, node) != null) {
+        for (self.project.models[file.raw()].scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
+    }
+    return null;
 }
 
 /// What a builtin call gives: an imported file, `@This()`, a reflected declaration, a type
@@ -1888,6 +1901,7 @@ fn same(a: Value, b: Value, depth: usize) bool {
         .error_set, .scalar => true,
         .reflected => false,
         .reified => |built| built.value == b.reified.value and same(built.fields.*, b.reified.fields.*, depth + 1),
+        .fn_type => |key| std.meta.eql(key, b.fn_type),
         // One literal is one anonymous type; two literals are two.
         .literal => |l| std.meta.eql(l, b.literal),
     };
@@ -2202,11 +2216,11 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
         .error_union => return if (std.mem.eql(u8, name, "payload")) self.payload(r.of.*, .error_union) else unsupported,
         .array => return if (std.mem.eql(u8, name, "child")) self.indexed(r.of.*, {}) else unsupported,
         .function => {
-            if (r.of.* != .function) return if (r.of.* == .unknown) r.of.* else unsupported;
+            const proto = self.prototype(r.of.*) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "param_types")) return .{ .reflected = .{ .of = r.of, .at = .params } };
             if (!std.mem.eql(u8, name, "return_type")) return unsupported;
             // `?type`: null for a result that depends on an argument.
-            const result = try self.returnTypeOf(r.of.function);
+            const result = try self.resultOf(proto);
             if (result == .unknown) return result;
             return .{ .optional = try self.boxed(result) };
         },
@@ -2217,32 +2231,46 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
 /// `param_types[i]` of a reflected function, `?type` as Zig gives it: the parameter's
 /// declared type, null (unknown here) for `anytype` or a type that depends on an argument.
 fn reflectedElement(self: *Facts, r: Reflected, tree: *const Ast, index_node: Ast.Node.Index) ResolveError!Value {
-    if (r.at != .params or r.of.* != .function) return .{ .unknown = .unsupported };
+    if (r.at != .params) return .{ .unknown = .unsupported };
+    const proto = self.prototype(r.of.*) orelse return .{ .unknown = .unsupported };
     if (tree.nodeTag(index_node) != .number_literal) return .{ .unknown = .comptime_dependent };
     const position = std.fmt.parseInt(usize, tree.tokenSlice(tree.nodeMainToken(index_node)), 0) catch return .{ .unknown = .unsupported };
-    const decl = r.of.function;
-    const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const target_tree = &self.project.files[proto.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var fn_buffer: [1]Ast.Node.Index = undefined;
-    const function = target_tree.fullFnProto(&fn_buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
+    const function = target_tree.fullFnProto(&fn_buffer, proto.node) orelse return .{ .unknown = .unsupported };
     var it = function.iterate(target_tree);
     var at: usize = 0;
     while (it.next()) |param| : (at += 1) {
         if (at != position) continue;
         const type_expr = param.type_expr orelse return .{ .unknown = .comptime_dependent };
-        const value = try self.resolve(decl.file, type_expr);
+        const value = try self.resolve(proto.file, type_expr);
         if (value == .unknown) return value;
         return .{ .optional = try self.boxed(value) };
     }
     return .{ .unknown = .unsupported };
 }
 
+/// The prototype a function or a function type is written with.
+fn prototype(self: *const Facts, value: Value) ?Key {
+    return switch (value) {
+        .function => |decl| .{ .file = decl.file, .node = self.project.models[decl.file.raw()].declarations[decl.index].node }, // safe: enum identities index their owning frozen tables without narrowing.
+        .fn_type => |key| key,
+        else => null,
+    };
+}
+
 /// A function's declared result as a type, `!T` an error union of it.
 fn returnTypeOf(self: *Facts, decl: Decl) ResolveError!Value {
-    const target_tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    return self.resultOf(self.prototype(.{ .function = decl }).?); // unreachable: a function has a prototype
+}
+
+/// The result a prototype declares, as a type, `!T` an error union of it.
+fn resultOf(self: *Facts, proto: Key) ResolveError!Value {
+    const target_tree = &self.project.files[proto.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var fn_buffer: [1]Ast.Node.Index = undefined;
-    const function = target_tree.fullFnProto(&fn_buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
+    const function = target_tree.fullFnProto(&fn_buffer, proto.node) orelse return .{ .unknown = .unsupported };
     const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
-    const result = try self.resolve(decl.file, result_node);
+    const result = try self.resolve(proto.file, result_node);
     if (result == .unknown) return result;
     if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(result) };
     return result;
