@@ -949,6 +949,8 @@ test "owners, result obligations and shared values are released once and never c
     // MustUse: discharged by take or a reasoned acknowledgment; its deinit alone discharges nothing.
     try expectJudged(head ++ "pub fn f() void { var m = M.init(1); defer m.deinit(); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f() void { var m = M.init(1); defer m.deinit(); m.acknowledge(\"the count is logged elsewhere\"); }", pack.cleanup, true, 0);
+    // Its deinit after the discharge is the check that the discharge came.
+    try expectJudged(head ++ "pub fn f(out: *u32) void { var m = M.init(1); m.take(out); m.deinit(); }", pack.cleanup, true, 0);
     // Shared: each handle, the created one and each retained one, is released.
     try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); _ = other.get(); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); defer other.release(); }", pack.cleanup, true, 0);

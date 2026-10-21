@@ -448,6 +448,15 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
     };
 }
 
+/// What checks a local owner's obligation once it is discharged, by kind: a result
+/// obligation's `deinit`, which stops the program unless `take` or `acknowledge` came first.
+fn teardown(k: Contract.Kind) ?[]const u8 {
+    return switch (k) {
+        .must_use => "deinit",
+        else => null,
+    };
+}
+
 fn releaseName(k: Contract.Kind, name: []const u8) bool {
     for (releases(k) orelse return false) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
@@ -940,7 +949,7 @@ fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context
 /// that meet in different states, a jump to a loop or block of the walk other than the loop it
 /// is in, any use of the owner but its members or a loan (its address, a copy, an argument: a
 /// transfer or an alias), a release nested where the walk does not follow, a use after
-/// release. Findings: a second direct cleanup, the owner's address discarded after release.
+/// release other than a result obligation's `deinit`, its check. Findings: a second direct cleanup, the owner's address discarded after release.
 const Flow = struct {
     c: *Context,
     tree: *const Ast,
@@ -1004,6 +1013,8 @@ const Flow = struct {
                 if (state == .released) try f.c.at(cleanup, f.tree.nodeMainToken(f.tree.nodeData(f.tree.nodeData(stmt).node_and_node[1]).node), "same local owner used after cleanup on this straight-line path");
                 continue;
             }
+            // After the discharge, the check that it came is no use of the owner.
+            if (state == .released and try f.tornDown(stmt)) continue;
             if (state == .released and try f.reacquired(stmt)) {
                 state = .live;
                 continue;
@@ -1388,6 +1399,12 @@ const Flow = struct {
         return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
     }
 
+    /// `owner.deinit()` of a result obligation: the check that its discharge came.
+    fn tornDown(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        const name = teardown(f.kind) orelse return false;
+        return std.mem.eql(u8, (try ownerCall(f.c, stmt, f.token)) orelse return false, name);
+    }
+
     /// `_ = &owner;`
     fn discardedAddress(f: Flow, stmt: Ast.Node.Index) bool {
         if (f.tree.nodeTag(stmt) != .assign) return false;
@@ -1662,13 +1679,18 @@ fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {
 }
 /// `owner.<release>(...)`: the call that ends the obligation of an owner of kind `k`.
 fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract.Kind) Context.Error!bool {
+    return releaseName(k, (try ownerCall(c, node, token)) orelse return false);
+}
+/// The member `node` calls on the local `token` declares, if it is such a call.
+fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!?[]const u8 {
     const tree = try c.project.syntax(try c.source());
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const index = Contract.local(c, data[0]) orelse return false;
-    return c.project.models[c.file.raw()].declarations[index].token == token and releaseName(k, try Model.identifier(c.allocator, tree.tokenSlice(data[1])));
+    const index = Contract.local(c, data[0]) orelse return null;
+    if (c.project.models[c.file.raw()].declarations[index].token != token) return null;
+    return try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
 }
 fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
