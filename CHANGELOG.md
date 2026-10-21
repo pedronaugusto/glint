@@ -6,10 +6,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
+- A003 witnesses: a member of a local owner used where every path has released or transferred it, and an `errdefer` that releases the owner again on an error exit after its cleanup or transfer.
 - `Report.stale`: each suppression that suppressed nothing, by the rule it names and its comment's site (`stale_suppressions` stays their number). The text report prints each (`suppression: FILE:LINE:COL: RULE suppresses nothing`, where it printed a count); JSON and SARIF carry the list beside the count. Only suppressions of rules the run checks count: a run that leaves a rule out shows nothing about its suppressions.
 
 ### Changed
 
+- A003 reads the owner stored by value where the function does not hold it (`slot.* = fresh`, `h.proxy_secret = kept`, into a container's variable) as a transfer by assignment, as aegis has it: the place's holder releases it. A field of a local value stays undecided. An unlabeled block of its own is walked statement by statement, and branches that leave the owner in different states go on apart while a local flag set to a literal in those branches tells them apart (`if (same) { slot.* = made; swapped = true; } ... if (swapped) return; made.release();`): cloak's ticket-key rotation, relic's credential slots and proxy secret.
+- A002 decides a generic's copies of its `anytype` parameter where the argument is bound, as it does a type parameter's.
+- A003 decides what a generic acquires through its type parameter (`T.init(...)` of a `comptime T: type`) at each binding: a type with nothing to release owes nothing; an owner with a release is undecided at the binding, whose cleanup is not walked per binding.
 - A003 reads a `MustUse`'s `deinit` after its `take` or `acknowledge` as the check that it was discharged, as aegis has it, no longer a use after release that leaves the site undecided.
 - An `inline` prong's capture is each field's payload in turn (`inline else => |m| m.state`), an `else` prong's the fields no other prong names; a capture of differing payloads was undecided (cloak's machine and record protection).
 - A `switch` prong on a comptime enum parameter settles it for what the prong reads, as `if` on a comptime `bool` does: a value an earlier `switch` on the same parameter chose is that prong's alone (strand's three readers in `keep_test.zig`); a function that switches on one branches per build for A003.

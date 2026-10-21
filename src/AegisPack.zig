@@ -926,7 +926,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = model.scopes[decl.scope].node };
         switch (try flow.walk(statements[at..], .live)) {
             .paths => |paths| if (paths.falls == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
-            .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
+            .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
 }
@@ -983,8 +983,10 @@ fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context
 
 /// The paths of a block after a local acquisition, statement by statement. The owner is live
 /// until a direct `deinit` releases it, a `defer` schedules one, a guard's `handOff` gives its
-/// release to the code the hand-off is passed to (a declared transfer), or a `return` gives the
-/// owner itself to the caller. An `if` is followed into its branches and a loop into its body:
+/// release to the code the hand-off is passed to (a declared transfer), a `return` gives the
+/// owner itself to the caller, or an assignment stores it where the function does not hold it
+/// (`stored`). An `if` is followed into its branches, a block into its statements and a loop
+/// into its body, and branches that end apart go on apart while a flag tells them so (`Split`):
 /// the body must leave the owner at its back edge as it found it, and the loop goes on in the
 /// state its exits (its `break`s, and its condition when it can fail) agree on; a loop that
 /// never exits ends the path. A release a branch or a body defers runs as it ends. Undecided:
@@ -993,7 +995,8 @@ fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context
 /// is in, any use of the owner but its members or a loan (its address, a copy, an argument: a
 /// transfer or an alias), a release nested where the walk does not follow. Findings: a second
 /// direct cleanup, a member of the owner used after its release or transfer (a result
-/// obligation's `deinit`, its check, aside), the owner's address discarded after release.
+/// obligation's `deinit`, its check, aside), the owner's address discarded after release, an
+/// `errdefer` that releases it again on an error exit after that.
 const Flow = struct {
     c: *Context,
     tree: *const Ast,
@@ -1011,6 +1014,9 @@ const Flow = struct {
     /// obligation is the aggregate's, discharged only by giving the aggregate to the caller,
     /// as glint does not read the aggregate's own release.
     aggregate: bool = false,
+    /// The value a flag that tells the owner's paths apart has on the paths this walk follows
+    /// (`Split`): an `if` on it takes only the branch that value chooses.
+    known: ?Known = null,
 
     const State = enum { live, released, deferred };
     const States = std.EnumSet(State);
@@ -1022,14 +1028,38 @@ const Flow = struct {
         breaks: States = .empty,
         continues: States = .empty,
     };
-    const Outcome = union(enum) { paths: Paths, uncertain };
+    /// Paths past an `if` whose branches leave the owner in different states, told apart by a
+    /// local flag the branches set to different values (`correlated`): the walk goes on from
+    /// each state with the flag's value it comes with, and the paths meet again where they agree.
+    const Split = struct {
+        /// The ways out of the `if` itself; its end is in `when`.
+        paths: Paths,
+        /// The flag's declaration.
+        flag: u32,
+        /// The state past the `if` while the flag is false, and while it is true.
+        when: [2]State,
+    };
+    const Known = struct { flag: u32, value: bool };
+    const Outcome = union(enum) {
+        paths: Paths,
+        split: Split,
+        uncertain,
+
+        /// The paths, where they do not stay split.
+        fn settled(outcome: Outcome) ?Paths {
+            return switch (outcome) {
+                .paths => |paths| paths,
+                .split, .uncertain => null,
+            };
+        }
+    };
     const ends: Outcome = .{ .paths = .{} };
 
     fn walk(flow: Flow, statements: []const Ast.Node.Index, start: State) Context.Error!Outcome {
         var f = flow;
         var state = start;
         var out: Paths = .{};
-        for (statements) |stmt| {
+        for (statements, 0..) |stmt, at| {
             if (state == .live and !f.aggregate) if (try f.movedInto(stmt)) |aggregate| {
                 f.token = aggregate;
                 f.aggregate = true;
@@ -1042,6 +1072,11 @@ const Flow = struct {
             }
             if (try f.handedOff(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
+                state = .released;
+                continue;
+            }
+            if (!f.aggregate and try f.stored(stmt)) {
+                if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local owner is stored after its cleanup or transfer on this straight-line path");
                 state = .released;
                 continue;
             }
@@ -1065,6 +1100,7 @@ const Flow = struct {
             }
             const next = switch (try f.step(stmt, state)) {
                 .paths => |paths| paths,
+                .split => |split| return f.apart(split, statements[at + 1 ..], out),
                 .uncertain => return .uncertain,
             };
             out.breaks.setUnion(next.breaks);
@@ -1072,6 +1108,26 @@ const Flow = struct {
             state = next.falls orelse return .{ .paths = out };
         }
         out.falls = state;
+        return .{ .paths = out };
+    }
+
+    /// The statements after a split, walked from each of its states with the flag's value it
+    /// comes with; still split where they end apart. One flag at a time.
+    fn apart(f: Flow, split: Split, rest: []const Ast.Node.Index, before: Paths) Context.Error!Outcome {
+        if (f.known != null) return .uncertain;
+        var out = before;
+        out.breaks.setUnion(split.paths.breaks);
+        out.continues.setUnion(split.paths.continues);
+        var falls: [2]?State = undefined;
+        for (0..2) |value| {
+            var each = f;
+            each.known = .{ .flag = split.flag, .value = value == 1 };
+            const paths = (try each.walk(rest, split.when[value])).settled() orelse return .uncertain;
+            out.breaks.setUnion(paths.breaks);
+            out.continues.setUnion(paths.continues);
+            falls[value] = paths.falls;
+        }
+        out.falls = meet(falls[0], falls[1]) catch return .{ .split = .{ .paths = out, .flag = split.flag, .when = .{ falls[0].?, falls[1].? } } };
         return .{ .paths = out };
     }
 
@@ -1090,41 +1146,141 @@ const Flow = struct {
         // `x = a catch |e| handler` and `const x = a orelse handler`: the handler is a branch
         // taken when `a` fails, the statement goes on in the state `a` leaves otherwise.
         if (f.handled(stmt)) |parts| {
-            var out = switch (try f.leave(parts[0], state)) {
-                .paths => |paths| paths,
-                .uncertain => return .uncertain,
-            };
-            const handler = switch (try f.block(parts[1], state)) {
-                .paths => |paths| paths,
-                .uncertain => return .uncertain,
-            };
+            var out = (try f.leave(parts[0], state)).settled() orelse return .uncertain;
+            const handler = (try f.block(parts[1], state)).settled() orelse return .uncertain;
             out.falls = meet(out.falls, handler.falls) catch return .uncertain;
             out.breaks.setUnion(handler.breaks);
             out.continues.setUnion(handler.continues);
             return .{ .paths = out };
         }
         if (f.tree.fullIf(stmt)) |branch| {
-            var out = switch (try f.leave(branch.ast.cond_expr, state)) {
-                .paths => |paths| paths,
-                .uncertain => return .uncertain,
+            // On the flag the walk knows: the branch its value takes.
+            if (branch.payload_token == null and branch.error_token == null) if (f.decided(branch.ast.cond_expr)) |taken| {
+                const node = if (taken) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return .{ .paths = .{ .falls = state } };
+                return f.block(node, state);
             };
-            const then_paths = switch (try f.block(branch.ast.then_expr, state)) {
-                .paths => |paths| paths,
-                .uncertain => return .uncertain,
-            };
-            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| switch (try f.block(other, state)) {
-                .paths => |paths| paths,
-                .uncertain => return .uncertain,
-            } else .{ .falls = state };
-            out.falls = meet(then_paths.falls, else_paths.falls) catch return .uncertain;
+            var out = (try f.leave(branch.ast.cond_expr, state)).settled() orelse return .uncertain;
+            const then_paths = (try f.block(branch.ast.then_expr, state)).settled() orelse return .uncertain;
+            const else_paths: Paths = if (branch.ast.else_expr.unwrap()) |other| (try f.block(other, state)).settled() orelse return .uncertain else .{ .falls = state };
             for ([_]Paths{ then_paths, else_paths }) |paths| {
                 out.breaks.setUnion(paths.breaks);
                 out.continues.setUnion(paths.continues);
             }
+            out.falls = meet(then_paths.falls, else_paths.falls) catch {
+                const flag = (try f.correlated(stmt, branch)) orelse return .uncertain;
+                // Both fall, as only states that are there differ.
+                const when: [2]State = if (flag.then) .{ else_paths.falls.?, then_paths.falls.? } else .{ then_paths.falls.?, else_paths.falls.? };
+                return .{ .split = .{ .paths = out, .flag = flag.declaration, .when = when } };
+            };
             return .{ .paths = out };
         }
         if (f.tree.fullWhile(stmt) != null or f.tree.fullFor(stmt) != null) return f.repeat(stmt, state);
+        // A block of its own, unlabeled: its statements in turn.
+        switch (f.tree.nodeTag(stmt)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => if (f.tree.tokenTag(f.tree.nodeMainToken(stmt) -| 1) != .colon) return f.block(stmt, state),
+            else => {},
+        }
         return f.leave(stmt, state);
+    }
+
+    /// The value of a condition that is the flag the walk knows, or its negation.
+    fn decided(f: Flow, cond: Ast.Node.Index) ?bool {
+        const known = f.known orelse return null;
+        var node = cond;
+        var negated = false;
+        while (true) switch (f.tree.nodeTag(node)) {
+            .grouped_expression => node = f.tree.nodeData(node).node_and_token[0],
+            .bool_not => {
+                node = f.tree.nodeData(node).node;
+                negated = !negated;
+            },
+            else => break,
+        };
+        if (f.tree.nodeTag(node) != .identifier) return null;
+        const ref = f.model.reference(node) orelse return null;
+        if (ref.declaration != known.flag) return null;
+        return known.value != negated;
+    }
+
+    /// A local flag whose value tells the branches of `stmt` apart, and its value past the
+    /// `then` branch: a `var` of the function's own, declared as `true` or `false` in the
+    /// same pass of any loop as `stmt`, set to a literal only by statements of the branches
+    /// themselves and to different values past each (a branch that does not set it leaves it as
+    /// declared), its address never taken.
+    fn correlated(f: Flow, stmt: Ast.Node.Index, branch: Ast.full.If) Context.Error!?struct { declaration: u32, then: bool } {
+        const branches = [2]?Ast.Node.Index{ branch.ast.then_expr, branch.ast.else_expr.unwrap() };
+        for (branches) |side| {
+            const node = side orelse continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
+            for (statements) |candidate| {
+                const set = f.setsFlag(candidate) orelse continue;
+                const declared = f.flagDeclared(set.declaration) orelse continue;
+                if (!try f.flagWritesIn(set.declaration, branches)) continue;
+                if (loopOf(f.model, f.tree, f.model.declarations[set.declaration].node) != loopOf(f.model, f.tree, stmt)) continue;
+                const then_value = f.flagPast(branch.ast.then_expr, set.declaration) orelse declared;
+                const else_value = if (branches[1]) |other| f.flagPast(other, set.declaration) orelse declared else declared;
+                if (then_value != else_value) return .{ .declaration = set.declaration, .then = then_value };
+            }
+        }
+        return null;
+    }
+
+    /// `flag = true` or `flag = false` of a local: the flag's declaration and the value.
+    fn setsFlag(f: Flow, stmt: Ast.Node.Index) ?struct { declaration: u32, value: bool } {
+        if (f.tree.nodeTag(stmt) != .assign) return null;
+        const data = f.tree.nodeData(stmt).node_and_node;
+        if (f.tree.nodeTag(data[0]) != .identifier) return null;
+        const value = literalBool(f.tree, data[1]) orelse return null;
+        const ref = f.model.reference(data[0]) orelse return null;
+        const declaration = ref.declaration orelse return null;
+        const record = f.model.declarations[declaration];
+        if (record.kind != .variable or f.model.scopes[record.scope].kind != .block) return null;
+        return .{ .declaration = declaration, .value = value };
+    }
+
+    /// The literal a `var` is declared with, if it is one.
+    fn flagDeclared(f: Flow, declaration: u32) ?bool {
+        const variable = f.tree.fullVarDecl(f.model.declarations[declaration].node) orelse return null;
+        if (f.tree.tokenTag(variable.ast.mut_token) != .keyword_var) return null;
+        return literalBool(f.tree, variable.ast.init_node.unwrap() orelse return null);
+    }
+
+    /// The value a branch leaves the flag at when it falls through: its last top-level setting.
+    fn flagPast(f: Flow, node: Ast.Node.Index, declaration: u32) ?bool {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
+        var value: ?bool = null;
+        for (statements) |stmt| if (f.setsFlag(stmt)) |set| {
+            if (set.declaration == declaration) value = set.value;
+        };
+        return value;
+    }
+
+    /// Whether every write of the flag is a top-level literal setting in one of `branches`, and
+    /// nothing takes its address.
+    fn flagWritesIn(f: Flow, declaration: u32, branches: [2]?Ast.Node.Index) Context.Error!bool {
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const ref = f.model.reference(node) orelse continue;
+            if (ref.declaration != declaration) continue;
+            const parent = f.model.node_parents[i] orelse return false;
+            switch (f.tree.nodeTag(parent)) {
+                .address_of => return false,
+                .assign => if (f.tree.nodeData(parent).node_and_node[0] == node) {
+                    const place = f.model.node_parents[@backingInt(parent)] orelse return false; // safe: an AST node index reads its own parent table
+                    for (branches) |side| {
+                        const branch = side orelse continue;
+                        if (place == branch or parent == branch) break;
+                    } else return false;
+                    if (f.setsFlag(parent) == null) return false;
+                },
+                .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat, .assign_shl_sat => if (f.tree.nodeData(parent).node_and_node[0] == node) return false,
+                else => {},
+            }
+        }
+        return true;
     }
 
     /// A branch or a loop's body walked from `state`; a release it defers runs on every way
@@ -1133,8 +1289,17 @@ const Flow = struct {
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
         var outcome = try f.walk(statements, state);
-        if (state == .deferred or outcome == .uncertain) return outcome;
-        const paths = &outcome.paths;
+        if (state == .deferred) return outcome;
+        const paths = switch (outcome) {
+            .paths => |*paths| paths,
+            .split => |*split| split: {
+                for (&split.when) |*each| if (each.* == .deferred) {
+                    each.* = .released;
+                };
+                break :split &split.paths;
+            },
+            .uncertain => return outcome,
+        };
         if (paths.falls == .deferred) paths.falls = .released;
         for ([_]*States{ &paths.breaks, &paths.continues }) |set| if (set.contains(.deferred)) {
             set.remove(.deferred);
@@ -1172,35 +1337,26 @@ const Flow = struct {
             otherwise = loop.ast.else_expr.unwrap();
         }
         var out: Paths = .{};
-        for (heads[0..head_count]) |head| switch (try f.leave(head, state)) {
-            .paths => |paths| {
-                out.breaks.setUnion(paths.breaks);
-                out.continues.setUnion(paths.continues);
-            },
-            .uncertain => return .uncertain,
-        };
-        for (inputs) |input| switch (try f.leave(input, state)) {
-            .paths => |paths| {
-                out.breaks.setUnion(paths.breaks);
-                out.continues.setUnion(paths.continues);
-            },
-            .uncertain => return .uncertain,
-        };
-        const looped = switch (try inner.block(body, state)) {
-            .paths => |paths| paths,
-            .uncertain => return .uncertain,
-        };
+        for (heads[0..head_count]) |head| {
+            const paths = (try f.leave(head, state)).settled() orelse return .uncertain;
+            out.breaks.setUnion(paths.breaks);
+            out.continues.setUnion(paths.continues);
+        }
+        for (inputs) |input| {
+            const paths = (try f.leave(input, state)).settled() orelse return .uncertain;
+            out.breaks.setUnion(paths.breaks);
+            out.continues.setUnion(paths.continues);
+        }
+        const looped = (try inner.block(body, state)).settled() orelse return .uncertain;
         if (looped.falls) |back| if (back != state) return .uncertain;
         if (!looped.continues.subsetOf(.initOne(state))) return .uncertain;
         var ways = looped.breaks;
         if (bounded) {
-            if (otherwise) |node| switch (try f.block(node, state)) {
-                .paths => |paths| {
-                    if (paths.falls) |next| ways.insert(next);
-                    out.breaks.setUnion(paths.breaks);
-                    out.continues.setUnion(paths.continues);
-                },
-                .uncertain => return .uncertain,
+            if (otherwise) |node| {
+                const paths = (try f.block(node, state)).settled() orelse return .uncertain;
+                if (paths.falls) |next| ways.insert(next);
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
             } else ways.insert(state);
         }
         var it = ways.iterator();
@@ -1242,7 +1398,9 @@ const Flow = struct {
                 .inside => {},
                 .loop_break => out.breaks.insert(state),
                 .loop_continue => out.continues.insert(state),
-                .out => if (state == .live and !(f.errdeferred and try failing(f.c, f.tree, jumping))) return .uncertain,
+                .out => if (f.errdeferred and try failing(f.c, f.tree, jumping)) {
+                    if (state == .released) try f.c.at(cleanup, main, "an errdefer releases the same local owner again on this error exit, after its cleanup or transfer");
+                } else if (state == .live) return .uncertain,
                 .other => return .uncertain,
             }
         }
@@ -1442,6 +1600,46 @@ const Flow = struct {
         const data = f.tree.nodeData(call.ast.fn_expr).node_and_token;
         const index = Contract.local(f.c, data[0]) orelse return false;
         return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
+    }
+
+    /// `place = owner` into storage the function does not hold, the owner itself by value: a
+    /// transfer by assignment, the obligation then the place's holder's. Storage the function
+    /// does not hold is reached through a pointer (`p.*`, a field or element of a pointer, a
+    /// slice's element) or is a parameter's (a field of one is assignable only through a pointer)
+    /// or a container's variable. A field of a local value is the local's, not followed.
+    fn stored(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        if (f.tree.nodeTag(stmt) != .assign) return false;
+        const data = f.tree.nodeData(stmt).node_and_node;
+        if (!f.mine(data[1])) return false;
+        var place = data[0];
+        while (true) switch (f.tree.nodeTag(place)) {
+            .deref => return true,
+            .field_access, .array_access, .unwrap_optional => {
+                const base = switch (f.tree.nodeTag(place)) {
+                    .field_access => f.tree.nodeData(place).node_and_token[0],
+                    .array_access => f.tree.nodeData(place).node_and_node[0],
+                    else => f.tree.nodeData(place).node_and_token[0],
+                };
+                switch (try f.c.facts.resolve(f.c.file, base)) {
+                    .pointer => return true,
+                    .unknown => return false,
+                    else => place = base,
+                }
+            },
+            .identifier => {
+                const ref = f.model.reference(place) orelse return false;
+                const declaration = f.model.declarations[ref.declaration orelse return false];
+                return switch (declaration.kind) {
+                    .parameter => true,
+                    .variable => switch (f.model.scopes[declaration.scope].kind) {
+                        .file, .container => true,
+                        else => false,
+                    },
+                    else => false,
+                };
+            },
+            else => return false,
+        };
     }
 
     /// Whether a `defer` or `errdefer` body releases the owner: the release itself, or a block
@@ -1750,6 +1948,31 @@ fn failing(c: *Context, tree: *const Ast, jumping: Ast.Node.Index) Context.Error
     const value = tree.nodeData(jumping).opt_node.unwrap() orelse return false;
     if (tree.nodeTag(value) == .error_value) return true;
     return try c.facts.resolve(c.file, value) == .error_set;
+}
+
+/// `true` or `false`.
+fn literalBool(tree: *const Ast, node: Ast.Node.Index) ?bool {
+    if (tree.nodeTag(node) != .identifier) return null;
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    if (std.mem.eql(u8, name, "true")) return true;
+    if (std.mem.eql(u8, name, "false")) return false;
+    return null;
+}
+
+/// The innermost `while` or `for` around `node` within its function, whose passes it runs in.
+fn loopOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var child = node;
+    var at = model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
+    while (at) |parent| : ({
+        child = parent;
+        at = model.node_parents[@backingInt(parent)]; // safe: an AST node index reads its own parent table
+    }) {
+        if (tree.nodeTag(parent) == .fn_decl) return null;
+        if (tree.fullWhile(parent)) |loop| {
+            if (child == loop.ast.then_expr or child == loop.ast.cont_expr.unwrap() or child == loop.ast.cond_expr) return parent;
+        } else if (tree.fullFor(parent)) |loop| if (child == loop.ast.then_expr) return parent;
+    }
+    return null;
 }
 
 fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {

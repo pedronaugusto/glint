@@ -674,6 +674,33 @@ test "a guard's release handed off is a declared transfer" {
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); _ = held.handOff(); }", pack.cleanup, true, 1);
 }
 
+test "an owner stored where the function does not hold it is transferred" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst H = struct { s: ?S(u32) };\nfn ready() bool { return true; }\nfn g() !void {}\n";
+    // Through a pointer, into a pointer's field, into a container's variable.
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var s = S(u32).init(1); _ = s.expose(); slot.* = s; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(h: *H) void { const s = S(u32).init(1); if (h.s) |*old| old.deinit(); h.s = s; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "var kept: ?S(u32) = null;\npub fn f() void { const s = S(u32).init(1); kept = s; }", pack.cleanup, true, 0);
+    // A field of a local value is the local's: not followed.
+    try expectJudged(head ++ "pub fn f() void { var h: H = .{ .s = null }; const s = S(u32).init(1); h.s = s; _ = &h; }", pack.cleanup, false, 0);
+    // Used after the store, or released again by an errdefer on an error exit after it.
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var s = S(u32).init(1); slot.* = s; _ = s.expose(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) !void { var s = S(u32).init(1); errdefer s.deinit(); slot.* = s; try g(); }", pack.cleanup, true, 1);
+    // A block of its own is walked statement by statement.
+    try expectJudged(head ++ "pub fn f() void { var s = S(u32).init(1); { _ = s.expose(); s.deinit(); } }", pack.cleanup, true, 0);
+}
+
+test "a flag set with the transfer tells the owner's paths apart" {
+    const head = "const S = @import(\"aegis\").Secret;\nfn ready() bool { return true; }\n";
+    // Stored on one path, flagged; the flag later chooses the release.
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { while (true) { var s = S(u32).init(1); var stored = false; { if (ready()) { slot.* = s; stored = true; } } if (stored) return; s.deinit(); } }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var s = S(u32).init(1); var stored = true; if (ready()) slot.* = s else stored = false; if (!stored) s.deinit(); }", pack.cleanup, true, 0);
+    // Released again on the flagged path: a witness.
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var s = S(u32).init(1); var stored = false; if (ready()) { slot.* = s; stored = true; } if (stored) { s.deinit(); return; } s.deinit(); }", pack.cleanup, true, 1);
+    // A flag written elsewhere, or declared outside the loop the branch runs in, tells nothing.
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var s = S(u32).init(1); var stored = false; if (ready()) { slot.* = s; stored = true; } stored = ready(); if (!stored) s.deinit(); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(slot: *S(u32)) void { var stored = false; while (ready()) { var s = S(u32).init(1); if (ready()) { slot.* = s; stored = true; } if (!stored) s.deinit(); } }", pack.cleanup, false, 0);
+}
+
 test "receivers through elements, slices, joined arrays and generic results written around T are decided" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst S = @import(\"aegis\").Secret;\nconst Plain = struct { data: u32, lock: u32 };\nconst Event = union(enum) { data: struct { bytes: []const u8 }, other: void };\n";
     // An element of an array, of an optional's array, of a pointer to an array or of a slice.
