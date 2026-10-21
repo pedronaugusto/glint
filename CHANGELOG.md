@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `Report.stale`: each suppression that suppressed nothing, by the rule it names and its comment's site (`stale_suppressions` stays their number). The text report prints each (`suppression: FILE:LINE:COL: RULE suppresses nothing`, where it printed a count); JSON and SARIF carry the list beside the count.
+
 ## [0.4.3] - 2026-10-21
 
 ### Added

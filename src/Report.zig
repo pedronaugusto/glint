@@ -10,7 +10,10 @@ snapshot: u64,
 diagnostics: []const Diagnostic,
 coverage: []const Coverage,
 suppressed: usize,
+/// How many suppressions matched no finding.
 stale_suppressions: usize,
+/// Each suppression that matched no finding, at its comment.
+stale: []const Stale = &.{},
 complete: bool,
 /// Assertion metrics, when the configuration asks for them (`Config.metrics`).
 metrics: ?Metrics = null,
@@ -93,6 +96,8 @@ pub const Coverage = struct {
     detail: []const u8 = "",
     pub const Reason = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted, unresolved, unsupported };
 };
+/// A suppression that suppressed nothing: the rule it names and its comment's site.
+pub const Stale = struct { name: []const u8, span: Span };
 pub const Format = enum { text, json, sarif };
 pub const WriteError = std.Io.Writer.Error || error{InvalidProject};
 
@@ -113,11 +118,16 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             for (self.coverage) |coverage| if (coverage.reason != .parsed) {
                 try writer.print("coverage: {s}: {s}: {s}\n", .{ project.inputs[coverage.file.raw()].name, @tagName(coverage.reason), coverage.detail }); // safe: enum identities index their owning frozen tables without narrowing.
             };
-            if (self.stale_suppressions != 0) try writer.print("suppression: {d} stale site records\n", .{self.stale_suppressions});
+            for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.inputs[stale.span.file.raw()].name, stale.span.line, stale.span.column, stale.name }); // safe: enum identities index their owning frozen tables without narrowing.
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
-            try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"diagnostics\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
+            try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"stale\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale.len });
+            for (self.stale, 0..) |stale, i| {
+                if (i != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(.{ .source = project.inputs[stale.span.file.raw()].name, .rule = stale.name, .line = stale.span.line, .column = stale.span.column }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+            }
+            try writer.writeAll("],\"diagnostics\":[");
             for (self.diagnostics, 0..) |d, i| {
                 if (i != 0) try writer.writeByte(',');
                 try jsonDiagnostic(writer, project, d); // safe: enum identities index their owning frozen tables without narrowing.
@@ -150,7 +160,12 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 if (i != 0) try writer.writeByte(',');
                 try sarifDiagnostic(writer, project, d);
             }
-            try writer.print("],\"properties\":{{\"analysisComplete\":{s},\"suppressed\":{d},\"staleSuppressions\":{d},\"coverage\":", .{ if (self.complete) "true" else "false", self.suppressed, self.stale_suppressions });
+            try writer.print("],\"properties\":{{\"analysisComplete\":{s},\"suppressed\":{d},\"staleSuppressions\":{d},\"stale\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale.len });
+            for (self.stale, 0..) |stale, i| {
+                if (i != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(.{ .file = stale.span.file.raw(), .rule = stale.name, .start = stale.span.start, .line = stale.span.line, .column = stale.span.column }, .{}, writer);
+            }
+            try writer.writeAll("],\"coverage\":");
             try writer.writeByte('[');
             for (self.coverage, 0..) |c, i| {
                 if (i != 0) try writer.writeByte(',');

@@ -18,7 +18,7 @@ diagnostics: std.ArrayList(Report.Diagnostic) = .empty,
 coverage: std.ArrayList(Report.Coverage) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
-stale: usize = 0,
+stale: std.ArrayList(Report.Stale) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
 file: Project.FileId = Project.FileId.fromRaw(0), // safe: validated file identities and budgeted std source indexes fit u32.
@@ -95,16 +95,17 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             runner.complete = false;
         };
         for (runner.suppressions) |suppression| if (!suppression.used) {
-            runner.stale += 1;
+            const start = suppression.comment.start;
+            try runner.stale.append(a, .{ .name = (rules.definition(suppression.rule, definitions) orelse return error.InvalidSelection).name, .span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 } });
         };
     }
     if (runner.facts.remaining == 0) {
         runner.complete = false;
         try runner.coverage.append(a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
     }
-    if (config.strict_suppressions and runner.stale != 0) runner.complete = false;
+    if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {

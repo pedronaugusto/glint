@@ -94,6 +94,8 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     defer report.deinit();
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(@as(usize, 1), report.stale_suppressions); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqualStrings("Z013", report.stale[0].name);
+    try std.testing.expectEqual(@as(u32, 1), report.stale[0].span.line); // safe: explicit compile-time type selection; the value is representable in that type.
     config.strict_suppressions = false;
     config.fact_budget = 0;
     var exhausted = try glint.run(std.testing.allocator, &project, config);
