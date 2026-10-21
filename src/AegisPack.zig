@@ -6,6 +6,7 @@ const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Rule = @import("Rule.zig").Rule;
+const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
 pub const access: Rule = @fromBackingInt(@intCast(1100)); // safe: compiled pack identities are reserved stable u16 values.
 pub const copies: Rule = @fromBackingInt(@intCast(1101)); // safe: compiled pack identities are reserved stable u16 values.
@@ -1092,8 +1093,14 @@ const Flow = struct {
     /// as glint does not read the aggregate's own release.
     aggregate: bool = false,
     /// The value a flag that tells the owner's paths apart has on the paths this walk follows
-    /// (`Split`): an `if` on it takes only the branch that value chooses.
+    /// (`Split`): an `if` on it takes only the branch that value chooses. In a function walked
+    /// for a call (`consumed`), a `comptime` parameter the call binds to a literal.
     known: ?Known = null,
+    /// How many calls deep the walk reads a function a call gives the owner to (`consumed`).
+    depth: u8 = 0,
+    /// Whether `token` names a pointer to the owner (a parameter `consumed` walks): storing,
+    /// passing or returning it aliases the owner, never moves it.
+    pointer: bool = false,
 
     /// `passed`: given by value as a call's argument (`try map.put(gpa, key, owner)`), moved
     /// into the call where nothing names the owner after it; where something does, the callee
@@ -1147,7 +1154,7 @@ const Flow = struct {
                 }
                 if (try f.uses(stmt) != .none) return .uncertain;
             }
-            if (state == .live and !f.aggregate) if (try f.movedInto(stmt)) |aggregate| {
+            if (state == .live and !f.aggregate and !f.pointer) if (try f.movedInto(stmt)) |aggregate| {
                 f.token = aggregate;
                 f.aggregate = true;
                 continue;
@@ -1162,7 +1169,7 @@ const Flow = struct {
                 state = .released;
                 continue;
             }
-            if (state == .live and !f.aggregate and try f.argument(stmt)) {
+            if (state == .live and !f.aggregate and !f.pointer and try f.argument(stmt)) {
                 // Its error exits leave the owner with the caller: the call failed to take it.
                 const paths = (try f.jumps(stmt, state)).settled() orelse return .uncertain;
                 out.breaks.setUnion(paths.breaks);
@@ -1171,7 +1178,16 @@ const Flow = struct {
                 state = .passed;
                 continue;
             }
-            if (!f.aggregate and try f.stored(stmt)) {
+            if (state == .live and !f.aggregate and try f.consumed(stmt)) {
+                // Its error exits come after the function released the owner.
+                const paths = (try f.jumps(stmt, .released)).settled() orelse return .uncertain;
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+                if (paths.falls == null) return .{ .paths = out };
+                state = .released;
+                continue;
+            }
+            if (!f.aggregate and !f.pointer and try f.stored(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local owner is stored after its cleanup or transfer on this straight-line path");
                 state = .released;
                 continue;
@@ -1230,7 +1246,7 @@ const Flow = struct {
     /// A statement that neither releases nor acquires the owner again, from `state`.
     fn step(f: Flow, stmt: Ast.Node.Index, state: State) Context.Error!Outcome {
         switch (f.tree.nodeTag(stmt)) {
-            .@"return" => if (state == .live) if (f.tree.nodeData(stmt).opt_node.unwrap()) |value| {
+            .@"return" => if (state == .live and !f.pointer) if (f.tree.nodeData(stmt).opt_node.unwrap()) |value| {
                 // The owner itself, returned held, or carried by value in what is returned (a
                 // field of a returned literal, an argument of the call that makes it): its
                 // release is the caller's.
@@ -1751,6 +1767,78 @@ const Flow = struct {
         return named == 1;
     }
 
+    /// A statement that calls a function of the program's own, or tries the call, with the
+    /// owner's address among its arguments (`c.owned(true, &owner, fail)`, or the pointer a
+    /// walk of such a function has, passed on) and the owner named
+    /// nowhere else in it, where the function releases what that parameter points at on every
+    /// path: its body walked as this walk is, the parameter the owner, a `comptime` `bool`
+    /// parameter the call passes a literal as known, in a reading of the function's file that
+    /// reports nothing there. A finding or an undecided site in that reading, or a path that
+    /// leaves it held, and the call is no release.
+    fn consumed(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        if (f.depth == 8) return false;
+        const value = if (f.tree.nodeTag(stmt) == .@"try") f.tree.nodeData(stmt).node else stmt;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = f.tree.fullCall(&buffer, value) orelse return false;
+        // The owner's address: `&owner`, or the pointer itself where the walk has one.
+        const position = for (call.ast.params, 0..) |param, i| {
+            if (if (f.pointer) f.mine(param) else f.tree.nodeTag(param) == .address_of and f.mine(f.tree.nodeData(param).node)) break i;
+        } else return false;
+        const first = f.tree.firstToken(stmt);
+        const last = f.tree.lastToken(stmt);
+        var named: usize = 0;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = f.tree.nodeMainToken(candidate);
+            if (main >= first and main <= last and f.mine(candidate)) named += 1;
+        }
+        if (named != 1) return false;
+        const decl = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return false;
+        const function = (try f.c.facts.origin(decl)) orelse return false;
+        if (!f.c.project.inputs[function.file.raw()].selected or try f.c.inLibrary(Contract.library, function.file)) return false;
+        const model = &f.c.project.models[function.file.raw()];
+        const record = model.declarations[function.index];
+        if (record.kind != .function) return false;
+        const written = &f.c.project.files[function.file.raw()].tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
+        const whole_fn = if (written.nodeTag(record.node) == .fn_decl) record.node else model.node_parents[@backingInt(record.node)] orelse return false; // safe: an AST node index reads its own parent table
+        if (written.nodeTag(whole_fn) != .fn_decl) return false;
+        var count: usize = 0;
+        var counting = proto.iterate(written);
+        while (counting.next()) |_| count += 1;
+        // A method called on a value takes the value as its first parameter.
+        const skip: usize = if (count == call.ast.params.len + 1) 1 else if (count == call.ast.params.len) 0 else return false;
+        var token: ?Ast.TokenIndex = null;
+        var known: ?Known = null;
+        var it = proto.iterate(written);
+        var at: usize = 0;
+        while (it.next()) |param| : (at += 1) {
+            if (at == position + skip) token = param.name_token;
+            if (known != null or at < skip or param.comptime_noalias == null or written.tokenTag(param.comptime_noalias.?) != .keyword_comptime) continue;
+            const truth = literalBool(f.tree, call.ast.params[at - skip]) orelse continue;
+            const name = param.name_token orelse continue;
+            for (model.declarations, 0..) |d, i| if (d.kind == .parameter and d.token == name) {
+                known = .{ .flag = @intCast(i), .value = truth }; // safe: declaration indexes come from the bounded frozen model.
+            };
+        }
+        var heard: Heard = .{};
+        var probe = f.c.*;
+        probe.file = function.file;
+        probe.sink = heard.sink();
+        const body = written.nodeData(whole_fn).node_and_node[1];
+        const walker: Flow = .{ .c = &probe, .tree = written, .model = model, .token = token orelse return false, .kind = f.kind, .scope = body, .known = known, .depth = f.depth + 1, .pointer = true };
+        var block_buffer: [2]Ast.Node.Index = undefined;
+        const statements = written.blockStatements(&block_buffer, body) orelse return false;
+        const outcome = try walker.walk(statements, .live);
+        if (heard.any) return false;
+        const paths = outcome.settled() orelse return false;
+        if (paths.breaks.count() != 0 or paths.continues.count() != 0) return false;
+        const end = paths.falls orelse return true;
+        return end == .released or end == .deferred;
+    }
+
     /// `place = owner` into storage the function does not hold, the owner itself by value: a
     /// transfer by assignment, the obligation then the place's holder's. Storage the function
     /// does not hold is reached through a pointer (`p.*`, a field or element of a pointer, a
@@ -1840,6 +1928,24 @@ const Flow = struct {
         if (f.tree.nodeTag(data[0]) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(data[0])), "_") or f.tree.nodeTag(data[1]) != .address_of) return false;
         const index = Contract.local(f.c, f.tree.nodeData(data[1]).node) orelse return false;
         return f.model.declarations[index].token == f.token;
+    }
+};
+
+/// What a reading of another file for a call's sake heard: findings and undecided sites there,
+/// kept from the report as that file's own.
+const Heard = struct {
+    any: bool = false,
+
+    fn sink(heard: *Heard) Context.Sink {
+        return .{ .data = heard, .diagnostic = diagnostic, .coverage = coverage };
+    }
+    fn diagnostic(data: *anyopaque, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span) Context.Error!void {
+        const heard: *Heard = @ptrCast(@alignCast(data)); // safe: `sink` gives this callback a Heard.
+        heard.any = true;
+    }
+    fn coverage(data: *anyopaque, _: Report.Coverage) Context.Error!void {
+        const heard: *Heard = @ptrCast(@alignCast(data)); // safe: `sink` gives this callback a Heard.
+        heard.any = true;
     }
 };
 

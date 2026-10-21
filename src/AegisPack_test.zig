@@ -619,10 +619,12 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     try expectJudged(head ++ "pub fn f(g: *G(u32)) u32 { var held = g.acquire(); defer held.deinit(); while (true) { if (ready()) break; } for (0..3) |i| if (i == held.value().*) return 1; return 0; }", pack.cleanup, true, 0);
     // Released again after a deferred release: a witness.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); defer held.deinit(); held.deinit(); }", pack.cleanup, true, 1);
-    // A return while held, a hand-off of its address, a release nested where the walk does not
-    // follow: undecided, never a claim.
+    // A return while held, a hand-off of its address to a function that may keep it held, a
+    // release nested where the walk does not follow: undecided, never a claim.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) return; held.deinit(); }", pack.cleanup, false, 0);
-    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { if (ready()) h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, false, 0);
+    // Handed to a function that releases it on every path, the call releases it.
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, true, 0);
     // Lent to a function that hands it back held, it is still the caller's to release.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); while (ready()) held.deinit(); }", pack.cleanup, false, 0);
@@ -1402,4 +1404,23 @@ test "a generic's copies of its anytype parameter are decided where the argument
     // seen through its owner).
     const layered = head ++ "fn Inner(comptime E: type) type { return struct { pub const Record = struct { event: E }; pub fn copy(r: Record) void { keep(r.event); } }; }\nfn Outer(comptime E: type) type { return struct { const State = Inner(E); pub const Record = State.Record; }; }\nfn state(owner: anytype) *Inner(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, \"event\")) { return @ptrCast(owner); }\nfn quiet(owner: anytype) void { _ = state(owner); }\n";
     try expectJudged(layered ++ "pub fn f() void { var o: Outer(P) = undefined; quiet(&o); }", pack.copies, true, 0);
+}
+
+test "an owner whose address a function of the program releases on every path is released by the call" {
+    const head = "const aegis = @import(\"aegis\");\nfn clean(_: *u32) void {}\nconst O = aegis.own.Owned(u32, clean);\nconst M = aegis.own.MustUse(u32, \"read the count\");\n";
+    // Released by a deferred `deinit` on every path, under the `comptime` flag the call passes;
+    // a result obligation taken and checked.
+    const owned = "fn owned(comptime wrapped: bool, owner: if (wrapped) *O else *u32, fail: bool) void { if (wrapped) { defer owner.deinit(); if (fail) return; owner.borrowMut().* +%= 1; } else { owner.* +%= 1; } }\n";
+    const must = "fn must(owner: *M, out: *u32) void { owner.take(out); owner.deinit(); }\n";
+    try expectJudged(head ++ owned ++ "pub fn f(fail: bool) void { var owner = O.init(1); owned(true, &owner, fail); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ must ++ "pub fn f() u32 { var out: u32 = 0; var owner = M.init(1); must(&owner, &out); return out; }", pack.cleanup, true, 0);
+    // Released again after the call: a second cleanup.
+    try expectJudged(head ++ owned ++ "pub fn f(fail: bool) void { var owner = O.init(1); owned(true, &owner, fail); owner.deinit(); }", pack.cleanup, true, 1);
+    // A path that keeps it held, a flag the call does not pass as a literal, or a function that
+    // passes it on stay undecided.
+    try expectJudged(head ++ "fn half(owner: *O, fail: bool) void { if (fail) return; owner.deinit(); }\npub fn f(fail: bool) void { var owner = O.init(1); half(&owner, fail); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ owned ++ "pub fn f(comptime wrapped: bool, fail: bool) void { var owner = O.init(1); owned(wrapped, &owner, fail); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "var kept: ?*O = null;\nfn keep(owner: *O) void { kept = owner; }\npub fn f() void { var owner = O.init(1); keep(&owner); }", pack.cleanup, false, 0);
+    // Passed on to a function that releases it, the pointer it was given.
+    try expectJudged(head ++ "fn release(owner: *O) void { owner.deinit(); }\nfn on(owner: *O) void { release(owner); }\npub fn f() void { var owner = O.init(1); on(&owner); }", pack.cleanup, true, 0);
 }
