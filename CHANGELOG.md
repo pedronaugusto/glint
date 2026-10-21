@@ -11,6 +11,11 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Changed
 
 - A003 reads a `MustUse`'s `deinit` after its `take` or `acknowledge` as the check that it was discharged, as aegis has it, no longer a use after release that leaves the site undecided.
+- A003 reads a `defer` or `errdefer` block that releases the owner once at its top level (`defer { guard.deinit(io); self.gpa.destroy(self); }`), the owner named before the release only through its members and not after it.
+
+### Fixed
+
+- A made container's declaration that names a type another call makes (`const State = Inner(T); pub const Record = State.Record;`) is read with the bindings of the call that made the container. It was read with the union of every caller's, so `Outer(Plain).Record`'s fields took the types of every `Outer(...)` in the project: undecided sites (chronicle's `record.event`), and a false A001 finding where another caller bound a guard.
 
 ## [0.4.3] - 2026-10-21
 
