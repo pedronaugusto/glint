@@ -1383,4 +1383,9 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
+    // A field's type read by `@FieldType` of a made container is the making call's, also in a
+    // generic's result written in terms of its `anytype` parameter (chronicle's journal state
+    // seen through its owner).
+    const layered = head ++ "fn Inner(comptime E: type) type { return struct { pub const Record = struct { event: E }; pub fn copy(r: Record) void { keep(r.event); } }; }\nfn Outer(comptime E: type) type { return struct { const State = Inner(E); pub const Record = State.Record; }; }\nfn state(owner: anytype) *Inner(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, \"event\")) { return @ptrCast(owner); }\nfn quiet(owner: anytype) void { _ = state(owner); }\n";
+    try expectJudged(layered ++ "pub fn f() void { var o: Outer(P) = undefined; quiet(&o); }", pack.copies, true, 0);
 }

@@ -1025,7 +1025,7 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
     if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolve(file, args[1])) };
-    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, args[0], args[1]);
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolve(file, args[0]), args[1]);
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolve(file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolve(file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
@@ -1068,13 +1068,15 @@ fn reifiedEach(self: *Facts, types: Value, _: void) ResolveError!Value {
 
 /// `@FieldType(T, name)`: the type of `T`'s field `name`; for a name computed at compile
 /// time, one of its fields' types, each a choice.
-fn fieldType(self: *Facts, file: Project.FileId, container_node: Ast.Node.Index, name_node: Ast.Node.Index) ResolveError!Value {
-    const container = switch (try self.resolve(file, container_node)) {
+fn fieldType(self: *Facts, file: Project.FileId, of: Value, name_node: Ast.Node.Index) ResolveError!Value {
+    const container = switch (of) {
         .container => |c| c,
         .unknown => |why| return .{ .unknown = why },
         else => return .{ .unknown = .unsupported },
     };
-    if (container.symbolic) return .{ .unknown = .comptime_dependent };
+    // A container a type function makes has its fields' types where the call that made it is
+    // known, read with that call's bindings.
+    if (container.symbolic and container.made_by == null) return .{ .unknown = .comptime_dependent };
     const t = self.syntaxOf(file);
     if (t.nodeTag(name_node) == .string_literal) {
         const name = std.zig.string_literal.parseAlloc(self.gpa, t.tokenSlice(t.nodeMainToken(name_node))) catch |err| switch (err) {
@@ -1082,18 +1084,15 @@ fn fieldType(self: *Facts, file: Project.FileId, container_node: Ast.Node.Index,
             else => return .{ .unknown = .unsupported },
         };
         const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
-        return switch (try self.declaration(field)) {
-            .instance => |c| .{ .container = c },
-            else => |other| other,
-        };
+        return typeOf(self, try self.memberOf(container, field), {});
     }
     const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     var each: std.ArrayList(Value) = .empty;
-    for (model.declarations) |d| {
+    for (model.declarations, 0..) |d, i| {
         if (d.kind != .field or d.scope != container.scope) continue;
         const field = self.syntaxOf(container.file).fullContainerField(d.node) orelse continue;
-        const type_node = field.ast.type_expr.unwrap() orelse continue;
-        try each.append(self.gpa, try self.resolve(container.file, type_node));
+        if (field.ast.type_expr == .none) continue;
+        try each.append(self.gpa, try typeOf(self, try self.memberOf(container, .{ .file = container.file, .index = @intCast(i) }), {})); // safe: declaration indexes come from the bounded frozen model.
     }
     if (each.items.len == 0) return .{ .unknown = .unsupported };
     return self.choose(each.items);
@@ -2410,6 +2409,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 return self.instance(named);
             }
             if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
+            if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
             return self.resolve(file, node);
         },
         .call_one, .call_one_comma, .call, .call_comma => {
