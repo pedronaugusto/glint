@@ -1270,3 +1270,16 @@ test "a generic's copies of its parameter are decided where the parameter is bou
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = clone(aegis.Secret(u32), s); }", pack.copies, true, 1);
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = outer(aegis.Secret(u32), s); }", pack.copies, true, 1);
 }
+
+test "a generic's copies of its anytype parameter are decided where the argument is bound" {
+    const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
+    // At the definition the copy is the arguments' obligation, also through a generic passing it on.
+    try expectJudged(head, pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(p: P) void { keep(p); on(p); }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { on(s); }", pack.copies, true, 1);
+    // A pointer's copies are aliases.
+    try expectJudged(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 0);
+    // An argument that does not resolve leaves the call undecided.
+    try expectJudged(head ++ "pub fn f(g: fn () @import(\"missing\").T) void { keep(g()); }", pack.copies, false, 0);
+}

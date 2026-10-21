@@ -440,9 +440,9 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 }
 
 /// A local a generic function initialises by copying a value its type parameter at `position`
-/// types (`var result = value;` of `value: T`), there or in a function it passes the parameter
-/// on to (as is, or a part of it its type information gives). An `anytype` parameter is its own
-/// argument's value, which the call already passes by value: its copies are read where written.
+/// types (`var result = value;` of `value: T`), or its `anytype` parameter at `position`
+/// (`var local = args;`), there or in a function it passes the parameter on to (as is, or a
+/// part of it its type information gives).
 pub const ParameterCopy = struct { position: usize, site: Key };
 
 /// The copies `function` makes of its generic parameters' values. Found once for every function
@@ -543,6 +543,19 @@ fn genericPosition(self: *const Facts, function: Decl, parameter: u32) ?usize {
     return null;
 }
 
+/// The position of `function`'s parameter named at `token`, when it is `anytype`.
+pub fn anytypeAt(self: *const Facts, function: Decl, token: Ast.TokenIndex) ?usize {
+    const t = self.syntaxOf(function.file);
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = t.fullFnProto(&fn_buffer, self.project.models[function.file.raw()].declarations[function.index].node) orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
+    var it = proto.iterate(t);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (param.name_token == token) return if (param.anytype_ellipsis3 != null) position else null;
+    }
+    return null;
+}
+
 fn hasGenericParameter(self: *const Facts, function: Decl) bool {
     const t = self.syntaxOf(function.file);
     var fn_buffer: [1]Ast.Node.Index = undefined;
@@ -555,12 +568,14 @@ fn hasGenericParameter(self: *const Facts, function: Decl) bool {
     return false;
 }
 
-/// The type parameter whose value `value` (a parameter of `function` declared `T`) is.
+/// The generic parameter whose value `value` is: a parameter of `function` declared `T` of a
+/// type parameter, or an `anytype` parameter, its own argument's value.
 fn valueOfParameter(self: *const Facts, function: Decl, value: u32) ?usize {
     const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const record = model.declarations[value];
     if (record.kind != .parameter or model.scopes[record.scope].node != self.scopeNode(function)) return null;
     const t = self.syntaxOf(function.file);
+    if (self.anytypeAt(function, record.token)) |position| return position;
     if (t.nodeTag(record.node) != .identifier) return null;
     const named = (model.reference(record.node) orelse return null).declaration orelse return null;
     return self.genericPosition(function, named);

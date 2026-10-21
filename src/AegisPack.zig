@@ -591,8 +591,9 @@ fn bindingTyped(value: Facts.Value) bool {
 
 /// A call binding a generic's type or `anytype` parameter whose values the generic copies
 /// (there or in what it passes them on to): a finding where the binding is a recognized owner,
-/// reported here, at the binding, naming the copy. A binding that does not resolve is
-/// undecided; one a generic of this file's own gives is decided where that one is bound.
+/// reported here, at the binding, naming the copy. An `anytype` parameter is bound to its
+/// argument's value. A binding that does not resolve is undecided; one a generic of this
+/// file's own gives is decided where that one is bound.
 fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, node) orelse return;
@@ -611,20 +612,24 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Err
     const proto = written.fullFnProto(&proto_buffer, c.project.models[function.file.raw()].declarations[function.index].node) orelse return;
     // Which parameters take a type: a binding of one is a type the call writes.
     var types: [64]bool = @splat(false);
+    var values: [64]bool = @splat(false);
     var count: usize = 0;
     var it = proto.iterate(written);
     while (it.next()) |param| : (count += 1) {
         if (count == types.len) return;
         types[count] = if (param.type_expr) |t| written.nodeTag(t) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(t)), "type") else false;
+        values[count] = param.anytype_ellipsis3 != null;
     }
     const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
     for (made) |copy| {
-        if (copy.position < receiver or copy.position - receiver >= call.ast.params.len or !types[copy.position]) continue;
+        if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
+        if (!types[copy.position] and !values[copy.position]) continue;
         const argument = call.ast.params[copy.position - receiver];
         // A parameter of a generic this call is in, passed on: decided where that is bound.
         if (c.facts.fromParameter(c.file, argument)) continue;
-        // A type of plain data, as written: numbers, and pointers or arrays of them.
-        if (try plainType(c, c.file, argument, 0)) continue;
+        // Plain data, as written: a type of numbers, and pointers or arrays of them, or a value
+        // of one.
+        if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0)) continue;
         const value = try c.facts.resolve(c.file, argument);
         // A pointer type: its copies are aliases, which A002 leaves out.
         if (pointerShaped(value)) continue;
