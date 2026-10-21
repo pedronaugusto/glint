@@ -142,7 +142,7 @@ const Walk = struct {
     fn value(self: Walk, d: u32) Context.Error!bool {
         const kind = self.declaredType(d) orelse return false;
         return switch (try self.c.facts.resolve(self.c.file, kind)) {
-            .container, .array => true,
+            .container, .array, .reified => true,
             else => false,
         };
     }

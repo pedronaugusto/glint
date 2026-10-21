@@ -306,6 +306,10 @@ fn syntaxRules(self: *Context) RunError!void {
                     .container, .primitive, .error_set, .pointer, .array, .optional, .error_union => {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     },
+                    // A type built from field types names a type; a value of one is a value.
+                    .reified => |built| if (!built.value) {
+                        if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
+                    } else if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case"),
                     .function => |definition| {
                         const target = &self.project.files[definition.file.raw()].tree; // safe: resolved declaration belongs to its frozen file.
                         const record = self.project.models[definition.file.raw()].declarations[definition.index];

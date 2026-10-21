@@ -1371,4 +1371,16 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32)) void { keep(.{ s, 1 }); }", pack.copies, true, 1);
     // A tuple holding what does not resolve is undecided.
     try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32), g: fn () @import(\"missing\").T) void { keep(.{ s, g() }); }", pack.copies, false, 0);
+    // A choice of types whose pointers, and arrays of them, are aliases.
+    try expectJudged(head ++ "pub fn f(comptime n: u8) void { const T = switch (n) { 0 => [*]const u8, 1 => [0]*const u8, else => P }; const v: T = undefined; keep(v); }", pack.copies, true, 0);
+    // A tuple's element, by its number, also where an `inline for` gives the tuple.
+    const typed = head ++ "fn take(comptime T: type, value: T) void { var copy = value; _ = &copy; }\n";
+    try expectJudged(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ u8, 2 } }) |case| take(case[0], undefined); }", pack.copies, true, 0);
+    try expectJudged(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ aegis.Secret(u32), 2 } }) |case| take(case[0], undefined); }", pack.copies, true, 1);
+    // A type built from field types holds what they do: `@Struct`, `@Tuple`, through `@as` of
+    // types and `@splat`, and made by a type function of no parameter.
+    try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{P}, &@splat(.{}));\npub fn f(b: Built, t: @Tuple(&@as([2]type, @splat(P)))) void { keep(b); keep(t); }", pack.copies, true, 0);
+    try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
+    try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
 }

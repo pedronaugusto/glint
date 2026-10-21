@@ -510,6 +510,19 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     return true;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
+/// Two readings of what parts or alternatives hold, as one: unknown stays unknown, one owner
+/// kind among plain types is that kind's, two kinds are unknown.
+fn joined(found: Typed, next: Typed) Typed {
+    return switch (found) {
+        .unknown => .unknown,
+        .other => next,
+        .owner => |k| switch (next) {
+            .other => found,
+            .owner => |other| if (other == k) found else .unknown,
+            .unknown => .unknown,
+        },
+    };
+}
 /// What a value is in the builds that choose among types: the one published kind its
 /// alternatives are, the rest plain types, decided as that kind; any unknown alternative, or
 /// two kinds, leave it unknown.
@@ -517,19 +530,29 @@ fn perBuild(c: *Context, value: Facts.Value) Context.Error!Typed {
     var current = value;
     while (true) current = switch (current) {
         .pointer, .array, .optional, .error_union => |payload| payload.*,
+        .reified => |built| built.fields.*,
         else => break,
     };
     if (current != .alternatives) return typed(c, value, 0);
     var found: Typed = .other;
-    for (current.alternatives) |one| switch (try typed(c, one, 0)) {
-        .unknown => return .unknown,
-        .other => {},
-        .owner => |k| switch (found) {
-            .owner => |earlier| if (earlier != k) return .unknown,
-            else => found = .{ .owner = k },
-        },
-    };
+    for (current.alternatives) |one| found = joined(found, try typed(c, one, 0));
     return found;
+}
+/// What a copy of a value of a binding's type duplicates, per build as `perBuild` reads it: a
+/// pointer in it, or in an array of them, is an alias, which A002 leaves out.
+fn copied(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
+    if (depth == 64) return .unknown;
+    return switch (value) {
+        .pointer => .other,
+        .array, .optional, .error_union => |payload| copied(c, payload.*, depth + 1),
+        .reified => |built| copied(c, built.fields.*, depth + 1),
+        .alternatives => |each| blk: {
+            var found: Typed = .other;
+            for (each) |one| found = joined(found, try copied(c, one, depth + 1));
+            break :blk found;
+        },
+        else => typed(c, value, depth + 1),
+    };
 }
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
 /// guard is: its own operations belong to that type's contract.
@@ -564,6 +587,8 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
     return switch (value) {
         .unknown => .unknown,
         .pointer, .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
+        // A built type holds what its fields' types do.
+        .reified => |built| typed(c, built.fields.*, depth + 1),
         .alternatives => |each| blk: {
             const first = try typed(c, each[0], depth + 1);
             for (each[1..]) |one| if (!std.meta.eql(first, try typed(c, one, depth + 1))) break :blk .unknown;
@@ -573,14 +598,7 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         // parts is that owner's, as a copy of the literal copies it.
         .literal => |literal| blk: {
             var found: Typed = .other;
-            for (try c.facts.literalParts(literal)) |part| switch (try typed(c, part, depth + 1)) {
-                .unknown => break :blk .unknown,
-                .other => {},
-                .owner => |k| switch (found) {
-                    .owner => |earlier| if (earlier != k) break :blk .unknown,
-                    else => found = .{ .owner = k },
-                },
-            };
+            for (try c.facts.literalParts(literal)) |part| found = joined(found, try typed(c, part, depth + 1));
             break :blk found;
         },
         .container, .instance => |container| blk: {
@@ -667,7 +685,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             }
             continue;
         }
-        switch (try perBuild(c, bound)) {
+        switch (try copied(c, bound, 0)) {
             .owner => |k| if (copiedOwner(k)) {
                 const site = &c.project.files[copy.site.file.raw()];
                 const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.inputs[copy.site.file.raw()].name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });

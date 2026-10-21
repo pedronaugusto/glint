@@ -122,6 +122,11 @@ test "review Z006 resolves callable aliases instead of their spelling" {
     try check(.Z006, "const snake_alias = factory; fn factory() type { return u8; } const TypeAlias = snake_alias; pub const value: TypeAlias() = 1;", 0);
 }
 
+test "review Z006 reads a type built from field types as a type, and a value of one as a value" {
+    try check(.Z006, "pub const Built = @Struct(.auto, null, &.{\"a\"}, &.{u8}, &@splat(.{})); pub const Pair = @Tuple(&.{ u8, u16 });", 0);
+    try check(.Z006, "const Built = @Struct(.auto, null, &.{\"a\"}, &.{u8}, &@splat(.{})); pub const badValue: Built = undefined;", 1);
+}
+
 test "review Z006 declines computed naming facts" {
     try check(.Z006, "const dep = @import(\"unmapped\"); const computedAlias = @field(dep, \"Type\"); pub fn run() void { _ = computedAlias; }", 0);
 }

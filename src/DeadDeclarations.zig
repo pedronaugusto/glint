@@ -140,7 +140,7 @@ fn computed(context: *Context, candidates: []Candidate, model: *const Model, val
             for (each) |one| if (!try computed(context, candidates, model, one, token)) return false;
             return true;
         },
-        .primitive, .scalar, .error_set, .function, .array, .literal => return true,
+        .primitive, .scalar, .error_set, .function, .array, .literal, .reified => return true,
         .unknown, .reflected => return false,
     }
 }
