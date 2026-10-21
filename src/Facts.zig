@@ -16,6 +16,10 @@ settled: std.ArrayList([]const Assumption) = .empty,
 /// The set in force: what the path to the node being read settles. A value is read as Zig
 /// analyses the node, in the instantiations where its path is taken.
 assumed: u32 = 0,
+/// What each generic function copies of its parameters' values, found once (`parameterCopies`).
+copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
+/// The names those functions are declared under, for a quick look before a callee is resolved.
+copier_names: std.StringHashMapUnmanaged(void) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
@@ -92,7 +96,10 @@ pub const Target = union(enum) { function: Decl, container: Container };
 pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), so the code that needs it is not compiled in this build.
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent };
+/// `generic`: it depends on a type or `anytype` parameter that calls from outside the
+/// project's reading bind (a consumer's, or a use other than a call), so each binding decides
+/// it where it is made; what is read of it (its type information, its parts) stays so.
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic };
 pub const Value = union(enum) {
     unknown: Unknown,
     primitive: []const u8,
@@ -126,6 +133,8 @@ pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.active.deinit(self.gpa);
     self.settled.deinit(self.gpa);
+    if (self.copies) |*found| found.deinit(self.gpa);
+    self.copier_names.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
@@ -385,6 +394,276 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
     };
 }
 
+/// A local a generic function initialises by copying a value its type parameter at `position`
+/// types (`var result = value;` of `value: T`), there or in a function it passes the parameter
+/// on to (as is, or a part of it its type information gives). An `anytype` parameter is its own
+/// argument's value, which the call already passes by value: its copies are read where written.
+pub const ParameterCopy = struct { position: usize, site: Key };
+
+/// The copies `function` makes of its generic parameters' values. Found once for every function
+/// outside std: a copy where it is written, then through calls that pass a parameter on, until
+/// nothing more is found.
+pub fn parameterCopies(self: *Facts, function: Decl) ResolveError![]const ParameterCopy {
+    if (self.copies == null) try self.findCopies();
+    return self.copies.?.get(function) orelse &.{};
+}
+
+fn findCopies(self: *Facts) ResolveError!void {
+    var found: std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = .empty;
+    self.copies = found;
+    const outside = try self.standardFiles();
+    var functions: std.ArrayList(Decl) = .empty;
+    for (self.project.files, self.project.models, 0..) |*file, *model, raw| {
+        if (file.status != .parsed or outside[raw]) continue;
+        const id: Project.FileId = .fromRaw(@intCast(raw)); // safe: file indexes are bounded by the frozen project table.
+        for (model.declarations, 0..) |d, i| {
+            if (d.kind != .function) continue;
+            const decl: Decl = .{ .file = id, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            if (self.syntaxOf(id).nodeTag(self.scopeNode(decl)) != .fn_decl) continue;
+            if (!self.hasGenericParameter(decl)) continue;
+            try functions.append(self.gpa, decl);
+            var direct: std.ArrayList(ParameterCopy) = .empty;
+            try self.directCopies(decl, &direct);
+            if (direct.items.len != 0) try found.put(self.gpa, decl, direct.items);
+        }
+    }
+    // Through calls that pass a parameter on, until nothing more is found.
+    var changed = true;
+    var rounds: usize = 0;
+    while (changed and rounds < 16) : (rounds += 1) {
+        changed = false;
+        for (functions.items) |decl| {
+            var more: std.ArrayList(ParameterCopy) = .empty;
+            try more.appendSlice(self.gpa, found.get(decl) orelse &.{});
+            const before = more.items.len;
+            self.copies = found;
+            try self.passedCopies(decl, &more);
+            if (more.items.len != before) {
+                try found.put(self.gpa, decl, more.items);
+                changed = true;
+            }
+        }
+    }
+    self.copies = found;
+    var it = found.keyIterator();
+    while (it.next()) |decl| try self.copier_names.put(self.gpa, self.project.models[decl.file.raw()].declarations[decl.index].name, {}); // safe: enum identities index their owning frozen tables without narrowing.
+}
+
+/// Whether some function named `name` copies a generic parameter's values.
+pub fn mayCopy(self: *Facts, name: []const u8) ResolveError!bool {
+    if (self.copies == null) try self.findCopies();
+    return self.copier_names.contains(name);
+}
+
+fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
+    return &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+}
+
+/// The files std's module reaches: its own generics are std's, not the program's.
+fn standardFiles(self: *Facts) ResolveError![]const bool {
+    const reached = try self.gpa.alloc(bool, self.project.count());
+    @memset(reached, false);
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) {
+        reached[mapping.target.raw()] = true; // safe: validated mapping targets index the frozen file table.
+    };
+    var growing = true;
+    while (growing) {
+        growing = false;
+        for (self.project.imports) |mapping| {
+            if (!reached[mapping.from.raw()] or reached[mapping.target.raw()]) continue; // safe: validated mapping identities index the frozen file table.
+            reached[mapping.target.raw()] = true; // safe: validated mapping identities index the frozen file table.
+            growing = true;
+        }
+    }
+    return reached;
+}
+
+/// The position of each parameter of `function` that takes a type or `anytype`, by its
+/// declaration's index; null for any other parameter.
+fn genericPosition(self: *const Facts, function: Decl, parameter: u32) ?usize {
+    const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const record = model.declarations[parameter];
+    if (record.kind != .parameter or model.scopes[record.scope].node != self.scopeNode(function)) return null;
+    const t = self.syntaxOf(function.file);
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = t.fullFnProto(&fn_buffer, model.declarations[function.index].node) orelse return null;
+    var it = proto.iterate(t);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (param.name_token != record.token) continue;
+        if (param.anytype_ellipsis3 != null) return position;
+        const type_expr = param.type_expr orelse return null;
+        return if (typeKeyword(t, type_expr)) position else null;
+    }
+    return null;
+}
+
+fn hasGenericParameter(self: *const Facts, function: Decl) bool {
+    const t = self.syntaxOf(function.file);
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = t.fullFnProto(&fn_buffer, self.project.models[function.file.raw()].declarations[function.index].node) orelse return false; // safe: enum identities index their owning frozen tables without narrowing.
+    var it = proto.iterate(t);
+    while (it.next()) |param| {
+        if (param.anytype_ellipsis3 != null) return true;
+        if (param.type_expr) |type_expr| if (typeKeyword(t, type_expr)) return true;
+    }
+    return false;
+}
+
+/// The type parameter whose value `value` (a parameter of `function` declared `T`) is.
+fn valueOfParameter(self: *const Facts, function: Decl, value: u32) ?usize {
+    const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const record = model.declarations[value];
+    if (record.kind != .parameter or model.scopes[record.scope].node != self.scopeNode(function)) return null;
+    const t = self.syntaxOf(function.file);
+    if (t.nodeTag(record.node) != .identifier) return null;
+    const named = (model.reference(record.node) orelse return null).declaration orelse return null;
+    return self.genericPosition(function, named);
+}
+
+/// `const x = v;` in `function`'s own body, `v` a value of a generic parameter.
+fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const whole = self.scopeNode(function);
+    for (model.declarations) |d| {
+        // A local of the body: a declaration of a container it returns is comptime.
+        if (d.kind != .variable or model.scopes[d.scope].kind != .block or !self.inside(function.file, d.scope, whole)) continue;
+        const v = t.fullVarDecl(d.node) orelse continue;
+        if (v.comptime_token != null) continue;
+        const init = v.ast.init_node.unwrap() orelse continue;
+        if (t.nodeTag(init) != .identifier) continue;
+        const named = (model.reference(init) orelse continue).declaration orelse continue;
+        const position = self.valueOfParameter(function, named) orelse continue;
+        try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node } });
+    }
+}
+
+/// A call in `function`'s body passing a generic parameter on (or a part of it) where the
+/// callee copies the parameter it takes: `function` copies its own.
+fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const whole = self.scopeNode(function);
+    const first = t.firstToken(whole);
+    const last = t.lastToken(whole);
+    for (t.nodes.items(.tag), 0..) |_, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = t.fullCall(&call_buffer, node) orelse continue;
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        // Only a call passing something a generic parameter gives is read.
+        var passes = false;
+        for (call.ast.params) |arg| if (self.derivedParameter(function, arg, 0) != null) {
+            passes = true;
+        };
+        if (!passes) continue;
+        const callee = (try self.definition(function.file, call.ast.fn_expr)) orelse continue;
+        const target = (try self.origin(callee)) orelse continue;
+        if (std.meta.eql(target, function)) continue;
+        const theirs = self.copies.?.get(target) orelse continue;
+        const receiver: usize = if (self.methodCall(function.file, call, target)) 1 else 0;
+        for (theirs) |copy| {
+            if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
+            const mine = self.derivedParameter(function, call.ast.params[copy.position - receiver], 0) orelse continue;
+            for (out.items) |held| {
+                if (held.position == mine and std.meta.eql(held.site, copy.site)) break;
+            } else try out.append(self.gpa, .{ .position = mine, .site = copy.site });
+        }
+    }
+}
+
+/// Whether `node`, an identifier, names a value of a type parameter of its function (`value`
+/// of `value: T`): a copy of it is each binding's.
+pub fn parameterValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    if (self.syntaxOf(file).nodeTag(node) != .identifier) return false;
+    const index = (model.reference(node) orelse return false).declaration orelse return false;
+    const function = self.functionOf(.{ .file = file, .index = index }) orelse return false;
+    return self.valueOfParameter(function, index) != null;
+}
+
+/// Whether `node`, written in a generic function, is or is a part of one of its generic
+/// parameters: a binding passed on, which the binding of that parameter decides.
+pub fn fromParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const t = self.syntaxOf(file);
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    var up = model.node_parents[@backingInt(node)]; // safe: a node index indexes its own tree's parent table.
+    while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: a node index indexes its own tree's parent table.
+        if (t.nodeTag(parent) != .fn_decl) continue;
+        for (model.declarations, 0..) |d, i| {
+            if (d.kind != .function) continue;
+            const candidate: Decl = .{ .file = file, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            if (self.scopeNode(candidate) != parent) continue;
+            if (self.derivedParameter(candidate, node, 0) != null) return true;
+            break;
+        }
+    }
+    return false;
+}
+
+/// Whether `call` reaches `target` as a method of a value, which takes the value first.
+fn methodCall(self: *const Facts, file: Project.FileId, call: Ast.full.Call, target: Decl) bool {
+    const t = self.syntaxOf(file);
+    if (t.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const target_tree = self.syntaxOf(target.file);
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = target_tree.fullFnProto(&fn_buffer, self.project.models[target.file.raw()].declarations[target.index].node) orelse return false; // safe: enum identities index their owning frozen tables without narrowing.
+    var count: usize = 0;
+    var it = proto.iterate(target_tree);
+    while (it.next()) |_| count += 1;
+    return count == call.ast.params.len + 1;
+}
+
+/// The generic parameter of `function` that `node` is or is a part of: the parameter itself, a
+/// value of it, or what a capture or a constant reads of its type information.
+fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) ?usize {
+    if (depth == 8) return null;
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const first = t.firstToken(node);
+    const last = t.lastToken(node);
+    for (first..last + 1) |raw| {
+        const token: Ast.TokenIndex = @intCast(raw); // safe: bounded by the node's own token range.
+        if (t.tokenTag(token) != .identifier) continue;
+        const scope = model.token_scopes[token];
+        const index = self.lexical(function.file, scope, t.tokenSlice(token)) orelse continue;
+        const record = model.declarations[index];
+        if (self.genericPosition(function, index)) |position| return position;
+        if (self.valueOfParameter(function, index)) |position| return position;
+        if (!self.inside(function.file, record.scope, self.scopeNode(function))) continue;
+        const source: Ast.Node.Index = switch (record.kind) {
+            .variable => (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue,
+            .capture => self.captureSource(function.file, record.node) orelse continue,
+            else => continue,
+        };
+        if (source == node) continue;
+        if (self.derivedParameter(function, source, depth + 1)) |position| return position;
+    }
+    return null;
+}
+
+/// The declaration `name` reaches from `scope`, looking outward.
+fn lexical(self: *const Facts, file: Project.FileId, scope: u32, name: []const u8) ?u32 {
+    const scopes = self.project.models[file.raw()].scopes; // safe: enum identities index their owning frozen tables without narrowing.
+    var at: ?u32 = scope;
+    while (at) |s| : (at = scopes[s].parent) if (scopes[s].names.get(name)) |index| return index;
+    return null;
+}
+
+/// What a capture is read from: a switch's subject, a loop's inputs, an `if`'s condition.
+fn captureSource(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
+    const t = self.syntaxOf(file);
+    if (t.fullSwitchCase(node) != null) {
+        const parent = self.project.models[file.raw()].node_parents[@backingInt(node)] orelse return null; // safe: enum identities index their owning frozen tables without narrowing.
+        return (t.fullSwitch(parent) orelse return null).ast.condition;
+    }
+    if (t.fullFor(node)) |loop| return if (loop.ast.inputs.len != 0) loop.ast.inputs[0] else null;
+    if (t.fullIf(node)) |branch| return branch.ast.cond_expr;
+    if (t.fullWhile(node)) |loop| return loop.ast.cond_expr;
+    return null;
+}
+
 /// The comptime `bool` parameter `node` names, if it names one.
 fn conditionParameter(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Decl {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
@@ -603,6 +882,7 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
         return self.declaration(target);
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) return self.instance(try self.resolve(file, args[0]));
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, args[0], args[1]);
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolve(file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolve(file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
@@ -610,6 +890,39 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
     // A number or a truth value, whatever the arguments are.
     for (numeric_builtins) |number| if (std.mem.eql(u8, name, number)) return .scalar;
     return .{ .unknown = .comptime_dependent };
+}
+
+/// `@FieldType(T, name)`: the type of `T`'s field `name`; for a name computed at compile
+/// time, one of its fields' types, each a choice.
+fn fieldType(self: *Facts, file: Project.FileId, container_node: Ast.Node.Index, name_node: Ast.Node.Index) ResolveError!Value {
+    const container = switch (try self.resolve(file, container_node)) {
+        .container => |c| c,
+        .unknown => |why| return .{ .unknown = why },
+        else => return .{ .unknown = .unsupported },
+    };
+    if (container.symbolic) return .{ .unknown = .comptime_dependent };
+    const t = self.syntaxOf(file);
+    if (t.nodeTag(name_node) == .string_literal) {
+        const name = std.zig.string_literal.parseAlloc(self.gpa, t.tokenSlice(t.nodeMainToken(name_node))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .unknown = .unsupported },
+        };
+        const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
+        return switch (try self.declaration(field)) {
+            .instance => |c| .{ .container = c },
+            else => |other| other,
+        };
+    }
+    const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    var each: std.ArrayList(Value) = .empty;
+    for (model.declarations) |d| {
+        if (d.kind != .field or d.scope != container.scope) continue;
+        const field = self.syntaxOf(container.file).fullContainerField(d.node) orelse continue;
+        const type_node = field.ast.type_expr.unwrap() orelse continue;
+        try each.append(self.gpa, try self.resolve(container.file, type_node));
+    }
+    if (each.items.len == 0) return .{ .unknown = .unsupported };
+    return self.choose(each.items);
 }
 
 /// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
@@ -1503,6 +1816,8 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
 /// the alternatives.
 fn choose(self: *Facts, values: []const Value) ResolveError!Value {
     var kept: std.ArrayList(Value) = .empty;
+    // An unknown that a binding would not settle comes first: the choice is unknown for it.
+    for (values) |value| if (value == .unknown and value.unknown != .generic) return value;
     for (values) |value| {
         if (value == .unknown) return value;
         const parts: []const Value = if (value == .alternatives) value.alternatives else &.{value};
@@ -1890,11 +2205,12 @@ fn scopeNode(self: *const Facts, function: Decl) Ast.Node.Index {
 /// and its consumers cannot call it by name. Anything else stays unknown.
 fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!Value {
     const function = self.functionOf(parameter) orelse return .{ .unknown = .comptime_dependent };
-    const found = (try self.callArguments(function, position)) orelse return .{ .unknown = .comptime_dependent };
+    const found = (try self.callArguments(function, position)) orelse return .{ .unknown = .generic };
     // A call that passes something from a module the build does not have is not compiled.
     var values: std.ArrayList(Value) = .empty;
     for (found) |value| if (!absent(value)) try values.append(self.gpa, value);
-    if (values.items.len == 0) return .{ .unknown = .comptime_dependent };
+    // No call the build compiles binds it: whatever binding is made decides.
+    if (values.items.len == 0) return .{ .unknown = .generic };
     return self.choose(values.items);
 }
 

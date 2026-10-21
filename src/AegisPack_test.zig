@@ -164,7 +164,6 @@ test "adopted gates retain unresolved obligations and known unrelated receivers"
     const cases = .{
         .{ pack.access, "pub fn f(v: anytype) void { _ = v.material; }" },
         .{ pack.access, "pub fn f(comptime T: type, v: *T) void { _ = v.material; }" },
-        .{ pack.copies, "pub fn f(v: anytype) void { const copy = v; _ = copy; }" },
         .{ pack.copies, "pub fn f(v: anytype) *const u32 { return v.expose(); }" },
         .{ pack.cleanup, "pub fn f(T: type) void { var v = T.init(1); _ = &v; }" },
         .{ pack.capacity, "pub fn f(T: type, gpa: anytype, bytes: []u8) void { _ = T.adopt(gpa, bytes, 0); }" },
@@ -1216,4 +1215,15 @@ test "a comptime condition settled on the path decides a receiver chosen by it" 
     try expectJudged(head ++ "fn State(comptime wrapped: bool) type { return struct { m: if (wrapped) aegis.Guarded(u64) else Direct }; }\npub fn f(comptime wrapped: bool, s: *State(wrapped)) u64 { if (wrapped) return 0; const owner = &s.m; return owner.data; }", pack.access, true, 0);
     // On the wrapped side the same access is the aegis owner's backing field.
     try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) return 0; return owner.data; }", pack.access, true, 1);
+}
+
+test "a generic's copies of its parameter are decided where the parameter is bound" {
+    const head = "const aegis = @import(\"aegis\");\npub fn clone(comptime T: type, value: T) T { var result = value; _ = &result; return result; }\npub fn outer(comptime T: type, value: T) T { return clone(T, value); }\n";
+    // At the definition the copy is the bindings' obligation.
+    try expectJudged(head, pack.copies, true, 0);
+    // A binding to a plain type copies no owner; one to an owner does, there or through a
+    // generic that passes it on.
+    try expectJudged(head ++ "const P = struct { n: u8 };\npub fn f(p: P) void { _ = clone(P, p); _ = outer(P, p); }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = clone(aegis.Secret(u32), s); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = outer(aegis.Secret(u32), s); }", pack.copies, true, 1);
 }

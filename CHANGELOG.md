@@ -4,6 +4,11 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- A002 decides a generic's copies of a value its type parameter types (`var result = value;` of `value: T`) where the parameter is bound: at the definition the copy is the bindings' obligation; a call binding the parameter to a recognized owner is a finding there, naming the copy's line, also through generics that pass the parameter on (as is, or a part of its type information). A binding to a type that does not resolve is undecided; one a surrounding generic's own parameter gives is decided where that is bound. `Facts.parameterCopies`, and the `generic` reason a value is unknown: it depends on a parameter that calls outside the project's reading bind.
+- `@FieldType(T, name)` resolves: the field's type, and for a computed name each field's type as a choice.
+
 ### Changed
 
 - Z006 accepts a container's declaration whose name a generic reads on its type parameter (`P.identityElement` of a `comptime P: type`) when a type outside the selected sources declares it in public: the generic takes both, so the outside type (std's `Edwards25519`) fixes the spelling.

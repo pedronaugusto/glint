@@ -568,16 +568,86 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         else => .other,
     };
 }
+/// Whether a value is unknown only because a generic's binding gives its type.
+fn bindingTyped(value: Facts.Value) bool {
+    var current = value;
+    while (true) current = switch (current) {
+        .pointer, .array, .optional, .error_union => |inner| inner.*,
+        .unknown => |why| return why == .generic,
+        else => return false,
+    };
+}
+
+/// A call binding a generic's type or `anytype` parameter whose values the generic copies
+/// (there or in what it passes them on to): a finding where the binding is a recognized owner,
+/// reported here, at the binding, naming the copy. A binding that does not resolve is
+/// undecided; one a generic of this file's own gives is decided where that one is bound.
+fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node) orelse return;
+    const name_token = switch (tree.nodeTag(call.ast.fn_expr)) {
+        .identifier => tree.nodeMainToken(call.ast.fn_expr),
+        .field_access => tree.nodeData(call.ast.fn_expr).node_and_token[1],
+        else => return,
+    };
+    if (!try c.facts.mayCopy(try Model.identifier(c.allocator, tree.tokenSlice(name_token)))) return;
+    const decl = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return;
+    const function = (try c.facts.origin(decl)) orelse return;
+    const made = try c.facts.parameterCopies(function);
+    if (made.len == 0) return;
+    const written = &c.project.files[function.file.raw()].tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = written.fullFnProto(&proto_buffer, c.project.models[function.file.raw()].declarations[function.index].node) orelse return;
+    // Which parameters take a type: a binding of one is a type the call writes.
+    var types: [64]bool = @splat(false);
+    var count: usize = 0;
+    var it = proto.iterate(written);
+    while (it.next()) |param| : (count += 1) {
+        if (count == types.len) return;
+        types[count] = if (param.type_expr) |t| written.nodeTag(t) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(t)), "type") else false;
+    }
+    const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
+    for (made) |copy| {
+        if (copy.position < receiver or copy.position - receiver >= call.ast.params.len or !types[copy.position]) continue;
+        const argument = call.ast.params[copy.position - receiver];
+        // A parameter of a generic this call is in, passed on: decided where that is bound.
+        if (c.facts.fromParameter(c.file, argument)) continue;
+        // A type of plain data, as written: numbers, and pointers or arrays of them.
+        if (try plainType(c, c.file, argument, 0)) continue;
+        const value = try c.facts.resolve(c.file, argument);
+        // A pointer type: its copies are aliases, which A002 leaves out.
+        if (pointerShaped(value)) continue;
+        // A type argument stands for its values.
+        const bound = switch (value) {
+            .container => |container| Facts.Value{ .instance = container },
+            else => value,
+        };
+        switch (try perBuild(c, bound)) {
+            .owner => |k| if (copiedOwner(k)) {
+                const site = &c.project.files[copy.site.file.raw()];
+                const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.inputs[copy.site.file.raw()].name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
+                try c.at(copies, tree.nodeMainToken(node), detail);
+                return;
+            },
+            .other => {},
+            .unknown => if (!bindingTyped(bound)) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve"),
+        }
+    }
+}
+
 fn checkCopies(c: *Context) Context.Error!void {
     if (!try begin(c, copies)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        try checkBinding(c, tree, node);
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
             if (tree.nodeTag(init) != .identifier) continue;
             // `undefined`, `true`, `false` and `null` are values, not references to an owner.
             if (c.project.models[c.file.raw()].reference(init) == null) continue; // safe: the checked source handle indexes this frozen model.
+            // A value of a generic's parameter: each binding's copy, checked at the binding.
+            if (c.facts.parameterValue(c.file, init)) continue;
             // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
             if (v.ast.type_node.unwrap()) |t| if (try plainType(c, c.file, t, 0)) continue;
             if (try plainValue(c, c.file, init, 0)) continue;
