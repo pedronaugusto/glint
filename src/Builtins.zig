@@ -8,6 +8,7 @@ const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Escapes = @import("Escapes.zig");
+const Growth = @import("Growth.zig");
 const Disallowed = @import("Disallowed.zig");
 const RunError = Context.Error;
 
@@ -25,6 +26,7 @@ pub fn check(context: *Context) RunError!void {
     try Disallowed.check(context);
     try DeadDeclarations.check(context);
     try Escapes.check(context);
+    try Growth.check(context);
     try unknownCoverage(context);
 }
 

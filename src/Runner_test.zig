@@ -602,3 +602,86 @@ test "review Z006 accepts a name a generic reads on its type parameter that an o
         try std.testing.expectEqual(@as(usize, if (generic) 1 else 2), report.diagnostics.len); // safe: fixture counts are representable.
     }
 }
+
+/// `rule` over `source` beside a small std (an array list and a hash map whose storage their
+/// borrows point into): its findings, and its undecided sites.
+fn checkWithStd(rule: glint.Rule, source: []const u8, expected: usize, undecided: usize) !void {
+    const std_root =
+        \\pub const array_list = @import("array_list.zig");
+        \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
+        \\pub const AutoHashMapUnmanaged = @import("hash_map.zig").AutoHashMapUnmanaged;
+    ;
+    const list =
+        \\pub fn Aligned(comptime T: type, comptime alignment: ?u8) type {
+        \\    _ = alignment;
+        \\    return struct {
+        \\        const Self = @This();
+        \\        items: []T = &.{},
+        \\        capacity: usize = 0,
+        \\        pub fn append(self: *Self, gpa: anytype, item: T) !void { _ = .{ self, gpa, item }; }
+        \\        pub fn appendAssumeCapacity(self: *Self, item: T) void { _ = .{ self, item }; }
+        \\        pub fn addOne(self: *Self, gpa: anytype) !*T { _ = gpa; return &self.items[0]; }
+        \\        pub fn ensureTotalCapacity(self: *Self, gpa: anytype, n: usize) !void { _ = .{ self, gpa, n }; }
+        \\        pub fn deinit(self: *Self, gpa: anytype) void { _ = .{ self, gpa }; }
+        \\        pub fn toOwnedSlice(self: *Self, gpa: anytype) ![]T { _ = gpa; return self.items; }
+        \\    };
+        \\}
+    ;
+    const map =
+        \\pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        values_: []V = &.{},
+        \\        pub fn getPtr(self: *Self, key: K) ?*V { _ = key; return &self.values_[0]; }
+        \\        pub fn put(self: *Self, gpa: anytype, key: K, value: V) !void { _ = .{ self, gpa, key, value }; }
+        \\    };
+        \\}
+    ;
+    const file = glint.Project.FileId.fromRaw;
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "fixture", .stem = "Fixture", .bytes = source },
+        .{ .name = "std/std.zig", .bytes = std_root, .selected = false },
+        .{ .name = "std/array_list.zig", .bytes = list, .selected = false },
+        .{ .name = "std/hash_map.zig", .bytes = map, .selected = false },
+    }, &.{
+        .{ .from = file(0), .spelling = "std", .target = file(1) },
+        .{ .from = file(1), .spelling = "array_list.zig", .target = file(2) },
+        .{ .from = file(1), .spelling = "hash_map.zig", .target = file(3) },
+    }, .{});
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(rule, true);
+    var report = try glint.run(std.testing.allocator, &project, config);
+    defer report.deinit();
+    try std.testing.expectEqual(expected, report.diagnostics.len);
+    var sites: usize = 0;
+    for (report.coverage) |entry| {
+        if (entry.rule == rule) sites += 1;
+    }
+    try std.testing.expectEqual(undecided, sites);
+}
+
+test "E002 finds a borrow of a list's or map's storage used after an operation that may move it" {
+    const head = "const std = @import(\"std\");\nconst List = std.ArrayList(u32);\nconst Map = std.AutoHashMapUnmanaged(u32, u32);\n";
+    // An element's address, the items, the element `addOne` gives, a map's value pointer.
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !u32 { const first = &list.items[0]; try list.append(gpa, 1); return first.*; }", 1, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !u32 { const all = list.items; try list.append(gpa, 2); return all[0]; }", 1, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !void { const slot = try list.addOne(gpa); try list.append(gpa, 1); slot.* = 3; }", 1, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, map: *Map) !void { const p = map.getPtr(1) orelse return; try map.put(gpa, 2, 3); p.* += 1; }", 1, 0);
+    // A field of the caller's, and a loop that grows it before the next pass reads the borrow.
+    try checkWithStd(.E002, head ++ "const S = struct { list: List };\npub fn f(gpa: u8, s: *S) !u32 { const first = &s.list.items[0]; try s.list.append(gpa, 1); return first.*; }", 1, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !void { const first = &list.items[0]; for (0..3) |_| { first.* += 1; try list.append(gpa, 1); } }", 1, 0);
+}
+
+test "E002 leaves copies, borrows taken again, capacity reserved first, other containers and exits alone" {
+    const head = "const std = @import(\"std\");\nconst List = std.ArrayList(u32);\n";
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !u32 { const first = list.items[0]; try list.append(gpa, 1); return first; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !u32 { var all = list.items; try list.append(gpa, 1); all = list.items; return all[0]; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) !u32 { try list.ensureTotalCapacity(gpa, 4); const first = &list.items[0]; list.appendAssumeCapacity(1); return first.*; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List, other: *List) !u32 { const first = &list.items[0]; try other.append(gpa, 1); return first.*; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List, n: u32) !u32 { const first = &list.items[0]; if (n > 3) { try list.append(gpa, 1); return 0; } return first.*; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List) u32 { defer list.deinit(gpa); const all = list.items; return all[0]; }", 0, 0);
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: u8, list: *List, done: bool) ![]u32 { const all = list.items; if (done) return list.toOwnedSlice(gpa); return all; }", 0, 0);
+    // A container whose type does not resolve: undecided.
+    try checkWithStd(.E002, head ++ "pub fn f(gpa: anytype, list: anytype) !u32 { const first = &list.items[0]; try list.append(gpa, 1); return first.*; }", 0, 1);
+}

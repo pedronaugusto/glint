@@ -36,6 +36,8 @@ comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
 /// The declarations the program dereferences (`p.*`), found per file once.
 dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
+/// The files std's module reaches, found once (`standard`).
+standard_files: ?[]const bool = null,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -514,7 +516,13 @@ fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
 }
 
 /// The files std's module reaches: its own generics are std's, not the program's.
+/// Whether `file` is one of std's own: reached from the module `std` by its imports.
+pub fn standard(self: *Facts, file: Project.FileId) ResolveError!bool {
+    return (try self.standardFiles())[file.raw()]; // safe: a file identity indexes the frozen file table.
+}
+
 fn standardFiles(self: *Facts) ResolveError![]const bool {
+    if (self.standard_files) |known| return known;
     const reached = try self.gpa.alloc(bool, self.project.count());
     @memset(reached, false);
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) {
@@ -529,6 +537,7 @@ fn standardFiles(self: *Facts) ResolveError![]const bool {
             growing = true;
         }
     }
+    self.standard_files = reached;
     return reached;
 }
 

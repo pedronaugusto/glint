@@ -24,11 +24,12 @@ pub const Rule = enum(u16) {
     P006 = 45,
     D001 = 46,
     E001 = 47,
+    E002 = 48,
     _,
 
     pub fn group(self: Rule) Group {
         return switch (self) {
-            .Z003, .Z011, .Z013, .Z026, .D001, .E001 => .correctness,
+            .Z003, .Z011, .Z013, .Z026, .D001, .E001, .E002 => .correctness,
             .Z012, .Z016, .P001, .P002, .P003, .P004, .P005, .P006 => .family_policy,
             else => .zig_style,
         };
@@ -43,6 +44,7 @@ pub const Rule = enum(u16) {
             .P006 => "resolved declaration is disallowed by project policy",
             .D001 => "private declaration its file names nowhere",
             .E001 => "pointer into a function's own frame outlives the call (heuristic)",
+            .E002 => "pointer into a std list's or map's storage used after it may move (heuristic)",
             .Z003 => "syntax incompatibility",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
