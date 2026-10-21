@@ -1053,6 +1053,13 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     return .{ .unknown = .comptime_dependent };
 }
 
+/// Whether a value is type information (`@typeInfo(T)`), or a choice of it.
+fn reflectedInfo(value: Value) bool {
+    const each: []const Value = if (value == .alternatives) value.alternatives else &.{value};
+    for (each) |one| if (one != .reflected or one.reflected.at != .info) return false;
+    return true;
+}
+
 /// Whether a value is unknown, itself or what a pointer, optional, error union or array holds.
 fn unknownWithin(value: Value) bool {
     return switch (value) {
@@ -1772,10 +1779,16 @@ fn switchPayload(self: *Facts, file: Project.FileId, case_node: Ast.Node.Index, 
     const parent = self.project.models[file.raw()].node_parents[@backingInt(case_node)] orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
     const whole = tree.fullSwitch(parent) orelse return .{ .unknown = .unsupported };
     const subject = try self.resolve(file, whole.ast.condition);
-    // A switch on type information (`@typeInfo(T)`) captures the part its prong names.
-    if (subject == .reflected and subject.reflected.at == .info) {
-        if (full.ast.values.len != 1 or tree.nodeTag(full.ast.values[0]) != .enum_literal) return .{ .reflected = .{ .of = subject.reflected.of, .at = .part } };
-        return self.reflectedMember(subject.reflected, try self.memberName(tree.tokenSlice(tree.nodeMainToken(full.ast.values[0]))));
+    // A switch on type information (`@typeInfo(T)`) captures the part its prong names, of
+    // each type a choice of them gives.
+    if (reflectedInfo(subject)) {
+        const each: []const Value = if (subject == .alternatives) subject.alternatives else &.{subject};
+        const parts = try self.gpa.alloc(Value, each.len);
+        for (each, parts) |one, *part| part.* = if (full.ast.values.len != 1 or tree.nodeTag(full.ast.values[0]) != .enum_literal)
+            .{ .reflected = .{ .of = one.reflected.of, .at = .part } }
+        else
+            try self.reflectedMember(one.reflected, try self.memberName(tree.tokenSlice(tree.nodeMainToken(full.ast.values[0]))));
+        return self.choose(parts);
     }
     // A pointer's target resolves as its type: a dereferenced subject is a container here.
     const container = switch (subject) {
@@ -2179,11 +2192,18 @@ fn reflect(self: *Facts, of: Value) ResolveError!Value {
 /// `base[index]`: a reflected function's parameter type, or an element.
 fn elementOf(self: *Facts, base: Value, tree: *const Ast, index_node: Ast.Node.Index) ResolveError!Value {
     switch (base) {
-        .reflected => |r| return self.reflectedElement(r, tree, index_node),
+        .reflected => |r| return (try self.reflectedElement(r, tree, index_node)) orelse .{ .unknown = .unsupported },
         .alternatives => |each| {
-            const mapped = try self.gpa.alloc(Value, each.len);
-            for (each, mapped) |one, *out| out.* = try self.elementOf(one, tree, index_node);
-            return self.choose(mapped);
+            var mapped: std.ArrayList(Value) = .empty;
+            for (each) |one| {
+                // A function of the choice with no parameter there is one no build of this
+                // code takes: Zig refuses the index where it would.
+                if (one == .reflected) {
+                    try mapped.append(self.gpa, (try self.reflectedElement(one.reflected, tree, index_node)) orelse continue);
+                } else try mapped.append(self.gpa, try self.elementOf(one, tree, index_node));
+            }
+            if (mapped.items.len == 0) return .{ .unknown = .unsupported };
+            return self.choose(mapped.items);
         },
         // A tuple's element: the one a number names, or, for an index known only as the
         // program compiles (an `inline for`'s), one of a literal's parts.
@@ -2230,7 +2250,8 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
 
 /// `param_types[i]` of a reflected function, `?type` as Zig gives it: the parameter's
 /// declared type, null (unknown here) for `anytype` or a type that depends on an argument.
-fn reflectedElement(self: *Facts, r: Reflected, tree: *const Ast, index_node: Ast.Node.Index) ResolveError!Value {
+/// Null where the function has no parameter `i`.
+fn reflectedElement(self: *Facts, r: Reflected, tree: *const Ast, index_node: Ast.Node.Index) ResolveError!?Value {
     if (r.at != .params) return .{ .unknown = .unsupported };
     const proto = self.prototype(r.of.*) orelse return .{ .unknown = .unsupported };
     if (tree.nodeTag(index_node) != .number_literal) return .{ .unknown = .comptime_dependent };
@@ -2247,7 +2268,7 @@ fn reflectedElement(self: *Facts, r: Reflected, tree: *const Ast, index_node: As
         if (value == .unknown) return value;
         return .{ .optional = try self.boxed(value) };
     }
-    return .{ .unknown = .unsupported };
+    return null;
 }
 
 /// The prototype a function or a function type is written with.

@@ -562,6 +562,9 @@ test "receivers bound by captures are decided by what they bind" {
     // with the call's argument: an element of the slice it is given (airlock's slot lookup).
     const lookup = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst Index = aegis.handle.Index(Tag, u32);\n";
     try expectJudged(lookup ++ "const Slot = struct { index: Index };\npub fn find(all: []Slot, index: Index) ?*Slot { if (index.get(all)) |s| { if (s.index == index) return s; } else |_| {} return null; }", pack.access, true, 0);
+    // A prong's capture of type information is that part of each type a choice gives
+    // (shakedown's outcome of a simulated call, `@typeInfo(R)` per call's result type).
+    try expectJudged("const aegis = @import(\"aegis\");\nfn width(comptime T: type) u64 { return @sizeOf(T); }\nfn outcome(comptime R: type, result: R) u64 { switch (@typeInfo(R)) { .error_union => |u| { const value = result catch return 0; _ = value; return width(u.payload); }, else => return 1 } }\npub fn f(a: error{A}!u32, b: error{B}!u8, c: bool) u64 { return outcome(@TypeOf(a), a) + outcome(@TypeOf(b), b) + outcome(bool, c); }", pack.access, true, 0);
     // The same where another `get` the program calls does not resolve, so its calls do not
     // settle the parameter: the call's own argument does.
     try expectJudged(lookup ++ "const ext = @import(\"missing\");\nconst Slot = struct { index: Index };\npub fn find(all: []Slot, index: Index) ?*Slot { if (index.get(all)) |s| { if (s.index == index) return s; } else |_| {} return null; }\npub fn other(t: ext.T) void { _ = t.get(1); }", pack.access, true, 0);
@@ -1410,8 +1413,8 @@ test "a generic's copies of its anytype parameter are decided where the argument
     // field types, each a function pointer, give their parameters' types (shakedown's
     // simulated `Io` calls); one of them an owner makes a copy of the parameter a finding.
     const vtable = "pub fn slot(comptime name: []const u8) @FieldType(VTable, name) {\n    const info = @typeInfo(@typeInfo(@FieldType(VTable, name)).pointer.child).@\"fn\";\n    const params = info.param_types;\n    return &struct {\n        fn f(u: ?*anyopaque, a: params[1].?) void {\n            _ = u;\n            keep(.{a});\n        }\n    }.f;\n}\n";
-    try expectJudged(head ++ "const VTable = struct { open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, P) void };\n" ++ vtable, pack.copies, true, 0);
-    try expectJudged(head ++ "const VTable = struct { open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, aegis.Secret(u32)) void };\n" ++ vtable, pack.copies, true, 1);
+    try expectJudged(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, P) void };\n" ++ vtable, pack.copies, true, 0);
+    try expectJudged(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, aegis.Secret(u32)) void };\n" ++ vtable, pack.copies, true, 1);
     // A field's type read by `@FieldType` of a made container is the making call's, also in a
     // generic's result written in terms of its `anytype` parameter (chronicle's journal state
     // seen through its owner).
