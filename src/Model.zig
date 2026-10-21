@@ -322,8 +322,17 @@ fn scopeLess(_: void, lhs: Scope, rhs: Scope) bool {
     if (lhs.first != rhs.first) return lhs.first < rhs.first;
     if (lhs.last != rhs.last) return lhs.last > rhs.last;
     // A branch whose expression is a container (`.windows => struct { ... }`) spans the same
-    // tokens: the container is the inner scope, so its members are its own.
-    return lhs.kind != .container and rhs.kind == .container;
+    // tokens: the container is the inner scope, so its members are its own. A branch's or a
+    // loop's body that is a block is the block's scope, so its declarations are the block's.
+    return inner(lhs.kind) < inner(rhs.kind);
+}
+
+fn inner(kind: Kind) u2 {
+    return switch (kind) {
+        .container => 2,
+        .block => 1,
+        else => 0,
+    };
 }
 
 fn addScope(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope), node: Ast.Node.Index, kind: Kind) InitError!void {

@@ -11,11 +11,13 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Changed
 
 - A003 reads a `MustUse`'s `deinit` after its `take` or `acknowledge` as the check that it was discharged, as aegis has it, no longer a use after release that leaves the site undecided.
+- An `inline` prong's capture is each field's payload in turn (`inline else => |m| m.state`), an `else` prong's the fields no other prong names; a capture of differing payloads was undecided (cloak's machine and record protection).
 - A `switch` prong on a comptime enum parameter settles it for what the prong reads, as `if` on a comptime `bool` does: a value an earlier `switch` on the same parameter chose is that prong's alone (strand's three readers in `keep_test.zig`); a function that switches on one branches per build for A003.
 - A003 reads a `defer` or `errdefer` block that releases the owner once at its top level (`defer { guard.deinit(io); self.gpa.destroy(self); }`), the owner named before the release only through its members and not after it.
 
 ### Fixed
 
+- A declaration in a branch's or a loop's block body (`if (c) { var held = g.acquire(); ... }`, the same in `for` and `while`) is the block's: the branch's or loop's scope, spanning the same tokens, took it, and A002, A003 and A005 read only a block's declarations, so an owner declared there was never checked. A guard left held in a loop body was no finding.
 - A001-A003 refute an unresolved call on a receiver held at run time (`const owner: T = @ptrCast(raw); owner.read(io, oid)`) by the aegis functions it can call as a method only: a value calls no namespace function (relic's `Database.from` adapter).
 - A `while` payload is in scope in the loop's continue expression (`while (at) |layer| : (at = layer.base)`), and in a block body's loop scope: a read of it there resolved to nothing (relic's graph layers).
 - Two instantiations of one type function (`Line(Plain)`, `Line(Guarded)`) are two types: a choice of them kept only the first, so a member read through the choice missed the other's finding while the run counted as complete.

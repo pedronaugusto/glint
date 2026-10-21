@@ -561,8 +561,12 @@ test "receivers bound by captures are decided by what they bind" {
     // A switch prong's payload is the union field its item names.
     try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *const U) void { switch (u.*) { .a => |p| _ = p.data, .b => {} } }", pack.access, true, 0);
     try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *U) void { switch (u.*) { .a => {}, .b => |*g| _ = g.data } }", pack.access, true, 1);
-    // Prong items whose payloads differ, and an `else` prong of a union, stay undecided.
+    // Prong items whose payloads differ stay undecided.
     try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: U) void { switch (u) { .a, .b => |x| _ = x.data } }", pack.access, false, 0);
+    // An `inline` prong captures each field's payload in turn; `else`, those no other prong names.
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: Plain, c: G(u32) };\npub fn f(u: U) void { switch (u) { .c => {}, inline else => |x| _ = x.data } }", pack.access, true, 0);
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: Plain, c: G(u32) };\npub fn f(u: *U) void { switch (u.*) { .a => {}, inline else => |*x| _ = x.data } }", pack.access, true, 1);
+    try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32), c };\npub fn f(u: U) void { switch (u) { inline .a, .c => |x| _ = x } }", pack.access, true, 0);
     // A `for` capture is its slice's element; a range's is a number.
     try expectJudged(head ++ "pub fn f(items: []Plain) void { for (items, 0..) |item, i| { _ = item.data; _ = i; } }", pack.access, true, 0);
     try expectJudged(head ++ "pub fn f(items: []G(u32)) void { for (items) |*item| _ = item.data; }", pack.access, true, 1);
@@ -977,6 +981,11 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
     try expectJudged(head ++ "pub fn f(t: *Table, r: aegis.scope.Ref(Tag, *u32)) void { _ = t.open_count; _ = r.generation; }", pack.access, true, 2);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); _ = &s; }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer s.end(); }", pack.cleanup, true, 0);
+    // An owner declared in a branch's or a loop's block body is checked there.
+    try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), c: bool) void { if (c) { var held = g.acquire(); _ = held.value(); } }", pack.cleanup, true, 1);
+    try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), xs: []const u8) void { for (xs) |_| { var held = g.acquire(); _ = held.value(); } }", pack.cleanup, true, 1);
+    try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), n: usize) void { var i: usize = 0; while (i < n) { var held = g.acquire(); _ = held.value(); i += 1; } }", pack.cleanup, true, 1);
+    try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), n: usize) void { var i: usize = 0; while (i < n) : (i += 1) { var held = g.acquire(); defer held.deinit(); _ = held.value(); } }", pack.cleanup, true, 0);
     // A deferred block that ends it once at its top level, the scope not named after.
     try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); defer { s.end(); n.* += 1; } }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); errdefer { n.* += 1; s.end(); } try g(); s.end(); }\nfn g() !void {}", pack.cleanup, true, 0);
