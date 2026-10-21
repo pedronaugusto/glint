@@ -943,7 +943,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         for (model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
     }
     switch (tag) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(file, node),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(null, file, node),
         .call_one, .call_one_comma, .call, .call_comma => {
             var call_buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&call_buffer, node).?;
@@ -951,8 +951,12 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             if (callee == .alternatives) return self.map(callee, {}, callResult);
             if (callee == .function) {
                 if (try self.typeArgument(file, call, callee.function)) |result| return result;
-                if (try self.madeResult(file, call, callee.function)) |value| return value;
+                // A made container's method read with the container's bindings; where its own
+                // generic parameters leave the result unknown, the call's reading of them.
+                const made = try self.madeResult(file, call, callee.function);
+                if (made) |value| if (!unknownWithin(value)) return value;
                 if (try self.evaluateCall(null, file, call, callee.function)) |value| return value;
+                if (made) |value| return value;
                 var result = try self.callResult(callee, {});
                 if (result == .container and result.container.symbolic) {
                     result.container.made_by = try self.making(.{ .function = callee.function, .file = file, .call = node, .assumed = self.assumed });
@@ -982,8 +986,9 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
 }
 
 /// What a builtin call gives: an imported file, `@This()`, a reflected declaration, a type
-/// `@as` names, a value's type, a type's information.
-fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+/// `@as` names, a value's type, a type's information; its operands read with `env`'s
+/// bindings where a generic call's reading gives them.
+fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     var buffer: [2]Ast.Node.Index = undefined;
@@ -1011,28 +1016,37 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
         return self.declaration(target);
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) {
-        const named = try self.resolve(file, args[0]);
+        const named = try self.resolveIn(env, file, args[0]);
         // A type, or types, held as a value: what they are is the operand.
-        if (holdsTypes(named)) return self.resolve(file, args[1]);
+        if (holdsTypes(named)) return self.resolveIn(env, file, args[1]);
         return self.instance(named);
     }
     // Every element the operand: an array of it (a vector is indexed as one).
-    if (std.mem.eql(u8, name, "@splat") and args.len == 1) return .{ .array = try self.boxed(try self.resolve(file, args[0])) };
+    if (std.mem.eql(u8, name, "@splat") and args.len == 1) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[0])) };
     // A type built from its fields' types: `@Struct(layout, backing, names, types, attributes)`,
     // `@Union(layout, tag, names, types, attributes)`, `@Tuple(types)`.
-    if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolve(file, args[3]));
-    if (std.mem.eql(u8, name, "@Tuple") and args.len == 1) return self.reified(try self.resolve(file, args[0]));
+    if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolveIn(env, file, args[3]));
+    if (std.mem.eql(u8, name, "@Tuple") and args.len == 1) return self.reified(try self.resolveIn(env, file, args[0]));
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
-    if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolve(file, args[1])) };
-    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolve(file, args[0]), args[1]);
-    if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolve(file, args[0]), {}, typeOf);
-    if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolve(file, args[0]));
+    if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
+    if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
+    if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
     for ([_][]const u8{ "@errorName", "@tagName", "@typeName", "@embedFile" }) |bytes| if (std.mem.eql(u8, name, bytes)) return .{ .pointer = try self.boxed(.{ .primitive = "u8" }) };
     // A number or a truth value, whatever the arguments are.
     for (numeric_builtins) |number| if (std.mem.eql(u8, name, number)) return .scalar;
     return .{ .unknown = .comptime_dependent };
+}
+
+/// Whether a value is unknown, itself or what a pointer, optional, error union or array holds.
+fn unknownWithin(value: Value) bool {
+    return switch (value) {
+        .unknown => true,
+        .pointer, .optional, .error_union, .array => |inner| unknownWithin(inner.*),
+        else => false,
+    };
 }
 
 /// Whether a declared type holds types as values: `type`, `[N]type`, `[]const type`, `?type`.
@@ -2388,7 +2402,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
                 if (variable.ast.type_node.unwrap()) |t| {
                     const type_value = try self.resolveIn(env, file, t);
-                    if (type_value != .primitive or !std.mem.eql(u8, type_value.primitive, "type")) return self.instance(type_value);
+                    if (!holdsTypes(type_value)) return self.instance(type_value);
                 }
                 if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env, file, init);
             }
@@ -2410,21 +2424,12 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             const base = try self.resolveIn(env, file, operands[0]);
             return self.elementOf(base, tree, operands[1]);
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = builtinArgs(tree, node, &buffer);
-            if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
-            if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
-            if (std.mem.eql(u8, name, "@as") and args.len == 2) {
-                const named = try self.resolveIn(env, file, args[0]);
-                if (holdsTypes(named)) return self.resolveIn(env, file, args[1]);
-                return self.instance(named);
-            }
-            if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
-            if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
-            return self.resolve(file, node);
-        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(env, file, node),
+        .address_of => return .{ .pointer = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
+        .deref => return self.pointee(try self.resolveIn(env, file, tree.nodeData(node).node), {}),
+        .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolveIn(env, file, tree.fullSlice(node).?.ast.sliced), {}), // unreachable: a slice node is a full slice
+        .@"catch" => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[0]), .error_union),
+        .@"orelse" => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[0]), .optional),
         .call_one, .call_one_comma, .call, .call_comma => {
             var call_buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&call_buffer, node).?;

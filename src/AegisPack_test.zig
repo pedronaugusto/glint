@@ -558,6 +558,13 @@ fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: 
 
 test "receivers bound by captures are decided by what they bind" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, lock: u32 };\n";
+    // A generic's result written over its `anytype` parameter (`@TypeOf(&slice[0])`), read
+    // with the call's argument: an element of the slice it is given (airlock's slot lookup).
+    const lookup = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst Index = aegis.handle.Index(Tag, u32);\n";
+    try expectJudged(lookup ++ "const Slot = struct { index: Index };\npub fn find(all: []Slot, index: Index) ?*Slot { if (index.get(all)) |s| { if (s.index == index) return s; } else |_| {} return null; }", pack.access, true, 0);
+    // The same where another `get` the program calls does not resolve, so its calls do not
+    // settle the parameter: the call's own argument does.
+    try expectJudged(lookup ++ "const ext = @import(\"missing\");\nconst Slot = struct { index: Index };\npub fn find(all: []Slot, index: Index) ?*Slot { if (index.get(all)) |s| { if (s.index == index) return s; } else |_| {} return null; }\npub fn other(t: ext.T) void { _ = t.get(1); }", pack.access, true, 0);
     // A switch prong's payload is the union field its item names.
     try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *const U) void { switch (u.*) { .a => |p| _ = p.data, .b => {} } }", pack.access, true, 0);
     try expectJudged(head ++ "const U = union(enum) { a: Plain, b: G(u32) };\npub fn f(u: *U) void { switch (u.*) { .a => {}, .b => |*g| _ = g.data } }", pack.access, true, 1);
