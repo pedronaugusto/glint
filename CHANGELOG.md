@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-21
+
 ### Added
 
 - A002 decides a generic's copies of a value its type parameter types (`var result = value;` of `value: T`) where the parameter is bound: at the definition the copy is the bindings' obligation; a call binding the parameter to a recognized owner is a finding there, naming the copy's line, also through generics that pass the parameter on (as is, or a part of its type information). A binding to a type that does not resolve is undecided; one a surrounding generic's own parameter gives is decided where that is bound. `Facts.parameterCopies`, and the `generic` reason a value is unknown: it depends on a parameter that calls outside the project's reading bind.
