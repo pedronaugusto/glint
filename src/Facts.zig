@@ -1616,20 +1616,46 @@ fn switchPayload(self: *Facts, file: Project.FileId, case_node: Ast.Node.Index, 
         else => return .{ .unknown = .unsupported },
     };
     if (!self.isUnion(container)) return .{ .instance = container };
-    if (full.ast.values.len == 0) return .{ .unknown = .unsupported };
-    var found: ?Value = null;
-    for (full.ast.values) |item| {
+    // The fields the prong takes: those its items name, or for `else` those no other prong names.
+    var fields: std.ArrayList(Decl) = .empty;
+    if (full.ast.values.len == 0) {
+        const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+        const owner = &self.project.files[container.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+        for (model.declarations, 0..) |record, i| {
+            if (record.kind != .field or record.scope != container.scope) continue;
+            const field_name = try self.memberName(owner.tokenSlice(record.token));
+            if (try self.prongNames(file, whole, field_name)) continue;
+            try fields.append(self.gpa, .{ .file = container.file, .index = @intCast(i) }); // safe: declaration indexes come from the bounded frozen model.
+        }
+    } else for (full.ast.values) |item| {
         if (tree.nodeTag(item) != .enum_literal) return .{ .unknown = .unsupported };
-        const field_name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(item)));
-        const field = self.member(container, field_name) orelse return .{ .unknown = .unresolved };
+        const field = self.member(container, try self.memberName(tree.tokenSlice(tree.nodeMainToken(item)))) orelse return .{ .unknown = .unresolved };
         if (self.project.models[field.file.raw()].declarations[field.index].kind != .field) return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
-        const value = try self.declaration(field);
-        if (value == .unknown) return value;
-        if (found) |earlier| {
-            if (!same(earlier, value, 0)) return .{ .unknown = .unsupported };
-        } else found = value;
+        try fields.append(self.gpa, field);
     }
-    return found.?;
+    if (fields.items.len == 0) return .{ .unknown = .unsupported };
+    const values = try self.gpa.alloc(Value, fields.items.len);
+    for (fields.items, values) |field, *value| {
+        // A field with no type holds `void`.
+        const record = self.project.models[field.file.raw()].declarations[field.index]; // safe: enum identities index their owning frozen tables without narrowing.
+        const typed = self.project.files[field.file.raw()].tree.fullContainerField(record.node).?.ast.type_expr != .none; // safe: enum identities index their owning frozen tables without narrowing.
+        value.* = if (typed) try self.declaration(field) else .scalar;
+        if (value.* == .unknown) return value.*;
+    }
+    // An `inline` prong is analysed once per field, its capture each one's payload in turn;
+    // otherwise Zig requires the payloads to be one type.
+    if (full.inline_token != null) return self.choose(values);
+    for (values[1..]) |value| if (!same(values[0], value, 0)) return .{ .unknown = .unsupported };
+    return values[0];
+}
+
+/// Whether a prong of `whole` names the union field `name`.
+fn prongNames(self: *Facts, file: Project.FileId, whole: Ast.full.Switch, name: []const u8) ResolveError!bool {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    for (whole.ast.cases) |case| for (tree.fullSwitchCase(case).?.ast.values) |item| {
+        if (tree.nodeTag(item) == .enum_literal and std.mem.eql(u8, try self.memberName(tree.tokenSlice(tree.nodeMainToken(item))), name)) return true;
+    };
+    return false;
 }
 
 fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.TokenIndex) ResolveError!Value {
