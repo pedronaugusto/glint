@@ -593,8 +593,11 @@ fn bindingTyped(value: Facts.Value) bool {
 /// (there or in what it passes them on to): a finding where the binding is a recognized owner,
 /// reported here, at the binding, naming the copy. An `anytype` parameter is bound to its
 /// argument's value. A binding that does not resolve is undecided; one a generic of this
-/// file's own gives is decided where that one is bound.
-fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+/// file's own gives is decided where that one is bound. For A003, a local the generic acquires
+/// by a function of its type parameter (`var h = Hash.init(.{});`): a binding to a plain type
+/// owes nothing; one to an owner with a release leaves the binding undecided, as the generic's
+/// paths are not walked per binding.
+fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule) Context.Error!void {
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, node) orelse return;
     const name_token = switch (tree.nodeTag(call.ast.fn_expr)) {
@@ -622,6 +625,8 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Err
     }
     const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
     for (made) |copy| {
+        if ((copy.kind == .made) != (rule == cleanup)) continue;
+        if (copy.kind == .made and !try acquiring(c, copy.site)) continue;
         if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
         if (!types[copy.position] and !values[copy.position]) continue;
         const argument = call.ast.params[copy.position - receiver];
@@ -638,6 +643,16 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Err
             .container => |container| Facts.Value{ .instance = container },
             else => value,
         };
+        if (copy.kind == .made) {
+            const site = &c.project.files[copy.site.file.raw()];
+            const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
+            switch (try perBuild(c, bound)) {
+                .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.inputs[copy.site.file.raw()].name, line })),
+                .other => {},
+                .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
+            }
+            continue;
+        }
         switch (try perBuild(c, bound)) {
             .owner => |k| if (copiedOwner(k)) {
                 const site = &c.project.files[copy.site.file.raw()];
@@ -656,7 +671,7 @@ fn checkCopies(c: *Context) Context.Error!void {
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
-        try checkBinding(c, tree, node);
+        try checkBinding(c, tree, node, copies);
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
             if (tree.nodeTag(init) != .identifier) continue;
@@ -878,6 +893,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
     if (!try begin(c, cleanup)) return;
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
+    for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup); // safe: AST node table supplies bounded indexes.
     for (model.declarations) |decl| {
         if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) continue;
         const v = tree.fullVarDecl(decl.node) orelse continue;
@@ -892,6 +908,8 @@ fn checkCleanup(c: *Context) Context.Error!void {
             else => init,
         };
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
+        // By a function of the generic's type parameter: each binding's, checked at the binding.
+        if (c.facts.madeByParameter(c.file, init) != null) continue;
         const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
             const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
             break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
@@ -911,6 +929,24 @@ fn checkCleanup(c: *Context) Context.Error!void {
             .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
+}
+
+/// Whether the local declared at `site` is initialised by an acquisition: an owner's
+/// constructor or an operation that gives one by its name.
+fn acquiring(c: *Context, site: Facts.Key) Context.Error!bool {
+    const tree = &c.project.files[site.file.raw()].tree;
+    const v = tree.fullVarDecl(site.node) orelse return false;
+    const init = v.ast.init_node.unwrap() orelse return false;
+    const value = switch (tree.nodeTag(init)) {
+        .@"try" => tree.nodeData(init).node,
+        .@"catch" => tree.nodeData(init).node_and_node[0],
+        else => init,
+    };
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, value) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
+    return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
 }
 
 /// Whether `call` gives a value of a type the library declares and the contract does not list

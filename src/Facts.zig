@@ -442,8 +442,10 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 /// A local a generic function initialises by copying a value its type parameter at `position`
 /// types (`var result = value;` of `value: T`), or its `anytype` parameter at `position`
 /// (`var local = args;`), there or in a function it passes the parameter on to (as is, or a
-/// part of it its type information gives).
-pub const ParameterCopy = struct { position: usize, site: Key };
+/// part of it its type information gives). Or a local it initialises by calling a function of
+/// its type parameter at `position` (`var h = Hash.init(.{});`): what the call gives is the
+/// binding's, an owner where the binding is one.
+pub const ParameterCopy = struct { position: usize, site: Key, kind: enum { copy, made } = .copy };
 
 /// The copies `function` makes of its generic parameters' values. Found once for every function
 /// outside std: a copy where it is written, then through calls that pass a parameter on, until
@@ -592,11 +594,36 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         const v = t.fullVarDecl(d.node) orelse continue;
         if (v.comptime_token != null) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
+        if (self.madeByParameter(function.file, init)) |position| {
+            try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node }, .kind = .made });
+            continue;
+        }
         if (t.nodeTag(init) != .identifier) continue;
         const named = (model.reference(init) orelse continue).declaration orelse continue;
         const position = self.valueOfParameter(function, named) orelse continue;
         try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node } });
     }
+}
+
+/// The position of the type parameter whose function `value` calls (`T.init(...)`, through
+/// `try` or `catch`), a parameter of the function the call is in declared `comptime T: type`.
+pub fn madeByParameter(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?usize {
+    const t = self.syntaxOf(file);
+    const made = switch (t.nodeTag(value)) {
+        .@"try" => t.nodeData(value).node,
+        .@"catch" => t.nodeData(value).node_and_node[0],
+        else => value,
+    };
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = t.fullCall(&call_buffer, made) orelse return null;
+    if (t.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    const receiver = t.nodeData(call.ast.fn_expr).node_and_token[0];
+    if (t.nodeTag(receiver) != .identifier) return null;
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const index = (model.reference(receiver) orelse return null).declaration orelse return null;
+    const function = self.functionOf(.{ .file = file, .index = index }) orelse return null;
+    if (self.anytypeAt(function, model.declarations[index].token) != null) return null;
+    return self.genericPosition(function, index);
 }
 
 /// A call in `function`'s body passing a generic parameter on (or a part of it) where the
@@ -628,7 +655,7 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             const mine = self.derivedParameter(function, call.ast.params[copy.position - receiver], 0) orelse continue;
             for (out.items) |held| {
                 if (held.position == mine and std.meta.eql(held.site, copy.site)) break;
-            } else try out.append(self.gpa, .{ .position = mine, .site = copy.site });
+            } else try out.append(self.gpa, .{ .position = mine, .site = copy.site, .kind = copy.kind });
         }
     }
 }

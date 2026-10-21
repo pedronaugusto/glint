@@ -165,7 +165,7 @@ test "adopted gates retain unresolved obligations and known unrelated receivers"
         .{ pack.access, "pub fn f(v: anytype) void { _ = v.material; }" },
         .{ pack.access, "pub fn f(comptime T: type, v: *T) void { _ = v.material; }" },
         .{ pack.copies, "pub fn f(v: anytype) *const u32 { return v.expose(); }" },
-        .{ pack.cleanup, "pub fn f(T: type) void { var v = T.init(1); _ = &v; }" },
+        .{ pack.cleanup, "pub fn f(m: anytype) void { var v = m.T.init(1); _ = &v; }" },
         .{ pack.capacity, "pub fn f(T: type, gpa: anytype, bytes: []u8) void { _ = T.adopt(gpa, bytes, 0); }" },
     };
     inline for (cases) |case| {
@@ -1224,7 +1224,8 @@ test "A003 refutes an unresolved acquisition no aegis function can be by its arg
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
     // A receiver held at run time calls a method: `read(self, io)` takes one argument there.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, true, 0);
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, false, 0);
+    // A function of a type parameter gives what each binding makes, checked at the binding.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, true, 0);
 }
 
 test "A002 reads operators and a tuple written in place" {
@@ -1269,6 +1270,17 @@ test "a generic's copies of its parameter are decided where the parameter is bou
     try expectJudged(head ++ "const P = struct { n: u8 };\npub fn f(p: P) void { _ = clone(P, p); _ = outer(P, p); }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = clone(aegis.Secret(u32), s); }", pack.copies, true, 1);
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = outer(aegis.Secret(u32), s); }", pack.copies, true, 1);
+}
+
+test "what a generic acquires by its type parameter is decided where the parameter is bound" {
+    const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { n: u8, fn init(_: struct {}) Plain { return .{ .n = 0 }; } };\nfn digest(comptime Hash: type) void { var h = Hash.init(.{}); _ = &h; }\npub fn sign(comptime Hash: type) void { digest(Hash); }\n";
+    // At the definition, and through a generic passing the parameter on, it is each binding's.
+    try expectJudged(head, pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { sign(Plain); digest(Plain); }", pack.cleanup, true, 0);
+    // A binding to an owner with a release leaves it undecided there: the generic's paths are
+    // not walked per binding. A guarded value owes none; its guard does.
+    try expectJudged(head ++ "pub fn f() void { sign(aegis.Guarded(u32)); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { sign(aegis.Secret([4]u8)); }", pack.cleanup, false, 0);
 }
 
 test "a generic's copies of its anytype parameter are decided where the argument is bound" {
