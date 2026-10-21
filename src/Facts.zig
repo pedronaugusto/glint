@@ -1050,6 +1050,13 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     for ([_][]const u8{ "@errorName", "@tagName", "@typeName", "@embedFile" }) |bytes| if (std.mem.eql(u8, name, bytes)) return .{ .pointer = try self.boxed(.{ .primitive = "u8" }) };
     // A number or a truth value, whatever the arguments are.
     for (numeric_builtins) |number| if (std.mem.eql(u8, name, number)) return .scalar;
+    // Values of std's own types, as the language gives them.
+    if (std.mem.eql(u8, name, "@errorReturnTrace")) {
+        const trace = try self.stdMember(&.{ "builtin", "StackTrace" });
+        if (trace == .unknown) return trace;
+        return .{ .optional = try self.boxed(.{ .pointer = try self.boxed(try self.instance(trace)) }) };
+    }
+    if (std.mem.eql(u8, name, "@src")) return self.instance(try self.stdMember(&.{ "builtin", "SourceLocation" }));
     return .{ .unknown = .comptime_dependent };
 }
 
@@ -1067,6 +1074,17 @@ fn unknownWithin(value: Value) bool {
         .pointer, .optional, .error_union, .array => |inner| unknownWithin(inner.*),
         else => false,
     };
+}
+
+/// A declaration of std's by its path from std's root (`builtin.StackTrace`), where the
+/// project maps std.
+fn stdMember(self: *Facts, path: []const []const u8) ResolveError!Value {
+    const root = for (self.project.imports) |mapping| {
+        if (std.mem.eql(u8, mapping.spelling, "std")) break mapping.target;
+    } else return .{ .unknown = .missing_mapping };
+    var value: Value = .{ .container = .{ .file = root, .scope = 0 } };
+    for (path) |name| value = try self.memberValue(value, name);
+    return value;
 }
 
 /// Whether a declared type holds types as values: `type`, `[N]type`, `[]const type`, `?type`.
@@ -3146,4 +3164,41 @@ test "an error value among a block's breaks makes the others an error union, as 
     try std.testing.expect(found[0] == .instance);
     try std.testing.expect(found[1] == .optional and found[1].optional.* == .instance);
     try std.testing.expect(found[2] == .error_union and found[2].error_union.* == .instance);
+}
+
+test "@errorReturnTrace and @src give std's own types where the project maps std" {
+    const source =
+        \\const std = @import("std");
+        \\pub fn f() void {
+        \\    const here = @src();
+        \\    if (@errorReturnTrace()) |trace| {
+        \\        const held = trace;
+        \\        _ = .{ held, here };
+        \\    }
+        \\}
+    ;
+    const lang = "pub const StackTrace = struct { index: usize };\npub const SourceLocation = struct { line: u32 };\n";
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = source },
+        .{ .name = "std/std.zig", .bytes = "pub const lang = @import(\"lang.zig\");\npub const builtin = lang;\n", .selected = false },
+        .{ .name = "std/lang.zig", .bytes = lang, .selected = false },
+    }, &.{
+        .{ .from = .fromRaw(0), .spelling = "std", .target = .fromRaw(1) },
+        .{ .from = .fromRaw(1), .spelling = "lang.zig", .target = .fromRaw(2) },
+    }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const model = &project.models[0];
+    var found: [2]Value = undefined;
+    for ([_][]const u8{ "held", "here" }, &found) |name, *out| {
+        const d = for (model.declarations) |d| {
+            if (d.kind == .variable and std.mem.eql(u8, d.name, name)) break d;
+        } else unreachable; // unreachable: the source declares each name
+        out.* = try facts.resolve(Project.FileId.fromRaw(0), project.files[0].tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?); // safe: one source.
+    }
+    try std.testing.expect(found[0] == .pointer and found[0].pointer.* == .instance and found[0].pointer.instance.file.eql(.fromRaw(2)));
+    try std.testing.expect(found[1] == .instance and found[1].instance.file.eql(.fromRaw(2)));
 }
