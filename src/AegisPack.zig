@@ -985,7 +985,8 @@ fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context
 /// until a direct `deinit` releases it, a `defer` schedules one, a guard's `handOff` gives its
 /// release to the code the hand-off is passed to (a declared transfer), a `return` gives the
 /// owner itself to the caller, or an assignment stores it where the function does not hold it
-/// (`stored`). An `if` is followed into its branches, a block into its statements and a loop
+/// (`stored`), or a call outside the program takes it by value (`argument`). An `if` and a
+/// `switch` are followed into their branches, a block into its statements and a loop
 /// into its body, and branches that end apart go on apart while a flag tells them so (`Split`):
 /// the body must leave the owner at its back edge as it found it, and the loop goes on in the
 /// state its exits (its `break`s, and its condition when it can fail) agree on; a loop that
@@ -1018,7 +1019,10 @@ const Flow = struct {
     /// (`Split`): an `if` on it takes only the branch that value chooses.
     known: ?Known = null,
 
-    const State = enum { live, released, deferred };
+    /// `passed`: given by value as a call's argument (`try map.put(gpa, key, owner)`), moved
+    /// into the call where nothing names the owner after it; where something does, the callee
+    /// may have kept it or read a copy, and the walk stops undecided.
+    const State = enum { live, released, deferred, passed };
     const States = std.EnumSet(State);
     /// The ways on from a run of statements, by the state each leaves the owner in: past its
     /// end, out of the walk's loop, and back to that loop's start. None: every path ends (a
@@ -1060,6 +1064,13 @@ const Flow = struct {
         var state = start;
         var out: Paths = .{};
         for (statements, 0..) |stmt, at| {
+            if (state == .passed) {
+                if (try f.reacquired(stmt)) {
+                    state = .live;
+                    continue;
+                }
+                if (try f.uses(stmt) != .none) return .uncertain;
+            }
             if (state == .live and !f.aggregate) if (try f.movedInto(stmt)) |aggregate| {
                 f.token = aggregate;
                 f.aggregate = true;
@@ -1073,6 +1084,15 @@ const Flow = struct {
             if (try f.handedOff(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
                 state = .released;
+                continue;
+            }
+            if (state == .live and !f.aggregate and try f.argument(stmt)) {
+                // Its error exits leave the owner with the caller: the call failed to take it.
+                const paths = (try f.jumps(stmt, state)).settled() orelse return .uncertain;
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+                if (paths.falls == null) return .{ .paths = out };
+                state = .passed;
                 continue;
             }
             if (!f.aggregate and try f.stored(stmt)) {
@@ -1175,6 +1195,20 @@ const Flow = struct {
             return .{ .paths = out };
         }
         if (f.tree.fullWhile(stmt) != null or f.tree.fullFor(stmt) != null) return f.repeat(stmt, state);
+        // An unlabeled `switch`: each prong a branch (its items are compile-time values).
+        if (f.tree.fullSwitch(stmt)) |choice| if (choice.label_token == null) {
+            var out = (try f.leave(choice.ast.condition, state)).settled() orelse return .uncertain;
+            var falls: ?State = null;
+            for (choice.ast.cases) |node| {
+                const prong = f.tree.fullSwitchCase(node).?; // unreachable: a switch's cases are cases
+                const paths = (try f.block(prong.ast.target_expr, state)).settled() orelse return .uncertain;
+                falls = meet(falls, paths.falls) catch return .uncertain;
+                out.breaks.setUnion(paths.breaks);
+                out.continues.setUnion(paths.continues);
+            }
+            out.falls = falls;
+            return .{ .paths = out };
+        };
         // A block of its own, unlabeled: its statements in turn.
         switch (f.tree.nodeTag(stmt)) {
             .block, .block_semicolon, .block_two, .block_two_semicolon => if (f.tree.tokenTag(f.tree.nodeMainToken(stmt) -| 1) != .colon) return f.block(stmt, state),
@@ -1365,10 +1399,13 @@ const Flow = struct {
         return .{ .paths = out };
     }
 
+    /// The state two paths agree on: one, or `passed` where the other released.
     fn meet(a: ?State, b: ?State) error{Differ}!?State {
         const x = a orelse return b;
         const y = b orelse return a;
-        return if (x == y) x else error.Differ;
+        if (x == y) return x;
+        if ((x == .passed and y == .released) or (x == .released and y == .passed)) return .passed;
+        return error.Differ;
     }
 
     /// A statement or expression the walk does not enter, from `state`: how it uses the
@@ -1382,6 +1419,11 @@ const Flow = struct {
             .members => if (state == .released) try f.c.at(cleanup, f.firstUse(node), "same local owner used after its cleanup or transfer on every path here"),
             .other => return .uncertain,
         }
+        return f.jumps(node, state);
+    }
+
+    /// Where `node` can jump, from `state` (`leave`).
+    fn jumps(f: Flow, node: Ast.Node.Index, state: State) Context.Error!Outcome {
         const first = f.tree.firstToken(node);
         const last = f.tree.lastToken(node);
         var out: Paths = .{ .falls = state };
@@ -1398,8 +1440,10 @@ const Flow = struct {
                 .inside => {},
                 .loop_break => out.breaks.insert(state),
                 .loop_continue => out.continues.insert(state),
-                .out => if (f.errdeferred and try failing(f.c, f.tree, jumping)) {
-                    if (state == .released) try f.c.at(cleanup, main, "an errdefer releases the same local owner again on this error exit, after its cleanup or transfer");
+                .out => if (f.errdeferred and try failing(f.c, f.tree, jumping)) switch (state) {
+                    .released => try f.c.at(cleanup, main, "an errdefer releases the same local owner again on this error exit, after its cleanup or transfer"),
+                    .passed => return .uncertain,
+                    .live, .deferred => {},
                 } else if (state == .live) return .uncertain,
                 .other => return .uncertain,
             }
@@ -1600,6 +1644,35 @@ const Flow = struct {
         const data = f.tree.nodeData(call.ast.fn_expr).node_and_token;
         const index = Contract.local(f.c, data[0]) orelse return false;
         return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
+    }
+
+    /// A statement that is a call, or keeps or tries its result, with the owner itself among
+    /// its arguments and named nowhere else in the statement, to a function outside the
+    /// program's own sources (std's containers, a dependency's): one that takes an owner by
+    /// value keeps it, as a `put` or an `append` does. A function of the program's own is not
+    /// walked for what it does with its parameter, so a call to one stays undecided.
+    fn argument(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        var value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) f.tree.nodeData(stmt).node_and_node[1] else stmt;
+        if (f.tree.nodeTag(value) == .@"try") value = f.tree.nodeData(value).node;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = f.tree.fullCall(&buffer, value) orelse return false;
+        var given: usize = 0;
+        for (call.ast.params) |param| {
+            if (f.mine(param)) given += 1;
+        }
+        if (given != 1) return false;
+        const callee = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return false;
+        if (f.c.project.inputs[callee.file.raw()].selected) return false;
+        const first = f.tree.firstToken(stmt);
+        const last = f.tree.lastToken(stmt);
+        var named: usize = 0;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = f.tree.nodeMainToken(candidate);
+            if (main >= first and main <= last and f.mine(candidate)) named += 1;
+        }
+        return named == 1;
     }
 
     /// `place = owner` into storage the function does not hold, the owner itself by value: a

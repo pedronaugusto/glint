@@ -689,6 +689,38 @@ test "an owner stored where the function does not hold it is transferred" {
     try expectJudged(head ++ "pub fn f() void { var s = S(u32).init(1); { _ = s.expose(); s.deinit(); } }", pack.cleanup, true, 0);
 }
 
+fn expectJudgedWithDependency(source: []const u8, dependency: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWithDependency(std.testing.allocator, source, dependency);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "an owner given by value to a dependency's function is the function's" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst lib = @import(\"lib\");\n";
+    const map = "const S = @import(\"aegis\").Secret;\npub const Map = struct { pub fn put(self: *Map, value: S(u32)) !void { _ = self; _ = value; } pub fn keep(self: *Map, value: S(u32)) void { _ = self; _ = value; } };\n";
+    // Its last use, an errdefer covering the call's failure.
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) !void { var s = S(u32).init(1); errdefer s.deinit(); _ = s.expose(); try m.put(s); }", map, pack.cleanup, true, 0);
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) void { const s = S(u32).init(1); m.keep(s); }", map, pack.cleanup, true, 0);
+    // A failure that leaves the owner with nothing to release it, or a use after the call: undecided.
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) !void { const s = S(u32).init(1); try m.put(s); }", map, pack.cleanup, false, 0);
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) void { var s = S(u32).init(1); m.keep(s); s.deinit(); }", map, pack.cleanup, false, 0);
+    // A function of the program's own is not walked for what it does with the owner.
+    try expectJudged("const S = @import(\"aegis\").Secret;\nfn keep(value: S(u32)) void { _ = value; }\npub fn f() void { const s = S(u32).init(1); keep(s); }", pack.cleanup, false, 0);
+}
+
+test "a switch's prongs are the owner's branches" {
+    const head = "const S = @import(\"aegis\").Secret;\nfn read() error{ A, B }!usize { return 0; }\n";
+    try expectJudged(head ++ "pub fn f(n: u8) void { var s = S(u32).init(1); switch (n) { 0 => s.deinit(), else => { _ = s.expose(); s.deinit(); } } }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(n: u8) void { var s = S(u32).init(1); switch (n) { 0 => s.deinit(), else => {} } }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(n: u8) void { var s = S(u32).init(1); switch (n) { 0 => s.deinit(), else => {} } s.deinit(); }", pack.cleanup, false, 0);
+    // A handler's prongs: released and gone on one, the owner returned past the others.
+    try expectJudged(head ++ "pub fn f() !?S(u32) { var s = S(u32).init(1); errdefer s.deinit(); const n = read() catch |err| switch (err) { error.A => 0, error.B => { s.deinit(); return null; } }; _ = n; return s; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(n: u8) void { var s = S(u32).init(1); switch (n) { 0 => s.deinit(), else => {} } _ = s.expose(); }", pack.cleanup, false, 0);
+}
+
 test "a flag set with the transfer tells the owner's paths apart" {
     const head = "const S = @import(\"aegis\").Secret;\nfn ready() bool { return true; }\n";
     // Stored on one path, flagged; the flag later chooses the release.

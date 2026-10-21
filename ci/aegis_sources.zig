@@ -172,10 +172,19 @@ pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
 /// `project`, with a second source of the program's own, imported by the consumer as `lib`
 /// and importing aegis as `aegis`: a module a program reaches its types through.
 pub fn projectWith(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8) !glint.Project {
+    return withLib(gpa, consumer, lib, true);
+}
+
+/// `projectWith`, the second source a dependency's: outside the program's own sources.
+pub fn projectWithDependency(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8) !glint.Project {
+    return withLib(gpa, consumer, lib, false);
+}
+
+fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, selected: bool) !glint.Project {
     var inputs: [sources.len + 2]Project.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
     for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
-    inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib };
+    inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib, .selected = selected };
     const lib_file = file(sources.len + 1);
     const mapped = imports();
     var all: [mapped.len + 2]Project.Import = undefined;
