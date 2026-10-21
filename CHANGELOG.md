@@ -11,10 +11,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Changed
 
 - A003 reads a `MustUse`'s `deinit` after its `take` or `acknowledge` as the check that it was discharged, as aegis has it, no longer a use after release that leaves the site undecided.
+- A `switch` prong on a comptime enum parameter settles it for what the prong reads, as `if` on a comptime `bool` does: a value an earlier `switch` on the same parameter chose is that prong's alone (strand's three readers in `keep_test.zig`); a function that switches on one branches per build for A003.
 - A003 reads a `defer` or `errdefer` block that releases the owner once at its top level (`defer { guard.deinit(io); self.gpa.destroy(self); }`), the owner named before the release only through its members and not after it.
 
 ### Fixed
 
+- Two instantiations of one type function (`Line(Plain)`, `Line(Guarded)`) are two types: a choice of them kept only the first, so a member read through the choice missed the other's finding while the run counted as complete.
 - A made container's declaration that names a type another call makes (`const State = Inner(T); pub const Record = State.Record;`) is read with the bindings of the call that made the container. It was read with the union of every caller's, so `Outer(Plain).Record`'s fields took the types of every `Outer(...)` in the project: undecided sites (chronicle's `record.event`), and a false A001 finding where another caller bound a guard.
 
 ## [0.4.3] - 2026-10-21
