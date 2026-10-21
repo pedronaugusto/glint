@@ -974,6 +974,12 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
     try expectJudged(head ++ "pub fn f(t: *Table, r: aegis.scope.Ref(Tag, *u32)) void { _ = t.open_count; _ = r.generation; }", pack.access, true, 2);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); _ = &s; }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer s.end(); }", pack.cleanup, true, 0);
+    // A deferred block that ends it once at its top level, the scope not named after.
+    try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); defer { s.end(); n.* += 1; } }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); errdefer { n.* += 1; s.end(); } try g(); s.end(); }\nfn g() !void {}", pack.cleanup, true, 0);
+    // Ended only on one branch of the block, or named again after it, the block is not read.
+    try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); defer { if (n.* == 0) s.end(); } }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer { s.end(); _ = s.ref(t); } }", pack.cleanup, false, 0);
     try expectJudged(head ++ "pub fn f(t: *Table) !void { const s = try t.open(); defer s.end(); const copy = s; _ = copy; }", pack.copies, true, 0);
     // Unparsed input read past its parser; a decision read past its declassification.
     try expectJudged(head ++ "pub fn f(u: aegis.input.Untrusted([]const u8)) []const u8 { return u.readForParse(); }", pack.access, true, 0);

@@ -992,7 +992,7 @@ const Flow = struct {
                 continue;
             };
             // `errdefer owner.deinit()`: the owner is released on the error exits that follow.
-            if (f.tree.nodeTag(stmt) == .@"errdefer" and state == .live and !f.aggregate and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind)) {
+            if (f.tree.nodeTag(stmt) == .@"errdefer" and state == .live and !f.aggregate and try f.releasesIn(f.tree.nodeData(stmt).node)) {
                 f.errdeferred = true;
                 continue;
             }
@@ -1002,7 +1002,7 @@ const Flow = struct {
                 continue;
             }
             const tag = f.tree.nodeTag(stmt);
-            const deferred = !f.aggregate and tag == .@"defer" and try release(f.c, f.tree.nodeData(stmt).node, f.token, f.kind);
+            const deferred = !f.aggregate and tag == .@"defer" and try f.releasesIn(f.tree.nodeData(stmt).node);
             if (deferred or (!f.aggregate and try release(f.c, stmt, f.token, f.kind))) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), if (deferred) "same local capability has repeated cleanup scheduled on this straight-line path" else "same local capability is cleaned twice on this straight-line path");
                 state = if (deferred) .deferred else .released;
@@ -1397,6 +1397,28 @@ const Flow = struct {
         const data = f.tree.nodeData(call.ast.fn_expr).node_and_token;
         const index = Contract.local(f.c, data[0]) orelse return false;
         return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
+    }
+
+    /// Whether a `defer` or `errdefer` body releases the owner: the release itself, or a block
+    /// that makes it once at its top level, the owner named before it only through its members
+    /// and not at all after it.
+    fn releasesIn(f: Flow, body: Ast.Node.Index) Context.Error!bool {
+        if (try release(f.c, body, f.token, f.kind)) return true;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = f.tree.blockStatements(&buffer, body) orelse return false;
+        var released = false;
+        for (statements) |stmt| {
+            if (!released and try release(f.c, stmt, f.token, f.kind)) {
+                released = true;
+                continue;
+            }
+            switch (try f.uses(stmt)) {
+                .none => {},
+                .members => if (released) return false,
+                .other => return false,
+            }
+        }
+        return released;
     }
 
     /// `owner.deinit()` of a result obligation: the check that its discharge came.
