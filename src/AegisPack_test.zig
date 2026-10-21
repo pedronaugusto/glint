@@ -1356,4 +1356,14 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 0);
     // An argument that does not resolve leaves the call undecided.
     try expectJudged(head ++ "pub fn f(g: fn () @import(\"missing\").T) void { keep(g()); }", pack.copies, false, 0);
+    // A `comptime` parameter's value holds nothing at run time: its copies are no owner's.
+    const fixed = "const aegis = @import(\"aegis\");\nfn digits(comptime value: anytype) usize { var rest = value; _ = &rest; return 1; }\nfn width(comptime T: type, comptime value: T) usize { const copy = value; _ = copy; return 1; }\n";
+    try expectJudged(fixed ++ "pub fn f(g: fn () @import(\"missing\").T) usize { return digits(g()) + width(u8, 1); }", pack.copies, true, 0);
+    // Arguments plain as written: a vector, an enum's or a union's tag, `{}`, a tuple of plain
+    // values, an element of a typed array of plain tuples.
+    const shapes = head ++ "const Color = enum { red, @\"with space\" };\nconst Shape = union(enum) { circle: f32, empty };\n";
+    try expectJudged(shapes ++ "pub fn f() void { keep(@as(@Vector(3, u8), @splat(1))); keep(Color.red); keep(Color.@\"with space\"); keep(Shape.empty); keep({}); keep(.{ 1, \"two\" }); }", pack.copies, true, 0);
+    try expectJudged(shapes ++ "pub fn f() void { const cases = [_]struct { f64, []const u8 }{ .{ 0.5, \"0.5\" } }; for (cases) |case| keep(case[0]); }", pack.copies, true, 0);
+    // A tuple holding an owner is not plain.
+    try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32), g: fn () @import(\"missing\").T) void { keep(.{ s, g() }); }", pack.copies, false, 0);
 }

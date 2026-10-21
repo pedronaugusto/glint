@@ -571,12 +571,14 @@ fn hasGenericParameter(self: *const Facts, function: Decl) bool {
 }
 
 /// The generic parameter whose value `value` is: a parameter of `function` declared `T` of a
-/// type parameter, or an `anytype` parameter, its own argument's value.
+/// type parameter, or an `anytype` parameter, its own argument's value. A `comptime` one's
+/// value is known as the program compiles and holds nothing at run time: none.
 fn valueOfParameter(self: *const Facts, function: Decl, value: u32) ?usize {
     const model = &self.project.models[function.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const record = model.declarations[value];
     if (record.kind != .parameter or model.scopes[record.scope].node != self.scopeNode(function)) return null;
     const t = self.syntaxOf(function.file);
+    if (record.token > 0 and t.tokenTag(record.token - 1) == .keyword_comptime) return null;
     if (self.anytypeAt(function, record.token)) |position| return position;
     if (t.nodeTag(record.node) != .identifier) return null;
     const named = (model.reference(record.node) orelse return null).declaration orelse return null;
@@ -658,6 +660,16 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             } else try out.append(self.gpa, .{ .position = mine, .site = copy.site, .kind = copy.kind });
         }
     }
+}
+
+/// Whether `node`, an identifier, names a `comptime` parameter.
+pub fn comptimeParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const t = self.syntaxOf(file);
+    if (t.nodeTag(node) != .identifier) return false;
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const index = (model.reference(node) orelse return false).declaration orelse return false;
+    const record = model.declarations[index];
+    return record.kind == .parameter and record.token > 0 and t.tokenTag(record.token - 1) == .keyword_comptime;
 }
 
 /// Whether `node`, an identifier, names a value of a type parameter of its function (`value`
@@ -990,6 +1002,9 @@ fn builtin(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveErro
         return self.declaration(target);
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) return self.instance(try self.resolve(file, args[0]));
+    // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
+    // pointers.
+    if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolve(file, args[1])) };
     if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, args[0], args[1]);
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolve(file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolve(file, args[0]));
@@ -1059,8 +1074,31 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
         .unknown => return lhs,
         else => return .{ .unknown = .unresolved },
     };
+    // A tag named on an enum or a union type (`Color.red`, `Shape.empty`): a value of it.
+    if (lhs == .container and self.declaresTag(container, name)) return .{ .instance = container };
     if (self.member(container, name)) |decl| return self.memberOf(container, decl);
     return .{ .unknown = .unresolved };
+}
+
+/// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags. An
+/// enum's field is written as a bare name, which Zig's syntax tree reads as a tuple's field.
+fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
+    const node = self.project.models[container.file.raw()].scopes[container.scope].node; // safe: enum identities index their owning frozen tables without narrowing.
+    if (node == .root) return false;
+    const tree = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, node) orelse return false;
+    switch (tree.tokenTag(decl.ast.main_token)) {
+        .keyword_enum, .keyword_union => {},
+        else => return false,
+    }
+    for (decl.ast.members) |member_node| {
+        var field = tree.fullContainerField(member_node) orelse continue;
+        field.convertToNonTupleLike(tree);
+        if (field.ast.tuple_like) continue;
+        if (std.mem.eql(u8, Model.identifier(self.gpa, tree.tokenSlice(field.ast.main_token)) catch return false, name)) return true;
+    }
+    return false;
 }
 
 /// Whether a container written in the program declares no member `name`.
@@ -2274,6 +2312,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
             if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
             if (std.mem.eql(u8, name, "@as") and args.len == 2) return self.instance(try self.resolveIn(env, file, args[0]));
+            if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
             return self.resolve(file, node);
         },
         .call_one, .call_one_comma, .call, .call_comma => {

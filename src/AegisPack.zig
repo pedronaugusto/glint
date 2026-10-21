@@ -679,6 +679,9 @@ fn checkCopies(c: *Context) Context.Error!void {
             if (c.project.models[c.file.raw()].reference(init) == null) continue; // safe: the checked source handle indexes this frozen model.
             // A value of a generic's parameter: each binding's copy, checked at the binding.
             if (c.facts.parameterValue(c.file, init)) continue;
+            // A `comptime` parameter's value, known as the program compiles: it holds nothing at
+            // run time.
+            if (c.facts.comptimeParameter(c.file, init)) continue;
             // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
             if (v.ast.type_node.unwrap()) |t| if (try plainType(c, c.file, t, 0)) continue;
             if (try plainValue(c, c.file, init, 0)) continue;
@@ -756,6 +759,19 @@ fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usi
         .optional_type => plainType(c, file, tree.nodeData(node).node, depth + 1),
         .error_union => plainType(c, file, tree.nodeData(node).node_and_node[1], depth + 1),
         .identifier => try c.facts.resolve(file, node) == .primitive,
+        // A struct or tuple type written in place, every field plain: never a published aegis
+        // type, which has a name.
+        .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing => blk: {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const decl = tree.fullContainerDecl(&buffer, node).?; // unreachable: the tag is a container's
+            if (tree.tokenTag(decl.ast.main_token) != .keyword_struct) break :blk false;
+            for (decl.ast.members) |member| {
+                const field = tree.fullContainerField(member) orelse continue;
+                const t = field.ast.type_expr.unwrap() orelse break :blk false;
+                if (!try plainType(c, file, t, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
         // `@Vector(n, T)`: lanes of plain data.
         .builtin_call_two, .builtin_call_two_comma => blk: {
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@Vector")) break :blk false;
@@ -796,12 +812,40 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             const otherwise = branch.ast.else_expr.unwrap() orelse return false;
             return try plainValue(c, file, branch.ast.then_expr, depth + 1) or try plainValue(c, file, otherwise, depth + 1);
         },
-        .block, .block_semicolon, .block_two, .block_two_semicolon => return plainBreaks(c, file, node, depth + 1),
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            // `{}`: void.
+            var buffer: [2]Ast.Node.Index = undefined;
+            const brace = tree.nodeMainToken(node);
+            if ((tree.blockStatements(&buffer, node) orelse return false).len == 0 and (brace < 2 or tree.tokenTag(brace - 1) != .colon)) return true;
+            return plainBreaks(c, file, node, depth + 1);
+        },
+        // A literal of plain values, with no type of its own or of a plain type.
+        .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
+            if (literal.ast.type_expr.unwrap()) |t| return plainType(c, file, t, depth + 1);
+            for (literal.ast.elements) |element| if (!try plainValue(c, file, element, depth + 1)) return false;
+            return true;
+        },
+        .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (tree.fullStructInit(&buffer, node).?.ast.fields) |field| if (!try plainValue(c, file, field, depth + 1)) return false; // unreachable: the tag is a struct literal's
+            return true;
+        },
         .identifier => {
             const ref = model.reference(node) orelse return false;
             const index = ref.declaration orelse return false;
             const decl = model.declarations[index];
             if (decl.kind == .parameter) return plainType(c, file, decl.node, depth + 1);
+            // A `for` capture over plain inputs: an element of plain data, or a number.
+            if (decl.kind == .capture) {
+                const loop = tree.fullFor(decl.node) orelse return false;
+                for (loop.ast.inputs) |input| {
+                    if (tree.nodeTag(input) == .for_range) continue;
+                    if (!try plainValue(c, file, input, depth + 1)) return false;
+                }
+                return true;
+            }
             const v = tree.fullVarDecl(decl.node) orelse return false;
             if (v.ast.type_node.unwrap()) |t| return plainType(c, file, t, depth + 1);
             const init = v.ast.init_node.unwrap() orelse return false;
