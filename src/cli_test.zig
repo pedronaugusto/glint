@@ -3,6 +3,10 @@ const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
 
+/// Where a refused line's message goes in tests that only read the error.
+var quiet_buffer: [256]u8 = undefined;
+var quiet: std.Io.Writer.Discarding = .init(&quiet_buffer);
+
 fn resultPath(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]const u8 {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(path);
@@ -20,7 +24,7 @@ fn completionCase(findings: bool) !void {
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "test-run", input }, &output.writer);
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "test-run", input }, &output.writer, &quiet.writer);
     try std.testing.expectEqual(@as(u8, if (findings) 1 else 0), status); // safe: explicit compile-time type selection; the value is representable in that type.
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "result.json", a, .limited(65536));
     defer a.free(bytes);
@@ -52,7 +56,7 @@ test "completion output failure cannot publish success" {
     const result = try resultPath(a, &tmp, "result.json");
     defer a.free(result);
     var failed: std.Io.Writer = .failing;
-    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "failed-run", input }, &failed));
+    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "failed-run", input }, &failed, &quiet.writer));
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "result.json", a, .limited(65536));
     defer a.free(bytes);
     const json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
@@ -81,9 +85,9 @@ test "completion missing input and bad arguments never certify clean" {
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "missing", missing }, &output.writer));
+    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "missing", missing }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "input_failure");
-    try std.testing.expectError(error.UnknownOption, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "bad-args", "--invalid" }, &output.writer));
+    try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "bad-args", "--invalid" }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "argument_failure");
 }
 
@@ -98,7 +102,7 @@ test "completion unread required import is a traversal failure" {
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "traversal", input }, &output.writer));
+    try std.testing.expectError(error.FileNotFound, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "traversal", input }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "traversal_failure");
 }
 
@@ -114,10 +118,10 @@ test "completion canceled input publishes failure and cannot inherit old success
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    _ = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "old-success", input }, &output.writer);
+    _ = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "old-success", input }, &output.writer, &quiet.writer);
     const fault = try shakedown.FaultIo.init(a, std.testing.io, .{ .plan = &.{.{ .at = .{ .nth = .{ .call = .dirRealPathFile, .n = 1 } }, .fault = .{ .fail = error.Canceled } }} });
     defer fault.deinit();
-    try std.testing.expectError(error.Canceled, cli.execute(a, fault.io(), &.{ "glint", "--result", result, "--run-id", "canceled", input }, &output.writer));
+    try std.testing.expectError(error.Canceled, cli.execute(a, fault.io(), &.{ "glint", "--result", result, "--run-id", "canceled", input }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "canceled");
 }
 
@@ -139,7 +143,7 @@ test "completion flush failure after buffering every byte cannot certify success
     defer a.free(result);
     var failing: Failing = .{ .writer = undefined };
     failing.writer = .{ .vtable = &.{ .drain = Failing.drain }, .buffer = &failing.buffer };
-    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "flush", input }, &failing.writer));
+    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "flush", input }, &failing.writer, &quiet.writer));
     try std.testing.expect(failing.writer.end > 0);
     try expectOutcome(&tmp, "output_failure");
 }
@@ -162,7 +166,7 @@ test "completion lexical resource budget refuses a completed run" {
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    try std.testing.expectError(error.SourceTooComplex, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "budget", input }, &output.writer));
+    try std.testing.expectError(error.SourceTooComplex, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "budget", input }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "analysis_incomplete");
 }
 
@@ -173,7 +177,7 @@ test "completion help write failure is an output failure" {
     const result = try resultPath(a, &tmp, "result.json");
     defer a.free(result);
     var failed: std.Io.Writer = .failing;
-    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "help-fails", "--help" }, &failed));
+    try std.testing.expectError(error.WriteFailed, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "help-fails", "--help" }, &failed, &quiet.writer));
     try expectOutcome(&tmp, "output_failure");
 }
 
@@ -185,9 +189,9 @@ test "completion retired rule selections are argument failures" {
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    try std.testing.expectError(error.UnknownRule, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "removed", "--only", "Z033" }, &output.writer));
+    try std.testing.expectError(error.UnknownRule, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "removed", "--only", "Z033" }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "argument_failure");
-    try std.testing.expectError(error.UnknownOption, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "retired", "--compatibility" }, &output.writer));
+    try std.testing.expectError(error.InvalidArguments, cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "retired", "--compatibility" }, &output.writer, &quiet.writer));
     try expectOutcome(&tmp, "argument_failure");
 }
 
@@ -202,7 +206,7 @@ test "G2 completion rejects incomplete analysis despite every finding being allo
     defer a.free(result);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--only", "Z012", "--gate", "Z012", "--result", result, "--run-id", "incomplete-allowed", input }, &output.writer);
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--result", result, "--run-id", "incomplete-allowed", "--only", "Z012", "--gate", "Z012", input }, &output.writer, &quiet.writer);
     try std.testing.expectEqual(@as(u8, 2), status); // safe: incomplete analysis uses the failure exit class.
     const receipt = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, result, a, .limited(4096));
     defer a.free(receipt);
@@ -236,10 +240,10 @@ test "a package directory names its files' package, the innermost one winning" {
     defer a.free(inner);
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--package", owner, "--package", inner, joined[3], joined[4], joined[5] }, &output.writer);
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--config", joined[0], "--package", owner, "--package", inner, joined[3], joined[4], joined[5] }, &output.writer, &quiet.writer);
     try std.testing.expectEqual(@as(u8, 1), status); // safe: findings exit.
     try std.testing.expect(std.mem.find(u8, output.written(), "a.zig:2") == null);
     try std.testing.expect(std.mem.find(u8, output.written(), "b.zig:2") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "c.zig:2") != null);
-    try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer));
+    try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer, &quiet.writer));
 }

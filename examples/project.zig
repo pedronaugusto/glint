@@ -13,6 +13,8 @@ pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
-    const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &rules) catch std.process.exit(2);
+    var problems_buffer: [1024]u8 = undefined;
+    var problems = std.Io.File.stderr().writer(init.io, &problems_buffer);
+    const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch std.process.exit(2);
     if (status != 0) std.process.exit(status);
 }

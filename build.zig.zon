@@ -9,6 +9,10 @@
             .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.14#5852ab956e97a47926af73abbb7dced5361f9267",
             .hash = "aegis-0.1.14-rsxouiwFCACpt6FVOECFUhpjUaetlNneWpaDTj95q514",
         },
+        .ensign = .{
+            .url = "git+https://github.com/pedronaugusto/ensign?ref=v0.2.3#4637655dfb128aee48ea1ef9146c911523075cef",
+            .hash = "ensign-0.2.3-6eMTDycrBACbFVaH6ffvt5cPJNAkyBxEsGMgeXC3_ARP",
+        },
     },
     .dev_dependencies = .{
         .preflight = .{

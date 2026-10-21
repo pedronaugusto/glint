@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- glint's command line is read by ensign 0.2.3 from a declaration (`cli.Arguments`), as `glint-build-gate`'s is: generated help (`--help`), `--version`, completions' spelling, and a mistake named with the nearest option (`unknown option '--onyl'; did you mean '--only'?`). The starting rules are one of `--only` (repeated), `--reviewed`, `--family` and `--config`, and `--report`, `--gate` and `--disable` set levels over them whatever their order; a later value of one option replaces an earlier one. `--enable` goes: it was `--report`. `--result` and `--run-id` come before every other argument, so a line glint refuses still leaves its record (`argument_failure`); `glint-build-gate` passes them so. `cli.execute` and `cli.executeConfigured` take a `problems` writer for a refused line's message, and return `error.InvalidArguments` for one.
+
 ### Added
 
 - A003 witnesses: a member of a local owner used where every path has released or transferred it, and an `errdefer` that releases the owner again on an error exit after its cleanup or transfer.

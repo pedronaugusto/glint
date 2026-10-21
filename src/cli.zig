@@ -7,6 +7,8 @@ const Report = @import("Report.zig");
 const RuleContext = @import("RuleContext.zig");
 const Runner = @import("Runner.zig");
 const Result = @import("Result.zig");
+const ensign = @import("ensign");
+const release = @import("release");
 const Cli = @This();
 
 const Module = struct { name: []const u8, path: []const u8 };
@@ -19,7 +21,6 @@ const Options = struct {
     packages: std.ArrayList(Module) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
     zig_lib_path: ?[]const u8 = null,
-    help: bool = false,
 };
 
 const Loader = struct {
@@ -117,100 +118,142 @@ fn within(root: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, root, path) or (root.len == 1 and std.Io.Dir.path.isSep(root[0]) and std.Io.Dir.path.isAbsolute(path)) or (std.mem.startsWith(u8, path, root) and path.len > root.len and std.Io.Dir.path.isSep(path[root.len]));
 }
 
-fn value(args: []const []const u8, index: *usize) ![]const u8 {
-    index.* += 1;
-    if (index.* >= args.len) return error.MissingArgument;
-    return args[index.*];
-}
+/// What a caller asks of the run before its line is read: a record of how the run went, at
+/// `--result`, so a line glint refuses still leaves one. It comes first; the rest of the line
+/// is glint's own (`Arguments`).
+const Request = struct {
+    result: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
+    arguments: []const []const u8 = &.{},
+    pub const spec: ensign.Spec(@This()) = .{
+        .name = "glint",
+        .help = null,
+        .options = .{
+            .result = .{ .value_name = "FILE", .hint = .file, .help = "Write the run's record here" },
+            .run_id = .{ .value_name = "ID", .help = "The run's name in its record" },
+            .arguments = .{ .positional = true, .raw = true, .value_name = "ARGUMENT" },
+        },
+    };
+};
 
-fn options(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !Options {
-    return optionsConfigured(a, io, args, &.{});
-}
-fn optionsConfigured(a: std.mem.Allocator, io: std.Io, args: []const []const u8, definitions: []const Rule.Definition) !Options {
-    var result: Options = .{};
-    var selected = false;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--help")) {
-            result.help = true;
-        } else if (std.mem.eql(u8, arg, "--format")) {
-            result.format = std.meta.stringToEnum(Report.Format, try value(args, &i)) orelse return error.UnknownFormat;
-        } else if (std.mem.eql(u8, arg, "--only")) {
-            if (!selected) {
-                result.config = Rule.Config.none();
-                selected = true;
-            }
-            const rule = Rule.parseConfigured(try value(args, &i), definitions) orelse return error.UnknownRule;
-            try select(a, &result.config, rule, .report);
-        } else if (std.mem.eql(u8, arg, "--reviewed")) {
-            result.config = Rule.Config.reviewed();
-            selected = false;
-        } else if (std.mem.eql(u8, arg, "--enable") or std.mem.eql(u8, arg, "--disable")) {
-            const rule = Rule.parseConfigured(try value(args, &i), definitions) orelse return error.UnknownRule;
-            try select(a, &result.config, rule, if (std.mem.eql(u8, arg, "--enable")) .report else .off);
-        } else if (std.mem.eql(u8, arg, "--family")) {
-            result.config = Rule.Config.family();
-            selected = false;
-        } else if (std.mem.eql(u8, arg, "--gate") or std.mem.eql(u8, arg, "--report")) {
-            const rule = Rule.parseConfigured(try value(args, &i), definitions) orelse return error.UnknownRule;
-            try select(a, &result.config, rule, if (std.mem.eql(u8, arg, "--gate")) .gate else .report);
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, try value(args, &i), a, .limited(4 * 1024 * 1024));
-            result.config = try configure(a, bytes, definitions);
-            selected = false;
-        } else if (std.mem.eql(u8, arg, "--max-function-lines")) {
-            result.config.max_function_lines = try std.fmt.parseInt(u32, try value(args, &i), 10);
-        } else if (std.mem.eql(u8, arg, "--fact-budget")) {
-            result.config.fact_budget = try std.fmt.parseInt(usize, try value(args, &i), 10);
-        } else if (std.mem.eql(u8, arg, "--max-line-length")) {
-            result.config.max_line_length = try std.fmt.parseInt(u32, try value(args, &i), 10);
-        } else if (std.mem.eql(u8, arg, "--strict-suppressions")) {
-            result.config.strict_suppressions = true;
-        } else if (std.mem.eql(u8, arg, "--metrics")) {
-            result.config.metrics = true;
-        } else if (std.mem.eql(u8, arg, "--zig-lib-path")) {
-            result.zig_lib_path = try value(args, &i);
-        } else if (std.mem.eql(u8, arg, "--root")) {
-            try result.roots.append(a, try value(args, &i));
-        } else if (std.mem.eql(u8, arg, "--module")) {
-            const mapping = try value(args, &i);
-            const equals = std.mem.findScalar(u8, mapping, '=') orelse return error.InvalidModule;
-            if (equals == 0 or equals + 1 == mapping.len) return error.InvalidModule;
-            try result.modules.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
-        } else if (std.mem.eql(u8, arg, "--package")) {
-            const mapping = try value(args, &i);
-            const equals = std.mem.findScalar(u8, mapping, '=') orelse return error.InvalidPackage;
-            if (equals == 0 or equals + 1 == mapping.len) return error.InvalidPackage;
-            try result.packages.append(a, .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] });
-        } else if (std.mem.eql(u8, arg, "--result") or std.mem.eql(u8, arg, "--run-id")) {
-            _ = try value(args, &i);
-        } else if (std.mem.eql(u8, arg, "--input-directory")) {
-            _ = try value(args, &i); // Caller build input only; never source selection.
-        } else if (std.mem.eql(u8, arg, "--files-from")) {
-            const list = try std.Io.Dir.cwd().readFileAlloc(io, try value(args, &i), a, .limited(4 * 1024 * 1024));
-            var lines = std.mem.splitScalar(u8, list, '\n');
-            while (lines.next()) |line| {
-                const path = std.mem.trim(u8, line, "\r");
-                if (path.len > 0) try result.files.append(a, path);
-            }
-        } else if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption else try result.files.append(a, arg);
+/// glint's command line, read from this declaration by ensign: the rules and their levels,
+/// the code options, and the files with what their imports reach.
+pub const Arguments = struct {
+    files: []const []const u8 = &.{},
+    only: []const []const u8 = &.{},
+    reviewed: bool = false,
+    family: bool = false,
+    config: ?[]const u8 = null,
+    report: []const []const u8 = &.{},
+    gate: []const []const u8 = &.{},
+    disable: []const []const u8 = &.{},
+    format: Report.Format = .text,
+    max_line_length: ?u32 = null,
+    max_function_lines: ?u32 = null,
+    fact_budget: ?usize = null,
+    strict_suppressions: bool = false,
+    metrics: bool = false,
+    zig_lib_path: ?[]const u8 = null,
+    module: []const []const u8 = &.{},
+    root: []const []const u8 = &.{},
+    package: []const []const u8 = &.{},
+    files_from: []const []const u8 = &.{},
+    input_directory: []const []const u8 = &.{},
+    pub const spec: ensign.Spec(@This()) = .{
+        .name = "glint",
+        .version = release.version,
+        .about = "A linter for Zig on Zig's own parser and semantic form",
+        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed, --family or --config; --report, --gate and --disable then set a rule's level. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
+        .options = .{
+            .files = .{ .positional = true, .value_name = "FILE", .hint = .file, .help = "A file to check" },
+            .only = .{ .value_name = "ID", .section = "Rules", .help = "Check only this rule, repeated, at report level" },
+            .reviewed = .{ .negatable = false, .section = "Rules", .help = "Every retained rule, at report level" },
+            .family = .{ .negatable = false, .section = "Rules", .help = "The family's reporting profile" },
+            .config = .{ .value_name = "FILE", .hint = .file, .section = "Rules", .help = "A JSON policy: its profile, rule levels and code options" },
+            .report = .{ .value_name = "ID", .section = "Rules", .help = "Report this rule, repeated" },
+            .gate = .{ .value_name = "ID", .section = "Rules", .help = "Gate on this rule, repeated: a finding fails the run" },
+            .disable = .{ .value_name = "ID", .section = "Rules", .help = "Leave this rule out, repeated" },
+            .format = .{ .help = "How the report is written" },
+            .max_line_length = .{ .value_name = "N", .help = "The line length Z024's readability report allows, in bytes; 100 by default" },
+            .max_function_lines = .{ .value_name = "N", .help = "The lines P003 allows a function; 120 by default" },
+            .fact_budget = .{ .value_name = "N", .help = "How many facts a file's analysis may resolve; 100000 by default" },
+            .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
+            .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
+            .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
+            .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
+            .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
+            .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
+            .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check, one a line, repeated" },
+            .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
+        },
+        .conflicts = &.{&.{ .only, .reviewed, .family, .config }},
+    };
+};
+
+/// What the arguments ask: the rules from the profile chosen, then each rule's level as asked.
+fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: []const Rule.Definition) !Options {
+    var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
+    if (arguments.config) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4 * 1024 * 1024));
+        result.config = try configure(a, bytes, definitions);
+    } else if (arguments.reviewed) {
+        result.config = Rule.Config.reviewed();
+    } else if (arguments.family) {
+        result.config = Rule.Config.family();
+    } else if (arguments.only.len != 0) {
+        result.config = Rule.Config.none();
+        for (arguments.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
+    }
+    const levels = [_]struct { []const []const u8, Rule.Config.Level }{ .{ arguments.report, .report }, .{ arguments.gate, .gate }, .{ arguments.disable, .off } };
+    for (levels) |level| for (level[0]) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, level[1]);
+    if (arguments.max_line_length) |n| result.config.max_line_length = n;
+    if (arguments.max_function_lines) |n| result.config.max_function_lines = n;
+    if (arguments.fact_budget) |n| result.config.fact_budget = n;
+    if (arguments.strict_suppressions) result.config.strict_suppressions = true;
+    if (arguments.metrics) result.config.metrics = true;
+    try result.roots.appendSlice(a, arguments.root);
+    for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
+    for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
+    try result.files.appendSlice(a, arguments.files);
+    for (arguments.files_from) |from| {
+        const list = try std.Io.Dir.cwd().readFileAlloc(io, from, a, .limited(4 * 1024 * 1024));
+        var lines = std.mem.splitScalar(u8, list, '\n');
+        while (lines.next()) |line| {
+            const path = std.mem.trim(u8, line, "\r");
+            if (path.len > 0) try result.files.append(a, path);
+        }
     }
     return result;
 }
 
-pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer) !u8 {
-    return executeConfigured(gpa, io, args, writer, &AegisPack.rules);
+/// `NAME=VALUE`, neither empty.
+fn named(mapping: []const u8) ?Module {
+    const equals = std.mem.findScalar(u8, mapping, '=') orelse return null;
+    if (equals == 0 or equals + 1 == mapping.len) return null;
+    return .{ .name = mapping[0..equals], .path = mapping[equals + 1 ..] };
+}
+
+/// Runs glint on `args`, the program's name first: the report, help or version to `writer`,
+/// a mistake in the arguments to `problems`.
+pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer) !u8 {
+    return executeConfigured(gpa, io, args, writer, problems, &AegisPack.rules);
 }
 /// Standalone CLI for compiled project rules. Same completion and output contract.
-pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, project_rules: []const RuleContext.Rule) !u8 {
+pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, project_rules: []const RuleContext.Rule) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const requested = try Result.request(args);
+    var diagnostic: ensign.Diagnostic = .{};
+    const line = if (args.len == 0) args else args[1..];
+    const request = switch (ensign.parse(Request, a, line, .{ .diagnostic = &diagnostic }) catch |err| return refused(err, diagnostic, problems)) {
+        .parsed => |parsed| parsed,
+        // `Request` leaves `--help` to the arguments and has no version.
+        .help, .version => unreachable,
+    };
+    const requested = try Result.request(request.result, request.run_id);
     var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .version = 1, .completed = false, .outcome = .running, .sources = 0, .findings = 0, .suppressed = 0, .output_bytes = 0, .output_sha256 = "" };
     try Result.publish(a, io, requested, record);
-    const status = executeInner(gpa, a, io, args, writer, &record, project_rules) catch |err| {
+    const status = executeInner(gpa, a, io, request.arguments, writer, problems, &record, project_rules) catch |err| {
         if (err == error.Canceled) record.outcome = .canceled;
         if (err == error.OutOfMemory) record.outcome = .tool_failure;
         switch (err) {
@@ -224,22 +267,29 @@ pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []con
     return status;
 }
 
-fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule) !u8 {
+fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     record.outcome = .argument_failure;
     const definitions = try a.alloc(Rule.Definition, project_rules.len);
     for (project_rules, 0..) |rule, i| definitions[i] = rule.definition;
-    const configured = try optionsConfigured(a, io, args, definitions);
-    if (configured.help) {
-        record.outcome = .output_failure;
-        try writer.writeAll("glint [--only ID | --reviewed | --family] [--format text|json|sarif]\n      [--config FILE] [--gate ID | --report ID] [--max-function-lines N]\n      [--zig-lib-path DIR] [--module NAME=FILE] [--root DIR]\n      [--package NAME=DIR]\n      [--files-from FILE] [--fact-budget N] [--strict-suppressions] [--metrics]\n      [--result FILE --run-id ID] FILE...\n\nExplicit files only. No path patterns or build.zig execution.\nSuppress one site: // glint-ignore: Z013 -- written reason\nExit: 0 complete/clean; 1 findings; 2 input/tool/incomplete.\n");
-        try writer.flush();
-        record.outcome = .help;
-        record.completed = false;
-        return 0;
-    }
+    var diagnostic: ensign.Diagnostic = .{};
+    const outcome = ensign.parse(Arguments, a, args, .{ .diagnostic = &diagnostic }) catch |err| return refused(err, diagnostic, problems);
+    const arguments = switch (outcome) {
+        .parsed => |parsed| parsed,
+        .help => |page| {
+            record.outcome = .output_failure;
+            try page.write(writer, width);
+            return told(writer, record);
+        },
+        .version => |version| {
+            record.outcome = .output_failure;
+            try version.write(writer);
+            return told(writer, record);
+        },
+    };
+    const configured = try options(a, io, arguments, definitions);
     if (configured.files.items.len == 0) return error.MissingSource;
     record.outcome = .input_failure;
     var loader: Loader = .{ .a = a, .io = io, .options = &configured };
@@ -282,11 +332,29 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     return if (!report.complete) 2 else if (report.diagnostics.len != 0) 1 else 0;
 }
 
+/// The width help and messages wrap to.
+const width = 100;
+
+/// Help or the version, written: the run answered and checked nothing.
+fn told(writer: *std.Io.Writer, record: *Result.Record) !u8 {
+    try writer.flush();
+    record.outcome = .help;
+    return 0;
+}
+
+/// A line ensign refuses: its message written to `problems`, and `error.InvalidArguments`.
+fn refused(err: ensign.Error, diagnostic: ensign.Diagnostic, problems: *std.Io.Writer) !u8 {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    try diagnostic.write(problems, width);
+    try problems.flush();
+    return error.InvalidArguments;
+}
+
 test "CLI invalid selections and unknown formats fail" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.UnknownRule, options(arena.allocator(), std.testing.io, &.{ "glint", "--only", "Z008" }));
-    try std.testing.expectError(error.UnknownFormat, options(arena.allocator(), std.testing.io, &.{ "glint", "--format", "other" }));
+    try std.testing.expectError(error.UnknownRule, options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} }, &.{}));
+    try std.testing.expectError(error.InvalidValue, ensign.parse(Arguments, arena.allocator(), &.{ "--format", "other" }, .{}));
     try std.testing.expect(within("/root", "/root/src/x.zig"));
     try std.testing.expect(!within("/root", "/root-copy/x.zig"));
 }

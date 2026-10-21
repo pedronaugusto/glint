@@ -80,7 +80,7 @@ Consequences a pack author can rely on. Any revision that keeps the public names
 ## Published aegis reports (G3)
 
 The optional `AegisPack.rules` uses the public compiled-rule API. The standalone CLI registers
-its IDs but never enables them by default; select `--enable A001` (through A006), or pass
+its IDs but never enables them by default; select `--report A001` (through A006), or pass
 report or gate selections and the pack descriptors to `runConfigured`. Explicit gate selection is accepted; an undecided required site still makes execution incomplete.
 Generic defaults and the Z012 and D001 reports are unchanged.
 
