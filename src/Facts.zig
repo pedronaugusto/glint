@@ -897,7 +897,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
-        .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(file, node)) |value| return value,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(null, file, node)) |value| return value,
         .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
         // `comptime x` and `nosuspend x` have `x`'s type.
@@ -1040,6 +1040,13 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     // `@Union(layout, tag, names, types, attributes)`, `@Tuple(types)`.
     if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolveIn(env, file, args[3]));
     if (std.mem.eql(u8, name, "@Tuple") and args.len == 1) return self.reified(try self.resolveIn(env, file, args[0]));
+    // `@Pointer(size, attributes, child, sentinel)`: a pointer to `child`, as a slice or a
+    // many-item pointer is too.
+    if (std.mem.eql(u8, name, "@Pointer") and args.len == 4) {
+        const child = try self.resolveIn(env, file, args[2]);
+        if (child == .unknown) return child;
+        return .{ .pointer = try self.boxed(child) };
+    }
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
     if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
@@ -1628,7 +1635,7 @@ fn peered(self: *Facts, chosen: Value, peers: Peers) ResolveError!Value {
 }
 
 /// A labeled block: what its `break`s give it, chosen as one, as a `switch`'s branches are.
-fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+fn breaks(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const brace = tree.nodeMainToken(node);
     if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return null;
@@ -1651,7 +1658,7 @@ fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
         // A break in a branch this instantiation does not take gives nothing.
         if (try self.dead(file, jump)) continue;
         if (peers.literal(tree, operand)) continue;
-        try values.append(self.gpa, try self.resolve(file, operand));
+        try values.append(self.gpa, try self.resolveIn(env, file, operand));
     }
     return try self.peered(try self.choose(values.items), peers);
 }
@@ -1755,33 +1762,33 @@ fn never(tree: *const Ast, node: Ast.Node.Index) bool {
 /// is its input's element, or a number for a range. A `|*x|` capture points at it. Anything
 /// else stays unknown: an `else` prong of a union, a prong's tag capture, an input that is not
 /// a slice.
-fn captured(self: *Facts, decl: Decl) ResolveError!Value {
+fn captured(self: *Facts, env: ?*const Env, decl: Decl) ResolveError!Value {
     const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
     const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const node = record.node;
     const name = record.token;
     const by_pointer = tree.tokenTag(name - 1) == .asterisk;
     const bound: Value = if (tree.fullIf(node)) |branch|
-        try self.conditional(decl.file, branch.payload_token, branch.error_token, branch.ast.cond_expr, name)
+        try self.conditional(env, decl.file, branch.payload_token, branch.error_token, branch.ast.cond_expr, name)
     else if (tree.fullWhile(node)) |loop|
-        try self.conditional(decl.file, loop.payload_token, loop.error_token, loop.ast.cond_expr, name)
+        try self.conditional(env, decl.file, loop.payload_token, loop.error_token, loop.ast.cond_expr, name)
     else if (tree.nodeTag(node) == .@"catch")
         .error_set
     else if (tree.fullSwitchCase(node)) |case|
-        try self.switchPayload(decl.file, node, case, name)
+        try self.switchPayload(env, decl.file, node, case, name)
     else if (tree.fullFor(node)) |loop|
-        try self.element(decl.file, loop, name)
+        try self.element(env, decl.file, loop, name)
     else
         .{ .unknown = .unsupported };
     if (bound == .unknown or !by_pointer) return bound;
     return .{ .pointer = try self.boxed(bound) };
 }
 
-fn conditional(self: *Facts, file: Project.FileId, payload_token: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, condition: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!Value {
+fn conditional(self: *Facts, env: ?*const Env, file: Project.FileId, payload_token: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, condition: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!Value {
     if (error_token) |token| if (token == name) return .error_set;
     const first = payload_token orelse return .{ .unknown = .unsupported };
     if (first != name and first + 1 != name) return .{ .unknown = .unsupported };
-    const value = try self.resolve(file, condition);
+    const value = try self.resolveIn(env, file, condition);
     return switch (value) {
         .optional, .error_union => |inner| inner.*,
         .unknown => value,
@@ -1789,14 +1796,14 @@ fn conditional(self: *Facts, file: Project.FileId, payload_token: ?Ast.TokenInde
     };
 }
 
-fn switchPayload(self: *Facts, file: Project.FileId, case_node: Ast.Node.Index, full: Ast.full.SwitchCase, name: Ast.TokenIndex) ResolveError!Value {
+fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node: Ast.Node.Index, full: Ast.full.SwitchCase, name: Ast.TokenIndex) ResolveError!Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     // The payload is the first capture; a second is the prong's tag.
     const first = full.payload_token orelse return .{ .unknown = .unsupported };
     if (first != name and first + 1 != name) return .{ .unknown = .unsupported };
     const parent = self.project.models[file.raw()].node_parents[@backingInt(case_node)] orelse return .{ .unknown = .unsupported }; // safe: enum identities index their owning frozen tables without narrowing.
     const whole = tree.fullSwitch(parent) orelse return .{ .unknown = .unsupported };
-    const subject = try self.resolve(file, whole.ast.condition);
+    const subject = try self.resolveIn(env, file, whole.ast.condition);
     // A switch on type information (`@typeInfo(T)`) captures the part its prong names, of
     // each type a choice of them gives.
     if (reflectedInfo(subject)) {
@@ -1859,7 +1866,7 @@ fn prongNames(self: *Facts, file: Project.FileId, whole: Ast.full.Switch, name: 
     return false;
 }
 
-fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.TokenIndex) ResolveError!Value {
+fn element(self: *Facts, env: ?*const Env, file: Project.FileId, loop: Ast.full.For, name: Ast.TokenIndex) ResolveError!Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var position: usize = 0;
     var token = loop.payload_token;
@@ -1875,12 +1882,12 @@ fn element(self: *Facts, file: Project.FileId, loop: Ast.full.For, name: Ast.Tok
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullArrayInit(&buffer, input)) |list| if (list.ast.type_expr == .none) {
         const each = try self.gpa.alloc(Value, list.ast.elements.len);
-        for (list.ast.elements, each) |item, *out| out.* = try self.resolve(file, item);
+        for (list.ast.elements, each) |item, *out| out.* = try self.resolveIn(env, file, item);
         return self.choose(each);
     };
     // A `for` takes arrays, pointers to arrays and slices, never a single item: a resolved
     // pointer input is a slice, whose element is what it points at.
-    return self.indexed(try self.resolve(file, input), {});
+    return self.indexed(try self.resolveIn(env, file, input), {});
 }
 
 fn isUnion(self: *const Facts, container: Container) bool {
@@ -1994,7 +2001,7 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return .{ .unknown = .comptime_dependent };
         return self.instance(value);
     }
-    if (declaration_record.kind == .capture) return self.captured(decl);
+    if (declaration_record.kind == .capture) return self.captured(null, decl);
     if (declaration_record.kind == .field) {
         const field = tree.fullContainerField(declaration_record.node).?;
         if (field.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(decl.file, t));
@@ -2473,6 +2480,8 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 }
                 if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env, file, init);
             }
+            // A capture of the function's own: what it captures, read with the call's bindings.
+            if (record.kind == .capture and self.inside(file, record.scope, function_scope)) return self.captured(env, .{ .file = file, .index = index });
             return self.resolve(file, node);
         },
         .field_access => {
@@ -2486,6 +2495,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .optional_type => return .{ .optional = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
         .error_union => return .{ .error_union = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[1])) },
         .@"switch", .switch_comma, .@"if" => if (try self.branches(env, file, node)) |value| return value,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(env, file, node)) |value| return value,
         .array_access => {
             const operands = tree.nodeData(node).node_and_node;
             const base = try self.resolveIn(env, file, operands[0]);

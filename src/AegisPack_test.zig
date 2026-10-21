@@ -1412,6 +1412,9 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
     try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
+    // `@Pointer(...)` makes a pointer: a copy of what `Untrusted.readForParse` gives is an
+    // alias (relic's credential answer read a line at a time).
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(answer: aegis.input.Untrusted([]const u8)) usize { var rest = answer.readForParse(); var line = rest; rest = rest[1..]; line = line[0..1]; return line.len + rest.len; }", pack.copies, true, 0);
     // A function type written in place is reflected as a declared function is: a vtable's
     // field types, each a function pointer, give their parameters' types (shakedown's
     // simulated `Io` calls); one of them an owner makes a copy of the parameter a finding.
