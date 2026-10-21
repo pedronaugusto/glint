@@ -1213,6 +1213,9 @@ test "A003 refutes an unresolved acquisition no aegis function can be by its arg
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, true, 0);
     // An argument a `read` could take leaves it undecided.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
+    // A receiver held at run time calls a method: `read(self, io)` takes one argument there.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, true, 0);
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, false, 0);
 }
 
 test "A002 reads operators and a tuple written in place" {

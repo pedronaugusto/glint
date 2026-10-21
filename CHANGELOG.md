@@ -16,6 +16,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- A001-A003 refute an unresolved call on a receiver held at run time (`const owner: T = @ptrCast(raw); owner.read(io, oid)`) by the aegis functions it can call as a method only: a value calls no namespace function (relic's `Database.from` adapter).
 - A `while` payload is in scope in the loop's continue expression (`while (at) |layer| : (at = layer.base)`), and in a block body's loop scope: a read of it there resolved to nothing (relic's graph layers).
 - Two instantiations of one type function (`Line(Plain)`, `Line(Guarded)`) are two types: a choice of them kept only the first, so a member read through the choice missed the other's finding while the run counted as complete.
 - A made container's declaration that names a type another call makes (`const State = Inner(T); pub const Record = State.Record;`) is read with the bindings of the call that made the container. It was read with the union of every caller's, so `Outer(Plain).Record`'s fields took the types of every `Outer(...)` in the project: undecided sites (chronicle's `record.event`), and a false A001 finding where another caller bound a guard.

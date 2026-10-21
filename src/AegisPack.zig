@@ -489,6 +489,8 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     const call = tree.fullCall(&call_buffer, node) orelse return false;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
     const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
+    // A receiver held at run time calls a method, never a namespace's function.
+    const value = try c.facts.runtime(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
     const found = try c.facts.publication(Contract.library);
     for (found.files) |file| {
         const model = &c.project.models[file.raw()];
@@ -502,7 +504,7 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
                 .unknown, .pointer, .alternatives => return false,
                 else => continue,
             }
-            if (try c.accepts(candidate, call, 1) or try c.accepts(candidate, call, 0)) return false;
+            if (try c.accepts(candidate, call, 1) or (!value and try c.accepts(candidate, call, 0))) return false;
         }
     }
     return true;
