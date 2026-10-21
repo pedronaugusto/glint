@@ -2193,43 +2193,228 @@ fn checkCapacity(c: *Context) Context.Error!void {
     }
 }
 
-/// Whether an adoption's `allocation` is a whole byte allocation the adoption takes over alone:
-/// a local initialized by `a.alloc(u8, n)` (through `try` or `catch`), where `a` is the
-/// allocator the adoption is given, written the same way, so the extent is the allocation's and
-/// the alignment a byte's; and no use of the local follows the adoption or waits in a `defer` or
-/// `errdefer`, which would free or reach memory the owner now holds. Any other shape stays a
-/// review site.
+/// Whether an adoption's `allocation` is a whole byte allocation the adoption takes over alone,
+/// made by the allocator it is given (`gpa`, named the same way), so the extent is the
+/// allocation's and the alignment a byte's: `a.alloc(u8, n)`, `a.dupe(u8, bytes)` or
+/// `a.print(format, args)`, through `try`, a `catch` or `orelse` that does not complete, a local
+/// it initializes, an `if` capture of it, what a function of this file returns on every path
+/// that gives a value, or a parameter of a private function every call of which passes one.
+/// Nothing else may hold it once it is taken: no use of a local follows, and none waits in a
+/// `defer` or `errdefer`, which would free or reach memory the owner now holds. Any other shape
+/// stays a review site.
 fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, gpa: Ast.Node.Index, allocation: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
-    const index = Contract.local(c, allocation) orelse return false;
-    const decl = model.declarations[index];
-    if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) return false;
-    const v = tree.fullVarDecl(decl.node) orelse return false;
-    const init = v.ast.init_node.unwrap() orelse return false;
-    const made = switch (tree.nodeTag(init)) {
-        .@"try" => tree.nodeData(init).node,
-        .@"catch" => tree.nodeData(init).node_and_node[0],
-        else => init,
+    const want = (try pathOf(c, gpa)) orelse return false;
+    return wholeBytes(c, allocation, want, &.{}, tree.lastToken(adoption), 0);
+}
+
+/// A value named as a path: a declaration of the checked file, then members of it (`s.gpa`).
+const Path = struct { root: u32, chain: []const []const u8 };
+
+fn pathOf(c: *Context, node: Ast.Node.Index) Context.Error!?Path {
+    const tree = try c.project.syntax(try c.source());
+    return switch (tree.nodeTag(node)) {
+        .identifier => .{ .root = Contract.local(c, node) orelse return null, .chain = &.{} },
+        .grouped_expression => pathOf(c, tree.nodeData(node).node_and_token[0]),
+        .field_access => blk: {
+            const data = tree.nodeData(node).node_and_token;
+            const base = (try pathOf(c, data[0])) orelse break :blk null;
+            break :blk .{ .root = base.root, .chain = try std.mem.concat(c.allocator, []const u8, &.{ base.chain, &.{tree.tokenSlice(data[1])} }) };
+        },
+        else => null,
     };
+}
+
+fn samePaths(a: Path, b: Path) bool {
+    if (a.root != b.root or a.chain.len != b.chain.len) return false;
+    for (a.chain, b.chain) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// A call a value is read through: into `function`, called by `call`.
+const Frame = struct { function: u32, call: Ast.Node.Index };
+
+/// `path`, read inside the function the innermost of `frames` calls, as the function the
+/// outermost call is in reads it: a parameter is the call's argument there; a declaration
+/// outside the called function is the same one. Null for one of the function's own locals.
+fn outward(c: *Context, path: Path, frames: []const Frame) Context.Error!?Path {
+    var current = path;
+    var at = frames.len;
+    while (at > 0) {
+        at -= 1;
+        const frame = frames[at];
+        if (parameterPosition(c, frame.function, current.root)) |position| {
+            const argument = argumentAt(c, frame.function, frame.call, position) orelse return null;
+            const base = (try pathOf(c, argument)) orelse return null;
+            current = .{ .root = base.root, .chain = try std.mem.concat(c.allocator, []const u8, &.{ base.chain, current.chain }) };
+        } else if (within(c, current.root, frame.function)) return null;
+    }
+    return current;
+}
+
+/// The position of `decl` among the parameters of `function`, if it is one.
+fn parameterPosition(c: *Context, function: u32, decl: u32) ?usize {
+    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
+    if (model.declarations[decl].kind != .parameter) return null;
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, made) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 2) return false;
-    const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "alloc")) return false;
-    const element = call.ast.params[0];
-    if (tree.nodeTag(element) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(element)), "u8")) return false;
-    if (model.reference(element)) |ref| if (ref.declaration != null) return false;
-    if (!samePath(c, data[0], gpa)) return false;
-    // Every other reference to the local comes before the adoption, outside deferred code.
-    const at = tree.nodeMainToken(adoption);
+    const proto = tree.fullFnProto(&buffer, model.declarations[function].node) orelse return null;
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) if (param.name_token == model.declarations[decl].token) return position;
+    return null;
+}
+
+/// Whether `decl` is declared inside `function`'s body or among its parameters.
+fn within(c: *Context, decl: u32, function: u32) bool {
+    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
+    const node = model.declarations[function].node;
+    const whole_fn = model.node_parents[@backingInt(node)] orelse node; // safe: an AST node index reads its own parent table
+    const token = model.declarations[decl].token;
+    return tree.firstToken(whole_fn) <= token and token <= tree.lastToken(whole_fn);
+}
+
+/// The argument `call` passes at `function`'s parameter `position`: a method called on a value
+/// takes the value first.
+fn argumentAt(c: *Context, function: u32, call_node: Ast.Node.Index, position: usize) ?Ast.Node.Index {
+    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return null;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[function].node) orelse return null;
+    var count: usize = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |_| count += 1;
+    const method = tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1;
+    if (method and position == 0) return tree.nodeData(call.ast.fn_expr).node_and_token[0];
+    const at = if (method) position - 1 else position;
+    return if (at < call.ast.params.len) call.ast.params[at] else null;
+}
+
+/// Whether `node`, read in the function the innermost of `frames` calls, is a whole byte
+/// allocation of the allocator `want` names in the function the outermost call is in, held
+/// by nothing else after `until` (see `wholeAllocation`).
+fn wholeBytes(c: *Context, node: Ast.Node.Index, want: Path, frames: []const Frame, until: Ast.TokenIndex, depth: usize) Context.Error!bool {
+    if (depth == 16) return false;
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.models[c.file.raw()];
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return wholeBytes(c, tree.nodeData(node).node_and_token[0], want, frames, until, depth + 1),
+        .@"try" => return wholeBytes(c, tree.nodeData(node).node, want, frames, until, depth + 1),
+        // The other side does not complete: the value is the operand's.
+        .@"catch", .@"orelse" => {
+            const sides = tree.nodeData(node).node_and_node;
+            if (!completesNot(tree, sides[1])) return false;
+            return wholeBytes(c, sides[0], want, frames, until, depth + 1);
+        },
+        .identifier => {
+            const index = Contract.local(c, node) orelse return false;
+            const decl = model.declarations[index];
+            switch (decl.kind) {
+                .variable => {
+                    if (model.scopes[decl.scope].kind != .block) return false;
+                    const v = tree.fullVarDecl(decl.node) orelse return false;
+                    const init = v.ast.init_node.unwrap() orelse return false;
+                    if (!heldAlone(c, index, node, until)) return false;
+                    return wholeBytes(c, init, want, frames, until, depth + 1);
+                },
+                // `if (x) |bytes|`: the optional's payload.
+                .capture => {
+                    const branch = tree.fullIf(decl.node) orelse return false;
+                    if (branch.payload_token != decl.token or branch.error_token != null) return false;
+                    if (!heldAlone(c, index, node, until)) return false;
+                    return wholeBytes(c, branch.ast.cond_expr, want, frames, until, depth + 1);
+                },
+                .parameter => {
+                    // A parameter of a function read through a call: that call's argument.
+                    if (frames.len != 0) {
+                        const frame = frames[frames.len - 1];
+                        const position = parameterPosition(c, frame.function, index) orelse return false;
+                        const argument = argumentAt(c, frame.function, frame.call, position) orelse return false;
+                        return wholeBytes(c, argument, want, frames[0 .. frames.len - 1], tree.lastToken(frame.call), depth + 1);
+                    }
+                    return passedWhole(c, index, want, depth);
+                },
+                else => return false,
+            }
+        },
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const data = tree.nodeData(call.ast.fn_expr).node_and_token;
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
+        const made = if (std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dupe"))
+            call.ast.params.len == 2 and isByte(c, call.ast.params[0])
+        else
+            std.mem.eql(u8, name, "print") and call.ast.params.len == 2;
+        if (made) {
+            const giver = (try pathOf(c, data[0])) orelse return false;
+            const read = (try outward(c, giver, frames)) orelse return false;
+            return samePaths(read, want);
+        }
+    }
+    // A function of this file: what it returns on every path that gives a value.
+    const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return false;
+    const function = (try c.facts.origin(callee)) orelse return false;
+    if (!function.file.eql(c.file) or model.declarations[function.index].kind != .function) return false;
+    const body_fn = model.node_parents[@backingInt(model.declarations[function.index].node)] orelse return false; // safe: an AST node index reads its own parent table
+    if (tree.nodeTag(body_fn) != .fn_decl) return false;
+    const inner = try std.mem.concat(c.allocator, Frame, &.{ frames, &.{.{ .function = function.index, .call = node }} });
+    var gives = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const ret: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        if (enclosingFunction(tree, model, ret) != body_fn) continue;
+        const value = tree.nodeData(ret).opt_node.unwrap() orelse continue;
+        if (tree.nodeTag(value) == .error_value) continue;
+        if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
+        if (!try wholeBytes(c, value, want, inner, tree.lastToken(ret), depth + 1)) return false;
+        gives = true;
+    }
+    return gives;
+}
+
+/// Whether `node` never completes with a value: `return`, `unreachable`, a `break` or
+/// `continue`.
+fn completesNot(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .@"return", .unreachable_literal, .@"break", .@"continue" => true,
+        else => false,
+    };
+}
+
+fn isByte(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "u8")) return false;
+    const ref = c.project.models[c.file.raw()].reference(node) orelse return true;
+    return ref.declaration == null;
+}
+
+/// The `fn_decl` whose body holds `node`, nearest first.
+fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    var up = model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
+    while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+        if (tree.nodeTag(parent) == .fn_decl) return parent;
+    }
+    return null;
+}
+
+/// Whether the local `index` is named, apart from at `read`, only before `until` and never in
+/// deferred code: what it holds is the reader's alone from there.
+fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenIndex) bool {
+    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
         const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
-        if (candidate == allocation) continue;
+        if (candidate == read) continue;
         const ref = model.reference(candidate) orelse continue;
         if (ref.declaration != index) continue;
-        if (tree.nodeMainToken(candidate) > at) return false;
+        if (tree.nodeMainToken(candidate) > until) return false;
         var up = model.node_parents[i];
         while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
             switch (tree.nodeTag(parent)) {
@@ -2237,6 +2422,42 @@ fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, gpa: Ast.Node.Index, a
                 else => {},
             }
         }
+    }
+    return true;
+}
+
+/// Whether every call of the function whose parameter `index` is passes a whole allocation
+/// there, of the allocator `want` names in the function, read at the call: the function is
+/// private to this file and named only as the callee of calls.
+fn passedWhole(c: *Context, index: u32, want: Path, depth: usize) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.models[c.file.raw()];
+    const function: u32 = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .function and parameterPosition(c, @intCast(i), index) != null) break @intCast(i); // safe: declaration indexes come from the bounded frozen model.
+    } else return false;
+    const record = model.declarations[function];
+    if (record.public or record.exported) return false;
+    // A method's calls name it as a member, which a declaration's references do not show.
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .field_access) continue;
+        const member: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(member).node_and_token[1]), record.name)) return false;
+    }
+    const position = parameterPosition(c, function, index).?; // unreachable: the parameter was found in this function
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const use: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        if (tree.nodeMainToken(use) == record.token) continue;
+        const ref = model.reference(use) orelse continue;
+        if (ref.declaration != function) continue;
+        const parent = model.node_parents[i] orelse return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse return false;
+        if (call.ast.fn_expr != use) return false;
+        const frame: Frame = .{ .function = function, .call = parent };
+        const read = (try outward(c, want, &.{frame})) orelse return false;
+        const argument = argumentAt(c, function, parent, position) orelse return false;
+        if (!try wholeBytes(c, argument, read, &.{}, tree.lastToken(parent), depth + 1)) return false;
     }
     return true;
 }

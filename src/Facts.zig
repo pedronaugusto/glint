@@ -1515,20 +1515,17 @@ fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
 /// A `switch` or `if`-`else` expression: what its branches give, chosen as one. A branch
 /// that gives no value of its own (`@compileError`, `unreachable`, `undefined`) or never
 /// completes (`return`, `break`, `continue`, `@panic`, `@trap`) is left out; a `null` one
-/// makes the others optional.
+/// makes the others optional, an error value (`error.Name`) an error union.
 fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     var values: std.ArrayList(Value) = .empty;
-    var nullable = false;
+    var peers: Peers = .{};
     if (tree.fullSwitch(node)) |whole| {
         for (whole.ast.cases) |case| {
             const branch = tree.fullSwitchCase(case).?.ast.target_expr;
             // A prong the path rules out: Zig analyses only the one a comptime operand takes.
             if (never(tree, branch) or try self.dead(file, branch)) continue;
-            if (isNull(tree, branch)) {
-                nullable = true;
-                continue;
-            }
+            if (peers.literal(tree, branch)) continue;
             try values.append(self.gpa, try self.resolveIn(env, file, branch));
         }
     } else if (tree.fullIf(node)) |whole| {
@@ -1540,16 +1537,42 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
             &.{ whole.ast.then_expr, otherwise } else &.{ whole.ast.then_expr, otherwise };
         for (taken) |branch| {
             if (never(tree, branch)) continue;
-            if (isNull(tree, branch)) {
-                nullable = true;
-                continue;
-            }
+            if (peers.literal(tree, branch)) continue;
             try values.append(self.gpa, try self.resolveIn(env, file, branch));
         }
     } else return null;
-    const chosen = try self.choose(values.items);
-    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
-    return .{ .optional = try self.boxed(chosen) };
+    return try self.peered(try self.choose(values.items), peers);
+}
+
+/// What a `null` or an error value among a value's branches or breaks adds to the others:
+/// Zig makes them optional, or an error union.
+const Peers = struct {
+    nullable: bool = false,
+    fallible: bool = false,
+
+    /// Whether `node` is `null` or an error value, noted as such.
+    fn literal(peers: *Peers, tree: *const Ast, node: Ast.Node.Index) bool {
+        if (isNull(tree, node)) {
+            peers.nullable = true;
+            return true;
+        }
+        if (tree.nodeTag(node) == .error_value) {
+            peers.fallible = true;
+            return true;
+        }
+        return false;
+    }
+};
+fn peered(self: *Facts, chosen: Value, peers: Peers) ResolveError!Value {
+    if (chosen == .unknown) return chosen;
+    const optional: Value = if (!peers.nullable) chosen else switch (chosen) {
+        .optional => chosen,
+        // `E!T` and `null`: `E!?T`.
+        .error_union => |held| if (held.* == .optional) chosen else .{ .error_union = try self.boxed(.{ .optional = held }) },
+        else => .{ .optional = try self.boxed(chosen) },
+    };
+    if (!peers.fallible or optional == .error_union) return optional;
+    return .{ .error_union = try self.boxed(optional) };
 }
 
 /// A labeled block: what its `break`s give it, chosen as one, as a `switch`'s branches are.
@@ -1562,7 +1585,7 @@ fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
     var values: std.ArrayList(Value) = .empty;
-    var nullable = false;
+    var peers: Peers = .{};
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
         const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
@@ -1575,15 +1598,10 @@ fn breaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
         if (never(tree, operand)) continue;
         // A break in a branch this instantiation does not take gives nothing.
         if (try self.dead(file, jump)) continue;
-        if (isNull(tree, operand)) {
-            nullable = true;
-            continue;
-        }
+        if (peers.literal(tree, operand)) continue;
         try values.append(self.gpa, try self.resolve(file, operand));
     }
-    const chosen = try self.choose(values.items);
-    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
-    return .{ .optional = try self.boxed(chosen) };
+    return try self.peered(try self.choose(values.items), peers);
 }
 
 /// A loop used as a value (`const e = for (xs) |x| { if (p(x)) break x; } else null;`): what
@@ -1600,7 +1618,7 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
     else
         return null;
     var values: std.ArrayList(Value) = .empty;
-    var nullable = false;
+    var peers: Peers = .{};
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -1624,17 +1642,12 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
         if (never(tree, operand)) continue;
         // A break in a branch this instantiation does not take gives nothing.
         if (try self.dead(file, jump)) continue;
-        if (isNull(tree, operand)) {
-            nullable = true;
-            continue;
-        }
+        if (peers.literal(tree, operand)) continue;
         try values.append(self.gpa, try self.resolve(file, operand));
     }
-    if (isNull(tree, otherwise)) nullable = true else if (!never(tree, otherwise)) try values.append(self.gpa, try self.resolve(file, otherwise));
+    if (!peers.literal(tree, otherwise) and !never(tree, otherwise)) try values.append(self.gpa, try self.resolve(file, otherwise));
     if (values.items.len == 0) return null;
-    const chosen = try self.choose(values.items);
-    if (!nullable or chosen == .unknown or chosen == .optional) return chosen;
-    return .{ .optional = try self.boxed(chosen) };
+    return try self.peered(try self.choose(values.items), peers);
 }
 
 /// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
@@ -3045,4 +3058,38 @@ test "a container a forwarding type function makes is read with the outer call's
     const value = try facts.resolve(Project.FileId.fromRaw(0), init); // safe: one source.
     try std.testing.expect(value == .pointer);
     try std.testing.expect(value.pointer.* == .instance);
+}
+
+test "an error value among a block's breaks makes the others an error union, as null makes them optional" {
+    const source =
+        \\const Status = struct { entries: []const u8 };
+        \\fn status() !Status { return .{ .entries = "" }; }
+        \\pub fn f(bare: bool) void {
+        \\    const changes = deploy: {
+        \\        if (bare) break :deploy error.BareRepository;
+        \\        break :deploy status();
+        \\    };
+        \\    const s = changes catch return;
+        \\    const maybe = if (bare) null else status() catch return;
+        \\    const either = if (bare) error.Bare else Status{ .entries = "" };
+        \\    _ = .{ s, maybe, either };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const model = &project.models[0];
+    var found: [3]Value = undefined;
+    for ([_][]const u8{ "s", "maybe", "either" }, &found) |name, *out| {
+        const d = for (model.declarations) |d| {
+            if (d.kind == .variable and std.mem.eql(u8, d.name, name)) break d;
+        } else unreachable; // unreachable: the source declares each name
+        out.* = try facts.resolve(Project.FileId.fromRaw(0), project.files[0].tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?); // safe: one source.
+    }
+    try std.testing.expect(found[0] == .instance);
+    try std.testing.expect(found[1] == .optional and found[1].optional.* == .instance);
+    try std.testing.expect(found[2] == .error_union and found[2].error_union.* == .instance);
 }
