@@ -83,13 +83,31 @@ pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: 
     return position - @min(position, skip) == call.ast.params.len;
 }
 /// Whether `node`, in the checked file, is a type: written as one (a pointer, array, optional or
-/// error union type, a container) or naming one.
+/// error union type, a container), naming one, made by a call to a function that returns
+/// `type`, or given by a builtin that makes types.
 fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
     const tree = &self.project.files[self.file.raw()].tree;
     if (tree.fullPtrType(node) != null or tree.fullArrayType(node) != null) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) return true;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, node)) |call| {
+        const decl = (try self.facts.definition(self.file, call.ast.fn_expr)) orelse return false;
+        const function = (try self.facts.origin(decl)) orelse return false;
+        const record = self.project.models[function.file.raw()].declarations[function.index];
+        if (record.kind != .function) return false;
+        const written = &self.project.files[function.file.raw()].tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
+        const result = proto.ast.return_type.unwrap() orelse return false;
+        return written.nodeTag(result) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(result)), "type");
+    }
     switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            for ([_][]const u8{ "@TypeOf", "@Vector", "@FieldType", "@Struct", "@Union", "@Tuple", "@Enum", "@EnumLiteral", "@Int", "@Pointer", "@Fn", "@This" }) |made| if (std.mem.eql(u8, name, made)) return true;
+            return false;
+        },
         .optional_type, .error_union => return true,
         .identifier, .field_access => return switch (try self.facts.resolve(self.file, node)) {
             .container => true,
