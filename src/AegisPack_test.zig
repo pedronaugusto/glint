@@ -986,6 +986,9 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
     try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), xs: []const u8) void { for (xs) |_| { var held = g.acquire(); _ = held.value(); } }", pack.cleanup, true, 1);
     try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), n: usize) void { var i: usize = 0; while (i < n) { var held = g.acquire(); _ = held.value(); i += 1; } }", pack.cleanup, true, 1);
     try expectJudged("const G = @import(\"aegis\").Guarded;\npub fn f(g: *G(u32), n: usize) void { var i: usize = 0; while (i < n) : (i += 1) { var held = g.acquire(); defer held.deinit(); _ = held.value(); } }", pack.cleanup, true, 0);
+    // A member of it used after it ended, on every path there.
+    try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); s.end(); _ = s.ref(n); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(t: *Table, n: *u32, c: bool) !void { const s = try t.open(); if (c) { s.end(); } else { s.end(); } _ = s.ref(n); }", pack.cleanup, true, 1);
     // A deferred block that ends it once at its top level, the scope not named after.
     try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); defer { s.end(); n.* += 1; } }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f(t: *Table, n: *u32) !void { const s = try t.open(); errdefer { n.* += 1; s.end(); } try g(); s.end(); }\nfn g() !void {}", pack.cleanup, true, 0);

@@ -991,8 +991,9 @@ fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context
 /// an exit (`return`, `try`, a `break` or `continue` that leaves the walk) while live, paths
 /// that meet in different states, a jump to a loop or block of the walk other than the loop it
 /// is in, any use of the owner but its members or a loan (its address, a copy, an argument: a
-/// transfer or an alias), a release nested where the walk does not follow, a use after
-/// release other than a result obligation's `deinit`, its check. Findings: a second direct cleanup, the owner's address discarded after release.
+/// transfer or an alias), a release nested where the walk does not follow. Findings: a second
+/// direct cleanup, a member of the owner used after its release or transfer (a result
+/// obligation's `deinit`, its check, aside), the owner's address discarded after release.
 const Flow = struct {
     c: *Context,
     tree: *const Ast,
@@ -1217,11 +1218,12 @@ const Flow = struct {
     /// A statement or expression the walk does not enter, from `state`: how it uses the
     /// owner, then where it can jump. A `break` or `continue` of the walk's loop goes there; a
     /// `return`, a `try` or a jump out of the walk ends its path unless the owner is live; a
-    /// jump to another loop or block of the walk is not followed.
+    /// jump to another loop or block of the walk is not followed. A member of the owner used
+    /// where every path has released or transferred it is a finding.
     fn leave(f: Flow, node: Ast.Node.Index, state: State) Context.Error!Outcome {
         switch (try f.uses(node)) {
             .none => {},
-            .members => if (state == .released) return .uncertain,
+            .members => if (state == .released) try f.c.at(cleanup, f.firstUse(node), "same local owner used after its cleanup or transfer on every path here"),
             .other => return .uncertain,
         }
         const first = f.tree.firstToken(node);
@@ -1462,6 +1464,20 @@ const Flow = struct {
             }
         }
         return released;
+    }
+
+    /// The first token in `node` naming the owner.
+    fn firstUse(f: Flow, node: Ast.Node.Index) Ast.TokenIndex {
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        var found = last;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const main = f.tree.nodeMainToken(candidate);
+            if (main >= first and main <= found and f.mine(candidate)) found = main;
+        }
+        return found;
     }
 
     /// `owner.deinit()` of a result obligation: the check that its discharge came.
