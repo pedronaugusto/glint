@@ -356,7 +356,9 @@ fn collectScopes(a: std.mem.Allocator, tree: *const Ast, node_parents: []const ?
             if (value.ast.else_expr.unwrap()) |other| try addScope(a, tree, list, other, .branch);
         }
         if (tree.fullWhile(node)) |value| {
-            try addScope(a, tree, list, value.ast.then_expr, .loop);
+            // The body's scope, from the continue expression on: a capture is visible there too.
+            const body = value.ast.then_expr;
+            try list.append(a, .{ .kind = .loop, .node = body, .first = tree.firstToken(value.ast.cont_expr.unwrap() orelse body), .last = tree.lastToken(body) });
             if (value.ast.else_expr.unwrap()) |other| try addScope(a, tree, list, other, .branch);
         }
         if (tag == .@"catch") try addScope(a, tree, list, tree.nodeData(node).node_and_node[1], .branch);
@@ -436,7 +438,11 @@ fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const u
             if (value.error_token) |token| if (value.ast.else_expr.unwrap()) |body| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(body)], node);
         }
         if (tree.fullWhile(node)) |value| {
-            if (value.payload_token) |token| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(value.ast.then_expr)], node);
+            // The loop's scope, which holds its continue expression and its body.
+            const loop: u32 = for (scopes, 0..) |scope, i| {
+                if (scope.kind == .loop and scope.node == value.ast.then_expr) break @intCast(i); // safe: std node/token/instruction indexes and bounded table lengths fit u32.
+            } else tokens[tree.firstToken(value.ast.then_expr)];
+            if (value.payload_token) |token| try capture(a, tree, scopes, list, token, loop, node);
             if (value.error_token) |token| if (value.ast.else_expr.unwrap()) |body| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(body)], node);
         }
         if (tag == .@"catch") {

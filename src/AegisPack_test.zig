@@ -572,6 +572,9 @@ test "receivers bound by captures are decided by what they bind" {
     // An `if` or `while` payload is its condition's optional or error-union payload.
     try expectJudged(head ++ "fn next() ?*Plain { return null; }\npub fn f() void { while (next()) |p| _ = p.lock; }", pack.access, true, 0);
     try expectJudged(head ++ "fn next() ?*G(u32) { return null; }\npub fn f() void { if (next()) |g| _ = g.lock; }", pack.access, true, 1);
+    // A `while` payload is in scope in the loop's continue expression too.
+    try expectJudged(head ++ "const Layer = struct { base: ?*const Layer, data: u32 };\npub fn f(first: ?*const Layer) u32 { var sum: u32 = 0; var at = first; while (at) |layer| : (at = layer.base) sum += layer.data; return sum; }", pack.access, true, 0);
+    try expectJudged(head ++ "fn next() ?*G(u32) { return null; }\npub fn f() void { var n: u32 = 0; while (next()) |g| : (n += g.data) {} }", pack.access, true, 1);
 }
 
 test "receivers through locals, unwrapping, branches and generic results are decided" {
