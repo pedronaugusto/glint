@@ -996,9 +996,17 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
 fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
     const made = container.made_by orelse return self.declaration(decl);
     const record = self.project.models[decl.file.raw()].declarations[decl.index]; // safe: enum identities index their owning frozen tables without narrowing.
-    // A type it declares (`Replay`, `Record`) is made by the same call.
-    if (record.kind != .field) return self.madeWithin(try self.declaration(decl), container, made);
     const tree = &self.project.files[decl.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    // A type it declares (`Replay`, `Record`) is made by the same call; a declaration naming
+    // one made elsewhere (`const Record = State.Record;`) is read with the call's bindings, as
+    // a field's type is, the template's reading standing where that reading is unknown.
+    if (record.kind != .field) {
+        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.type_node == .none) if (variable.ast.init_node.unwrap()) |init| {
+            const value = try self.substituted(decl.file, init, made);
+            if (value != .unknown) return self.madeWithin(value, container, made);
+        };
+        return self.madeWithin(try self.declaration(decl), container, made);
+    }
     const field = tree.fullContainerField(record.node) orelse return self.declaration(decl);
     const type_node = field.ast.type_expr.unwrap() orelse return self.declaration(decl);
     const value = try self.substituted(decl.file, type_node, made);

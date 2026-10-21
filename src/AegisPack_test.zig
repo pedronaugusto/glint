@@ -1183,6 +1183,14 @@ test "a made container's method result is read with the call's bindings through 
     try expectJudged(head ++ "pub fn f(r: *Reader(aegis.Guarded(u32))) void { if (r.record()) |rec| _ = rec.value.data; }", pack.access, true, 1);
 }
 
+test "a made container's declaration naming a type another call makes is read with the call's bindings" {
+    // Not with every caller's: `Outer` is also made over a guard, which `Outer(Plain).Record`
+    // does not hold.
+    const head = "const aegis = @import(\"aegis\");\nfn Inner(comptime T: type) type { return struct { pub const Record = struct { value: T }; }; }\npub fn Outer(comptime T: type) type { return opaque { const State = Inner(T); pub const Record = State.Record; }; }\nconst Plain = struct { data: u32 };\n";
+    try expectJudged(head ++ "pub fn f(rec: Outer(Plain).Record) void { _ = rec.value.data; }\npub fn g(o: *Outer(aegis.Guarded(u32))) void { _ = o; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(rec: Outer(aegis.Guarded(u32)).Record) void { _ = rec.value.data; }\npub fn g(o: *Outer(Plain)) void { _ = o; }", pack.access, true, 1);
+}
+
 test "A001 refutes an unresolved receiver by the other members the file reads of the same expression" {
     // `p.name` beside `p.value`: no aegis type with a `value` field has a `name`.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| { _ = p.name; _ = p.value; } }", pack.access, true, 0);
