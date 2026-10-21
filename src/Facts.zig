@@ -41,10 +41,27 @@ remaining: usize = 100_000,
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
 const Settled = struct { key: Key, assumed: u32 };
-/// A `comptime` `bool` parameter's value on a path: inside `if (wrapped)`'s branches, or after
-/// `if (wrapped) return ...;`. Zig analyses a branch of a comptime-known condition only in the
-/// instantiations that take it, so what the path settles holds for everything read there.
-pub const Assumption = struct { parameter: Decl, value: bool };
+/// A `comptime` parameter's value on a path: a `bool`'s inside `if (wrapped)`'s branches or
+/// after `if (wrapped) return ...;`, an enum's inside a `switch` prong naming one tag. Zig
+/// analyses a branch of a comptime-known condition only in the instantiations that take it, so
+/// what the path settles holds for everything read there.
+pub const Assumption = struct {
+    parameter: Decl,
+    value: Known,
+
+    fn eql(a: Assumption, b: Assumption) bool {
+        if (!std.meta.eql(a.parameter, b.parameter) or std.meta.activeTag(a.value) != std.meta.activeTag(b.value)) return false;
+        return switch (a.value) {
+            .boolean => |value| value == b.value.boolean,
+            .tag => |name| std.mem.eql(u8, name, b.value.tag),
+        };
+    }
+};
+pub const Known = union(enum) {
+    boolean: bool,
+    /// The enum literal's name, as written.
+    tag: []const u8,
+};
 pub const Decl = struct { file: Project.FileId, index: u32 };
 pub const Container = struct {
     file: Project.FileId,
@@ -294,7 +311,7 @@ fn intern(self: *Facts, items: []const Assumption) ResolveError!u32 {
         if (set.len != items.len) continue;
         for (items) |item| {
             for (set) |held| {
-                if (std.meta.eql(held, item)) break;
+                if (held.eql(item)) break;
             } else break;
         } else return @intCast(index); // safe: the sets are few, one per distinct path read.
     }
@@ -303,9 +320,9 @@ fn intern(self: *Facts, items: []const Assumption) ResolveError!u32 {
 }
 
 /// Adds to `found` what the path from the file's root to `node` settles: the branch of each
-/// `if` on a comptime `bool` parameter that holds it, and, in each enclosing block, every
-/// earlier `if (c) <exit>;` (the rest of the block runs only where `c` is false). False when
-/// the path contradicts `found`.
+/// `if` on a comptime `bool` parameter that holds it, the prong of each `switch` on a comptime
+/// enum parameter, and, in each enclosing block, every earlier `if (c) <exit>;` (the rest of
+/// the block runs only where `c` is false). False when the path contradicts `found`.
 fn pathFacts(self: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *std.ArrayList(Assumption)) ResolveError!bool {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const parents = self.project.models[file.raw()].node_parents; // safe: enum identities index their owning frozen tables without narrowing.
@@ -319,6 +336,9 @@ fn pathFacts(self: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *s
         if (tree.fullIf(parent)) |whole| if (whole.payload_token == null and whole.error_token == null) {
             if (child == whole.ast.then_expr and !try self.holds(file, whole.ast.cond_expr, true, found)) return false;
             if (whole.ast.else_expr.unwrap() == child and !try self.holds(file, whole.ast.cond_expr, false, found)) return false;
+        };
+        if (tree.fullSwitchCase(parent)) |case| if (case.ast.target_expr == child) if (parents[@backingInt(parent)]) |at| if (tree.fullSwitch(at)) |whole| { // safe: a node index indexes its own tree's parent table.
+            if (self.switchParameter(file, whole.ast.condition)) |parameter| if (!try self.prong(tree, whole, case, parameter, found)) return false;
         };
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, parent) orelse continue;
@@ -352,16 +372,38 @@ fn holds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, value: bool, 
         },
         .identifier => {
             const parameter = self.conditionParameter(file, node) orelse return true;
-            for (found.items) |held| if (std.meta.eql(held.parameter, parameter)) return held.value == value;
-            try found.append(self.gpa, .{ .parameter = parameter, .value = value });
+            for (found.items) |held| if (std.meta.eql(held.parameter, parameter)) return held.value == .boolean and held.value.boolean == value;
+            try found.append(self.gpa, .{ .parameter = parameter, .value = .{ .boolean = value } });
             return true;
         },
         else => return true,
     }
 }
 
-/// Whether the function around `node` branches on a comptime `bool` parameter anywhere in its
-/// body: its paths then differ between the instantiations that bind it.
+/// Records that a `switch` prong on a comptime parameter is taken: the parameter is the tag the
+/// prong's one item names. False when `found` holds a tag the prong does not take: none of its
+/// items, or for `else`, one a case names.
+fn prong(self: *Facts, tree: *const Ast, whole: Ast.full.Switch, case: Ast.full.SwitchCase, parameter: Decl, found: *std.ArrayList(Assumption)) ResolveError!bool {
+    for (found.items) |held| if (std.meta.eql(held.parameter, parameter)) {
+        if (held.value != .tag) return true;
+        if (case.ast.values.len == 0) {
+            for (whole.ast.cases) |other| for (tree.fullSwitchCase(other).?.ast.values) |item| if (namesTag(tree, item, held.value.tag)) return false;
+            return true;
+        }
+        for (case.ast.values) |item| if (namesTag(tree, item, held.value.tag)) return true;
+        return false;
+    };
+    if (case.ast.values.len == 1 and tree.nodeTag(case.ast.values[0]) == .enum_literal) try found.append(self.gpa, .{ .parameter = parameter, .value = .{ .tag = tree.tokenSlice(tree.nodeMainToken(case.ast.values[0])) } });
+    return true;
+}
+
+fn namesTag(tree: *const Ast, item: Ast.Node.Index, tag: []const u8) bool {
+    return tree.nodeTag(item) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(item)), tag);
+}
+
+/// Whether the function around `node` branches on a comptime `bool` parameter, or switches on a
+/// comptime enum one, anywhere in its body: its paths then differ between the instantiations
+/// that bind it.
 pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     if (!try self.hasConditions(file)) return false;
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
@@ -373,11 +415,14 @@ pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.In
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"if" and tag != .if_simple) continue;
         const branch: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(branch);
         if (at < first or at > last) continue;
-        if (self.namesCondition(file, tree.fullIf(branch).?.ast.cond_expr, 0)) return true;
+        switch (tag) {
+            .@"if", .if_simple => if (self.namesCondition(file, tree.fullIf(branch).?.ast.cond_expr, 0)) return true,
+            .@"switch", .switch_comma => if (self.switchParameter(file, tree.fullSwitch(branch).?.ast.condition) != null) return true,
+            else => {},
+        }
     }
     return false;
 }
@@ -674,16 +719,37 @@ fn conditionParameter(self: *const Facts, file: Project.FileId, node: Ast.Node.I
     return .{ .file = file, .index = index };
 }
 
+/// The comptime enum parameter a `switch` operand names: one declared `comptime x: T` with `T`
+/// a named type other than `type` and `bool`, whose prongs name its tags.
+fn switchParameter(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Decl {
+    const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    if (tree.nodeTag(node) != .identifier) return null;
+    const model = &self.project.models[file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[index];
+    if (record.kind != .parameter or !comptimeNamed(tree, record)) return null;
+    return .{ .file = file, .index = index };
+}
+
+fn comptimeNamed(tree: *const Ast, record: Model.Declaration) bool {
+    if (record.token == 0 or tree.tokenTag(record.token - 1) != .keyword_comptime) return false;
+    return switch (tree.nodeTag(record.node)) {
+        .identifier => !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "type") and !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "bool"),
+        .field_access => true,
+        else => false,
+    };
+}
+
 fn comptimeBool(tree: *const Ast, record: Model.Declaration) bool {
     return record.token > 0 and tree.tokenTag(record.token - 1) == .keyword_comptime and tree.nodeTag(record.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "bool");
 }
 
-/// Whether `file` declares a comptime `bool` parameter, whose conditions paths can settle.
+/// Whether `file` declares a comptime `bool` or enum parameter, whose conditions paths can settle.
 fn hasConditions(self: *Facts, file: Project.FileId) ResolveError!bool {
     if (self.conditional_files.get(file)) |known| return known;
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
     const any = for (self.project.models[file.raw()].declarations) |record| { // safe: enum identities index their owning frozen tables without narrowing.
-        if (record.kind == .parameter and comptimeBool(tree, record)) break true;
+        if (record.kind == .parameter and (comptimeBool(tree, record) or comptimeNamed(tree, record))) break true;
     } else false;
     try self.conditional_files.put(self.gpa, file, any);
     return any;
@@ -712,7 +778,7 @@ fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.N
         const position = self.parameterPosition(file, e.function, record.token) orelse return null;
         return if (position < e.truths.len) e.truths[position] else null;
     };
-    for (self.assumptions(self.assumed)) |held| if (held.parameter.file.eql(file) and held.parameter.index == index) return held.value;
+    for (self.assumptions(self.assumed)) |held| if (held.parameter.file.eql(file) and held.parameter.index == index) return if (held.value == .boolean) held.value.boolean else null;
     return null;
 }
 
@@ -1327,7 +1393,8 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     if (tree.fullSwitch(node)) |whole| {
         for (whole.ast.cases) |case| {
             const branch = tree.fullSwitchCase(case).?.ast.target_expr;
-            if (never(tree, branch)) continue;
+            // A prong the path rules out: Zig analyses only the one a comptime operand takes.
+            if (never(tree, branch) or try self.dead(file, branch)) continue;
             if (isNull(tree, branch)) {
                 nullable = true;
                 continue;
@@ -1597,6 +1664,23 @@ fn isUnion(self: *const Facts, container: Container) bool {
     return tree.tokenTag(tree.nodeMainToken(scope.node)) == .keyword_union;
 }
 
+/// Whether two readings of a container a type function made are one type: the same call read
+/// with the same bindings (`Line(Plain)` and `Line(Guarded)` are two).
+fn sameMaking(a: ?*const Made, b: ?*const Made, depth: usize) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    if (x == y) return true;
+    if (depth >= 64) return false;
+    if (!std.meta.eql(x.function, y.function) or !x.file.eql(y.file) or x.call != y.call or x.assumed != y.assumed) return false;
+    if (!sameMaking(x.via, y.via, depth + 1)) return false;
+    const ex = x.env orelse return y.env == null;
+    const ey = y.env orelse return false;
+    if (ex == ey) return true;
+    if (!std.meta.eql(ex.function, ey.function) or ex.args.len != ey.args.len) return false;
+    for (ex.args, ey.args) |one, other| if (!same(one, other, depth + 1)) return false;
+    return true;
+}
+
 fn same(a: Value, b: Value, depth: usize) bool {
     if (depth == 64) return false;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
@@ -1610,7 +1694,7 @@ fn same(a: Value, b: Value, depth: usize) bool {
                 .container, .instance => |o| o,
                 else => unreachable,
             };
-            break :blk c.file.eql(other.file) and c.scope == other.scope;
+            break :blk c.file.eql(other.file) and c.scope == other.scope and sameMaking(c.made_by, other.made_by, depth + 1);
         },
         .primitive => |p| std.mem.eql(u8, p, b.primitive),
         .function => |f| std.meta.eql(f, b.function),

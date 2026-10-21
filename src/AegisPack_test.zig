@@ -1231,6 +1231,18 @@ test "a comptime condition settled on the path decides a receiver chosen by it" 
     try expectJudged(head ++ "fn State(comptime wrapped: bool) type { return struct { m: if (wrapped) aegis.Guarded(u64) else Direct }; }\npub fn f(comptime wrapped: bool, s: *State(wrapped)) u64 { if (wrapped) return 0; const owner = &s.m; return owner.data; }", pack.access, true, 0);
     // On the wrapped side the same access is the aegis owner's backing field.
     try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) return 0; return owner.data; }", pack.access, true, 1);
+    // Two instantiations of one type function are two alternatives, each read with its call.
+    try expectJudged(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(aegis.Guarded(u64)) else Line(Direct)) u64 { return line.value.data; }", pack.access, true, 1);
+    try expectJudged(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(Direct) else Line(Direct)) u64 { return line.value.data; }", pack.access, true, 0);
+}
+
+test "a switch prong on a comptime enum parameter settles it for what the prong reads" {
+    const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32 };\nfn Line(comptime T: type) type { return struct { value: T }; }\nconst A = struct { fn next(_: *A) ?Line(Plain) { return null; } };\nconst C = struct { fn next(_: *C, n: u32) Line(aegis.Guarded(u32)) { _ = n; return undefined; } };\nconst D = enum { a, c };\n";
+    // Inside `.a`, the reader the earlier switch on `d` chose is `A`'s alone.
+    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; return switch (d) { .a => r.next().?.value.data, .c => 0 }; }", pack.access, true, 0);
+    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; _ = line; return switch (d) { .a => 0, .c => r.next(1).value.data }; }", pack.access, true, 1);
+    // Read outside a prong, the receiver is either reader's.
+    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; return line.value.data; }", pack.access, true, 1);
 }
 
 test "a generic's copies of its parameter are decided where the parameter is bound" {
