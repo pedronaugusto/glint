@@ -965,6 +965,8 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
             return .{ .unknown = .unsupported };
         },
+        // A tuple with no type of its own (`.{ sha2.Sha256, .sha256 }`), as a struct literal is.
+        .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => return .{ .literal = .{ .file = file, .node = node } },
         .address_of => return .{ .pointer = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         .deref => return self.pointee(try self.resolve(file, tree.nodeData(node).node), {}),
         .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),
@@ -1895,8 +1897,22 @@ fn destructured(self: *Facts, file: Project.FileId, whole: Ast.Node.Index, varia
     const full = tree.assignDestructure(whole);
     const position = std.mem.findScalar(Ast.Node.Index, full.ast.variables, variable) orelse return .{ .unknown = .unsupported };
     const value = try self.resolve(file, full.ast.value_expr);
+    return self.destructuredAt(value, position);
+}
+
+/// Element `position` of a tuple or an array `value` is destructured into.
+fn destructuredAt(self: *Facts, value: Value, position: usize) ResolveError!Value {
     switch (value) {
         .array => |each| return each.*,
+        .literal => |literal| {
+            const parts = try self.literalParts(literal);
+            return if (position < parts.len) parts[position] else .{ .unknown = .unsupported };
+        },
+        .alternatives => |each| {
+            const mapped = try self.gpa.alloc(Value, each.len);
+            for (each, mapped) |one, *out| out.* = try self.destructuredAt(one, position);
+            return self.choose(mapped);
+        },
         .instance => |tuple| {
             const model = &self.project.models[tuple.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
             const source = &self.project.files[tuple.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
@@ -1914,6 +1930,16 @@ fn destructured(self: *Facts, file: Project.FileId, whole: Ast.Node.Index, varia
         .unknown => return value,
         else => return .{ .unknown = .unsupported },
     }
+}
+
+/// The values an anonymous literal holds: its fields' or its elements', in order.
+pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
+    const tree = &self.project.files[literal.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    var buffer: [2]Ast.Node.Index = undefined;
+    const nodes = if (tree.fullStructInit(&buffer, literal.node)) |full| full.ast.fields else if (tree.fullArrayInit(&buffer, literal.node)) |full| full.ast.elements else return &.{};
+    const parts = try self.gpa.alloc(Value, nodes.len);
+    for (nodes, parts) |node, *part| part.* = try self.resolve(literal.file, node);
+    return parts;
 }
 
 fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {

@@ -569,6 +569,20 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             for (each[1..]) |one| if (!std.meta.eql(first, try typed(c, one, depth + 1))) break :blk .unknown;
             break :blk first;
         },
+        // An anonymous literal holds what its fields or elements do: one owner among plain
+        // parts is that owner's, as a copy of the literal copies it.
+        .literal => |literal| blk: {
+            var found: Typed = .other;
+            for (try c.facts.literalParts(literal)) |part| switch (try typed(c, part, depth + 1)) {
+                .unknown => break :blk .unknown,
+                .other => {},
+                .owner => |k| switch (found) {
+                    .owner => |earlier| if (earlier != k) break :blk .unknown,
+                    else => found = .{ .owner = k },
+                },
+            };
+            break :blk found;
+        },
         .container, .instance => |container| blk: {
             if (try c.role(Contract.library, value)) |k| break :blk .{ .owner = k };
             const outer = (try enclosingPublished(c, container)) orelse break :blk .other;

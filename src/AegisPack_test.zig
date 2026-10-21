@@ -1343,6 +1343,9 @@ test "what a generic acquires by its type parameter is decided where the paramet
     // not walked per binding. A guarded value owes none; its guard does.
     try expectJudged(head ++ "pub fn f() void { sign(aegis.Guarded(u32)); }", pack.cleanup, true, 0);
     try expectJudged(head ++ "pub fn f() void { sign(aegis.Secret([4]u8)); }", pack.cleanup, false, 0);
+    // Bound in turn from a tuple of pairs written in place, destructured.
+    try expectJudged(head ++ "const Other = struct { n: u16, fn init(_: struct {}) Other { return .{ .n = 0 }; } };\npub fn f() void { inline for (.{ .{ Plain, .plain }, .{ Other, .other } }) |pair| { const Hash, const name = pair; _ = name; sign(Hash); } }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { inline for (.{ .{ Plain, .plain }, .{ aegis.Secret([4]u8), .secret } }) |pair| { const Hash, const name = pair; _ = name; sign(Hash); } }", pack.cleanup, false, 0);
 }
 
 test "a generic's copies of its anytype parameter are decided where the argument is bound" {
@@ -1364,6 +1367,8 @@ test "a generic's copies of its anytype parameter are decided where the argument
     const shapes = head ++ "const Color = enum { red, @\"with space\" };\nconst Shape = union(enum) { circle: f32, empty };\n";
     try expectJudged(shapes ++ "pub fn f() void { keep(@as(@Vector(3, u8), @splat(1))); keep(Color.red); keep(Color.@\"with space\"); keep(Shape.empty); keep({}); keep(.{ 1, \"two\" }); }", pack.copies, true, 0);
     try expectJudged(shapes ++ "pub fn f() void { const cases = [_]struct { f64, []const u8 }{ .{ 0.5, \"0.5\" } }; for (cases) |case| keep(case[0]); }", pack.copies, true, 0);
-    // A tuple holding an owner is not plain.
+    // A tuple holding an owner holds that owner: its copy is a finding.
+    try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32)) void { keep(.{ s, 1 }); }", pack.copies, true, 1);
+    // A tuple holding what does not resolve is undecided.
     try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32), g: fn () @import(\"missing\").T) void { keep(.{ s, g() }); }", pack.copies, false, 0);
 }
