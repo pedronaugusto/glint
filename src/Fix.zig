@@ -1,7 +1,8 @@
 //! The fixes a run's findings carry, applied: each a set of edits of one file's bytes that
 //! replaces a raw site with aegis's answer where the answer follows from the site alone
 //! (designs/aegis.md §7). A written reason the family kept beside a site (`// safe: why`,
-//! `// unreachable: why`) becomes the pack's escape, and an escape that covers nothing goes.
+//! `// unreachable: why`) becomes the pack's escape, as does the pack's old suppression
+//! (`// glint-ignore: A001 -- design: why`), and an escape that covers nothing goes.
 //! A site whose answer is a design choice carries no fix.
 const std = @import("std");
 const Project = @import("Project.zig");
@@ -62,6 +63,13 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end));
     }
+    for (report.malformed) |entry| {
+        const file = &project.files[entry.span.file.raw()];
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse continue;
+        const slot = try by_file.getOrPut(a, entry.span.file.raw());
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(a, edit);
+    }
     var out: std.ArrayList(Changed) = .empty;
     for (by_file.keys(), by_file.values()) |raw, *edits| {
         const source = project.files[raw].source;
@@ -83,6 +91,23 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         try out.append(a, .{ .file = Project.FileId.fromRaw(raw), .bytes = bytes.items, .edits = made });
     }
     return out.items;
+}
+
+/// The escape for the pack's old suppression, `// glint-ignore: A0NN -- <category>: <why>`: its
+/// category becomes the escape's reason (`measured-boundary` is `hot-loop`,
+/// `safe-type-internals` `internal`, `c-os-boundary` `boundary`), its words kept.
+fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32) std.mem.Allocator.Error!?Report.Edit {
+    const text = file.source[start..end];
+    const prefix = "// glint-ignore: A0";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    const separator = std.mem.find(u8, text, " -- ") orelse return null;
+    const rest = text[separator + 4 ..];
+    const colon = std.mem.findScalar(u8, rest, ':') orelse return null;
+    const categories = [_][2][]const u8{ .{ "no-danger", "no-danger" }, .{ "design", "design" }, .{ "measured-boundary", "hot-loop" }, .{ "safe-type-internals", "internal" }, .{ "c-os-boundary", "boundary" } };
+    for (categories) |category| if (std.mem.eql(u8, std.mem.trim(u8, rest[0..colon], " "), category[0])) {
+        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}:{s}", .{ category[1], rest[colon + 1 ..] }) };
+    };
+    return null;
 }
 
 fn earlier(_: void, x: Report.Edit, y: Report.Edit) bool {

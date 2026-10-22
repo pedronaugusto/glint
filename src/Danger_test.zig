@@ -640,7 +640,7 @@ test "A013's fix makes std's assert on input aegis's invariant, through a privat
     , alias);
 }
 
-test "the fix makes an older written reason the escape and removes an escape that covers nothing" {
+test "the fix makes an older written reason or the old pack suppression the escape, and removes an escape that covers nothing" {
     const out = try fixed(pack.unsafe_set,
         \\pub fn f(p: *const u8) *u8 {
         \\    // safe: the caller passes memory it owns
@@ -649,6 +649,10 @@ test "the fix makes an older written reason the escape and removes an escape tha
         \\pub fn g() u8 {
         \\    // aegis: no-danger: nothing here any more
         \\    return 1; // aegis: design: nor here
+        \\}
+        \\pub fn h(p: *const u8) *u8 {
+        \\    // glint-ignore: A019 -- c-os-boundary: the kernel's handle
+        \\    return @constCast(p);
         \\}
     );
     defer std.testing.allocator.free(out);
@@ -659,6 +663,10 @@ test "the fix makes an older written reason the escape and removes an escape tha
         \\}
         \\pub fn g() u8 {
         \\    return 1;
+        \\}
+        \\pub fn h(p: *const u8) *u8 {
+        \\    // aegis: boundary: the kernel's handle
+        \\    return @constCast(p);
         \\}
     , out);
 }
