@@ -24,7 +24,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
-    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } };
+    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } };
     \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
@@ -75,7 +75,7 @@ const std_files = [_]sources.Extra{
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }" },
-    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };" },
+    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
@@ -84,11 +84,13 @@ const std_files = [_]sources.Extra{
     \\pub const Limit = enum(usize) { unlimited = 0, _ };
     \\pub fn fixed(bytes: []const u8) @This() { _ = bytes; return .{}; }
     \\pub fn takeByte(r: *@This()) !u8 { _ = r; return 0; }
+    \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }
     \\pub fn take(r: *@This(), n: usize) ![]u8 { _ = n; return r.buffer; }
     \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
+    \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -167,11 +169,12 @@ test "A007 finds std's synchronization, raw atomics and mutable container state"
     try expect(pack.shared_state,
         \\const std = @import("std");
         \\const Io = std.Io;
-        \\pub fn f(l: *Io.RwLock, c: *Io.Condition, s: *Io.Semaphore, e: *Io.Event, m: *std.atomic.Mutex) void { _ = l; _ = c; _ = s; _ = e; _ = m; }
-    , 5);
+        \\const T = struct { l: Io.RwLock, c: Io.Condition, s: Io.Semaphore, e: Io.Event, m: std.atomic.Mutex };
+        \\var detected: std.atomic.Value(u8) = .init(0);
+    , 6);
 }
 
-test "A007 leaves constants, thread-local state, aliases' uses and test code alone" {
+test "A007 leaves constants, thread-local state, aliases' uses, borrows and test code alone" {
     try expect(pack.shared_state,
         \\const std = @import("std");
         \\const Mutex = std.Io.Mutex;
@@ -179,6 +182,9 @@ test "A007 leaves constants, thread-local state, aliases' uses and test code alo
         \\threadlocal var scratch: u32 = 0;
         \\pub fn f(a: *Mutex, b: *Mutex) void { _ = a; _ = b; }
         \\test { var m: std.Io.Mutex = .init; m.lock(); }
+        \\const Io = std.Io;
+        \\pub fn g(l: *Io.RwLock, e: *const Io.Event, s: ?*std.atomic.Value(bool)) void { _ = l; _ = e; _ = s; }
+        \\const Borrow = struct { stop: ?*const std.atomic.Value(bool) };
     , 1);
 }
 
@@ -192,17 +198,18 @@ test "A008 finds hand wipes, hand comparisons and std secret keys held by value"
     , 4);
 }
 
-test "A008 leaves borrowed keys, sealed keys and public keys alone" {
+test "A008 leaves borrowed keys, sealed keys, public keys and compared key types alone" {
     try expect(pack.secrets,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
         \\const Ed25519 = std.crypto.sign.Ed25519;
         \\const Signer = struct { key: aegis.Secret(Ed25519.KeyPair), public: Ed25519.PublicKey };
         \\pub fn f(kp: *const Ed25519.KeyPair) void { _ = kp; }
+        \\pub const same = Ed25519.SecretKey == Ed25519.SecretKey;
     , 0);
 }
 
-test "A011 finds time crossing as a raw integer and units converted by hand" {
+test "A011 finds time crossing as a raw integer and units converted by hand, not raw nanoseconds compared or subtracted" {
     try expect(pack.units,
         \\const std = @import("std");
         \\pub fn f(ms: i64, d: std.Io.Duration) i64 {
@@ -216,6 +223,10 @@ test "A011 finds time crossing as a raw integer and units converted by hand" {
     try expect(pack.units,
         \\const std = @import("std");
         \\pub fn f() u64 { return std.time.ns_per_ms; }
+        \\pub fn late(now: std.Io.Timestamp, end: std.Io.Timestamp, left: std.Io.Duration) bool {
+        \\    if (left.nanoseconds <= 0) return true;
+        \\    return now.nanoseconds >= end.nanoseconds or end.nanoseconds - now.nanoseconds < left.nanoseconds;
+        \\}
     , 0);
 }
 
@@ -240,18 +251,24 @@ test "A013 leaves what runs as the program compiles, and tests, alone" {
     , 0);
 }
 
-test "A010 finds every fallible conversion at run time, but not a literal's" {
+test "A010 finds conversions of input and division by it, not of the program's own values or a truncation" {
     try expect(pack.integers,
+        \\const std = @import("std");
         \\const E = enum(u8) { a, b };
-        \\pub fn f(x: u64, y: f64) void {
+        \\pub fn f(r: *std.Io.Reader, x: u64, y: f64) !void {
+        \\    const n = try r.takeByte();
+        \\    const wide: u64 = n;
+        \\    _ = @as(u4, @intCast(n));
+        \\    _ = @as(E, @enumFromInt(n));
+        \\    _ = x / wide;
+        \\    _ = @as(u8, @truncate(wide));
         \\    _ = @as(u8, @intCast(x));
-        \\    _ = @as(u8, @truncate(x));
         \\    _ = @as(u8, @intFromFloat(y));
         \\    _ = @as(E, @enumFromInt(x));
-        \\    _ = @as(u8, @intCast(7));
-        \\    _ = @as(u64, @intFromBool(x == 1));
+        \\    _ = wide / 2;
+        \\    _ = wide >> 1;
         \\}
-    , 4);
+    , 3);
 }
 
 test "A019 finds the unchecked operations, the escape covering one" {
@@ -306,7 +323,10 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
         \\const std = @import("std");
         \\// aegis: internal: the counter aegis's own Atomic would wrap; measured in bench/count.zig
         \\var hits: u32 = 0;
-        \\pub fn f(x: u64) u8 { return @intCast(x); } // aegis: no-danger: the caller passes a byte
+        \\pub fn f(r: *std.Io.Reader) !u4 {
+        \\    const b = try r.takeByte();
+        \\    return @intCast(b); // aegis: no-danger: the peer's protocol sends a nibble here
+        \\}
         \\pub fn g() void {} // aegis: design: nothing here
     , &std_files, &std_imports);
     defer project.deinit();
@@ -344,11 +364,12 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
-test "A015 finds std resources held or returned by value, not borrowed or owned" {
+test "A015 finds std resources held by value in a field its file releases or returned by value, not borrowed or owned" {
     try expect(pack.ownership,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
-        \\const Conn = struct { stream: std.Io.net.Stream, log: ?std.Io.File, dir: *std.Io.Dir };
+        \\const Conn = struct { stream: std.Io.net.Stream, log: ?std.Io.File, dir: *std.Io.Dir, pub fn deinit(c: *Conn) void { c.stream.close(); if (c.log) |l| l.close(); c.log.?.close(); } };
+        \\const Options = struct { cwd: std.Io.Dir, out: std.Io.File };
         \\pub fn open() !std.Io.File { return undefined; }
         \\pub fn child() std.process.Child { return undefined; }
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
@@ -381,7 +402,7 @@ test "A017 finds an enum state written in two functions and switched on" {
     , 1);
 }
 
-test "A019 finds a local read while still undefined, and leaves written, filled and branch-written ones" {
+test "A019 finds a local read while still undefined, and leaves written, filled and branch-written ones, an array's length and a field written by name" {
     try expect(pack.unsafe_set,
         \\fn fill(b: []u8) void { b[0] = 1; }
         \\pub fn bad() u8 { var x: u8 = undefined; const y = x + 1; x = 2; return y; }
@@ -392,6 +413,9 @@ test "A019 finds a local read while still undefined, and leaves written, filled 
         \\pub fn both(c: bool) u8 { var x: u8 = undefined; if (c) { x = 1; } else { x = 2; } return x; }
         \\pub fn some(c: bool) u8 { var x: u8 = undefined; if (c) x = 1; return x; }
         \\pub fn selfRead() u8 { var x: u8 = undefined; x = x + 1; return x; }
+        \\pub fn length(r: []const u8) u8 { var b: [8]u8 = undefined; const n = @min(r.len, b.len); @memcpy(b[0..n], r[0..n]); return b[0]; }
+        \\const P = struct { a: u8 };
+        \\pub fn named() u8 { var p: P = undefined; @field(p, "a") = 1; return p.a; }
     , 3);
 }
 
@@ -436,6 +460,15 @@ const input_program =
     \\    _ = try gpa.alloc(u8, 16);
     \\    _ = try r.take(n);
     \\    _ = try r.allocRemaining(gpa, .unlimited);
+    \\    const count = try r.takeInt(u32, 0);
+    \\    for (0..count) |_| {}
+    \\    const wide = @as(usize, buf[1]) << 8 | buf[2];
+    \\    _ = table[0..wide];
+    \\    _ = try gpa.alloc(u8, count);
+    \\    _ = name[n];
+    \\    _ = table[count];
+    \\    const total = count + 1;
+    \\    _ = total;
     \\    _ = sum;
     \\    _ = doubled;
     \\    _ = wrapped_sum;
@@ -443,16 +476,61 @@ const input_program =
     \\}
 ;
 
-test "A009 finds input that indexes, slices, bounds a loop or names a path, and leaves clean, fixed and refined values" {
+test "A009 finds input that indexes or slices input, names a path, and a number that picks a table entry or bounds a loop; it leaves clean, fixed and refined values and a byte picking a table entry" {
     try expect(pack.untrusted_input, input_program, 6);
 }
 
-test "A010 finds arithmetic on input that can overflow, beside every fallible conversion" {
-    try expect(pack.integers, input_program, 2);
+test "A009's input is a child's output and a file's contents, never the path or allocator a read is given, nor a read the program declares its own" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn load(dir: std.Io.Dir, gpa: std.mem.Allocator, table: []const u8, name: []const u8) !u8 {
+        \\    const bytes = try dir.readFileAlloc(null, name, gpa, 100);
+        \\    const mine = try dir.readFileAlloc(null, "receipt", gpa, 100); // aegis: internal: the receipt this program wrote
+        \\    const out = try std.process.run(gpa, null, .{});
+        \\    _ = table[name[0]];
+        \\    _ = mine[mine[0]];
+        \\    _ = bytes[bytes[0]];
+        \\    return out.stdout[out.stdout[0]];
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 2);
+    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.escapes.len); // safe: fixture counts are representable.
+    try std.testing.expectEqualStrings("A009", report.escapes[0].covered[0].name);
+    try std.testing.expectEqual(@as(usize, 0), report.stale.len); // safe: fixture counts are representable.
 }
 
-test "A012 finds work sized by input and reads with no limit" {
-    try expect(pack.bounded_work, input_program, 3);
+test "positions std finds in input, a read's count and a value under a clean bound are clean; a number assembled by hand is a number, and a 16-bit decode is data" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !usize {
+        \\    const line = try r.take(16);
+        \\    const space = std.mem.findScalar(u8, line, ' ') orelse return 0;
+        \\    _ = line[space + 1 ..];
+        \\    var buf: [8]u8 = undefined;
+        \\    const got = try r.readSliceShort(&buf);
+        \\    _ = buf[0..got];
+        \\    _ = table[@min(line[0], table.len - 1)];
+        \\    var n: usize = 0;
+        \\    for (line) |d| n = n * 10 + d;
+        \\    const short = try r.takeInt(u16, 0);
+        \\    _ = @as(usize, short) + 0x7f00;
+        \\    return table.len + n;
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    try expect(pack.integers, program, 3);
+}
+
+test "A010 finds arithmetic on a number from input, not on its bytes" {
+    try expect(pack.integers, input_program, 1);
+}
+
+test "A012 finds work sized by a number from input and reads with no limit" {
+    try expect(pack.bounded_work, input_program, 2);
 }
 
 test "A018 finds an error's name written to a peer, not to another writer" {
@@ -472,7 +550,7 @@ test "A020 finds a loop on input or without bound that gives its Io to nothing" 
         \\const std = @import("std");
         \\pub fn serve(io: std.Io, r: *std.Io.Reader) void { _ = io; while (true) { _ = r.takeByte() catch return; } }
         \\pub fn polite(io: std.Io, r: *std.Io.Reader) void { while (true) { io.checkCancel() catch return; _ = r.takeByte() catch return; } }
-        \\pub fn counted(io: std.Io, r: *std.Io.Reader) void { const n = r.takeByte() catch return; var i: u8 = 0; while (i < n) : (i += 1) {} _ = io; }
+        \\pub fn counted(io: std.Io, r: *std.Io.Reader) void { const n = r.takeInt(u32, 0) catch return; var i: u32 = 0; while (i < n) : (i += 1) {} _ = io; }
         \\pub fn plain(io: std.Io) void { var i: u8 = 0; while (i < 10) : (i += 1) {} _ = io; }
     , 2);
 }

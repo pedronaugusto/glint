@@ -21,7 +21,7 @@ const Ast = std.zig.Ast;
 /// A007: shared state outside aegis's guards.
 pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "Io.Event", "atomic.Value", "atomic.Mutex" };
-    try governed(c, rule, &sync, false, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
+    const held = try governedHeld(c, rule, &sync, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
@@ -40,6 +40,8 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
         // An `extern var` is the unsafe set's (A019): its storage is another program's.
         if (variable.extern_export_token) |token| if (tree.tokenTag(token) == .keyword_extern) continue;
         if (c.inTest(decl.token)) continue;
+        // A variable of a synchronization type is that type's site, counted once.
+        if (variable.ast.type_node.unwrap()) |kind| if (within(tree, held, kind)) continue;
         try c.at(rule, decl.token, try c.allocator.print("container-level var '{s}': mutable state any thread may reach; aegis Guarded, Atomic, Once or Lazy holds it, or Confined checks its one owner", .{decl.name}));
     }
 }
@@ -51,6 +53,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     const keys = try secretKeys(c);
     if (keys.len == 0) return;
     const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const site = switch (tag) {
@@ -67,6 +70,11 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         for (keys) |key| secret = secret or std.meta.eql(key, decl) or std.meta.eql(key, origin);
         if (!secret or !std.meta.eql(decl, origin) and c.project.inputs[decl.file.raw()].selected) continue;
         if (try borrowedOrSealed(c, node)) continue;
+        // A secret type compared with another is named, not held.
+        if (model.node_parents[@backingInt(node)]) |parent| switch (tree.nodeTag(parent)) { // safe: a node index indexes its own tree's parent table
+            .equal_equal, .bang_equal => continue,
+            else => {},
+        };
         try c.at(rule, site, try c.allocator.print("std.crypto {s} held by value outside aegis Secret: its bytes are copied and never wiped", .{spelled}));
     }
 }
@@ -136,7 +144,7 @@ pub fn units(c: *Context, rule: Rule) Context.Error!void {
         "Io.Duration.nanoseconds",     "Io.Timestamp.fromNanoseconds", "Io.Timestamp.toNanoseconds",   "Io.Timestamp.toMicroseconds",
         "Io.Timestamp.toMilliseconds", "Io.Timestamp.toSeconds",       "Io.Timestamp.nanoseconds",
     };
-    try governed(c, rule, &doors, true, "{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration");
+    try rawTime(c, rule, &doors);
     const constants = [_][]const u8{
         "time.ns_per_us",  "time.ns_per_ms",   "time.ns_per_s",   "time.ns_per_min",  "time.ns_per_hour", "time.ns_per_day",  "time.ns_per_week",
         "time.us_per_ms",  "time.us_per_s",    "time.us_per_min", "time.us_per_hour", "time.us_per_day",  "time.us_per_week", "time.ms_per_s",
@@ -162,6 +170,59 @@ pub fn units(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
+/// A011's doors: each raw-integer crossing of std's time. Two raw nanosecond counts compared or
+/// subtracted, or one compared with zero, keep their unit: no conversion happens there.
+fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!void {
+    const targets = try c.allocator.alloc(Governed.Target, paths.len);
+    const indexes = try c.allocator.alloc(usize, paths.len);
+    for (paths, targets, indexes, 0..) |path, *target, *index, i| {
+        target.* = .{ .source = "std", .declaration = path, .production = true };
+        index.* = i;
+    }
+    const found = try Governed.resolve(c, rule, targets, indexes);
+    var sites: std.ArrayList(Governed.Site) = .empty;
+    try Governed.sites(c, rule, found, &sites);
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    for (sites.items) |site| {
+        if (site.through_alias or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
+        if (sameUnit(tree, model, site.node)) continue;
+        try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
+    }
+}
+
+/// Whether a raw `.nanoseconds` read meets only another one, or zero, in a comparison or a
+/// difference.
+fn sameUnit(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
+    if (!nanoseconds(tree, node)) return false;
+    var parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table
+    var at = node;
+    // A difference of raw counts is one too: what it meets is what the read meets.
+    while ((tree.nodeTag(parent) == .sub or tree.nodeTag(parent) == .sub_sat or tree.nodeTag(parent) == .grouped_expression) and nanoseconds(tree, parent)) {
+        at = parent;
+        parent = model.node_parents[@backingInt(parent)] orelse return false; // safe: a node index indexes its own tree's parent table
+    }
+    switch (tree.nodeTag(parent)) {
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .sub, .sub_sat => {},
+        else => return false,
+    }
+    if (nanoseconds(tree, parent)) return true;
+    const lhs, const rhs = tree.nodeData(parent).node_and_node;
+    const other = if (lhs == at) rhs else lhs;
+    if (nanoseconds(tree, other)) return true;
+    return tree.nodeTag(other) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(other)), "0");
+}
+
+/// Whether a node is a raw nanosecond count: a `.nanoseconds` read, or a difference of two.
+fn nanoseconds(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "nanoseconds"),
+        .sub, .sub_sat => nanoseconds(tree, tree.nodeData(node).node_and_node[0]) and nanoseconds(tree, tree.nodeData(node).node_and_node[1]),
+        .grouped_expression => nanoseconds(tree, tree.nodeData(node).node_and_token[0]),
+        else => false,
+    };
+}
+
 /// A013: contracts that are undefined behaviour when false in a release build.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const assert = [_][]const u8{"debug.assert"};
@@ -173,26 +234,6 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         try c.at(rule, token, "unreachable: undefined behaviour in ReleaseFast when reached; aegis assert.never stops in every build, or return an error");
-    }
-}
-
-/// A010's casts: every integer conversion that can fail or lose bits. The flow fact adds the
-/// arithmetic on input (Taint.zig).
-pub fn casts(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
-        const name = builtinName(tree, node) orelse continue;
-        var fallible = false;
-        for ([_][]const u8{ "@intCast", "@truncate", "@intFromFloat", "@enumFromInt", "@fromBackingInt" }) |cast| fallible = fallible or std.mem.eql(u8, name, cast);
-        if (!fallible) continue;
-        const token = tree.nodeMainToken(node);
-        if (c.inTest(token) or !atRuntime(c, node)) continue;
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, node, &buffer);
-        // A literal is converted as the program compiles, which refuses one that does not fit.
-        if (args.len == 1 and (tree.nodeTag(args[0]) == .number_literal or tree.nodeTag(args[0]) == .char_literal)) continue;
-        try c.at(rule, token, try c.allocator.print("{s}: a conversion that is undefined behaviour in ReleaseFast when the value does not fit, or loses bits; aegis int.cast, Checked or Ranged convert with a checked result", .{name}));
     }
 }
 
@@ -241,6 +282,56 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
 /// A014's frame escapes (Escapes.zig).
 pub fn lifetimes(c: *Context, rule: Rule) Context.Error!void {
     try Escapes.check(c, rule);
+}
+
+/// A007's synchronization types: each place the program holds one (a field, a variable, a
+/// value it makes), never a pointer that borrows one held elsewhere or a member named through
+/// the type (`Io.Event.Error`). The sites' tokens, for the variables they type.
+fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime message: []const u8) Context.Error![]const Ast.TokenIndex {
+    const targets = try c.allocator.alloc(Governed.Target, paths.len);
+    const indexes = try c.allocator.alloc(usize, paths.len);
+    for (paths, targets, indexes, 0..) |path, *target, *index, i| {
+        target.* = .{ .source = "std", .declaration = path, .production = true };
+        index.* = i;
+    }
+    const found = try Governed.resolve(c, rule, targets, indexes);
+    var sites: std.ArrayList(Governed.Site) = .empty;
+    try Governed.sites(c, rule, found, &sites);
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    var held: std.ArrayList(Ast.TokenIndex) = .empty;
+    for (sites.items) |site| {
+        if (site.through_alias or c.inTest(site.token)) continue;
+        if (borrowed(tree, model, site.node)) continue;
+        try held.append(c.allocator, site.token);
+        try c.at(rule, site.token, try c.allocator.print(message, .{paths[site.index]}));
+    }
+    return held.items;
+}
+
+/// Whether a type named at `node` stands behind a pointer, or names a member of the type.
+fn borrowed(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
+    if (model.node_parents[@backingInt(node)]) |parent| { // safe: a node index indexes its own tree's parent table
+        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return true;
+    }
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+        switch (tree.nodeTag(parent)) {
+            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return true,
+            .fn_decl, .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
+            else => {},
+        }
+        if (tree.fullVarDecl(parent) != null or tree.fullContainerField(parent) != null) return false;
+    }
+    return false;
+}
+
+/// Whether one of `tokens` lies in `node`.
+fn within(tree: *const Ast, tokens: []const Ast.TokenIndex, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (tokens) |token| if (token >= first and token <= last) return true;
+    return false;
 }
 
 /// Each site in production code that reaches one of std's `paths`, past an alias the program

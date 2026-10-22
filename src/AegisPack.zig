@@ -46,7 +46,7 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = shared_state, .name = "A007", .group = .family_policy, .purpose = "shared state outside aegis's guards", .exception = .aegis }, .check = checkSharedState },
     .{ .definition = .{ .id = secrets, .name = "A008", .group = .family_policy, .purpose = "secret material outside aegis's Secret and Choice", .exception = .aegis }, .check = checkSecrets },
     .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput },
-    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic that can fail unchecked", .exception = .aegis }, .check = checkIntegers },
+    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic on input that a peer can make fail", .exception = .aegis }, .check = checkIntegers },
     .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
     .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork },
     .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
@@ -78,8 +78,7 @@ fn checkSecrets(c: *Context) Context.Error!void {
 }
 fn checkIntegers(c: *Context) Context.Error!void {
     if (!try begin(c, integers)) return;
-    try Danger.casts(c, integers);
-    try Flows.arithmetic(c, integers);
+    try Flows.integers(c, integers);
 }
 fn checkUnits(c: *Context) Context.Error!void {
     if (try begin(c, units)) try Danger.units(c, units);

@@ -205,7 +205,8 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4 * 1024 * 1024));
-        result.config = try configure(a, bytes, definitions);
+        // A configuration file is the checked repository's content: input until parsed.
+        result.config = try aegis.input.Untrusted([]const u8).init(bytes).parse(Configuring{ .a = a, .definitions = definitions }, configure);
     } else if (arguments.reviewed) {
         result.config = Rule.Config.reviewed();
     } else if (arguments.family) {
@@ -402,7 +403,11 @@ fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule
     selections[config.selections.len] = .{ .rule = id, .level = level };
     config.selections = selections;
 }
-fn configure(a: std.mem.Allocator, bytes: []const u8, definitions: []const Rule.Definition) !Rule.Config {
+const Configuring = struct { a: std.mem.Allocator, definitions: []const Rule.Definition };
+const ConfigureError = std.json.ParseError(std.json.Scanner) || error{ InvalidSelection, UnknownRule };
+fn configure(context: Configuring, bytes: []const u8) ConfigureError!Rule.Config {
+    const a = context.a;
+    const definitions = context.definitions;
     const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
     var config: Rule.Config = switch (document.profile) {
         .core => .{},

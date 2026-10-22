@@ -12,8 +12,9 @@ const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-/// A015: a std resource held by value in a field, or returned by the program's own function,
-/// outside aegis's `own.Owned`.
+/// A015: a std resource held by value in a field its file releases (`close`, `deinit`), or
+/// returned by the program's own function, outside aegis's `own.Owned`. A field nothing in its
+/// file releases borrows a handle its caller owns (an options or context struct).
 pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     const paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
     const resources = try containersOf(c, rule, &paths);
@@ -32,10 +33,27 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         };
         const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         const which = find(resources, held) orelse continue;
+        if (decl.kind == .field and !released(tree, decl.name)) continue;
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once", .{ what, decl.name, how, paths[which] }));
     }
+}
+
+/// Whether the file releases something named `name`: `name.close(`, `name.deinit(`, `name.kill(`
+/// or `name.wait(`, through an optional's `.?` too.
+fn released(tree: *const Ast, name: []const u8) bool {
+    const tags = tree.tokens.items(.tag);
+    var i: usize = 0;
+    while (i + 2 < tags.len) : (i += 1) {
+        if (tags[i] != .identifier or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue; // aegis: no-danger: token indexes fit u32.
+        var at = i + 1;
+        if (tags[at] == .period_asterisk or (tags[at] == .period and at + 1 < tags.len and tags[at + 1] == .question_mark)) at += if (tags[at] == .period) 2 else 1;
+        if (at + 1 >= tags.len or tags[at] != .period or tags[at + 1] != .identifier) continue;
+        const method = tree.tokenSlice(@intCast(at + 1)); // aegis: no-danger: token indexes fit u32.
+        for ([_][]const u8{ "close", "deinit", "kill", "wait" }) |release| if (std.mem.eql(u8, method, release)) return true;
+    }
+    return false;
 }
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
@@ -330,7 +348,7 @@ const Walk = struct {
         for (w.mentions.items) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token < first or token > last) continue;
-            const use = w.classify(mention);
+            const use = w.classify(mention) orelse continue;
             if (earliest == null or use.key < earliest.?.key) earliest = .{ .key = use.key, .write = use.write, .token = token };
         }
         const found = earliest orelse return .unwritten;
@@ -341,9 +359,18 @@ const Walk = struct {
 
     const Use = struct { key: Ast.TokenIndex, write: bool };
 
-    /// Whether a mention writes the local, and where it falls in evaluation order.
-    fn classify(w: *Walk, mention: Ast.Node.Index) Use {
+    /// Whether a mention writes the local, and where it falls in evaluation order; null where
+    /// it reads none of its memory: an array's `.len`, known as the program compiles.
+    fn classify(w: *Walk, mention: Ast.Node.Index) ?Use {
         const tree = w.tree;
+        if (w.model.node_parents[@backingInt(mention)]) |parent| { // safe: a node index indexes its own tree's parent table.
+            if (tree.nodeTag(parent) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len") and w.array()) return null;
+            // `@field(local, name) = ...` writes the field it names.
+            if (builtinField(tree, parent, mention)) {
+                const grand = w.model.node_parents[@backingInt(parent)] orelse return .{ .key = tree.nodeMainToken(mention), .write = false }; // safe: a node index indexes its own tree's parent table.
+                if (tree.nodeTag(grand) == .assign and tree.nodeData(grand).node_and_node[0] == parent) return .{ .key = tree.lastToken(grand), .write = true };
+            }
+        }
         var at = mention;
         while (w.model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
             switch (tree.nodeTag(parent)) {
@@ -371,6 +398,26 @@ const Walk = struct {
             }
         }
         return .{ .key = tree.nodeMainToken(mention), .write = false };
+    }
+
+    /// Whether the local is declared an array, whose length its type holds.
+    fn array(w: *const Walk) bool {
+        const variable = w.tree.fullVarDecl(w.model.declarations[w.local].node) orelse return false;
+        const kind = variable.ast.type_node.unwrap() orelse return false;
+        return switch (w.tree.nodeTag(kind)) {
+            .array_type, .array_type_sentinel => true,
+            else => false,
+        };
+    }
+
+    fn builtinField(tree: *const Ast, node: Ast.Node.Index, operand: Ast.Node.Index) bool {
+        switch (tree.nodeTag(node)) {
+            .builtin_call_two, .builtin_call_two_comma => {},
+            else => return false,
+        }
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return false;
+        const first = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return false;
+        return first == operand;
     }
 
     fn mentioned(w: *Walk, node: Ast.Node.Index) bool {
