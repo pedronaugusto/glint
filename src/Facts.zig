@@ -36,6 +36,8 @@ comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
 /// The declarations the program dereferences (`p.*`), found per file once.
 dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
+/// Every member access in the selected files, by the member's name, found once (`memberUses`).
+member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -2174,6 +2176,29 @@ pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
 
 fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
     return Model.identifier(self.gpa, raw);
+}
+
+/// The member accesses (`x.name`) in the project's selected files that spell `name`, each a
+/// `field_access` node: an index built once, for rules that follow one member across files.
+pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
+    if (self.member_uses == null) {
+        var index: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty;
+        for (self.project.inputs, 0..) |input, f| {
+            if (!input.selected) continue;
+            const file = Project.FileId.fromRaw(@intCast(f)); // safe: the project's file table indexes fit u32.
+            const tree = &self.project.files[f].tree;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .field_access) continue;
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+                const spelled = try self.memberName(tree.tokenSlice(tree.nodeData(node).node_and_token[1]));
+                const entry = try index.getOrPut(self.gpa, spelled);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.gpa, .{ .file = file, .node = node });
+            }
+        }
+        self.member_uses = index;
+    }
+    return if (self.member_uses.?.get(name)) |list| list.items else &.{};
 }
 
 pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl {

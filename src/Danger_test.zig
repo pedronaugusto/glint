@@ -13,8 +13,17 @@ const std_files = [_]sources.Extra{
     \\pub const crypto = @import("crypto.zig");
     \\pub const debug = @import("debug.zig");
     \\pub const time = @import("time.zig");
+    \\pub const process = @import("process.zig");
+    \\pub const array_list = @import("array_list.zig");
+    \\pub const hash_map = @import("hash_map.zig");
+    \\pub const array_hash_map = @import("array_hash_map.zig");
+    \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
+    \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
     .{ .name = "std/Io.zig", .bytes =
+    \\pub const File = @import("Io/File.zig");
+    \\pub const Dir = struct { handle: i32 };
+    \\pub const net = struct { pub const Stream = struct { handle: i32 }; pub const Server = struct { stream: Stream }; };
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Condition = struct { state: u32 = 0 };
@@ -61,6 +70,11 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }" },
+    .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };" },
+    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
+    .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
+    .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -92,9 +106,14 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "atomic.zig", .target = 2 },
     .{ .from = 0, .spelling = "crypto.zig", .target = 3 },
     .{ .from = 0, .spelling = "debug.zig", .target = 6 },
-    .{ .from = 0, .spelling = "time.zig", .target = 7 },
+    .{ .from = 0, .spelling = "time.zig", .target = 12 },
     .{ .from = 3, .spelling = "crypto/timing_safe.zig", .target = 4 },
     .{ .from = 3, .spelling = "crypto/ed25519.zig", .target = 5 },
+    .{ .from = 1, .spelling = "Io/File.zig", .target = 7 },
+    .{ .from = 0, .spelling = "process.zig", .target = 8 },
+    .{ .from = 0, .spelling = "array_list.zig", .target = 9 },
+    .{ .from = 0, .spelling = "hash_map.zig", .target = 10 },
+    .{ .from = 0, .spelling = "array_hash_map.zig", .target = 11 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -302,4 +321,64 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
         result.undecided += 1;
     };
     return result;
+}
+
+test "A015 finds std resources held or returned by value, not borrowed or owned" {
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const Conn = struct { stream: std.Io.net.Stream, log: ?std.Io.File, dir: *std.Io.Dir };
+        \\pub fn open() !std.Io.File { return undefined; }
+        \\pub fn child() std.process.Child { return undefined; }
+        \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
+    , 4);
+}
+
+test "A016 finds identifying integers of one type meeting, not other integers" {
+    try expect(pack.identity,
+        \\const NodeIndex = u32;
+        \\pub fn link(parent_id: u32, child_id: u32) void { _ = parent_id; _ = child_id; }
+        \\pub fn move(from: NodeIndex, toIndex: u32) void { _ = from; _ = toIndex; }
+        \\pub const Edge = struct { source_index: usize, target_index: usize, weight: usize };
+        \\pub fn clamp(x: u32, lo: u32, hi: u32) u32 { _ = lo; _ = hi; return x; }
+        \\pub fn pair(node_id: u32, slot_id: u64) void { _ = node_id; _ = slot_id; }
+        \\fn private(a_id: u32, b_id: u32) void { _ = a_id; _ = b_id; }
+    , 2);
+}
+
+test "A017 finds an enum state written in two functions and switched on" {
+    try expect(pack.state_machines,
+        \\const Phase = enum { idle, running, done };
+        \\const Job = struct {
+        \\    phase: Phase = .idle,
+        \\    kind: Phase = .idle,
+        \\    fn start(j: *Job) void { j.phase = .running; j.kind = .done; }
+        \\    fn finish(j: *Job) void { j.phase = .done; }
+        \\    fn step(j: *Job) void { switch (j.phase) { .idle => j.start(), .running => j.finish(), .done => {} } switch (j.kind) { else => {} } }
+        \\};
+        \\pub fn run(j: *Job) void { j.step(); }
+    , 1);
+}
+
+test "A019 finds a local read while still undefined, and leaves written, filled and branch-written ones" {
+    try expect(pack.unsafe_set,
+        \\fn fill(b: []u8) void { b[0] = 1; }
+        \\pub fn bad() u8 { var x: u8 = undefined; const y = x + 1; x = 2; return y; }
+        \\pub fn inLoop(n: usize) u32 { var sum: u32 = undefined; for (0..n) |i| { sum += @truncate(i); } return 0; }
+        \\pub fn good() u8 { var x: u8 = undefined; x = 3; return x; }
+        \\pub fn filled() u8 { var b: [4]u8 = undefined; fill(&b); return b[0]; }
+        \\pub fn sliced() u8 { var b: [4]u8 = undefined; fill(b[0..]); return b[0]; }
+        \\pub fn both(c: bool) u8 { var x: u8 = undefined; if (c) { x = 1; } else { x = 2; } return x; }
+        \\pub fn some(c: bool) u8 { var x: u8 = undefined; if (c) x = 1; return x; }
+        \\pub fn selfRead() u8 { var x: u8 = undefined; x = x + 1; return x; }
+    , 3);
+}
+
+test "A014 finds a borrow of a std container's storage stored in a field" {
+    try expect(pack.lifetimes,
+        \\const std = @import("std");
+        \\const Cache = struct { view: []u32 = &.{}, slot: ?*u32 = null, list: std.ArrayList(u32) = .{}, map: std.AutoHashMapUnmanaged(u32, u32) = undefined };
+        \\pub fn keep(c: *Cache) void { c.view = c.list.items; c.slot = &c.list.items[0]; c.slot = c.map.getPtr(1); }
+        \\pub fn local(c: *Cache) u32 { const v = c.list.items; return v[0]; }
+    , 3);
 }

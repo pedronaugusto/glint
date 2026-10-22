@@ -6,6 +6,7 @@ const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
+const Shapes = @import("DangerShapes.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
@@ -44,6 +45,9 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
     .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
     .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
+    .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },
+    .{ .definition = .{ .id = identity, .name = "A016", .group = .family_policy, .purpose = "identifying integers of one type that one may pass for another", .exception = .aegis }, .check = checkIdentity },
+    .{ .definition = .{ .id = state_machines, .name = "A017", .group = .family_policy, .purpose = "state machine kept by hand", .exception = .aegis }, .check = checkStateMachines },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
 };
 fn checkSharedState(c: *Context) Context.Error!void {
@@ -62,10 +66,23 @@ fn checkContracts(c: *Context) Context.Error!void {
     if (try begin(c, contracts)) try Danger.contracts(c, contracts);
 }
 fn checkLifetimes(c: *Context) Context.Error!void {
-    if (try begin(c, lifetimes)) try Danger.lifetimes(c, lifetimes);
+    if (!try begin(c, lifetimes)) return;
+    try Danger.lifetimes(c, lifetimes);
+    try Shapes.borrowsStored(c, lifetimes);
+}
+fn checkOwnership(c: *Context) Context.Error!void {
+    if (try begin(c, ownership)) try Shapes.ownership(c, ownership);
+}
+fn checkIdentity(c: *Context) Context.Error!void {
+    if (try begin(c, identity)) try Shapes.identity(c, identity);
+}
+fn checkStateMachines(c: *Context) Context.Error!void {
+    if (try begin(c, state_machines)) try Shapes.stateMachines(c, state_machines);
 }
 fn checkUnsafeSet(c: *Context) Context.Error!void {
-    if (try begin(c, unsafe_set)) try Danger.unsafeSet(c, unsafe_set);
+    if (!try begin(c, unsafe_set)) return;
+    try Danger.unsafeSet(c, unsafe_set);
+    try Shapes.undefinedReads(c, unsafe_set);
 }
 fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
