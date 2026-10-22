@@ -20,3 +20,4 @@ pub const state_machines: Rule = @fromBackingInt(@intCast(1116)); // safe: compi
 pub const diagnostics: Rule = @fromBackingInt(@intCast(1117)); // safe: compiled pack identities are reserved stable u16 values.
 pub const unsafe_set: Rule = @fromBackingInt(@intCast(1118)); // safe: compiled pack identities are reserved stable u16 values.
 pub const cancellation: Rule = @fromBackingInt(@intCast(1119)); // safe: compiled pack identities are reserved stable u16 values.
+pub const lock_order: Rule = @fromBackingInt(@intCast(1120)); // safe: compiled pack identities are reserved stable u16 values.

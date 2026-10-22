@@ -171,6 +171,7 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
         .{ "aegis-lazy", "src/Lazy.zig" },
         .{ "aegis-confined", "src/Confined.zig" },
         .{ "aegis-atomic", "src/Atomic.zig" },
+        .{ "aegis-order", "src/Order.zig" },
         .{ "aegis-err", "src/err.zig" },
         .{ "aegis-bounded", "src/bounded.zig" },
         .{ "aegis-own", "src/own.zig" },

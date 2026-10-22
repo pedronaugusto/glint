@@ -1208,14 +1208,18 @@ test "receivers through a guard's resolved type, builtins, destructuring, loop v
     try expectJudged(head ++ "const P = struct { key: u8, value: []const u8 };\nconst E = struct { name: []const u8, params: []const P };\npub fn f(es: []const E, n: []const u8) usize { const entry = for (es) |e| { if (e.name.len == n.len) break e; } else null; if (entry) |e| { for (e.params) |p| return p.value.len; } return 0; }", pack.access, true, 0);
 }
 
-test "atomics, task contexts and counters are in the contract" {
-    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\n";
+test "atomics, task contexts, ordered locks and counters are in the contract" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst O = aegis.sync.Order(&.{ .{ .name = \"a\" }, .{ .name = \"b\", .after = &.{0} } });\n";
     // An atomic's cell is private; a copy is a second cell.
     try expectJudged(head ++ "pub fn f(a: *aegis.sync.Atomic(u32)) void { _ = a.cell; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(a: aegis.sync.Atomic(u32)) u32 { const b = a; return a.load(.acquire) + b.load(.acquire); }", pack.copies, true, 1);
     // A task's context: private stack, a copy is a second context.
-    try expectJudged(head ++ "pub fn f(i: *aegis.sync.InitContext) usize { return i.used; }", pack.access, true, 1);
-    try expectJudged(head ++ "fn use(_: *const aegis.sync.InitContext) void {}\npub fn f(c: aegis.sync.InitContext) void { var d = c; _ = &d; use(&c); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(c: *O.Context, i: *aegis.sync.InitContext) usize { return c.used + i.used; }", pack.access, true, 2);
+    try expectJudged(head ++ "fn use(_: *const O.Context) void {}\npub fn f(c: O.Context) void { var d = c; _ = &d; use(&c); }", pack.copies, true, 1);
+    // An ordered lock's base is private; its ordered acquisitions give guards released by `deinit`.
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L) void { _ = l.base; }", pack.access, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); g.value().* += 1; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "const L = O.Ordered(aegis.sync.BlockingGuarded(u32), 0);\npub fn f(l: *L, c: *O.Context, io: std.Io) void { var g = l.acquireOrderedUncancelable(io, c); defer g.deinit(io); g.value().* += 1; }", pack.cleanup, true, 0);
     // A counter issues ids: a copy issues them twice.
     try expectJudged(head ++ "const C = aegis.id.Counter(struct {}, u32);\npub fn f(c: C) !void { var d = c; var e = c; _ = try d.next(); _ = try e.next(); }", pack.copies, true, 2);
 }

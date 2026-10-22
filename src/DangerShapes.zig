@@ -8,6 +8,7 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
+const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
@@ -66,6 +67,83 @@ fn released(tree: *const Ast, name: []const u8) bool {
 fn release(method: []const u8) bool {
     for ([_][]const u8{ "close", "deinit", "kill", "wait" }) |name| if (std.mem.eql(u8, method, name)) return true;
     return false;
+}
+
+/// A021: lock order. A function that holds a guard of an aegis owner (`Guarded`,
+/// `BlockingGuarded`, `RwGuarded`, `SpinRwGuarded`, `Order.Ordered`) while it acquires another:
+/// two tasks that take two locks in two orders deadlock. The site is the second acquisition,
+/// unless both are ranked (`acquireOrdered`, `readOrdered`, `writeOrdered`, their forms), which
+/// `Order` checks in Debug. A guard is held from its acquisition to its `deinit` or `release`, or
+/// to its block's end when that is deferred. One function's own acquisitions only: a call made
+/// while holding a guard is not followed.
+pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    const Held = struct { first: Ast.TokenIndex, last: Ast.TokenIndex, ranked: bool };
+    var held: std.ArrayList(Held) = .empty;
+    var acquisitions: std.ArrayList(struct { node: Ast.Node.Index, ranked: bool }) = .empty;
+    for (tree.nodes.items(.tag), 0..) |_, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
+        const method = tree.tokenSlice(method_token);
+        var acquires = false;
+        for ([_][]const u8{ "acquire", "read", "write", "tryAcquire", "tryRead", "tryWrite" }) |prefix| acquires = acquires or std.mem.startsWith(u8, method, prefix);
+        if (!acquires or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (try c.role(Contract.library, try c.facts.resolve(c.file, receiver)) != .guarded) continue;
+        const ranked = std.mem.find(u8, method, "Ordered") != null;
+        try acquisitions.append(c.allocator, .{ .node = node, .ranked = ranked });
+        // The guard's local, and how long it is held.
+        const parent = model.node_parents[@backingInt(node)] orelse continue; // safe: a node index indexes its own tree's parent table.
+        var at = parent;
+        while (tree.nodeTag(at) == .@"try" or tree.nodeTag(at) == .@"catch" or tree.nodeTag(at) == .grouped_expression) at = model.node_parents[@backingInt(at)] orelse break; // safe: a node index indexes its own tree's parent table.
+        const variable = tree.fullVarDecl(at) orelse continue;
+        const name = tree.tokenSlice(variable.ast.mut_token + 1);
+        const block = enclosingBlock(tree, model, at) orelse continue;
+        const end = releaseOf(tree, name, tree.lastToken(at), tree.lastToken(block));
+        try held.append(c.allocator, .{ .first = tree.lastToken(at), .last = end, .ranked = ranked });
+    }
+    for (acquisitions.items) |second| {
+        const token = tree.nodeMainToken(second.node);
+        for (held.items) |first| {
+            if (token <= first.first or token > first.last) continue;
+            if (first.ranked and second.ranked) continue;
+            try c.at(rule, tree.firstToken(second.node), "a second lock taken while a guard is held, not both ranked: two tasks taking them in two orders deadlock; aegis Order ranks them and checks the order in Debug");
+            break;
+        }
+    }
+}
+
+/// The block a statement stands in.
+fn enclosingBlock(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        switch (tree.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => return parent,
+            .fn_decl => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Where a guard named `name` is released after `from`: its `deinit(` or `release(` called
+/// outside a `defer`, or the block's end.
+fn releaseOf(tree: *const Ast, name: []const u8, from: Ast.TokenIndex, block_end: Ast.TokenIndex) Ast.TokenIndex {
+    const tags = tree.tokens.items(.tag);
+    var i: usize = from + 1;
+    while (i + 2 < block_end) : (i += 1) {
+        if (tags[i] != .identifier or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue;
+        if (tags[i + 1] != .period or tags[i + 2] != .identifier) continue;
+        const method = tree.tokenSlice(@intCast(i + 2));
+        if (!std.mem.eql(u8, method, "deinit") and !std.mem.eql(u8, method, "release")) continue;
+        // A deferred release runs at the block's end.
+        if (i >= 1 and (tags[i - 1] == .keyword_defer or tags[i - 1] == .keyword_errdefer)) return block_end;
+        return @intCast(i);
+    }
+    return block_end;
 }
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one

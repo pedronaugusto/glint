@@ -34,8 +34,9 @@ pub const state_machines = Ids.state_machines;
 pub const diagnostics = Ids.diagnostics;
 pub const unsafe_set = Ids.unsafe_set;
 pub const cancellation = Ids.cancellation;
+pub const lock_order = Ids.lock_order;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
-pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation };
+pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
     .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },
@@ -57,6 +58,7 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = diagnostics, .name = "A018", .group = .family_policy, .purpose = "internal text written to a peer", .exception = .aegis }, .check = checkDiagnostics },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
     .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation },
+    .{ .definition = .{ .id = lock_order, .name = "A021", .group = .family_policy, .purpose = "two aegis guards held at once without both ranked by Order", .exception = .aegis }, .check = checkLockOrder },
 };
 fn checkInput(c: *Context) Context.Error!void {
     if (try begin(c, untrusted_input)) try Flows.input(c, untrusted_input);
@@ -90,6 +92,9 @@ fn checkLifetimes(c: *Context) Context.Error!void {
     if (!try begin(c, lifetimes)) return;
     try Danger.lifetimes(c, lifetimes);
     try Shapes.borrowsStored(c, lifetimes);
+}
+fn checkLockOrder(c: *Context) Context.Error!void {
+    if (try begin(c, lock_order)) try Shapes.lockOrder(c, lock_order);
 }
 fn checkOwnership(c: *Context) Context.Error!void {
     if (try begin(c, ownership)) try Shapes.ownership(c, ownership);

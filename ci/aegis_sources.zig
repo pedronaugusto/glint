@@ -46,6 +46,7 @@ const sources = [_]Source{
     .{ .name = "src/handle/Domain.zig", .bytes = @embedFile("aegis-handle-domain") },
     .{ .name = "src/handle/index.zig", .bytes = @embedFile("aegis-handle-index") },
     .{ .name = "src/Atomic.zig", .bytes = @embedFile("aegis-atomic") },
+    .{ .name = "src/Order.zig", .bytes = @embedFile("aegis-order") },
     .{ .name = "src/err.zig", .bytes = @embedFile("aegis-err") },
 };
 const root = 1;
@@ -87,10 +88,11 @@ const handle_secondary = 36;
 const handle_domain = 37;
 const handle_index = 38;
 const atomic = 39;
-const err = 40;
+const order = 40;
+const err = 41;
 
 /// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
-fn imports() [59]Project.Import {
+fn imports() [61]Project.Import {
     return .{
         .{ .from = file(root), .spelling = "secret.zig", .target = file(secret) },
         .{ .from = file(root), .spelling = "sync.zig", .target = file(sync) },
@@ -144,6 +146,8 @@ fn imports() [59]Project.Import {
         .{ .from = file(handle_dense), .spelling = "slot_map.zig", .target = file(handle_slot_map) },
         .{ .from = file(handle_pool), .spelling = "Domain.zig", .target = file(handle_domain) },
         .{ .from = file(sync), .spelling = "Atomic.zig", .target = file(atomic) },
+        .{ .from = file(sync), .spelling = "Order.zig", .target = file(order) },
+        .{ .from = file(order), .spelling = "Condition.zig", .target = file(condition) },
         .{ .from = file(root), .spelling = "err.zig", .target = file(err) },
         .{ .from = file(0), .spelling = "aegis", .target = file(root) },
         .{ .from = file(0), .spelling = "aegis.secret", .target = file(secret) },

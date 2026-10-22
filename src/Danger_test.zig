@@ -414,6 +414,39 @@ test "A017 finds an enum state written in two functions and switched on" {
     , 1);
 }
 
+test "A021 finds a second lock taken while a guard is held, unless both are ranked by Order" {
+    try expect(pack.lock_order,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const L = aegis.sync.BlockingGuarded(u32);
+        \\pub fn both(a: *L, b: *L, io: std.Io) void {
+        \\    var ga = a.acquireUncancelable(io);
+        \\    defer ga.deinit(io);
+        \\    var gb = b.acquireUncancelable(io);
+        \\    defer gb.deinit(io);
+        \\    ga.value().* += gb.value().*;
+        \\}
+        \\pub fn apart(a: *L, b: *L, io: std.Io) void {
+        \\    var ga = a.acquireUncancelable(io);
+        \\    ga.value().* += 1;
+        \\    ga.deinit(io);
+        \\    var gb = b.acquireUncancelable(io);
+        \\    gb.value().* += 1;
+        \\    gb.deinit(io);
+        \\}
+        \\const O = aegis.sync.Order(&.{ .{ .name = "a" }, .{ .name = "b", .after = &.{0} } });
+        \\const A = O.Ordered(L, 0);
+        \\const B = O.Ordered(L, 1);
+        \\pub fn ranked(a: *A, b: *B, c: *O.Context, io: std.Io) void {
+        \\    var ga = a.acquireOrderedUncancelable(io, c);
+        \\    defer ga.deinit(io);
+        \\    var gb = b.acquireOrderedUncancelable(io, c);
+        \\    defer gb.deinit(io);
+        \\    ga.value().* += gb.value().*;
+        \\}
+    , 1);
+}
+
 test "A019 finds a local read while still undefined, and leaves written, filled and branch-written ones, an array's length and a field written by name" {
     try expect(pack.unsafe_set,
         \\fn fill(b: []u8) void { b[0] = 1; }
