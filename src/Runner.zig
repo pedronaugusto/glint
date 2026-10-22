@@ -25,7 +25,7 @@ stale: std.ArrayList(Report.Stale) = .empty,
 escapes: std.ArrayList(Report.Escape) = .empty,
 malformed: std.ArrayList(Report.Malformed) = .empty,
 /// What each of the current file's aegis escapes covered, by its index in `suppressions`.
-covered: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Report.Covered)) = .empty,
+covered: std.array_hash_map.Auto(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
 files: []const FileConfig = &.{},

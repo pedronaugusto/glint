@@ -186,6 +186,9 @@ test "A007 leaves constants, thread-local state, aliases' uses, borrows and test
         \\const Io = std.Io;
         \\pub fn g(l: *Io.RwLock, e: *const Io.Event, s: ?*std.atomic.Value(bool)) void { _ = l; _ = e; _ = s; }
         \\const Borrow = struct { stop: ?*const std.atomic.Value(bool) };
+        \\const aegis = @import("aegis");
+        \\const Id = enum(u32) { _ };
+        \\var cell: aegis.Atomic(Id) = .init(@fromBackingInt(0));
     , 1);
 }
 

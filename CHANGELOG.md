@@ -7,7 +7,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Breaking
 
 - The aegis pack's danger rules (aegis's design §7, enforcement): each finds the sites where a danger exists and aegis's type is the answer, from what the code resolves to.
-  - A007 shared state: std's synchronization (`Io.Mutex`, `Io.RwLock`, `Io.Condition`, `Io.Semaphore`, `Io.Event`, `atomic.Value`, `atomic.Mutex`) where the program holds it (a pointer that borrows one is no site), the atomic builtins, a mutable container-level `var` of another type.
+  - A007 shared state: std's synchronization (`Io.Mutex`, `Io.RwLock`, `Io.Condition`, `Io.Semaphore`, `Io.Event`, `atomic.Value`, `atomic.Mutex`) where the program holds it (a pointer that borrows one is no site), the atomic builtins, a mutable container-level `var` of another type and not of an aegis type.
   - A008 secrets: `crypto.secureZero`, `crypto.timing_safe.eql` and `compare`, a std.crypto `SecretKey` or `KeyPair` held by value (not compared as a type).
   - A009 input: input that indexes or slices input's memory or names a `Dir` path, and a number from input that picks an entry of the program's own table or bounds a loop, before an aegis `input.Untrusted` parser refines it.
   - A010 integers: `@intCast`, `@intFromFloat`, `@enumFromInt` and `@fromBackingInt` of input, a sum, product or negation of a number from input, a difference that input can underflow, and division by input. The program's own conversions are the safe build's to check, and `@truncate` keeps bits by intent.

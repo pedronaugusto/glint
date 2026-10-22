@@ -128,7 +128,7 @@ pub const Flow = struct {
     /// std's `process.run`, whose result holds a child's output.
     run: std.ArrayList(Facts.Decl) = .empty,
     /// Reads the program declares its own by an escape on their line, as file and token.
-    owned: std.AutoArrayHashMapUnmanaged(Owned, void) = .empty,
+    owned: std.array_hash_map.Auto(Owned, void) = .empty,
     /// Per file, the lines an aegis escape stands on.
     escaped: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
     changed: bool = false,

@@ -37,7 +37,7 @@ pub fn escapeOf(a: std.mem.Allocator, file: *const File, line: u32, rule: []cons
         const text = file.source[comment.start..comment.end];
         for ([_][]const u8{ "// safe: ", "// unreachable: " }) |prefix| if (std.mem.startsWith(u8, text, prefix)) {
             const edits = try a.alloc(Report.Edit, 1);
-            edits[0] = .{ .start = comment.start, .end = comment.start + @as(u32, @intCast(prefix.len)), .text = try std.fmt.allocPrint(a, "// aegis: {s}: ", .{reason}) };
+            edits[0] = .{ .start = comment.start, .end = comment.start + @as(u32, @intCast(prefix.len)), .text = try a.print("// aegis: {s}: ", .{reason}) };
             return edits;
         };
     }
@@ -48,7 +48,7 @@ pub fn escapeOf(a: std.mem.Allocator, file: *const File, line: u32, rule: []cons
 /// removal of every escape that covered nothing. Overlapping edits keep the first; an edit two
 /// findings share is made once.
 pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report) std.mem.Allocator.Error![]const Changed {
-    var by_file: std.AutoArrayHashMapUnmanaged(u32, std.ArrayList(Report.Edit)) = .empty;
+    var by_file: std.array_hash_map.Auto(u32, std.ArrayList(Report.Edit)) = .empty;
     for (report.diagnostics) |d| {
         if (d.fix.len == 0) continue;
         const entry = try by_file.getOrPut(a, d.span.file.raw());

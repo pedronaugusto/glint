@@ -42,8 +42,12 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
         // An `extern var` is the unsafe set's (A019): its storage is another program's.
         if (variable.extern_export_token) |token| if (tree.tokenTag(token) == .keyword_extern) continue;
         if (c.inTest(decl.token)) continue;
-        // A variable of a synchronization type is that type's site, counted once.
-        if (variable.ast.type_node.unwrap()) |kind| if (within(tree, held, kind)) continue;
+        // A variable of a synchronization type is that type's site, counted once; one of an
+        // aegis type (`Atomic`, `Guarded`, `Once`, ...) is held by its answer.
+        if (variable.ast.type_node.unwrap()) |kind| {
+            if (within(tree, held, kind)) continue;
+            if (try c.role(Contract.library, try c.facts.resolve(c.file, kind)) != null) continue;
+        }
         try c.at(rule, decl.token, try c.allocator.print("container-level var '{s}': mutable state any thread may reach; aegis Guarded, Atomic, Once or Lazy holds it, or Confined checks its one owner", .{decl.name}));
     }
 }
@@ -341,7 +345,7 @@ fn aliasCalls(c: *Context, value: Ast.Node.Index, calls: *std.ArrayList(Ast.Node
     if (variable.visib_token != null) return;
     var declared: ?u32 = null;
     for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
-        declared = @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32
+        declared = @intCast(d);
     };
     const alias = declared orelse return;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -377,7 +381,7 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
     }
     const start = tree.tokenStart(tree.firstToken(node));
     const last = tree.lastToken(node);
-    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try std.fmt.allocPrint(c.allocator, "{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
+    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try c.allocator.print("{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
     return true;
 }
 

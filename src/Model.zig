@@ -125,8 +125,8 @@ pub fn init(file: *File) InitError!Model {
         node_references[index] = @intCast(references.items.len);
         try references.append(a, ref_record);
     }
-    model.references = references.items;
-    model.import_nodes = import_nodes.items;
+    model.references = try references.toOwnedSlice(a);
+    model.import_nodes = try import_nodes.toOwnedSlice(a);
     if (file.status == .parsed and file.zir != null) {
         var zir_refs: std.ArrayList(LoweredReference) = .empty;
         const visited = try a.alloc(bool, file.zir.?.instructions.len);
@@ -136,9 +136,9 @@ pub fn init(file: *File) InitError!Model {
             if (decl.type_body) |body| try walkLowered(a, file.zir.?, body, baseline, decl.node, tree, &model, visited, &zir_refs, &operations, 0);
             if (decl.value_body) |body| try walkLowered(a, file.zir.?, body, baseline, decl.node, tree, &model, visited, &zir_refs, &operations, 0);
         }
-        model.zir_references = zir_refs.items;
-        model.operations = operations.items;
-        for (operations.items, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i);
+        model.zir_references = try zir_refs.toOwnedSlice(a);
+        model.operations = try operations.toOwnedSlice(a);
+        for (model.operations, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i);
     }
 
     try classifyTests(a, tree, &model);

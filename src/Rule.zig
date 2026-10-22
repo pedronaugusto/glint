@@ -135,7 +135,7 @@ pub const Config = struct {
     }
     /// Selects a stable rule ID.
     pub fn set(self: *Config, rule: Rule, enabled: bool) void {
-        std.debug.assert(@backingInt(rule) < self.enabled.len); // aegis: no-danger: caller uses the fixed built-in selection table.
+        std.debug.assert(@backingInt(rule) < self.enabled.len);
         self.enabled[@backingInt(rule)] = enabled; // safe: enum identities index their owning frozen tables without narrowing.
     }
     /// A required semantic fact for a gating rule cannot be ignored or suppressed.

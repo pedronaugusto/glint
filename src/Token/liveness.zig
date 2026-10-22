@@ -4,7 +4,6 @@
 //! compiled outside `zig test`. Read in the passes recovery already makes:
 //! `Builder` as tokens are emitted, `Words.see` in its pass over words.
 const std = @import("std");
-const aegis = @import("aegis");
 const types = @import("data.zig");
 const Token = @import("store.zig").Token;
 
@@ -299,7 +298,7 @@ const Names = struct {
             names.next[i] = slot.*;
             slot.* = @intCast(i);
         };
-        names.this = this.items;
+        names.this = try this.toOwnedSlice(arena);
         return names;
     }
     inline fn find(self: *const Names, comptime capacity: usize, word: []const u8) ?u32 {
@@ -398,7 +397,7 @@ pub const Words = struct {
     /// keeps its kind, since dead code is no evidence of a test. `where`
     /// holds the index in the stream of each spec's token.
     pub fn classify(self: *Words, scratch: std.mem.Allocator, specs: []types.Import, where: []const u32) std.mem.Allocator.Error!void {
-        aegis.assert.invariant(specs.len == where.len, "specs.len == where.len");
+        std.debug.assert(specs.len == where.len);
         const reach = try self.reachable(scratch);
         var member: usize = 0;
         var test_range: usize = 0;
