@@ -91,7 +91,7 @@ pub const Dep = struct {
 
 pub const Fact = enum { input, peer };
 
-pub const Owned = struct { file: u32, token: Ast.TokenIndex };
+pub const Owned = struct { file: Project.FileId, token: Ast.TokenIndex };
 
 const Function = struct {
     file: Project.FileId,
@@ -123,6 +123,8 @@ pub const Flow = struct {
     file: ?Facts.Container = null,
     dir: ?Facts.Container = null,
     stream: ?Facts.Container = null,
+    /// The functions the configuration declares write to a peer.
+    peer_writers: std.ArrayList(Facts.Decl) = .empty,
     /// std's `process.run`, whose result holds a child's output.
     run: std.ArrayList(Facts.Decl) = .empty,
     /// Reads the program declares its own by an escape on their line, as file and token.
@@ -132,17 +134,16 @@ pub const Flow = struct {
     changed: bool = false,
 };
 
-const keys = struct {
-    var input: u8 = 0;
-    var peer: u8 = 0;
-};
+/// Both facts, kept for the run.
+const Flows = struct { input: Flow = .{}, peer: Flow = .{} };
 
 /// The program's `fact`, solved the first time a rule asks.
 pub fn get(c: *Context, fact: Fact) Context.Error!*Flow {
-    const flow = try c.facts.memo(Flow, switch (fact) {
-        .input => @intFromPtr(&keys.input),
-        .peer => @intFromPtr(&keys.peer),
-    });
+    const flows = try c.facts.memo(Flows);
+    const flow = switch (fact) {
+        .input => &flows.input,
+        .peer => &flows.peer,
+    };
     if (!flow.solved) {
         flow.fact = fact;
         try solve(c, flow);
@@ -172,7 +173,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
 fn reads(config: @import("Rule.zig").Config, fact: Fact) bool {
     const pack = @import("AegisRules.zig");
     return switch (fact) {
-        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation),
+        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation) or config.has(pack.contracts),
         .peer => config.has(pack.diagnostics),
     };
 }
@@ -189,6 +190,10 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
         }
     }
     flow.reader, flow.file, flow.dir, flow.stream = found;
+    for (c.config.peer_writers) |declared| {
+        const found_writers = (try Governed.declarations(c, declared.module, declared.declaration)) orelse (try Governed.declarationsOfPackage(c, declared.module, declared.declaration)) orelse &.{};
+        for (found_writers) |decl| try flow.peer_writers.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+    }
     for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.run.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try reach(c, &flow.std_files, mapping.target);
     for ([_][]const u8{ "mem", "fmt", "ascii", "unicode", "math", "base64" }) |namespace| {
@@ -543,7 +548,7 @@ fn declaredOwn(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
     const token = source_file.tree.nodeMainToken(call.ast.fn_expr);
     const line = source_file.line(source_file.tree.tokenStart(token));
     if (std.mem.findScalar(u32, lines, line) == null) return false;
-    try flow.owned.put(c.allocator, .{ .file = file.raw(), .token = token }, {});
+    try flow.owned.put(c.allocator, .{ .file = file, .token = token }, {});
     return true;
 }
 
@@ -638,24 +643,25 @@ fn fnDecl(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
 /// Whether a function outside the program starts the fact: a read of input, or a peer writer.
 fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.Error!bool {
     _ = c;
-    const file = decl.file.raw();
+    const file = decl.file;
     switch (flow.fact) {
         .input => {
             for (flow.run.items) |run| if (std.meta.eql(run, decl)) return true;
-            if (flow.reader) |reader| if (reader.file.raw() == file) {
+            if (flow.reader) |reader| if (reader.file.eql(file)) {
                 for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
             };
-            if (flow.file) |handle| if (handle.file.raw() == file) {
+            if (flow.file) |handle| if (handle.file.eql(file)) {
                 for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (std.mem.eql(u8, name, read)) return true;
             };
-            if (flow.dir) |dir| if (dir.file.raw() == file) {
+            if (flow.dir) |dir| if (dir.file.eql(file)) {
                 for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (std.mem.eql(u8, name, read)) return true;
             };
             return false;
         },
         .peer => {
+            for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) return true;
             const stream = flow.stream orelse return false;
-            return stream.file.raw() == file and std.mem.eql(u8, name, "writer");
+            return stream.file.eql(file) and std.mem.eql(u8, name, "writer");
         },
     }
 }
@@ -984,6 +990,25 @@ pub fn reached(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
     return .{ .decl = decl, .args = callee.args.items, .skip = callee.skip, .std = in_std, .method = callee.receiver != null };
 }
 
+/// The level of what a condition reads: its comparisons' and its logic's operands, each as
+/// the fact reads it (a comparison's own result is clean; what it compares is not).
+pub fn conditionAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+    const tree = &c.project.files[file.raw()].tree;
+    switch (tree.nodeTag(node)) {
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return (try conditionAt(c, flow, file, lhs)).join(try conditionAt(c, flow, file, rhs));
+        },
+        .bool_not, .grouped_expression => return conditionAt(c, flow, file, if (tree.nodeTag(node) == .bool_not) tree.nodeData(node).node else tree.nodeData(node).node_and_token[0]),
+        else => return levelAt(c, flow, file, node),
+    }
+}
+
+/// Whether a call reads input: a read the fact starts at.
+pub fn isRead(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!bool {
+    return (try resolveCall(c, flow, file, call)).kind == .source;
+}
+
 /// Whether a function outside the program is one of std's.
 pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
     return flow.std_files.contains(decl.file.raw());
@@ -1000,6 +1025,6 @@ pub fn directoryType(flow: *const Flow) ?Facts.Container {
 /// The reads in `file` the program declares its own, by their callee's token.
 pub fn ownedIn(a: std.mem.Allocator, flow: *const Flow, file: Project.FileId) error{OutOfMemory}![]const Ast.TokenIndex {
     var out: std.ArrayList(Ast.TokenIndex) = .empty;
-    for (flow.owned.keys()) |read| if (read.file == file.raw()) try out.append(a, read.token);
+    for (flow.owned.keys()) |read| if (read.file.eql(file)) try out.append(a, read.token);
     return out.items;
 }

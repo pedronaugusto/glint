@@ -61,6 +61,9 @@ pub const Config = struct {
     fact_budget: usize = 100_000,
     /// Count each selected file's functions and assertion calls into the report.
     metrics: bool = false,
+    /// The functions whose result writes to a peer, as the packages that own them declare
+    /// (A018's sinks beside std's `net.Stream.writer`).
+    peer_writers: []const PeerWriter = &.{},
 
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };
@@ -72,6 +75,9 @@ pub const Config = struct {
     /// per-build choice on the way read in every alternative. Null `source` names an external
     /// function by its symbol: every `extern fn` of that symbol, std's or the program's own, is
     /// the one the linker binds. A governed `extern fn` governs its symbol the same way.
+    /// A declaration by the module that publishes it and its path there (`uplink`,
+    /// `server.Response.writer`).
+    pub const PeerWriter = struct { module: []const u8, declaration: []const u8 };
     pub const Disallowed = struct {
         source: ?[]const u8 = null,
         declaration: []const u8,

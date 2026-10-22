@@ -2180,17 +2180,18 @@ fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
     return Model.identifier(self.gpa, raw);
 }
 
-/// A `T` this run keeps under `key`, made with its defaults the first time it is asked for: what
-/// a rule computes once for the whole project and reads from each file's check. It lives as
-/// long as the run.
-pub fn memo(self: *Facts, comptime T: type, key: usize) ResolveError!*T {
+/// The `T` this run keeps, made with its defaults the first time it is asked for: what a rule
+/// computes once for the whole project and reads from each file's check. A type is its own key,
+/// so one rule's state is never another's. It lives as long as the run.
+pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
+    const key = comptime std.hash.Wyhash.hash(0, @typeName(T));
     const entry = try self.memos.getOrPut(self.gpa, key);
     if (!entry.found_existing) {
         const made = try self.gpa.create(T);
         made.* = .{};
         entry.value_ptr.* = made;
     }
-    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal: the key is the caller's for this type alone.
+    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal: the key is this type's own name.
 }
 
 /// The member accesses (`x.name`) in the project's selected files that spell `name`, each a

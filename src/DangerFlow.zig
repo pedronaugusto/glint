@@ -51,7 +51,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const reached = try Taint.reached(c, flow, c.file, call);
                 const decl = reached.decl orelse continue;
                 const dir = Taint.directoryType(flow) orelse continue;
-                if (decl.file.raw() != dir.file.raw()) continue;
+                if (!decl.file.eql(dir.file)) continue;
                 const names = try parameters(c, decl);
                 for (reached.args, 0..) |arg, position| {
                     if (position >= names.len or std.mem.find(u8, names[position], "path") == null) continue;
@@ -133,7 +133,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const decl = reached.decl orelse continue;
         if (!reached.std) continue;
         const name = c.project.models[decl.file.raw()].declarations[decl.index].name;
-        const from_reader = if (Taint.readerType(flow)) |r| r.file.raw() == decl.file.raw() else false;
+        const from_reader = if (Taint.readerType(flow)) |r| r.file.eql(decl.file) else false;
         if (from_reader and std.mem.find(u8, name, "Unlimited") != null) {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
             continue;
@@ -211,7 +211,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             .instance, .container => |k| k,
             else => continue,
         };
-        if (held.file.raw() != io_type.file.raw() or held.scope != io_type.scope) continue;
+        if (!held.file.eql(io_type.file) or held.scope != io_type.scope) continue;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const loop = tree.fullWhile(node) orelse continue;

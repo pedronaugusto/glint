@@ -155,12 +155,12 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             const use_model = &c.project.models[use.file.raw()];
             const receiver = try c.facts.resolve(use.file, use_tree.nodeData(use.node).node_and_token[0]);
             const owner = byPointer(receiver) orelse continue;
-            if (owner.file.raw() != holder.file.raw() or owner.scope != holder.scope) continue;
+            if (!owner.file.eql(holder.file) or owner.scope != holder.scope) continue;
             const parent = use_model.node_parents[@backingInt(use.node)] orelse continue; // safe: a node index indexes its own tree's parent table.
             if (use_tree.nodeTag(parent) == .assign and use_tree.nodeData(parent).node_and_node[0] == use.node) {
                 const function = enclosingFunction(use_model, use_tree, parent) orelse continue;
                 for (writers.items) |seen| {
-                    if (seen.file.raw() == use.file.raw() and seen.node == function) break;
+                    if (seen.file.eql(use.file) and seen.node == function) break;
                 } else try writers.append(c.allocator, .{ .file = use.file, .node = function });
             }
             if (use_tree.fullSwitch(parent)) |s| switched = switched or s.ast.condition == use.node;
@@ -235,7 +235,7 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const Facts.Container, no
 /// Whether a value is a container declared in one of std's container namespaces.
 fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index) Context.Error!bool {
     const held = byPointer(try c.facts.resolve(c.file, node)) orelse return false;
-    for (namespaces) |namespace| if (held.file.raw() == namespace.file.raw()) return true;
+    for (namespaces) |namespace| if (held.file.eql(namespace.file)) return true;
     return false;
 }
 
@@ -461,7 +461,7 @@ fn containersOf(c: *Context, rule: Rule, paths: []const []const u8) Context.Erro
 }
 
 fn find(containers: []const Facts.Container, held: Facts.Container) ?usize {
-    for (containers, 0..) |k, i| if (k.file.raw() == held.file.raw() and k.scope == held.scope) return i;
+    for (containers, 0..) |k, i| if (k.file.eql(held.file) and k.scope == held.scope) return i;
     return null;
 }
 

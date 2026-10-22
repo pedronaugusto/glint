@@ -16,6 +16,7 @@ const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
+const Taint = @import("Taint.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -224,25 +225,79 @@ fn nanoseconds(tree: *const Ast, node: Ast.Node.Index) bool {
     };
 }
 
-/// A013: contracts that are undefined behaviour when false in a release build.
+/// A013: a contract a peer's input can reach: an `assert` whose condition holds input, an
+/// `unreachable` on a branch input chooses, a `catch unreachable` or `orelse unreachable` on a
+/// call that reads input or is given it. Input must meet an error, never a panic, or undefined
+/// behaviour in a consumer's ReleaseFast build. An internal invariant no input reaches is the
+/// program's to state, as Zig's own checks are; ReleaseFast is the consumer's choice.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
-    try asserts(c, rule);
+    const flow = try Taint.get(c, .input);
+    try asserts(c, rule, flow);
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .unreachable_literal) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
-        try c.at(rule, token, "unreachable: undefined behaviour in ReleaseFast when reached; aegis assert.never stops in every build, or return an error");
+        switch (try chosenBy(c, flow, node)) {
+            .clean => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a branch that passed through a call that does not resolve may be input's to choose"),
+            .data, .number => try c.at(rule, token, "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error"),
+        }
     }
 }
 
-/// A013's `std.debug.assert` sites, each with its fix where the file's code alone decides it:
-/// a call `std.debug.assert(c)` becomes `aegis.assert.invariant(c, "c")`; a private alias
-/// (`const assert = std.debug.assert;`) whose every use is such a call goes, its calls
-/// rewritten. The file imports aegis for it when it does not yet.
-fn asserts(c: *Context, rule: Rule) Context.Error!void {
-    const message = "std.debug.assert: a contract a ReleaseFast build assumes true; aegis assert.invariant, pre or post checks it in every build, assert.debug states a debug-only one";
+/// How far input chooses the path to `node`: the conditions of the branches and loops it is
+/// in, the operands of the switches whose prongs hold it, and a `catch` or `orelse` it is the
+/// answer of, through the call before it (what the call reads and is given), up to its
+/// function.
+fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    var out: Taint.Level = .clean;
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+        switch (tree.nodeTag(parent)) {
+            .fn_decl => break,
+            .@"catch", .@"orelse" => {
+                const lhs, const rhs = tree.nodeData(parent).node_and_node;
+                if (rhs == at) out = out.join(try failedBy(c, flow, lhs));
+            },
+            else => {},
+        }
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, branch.ast.cond_expr));
+        } else if (tree.fullWhile(parent)) |loop| {
+            if (loop.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr));
+        } else if (tree.fullSwitchCase(parent) != null) {
+            const choice = model.node_parents[@backingInt(parent)] orelse continue; // safe: a node index indexes its own tree's parent table
+            const whole = tree.fullSwitch(choice) orelse continue;
+            out = out.join(try Taint.levelAt(c, flow, c.file, whole.ast.condition));
+        }
+    }
+    return out;
+}
+
+/// How far input can make `expression` fail: what it holds, and what a call it makes reads
+/// and is given.
+fn failedBy(c: *Context, flow: *Taint.Flow, expression: Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.files[c.file.raw()].tree;
+    var out = try Taint.levelAt(c, flow, c.file, expression);
+    var inner = expression;
+    while (tree.nodeTag(inner) == .@"try" or tree.nodeTag(inner) == .grouped_expression) inner = if (tree.nodeTag(inner) == .@"try") tree.nodeData(inner).node else tree.nodeData(inner).node_and_token[0];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, inner) orelse return out;
+    const reached = try Taint.reached(c, flow, c.file, call);
+    for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
+    if (try Taint.isRead(c, flow, c.file, call)) out = out.join(.data);
+    return out;
+}
+
+/// A013's `std.debug.assert` sites whose condition holds input, each with its fix where the
+/// file's code alone decides it: `std.debug.assert(c)`, or a call through a private alias,
+/// becomes `aegis.assert.invariant(c, "c")`, the file importing aegis for it when it does not.
+fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
+    const message = "std.debug.assert on input: a contract a peer can break, a panic or undefined behaviour in a consumer's ReleaseFast build; return an error, or aegis assert.invariant checks it in every build";
     var target: [1]Governed.Target = .{.{ .source = "std", .declaration = "debug.assert", .production = true }};
     var index: [1]usize = .{0};
     const found = try Governed.resolve(c, rule, &target, &index);
@@ -250,17 +305,54 @@ fn asserts(c: *Context, rule: Rule) Context.Error!void {
     try Governed.sites(c, rule, found, &sites);
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
+    var calls: std.ArrayList(Ast.Node.Index) = .empty;
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
         const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == site.node) {
-            if (!atRuntime(c, parent)) continue;
-            var edits: std.ArrayList(Report.Edit) = .empty;
-            if (try invariant(c, parent, &edits)) try c.fixedAt(rule, site.token, message, edits.items) else try c.at(rule, site.token, message);
+            try calls.append(c.allocator, parent);
             continue;
         };
-        try c.fixedAt(rule, site.token, message, try aliasFix(c, parent));
+        try aliasCalls(c, parent, &calls);
+    }
+    for (calls.items) |node| {
+        if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, node).?;
+        if (call.ast.params.len != 1) continue;
+        const token = tree.firstToken(node);
+        switch (try Taint.conditionAt(c, flow, c.file, call.ast.params[0])) {
+            .clean => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a condition that passed through a call that does not resolve may hold input"),
+            .data, .number => {
+                var edits: std.ArrayList(Report.Edit) = .empty;
+                if (try invariant(c, node, &edits)) try c.fixedAt(rule, token, message, edits.items) else try c.at(rule, token, message);
+            },
+        }
+    }
+}
+
+/// The calls through a private alias of std's assert (`const assert = std.debug.assert;`).
+fn aliasCalls(c: *Context, value: Ast.Node.Index, calls: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    const variable = tree.fullVarDecl(value) orelse return;
+    if (variable.visib_token != null) return;
+    var declared: ?u32 = null;
+    for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
+        declared = @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32
+    };
+    const alias = declared orelse return;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != alias) continue;
+        const parent = model.node_parents[@backingInt(node)] orelse continue; // safe: a node index indexes its own tree's parent table
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse continue;
+        if (call.ast.fn_expr == node) try calls.append(c.allocator, parent);
     }
 }
 
@@ -287,36 +379,6 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
     const last = tree.lastToken(node);
     try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try std.fmt.allocPrint(c.allocator, "{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
     return true;
-}
-
-/// A private alias's fix: each use a call rewritten, the alias's line gone; none where it is
-/// public or used otherwise.
-fn aliasFix(c: *Context, value: Ast.Node.Index) Context.Error![]const Report.Edit {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    const variable = tree.fullVarDecl(value) orelse return &.{};
-    if (variable.visib_token != null) return &.{};
-    var declared: ?u32 = null;
-    for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
-        declared = @intCast(d);
-    };
-    const alias = declared orelse return &.{};
-    var edits: std.ArrayList(Report.Edit) = .empty;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const ref = model.reference(node) orelse continue;
-        if (ref.declaration != alias) continue;
-        const parent = model.node_parents[@backingInt(node)] orelse return &.{}; // safe: a node index indexes its own tree's parent table
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, parent) orelse return &.{};
-        if (call.ast.fn_expr != node or !try invariant(c, parent, &edits)) return &.{};
-    }
-    const file = &c.project.files[c.file.raw()];
-    const line = file.line(tree.tokenStart(tree.firstToken(value)));
-    const end: u32 = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len);
-    try edits.append(c.allocator, .{ .start = file.lines[line], .end = end, .text = "" });
-    return edits.items;
 }
 
 /// The name the file imports aegis by, an edit adding the import (after std's) when it has

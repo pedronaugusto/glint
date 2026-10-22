@@ -98,6 +98,17 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
     return walk(self, roots.items, path, true);
 }
 
+/// The declarations at `path` from the files of `package` the run checks: a package's own
+/// declaration, where none of its files imports the package by name.
+pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+    var roots: std.ArrayList(Project.FileId) = .empty;
+    for (self.project.inputs, 0..) |input, f| {
+        if (input.selected and std.mem.eql(u8, input.package, package)) try roots.append(self.allocator, Project.FileId.fromRaw(@intCast(f)));
+    }
+    if (roots.items.len == 0) return null;
+    return walk(self, roots.items, path, true);
+}
+
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {

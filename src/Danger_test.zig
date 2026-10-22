@@ -26,6 +26,7 @@ const std_files = [_]sources.Extra{
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } };
     \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
+    \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
@@ -230,15 +231,22 @@ test "A011 finds time crossing as a raw integer and units converted by hand, not
     , 0);
 }
 
-test "A013 finds std's assert and unreachable where the program runs" {
+test "A013 finds contracts input reaches: an assert on it, an unreachable it chooses, a catch unreachable on a call that reads or takes it; not the program's own invariants" {
     try expect(pack.contracts,
         \\const std = @import("std");
-        \\pub fn f(x: u8) u8 {
+        \\fn decode(b: u8) !u8 { if (b > 3) return error.Bad; return b; }
+        \\pub fn f(r: *std.Io.Reader, x: u8) !u8 {
+        \\    const b = try r.takeByte();
+        \\    std.debug.assert(b < 4);
         \\    std.debug.assert(x < 4);
-        \\    return switch (x) { 0 => 1, else => unreachable };
+        \\    _ = decode(b) catch unreachable;
+        \\    _ = r.takeByte() catch unreachable;
+        \\    _ = decode(x) catch unreachable;
+        \\    if (b == 7) unreachable;
+        \\    return switch (b) { 0 => 1, else => unreachable };
         \\}
-        \\pub fn g() !void {} pub fn h() void { g() catch unreachable; }
-    , 3);
+        \\pub fn g(x: u8) u8 { return switch (x) { 0 => 1, else => unreachable }; }
+    , 5);
 }
 
 test "A013 leaves what runs as the program compiles, and tests, alone" {
@@ -545,6 +553,24 @@ test "A018 finds an error's name written to a peer, not to another writer" {
     , 1);
 }
 
+test "A018 reads the peer writers a package declares" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub fn reply(err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = std.Io.protocolWriter(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\}
+    , &std_files, &std_imports);
+    defer project.deinit();
+    const declared = [_]glint.Config.PeerWriter{.{ .module = "std", .declaration = "Io.protocolWriter" }};
+    for ([_]usize{ 0, 1 }) |given| {
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }}, .peer_writers = declared[0..given] }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expectEqual(given, report.diagnostics.len);
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing" {
     try expect(pack.cancellation,
         \\const std = @import("std");
@@ -568,29 +594,33 @@ fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     return std.testing.allocator.dupe(u8, changed[0].bytes);
 }
 
-test "A013's fix makes std's assert aegis's invariant, a private alias's calls too, and imports aegis" {
+test "A013's fix makes std's assert on input aegis's invariant, through a private alias too, and imports aegis" {
     const once = try fixed(pack.contracts,
         \\const std = @import("std");
-        \\pub fn f(x: u8) void {
+        \\pub fn f(r: *std.Io.Reader, y: u8) !void {
+        \\    const x = try r.takeByte();
         \\    std.debug.assert(x <
         \\        4);
+        \\    std.debug.assert(y < 4);
         \\}
     );
     defer std.testing.allocator.free(once);
     try std.testing.expectEqualStrings(
         \\const std = @import("std");
         \\const aegis = @import("aegis");
-        \\pub fn f(x: u8) void {
+        \\pub fn f(r: *std.Io.Reader, y: u8) !void {
+        \\    const x = try r.takeByte();
         \\    aegis.assert.invariant(x <
         \\        4, "x < 4");
+        \\    std.debug.assert(y < 4);
         \\}
     , once);
     const alias = try fixed(pack.contracts,
         \\const std = @import("std");
         \\const checks = @import("aegis");
         \\const assert = std.debug.assert;
-        \\pub fn f(s: []const u8) void {
-        \\    assert(s.len > 0);
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const s = try r.take(2);
         \\    assert(s[0] != '"');
         \\}
     );
@@ -598,8 +628,9 @@ test "A013's fix makes std's assert aegis's invariant, a private alias's calls t
     try std.testing.expectEqualStrings(
         \\const std = @import("std");
         \\const checks = @import("aegis");
-        \\pub fn f(s: []const u8) void {
-        \\    checks.assert.invariant(s.len > 0, "s.len > 0");
+        \\const assert = std.debug.assert;
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const s = try r.take(2);
         \\    checks.assert.invariant(s[0] != '"', "s[0] != '\"'");
         \\}
     , alias);

@@ -13,12 +13,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
   - A010 integers: `@intCast`, `@intFromFloat`, `@enumFromInt` and `@fromBackingInt` of input, a sum, product or negation of a number from input, a difference that input can underflow, and division by input. The program's own conversions are the safe build's to check, and `@truncate` keeps bits by intent.
   - A011 units: time crossing to and from std as a raw integer, and arithmetic with a `std.time` constant; two raw nanosecond counts compared or subtracted, or one compared with zero, keep their unit.
   - A012 bounded work: an allocation, a container's growth or a read sized by a number from input, and a read with no limit.
-  - A013 contracts: `std.debug.assert` and every `unreachable` where the program runs.
+  - A013 contracts input reaches: a `std.debug.assert` whose condition holds input, an `unreachable` on a branch input chooses, a `catch` or `orelse unreachable` on a call that reads input or is given it. An invariant no input reaches is the program's to state.
   - A014 lifetimes: E001's frame escapes, and a borrow of a std container's storage stored in a field.
   - A015 ownership: a std `File`, `Dir`, `net.Stream`, `net.Server` or `process.Child` held by value in a field its file releases, or returned, outside `own.Owned`. A field nothing releases borrows its caller's handle.
   - A016 identity: two identifying integers of one type in one public signature or struct.
   - A017 state machines: an enum field written in two or more functions and switched on.
-  - A018 diagnostics: an error's name written to a writer that reaches a peer.
+  - A018 diagnostics: an error's name written to a writer that reaches a peer: `net.Stream`'s, and the functions `Config.peer_writers` names (each a module and a declaration path; JSON `peer_writers`).
   - A019 the unsafe set: `@setRuntimeSafety(false)`, the pointer conversions, `extern`, `asm`, and a local read while still `undefined` (an array's `.len` reads none of it, `@field(local, name) =` writes).
   - A020 cancellation: a loop on input or without bound, in a function given an `Io`, that gives that `Io` to nothing.
 - The input and peer facts (`Taint.zig`), computed once for the program: input is what a `Reader`, `File` or `Dir` read gives and what `process.run` collects from a child; a peer writer is what a `net.Stream` gives. A read on a line with an aegis escape is one the program declares its own (a file it wrote), listed at the escape. Input is data, or a number a peer chooses past a byte's range (std's `readInt`, `parseInt`, `takeInt` of more than 16 bits, or bytes shifted together, or a product that grows its own target). Positions std finds in data, read counts, `.len`, `.ptr`, bit counts and values under a clean bound are clean; a mask, a remainder, a truncation and wrapping arithmetic keep a number to data. The fact flows through locals, captures, the program's own fields, the program's calls by their summaries, and std's data functions; a method adds to a receiver it takes by mutable pointer. A call that does not resolve makes a sink undecided.
@@ -28,8 +28,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
-- Fixes: a finding may carry edits of its file (`Diagnostic.fix`, `RuleContext.fixedAt`), and `glint.Fix.apply` gives each file's bytes after a run's fixes. A013 makes `std.debug.assert(c)` `aegis.assert.invariant(c, "c")` (a private alias's calls too, the aegis import added); a pack finding's line that states its reason the older way (`// safe: why`, `// unreachable: why`) gets the escape; an escape that covers nothing is removed. `--fix` applies them; the report is the run before.
-- `Facts.memo`, per-run state a rule computes once for the project, and `Facts.memberUses`, the member accesses of a name across the selected files. `Governed.zig` is the one resolver of a declaration named by its path: P006's and the danger rules'.
+- Fixes: a finding may carry edits of its file (`Diagnostic.fix`, `RuleContext.fixedAt`), and `glint.Fix.apply` gives each file's bytes after a run's fixes. A013 makes its sites' `std.debug.assert(c)` `aegis.assert.invariant(c, "c")` (through a private alias too, the aegis import added); a pack finding's line that states its reason the older way (`// safe: why`, `// unreachable: why`) gets the escape; an escape that covers nothing is removed. `--fix` applies them; the report is the run before.
+- `Facts.memo(T)`, per-run state a rule computes once for the project, its type its key, and `Facts.memberUses`, the member accesses of a name across the selected files. `Governed.zig` is the one resolver of a declaration named by its path: P006's and the danger rules'.
 
 ## [0.5.1] - 2026-10-22
 
