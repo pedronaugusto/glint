@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A002 read a generic's pass-on of something it reads through its parameter (what calling it, or a method of it, returns, what it points to) as a copy of the parameter itself, decided at the binding by the argument: a function or a pointer there, never an owner, so a handler returning an owner whose result the generic copies was no finding, and the lint said it was complete. Such a copy is now read at each binding with the binding's arguments, through the generics that pass the parameter on (up to four routes to one copy; past them the binding is undecided). A function declared in a generic (a container's method it returns) reads the generic's parameters as the generic does: parley's typed tool handler, whose result its `call` writes out, is decided where `addTool` is bound.
+
 ## [0.5.0] - 2026-10-21
 
 ### Breaking

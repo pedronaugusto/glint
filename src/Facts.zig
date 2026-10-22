@@ -454,8 +454,23 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 /// (`var local = args;`), there or in a function it passes the parameter on to (as is, or a
 /// part of it its type information gives). Or a local it initialises by calling a function of
 /// its type parameter at `position` (`var h = Hash.init(.{});`): what the call gives is the
-/// binding's, an owner where the binding is one.
-pub const ParameterCopy = struct { position: usize, site: Key, kind: enum { copy, made } = .copy };
+/// binding's, an owner where the binding is one. What a call passes on may be the parameter
+/// itself or a value of it, or something else read from it (what calling it returns, what it
+/// points to): then `source` is that expression, read with the binding's arguments through the
+/// calls of `path`, each in the function before it, the first in the generic the copy is of.
+/// Each route to a source is its own copy, up to `routes`; past them the copy is `crowded`,
+/// and a binding of it is not read.
+pub const ParameterCopy = struct {
+    position: usize,
+    site: Key,
+    kind: enum { copy, made } = .copy,
+    source: ?Key = null,
+    path: []const Key = &.{},
+    crowded: bool = false,
+};
+
+/// How many routes through generics to one source are read for each parameter and copy.
+const routes = 4;
 
 /// The copies `function` makes of its generic parameters' values. Found once for every function
 /// outside std: a copy where it is written, then through calls that pass a parameter on, until
@@ -602,7 +617,7 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
     const whole = self.scopeNode(function);
     for (model.declarations) |d| {
         // A local of the body: a declaration of a container it returns is comptime.
-        if (d.kind != .variable or model.scopes[d.scope].kind != .block or !self.inside(function.file, d.scope, whole)) continue;
+        if (d.kind != .variable or model.scopes[d.scope].kind != .block or !self.enclosed(function.file, d.scope, whole)) continue;
         const v = t.fullVarDecl(d.node) orelse continue;
         if (v.comptime_token != null) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
@@ -664,12 +679,98 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         const receiver: usize = if (self.methodCall(function.file, call, target)) 1 else 0;
         for (theirs) |copy| {
             if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
-            const mine = self.derivedParameter(function, call.ast.params[copy.position - receiver], 0) orelse continue;
-            for (out.items) |held| {
-                if (held.position == mine and std.meta.eql(held.site, copy.site)) break;
-            } else try out.append(self.gpa, .{ .position = mine, .site = copy.site, .kind = copy.kind });
+            const argument = call.ast.params[copy.position - receiver];
+            const mine = self.derivedParameter(function, argument, 0) orelse continue;
+            // A path through this call again is a cycle of generics passing it round.
+            if (copy.source != null and onPath(copy.path, .{ .file = function.file, .node = node })) continue;
+            const passed: ParameterCopy = if (copy.source) |source| .{
+                .position = mine,
+                .site = copy.site,
+                .kind = copy.kind,
+                .source = source,
+                .path = try std.mem.concat(self.gpa, Key, &.{ &.{.{ .file = function.file, .node = node }}, copy.path }),
+            } else if (self.readThrough(function, argument, 0))
+                .{ .position = mine, .site = copy.site, .kind = copy.kind, .source = .{ .file = function.file, .node = argument } }
+            else
+                .{ .position = mine, .site = copy.site, .kind = copy.kind };
+            var seen: usize = 0;
+            for (out.items) |*held| {
+                if (held.position != passed.position or !std.meta.eql(held.site, passed.site) or !std.meta.eql(held.source, passed.source)) continue;
+                if (samePath(held.path, passed.path)) break;
+                seen += 1;
+                if (seen == routes) {
+                    held.crowded = true;
+                    break;
+                }
+            } else try out.append(self.gpa, passed);
         }
     }
+}
+
+fn onPath(path: []const Key, step: Key) bool {
+    for (path) |each| if (std.meta.eql(each, step)) return true;
+    return false;
+}
+
+fn samePath(a: []const Key, b: []const Key) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.meta.eql(x, y)) return false;
+    return true;
+}
+
+/// Whether `node` reads from a generic parameter of `function` what the parameter does not
+/// hold: what calling it, or a method of it, returns, or what it points to. What it holds (a
+/// field, an element, the payload of an optional or an error union) is the binding's argument's,
+/// read whole where it is bound.
+fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) bool {
+    if (depth == 8) return false;
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.models[function.file.raw()]; // safe: a declaration identity indexes its own frozen model.
+    const last = t.lastToken(node);
+    for (t.firstToken(node)..last + 1) |raw| {
+        const token: Ast.TokenIndex = @intCast(raw); // safe: bounded by the node's own token range.
+        if (t.tokenTag(token) != .identifier) continue;
+        const index = self.lexical(function.file, model.token_scopes[token], t.tokenSlice(token)) orelse continue;
+        const record = model.declarations[index];
+        if (self.genericPosition(function, index) != null or self.valueOfParameter(function, index) != null) {
+            // `p(...)`, `p.f(...)`, `p.*`, `p.f.*`.
+            var next = token + 1;
+            while (next + 1 <= last and t.tokenTag(next) == .period and t.tokenTag(next + 1) == .identifier) next += 2;
+            if (next <= last and (t.tokenTag(next) == .l_paren or t.tokenTag(next) == .period_asterisk)) return true;
+            continue;
+        }
+        if (record.kind != .variable or !self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
+        const init = (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue;
+        if (init != node and self.readThrough(function, init, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// What a copy `function` makes holds at the binding `call` in `file`: the binding's argument
+/// read through the copy's `path` to its `source`, each call's arguments read with the bindings
+/// of the one before. `receiver` is whether the call passes a value as the first parameter.
+pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiver: bool, function: Decl, copy: ParameterCopy) ResolveError!Value {
+    const source = copy.source.?;
+    const tree = self.syntaxOf(file);
+    var args: std.ArrayList(Value) = .empty;
+    if (receiver) try args.append(self.gpa, try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]));
+    for (call.ast.params) |arg| try args.append(self.gpa, try self.resolve(file, arg));
+    var env = try self.gpa.create(Env);
+    env.* = .{ .function = function, .args = args.items, .depth = 0 };
+    for (copy.path) |step| {
+        const step_tree = self.syntaxOf(step.file);
+        var step_buffer: [1]Ast.Node.Index = undefined;
+        const inner = step_tree.fullCall(&step_buffer, step.node) orelse return .{ .unknown = .unsupported };
+        const callee = (try self.definition(step.file, inner.ast.fn_expr)) orelse return .{ .unknown = .unresolved };
+        const target = (try self.origin(callee)) orelse return .{ .unknown = .unresolved };
+        var inner_args: std.ArrayList(Value) = .empty;
+        if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
+        for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
+        const next = try self.gpa.create(Env);
+        next.* = .{ .function = target, .args = inner_args.items, .depth = env.depth + 1 };
+        env = next;
+    }
+    return self.resolveIn(env, source.file, source.node);
 }
 
 /// Whether `node`, an identifier, names a `comptime` parameter.
@@ -740,7 +841,7 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         const record = model.declarations[index];
         if (self.genericPosition(function, index)) |position| return position;
         if (self.valueOfParameter(function, index)) |position| return position;
-        if (!self.inside(function.file, record.scope, self.scopeNode(function))) continue;
+        if (!self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
         const source: Ast.Node.Index = switch (record.kind) {
             .variable => (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue,
             .capture => self.captureSource(function.file, record.node) orelse continue,
@@ -2472,7 +2573,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 }
                 return .{ .unknown = .comptime_dependent };
             }
-            if (record.kind == .variable and self.inside(file, record.scope, function_scope)) {
+            if (record.kind == .variable and self.enclosed(file, record.scope, function_scope)) {
                 const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
                 if (variable.ast.type_node.unwrap()) |t| {
                     const type_value = try self.resolveIn(env, file, t);
@@ -2481,7 +2582,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env, file, init);
             }
             // A capture of the function's own: what it captures, read with the call's bindings.
-            if (record.kind == .capture and self.inside(file, record.scope, function_scope)) return self.captured(env, .{ .file = file, .index = index });
+            if (record.kind == .capture and self.enclosed(file, record.scope, function_scope)) return self.captured(env, .{ .file = file, .index = index });
             return self.resolve(file, node);
         },
         .field_access => {
@@ -2527,12 +2628,14 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     return self.resolve(file, node);
 }
 
-/// Whether `scope` lies inside the function whose node is `function_node`.
-fn inside(self: *const Facts, file: Project.FileId, scope: u32, function_node: Ast.Node.Index) bool {
+/// Whether `scope` is in the function at `function_node` or in a function declared in it, as a
+/// container's that the function returns or calls: what its body reads of the function's comptime
+/// parameters is fixed by each binding of the function.
+fn enclosed(self: *const Facts, file: Project.FileId, scope: u32, function_node: Ast.Node.Index) bool {
     const scopes = self.project.models[file.raw()].scopes; // safe: enum identities index their owning frozen tables without narrowing.
     var at: ?u32 = scope;
     while (at) |s| : (at = scopes[s].parent) {
-        if (scopes[s].kind == .function) return scopes[s].node == function_node;
+        if (scopes[s].kind == .function and scopes[s].node == function_node) return true;
     }
     return false;
 }

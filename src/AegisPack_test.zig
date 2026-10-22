@@ -1386,6 +1386,17 @@ test "a generic's copies of its anytype parameter are decided where the argument
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { on(s); }", pack.copies, true, 1);
     // A pointer's copies are aliases.
     try expectJudged(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 0);
+    // What a generic passes on of its parameter other than the parameter itself (what calling
+    // it returns, what it points to) is read where the parameter is bound, also from a function
+    // declared in the generic and through a generic passing the parameter on (parley's typed
+    // tool handler, its result written out).
+    const handlers = head ++ "fn Sig(comptime h: anytype) type { return struct { const Args = @typeInfo(@TypeOf(h)).@\"fn\".params.len; }; }\npub fn typed(comptime handler: anytype) fn () anyerror!void { const S = Sig(handler); const E = struct { fn call() anyerror!void { const out = if (S.Args == 0) handler() else blk: { break :blk handler(1); }; const value = out catch |err| return err; keep(value); } }; return E.call; }\npub fn add(comptime handler: anytype) void { _ = typed(handler); }\npub fn direct(comptime handler: anytype) void { const value = handler() catch return; keep(value); }\npub fn through(p: anytype) void { keep(p.*); }\n";
+    try expectJudged(handlers, pack.copies, true, 0);
+    try expectJudged(handlers ++ "fn plain() !P { return undefined; }\npub fn f() void { direct(plain); _ = typed(plain); add(plain); }", pack.copies, true, 0);
+    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { direct(secret); }", pack.copies, true, 1);
+    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { _ = typed(secret); }", pack.copies, true, 1);
+    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { add(secret); }", pack.copies, true, 1);
+    try expectJudged(handlers ++ "pub fn f(s: *aegis.Secret(u32), p: *P) void { through(s); through(p); }", pack.copies, true, 1);
     // An argument that does not resolve leaves the call undecided.
     try expectJudged(head ++ "pub fn f(g: fn () @import(\"missing\").T) void { keep(g()); }", pack.copies, false, 0);
     // A `comptime` parameter's value holds nothing at run time: its copies are no owner's.

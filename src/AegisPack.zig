@@ -671,10 +671,17 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         const argument = call.ast.params[copy.position - receiver];
         // A parameter of a generic this call is in, passed on: decided where that is bound.
         if (c.facts.fromParameter(c.file, argument)) continue;
-        // Plain data, as written: a type of numbers, and pointers or arrays of them, or a value
-        // of one.
-        if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0)) continue;
-        const value = try c.facts.resolve(c.file, argument);
+        // What the generic passes on of the argument (what calling it returns, what it points
+        // to), read with this call's bindings; else the argument, plain data as written (a type
+        // of numbers, and pointers or arrays of them, or a value of one) or as it resolves.
+        const value = if (copy.crowded)
+            Facts.Value{ .unknown = .budget }
+        else if (copy.source != null)
+            try c.facts.boundCopy(c.file, call, receiver == 1, function, copy)
+        else if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
+            continue
+        else
+            try c.facts.resolve(c.file, argument);
         // A pointer type: its copies are aliases, which A002 leaves out.
         if (pointerShaped(value)) continue;
         // A type argument stands for its values.
