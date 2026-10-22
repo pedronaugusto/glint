@@ -91,7 +91,11 @@ pub const Diagnostic = struct {
     message: []const u8,
     bug_class: []const u8,
     related: []const Span = &.{},
+    /// The finding's deterministic fix, when it has one: edits of its file's bytes.
+    fix: []const Edit = &.{},
 };
+/// One replacement of a file's bytes from `start` to `end` with `text`.
+pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 pub const Coverage = struct {
     file: Project.FileId,
     rule: ?rules.Rule = null,

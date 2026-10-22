@@ -2041,7 +2041,7 @@ const Heard = struct {
         const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal: `sink` gives this callback a Heard.
         return heard.outer.config(heard.outer.data, file);
     }
-    fn diagnostic(data: *anyopaque, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span) Context.Error!void {
+    fn diagnostic(data: *anyopaque, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {
         const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal: `sink` gives this callback a Heard.
         heard.any = true;
     }

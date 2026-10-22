@@ -6,6 +6,7 @@ const AegisPack = @import("AegisPack.zig");
 const Report = @import("Report.zig");
 const RuleContext = @import("RuleContext.zig");
 const Runner = @import("Runner.zig");
+const Fix = @import("Fix.zig");
 const Result = @import("Result.zig");
 const aegis = @import("aegis");
 const ensign = @import("ensign");
@@ -22,6 +23,8 @@ const Options = struct {
     packages: std.ArrayList(Module) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
     zig_lib_path: ?[]const u8 = null,
+    /// Apply the findings' fixes to the files they are in.
+    fix: bool = false,
 };
 
 const Loader = struct {
@@ -163,6 +166,7 @@ pub const Arguments = struct {
     fact_budget: ?usize = null,
     strict_suppressions: bool = false,
     metrics: bool = false,
+    fix: bool = false,
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
@@ -189,6 +193,7 @@ pub const Arguments = struct {
             .fact_budget = .{ .value_name = "N", .help = "How many facts a file's analysis may resolve; 100000 by default" },
             .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
             .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
+            .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
@@ -222,6 +227,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.fact_budget) |n| result.config.fact_budget = n;
     if (arguments.strict_suppressions) result.config.strict_suppressions = true;
     if (arguments.metrics) result.config.metrics = true;
+    result.fix = arguments.fix;
     try result.roots.appendSlice(a, arguments.root);
     for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
@@ -342,6 +348,16 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     record.output_bytes = bytes.len;
     record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+    if (configured.fix) {
+        var made: usize = 0;
+        const changed = try Fix.apply(a, &project, &report);
+        for (changed) |file| {
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project.inputs[file.file.raw()].name, .data = file.bytes });
+            made += file.edits;
+        }
+        try problems.print("glint: fixed {d} sites in {d} files\n", .{ made, changed.len });
+        try problems.flush();
+    }
     for (loader.inputs.items) |input| if (input.selected) {
         record.sources += 1;
     };

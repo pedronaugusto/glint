@@ -554,3 +554,76 @@ test "A020 finds a loop on input or without bound that gives its Io to nothing" 
         \\pub fn plain(io: std.Io) void { var i: u8 = 0; while (i < 10) : (i += 1) {} _ = io; }
     , 2);
 }
+
+/// `program` after the fixes of `rule`'s findings and its stale escapes.
+fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
+    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const changed = try glint.Fix.apply(arena.allocator(), &project, &report);
+    if (changed.len == 0) return std.testing.allocator.dupe(u8, program);
+    return std.testing.allocator.dupe(u8, changed[0].bytes);
+}
+
+test "A013's fix makes std's assert aegis's invariant, a private alias's calls too, and imports aegis" {
+    const once = try fixed(pack.contracts,
+        \\const std = @import("std");
+        \\pub fn f(x: u8) void {
+        \\    std.debug.assert(x <
+        \\        4);
+        \\}
+    );
+    defer std.testing.allocator.free(once);
+    try std.testing.expectEqualStrings(
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(x: u8) void {
+        \\    aegis.assert.invariant(x <
+        \\        4, "x < 4");
+        \\}
+    , once);
+    const alias = try fixed(pack.contracts,
+        \\const std = @import("std");
+        \\const checks = @import("aegis");
+        \\const assert = std.debug.assert;
+        \\pub fn f(s: []const u8) void {
+        \\    assert(s.len > 0);
+        \\    assert(s[0] != '"');
+        \\}
+    );
+    defer std.testing.allocator.free(alias);
+    try std.testing.expectEqualStrings(
+        \\const std = @import("std");
+        \\const checks = @import("aegis");
+        \\pub fn f(s: []const u8) void {
+        \\    checks.assert.invariant(s.len > 0, "s.len > 0");
+        \\    checks.assert.invariant(s[0] != '"', "s[0] != '\"'");
+        \\}
+    , alias);
+}
+
+test "the fix makes an older written reason the escape and removes an escape that covers nothing" {
+    const out = try fixed(pack.unsafe_set,
+        \\pub fn f(p: *const u8) *u8 {
+        \\    // safe: the caller passes memory it owns
+        \\    return @constCast(p);
+        \\}
+        \\pub fn g() u8 {
+        \\    // aegis: no-danger: nothing here any more
+        \\    return 1; // aegis: design: nor here
+        \\}
+    );
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(
+        \\pub fn f(p: *const u8) *u8 {
+        \\    // aegis: no-danger: the caller passes memory it owns
+        \\    return @constCast(p);
+        \\}
+        \\pub fn g() u8 {
+        \\    return 1;
+        \\}
+    , out);
+}

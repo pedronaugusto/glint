@@ -13,6 +13,8 @@ pub const Config = @import("Rule.zig").Config;
 pub const Report = @import("Report.zig");
 /// Runs the selected code checks over one frozen project.
 pub const run = @import("Runner.zig").run;
+/// A run's fixes applied: each file's bytes after them.
+pub const Fix = @import("Fix.zig");
 test {
     _ = @import("File.zig");
     _ = @import("Model.zig");
@@ -21,6 +23,7 @@ test {
     _ = @import("Rule.zig");
     _ = @import("Suppression.zig");
     _ = @import("Runner.zig");
+    _ = Fix;
     _ = @import("Facts.zig");
     _ = token;
     _ = cli;

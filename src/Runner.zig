@@ -7,6 +7,7 @@ const Report = @import("Report.zig");
 const Suppression = @import("Suppression.zig");
 const Runner = @This();
 const Context = @import("RuleContext.zig");
+const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
 
@@ -147,7 +148,7 @@ fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.D
     return @backingInt(lhs.rule) < @backingInt(rhs.rule); // safe: enum identities index their owning frozen tables without narrowing.
 }
 
-fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) Context.Error!void {
+fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
     if (!self.config.has(rule)) return;
     const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const line = file.line(start);
@@ -166,12 +167,12 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         .correctness => .correctness,
         .zig_style => .zig_style,
         .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose });
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else if (metadata.exception == .aegis) try Fix.escapeOf(self.a, file, line, metadata.name, message) else &.{} });
 }
 
-fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) Context.Error!void {
+fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
     const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal: this sink is created only from an aligned live Runner.
-    try runner.emitRelated(rule, start, end, message, related);
+    try runner.emitRelated(rule, start, end, message, related, fix);
 }
 fn sinkConfig(data: *anyopaque, file: Project.FileId) rules.Config {
     const runner: *Runner = @ptrCast(@alignCast(data)); // safe: this sink is created only from an aligned live Runner.

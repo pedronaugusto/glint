@@ -15,6 +15,7 @@ const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
+const Report = @import("Report.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -225,8 +226,7 @@ fn nanoseconds(tree: *const Ast, node: Ast.Node.Index) bool {
 
 /// A013: contracts that are undefined behaviour when false in a release build.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
-    const assert = [_][]const u8{"debug.assert"};
-    try governed(c, rule, &assert, true, "std.{s}: a contract a ReleaseFast build assumes true; aegis assert.invariant, pre or post checks it in every build, assert.debug states a debug-only one");
+    try asserts(c, rule);
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .unreachable_literal) continue;
@@ -235,6 +235,118 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         try c.at(rule, token, "unreachable: undefined behaviour in ReleaseFast when reached; aegis assert.never stops in every build, or return an error");
     }
+}
+
+/// A013's `std.debug.assert` sites, each with its fix where the file's code alone decides it:
+/// a call `std.debug.assert(c)` becomes `aegis.assert.invariant(c, "c")`; a private alias
+/// (`const assert = std.debug.assert;`) whose every use is such a call goes, its calls
+/// rewritten. The file imports aegis for it when it does not yet.
+fn asserts(c: *Context, rule: Rule) Context.Error!void {
+    const message = "std.debug.assert: a contract a ReleaseFast build assumes true; aegis assert.invariant, pre or post checks it in every build, assert.debug states a debug-only one";
+    var target: [1]Governed.Target = .{.{ .source = "std", .declaration = "debug.assert", .production = true }};
+    var index: [1]usize = .{0};
+    const found = try Governed.resolve(c, rule, &target, &index);
+    var sites: std.ArrayList(Governed.Site) = .empty;
+    try Governed.sites(c, rule, found, &sites);
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    for (sites.items) |site| {
+        if (site.through_alias or c.inTest(site.token)) continue;
+        const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == site.node) {
+            if (!atRuntime(c, parent)) continue;
+            var edits: std.ArrayList(Report.Edit) = .empty;
+            if (try invariant(c, parent, &edits)) try c.fixedAt(rule, site.token, message, edits.items) else try c.at(rule, site.token, message);
+            continue;
+        };
+        try c.fixedAt(rule, site.token, message, try aliasFix(c, parent));
+    }
+}
+
+/// The edits that make the call at `node` (`f(c)`) `aegis.assert.invariant(c, "c")`, the
+/// file's aegis import among them; false where the call is not that shape.
+fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edit)) Context.Error!bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    if (call.ast.params.len != 1) return false;
+    const aegis = (try aegisName(c, edits)) orelse return false;
+    const condition = tree.getNodeSource(call.ast.params[0]);
+    var said: std.Io.Writer.Allocating = .init(c.allocator);
+    // The message is the condition as written, on one line.
+    var words = std.mem.tokenizeAny(u8, condition, " \t\r\n");
+    var first = true;
+    while (words.next()) |word| {
+        // An allocating writer fails only when memory does.
+        if (!first) said.writer.writeByte(' ') catch return error.OutOfMemory;
+        std.zig.stringEscape(word, &said.writer) catch return error.OutOfMemory;
+        first = false;
+    }
+    const start = tree.tokenStart(tree.firstToken(node));
+    const last = tree.lastToken(node);
+    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try std.fmt.allocPrint(c.allocator, "{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) }); // aegis: no-danger: a token's span within the budgeted source.
+    return true;
+}
+
+/// A private alias's fix: each use a call rewritten, the alias's line gone; none where it is
+/// public or used otherwise.
+fn aliasFix(c: *Context, value: Ast.Node.Index) Context.Error![]const Report.Edit {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    const variable = tree.fullVarDecl(value) orelse return &.{};
+    if (variable.visib_token != null) return &.{};
+    var declared: ?u32 = null;
+    for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
+        declared = @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32
+    };
+    const alias = declared orelse return &.{};
+    var edits: std.ArrayList(Report.Edit) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != alias) continue;
+        const parent = model.node_parents[@backingInt(node)] orelse return &.{}; // safe: a node index indexes its own tree's parent table
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse return &.{};
+        if (call.ast.fn_expr != node or !try invariant(c, parent, &edits)) return &.{};
+    }
+    const file = &c.project.files[c.file.raw()];
+    const line = file.line(tree.tokenStart(tree.firstToken(value)));
+    const end: u32 = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len); // aegis: no-danger: positions within the budgeted source
+    try edits.append(c.allocator, .{ .start = file.lines[line], .end = end, .text = "" });
+    return edits.items;
+}
+
+/// The name the file imports aegis by, an edit adding the import (after std's) when it has
+/// none; null where `aegis` names something else.
+fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    const file = &c.project.files[c.file.raw()];
+    var after_std: u32 = 0;
+    for (model.declarations) |decl| {
+        if (decl.kind != .variable or model.scopes[decl.scope].kind != .file) continue;
+        const variable = tree.fullVarDecl(decl.node) orelse continue;
+        const init = variable.ast.init_node.unwrap() orelse continue;
+        const spelled = tree.getNodeSource(init);
+        if (std.mem.eql(u8, spelled, "@import(\"aegis\")")) return decl.name;
+        if (std.mem.eql(u8, decl.name, "aegis")) return null;
+        if (std.mem.eql(u8, spelled, "@import(\"std\")")) {
+            const line = file.line(tree.tokenStart(decl.token));
+            after_std = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len); // aegis: no-danger: positions within the budgeted source
+        }
+    }
+    // With no std import the line goes after the file's doc comment, which stands first.
+    if (after_std == 0) for (file.lines) |start| {
+        if (!std.mem.startsWith(u8, file.source[start..], "//!")) {
+            after_std = start;
+            break;
+        }
+    };
+    try edits.append(c.allocator, .{ .start = after_std, .end = after_std, .text = "const aegis = @import(\"aegis\");\n" });
+    return "aegis";
 }
 
 /// A019: the operations Zig leaves unchecked.

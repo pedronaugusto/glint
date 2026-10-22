@@ -18,7 +18,7 @@ sink: Sink,
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
 pub const Sink = struct {
     data: *anyopaque,
-    diagnostic: *const fn (*anyopaque, rules.Rule, u32, u32, []const u8, []const Report.Span) Error!void,
+    diagnostic: *const fn (*anyopaque, rules.Rule, u32, u32, []const u8, []const Report.Span, []const Report.Edit) Error!void,
     coverage: *const fn (*anyopaque, Report.Coverage) Error!void,
     /// The configuration another selected file is checked with.
     config: *const fn (*anyopaque, Project.FileId) rules.Config,
@@ -142,6 +142,10 @@ pub fn emit(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, message:
     return self.emitRelated(rule, start, end, message, &.{});
 }
 pub fn emitRelated(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) Error!void {
+    return self.emitFixed(rule, start, end, message, related, &.{});
+}
+/// Reports one site with its deterministic fix: edits of the checked file's bytes.
+pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Error!void {
     if (!self.config.has(rule)) return;
     if (rules.definition(rule, self.definitions) == null) return error.InvalidSelection;
     const bytes = try self.project.source(try self.source());
@@ -150,8 +154,9 @@ pub fn emitRelated(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, m
         const target = try self.project.handle(span.file);
         if (span.start > span.end or span.end > (try self.project.source(target)).len) return error.InvalidHandle;
     }
+    for (fix) |e| if (e.start > e.end or e.end > bytes.len) return error.InvalidHandle;
     // Rules may retain no temporary message storage in the report: the sink copies it.
-    return self.sink.diagnostic(self.sink.data, rule, start, end, message, related);
+    return self.sink.diagnostic(self.sink.data, rule, start, end, message, related, fix);
 }
 /// Required uncertainty cannot be suppressed into a completed gating run.
 pub fn undecided(self: *RuleContext, rule: rules.Rule, start: u32, reason: Report.Coverage.Reason, detail: []const u8) Error!void {
@@ -159,6 +164,13 @@ pub fn undecided(self: *RuleContext, rule: rules.Rule, start: u32, reason: Repor
     if (rules.definition(rule, self.definitions) == null) return error.InvalidSelection;
     if (start > (try self.project.source(try self.source())).len) return error.InvalidHandle;
     return self.sink.coverage(self.sink.data, .{ .file = self.file, .rule = rule, .start = start, .reason = reason, .detail = detail });
+}
+/// A site at `token` with its deterministic fix.
+pub fn fixedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, fix: []const Report.Edit) Error!void {
+    const tree = try self.project.syntax(try self.source());
+    if (token >= tree.tokens.len) return error.InvalidHandle;
+    const start = tree.tokenStart(token);
+    try self.emitFixed(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message, &.{}, fix); // aegis: no-danger: source budget bounds the token span.
 }
 pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8) Error!void {
     const tree = try self.project.syntax(try self.source());

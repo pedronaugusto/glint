@@ -64,7 +64,7 @@ const future = @import("future");
 
 One real comment suppresses one rule at one logical site, either inline or immediately before it. A nonempty written reason is required. Strings and ambiguous multiple sites cannot become silent exemptions; a malformed comment is reported where it is and makes the run incomplete. Stale records are counted; strict mode makes them incomplete.
 
-The aegis pack takes one escape instead, `// aegis: <reason>: <why>`, whose reason is one of `no-danger`, `design`, `hot-loop`, `internal` and `boundary`. It covers the pack's findings on its line, and the report lists each escape with what it covered.
+The aegis pack takes one escape instead, `// aegis: <reason>: <why>`, whose reason is one of `no-danger`, `design`, `hot-loop`, `internal` and `boundary`. It covers the pack's findings on its line, and the report lists each escape with what it covered. `--fix` applies the fixes that follow from a site alone: std's `assert` becomes aegis's `assert.invariant`, a reason written the older way (`// safe:`, `// unreachable:`) becomes the escape, and an escape that covers nothing goes.
 
 ## Limits and ownership
 
