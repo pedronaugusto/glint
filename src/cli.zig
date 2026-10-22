@@ -365,8 +365,6 @@ pub const Configuration = struct {
     rules: []const Setting = &.{},
     max_line_length: u32 = 100,
     max_function_lines: u32 = 120,
-    cast_scope: @FieldType(Rule.Config, "cast_scope") = .all,
-    casts: @FieldType(Rule.Config, "casts") = .all,
     function_exceptions: []const Rule.Config.FunctionException = &.{},
     disallowed: []const Rule.Config.Disallowed = &.{},
     strict_suppressions: bool = false,
@@ -395,8 +393,6 @@ fn configure(a: std.mem.Allocator, bytes: []const u8, definitions: []const Rule.
     };
     config.max_line_length = document.max_line_length;
     config.max_function_lines = document.max_function_lines;
-    config.cast_scope = document.cast_scope;
-    config.casts = document.casts;
     config.function_exceptions = document.function_exceptions;
     config.disallowed = document.disallowed;
     config.strict_suppressions = document.strict_suppressions;

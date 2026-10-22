@@ -16,33 +16,25 @@ pub const Rule = enum(u16) {
     Z026 = 26,
     Z031 = 31,
     Z032 = 32,
-    P001 = 40,
-    P002 = 41,
     P003 = 42,
-    P004 = 43,
     P005 = 44,
     P006 = 45,
     D001 = 46,
-    E001 = 47,
     _,
 
     pub fn group(self: Rule) Group {
         return switch (self) {
-            .Z003, .Z011, .Z013, .Z026, .D001, .E001 => .correctness,
-            .Z012, .Z016, .P001, .P002, .P003, .P004, .P005, .P006 => .family_policy,
+            .Z003, .Z011, .Z013, .Z026, .D001 => .correctness,
+            .Z012, .Z016, .P003, .P005, .P006 => .family_policy,
             else => .zig_style,
         };
     }
     pub fn purpose(self: Rule) []const u8 {
         return switch (self) {
-            .P001 => "cast requires a written boundary reason",
-            .P002 => "runtime safety disabled without a measured-site reason",
             .P003 => "function exceeds the configured reading budget",
-            .P004 => "catch unreachable requires a written invariant",
             .P005 => "production debug print violates explicit project policy",
             .P006 => "resolved declaration is disallowed by project policy",
             .D001 => "private declaration its file names nowhere",
-            .E001 => "pointer into a function's own frame outlives the call (heuristic)",
             .Z003 => "syntax incompatibility",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
@@ -63,8 +55,6 @@ pub const Config = struct {
     max_line_length: u32 = 100,
     strict_suppressions: bool = false,
     max_function_lines: u32 = 120,
-    cast_scope: enum { all, production } = .all,
-    casts: enum { all, pointer } = .all,
     function_exceptions: []const FunctionException = &.{},
     disallowed: []const Disallowed = &.{},
     selections: []const Selection = &.{},
@@ -159,8 +149,10 @@ pub const Config = struct {
 };
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 22), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 18), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
+    // Folded into the aegis pack's danger rules (A010, A013, A014, A019), never aliased.
+    for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expect(Rule.parse(id) == null);
     try std.testing.expect(Rule.parse("Z013-extra") == null);
     for ([_][]const u8{ "Z002", "Z004", "Z019", "Z020", "Z021", "Z022", "Z029", "Z030", "Z033" }) |id| try std.testing.expect(Rule.parse(id) == null);
     try std.testing.expect(!@as(Config, .{}).has(.Z011)); // safe: explicit compile-time type selection; the value is representable in that type.

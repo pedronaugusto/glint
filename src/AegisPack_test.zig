@@ -66,7 +66,7 @@ test "aegis pack local end without cleanup contrasts deferred owner" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), count(report, pack.cleanup)); // safe: fixture count is representable.
 }
-test "aegis pack accepts adopted gates and rejects uncategorized exceptions" {
+test "aegis pack accepts adopted gates, takes only the aegis escape and refuses glint-ignore" {
     var project = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }");
     defer project.deinit();
     var gated = try glint.runConfigured(std.testing.allocator, &project, .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
@@ -76,7 +76,7 @@ test "aegis pack accepts adopted gates and rejects uncategorized exceptions" {
     var invalid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // glint-ignore: A001 -- test\n");
     defer invalid.deinit();
     try std.testing.expectError(error.MalformedSuppression, glint.runConfigured(std.testing.allocator, &invalid, config, .{ .project_rules = &pack.rules }));
-    var valid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // glint-ignore: A001 -- safe-type-internals: fixture; inspect representation to test erasure\n");
+    var valid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // aegis: internal: a fixture inspecting the representation to test erasure\n");
     defer valid.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &valid, config, .{ .project_rules = &pack.rules });
     defer report.deinit();

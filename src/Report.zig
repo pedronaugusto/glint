@@ -14,6 +14,8 @@ suppressed: usize,
 stale_suppressions: usize,
 /// Each suppression that matched no finding, at its comment.
 stale: []const Stale = &.{},
+/// Each aegis escape that covered a finding, with the findings it covered: what the review reads.
+escapes: []const Escape = &.{},
 complete: bool,
 /// Assertion metrics, when the configuration asks for them (`Config.metrics`).
 metrics: ?Metrics = null,
@@ -96,8 +98,13 @@ pub const Coverage = struct {
     detail: []const u8 = "",
     pub const Reason = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted, unresolved, unsupported };
 };
-/// A suppression that suppressed nothing: the rule it names and its comment's site.
+/// A suppression that suppressed nothing: the rule it names (`aegis` for an escape) and its
+/// comment's site.
 pub const Stale = struct { name: []const u8, span: Span };
+/// An aegis escape (`// aegis: <reason>: <why>`) at its comment, and the pack's findings on its
+/// line that it covered.
+pub const Escape = struct { span: Span, reason: []const u8, why: []const u8, covered: []const Covered };
+pub const Covered = struct { name: []const u8, span: Span };
 pub const Format = enum { text, json, sarif };
 pub const WriteError = std.Io.Writer.Error || error{InvalidProject};
 
@@ -119,6 +126,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.print("coverage: {s}: {s}: {s}\n", .{ project.inputs[coverage.file.raw()].name, @tagName(coverage.reason), coverage.detail }); // safe: enum identities index their owning frozen tables without narrowing.
             };
             for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.inputs[stale.span.file.raw()].name, stale.span.line, stale.span.column, stale.name }); // safe: enum identities index their owning frozen tables without narrowing.
+            for (self.escapes) |escape| {
+                try writer.print("escape: {s}:{d}:{d}: {s}: {s} (", .{ project.inputs[escape.span.file.raw()].name, escape.span.line, escape.span.column, escape.reason, escape.why }); // safe: enum identities index their owning frozen tables without narrowing.
+                for (escape.covered, 0..) |covered, i| try writer.print("{s}{s} at {d}:{d}", .{ if (i == 0) "" else ", ", covered.name, covered.span.line, covered.span.column });
+                try writer.writeAll(")\n");
+            }
             if (self.metrics) |metrics| try textMetrics(writer, metrics);
         },
         .json => {
@@ -126,6 +138,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             for (self.stale, 0..) |stale, i| {
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .source = project.inputs[stale.span.file.raw()].name, .rule = stale.name, .line = stale.span.line, .column = stale.span.column }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+            }
+            try writer.writeAll("],\"escapes\":[");
+            for (self.escapes, 0..) |escape, i| {
+                if (i != 0) try writer.writeByte(',');
+                try jsonEscape(writer, project, escape);
             }
             try writer.writeAll("],\"diagnostics\":[");
             for (self.diagnostics, 0..) |d, i| {
@@ -194,6 +211,24 @@ fn jsonCounts(writer: *std.Io.Writer, counts: Metrics.Counts) std.Io.Writer.Erro
     try writer.print("\"functions\":{d},\"asserted\":{d},\"unresolved\":{d},\"assertions\":{{", .{ counts.functions, counts.asserted, counts.unresolved });
     for (std.meta.tags(Metrics.Kind), counts.assertions, 0..) |kind, n, i| try writer.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", kind.label(), n });
     try writer.writeByte('}');
+}
+
+fn jsonEscape(writer: *std.Io.Writer, project: *const Project, escape: Escape) std.Io.Writer.Error!void {
+    var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
+    try stream.beginObject();
+    try stream.objectField("source");
+    try stream.write(project.inputs[escape.span.file.raw()].name); // safe: the span belongs to this report's verified project.
+    try stream.objectField("span");
+    try stream.write(wireSpan(escape.span));
+    try stream.objectField("reason");
+    try stream.write(escape.reason);
+    try stream.objectField("why");
+    try stream.write(escape.why);
+    try stream.objectField("covered");
+    try stream.beginArray();
+    for (escape.covered) |covered| try stream.write(.{ .rule = covered.name, .span = wireSpan(covered.span) });
+    try stream.endArray();
+    try stream.endObject();
 }
 
 fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {

@@ -193,3 +193,25 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = file(root) };
     return Project.init(gpa, &inputs, &all, .{});
 }
+
+/// A source of another module beside aegis's, such as a fixture standing for std.
+pub const Extra = struct { name: []const u8, bytes: []const u8 };
+/// An import among the extra sources, by their index in what the caller gives; a null `from` is
+/// the consumer's.
+pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target: u32 };
+
+/// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
+pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
+    const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);
+    defer gpa.free(inputs);
+    inputs[0] = .{ .name = "consumer", .bytes = consumer };
+    for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    const mapped = imports();
+    const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len);
+    defer gpa.free(all);
+    @memcpy(all[0..mapped.len], &mapped);
+    const first: u32 = sources.len + 1;
+    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| file(first + from) else file(0), .spelling = entry.spelling, .target = file(first + entry.target) };
+    return Project.init(gpa, inputs, all, .{});
+}

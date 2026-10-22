@@ -5,6 +5,7 @@ const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
+const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
@@ -14,6 +15,22 @@ pub const cleanup: Rule = @fromBackingInt(@intCast(1102)); // safe: compiled pac
 pub const scalar: Rule = @fromBackingInt(@intCast(1103)); // safe: compiled pack identities are reserved stable u16 values.
 pub const capacity: Rule = @fromBackingInt(@intCast(1104)); // safe: compiled pack identities are reserved stable u16 values.
 pub const recursion: Rule = @fromBackingInt(@intCast(1105)); // safe: compiled pack identities are reserved stable u16 values.
+// The danger rules (designs/aegis.md §7): each finds where its danger exists and aegis's type is
+// the answer, from what the code resolves to.
+pub const shared_state: Rule = @fromBackingInt(@intCast(1106)); // safe: compiled pack identities are reserved stable u16 values.
+pub const secrets: Rule = @fromBackingInt(@intCast(1107)); // safe: compiled pack identities are reserved stable u16 values.
+pub const untrusted_input: Rule = @fromBackingInt(@intCast(1108)); // safe: compiled pack identities are reserved stable u16 values.
+pub const integers: Rule = @fromBackingInt(@intCast(1109)); // safe: compiled pack identities are reserved stable u16 values.
+pub const units: Rule = @fromBackingInt(@intCast(1110)); // safe: compiled pack identities are reserved stable u16 values.
+pub const bounded_work: Rule = @fromBackingInt(@intCast(1111)); // safe: compiled pack identities are reserved stable u16 values.
+pub const contracts: Rule = @fromBackingInt(@intCast(1112)); // safe: compiled pack identities are reserved stable u16 values.
+pub const lifetimes: Rule = @fromBackingInt(@intCast(1113)); // safe: compiled pack identities are reserved stable u16 values.
+pub const ownership: Rule = @fromBackingInt(@intCast(1114)); // safe: compiled pack identities are reserved stable u16 values.
+pub const identity: Rule = @fromBackingInt(@intCast(1115)); // safe: compiled pack identities are reserved stable u16 values.
+pub const state_machines: Rule = @fromBackingInt(@intCast(1116)); // safe: compiled pack identities are reserved stable u16 values.
+pub const diagnostics: Rule = @fromBackingInt(@intCast(1117)); // safe: compiled pack identities are reserved stable u16 values.
+pub const unsafe_set: Rule = @fromBackingInt(@intCast(1118)); // safe: compiled pack identities are reserved stable u16 values.
+pub const cancellation: Rule = @fromBackingInt(@intCast(1119)); // safe: compiled pack identities are reserved stable u16 values.
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
     .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },
@@ -21,7 +38,35 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = scalar, .name = "A004", .group = .family_policy, .purpose = "domain/unit or all-build integer checks bypassed by raw arithmetic/casts", .version = 2, .exception = .aegis }, .check = checkScalar },
     .{ .definition = .{ .id = capacity, .name = "A005", .group = .family_policy, .purpose = "SecretBytes adoption truncates wipe capacity or lacks proven allocation ownership", .version = 2, .exception = .aegis }, .check = checkCapacity },
     .{ .definition = .{ .id = recursion, .name = "A006", .group = .family_policy, .purpose = "recursion reachable from untrusted input without a depth bound", .version = 1, .exception = .aegis }, .check = checkRecursion },
+    .{ .definition = .{ .id = shared_state, .name = "A007", .group = .family_policy, .purpose = "shared state outside aegis's guards", .exception = .aegis }, .check = checkSharedState },
+    .{ .definition = .{ .id = secrets, .name = "A008", .group = .family_policy, .purpose = "secret material outside aegis's Secret and Choice", .exception = .aegis }, .check = checkSecrets },
+    .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic that can fail unchecked", .exception = .aegis }, .check = checkIntegers },
+    .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
+    .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
+    .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
+    .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
 };
+fn checkSharedState(c: *Context) Context.Error!void {
+    if (try begin(c, shared_state)) try Danger.sharedState(c, shared_state);
+}
+fn checkSecrets(c: *Context) Context.Error!void {
+    if (try begin(c, secrets)) try Danger.secrets(c, secrets);
+}
+fn checkIntegers(c: *Context) Context.Error!void {
+    if (try begin(c, integers)) try Danger.casts(c, integers);
+}
+fn checkUnits(c: *Context) Context.Error!void {
+    if (try begin(c, units)) try Danger.units(c, units);
+}
+fn checkContracts(c: *Context) Context.Error!void {
+    if (try begin(c, contracts)) try Danger.contracts(c, contracts);
+}
+fn checkLifetimes(c: *Context) Context.Error!void {
+    if (try begin(c, lifetimes)) try Danger.lifetimes(c, lifetimes);
+}
+fn checkUnsafeSet(c: *Context) Context.Error!void {
+    if (try begin(c, unsafe_set)) try Danger.unsafeSet(c, unsafe_set);
+}
 fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
     try @import("AegisRecursion.zig").check(c, recursion);

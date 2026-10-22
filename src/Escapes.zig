@@ -18,10 +18,10 @@
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
+const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-pub fn check(c: *Context) Context.Error!void {
-    if (!c.config.has(.E001)) return;
+pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const index = c.file.raw();
     const tree = &c.project.files[index].tree;
     const model = &c.project.models[index];
@@ -33,6 +33,7 @@ pub fn check(c: *Context) Context.Error!void {
             .assign => .{ tree.nodeData(node).node_and_node[1], tree.nodeData(node).node_and_node[0] },
             else => continue,
         };
+        if (c.inTest(tree.nodeMainToken(node))) continue;
         const function = self.enclosing(node) orelse continue;
         if (stored) |target| if (!self.outlives(target)) continue;
         const local = (try self.escaping(operand, function, true)) orelse continue;
@@ -42,7 +43,7 @@ pub fn check(c: *Context) Context.Error!void {
             try c.allocator.print("returns a pointer into local '{s}', which the return frees", .{name})
         else
             try c.allocator.print("stores a pointer into local '{s}' where it outlives the call that frees it", .{name});
-        try c.at(.E001, tree.nodeMainToken(operand), message);
+        try c.at(rule, tree.nodeMainToken(operand), message);
     }
 }
 

@@ -19,6 +19,9 @@ coverage: std.ArrayList(Report.Coverage) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
+escapes: std.ArrayList(Report.Escape) = .empty,
+/// What each of the current file's aegis escapes covered, by its index in `suppressions`.
+covered: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
 file: Project.FileId = Project.FileId.fromRaw(0), // safe: validated file identities and budgeted std source indexes fit u32.
@@ -91,12 +94,26 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             if (runner.config.has(rule.definition.id)) try rule.check(&context);
         };
         if (file.status != .parsed) runner.complete = false;
-        // Only a rule that ran shows that a suppression of it suppresses nothing.
-        for (runner.suppressions) |suppression| if (!suppression.used and runner.config.has(suppression.rule)) {
-            if (runner.config.strict_suppressions) runner.complete = false;
+        // Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
+        // stale when a pack rule ran and none of its findings stood on the line.
+        for (runner.suppressions, 0..) |suppression, i| {
             const start = suppression.comment.start;
-            try runner.stale.append(a, .{ .name = (rules.definition(suppression.rule, definitions) orelse return error.InvalidSelection).name, .span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 } });
-        };
+            const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 };
+            if (suppression.escape) |reason| {
+                if (suppression.used) {
+                    try runner.escapes.append(a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
+                } else if (runner.packRan(options.project_rules)) {
+                    if (runner.config.strict_suppressions) runner.complete = false;
+                    try runner.stale.append(a, .{ .name = "aegis", .span = span });
+                }
+                continue;
+            }
+            const rule = suppression.rule.?;
+            if (suppression.used or !runner.config.has(rule)) continue;
+            if (runner.config.strict_suppressions) runner.complete = false;
+            try runner.stale.append(a, .{ .name = (rules.definition(rule, definitions) orelse return error.InvalidSelection).name, .span = span });
+        }
+        runner.covered.clearRetainingCapacity();
     }
     if (runner.facts.remaining == 0) {
         runner.complete = false;
@@ -104,7 +121,13 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+}
+
+/// Whether a rule of the aegis pack ran on the current file.
+fn packRan(self: *const Runner, project_rules: []const Context.Rule) bool {
+    for (project_rules) |rule| if (rule.definition.exception == .aegis and self.config.has(rule.definition.id)) return true;
+    return false;
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {
@@ -118,16 +141,22 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     if (!self.config.has(rule)) return;
     const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const line = file.line(start);
-    for (self.suppressions) |*suppression| if (try suppression.matches(rule, line, start)) {
+    const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
+    const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 };
+    for (self.suppressions, 0..) |*suppression, i| if (try suppression.matches(rule, metadata.exception == .aegis, line, start)) {
         self.suppressed += 1;
+        if (suppression.escape != null) {
+            const entry = try self.covered.getOrPut(self.a, i);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(self.a, .{ .name = metadata.name, .span = span });
+        }
         return;
     };
-    const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
     try self.diagnostics.append(self.a, .{ .rule = rule, .name = metadata.name, .rule_version = metadata.version, .class = switch (metadata.group) {
         .correctness => .correctness,
         .zig_style => .zig_style,
         .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 }, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose });
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose });
 }
 
 fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) Context.Error!void {

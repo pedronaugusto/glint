@@ -7,7 +7,6 @@ const names = @import("names.zig");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
-const Escapes = @import("Escapes.zig");
 const Disallowed = @import("Disallowed.zig");
 const RunError = Context.Error;
 
@@ -24,7 +23,6 @@ pub fn check(context: *Context) RunError!void {
     try functionLengths(context);
     try Disallowed.check(context);
     try DeadDeclarations.check(context);
-    try Escapes.check(context);
     try unknownCoverage(context);
 }
 
@@ -407,64 +405,26 @@ fn unknownCoverage(self: *Context) RunError!void {
     }
 }
 
-fn hasReason(self: *const Context, token: Ast.TokenIndex, prefix: []const u8, previous: bool) bool {
-    const file = &self.project.files[self.file.raw()];
-    const line = file.line(file.tree.tokenStart(token));
-    for (file.comments) |comment| {
-        if (comment.line != line and !(previous and line != 0 and comment.line == line - 1)) continue;
-        const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t\r");
-        if (std.mem.startsWith(u8, raw, prefix) and std.mem.trim(u8, raw[prefix.len..], " \t\r").len != 0) return true;
-    }
-    return false;
-}
-fn isCast(name: []const u8, all: bool) bool {
-    const builtin = std.zig.BuiltinFn.list.get(name) orelse return false;
-    return switch (builtin.tag) {
-        .const_cast, .ptr_cast, .align_cast, .int_from_ptr => true,
-        .as, .bit_cast, .int_cast, .float_cast, .float_from_int, .int_from_float, .ptr_from_int, .truncate, .enum_from_int, .int_from_enum, .from_backing_int, .backing_int, .addrspace_cast, .error_cast, .error_from_int, .int_from_error, .int_from_bool, .volatile_cast => all,
-        else => false,
-    };
-}
 fn sourcePolicies(self: *Context) RunError!void {
-    if (!self.selected(&.{ .P001, .P002, .P004, .P005 })) return;
+    if (!self.config.has(.P005)) return;
     const tree = &self.project.files[self.file.raw()].tree;
-    if (self.config.has(.P001)) for (tree.tokens.items(.tag), 0..) |tag, i| {
-        if (tag != .builtin) continue;
-        const token: Ast.TokenIndex = @intCast(i); // safe: std tokens fit the checked source inventory.
-        if (self.config.cast_scope == .production and self.inTest(token)) continue;
-        if (isCast(tree.tokenSlice(token), self.config.casts == .all) and !hasReason(self, token, "safe:", false)) try self.at(.P001, token, "cast needs // safe: <site reason> on its line");
-    };
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
+    for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: std AST inventory fits u32.
         const token = tree.nodeMainToken(node);
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, node, &buffer);
-        if (self.config.has(.P002) and args.len == 1 and std.mem.eql(u8, tree.tokenSlice(token), "@setRuntimeSafety")) {
-            if (tree.nodeTag(args[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "false")) {
-                if (!hasReason(self, token, "safe:", false)) try self.at(.P002, token, "safety-off site needs // safe: <boundary invariant and measured hot-loop evidence>");
-            } else if (!(tree.nodeTag(args[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "true"))) try self.unknown(.P002, node, .comptime_dependent);
-        }
         if (self.inTest(token)) continue;
-        if (self.config.has(.P004) and tag == .@"catch") {
-            var rhs = tree.nodeData(node).node_and_node[1];
-            while (tree.nodeTag(rhs) == .grouped_expression) rhs = tree.nodeData(rhs).node_and_token[0];
-            if (tree.nodeTag(rhs) == .unreachable_literal and !hasReason(self, token, "unreachable:", true)) try self.at(.P004, token, "catch unreachable needs // unreachable: <invariant> on this or the previous line");
-        }
-        if (self.config.has(.P005)) {
-            var call_buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&call_buffer, node) orelse continue;
-            const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-            if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
-            if (value == .function) for (self.project.imports) |mapping| {
-                if (!mapping.from.eql(self.file) or !std.mem.eql(u8, mapping.spelling, "std")) continue;
-                const debug = (try standardContainer(self, .{ .file = mapping.target, .scope = 0 }, &.{"debug"})) orelse continue;
-                const print = self.facts.member(debug, "print") orelse continue;
-                if (std.meta.eql(print, value.function)) {
-                    try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
-                    break;
-                }
-            };
-        }
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse continue;
+        const value = try self.facts.resolve(self.file, call.ast.fn_expr);
+        if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
+        if (value == .function) for (self.project.imports) |mapping| {
+            if (!mapping.from.eql(self.file) or !std.mem.eql(u8, mapping.spelling, "std")) continue;
+            const debug = (try standardContainer(self, .{ .file = mapping.target, .scope = 0 }, &.{"debug"})) orelse continue;
+            const print = self.facts.member(debug, "print") orelse continue;
+            if (std.meta.eql(print, value.function)) {
+                try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
+                break;
+            }
+        };
     }
 }
 fn functionLengths(self: *Context) RunError!void {

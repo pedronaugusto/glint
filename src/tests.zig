@@ -2,6 +2,7 @@
 test {
     _ = @import("Token_test.zig");
     _ = @import("AegisPack_test.zig");
+    _ = @import("Danger_test.zig");
     _ = @import("Library_test.zig");
     _ = @import("build_gate_test.zig");
     _ = @import("glint");

@@ -247,15 +247,7 @@ test "D001 reads a computed @field through its receiver and withholds an unresol
     try std.testing.expect(withheld);
 }
 
-test "G2 casts safety-off catches and length follow configured code policy" {
-    try check(.P001, "pub fn f(x: u32) u8 { return @intCast(x); }", 1);
-    try check(.P001, "pub fn f(x: u32) u8 { return @intCast(x); } // safe: bounded input validated by caller\n", 0);
-    try check(.P001, "const text = \"// safe: forged\"; pub fn f(x: u32) u8 { _ = text; return @intCast(x); }", 1);
-    try check(.P002, "pub fn f() void { @setRuntimeSafety(false); }", 1);
-    try check(.P002, "pub fn f() void { @setRuntimeSafety(false); } // safe: measured parser loop, length validated at entry\n", 0);
-    try check(.P004, "fn fail() error{Failure}!void {} pub fn f() void { fail() catch unreachable; }", 1);
-    try check(.P004, "fn fail() error{Failure}!void {}\n// unreachable: this implementation cannot emit Failure\npub fn f() void { fail() catch unreachable; }", 0);
-    try check(.P004, "fn fail() error{Failure}!void {} test { fail() catch unreachable; }", 0);
+test "G2 function length follows configured code policy" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "length", .bytes = "pub fn f() void {\n\n\n}\n" }}, &.{}, .{});
     defer project.deinit();
     var config = glint.Config.none();
@@ -445,20 +437,6 @@ test "G2 policy configuration rejects blank reasons empty qualifiers and stale e
     try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: incomplete policy has no invented finding.
 }
 
-test "G2 complete cast inventory includes boolean and volatile conversion reasons" {
-    try check(.P001, "pub fn f(b: bool) u1 { return @intFromBool(b); }", 1);
-    try check(.P001, "pub fn f(p: *volatile u8) *u8 { return @volatileCast(p); }", 1);
-    try check(.P001, "pub fn f(b: bool) u1 { return @intFromBool(b); } // safe: bool conversion yields exactly zero or one\n", 0);
-    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "migration", .bytes = "pub fn f(b: bool) u1 { return @intFromBool(b); }" }}, &.{}, .{});
-    defer project.deinit();
-    var config = glint.Config.none();
-    config.set(.P001, true);
-    config.casts = .pointer;
-    var report = try glint.run(std.testing.allocator, &project, config);
-    defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: explicit narrower migration selection.
-}
-
 test "private import references through reflection strings preserve declaration identity" {
     try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @field(Self, \"dep\"); }", 0);
     try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @hasDecl(Self, \"dep\"); }", 0);
@@ -543,48 +521,6 @@ test "P006 decides an unresolved receiver by what Zig allows at the site" {
     };
     // `db.file().sync()` may be File.sync: it stays undecided.
     try std.testing.expectEqual(@as(usize, 1), undecided); // safe: one site cannot be refuted.
-}
-
-test "E001 finds a pointer into the frame carried out of the call" {
-    // A slice of a local array, returned.
-    try check(.E001, "pub fn f(n: usize) []u8 { var buf: [16]u8 = undefined; buf[0] = 1; return buf[0..n]; }", 1);
-    // Through a const alias, and in a returned struct literal.
-    try check(.E001, "pub fn f() *u32 { var x: u32 = 1; x += 1; const out = &x; return out; }", 1);
-    try check(.E001, "const R = struct { s: []u8 }; pub fn f(n: usize) R { var buf: [8]u8 = undefined; buf[0] = 1; return .{ .s = buf[0..n] }; }", 1);
-    // A field of a local value, through a parameter and into a container's variable.
-    try check(.E001, "const S = struct { a: u32 = 0 }; const T = struct { p: *u32 }; pub fn f(t: *T) void { var s: S = .{}; s.a = 1; t.p = &s.a; }", 1);
-    try check(.E001, "var last: ?*u32 = null; pub fn f() void { var x: u32 = 1; x += 1; last = &x; }", 1);
-}
-
-test "E001 leaves static storage, pointers, copies and undone stores alone" {
-    // A const is comptime-known and static; a comptime frame is comptime memory.
-    try check(.E001, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
-    try check(.E001, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
-    try check(.E001, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
-    // A local that is a pointer or a slice: its fields and elements are elsewhere.
-    try check(.E001, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
-    try check(.E001, "pub fn f(items: []u8) []u8 { var s: []u8 = items; s = s[1..]; return s[0..1]; }", 0);
-    // A copy, not a pointer; a store a defer undoes.
-    try check(.E001, "pub fn f() [4]u8 { var buf: [4]u8 = undefined; buf[0] = 1; return buf; }", 0);
-    try check(.E001, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer t.cur = null; }", 0);
-    // A store into another local outlives nothing.
-    try check(.E001, "pub fn f() u32 { var x: u32 = 1; var p: *u32 = undefined; p = &x; p.* += 1; return x; }", 0);
-}
-
-test "E001 leaves an intrusive waiter the function unlinks before it returns" {
-    try check(.E001,
-        \\const W = struct { next: ?*W = null };
-        \\const Q = struct { first: ?*W = null };
-        \\pub fn wait(q: *Q) void {
-        \\    var waiter: W = .{ .next = q.first };
-        \\    q.first = &waiter;
-        \\    defer {
-        \\        var link = &q.first;
-        \\        while (link.* != &waiter) link = &link.*.?.next;
-        \\        link.* = waiter.next;
-        \\    }
-        \\}
-    , 0);
 }
 
 test "review Z006 accepts a name a generic reads on its type parameter that an outside type declares" {

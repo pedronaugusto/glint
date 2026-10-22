@@ -104,7 +104,7 @@ pub fn dev(b: *std.Build, tools: type) void {
             p.path("src/tests.zig"),
         },
         .directories = &.{p.path("src")},
-        .args = &.{ "--only", "P001", "--only", "P002", "--only", "P003", "--gate", "P001", "--gate", "P002", "--gate", "P003" },
+        .args = &.{ "--only", "P003", "--gate", "P003" },
     });
     b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
