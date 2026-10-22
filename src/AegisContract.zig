@@ -45,7 +45,7 @@ pub const Kind = enum {
     choice,
     /// `Atomic`: one cell, shared by pointer.
     atomic,
-    /// A logical task's diagnostic context: `Order(...).Context`, `InitContext`.
+    /// A logical task's diagnostic context: `InitContext`.
     context,
     /// Runtime text classified public, `err.PublicSource`: made by `classify`, whose reason is
     /// the review a literal skips.
@@ -83,8 +83,6 @@ const sync_members = [_]Lib.Member{
     .{ .path = "Shared", .role = .shared, .required = false },
     .{ .path = "Atomic", .role = .atomic, .required = false },
     .{ .path = "InitContext", .role = .context, .required = false },
-    .{ .path = "Order.Context", .role = .context, .required = false },
-    .{ .path = "Order.Ordered", .role = .guarded, .required = false },
 };
 const int_members = [_]Lib.Member{
     .{ .path = "Checked", .role = .scalar },
@@ -129,8 +127,6 @@ const root_members = [_]Lib.Member{
     .{ .path = "Shared", .role = .shared },
     .{ .path = "Atomic", .role = .atomic },
     .{ .path = "InitContext", .role = .context },
-    .{ .path = "Order.Context", .role = .context },
-    .{ .path = "Order.Ordered", .role = .guarded },
     .{ .path = "bounded.Array", .role = .inline_store },
     .{ .path = "bounded.Ring", .role = .inline_store },
     .{ .path = "bounded.Queue", .role = .inline_store },

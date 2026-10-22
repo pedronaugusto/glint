@@ -176,7 +176,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .assign) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
         const target, const value = tree.nodeData(node).node_and_node;
         if (tree.nodeTag(target) != .field_access or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
@@ -239,7 +239,7 @@ pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
         const block = model.node_parents[@backingInt(decl.node)] orelse continue; // safe: a node index indexes its own tree's parent table.
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, block) orelse continue;
-        var walk: Walk = .{ .c = c, .tree = tree, .model = model, .local = @intCast(d) }; // safe: a file's declaration table indexes fit u32.
+        var walk: Walk = .{ .c = c, .tree = tree, .model = model, .local = @intCast(d) }; // aegis: no-danger: a file's declaration table indexes fit u32.
         try walk.collect();
         const start = std.mem.findScalar(Ast.Node.Index, statements, decl.node) orelse continue;
         _ = try walk.sequence(statements[start + 1 ..], .unwritten);
@@ -261,7 +261,7 @@ const Walk = struct {
     fn collect(w: *Walk) Context.Error!void {
         for (w.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
             const ref = w.model.reference(node) orelse continue;
             if (ref.declaration == w.local) try w.mentions.append(w.c.allocator, node);
         }

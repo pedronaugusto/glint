@@ -7,6 +7,7 @@ const Report = @import("Report.zig");
 const RuleContext = @import("RuleContext.zig");
 const Runner = @import("Runner.zig");
 const Result = @import("Result.zig");
+const aegis = @import("aegis");
 const ensign = @import("ensign");
 const release = @import("release");
 const Cli = @This();
@@ -51,16 +52,25 @@ const Loader = struct {
             };
             if (!permitted) return error.ImportOutsideRoots;
         }
-        const bytes = try std.Io.Dir.cwd().readFileAllocOptions(self.io, canonical, self.a, .limited(16 * 1024 * 1024), .@"1", 0);
-        self.bytes += bytes.len;
-        if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
-        const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // safe: the loader bounds source count to 4096 before creating u32 identities.
+        const read = try std.Io.Dir.cwd().readFileAllocOptions(self.io, canonical, self.a, .limited(16 * 1024 * 1024), .@"1", 0);
+        // A file's bytes are input until the project's budget has taken them.
+        const source = try aegis.input.Untrusted([:0]const u8).init(read).parse(self, Loader.take);
+        const bytes = source.bytes;
+        const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // aegis: no-danger: the loader bounds source count to 4096 before creating u32 identities.
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = self.packageOf(canonical) });
         try self.canonical_paths.append(self.a, canonical);
         try self.paths.put(self.a, canonical, id);
         return id;
+    }
+
+    /// A file's bytes, counted against the project's source budget.
+    const Source = struct { bytes: [:0]const u8 };
+    fn take(self: *Loader, bytes: [:0]const u8) error{SourceBudgetExceeded}!Source {
+        self.bytes += bytes.len;
+        if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
+        return .{ .bytes = bytes };
     }
 
     /// The package of the innermost directory holding `canonical`; empty when none does.
@@ -75,7 +85,7 @@ const Loader = struct {
     fn imports(self: *Loader) !void {
         var cursor: usize = 0;
         while (cursor < self.inputs.items.len) : (cursor += 1) {
-            const from: Project.FileId = Project.FileId.fromRaw(@intCast(cursor)); // safe: the loader bounds source count to 4096 before creating u32 identities.
+            const from: Project.FileId = Project.FileId.fromRaw(@intCast(cursor)); // aegis: no-danger: the loader bounds source count to 4096 before creating u32 identities.
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
             var lexer: std.zig.Tokenizer = .init(sentinel);
@@ -216,14 +226,23 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
     for (arguments.files_from) |from| {
-        const list = try std.Io.Dir.cwd().readFileAlloc(io, from, a, .limited(4 * 1024 * 1024));
-        var lines = std.mem.splitScalar(u8, list, '\n');
-        while (lines.next()) |line| {
-            const path = std.mem.trim(u8, line, "\r");
-            if (path.len > 0) try result.files.append(a, path);
-        }
+        const read = try std.Io.Dir.cwd().readFileAlloc(io, from, a, .limited(4 * 1024 * 1024));
+        const list = try aegis.input.Untrusted([]const u8).init(read).parse(a, fileList);
+        try result.files.appendSlice(a, list.paths);
     }
     return result;
+}
+
+/// The files a `--files-from` list names, one a line, blank lines aside.
+const FileList = struct { paths: []const []const u8 };
+fn fileList(a: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!FileList {
+    var paths: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const path = std.mem.trim(u8, line, "\r");
+        if (path.len > 0) try paths.append(a, path);
+    }
+    return .{ .paths = paths.items };
 }
 
 /// `NAME=VALUE`, neither empty.

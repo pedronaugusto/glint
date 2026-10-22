@@ -40,7 +40,7 @@ pub const Token = struct {
         return lexer.next().tag;
     }
     pub inline fn init(tag: std.zig.Token.Tag, bytes: []const u8, start: usize, finish: usize) Token {
-        return .{ .ptr = bytes.ptr, .length = @intCast(bytes.len), .offset = @intCast(start), .link = @intCast(finish - start), .tag = tag }; // safe: checked source bounds limit tokenizer offsets below u32.
+        return .{ .ptr = bytes.ptr, .length = @intCast(bytes.len), .offset = @intCast(start), .link = @intCast(finish - start), .tag = tag }; // aegis: no-danger: checked source bounds limit tokenizer offsets below u32.
     }
     pub inline fn initEscaped(bytes: []const u8, start: usize, finish: usize) Token {
         return init(.identifier, bytes, start, finish);

@@ -181,7 +181,7 @@ pub fn deinit(self: *Facts) void {
 /// module's name to, and each member is the declaration its path names from that root. Found
 /// once per run and shared by every rule.
 pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
-    const key = @intFromPtr(library.modules.ptr); // safe: the address names the library only for this run, which the caller keeps alive.
+    const key = @intFromPtr(library.modules.ptr); // aegis: no-danger: the address names the library only for this run, which the caller keeps alive.
     if (self.publications.get(key)) |found| return found;
     var entries: std.ArrayList(Entry) = .empty;
     var gaps: std.ArrayList(Gap) = .empty;
@@ -199,7 +199,7 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
             reached[mapping.target.raw()] = true; // safe: validated mapping targets index the frozen file table.
             for (module.members) |listed| switch (try self.published(mapping.target, listed.path)) {
                 .found => |target| {
-                    const role_value: u32 = @intCast(@backingInt(listed.role)); // safe: a role enum's values are small by construction.
+                    const role_value: u32 = @intCast(@backingInt(listed.role)); // aegis: no-danger: a role enum's values are small by construction.
                     try entries.append(self.gpa, .{ .role = role_value, .target = target });
                     // The container a type function returns is also its type: instances declared with it are the role's.
                     if (target == .function) if (try self.template(target.function)) |returned| if (returned == .container) {
@@ -221,7 +221,7 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
         }
     }
     var files: std.ArrayList(Project.FileId) = .empty;
-    for (reached, 0..) |in_library, index| if (in_library) try files.append(self.gpa, Project.FileId.fromRaw(@intCast(index))); // safe: the project bounds its file count to u32 identities.
+    for (reached, 0..) |in_library, index| if (in_library) try files.append(self.gpa, Project.FileId.fromRaw(@intCast(index))); // aegis: no-danger: the project bounds its file count to u32 identities.
     const result = try self.gpa.create(Publication);
     result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
     try self.publications.put(self.gpa, key, result);
@@ -266,11 +266,11 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
     while (true) switch (current) {
         .pointer, .array, .optional, .error_union => |inner| current = inner.*,
         .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role))); // safe: the entry holds a role value of this enum.
+            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role))); // aegis: no-danger: the entry holds a role value of this enum.
             return null;
         },
         .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(c.file) and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role))); // safe: the entry holds a role value of this enum.
+            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(c.file) and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role))); // aegis: no-danger: the entry holds a role value of this enum.
             return null;
         },
         else => return null,
@@ -327,10 +327,10 @@ fn intern(self: *Facts, items: []const Assumption) ResolveError!u32 {
             for (set) |held| {
                 if (held.eql(item)) break;
             } else break;
-        } else return @intCast(index); // safe: the sets are few, one per distinct path read.
+        } else return @intCast(index); // aegis: no-danger: the sets are few, one per distinct path read.
     }
     try self.settled.append(self.gpa, try self.gpa.dupe(Assumption, items));
-    return @intCast(self.settled.items.len); // safe: the sets are few, one per distinct path read.
+    return @intCast(self.settled.items.len); // aegis: no-danger: the sets are few, one per distinct path read.
 }
 
 /// Adds to `found` what the path from the file's root to `node` settles: the branch of each
@@ -429,7 +429,7 @@ pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.In
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const branch: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const branch: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(branch);
         if (at < first or at > last) continue;
         switch (tag) {
@@ -491,10 +491,10 @@ fn findCopies(self: *Facts) ResolveError!void {
     var functions: std.ArrayList(Decl) = .empty;
     for (self.project.files, self.project.models, 0..) |*file, *model, raw| {
         if (file.status != .parsed or outside[raw]) continue;
-        const id: Project.FileId = .fromRaw(@intCast(raw)); // safe: file indexes are bounded by the frozen project table.
+        const id: Project.FileId = .fromRaw(@intCast(raw)); // aegis: no-danger: file indexes are bounded by the frozen project table.
         for (model.declarations, 0..) |d, i| {
             if (d.kind != .function) continue;
-            const decl: Decl = .{ .file = id, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            const decl: Decl = .{ .file = id, .index = @intCast(i) }; // aegis: no-danger: declaration indexes come from the bounded frozen model.
             if (self.syntaxOf(id).nodeTag(self.scopeNode(decl)) != .fn_decl) continue;
             if (!self.hasGenericParameter(decl)) continue;
             try functions.append(self.gpa, decl);
@@ -665,7 +665,7 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
     const first = t.firstToken(whole);
     const last = t.lastToken(whole);
     for (t.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = t.fullCall(&call_buffer, node) orelse continue;
         const at = t.nodeMainToken(node);
@@ -732,7 +732,7 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
     const model = &self.project.models[function.file.raw()]; // safe: a declaration identity indexes its own frozen model.
     const last = t.lastToken(node);
     for (t.firstToken(node)..last + 1) |raw| {
-        const token: Ast.TokenIndex = @intCast(raw); // safe: bounded by the node's own token range.
+        const token: Ast.TokenIndex = @intCast(raw); // aegis: no-danger: bounded by the node's own token range.
         if (t.tokenTag(token) != .identifier) continue;
         const index = self.lexical(function.file, model.token_scopes[token], t.tokenSlice(token)) orelse continue;
         const record = model.declarations[index];
@@ -807,7 +807,7 @@ pub fn fromParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) b
         if (t.nodeTag(parent) != .fn_decl) continue;
         for (model.declarations, 0..) |d, i| {
             if (d.kind != .function) continue;
-            const candidate: Decl = .{ .file = file, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            const candidate: Decl = .{ .file = file, .index = @intCast(i) }; // aegis: no-danger: declaration indexes come from the bounded frozen model.
             if (self.scopeNode(candidate) != parent) continue;
             if (self.derivedParameter(candidate, node, 0) != null) return true;
             break;
@@ -838,7 +838,7 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
     const first = t.firstToken(node);
     const last = t.lastToken(node);
     for (first..last + 1) |raw| {
-        const token: Ast.TokenIndex = @intCast(raw); // safe: bounded by the node's own token range.
+        const token: Ast.TokenIndex = @intCast(raw); // aegis: no-danger: bounded by the node's own token range.
         if (t.tokenTag(token) != .identifier) continue;
         const scope = model.token_scopes[token];
         const index = self.lexical(function.file, scope, t.tokenSlice(token)) orelse continue;
@@ -1098,7 +1098,7 @@ fn typeWritten(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     if (tree.nodeTag(node) != .fn_decl and tree.fullFnProto(&proto_buffer, node) != null) return .{ .fn_type = .{ .file = file, .node = node } };
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) {
-        for (self.project.models[file.raw()].scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // safe: scope indexes come from the bounded frozen per-file model.
+        for (self.project.models[file.raw()].scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @intCast(s) } }; // aegis: no-danger: scope indexes come from the bounded frozen per-file model.
     }
     return null;
 }
@@ -1256,7 +1256,7 @@ fn fieldType(self: *Facts, file: Project.FileId, of: Value, name_node: Ast.Node.
         if (d.kind != .field or d.scope != container.scope) continue;
         const field = self.syntaxOf(container.file).fullContainerField(d.node) orelse continue;
         if (field.ast.type_expr == .none) continue;
-        try each.append(self.gpa, try typeOf(self, try self.memberOf(container, .{ .file = container.file, .index = @intCast(i) }), {})); // safe: declaration indexes come from the bounded frozen model.
+        try each.append(self.gpa, try typeOf(self, try self.memberOf(container, .{ .file = container.file, .index = @intCast(i) }), {})); // aegis: no-danger: declaration indexes come from the bounded frozen model.
     }
     if (each.items.len == 0) return .{ .unknown = .unsupported };
     return self.choose(each.items);
@@ -1595,7 +1595,7 @@ fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveE
     const statements = tree.blockStatements(&body_buffer, body) orelse return false;
     if (statements.len == 0) return false;
     const changed = self.recursion(function, body, statements[statements.len - 1]) orelse return false;
-    return position < 64 and changed & (@as(u64, 1) << @intCast(position)) != 0; // safe: bounded by the check before it.
+    return position < 64 and changed & (@as(u64, 1) << @intCast(position)) != 0; // aegis: no-danger: bounded by the check before it.
 }
 
 /// What calling `callee` returns: its declared result, or the container a type function makes.
@@ -1752,7 +1752,7 @@ fn breaks(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
     var peers: Peers = .{};
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
-        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(jump);
         if (at < first or at > last) continue;
         const data = tree.nodeData(jump).opt_token_and_opt_node;
@@ -1787,7 +1787,7 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
     const last = tree.lastToken(body);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
-        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(jump);
         if (at < first or at > last) continue;
         const data = tree.nodeData(jump).opt_token_and_opt_node;
@@ -1938,7 +1938,7 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
             if (record.kind != .field or record.scope != container.scope) continue;
             const field_name = try self.memberName(owner.tokenSlice(record.token));
             if (try self.prongNames(file, whole, field_name)) continue;
-            try fields.append(self.gpa, .{ .file = container.file, .index = @intCast(i) }); // safe: declaration indexes come from the bounded frozen model.
+            try fields.append(self.gpa, .{ .file = container.file, .index = @intCast(i) }); // aegis: no-danger: declaration indexes come from the bounded frozen model.
         }
     } else for (full.ast.values) |item| {
         if (tree.nodeTag(item) != .enum_literal) return .{ .unknown = .unsupported };
@@ -2190,7 +2190,7 @@ pub fn memo(self: *Facts, comptime T: type, key: usize) ResolveError!*T {
         made.* = .{};
         entry.value_ptr.* = made;
     }
-    return @ptrCast(@alignCast(entry.value_ptr.*)); // safe: the key is the caller's for this type alone.
+    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal: the key is the caller's for this type alone.
 }
 
 /// The member accesses (`x.name`) in the project's selected files that spell `name`, each a
@@ -2200,11 +2200,11 @@ pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
         var index: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty;
         for (self.project.inputs, 0..) |input, f| {
             if (!input.selected) continue;
-            const file = Project.FileId.fromRaw(@intCast(f)); // safe: the project's file table indexes fit u32.
+            const file = Project.FileId.fromRaw(@intCast(f)); // aegis: no-danger: the project's file table indexes fit u32.
             const tree = &self.project.files[f].tree;
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 if (tag != .field_access) continue;
-                const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
                 const spelled = try self.memberName(tree.tokenSlice(tree.nodeData(node).node_and_token[1]));
                 const entry = try index.getOrPut(self.gpa, spelled);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -2219,7 +2219,7 @@ pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
 pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl {
     const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     if (model.scopes[container.scope].names.get(name)) |decl| return .{ .file = container.file, .index = decl };
-    for (model.declarations, 0..) |decl, i| if (decl.kind == .field and decl.scope == container.scope and std.mem.eql(u8, decl.name, name)) return .{ .file = container.file, .index = @intCast(i) }; // safe: scope indexes come from the bounded frozen per-file model.
+    for (model.declarations, 0..) |decl, i| if (decl.kind == .field and decl.scope == container.scope and std.mem.eql(u8, decl.name, name)) return .{ .file = container.file, .index = @intCast(i) }; // aegis: no-danger: scope indexes come from the bounded frozen per-file model.
     return null;
 }
 
@@ -2558,7 +2558,7 @@ fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Nod
     const end = tree.nodeMainToken(last);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"return") continue;
-        const early: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const early: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(early);
         if (at < first or at >= end) continue;
         const operand = tree.nodeData(early).opt_node.unwrap() orelse return null;
@@ -2569,7 +2569,7 @@ fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Nod
         if (callee != decl.index or call.ast.params.len != count) return null;
         for (call.ast.params, 0..) |arg, position| {
             const same_parameter = tree.nodeTag(arg) == .identifier and if (model.reference(arg)) |ref| if (ref.declaration) |index| model.declarations[index].token == params[position] else false else false;
-            if (!same_parameter) changed |= @as(u64, 1) << @intCast(position); // safe: at most 64 parameters, checked above.
+            if (!same_parameter) changed |= @as(u64, 1) << @intCast(position); // aegis: no-danger: at most 64 parameters, checked above.
         }
     }
     return changed;
@@ -2586,7 +2586,7 @@ fn finalReturn(tree: *const Ast, parents: []const ?Ast.Node.Index, record: Model
     if (statements.len == 0 or tree.nodeTag(statements[statements.len - 1]) != .@"return") return null;
     const last = statements[statements.len - 1];
     for (tree.firstToken(body)..tree.nodeMainToken(last)) |token| {
-        if (tree.tokenTag(@intCast(token)) == .keyword_return) return null; // safe: the body's token range lies inside the file's token table.
+        if (tree.tokenTag(@intCast(token)) == .keyword_return) return null; // aegis: no-danger: the body's token range lies inside the file's token table.
     }
     return tree.nodeData(last).opt_node.unwrap();
 }
@@ -2719,7 +2719,7 @@ fn functionOf(self: *const Facts, parameter: Decl) ?Decl {
     if (scope.kind != .function) return null;
     for (model.declarations, 0..) |d, i| {
         if (d.kind != .function) continue;
-        const candidate: Decl = .{ .file = parameter.file, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen per-file model.
+        const candidate: Decl = .{ .file = parameter.file, .index = @intCast(i) }; // aegis: no-danger: declaration indexes come from the bounded frozen per-file model.
         if (self.scopeNode(candidate) == scope.node) return candidate;
     }
     return null;
@@ -2771,13 +2771,13 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         if (file.status != .parsed) continue;
         // A private function is used in its own file only; a file outside the package
         // reaches it only through a module's exported names, which this one is not among.
-        const id: Project.FileId = .fromRaw(@intCast(raw)); // safe: file indexes are bounded by the frozen project table.
+        const id: Project.FileId = .fromRaw(@intCast(raw)); // aegis: no-danger: file indexes are bounded by the frozen project table.
         const own = id.eql(function.file);
         if (!record.public and !own) continue;
         if (!self.project.inputs[raw].selected) continue;
         const tree = &file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const names_it = switch (tag) {
                 .identifier => blk: {
                     const ref = file_model.reference(node) orelse break :blk false;
@@ -2944,7 +2944,7 @@ fn dereferenced(self: *Facts, decl: Decl) ResolveError!bool {
         const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .deref) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const operand = tree.nodeData(node).node;
             if (tree.nodeTag(operand) != .identifier) continue;
             const ref = model.reference(operand) orelse continue;
@@ -3055,7 +3055,7 @@ fn exportedContainers(self: *Facts) ResolveError!*const std.AutoHashMapUnmanaged
         const model = &self.project.models[container.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
         for (model.declarations, 0..) |d, i| {
             if (d.scope != container.scope or !d.public or d.kind != .variable) continue;
-            const value = try self.declaration(.{ .file = container.file, .index = @intCast(i) }); // safe: declaration indexes come from the bounded frozen per-file model.
+            const value = try self.declaration(.{ .file = container.file, .index = @intCast(i) }); // aegis: no-danger: declaration indexes come from the bounded frozen per-file model.
             const reached = switch (value) {
                 .container, .instance => |c| c,
                 else => continue,

@@ -109,14 +109,26 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     try known(c, flow);
     for (c.project.inputs, 0..) |input, f| {
         if (!input.selected or input.classification == .@"test") continue;
-        try functionsOf(c, flow, Project.FileId.fromRaw(@intCast(f))); // safe: the project's file table indexes fit u32.
+        const file = Project.FileId.fromRaw(@intCast(f)); // aegis: no-danger: the project's file table indexes fit u32.
+        // A file whose rules read neither fact (a tool the package develops with) is no part
+        // of the program the facts describe.
+        if (!reads(c.configOf(file), flow.fact)) continue;
+        try functionsOf(c, flow, file);
     }
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         flow.changed = false;
-        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @intCast(i)); // safe: the function table is far below u32.
+        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @intCast(i)); // aegis: no-danger: the function table is far below u32.
         if (!flow.changed) break;
     }
+}
+
+fn reads(config: @import("Rule.zig").Config, fact: Fact) bool {
+    const pack = @import("AegisRules.zig");
+    return switch (fact) {
+        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation),
+        .peer => config.has(pack.diagnostics),
+    };
 }
 
 /// The declarations the fact starts from and stops at: std's reader, file, directory and stream,
@@ -171,7 +183,7 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
     @memset(owners, null);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .fn_decl) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, tree.nodeData(node).node_and_node[0]) orelse continue;
         var params: std.ArrayList(u32) = .empty;
@@ -183,18 +195,18 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
             };
             var found: u32 = std.math.maxInt(u32);
             for (model.declarations, 0..) |decl, d| if (decl.kind == .parameter and decl.token == name) {
-                found = @intCast(d); // safe: a file's declaration table indexes fit u32.
+                found = @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32.
                 break;
             };
             try params.append(c.allocator, found);
         }
         const levels = try c.allocator.alloc(Level, params.items.len);
         @memset(levels, .clean);
-        try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @intCast(flow.functions.items.len)); // safe: the function table is far below u32.
+        try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @intCast(flow.functions.items.len)); // aegis: no-danger: the function table is far below u32.
         try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels });
     }
     for (0..tree.nodes.len) |i| {
-        var at: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        var at: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
         while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
             if (tree.nodeTag(parent) == .fn_decl) {
                 owners[i] = flow.by_node.get(.{ .file = file, .node = parent });
@@ -221,7 +233,7 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
     const owners = flow.owners.get(f.file.raw()).?;
     for (owners, 0..) |own, i| {
         if (own != function) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
         switch (tree.nodeTag(node)) {
             .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => {
                 const init = (tree.fullVarDecl(node) orelse continue).ast.init_node.unwrap() orelse continue;
@@ -262,8 +274,8 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .capture) continue;
         if (owner(flow, f.file, decl.node) != function) continue;
-        const from = try captured(c, flow, function, decl, @intCast(d)); // safe: a file's declaration table indexes fit u32.
-        try raiseLocal(c, flow, .{ .file = f.file, .index = @intCast(d) }, from); // safe: a file's declaration table indexes fit u32.
+        const from = try captured(c, flow, function, decl, @intCast(d)); // aegis: no-danger: a file's declaration table indexes fit u32.
+        try raiseLocal(c, flow, .{ .file = f.file, .index = @intCast(d) }, from); // aegis: no-danger: a file's declaration table indexes fit u32.
     }
 }
 
@@ -304,7 +316,7 @@ fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration, d:
 
 /// The declaration a `var`/`const` node declares.
 fn declaredAt(model: *const Model, node: Ast.Node.Index) ?u32 {
-    for (model.declarations, 0..) |decl, d| if (decl.node == node and decl.kind == .variable) return @intCast(d); // safe: a file's declaration table indexes fit u32.
+    for (model.declarations, 0..) |decl, d| if (decl.node == node and decl.kind == .variable) return @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32.
     return null;
 }
 
@@ -436,7 +448,7 @@ fn fill(c: *Context, flow: *Flow, function: u32, arg: Ast.Node.Index) Context.Er
 }
 
 fn bit(index: usize) u64 {
-    return if (index < 64) @as(u64, 1) << @intCast(index) else 0; // safe: the shift is below 64.
+    return if (index < 64) @as(u64, 1) << @intCast(index) else 0; // aegis: no-danger: the shift is below 64.
 }
 
 /// A dependence read as a level, with what callers give the function's parameters.
@@ -650,7 +662,7 @@ fn labeled(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
     const last = tree.lastToken(node);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
-        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
         const token = tree.nodeMainToken(brk);
         if (token < first or token > last) continue;
         const target, const value = tree.nodeData(brk).opt_token_and_opt_node;

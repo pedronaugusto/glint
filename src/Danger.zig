@@ -24,7 +24,7 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     try governed(c, rule, &sync, false, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const name = builtinName(tree, node) orelse continue;
         for ([_][]const u8{ "@atomicLoad", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |atomic| if (std.mem.eql(u8, name, atomic)) {
             if (!c.inTest(tree.nodeMainToken(node)) and atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
@@ -52,7 +52,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     if (keys.len == 0) return;
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const site = switch (tag) {
             .identifier => tree.nodeMainToken(node),
             .field_access => tree.nodeData(node).node_and_token[1],
@@ -101,7 +101,7 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
     for (files.items) |file| for (c.project.models[file.raw()].declarations, 0..) |decl, d| {
         if (decl.kind != .variable or !decl.public) continue;
         if (!std.mem.eql(u8, decl.name, "SecretKey") and !std.mem.eql(u8, decl.name, "KeyPair")) continue;
-        try keys.append(c.allocator, .{ .file = file, .index = @intCast(d) }); // safe: a file's declaration table indexes fit u32
+        try keys.append(c.allocator, .{ .file = file, .index = @intCast(d) }); // aegis: no-danger: a file's declaration table indexes fit u32
     };
     return keys.items;
 }
@@ -169,7 +169,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .unreachable_literal) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         try c.at(rule, token, "unreachable: undefined behaviour in ReleaseFast when reached; aegis assert.never stops in every build, or return an error");
@@ -181,7 +181,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
 pub fn casts(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const name = builtinName(tree, node) orelse continue;
         var fallible = false;
         for ([_][]const u8{ "@intCast", "@truncate", "@intFromFloat", "@enumFromInt", "@fromBackingInt" }) |cast| fallible = fallible or std.mem.eql(u8, name, cast);
@@ -200,7 +200,7 @@ pub fn casts(c: *Context, rule: Rule) Context.Error!void {
 pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
         const token = tree.nodeMainToken(node);
         switch (tag) {
             .asm_simple, .@"asm" => {

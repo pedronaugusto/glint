@@ -1,0 +1,22 @@
+//! The aegis pack's rule identities, a leaf the pack and the facts its rules read share.
+const Rule = @import("Rule.zig").Rule;
+pub const access: Rule = @fromBackingInt(@intCast(1100)); // safe: compiled pack identities are reserved stable u16 values.
+pub const copies: Rule = @fromBackingInt(@intCast(1101)); // safe: compiled pack identities are reserved stable u16 values.
+pub const cleanup: Rule = @fromBackingInt(@intCast(1102)); // safe: compiled pack identities are reserved stable u16 values.
+pub const scalar: Rule = @fromBackingInt(@intCast(1103)); // safe: compiled pack identities are reserved stable u16 values.
+pub const capacity: Rule = @fromBackingInt(@intCast(1104)); // safe: compiled pack identities are reserved stable u16 values.
+pub const recursion: Rule = @fromBackingInt(@intCast(1105)); // safe: compiled pack identities are reserved stable u16 values.
+pub const shared_state: Rule = @fromBackingInt(@intCast(1106)); // safe: compiled pack identities are reserved stable u16 values.
+pub const secrets: Rule = @fromBackingInt(@intCast(1107)); // safe: compiled pack identities are reserved stable u16 values.
+pub const untrusted_input: Rule = @fromBackingInt(@intCast(1108)); // safe: compiled pack identities are reserved stable u16 values.
+pub const integers: Rule = @fromBackingInt(@intCast(1109)); // safe: compiled pack identities are reserved stable u16 values.
+pub const units: Rule = @fromBackingInt(@intCast(1110)); // safe: compiled pack identities are reserved stable u16 values.
+pub const bounded_work: Rule = @fromBackingInt(@intCast(1111)); // safe: compiled pack identities are reserved stable u16 values.
+pub const contracts: Rule = @fromBackingInt(@intCast(1112)); // safe: compiled pack identities are reserved stable u16 values.
+pub const lifetimes: Rule = @fromBackingInt(@intCast(1113)); // safe: compiled pack identities are reserved stable u16 values.
+pub const ownership: Rule = @fromBackingInt(@intCast(1114)); // safe: compiled pack identities are reserved stable u16 values.
+pub const identity: Rule = @fromBackingInt(@intCast(1115)); // safe: compiled pack identities are reserved stable u16 values.
+pub const state_machines: Rule = @fromBackingInt(@intCast(1116)); // safe: compiled pack identities are reserved stable u16 values.
+pub const diagnostics: Rule = @fromBackingInt(@intCast(1117)); // safe: compiled pack identities are reserved stable u16 values.
+pub const unsafe_set: Rule = @fromBackingInt(@intCast(1118)); // safe: compiled pack identities are reserved stable u16 values.
+pub const cancellation: Rule = @fromBackingInt(@intCast(1119)); // safe: compiled pack identities are reserved stable u16 values.

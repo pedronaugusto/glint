@@ -5,34 +5,35 @@ const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
+const Ids = @import("AegisRules.zig");
 const Danger = @import("Danger.zig");
 const Shapes = @import("DangerShapes.zig");
 const Flows = @import("DangerFlow.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
-pub const access: Rule = @fromBackingInt(@intCast(1100)); // safe: compiled pack identities are reserved stable u16 values.
-pub const copies: Rule = @fromBackingInt(@intCast(1101)); // safe: compiled pack identities are reserved stable u16 values.
-pub const cleanup: Rule = @fromBackingInt(@intCast(1102)); // safe: compiled pack identities are reserved stable u16 values.
-pub const scalar: Rule = @fromBackingInt(@intCast(1103)); // safe: compiled pack identities are reserved stable u16 values.
-pub const capacity: Rule = @fromBackingInt(@intCast(1104)); // safe: compiled pack identities are reserved stable u16 values.
-pub const recursion: Rule = @fromBackingInt(@intCast(1105)); // safe: compiled pack identities are reserved stable u16 values.
+pub const access = Ids.access;
+pub const copies = Ids.copies;
+pub const cleanup = Ids.cleanup;
+pub const scalar = Ids.scalar;
+pub const capacity = Ids.capacity;
+pub const recursion = Ids.recursion;
 // The danger rules (designs/aegis.md §7): each finds where its danger exists and aegis's type is
 // the answer, from what the code resolves to.
-pub const shared_state: Rule = @fromBackingInt(@intCast(1106)); // safe: compiled pack identities are reserved stable u16 values.
-pub const secrets: Rule = @fromBackingInt(@intCast(1107)); // safe: compiled pack identities are reserved stable u16 values.
-pub const untrusted_input: Rule = @fromBackingInt(@intCast(1108)); // safe: compiled pack identities are reserved stable u16 values.
-pub const integers: Rule = @fromBackingInt(@intCast(1109)); // safe: compiled pack identities are reserved stable u16 values.
-pub const units: Rule = @fromBackingInt(@intCast(1110)); // safe: compiled pack identities are reserved stable u16 values.
-pub const bounded_work: Rule = @fromBackingInt(@intCast(1111)); // safe: compiled pack identities are reserved stable u16 values.
-pub const contracts: Rule = @fromBackingInt(@intCast(1112)); // safe: compiled pack identities are reserved stable u16 values.
-pub const lifetimes: Rule = @fromBackingInt(@intCast(1113)); // safe: compiled pack identities are reserved stable u16 values.
-pub const ownership: Rule = @fromBackingInt(@intCast(1114)); // safe: compiled pack identities are reserved stable u16 values.
-pub const identity: Rule = @fromBackingInt(@intCast(1115)); // safe: compiled pack identities are reserved stable u16 values.
-pub const state_machines: Rule = @fromBackingInt(@intCast(1116)); // safe: compiled pack identities are reserved stable u16 values.
-pub const diagnostics: Rule = @fromBackingInt(@intCast(1117)); // safe: compiled pack identities are reserved stable u16 values.
-pub const unsafe_set: Rule = @fromBackingInt(@intCast(1118)); // safe: compiled pack identities are reserved stable u16 values.
-pub const cancellation: Rule = @fromBackingInt(@intCast(1119)); // safe: compiled pack identities are reserved stable u16 values.
+pub const shared_state = Ids.shared_state;
+pub const secrets = Ids.secrets;
+pub const untrusted_input = Ids.untrusted_input;
+pub const integers = Ids.integers;
+pub const units = Ids.units;
+pub const bounded_work = Ids.bounded_work;
+pub const contracts = Ids.contracts;
+pub const lifetimes = Ids.lifetimes;
+pub const ownership = Ids.ownership;
+pub const identity = Ids.identity;
+pub const state_machines = Ids.state_machines;
+pub const diagnostics = Ids.diagnostics;
+pub const unsafe_set = Ids.unsafe_set;
+pub const cancellation = Ids.cancellation;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation };
 pub const rules = [_]Context.Rule{
@@ -125,7 +126,7 @@ fn checkAccess(c: *Context) Context.Error!void {
     const tree = try c.project.syntax(try c.source());
     const made_by_constructor = try constructed(c);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (made_by_constructor.len != 0) try checkLiteral(c, tree, node, made_by_constructor);
         if (tag != .field_access) continue;
         const data = tree.nodeData(node).node_and_token;
@@ -143,7 +144,7 @@ fn checkAccess(c: *Context) Context.Error!void {
 fn constructed(c: *Context) Context.Error![]const Facts.Container {
     const found = try c.facts.publication(Contract.library);
     var out: std.ArrayList(Facts.Container) = .empty;
-    for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container); // safe: the entry holds a role value of this enum.
+    for (found.entries) |entry| if (entry.target == .container and @as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) == .public_source) try out.append(c.allocator, entry.target.container); // aegis: no-danger: the entry holds a role value of this enum.
     return out.items;
 }
 /// A struct literal of a type only its constructor makes, outside the library: a finding where
@@ -211,7 +212,7 @@ fn receiverMembers(c: *Context, tree: *const Ast, model: *const Model, receiver:
     if (!alikeRooted(tree, model, receiver, 0)) return names.items;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .field_access) continue;
-        const access_node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const access_node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const data = tree.nodeData(access_node).node_and_token;
         if (data[0] == receiver or !typedAlike(tree, model, data[0], receiver, 0)) continue;
         const read = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
@@ -309,7 +310,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const found = try c.facts.publication(Contract.library);
     var any = false;
     for (found.entries) |entry| {
-        const k: Contract.Kind = @fromBackingInt(@intCast(entry.role)); // safe: the entry holds a role value of this enum.
+        const k: Contract.Kind = @fromBackingInt(@intCast(entry.role)); // aegis: no-danger: the entry holds a role value of this enum.
         if (!backing(k, name)) continue;
         const container = (try publishedContainer(c, entry.target)) orelse return false;
         // A published type of this kind without such a field is no candidate.
@@ -439,7 +440,7 @@ fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Co
                 while (at) |p| : (at = model.scopes[p].parent) {
                     if (model.scopes[p].kind == .container) break;
                     if (model.scopes[p].kind == .function) {
-                        if (model.scopes[p].node == whole or model.scopes[p].node == record.node) return .{ .file = function.file, .scope = @intCast(i) }; // safe: scope indexes come from the bounded frozen per-file model.
+                        if (model.scopes[p].node == whole or model.scopes[p].node == record.node) return .{ .file = function.file, .scope = @intCast(i) }; // aegis: no-danger: scope indexes come from the bounded frozen per-file model.
                         break;
                     }
                 }
@@ -580,7 +581,7 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
         const model = &c.project.models[file.raw()];
         for (model.declarations, 0..) |decl, i| {
             if (!std.mem.eql(u8, decl.name, name) or model.scopes[decl.scope].kind != .container) continue;
-            const candidate: Facts.Decl = .{ .file = file, .index = @intCast(i) }; // safe: declaration indexes come from the bounded frozen model.
+            const candidate: Facts.Decl = .{ .file = file, .index = @intCast(i) }; // aegis: no-danger: declaration indexes come from the bounded frozen model.
             // A constant or a field of no function's type is no callee; one that may hold a
             // function (a pointer, or a type not known) may be.
             switch (try c.facts.declaration(candidate)) {
@@ -651,7 +652,7 @@ fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Co
     const scopes = c.project.models[container.file.raw()].scopes; // safe: a resolved container's file indexes the frozen model table.
     var scope = scopes[container.scope].parent;
     while (scope) |s| : (scope = scopes[s].parent) {
-        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role)); // safe: the entry holds a role value of this enum.
+        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role)); // aegis: no-danger: the entry holds a role value of this enum.
     }
     return null;
 }
@@ -799,7 +800,7 @@ fn checkCopies(c: *Context) Context.Error!void {
     if (!try begin(c, copies)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         try checkBinding(c, tree, node, copies);
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
@@ -855,7 +856,7 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
     const at = tree.lastToken(copy);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
-        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (candidate == source) continue;
         const ref = model.reference(candidate) orelse continue;
         if (ref.declaration != index) continue;
@@ -1009,7 +1010,7 @@ fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u
     var found = false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
-        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         const at = tree.nodeMainToken(brk);
         if (at < first or at > last) continue;
         const data = tree.nodeData(brk).opt_token_and_opt_node;
@@ -1066,7 +1067,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
     if (!try begin(c, cleanup)) return;
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
-    for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup); // safe: AST node table supplies bounded indexes.
+    for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup); // aegis: no-danger: AST node table supplies bounded indexes.
     for (model.declarations) |decl| {
         if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) continue;
         const v = tree.fullVarDecl(decl.node) orelse continue;
@@ -1484,7 +1485,7 @@ const Flow = struct {
     fn flagWritesIn(f: Flow, declaration: u32, branches: [2]?Ast.Node.Index) Context.Error!bool {
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const ref = f.model.reference(node) orelse continue;
             if (ref.declaration != declaration) continue;
             const parent = f.model.node_parents[i] orelse return false;
@@ -1620,7 +1621,7 @@ const Flow = struct {
                 .@"return", .@"try", .@"break", .@"continue" => {},
                 else => continue,
             }
-            const jumping: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const jumping: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(jumping);
             if (main < first or main > last) continue;
             const to: Jump = if (tag == .@"return" or tag == .@"try") .out else f.target(jumping, node);
@@ -1718,7 +1719,7 @@ const Flow = struct {
         var found = false;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(candidate);
             if (main < first or main > last or !f.mine(candidate)) continue;
             const parent = f.model.node_parents[i] orelse return false;
@@ -1746,7 +1747,7 @@ const Flow = struct {
         var held = false;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             if (!f.mine(candidate)) continue;
             const main = f.tree.nodeMainToken(candidate);
             if (main > last) return null;
@@ -1780,7 +1781,7 @@ const Flow = struct {
         var found: Use = .none;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(candidate);
             if (main < first or main > last) continue;
             const ref = f.model.reference(candidate) orelse continue;
@@ -1856,7 +1857,7 @@ const Flow = struct {
         var named: usize = 0;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(candidate);
             if (main >= first and main <= last and f.mine(candidate)) named += 1;
         }
@@ -1885,7 +1886,7 @@ const Flow = struct {
         var named: usize = 0;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(candidate);
             if (main >= first and main <= last and f.mine(candidate)) named += 1;
         }
@@ -1916,10 +1917,10 @@ const Flow = struct {
             const truth = literalBool(f.tree, call.ast.params[at - skip]) orelse continue;
             const name = param.name_token orelse continue;
             for (model.declarations, 0..) |d, i| if (d.kind == .parameter and d.token == name) {
-                known = .{ .flag = @intCast(i), .value = truth }; // safe: declaration indexes come from the bounded frozen model.
+                known = .{ .flag = @intCast(i), .value = truth }; // aegis: no-danger: declaration indexes come from the bounded frozen model.
             };
         }
-        var heard: Heard = .{};
+        var heard: Heard = .{ .outer = f.c.sink };
         var probe = f.c.*;
         probe.file = function.file;
         probe.sink = heard.sink();
@@ -2004,7 +2005,7 @@ const Flow = struct {
         var found = last;
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = f.tree.nodeMainToken(candidate);
             if (main >= first and main <= found and f.mine(candidate)) found = main;
         }
@@ -2031,16 +2032,22 @@ const Flow = struct {
 /// kept from the report as that file's own.
 const Heard = struct {
     any: bool = false,
+    /// The run's own sink, which knows each file's configuration.
+    outer: Context.Sink,
 
     fn sink(heard: *Heard) Context.Sink {
-        return .{ .data = heard, .diagnostic = diagnostic, .coverage = coverage };
+        return .{ .data = heard, .diagnostic = diagnostic, .coverage = coverage, .config = config };
+    }
+    fn config(data: *anyopaque, file: @import("Project.zig").FileId) @import("Rule.zig").Config {
+        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal: `sink` gives this callback a Heard.
+        return heard.outer.config(heard.outer.data, file);
     }
     fn diagnostic(data: *anyopaque, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span) Context.Error!void {
-        const heard: *Heard = @ptrCast(@alignCast(data)); // safe: `sink` gives this callback a Heard.
+        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal: `sink` gives this callback a Heard.
         heard.any = true;
     }
     fn coverage(data: *anyopaque, _: Report.Coverage) Context.Error!void {
-        const heard: *Heard = @ptrCast(@alignCast(data)); // safe: `sink` gives this callback a Heard.
+        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal: `sink` gives this callback a Heard.
         heard.any = true;
     }
 };
@@ -2239,7 +2246,7 @@ const Loan = struct {
         var found: Use = .none;
         for (l.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
             const main = l.tree.nodeMainToken(candidate);
             if (main < first or main > last or !l.mine(candidate)) continue;
             const parent = l.model.node_parents[i] orelse return .other;
@@ -2264,7 +2271,7 @@ fn exits(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
     for (first..last + 1) |raw_token| {
-        const token: Ast.TokenIndex = @intCast(raw_token); // safe: bounded by the node's own token range.
+        const token: Ast.TokenIndex = @intCast(raw_token); // aegis: no-danger: bounded by the node's own token range.
         switch (tree.tokenTag(token)) {
             .keyword_return, .keyword_try => return true,
             .keyword_break, .keyword_continue => {
@@ -2280,7 +2287,7 @@ fn exits(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 fn insideLoop(tree: *const Ast, model: *const Model, token: Ast.TokenIndex, root: Ast.Node.Index) bool {
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break" and tag != .@"continue") continue;
-        if (tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue; // safe: AST node table supplies bounded indexes.
+        if (tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue; // aegis: no-danger: AST node table supplies bounded indexes.
         var at = model.node_parents[i];
         while (at) |parent| : (at = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
             if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return true;
@@ -2360,7 +2367,7 @@ fn checkScalar(c: *Context) Context.Error!void {
     if (!try begin(c, scalar)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         switch (tag) {
             .add, .sub, .mul, .div, .mod, .shl, .add_wrap, .sub_wrap, .mul_wrap, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const operands = tree.nodeData(node).node_and_node;
@@ -2380,7 +2387,7 @@ fn checkCapacity(c: *Context) Context.Error!void {
     if (!try begin(c, capacity)) return;
     const tree = try c.project.syntax(try c.source());
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
@@ -2569,7 +2576,7 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: Path, frames: []const Fra
     var gives = false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"return") continue;
-        const ret: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const ret: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (enclosingFunction(tree, model, ret) != body_fn) continue;
         const value = tree.nodeData(ret).opt_node.unwrap() orelse continue;
         if (tree.nodeTag(value) == .error_value) continue;
@@ -2612,7 +2619,7 @@ fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenInde
     const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
-        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (candidate == read) continue;
         const ref = model.reference(candidate) orelse continue;
         if (ref.declaration != index) continue;
@@ -2635,20 +2642,20 @@ fn passedWhole(c: *Context, index: u32, want: Path, depth: usize) Context.Error!
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
     const function: u32 = for (model.declarations, 0..) |d, i| {
-        if (d.kind == .function and parameterPosition(c, @intCast(i), index) != null) break @intCast(i); // safe: declaration indexes come from the bounded frozen model.
+        if (d.kind == .function and parameterPosition(c, @intCast(i), index) != null) break @intCast(i); // aegis: no-danger: declaration indexes come from the bounded frozen model.
     } else return false;
     const record = model.declarations[function];
     if (record.public or record.exported) return false;
     // A method's calls name it as a member, which a declaration's references do not show.
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .field_access) continue;
-        const member: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const member: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(member).node_and_token[1]), record.name)) return false;
     }
     const position = parameterPosition(c, function, index).?; // unreachable: the parameter was found in this function
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
-        const use: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.
+        const use: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
         if (tree.nodeMainToken(use) == record.token) continue;
         const ref = model.reference(use) orelse continue;
         if (ref.declaration != function) continue;

@@ -44,7 +44,7 @@ pub fn count(context: *Context) Context.Error!Counts {
     @memset(asserted, false);
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         if (tag == .fn_decl) counts.functions += 1;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded AST node table fits u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: bounded AST node table fits u32.
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         const value = try context.facts.resolve(context.file, call.ast.fn_expr);

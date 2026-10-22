@@ -78,9 +78,9 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
     var site = comment.line;
     if (before.len == 0) {
         var token: usize = 0;
-        while (token < file.tree.tokens.len and file.tree.tokenStart(@intCast(token)) < comment.end) token += 1; // safe: token indexes are bounded by the already budget-checked source.
-        if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return .{ .malformed = "a suppression or escape stands before no code" }; // safe: token indexes are bounded by the already budget-checked source.
-        site = file.line(file.tree.tokenStart(@intCast(token))); // safe: token indexes are bounded by the already budget-checked source.
+        while (token < file.tree.tokens.len and file.tree.tokenStart(@intCast(token)) < comment.end) token += 1; // aegis: no-danger: token indexes are bounded by the already budget-checked source.
+        if (token == file.tree.tokens.len or file.tree.tokenTag(@intCast(token)) == .eof) return .{ .malformed = "a suppression or escape stands before no code" }; // aegis: no-danger: token indexes are bounded by the already budget-checked source.
+        site = file.line(file.tree.tokenStart(@intCast(token))); // aegis: no-danger: token indexes are bounded by the already budget-checked source.
         if (site > comment.line + 1) return .{ .malformed = "a suppression or escape on a line of its own stands on the line before its site" };
     }
     return .{ .found = .{ .rule = rule, .line = site, .comment = comment, .reason = reason, .escape = escape } };

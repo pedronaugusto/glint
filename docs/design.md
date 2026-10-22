@@ -200,8 +200,7 @@ The contract covers aegis's published types past the guards too, each by what it
 | `scope.Ref` | `pointer` (aegis 0.1.14), `slot`, `generation` | no | none |
 | `input.Untrusted` | `value` | no | none |
 | `sync.Atomic` | `cell` | yes: a second cell | none |
-| `Order(...).Context`, `InitContext` | `stack`, `used`, `suspended`, `owners` | yes: a second task context | none |
-| `Order(...).Ordered` | `base` | yes | its ordered acquisitions give guards released by `deinit(io)` |
+| `InitContext` | `stack`, `used`, `suspended`, `owners` | yes: a second task context | none |
 | `secret.Choice` | `bit` | no | none |
 
 An acquisition is any call that gives one of these by value (`budget.reserve(n)`, `shared.retain()`, `table.open()`, `Buffer(T).initAllocated(...)`), not only one named `init`. A call that gives a type aegis declares and the contract does not list (a guard's `Handoff`) owes nothing: the contract names every type that carries an obligation. A runtime machine's `state` is its backing field (reactor 0.7.0 types its backends' operations, so their `o.state` resolves). A name a backing field shares with a method is the method where the program calls it, since no backing field holds a function. `TaskIdentity` stays outside the contract: the caller issues identities (by `@enumFromInt` or otherwise), copies and compares them, and no aegis operation guards one. `err.PublicSource` is made by `classify`, whose reason is the review: A001 finds a struct literal of it outside aegis by the type the literal takes from its place (a declaration's written type, an assignment's target, a call's parameter, a made container's method read with its arguments, its function's result, a typed literal's field or array's element, `@as`, through groupings, branches and labeled breaks). A literal that names exactly its fields and whose place does not resolve is undecided.

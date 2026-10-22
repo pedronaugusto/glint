@@ -20,6 +20,8 @@ pub const Sink = struct {
     data: *anyopaque,
     diagnostic: *const fn (*anyopaque, rules.Rule, u32, u32, []const u8, []const Report.Span) Error!void,
     coverage: *const fn (*anyopaque, Report.Coverage) Error!void,
+    /// The configuration another selected file is checked with.
+    config: *const fn (*anyopaque, Project.FileId) rules.Config,
 };
 /// Compiled rule. Metadata and callback are validated once before execution.
 pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void };
@@ -162,12 +164,17 @@ pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, m
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
     const start = tree.tokenStart(token);
-    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message); // safe: source budget bounds the token span.
+    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message); // aegis: no-danger: source budget bounds the token span.
 }
 pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (@backingInt(node) >= tree.nodes.len) return error.InvalidHandle; // safe: reject compiler node indexes outside the frozen source.
     try self.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), if (reason == .budget) .budget_exhausted else .unresolved, @tagName(reason));
+}
+/// The configuration `file` is checked with: a fact computed for the whole program reads
+/// only the files whose rules ask for it.
+pub fn configOf(self: *const RuleContext, file: Project.FileId) rules.Config {
+    return self.sink.config(self.sink.data, file);
 }
 /// Whether a token is test code: a test input, or inside a `test` block.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
@@ -192,8 +199,8 @@ pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.Tok
     const start = tree.tokenStart(declarations[definition.index].token);
     const file = &self.project.files[definition.file.raw()];
     const line = file.line(start);
-    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[definition.index].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }}; // safe: source budget bounds the token span.
+    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[definition.index].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }}; // aegis: no-danger: source budget bounds the token span.
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenStart(token);
-    try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related); // safe: source budget bounds the site span.
+    try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related); // aegis: no-danger: source budget bounds the site span.
 }

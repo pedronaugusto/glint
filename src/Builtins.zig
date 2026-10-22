@@ -53,7 +53,7 @@ fn unusedImports(self: *Context) RunError!void {
         const args = Facts.builtinArgs(tree, value, &buffer);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import")) continue;
         try candidates.put(self.allocator, decl.name, {});
-        try indexes.append(self.allocator, @intCast(index)); // safe: bounded declaration table fits u32.
+        try indexes.append(self.allocator, @intCast(index)); // aegis: no-danger: bounded declaration table fits u32.
     }
     if (indexes.items.len == 0) return;
     const used = try self.allocator.alloc(bool, declarations.len);
@@ -62,7 +62,7 @@ fn unusedImports(self: *Context) RunError!void {
     defer undecided.deinit(self.allocator);
     // One pass for all candidates: spelling filters work, declaration identity decides usage.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded AST node table fits u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: bounded AST node table fits u32.
         if (tag != .field_access) {
             try reflectedImport(self, node, candidates, indexes.items, used, &undecided);
             continue;
@@ -135,7 +135,7 @@ fn priorityRules(self: *Context) RunError!void {
     const tree = &self.project.files[self.file.raw()].tree; // safe: selected identity belongs to the frozen project.
     // Node-table enumeration covers every expression position exactly once.
     for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: validated file identities and budgeted std source indexes fit u32.
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: validated file identities and budgeted std source indexes fit u32.
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (try self.facts.definition(self.file, call.ast.fn_expr)) |definition| {
@@ -166,7 +166,7 @@ fn amendedPolicies(self: *Context) RunError!void {
     };
     if (self.config.has(.Z026)) for (tree.nodes.items(.tag), 0..) |tag, n| {
         if (tag != .@"catch") continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded std AST indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: bounded std AST indexes fit u32.
         var buffer: [2]Ast.Node.Index = undefined;
         if (tree.blockStatements(&buffer, tree.nodeData(node).node_and_node[1])) |statements| {
             if (statements.len == 0) try self.at(.Z026, tree.nodeMainToken(node), "empty catch discards an error; write a reason at this site");
@@ -199,7 +199,7 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
             // A public alias to this same concrete container makes the type nameable.
             for (self.project.models[definition.file.raw()].declarations, 0..) |alias, i| {
                 if (!alias.public or alias.kind != .variable) continue;
-                const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @intCast(i) }); // safe: bounded declaration inventory.
+                const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @intCast(i) }); // aegis: no-danger: bounded declaration inventory.
                 if (exposed == .container and exposed.container.file.eql(value.container.file) and exposed.container.scope == value.container.scope and exposed.container.symbolic == value.container.symbolic) return;
             }
             try self.atDefinition(.Z012, site, try self.allocator.print("public signature exposes private type '{s}'", .{decl.name}), definition);
@@ -241,7 +241,7 @@ fn standardContainer(self: *Context, root: Facts.Container, path_parts: []const 
 fn lineLength(self: *Context) RunError!void {
     const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     if (self.config.has(.Z024)) for (file.lines, 0..) |start, l| {
-        var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len); // safe: validated file identities and budgeted std source indexes fit u32.
+        var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len); // aegis: no-danger: validated file identities and budgeted std source indexes fit u32.
         if (end > start and file.source[end - 1] == '\r') end -= 1;
         if (end - start > self.config.max_line_length) try self.emit(.Z024, start + self.config.max_line_length, end, "line exceeds configured byte length");
     };
@@ -356,7 +356,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
         const tree = &file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .field_access) continue;
-            const data = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_token; // safe: AST node table supplies bounded indexes.
+            const data = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_token; // aegis: no-danger: AST node table supplies bounded indexes.
             if (!std.mem.eql(u8, tree.tokenSlice(data[1]), name)) continue;
             if (tree.nodeTag(data[0]) != .identifier) continue;
             const index = (model.reference(data[0]) orelse continue).declaration orelse continue;
@@ -374,7 +374,7 @@ fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
     const tree = &self.project.files[self.file.raw()].tree; // safe: selected file identity belongs to the project.
     for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // safe: bounded AST node table fits u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: bounded AST node table fits u32.
         var cb: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&cb, node)) |call| {
             if (self.config.has(.Z016) and call.ast.params.len != 0 and tree.nodeTag(call.ast.params[0]) == .bool_and) {
@@ -409,7 +409,7 @@ fn sourcePolicies(self: *Context) RunError!void {
     if (!self.config.has(.P005)) return;
     const tree = &self.project.files[self.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: std AST inventory fits u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: std AST inventory fits u32.
         const token = tree.nodeMainToken(node);
         if (self.inTest(token)) continue;
         var call_buffer: [1]Ast.Node.Index = undefined;
@@ -435,7 +435,7 @@ fn functionLengths(self: *Context) RunError!void {
     @memset(used, false);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .fn_decl) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: checked AST inventory.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
         var buffer: [1]Ast.Node.Index = undefined;
         const function = tree.fullFnProto(&buffer, node).?;
         const name = tree.tokenSlice(function.name_token orelse continue);
@@ -447,7 +447,7 @@ fn functionLengths(self: *Context) RunError!void {
             var widest: u32 = 0;
             var container_buffer: [2]Ast.Node.Index = undefined;
             for (0..tree.nodes.len) |j| {
-                const inner: Ast.Node.Index = @fromBackingInt(@intCast(j)); // safe: checked AST inventory.
+                const inner: Ast.Node.Index = @fromBackingInt(@intCast(j)); // aegis: no-danger: checked AST inventory.
                 if (tree.fullContainerDecl(&container_buffer, inner) == null) continue;
                 const from = tree.firstToken(inner);
                 const to = tree.lastToken(inner);

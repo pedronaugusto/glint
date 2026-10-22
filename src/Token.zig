@@ -106,13 +106,13 @@ inline fn emit(arena: std.mem.Allocator, out: *std.ArrayList(StoredToken), token
             const n = out.items.len;
             const projected = @as(u128, n) * total / @max(token.end(), 1); // safe: widening preserves the source-bounded token count.
             const capacity = @min(@max(projected, n + n / 2 + 16), 4 * n + 16);
-            try out.ensureTotalCapacityPrecise(arena, @intCast(capacity)); // safe: capped at four times a source-bounded token count within usize.
+            try out.ensureTotalCapacityPrecise(arena, @intCast(capacity)); // aegis: no-danger: capped at four times a source-bounded token count within usize.
         }
     }
     out.appendAssumeCapacity(token);
 }
 inline fn unit(kind: Token.Kind, text: []const u8, start: usize, finish: usize) Token {
-    return .{ .text = text, .offset = @intCast(start), .detail = .{ .kind = kind, .value = @intCast(finish - start) } }; // safe: checked source spans fit the packed u29 length and u32 offset.
+    return .{ .text = text, .offset = @intCast(start), .detail = .{ .kind = kind, .value = @intCast(finish - start) } }; // aegis: no-danger: checked source spans fit the packed u29 length and u32 offset.
 }
 
 fn recoverShaped(arena: std.mem.Allocator, source: []const u8, ts: []const StoredToken, shape: liveness.Shape) error{ InvalidLiteral, OutOfMemory }!Facts {
@@ -152,7 +152,7 @@ fn recoverShaped(arena: std.mem.Allocator, source: []const u8, ts: []const Store
         if (ts.len <= 128) try classify(64, arena, ts, shape, &out, &where, aliases) else try classify(256, arena, ts, shape, &out, &where, aliases);
     }
     const tests = try arena.alloc(Range, shape.tests.len);
-    for (shape.tests, tests) |r, *bytes| bytes.* = .{ .first = ts[r.first].offset, .last = if (r.last + 1 < ts.len) ts[r.last + 1].offset - 1 else @intCast(source.len -| 1) }; // safe: checked byte bounds fit u32; byte ranges end before the following token.
+    for (shape.tests, tests) |r, *bytes| bytes.* = .{ .first = ts[r.first].offset, .last = if (r.last + 1 < ts.len) ts[r.last + 1].offset - 1 else @intCast(source.len -| 1) }; // aegis: no-danger: checked byte bounds fit u32; byte ranges end before the following token.
     return .{ .imports = try out.toOwnedSlice(arena), .unsupported = try unsupported.toOwnedSlice(arena), .tests = tests };
 }
 
@@ -168,17 +168,17 @@ fn classify(comptime capacity: usize, arena: std.mem.Allocator, ts: []const Stor
     var words = try liveness.Words.init(workspace, ts, shape, &slots);
     var alias_lengths: u64 = 0;
     var alias_names = aliases.keyIterator();
-    while (alias_names.next()) |name| alias_lengths |= @as(u64, 1) << @intCast(@min(name.len, 63)); // safe: bounded shift is at most 63.
+    while (alias_names.next()) |name| alias_lengths |= @as(u64, 1) << @intCast(@min(name.len, 63)); // aegis: no-danger: bounded shift is at most 63.
     for (ts, 0..) |t, i| {
         if (t.kind() == .string) try words.see(capacity, i);
         if (t.kind() != .word) continue;
         try words.see(capacity, i);
-        if (alias_lengths & (@as(u64, 1) << @intCast(@min(t.text().len, 63))) == 0) continue; // safe: bounded shift is at most 63.
+        if (alias_lengths & (@as(u64, 1) << @intCast(@min(t.text().len, 63))) == 0) continue; // aegis: no-danger: bounded shift is at most 63.
         if (i + 2 >= ts.len or !dot(ts[i + 1]) or ts[i + 2].kind() != .word) continue;
         if (i > 0 and dot(ts[i - 1])) continue;
         if (aliases.get(t.text())) |name| {
             try out.append(arena, .{ .name = name, .member = ts[i + 2].text(), .offset = t.offset });
-            try where.append(arena, @intCast(i)); // safe: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+            try where.append(arena, @intCast(i)); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
         }
     }
     try words.classify(workspace, out.items, where.items);

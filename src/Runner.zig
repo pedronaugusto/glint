@@ -13,6 +13,8 @@ const Metrics = @import("Metrics.zig");
 a: std.mem.Allocator,
 project: *const Project,
 config: rules.Config,
+/// The configuration given for every file no `files` entry names.
+base: rules.Config = .{},
 facts: Facts,
 diagnostics: std.ArrayList(Report.Diagnostic) = .empty,
 coverage: std.ArrayList(Report.Coverage) = .empty,
@@ -25,6 +27,7 @@ malformed: std.ArrayList(Report.Malformed) = .empty,
 covered: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
+files: []const FileConfig = &.{},
 file: Project.FileId = Project.FileId.fromRaw(0), // safe: validated file identities and budgeted std source indexes fit u32.
 
 pub const RunError = Suppression.ParseError || Context.Error;
@@ -52,13 +55,13 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         definitions[i].purpose = try a.dupe(u8, rule.definition.purpose);
     }
     try validateRules(config, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .remaining = config.fact_budget } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
-        runner.file = Project.FileId.fromRaw(@intCast(index)); // safe: validated file identities and budgeted std source indexes fit u32.
+        runner.file = Project.FileId.fromRaw(@intCast(index)); // aegis: no-danger: validated file identities and budgeted std source indexes fit u32.
         runner.config = config;
         for (options.files) |setting| if (setting.file.eql(runner.file)) {
             runner.config = setting.config;
@@ -90,7 +93,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
-        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage } };
+        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig } };
         try Builtins.check(&context);
         if (config.metrics) {
             const counts = try Metrics.count(&context);
@@ -167,11 +170,16 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
 }
 
 fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span) Context.Error!void {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // safe: this sink is created only from an aligned live Runner.
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal: this sink is created only from an aligned live Runner.
     try runner.emitRelated(rule, start, end, message, related);
 }
-fn sinkCoverage(data: *anyopaque, coverage: Report.Coverage) Context.Error!void {
+fn sinkConfig(data: *anyopaque, file: Project.FileId) rules.Config {
     const runner: *Runner = @ptrCast(@alignCast(data)); // safe: this sink is created only from an aligned live Runner.
+    for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
+    return runner.base;
+}
+fn sinkCoverage(data: *anyopaque, coverage: Report.Coverage) Context.Error!void {
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal: this sink is created only from an aligned live Runner.
     var owned = coverage;
     owned.detail = try runner.a.dupe(u8, coverage.detail);
     if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;

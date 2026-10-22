@@ -47,7 +47,7 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
     var lines: std.ArrayList(u32) = .empty;
     try lines.append(a, 0);
     for (source, 0..) |byte, offset| if (byte == '\n') {
-        try lines.append(a, @intCast(offset + 1)); // safe: the checked source byte budget bounds offsets below u32.
+        try lines.append(a, @intCast(offset + 1)); // aegis: no-danger: the checked source byte budget bounds offsets below u32.
     };
     const comment_list = try scanComments(a, source, lines.items);
     return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = try lines.toOwnedSlice(a), .comments = comment_list };
@@ -58,7 +58,7 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
 fn safeCharacters(tree: *const std.zig.Ast) bool {
     for (tree.tokens.items(.tag), 0..) |tag, i| {
         if (tag != .char_literal) continue;
-        const raw = tree.tokenSlice(@intCast(i)); // safe: bounded AST token inventory.
+        const raw = tree.tokenSlice(@intCast(i)); // aegis: no-danger: bounded AST token inventory.
         if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return false;
         if (raw[1] != '\\' and !std.unicode.utf8ValidateSlice(raw[1 .. raw.len - 1])) return false;
     }
@@ -110,7 +110,7 @@ fn lineIndex(lines: []const u32, offset: u32) u32 {
         const mid = lo + (hi - lo) / 2;
         if (lines[mid] <= offset) lo = mid + 1 else hi = mid;
     }
-    return @intCast(lo - 1); // safe: the checked source byte budget bounds offsets below u32.
+    return @intCast(lo - 1); // aegis: no-danger: the checked source byte budget bounds offsets below u32.
 }
 
 fn scanComments(a: std.mem.Allocator, source: [:0]const u8, lines: []const u32) InitError![]const Comment {
@@ -126,11 +126,11 @@ fn scanComments(a: std.mem.Allocator, source: [:0]const u8, lines: []const u32) 
             if (source[cursor] == '/' and cursor + 1 < token.loc.start and source[cursor + 1] == '/') {
                 const start = cursor;
                 while (cursor < token.loc.start and source[cursor] != '\n') cursor += 1;
-                try result.append(a, .{ .start = @intCast(start), .end = @intCast(cursor), .line = lineIndex(lines, @intCast(start)) }); // safe: the checked source byte budget bounds offsets below u32.
+                try result.append(a, .{ .start = @intCast(start), .end = @intCast(cursor), .line = lineIndex(lines, @intCast(start)) }); // aegis: no-danger: the checked source byte budget bounds offsets below u32.
             } else cursor += 1;
         }
         if (token.tag == .doc_comment or token.tag == .container_doc_comment) {
-            try result.append(a, .{ .start = @intCast(token.loc.start), .end = @intCast(token.loc.end), .line = lineIndex(lines, @intCast(token.loc.start)) }); // safe: the checked source byte budget bounds offsets below u32.
+            try result.append(a, .{ .start = @intCast(token.loc.start), .end = @intCast(token.loc.end), .line = lineIndex(lines, @intCast(token.loc.start)) }); // aegis: no-danger: the checked source byte budget bounds offsets below u32.
         }
         end = token.loc.end;
         if (token.tag == .eof) break;
