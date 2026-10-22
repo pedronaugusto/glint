@@ -27,7 +27,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.models[index];
     const self: Walk = .{ .c = c, .tree = tree, .model = model };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const operand: Ast.Node.Index, const stored: ?Ast.Node.Index = switch (tag) {
             .@"return" => .{ tree.nodeData(node).opt_node.unwrap() orelse continue, null },
             .assign => .{ tree.nodeData(node).node_and_node[1], tree.nodeData(node).node_and_node[0] },
@@ -196,7 +196,7 @@ const Walk = struct {
         const tree = self.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .@"defer") continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (self.enclosing(node) != function) continue;
             for (self.model.references) |reference| {
                 if (reference.declaration != local) continue;
@@ -214,13 +214,13 @@ const Walk = struct {
         const count = tree.lastToken(target) + 1 - from;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .@"defer") continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (self.enclosing(node) != function) continue;
             var t = tree.firstToken(node) + count;
             while (t <= tree.lastToken(node)) : (t += 1) {
                 if (tree.tokenTag(t) != .equal) continue;
                 for (0..count) |k| {
-                    const offset: u32 = @intCast(k); // aegis: no-danger: a node's token count fits u32.
+                    const offset: u32 = @intCast(k);
                     if (!std.mem.eql(u8, tree.tokenSlice(t - count + offset), tree.tokenSlice(from + offset))) break;
                 } else return true;
             }

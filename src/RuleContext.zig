@@ -170,13 +170,13 @@ pub fn fixedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenInd
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
     const start = tree.tokenStart(token);
-    try self.emitFixed(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message, &.{}, fix); // aegis: no-danger: source budget bounds the token span.
+    try self.emitFixed(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message, &.{}, fix);
 }
 pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
     const start = tree.tokenStart(token);
-    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message); // aegis: no-danger: source budget bounds the token span.
+    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message);
 }
 pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
@@ -211,8 +211,8 @@ pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.Tok
     const start = tree.tokenStart(declarations[definition.index].token);
     const file = &self.project.files[definition.file.raw()];
     const line = file.line(start);
-    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[definition.index].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }}; // aegis: no-danger: source budget bounds the token span.
+    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[definition.index].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }};
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenStart(token);
-    try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related); // aegis: no-danger: source budget bounds the site span.
+    try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related);
 }

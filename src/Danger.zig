@@ -25,7 +25,7 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const held = try governedHeld(c, rule, &sync, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const name = builtinName(tree, node) orelse continue;
         for ([_][]const u8{ "@atomicLoad", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |atomic| if (std.mem.eql(u8, name, atomic)) {
             if (!c.inTest(tree.nodeMainToken(node)) and atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
@@ -56,7 +56,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const site = switch (tag) {
             .identifier => tree.nodeMainToken(node),
             .field_access => tree.nodeData(node).node_and_token[1],
@@ -110,7 +110,7 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
     for (files.items) |file| for (c.project.models[file.raw()].declarations, 0..) |decl, d| {
         if (decl.kind != .variable or !decl.public) continue;
         if (!std.mem.eql(u8, decl.name, "SecretKey") and !std.mem.eql(u8, decl.name, "KeyPair")) continue;
-        try keys.append(c.allocator, .{ .file = file, .index = @intCast(d) }); // aegis: no-danger: a file's declaration table indexes fit u32
+        try keys.append(c.allocator, .{ .file = file, .index = @intCast(d) });
     };
     return keys.items;
 }
@@ -230,7 +230,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .unreachable_literal) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         try c.at(rule, token, "unreachable: undefined behaviour in ReleaseFast when reached; aegis assert.never stops in every build, or return an error");
@@ -285,7 +285,7 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
     }
     const start = tree.tokenStart(tree.firstToken(node));
     const last = tree.lastToken(node);
-    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try std.fmt.allocPrint(c.allocator, "{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) }); // aegis: no-danger: a token's span within the budgeted source.
+    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try std.fmt.allocPrint(c.allocator, "{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
     return true;
 }
 
@@ -298,13 +298,13 @@ fn aliasFix(c: *Context, value: Ast.Node.Index) Context.Error![]const Report.Edi
     if (variable.visib_token != null) return &.{};
     var declared: ?u32 = null;
     for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
-        declared = @intCast(d); // aegis: no-danger: a file's declaration table indexes fit u32
+        declared = @intCast(d);
     };
     const alias = declared orelse return &.{};
     var edits: std.ArrayList(Report.Edit) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const ref = model.reference(node) orelse continue;
         if (ref.declaration != alias) continue;
         const parent = model.node_parents[@backingInt(node)] orelse return &.{}; // safe: a node index indexes its own tree's parent table
@@ -314,7 +314,7 @@ fn aliasFix(c: *Context, value: Ast.Node.Index) Context.Error![]const Report.Edi
     }
     const file = &c.project.files[c.file.raw()];
     const line = file.line(tree.tokenStart(tree.firstToken(value)));
-    const end: u32 = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len); // aegis: no-danger: positions within the budgeted source
+    const end: u32 = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len);
     try edits.append(c.allocator, .{ .start = file.lines[line], .end = end, .text = "" });
     return edits.items;
 }
@@ -335,7 +335,7 @@ fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]c
         if (std.mem.eql(u8, decl.name, "aegis")) return null;
         if (std.mem.eql(u8, spelled, "@import(\"std\")")) {
             const line = file.line(tree.tokenStart(decl.token));
-            after_std = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len); // aegis: no-danger: positions within the budgeted source
+            after_std = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len);
         }
     }
     // With no std import the line goes after the file's doc comment, which stands first.
@@ -353,7 +353,7 @@ fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]c
 pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         switch (tag) {
             .asm_simple, .@"asm" => {

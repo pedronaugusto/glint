@@ -59,7 +59,7 @@ const Loader = struct {
         // A file's bytes are input until the project's budget has taken them.
         const source = try aegis.input.Untrusted([:0]const u8).init(read).parse(self, Loader.take);
         const bytes = source.bytes;
-        const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len)); // aegis: no-danger: the loader bounds source count to 4096 before creating u32 identities.
+        const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len));
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = self.packageOf(canonical) });
@@ -88,7 +88,7 @@ const Loader = struct {
     fn imports(self: *Loader) !void {
         var cursor: usize = 0;
         while (cursor < self.inputs.items.len) : (cursor += 1) {
-            const from: Project.FileId = Project.FileId.fromRaw(@intCast(cursor)); // aegis: no-danger: the loader bounds source count to 4096 before creating u32 identities.
+            const from: Project.FileId = Project.FileId.fromRaw(@intCast(cursor));
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
             var lexer: std.zig.Tokenizer = .init(sentinel);

@@ -46,10 +46,10 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .function) continue;
         if (!try takesUntrusted(c, tree, decl.node)) continue;
-        try entry(&walk, .{ .file = c.file, .index = @intCast(d) }, decl.token); // aegis: no-danger: bounded declaration table fits u32.
+        try entry(&walk, .{ .file = c.file, .index = @intCast(d) }, decl.token);
     }
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 2) continue;
@@ -130,7 +130,7 @@ fn cycle(self: *Walk, from: usize, token: Ast.TokenIndex) Context.Error!void {
     const message = try self.c.allocator.print("recursion reachable from untrusted input ({s}) has no depth bound: input nested deep enough overflows the stack", .{names.items});
     const tree = try self.c.project.syntax(try self.c.source());
     const at = tree.tokenStart(token);
-    try self.c.emitRelated(self.rule, at, at + @as(u32, @intCast(tree.tokenSlice(token).len)), message, related.items); // aegis: no-danger: source budget bounds the token span.
+    try self.c.emitRelated(self.rule, at, at + @as(u32, @intCast(tree.tokenSlice(token).len)), message, related.items);
 }
 
 fn name(self: *Walk, f: Facts.Decl) []const u8 {
@@ -204,7 +204,7 @@ fn compared(tree: *const Ast, model: *const Model, whole: Ast.Node.Index, depth:
             .less_than, .greater_than, .less_or_equal, .greater_or_equal, .equal_equal, .bang_equal => {},
             else => continue,
         }
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const main = tree.nodeMainToken(node);
         if (main < first or main > last) continue;
         const operands = tree.nodeData(node).node_and_node;
@@ -233,7 +233,7 @@ fn movedField(tree: *const Ast, model: *const Model, whole: Ast.Node.Index) bool
             .assign_add, .assign_sub, .assign_add_wrap, .assign_sub_wrap, .assign_add_sat, .assign_sub_sat => {},
             else => continue,
         }
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const main = tree.nodeMainToken(node);
         if (main < first or main > last) continue;
         const target = tree.nodeData(node).node_and_node[0];
@@ -252,7 +252,7 @@ fn callsOf(self: *Walk, f: Facts.Decl) Context.Error![]const Ast.Node.Index {
     if (!entry_.found_existing) {
         entry_.value_ptr.* = .empty;
         for (tree.nodes.items(.tag), 0..) |_, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: AST node table supplies bounded indexes.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             var buffer: [1]Ast.Node.Index = undefined;
             _ = tree.fullCall(&buffer, node) orelse continue;
             var at = model.node_parents[i];

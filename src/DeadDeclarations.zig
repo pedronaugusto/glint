@@ -44,8 +44,8 @@ pub fn check(context: *Context) Context.Error!void {
         }
         const entry = try by_name.getOrPut(a, decl.name);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(a, @intCast(candidates.items.len)); // aegis: no-danger: bounded declaration table fits u32.
-        try candidates.append(a, .{ .decl = @intCast(d), .first = tree.firstToken(whole), .last = tree.lastToken(whole) }); // aegis: no-danger: bounded declaration table fits u32.
+        try entry.value_ptr.append(a, @intCast(candidates.items.len));
+        try candidates.append(a, .{ .decl = @intCast(d), .first = tree.firstToken(whole), .last = tree.lastToken(whole) });
     }
     if (candidates.items.len == 0) return;
     const resolved = try a.alloc(?u32, tree.tokens.len);
@@ -54,7 +54,7 @@ pub fn check(context: *Context) Context.Error!void {
         if (model.declarations[d].kind != .field) resolved[reference.token] = d;
     };
     for (0..tree.tokens.len) |t| {
-        const token: Ast.TokenIndex = @intCast(t); // aegis: no-danger: bounded token table fits u32.
+        const token: Ast.TokenIndex = @intCast(t);
         if (tree.tokenTag(token) != .identifier or declared[token] or fieldName(tree, token)) continue;
         if (resolved[token]) |d| {
             if (find(candidates.items, by_name, model.declarations[d].name, d)) |c| {
@@ -70,7 +70,7 @@ pub fn check(context: *Context) Context.Error!void {
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
             else => continue,
         }
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: bounded AST node table fits u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         const main = tree.nodeMainToken(node);
         if (!std.mem.eql(u8, tree.tokenSlice(main), "@field")) continue;
         var buffer: [2]Ast.Node.Index = undefined;

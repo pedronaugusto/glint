@@ -185,7 +185,7 @@ pub fn comments(self: *const Project, h: Handle) QueryError![]const File.Comment
 pub fn node(self: *const Project, h: Handle, id: NodeId) QueryError!std.zig.Ast.Node.Index {
     // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
     if (id.raw() >= (try self.syntax(h)).nodes.len) return error.InvalidHandle;
-    return @fromBackingInt(id.raw()); // aegis: no-danger: checked against this snapshot's AST inventory.
+    return @fromBackingInt(id.raw());
 }
 /// Validates distinct token identity before crossing the std boundary.
 pub fn token(self: *const Project, h: Handle, id: TokenId) QueryError!std.zig.Ast.TokenIndex {

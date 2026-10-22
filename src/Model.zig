@@ -68,7 +68,7 @@ pub fn init(file: *File) InitError!Model {
     const a = file.arena.allocator();
     const tree = &file.tree;
     var scopes: std.ArrayList(Scope) = .empty;
-    try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) }); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+    try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) });
     const node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0);
     if (tree.errors.len == 0) try collectScopes(a, tree, node_parents, &scopes);
     std.mem.sort(Scope, scopes.items[1..], {}, scopeLess);
@@ -81,7 +81,7 @@ pub fn init(file: *File) InitError!Model {
     if (file.status == .parsed and file.zir != null) for (file.zir.?.instructions.items(.tag), 0..) |tag, index| {
         const zir = file.zir.?;
         if (tag != .declaration) continue;
-        const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index)); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+        const instruction: std.zig.Zir.Inst.Index = @fromBackingInt(@intCast(index));
         const decl = zir.getDeclaration(instruction);
         try lowered.append(a, .{ .instruction = instruction, .node = decl.src_node, .name = zir.nullTerminatedString(decl.name), .public = decl.is_pub, .type_body = decl.type_body, .value_body = decl.value_body });
     };
@@ -102,7 +102,7 @@ pub fn init(file: *File) InitError!Model {
     var references: std.ArrayList(Reference) = .empty;
     var import_nodes: std.ArrayList(Ast.Node.Index) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, index| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // aegis: no-danger: std AST node indexes fit the bounded frozen model.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
         switch (tag) {
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) try import_nodes.append(a, node),
             else => {},
@@ -122,7 +122,7 @@ pub fn init(file: *File) InitError!Model {
             ref_record.unknown = if (primitive(name)) .primitive else .unresolved;
             if (ref_record.unknown.? != .primitive) model.unknown_references += 1;
         }
-        node_references[index] = @intCast(references.items.len); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+        node_references[index] = @intCast(references.items.len);
         try references.append(a, ref_record);
     }
     model.references = references.items;
@@ -138,7 +138,7 @@ pub fn init(file: *File) InitError!Model {
         }
         model.zir_references = zir_refs.items;
         model.operations = operations.items;
-        for (operations.items, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i); // aegis: no-danger: bounded std index inventory.
+        for (operations.items, 0..) |operation, i| node_operations[@backingInt(operation.node)] = @intCast(i);
     }
 
     try classifyTests(a, tree, &model);
@@ -209,7 +209,7 @@ fn parents(a: std.mem.Allocator, tree: *const Ast) InitError![]const ?Ast.Node.I
     const Span = struct { node: Ast.Node.Index, first: Ast.TokenIndex, last: Ast.TokenIndex };
     const ordered = try a.alloc(Span, tree.nodes.len - 1);
     for (ordered, 1..) |*span, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n)); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         span.* = .{ .node = node, .first = tree.firstToken(node), .last = tree.lastToken(node) };
     }
     std.mem.sort(Span, ordered, {}, struct {
@@ -342,7 +342,7 @@ fn addScope(a: std.mem.Allocator, tree: *const Ast, list: *std.ArrayList(Scope),
 fn collectScopes(a: std.mem.Allocator, tree: *const Ast, node_parents: []const ?Ast.Node.Index, list: *std.ArrayList(Scope)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
         var container_buffer: [2]Ast.Node.Index = undefined;
         if (tree.fullContainerDecl(&container_buffer, node) != null) {
             try addScope(a, tree, list, node, .container);
@@ -386,7 +386,7 @@ fn assignScopes(a: std.mem.Allocator, scopes: []Scope, tokens: []u32) InitError!
         while (stack.items.len > 1 and scopes[stack.items[stack.items.len - 1]].last < token) _ = stack.pop();
         while (next < scopes.len and scopes[next].first == token) : (next += 1) {
             scopes[next].parent = stack.items[stack.items.len - 1];
-            try stack.append(a, @intCast(next)); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+            try stack.append(a, @intCast(next));
         }
         out.* = stack.items[stack.items.len - 1];
     }
@@ -396,7 +396,7 @@ fn addDeclaration(a: std.mem.Allocator, tree: *const Ast, scopes: []Scope, list:
     var value = decl;
     value.name = try identifier(a, tree.tokenSlice(decl.token));
     if (std.mem.eql(u8, value.name, "_")) return;
-    const index: u32 = @intCast(list.items.len); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+    const index: u32 = @intCast(list.items.len);
     try list.append(a, value);
     if (value.kind != .field) try scopes[value.scope].names.put(a, value.name, index);
 }
@@ -421,7 +421,7 @@ fn declarationScope(scopes: []const Scope, start: u32) u32 {
 fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const u32, scopes: []Scope, list: *std.ArrayList(Declaration)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(index)); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
         if (tree.fullVarDecl(node)) |value| {
             const token = value.ast.mut_token + 1;
             try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = node, .token = token, .scope = tokens[token], .kind = .variable, .public = value.visib_token != null, .exported = if (value.extern_export_token) |t| tree.tokenTag(t) == .keyword_export else false });
@@ -449,7 +449,7 @@ fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const u
         if (tree.fullWhile(node)) |value| {
             // The loop's scope, which holds its continue expression and its body.
             const loop: u32 = for (scopes, 0..) |scope, i| {
-                if (scope.kind == .loop and scope.node == value.ast.then_expr) break @intCast(i); // aegis: no-danger: std node/token/instruction indexes and bounded table lengths fit u32.
+                if (scope.kind == .loop and scope.node == value.ast.then_expr) break @intCast(i);
             } else tokens[tree.firstToken(value.ast.then_expr)];
             if (value.payload_token) |token| try capture(a, tree, scopes, list, token, loop, node);
             if (value.error_token) |token| if (value.ast.else_expr.unwrap()) |body| try capture(a, tree, scopes, list, token, tokens[tree.firstToken(body)], node);

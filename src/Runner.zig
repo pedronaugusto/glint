@@ -62,7 +62,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     var total: Report.Metrics.Counts = .{};
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
-        runner.file = Project.FileId.fromRaw(@intCast(index)); // aegis: no-danger: validated file identities and budgeted std source indexes fit u32.
+        runner.file = Project.FileId.fromRaw(@intCast(index));
         runner.config = config;
         for (options.files) |setting| if (setting.file.eql(runner.file)) {
             runner.config = setting.config;
@@ -175,7 +175,7 @@ fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, mess
     try runner.emitRelated(rule, start, end, message, related, fix);
 }
 fn sinkConfig(data: *anyopaque, file: Project.FileId) rules.Config {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // safe: this sink is created only from an aligned live Runner.
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: no-danger: this sink is created only from an aligned live Runner.
     for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
     return runner.base;
 }

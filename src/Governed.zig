@@ -67,7 +67,7 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
             } else try roots.append(self.allocator, mapping.target);
         };
         if (!module) for (self.project.inputs, 0..) |input, i| if (std.mem.eql(u8, input.name, source)) {
-            try roots.append(self.allocator, Project.FileId.fromRaw(@intCast(i))); // aegis: no-danger: checked project inventory.
+            try roots.append(self.allocator, Project.FileId.fromRaw(@intCast(i)));
         };
         if (roots.items.len == 0) {
             if (!module) try self.undecided(rule, 0, .unresolved, "governed declaration source is not a project input");
@@ -104,7 +104,7 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
     if (governed.len == 0) return;
     const tree = &self.project.files[self.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const site: Ast.TokenIndex, const spelled: []const u8 = switch (tag) {
             .identifier => blk: {
                 if (memberName(self, node)) continue;
@@ -294,7 +294,7 @@ fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) 
     if (variable.ast.init_node.unwrap() != node) return false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .field_access) continue;
-        const access: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: checked AST inventory.
+        const access: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const receiver = tree.nodeData(access).node_and_token[0];
         if (tree.nodeTag(receiver) != .identifier) continue;
         const ref = model.reference(receiver) orelse continue;

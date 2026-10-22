@@ -37,7 +37,7 @@ pub fn escapeOf(a: std.mem.Allocator, file: *const File, line: u32, rule: []cons
         const text = file.source[comment.start..comment.end];
         for ([_][]const u8{ "// safe: ", "// unreachable: " }) |prefix| if (std.mem.startsWith(u8, text, prefix)) {
             const edits = try a.alloc(Report.Edit, 1);
-            edits[0] = .{ .start = comment.start, .end = comment.start + @as(u32, @intCast(prefix.len)), .text = try std.fmt.allocPrint(a, "// aegis: {s}: ", .{reason}) }; // aegis: no-danger: a prefix of a few bytes.
+            edits[0] = .{ .start = comment.start, .end = comment.start + @as(u32, @intCast(prefix.len)), .text = try std.fmt.allocPrint(a, "// aegis: {s}: ", .{reason}) };
             return edits;
         };
     }
@@ -94,7 +94,7 @@ fn earlier(_: void, x: Report.Edit, y: Report.Edit) bool {
 fn removal(file: *const File, start: u32, end: u32) Report.Edit {
     const line = file.line(start);
     const line_start = file.lines[line];
-    const line_end: u32 = if (std.mem.findScalarPos(u8, file.source, end, '\n')) |newline| @intCast(newline + 1) else @intCast(file.source.len); // aegis: no-danger: positions within the budgeted source.
+    const line_end: u32 = if (std.mem.findScalarPos(u8, file.source, end, '\n')) |newline| @intCast(newline + 1) else @intCast(file.source.len);
     if (std.mem.trim(u8, file.source[line_start..start], " \t").len == 0 and std.mem.trim(u8, file.source[end..line_end], " \t\r\n").len == 0) {
         return .{ .start = line_start, .end = line_end, .text = "" };
     }

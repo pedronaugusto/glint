@@ -4,6 +4,7 @@
 //! compiled outside `zig test`. Read in the passes recovery already makes:
 //! `Builder` as tokens are emitted, `Words.see` in its pass over words.
 const std = @import("std");
+const aegis = @import("aegis");
 const types = @import("data.zig");
 const Token = @import("store.zig").Token;
 
@@ -45,13 +46,13 @@ pub fn Builder(comptime small: bool) type {
         pub inline fn token(self: *Self, arena: std.mem.Allocator, t: Token, ts: Tokens) std.mem.Allocator.Error!void {
             const i = ts.len - 1;
             switch (t.tag) {
-                .l_paren, .l_bracket, .l_brace => try self.open.append(arena, @intCast(i)), // aegis: no-danger: source-bounded token index fits u32.
+                .l_paren, .l_bracket, .l_brace => try self.open.append(arena, @intCast(i)),
                 .r_paren, .r_bracket, .r_brace => {
-                    const o = self.open.pop() orelse @as(u32, @intCast(i)); // aegis: no-danger: source-bounded token index fits u32.
-                    self.put(ts, o, @intCast(i)); // aegis: no-danger: source-bounded token index fits u32.
+                    const o = self.open.pop() orelse @as(u32, @intCast(i));
+                    self.put(ts, o, @intCast(i));
                     self.put(ts, i, o);
                 },
-                .keyword_test, .identifier => try self.marks.append(arena, @intCast(i)), // aegis: no-danger: emission supplies only test declarations and is_test identifiers here.
+                .keyword_test, .identifier => try self.marks.append(arena, @intCast(i)),
                 else => {},
             }
             // Emission cannot look ahead to `import` or its literal operand.
@@ -60,12 +61,12 @@ pub fn Builder(comptime small: bool) type {
                 try self.builtins.append(arena, ts[i - 6].text());
         }
         pub fn imported(self: *Self, arena: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
-            try self.imports.append(arena, @intCast(i)); // aegis: no-danger: source-bounded compact token index fits u32.
+            try self.imports.append(arena, @intCast(i));
         }
         pub fn finish(self: *Self, arena: std.mem.Allocator, ts: Tokens) std.mem.Allocator.Error!Shape {
             // The `import` word completed each recorded prefix during emission.
             const n = self.imports.items().len;
-            for (self.open.items()) |o| self.put(ts, o, @intCast(ts.len - 1)); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+            for (self.open.items()) |o| self.put(ts, o, @intCast(ts.len - 1));
             const partner: Partners = .{ .stream = ts };
             // Marks are in order and each range starts at or after its mark, so
             // the ranges come in order of their first token.
@@ -75,7 +76,7 @@ pub fn Builder(comptime small: bool) type {
                     const first = i + 2;
                     if (first >= ts.len) continue;
                     const last = if (ts[first].is("{")) partner.get(first) else expressionEnd(ts, partner, first) orelse continue;
-                    break :then .{ .first = first, .last = @intCast(last) }; // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+                    break :then .{ .first = first, .last = @intCast(last) };
                 } else continue;
                 if (tests.items.len > 0 and range.first <= tests.items[tests.items.len - 1].last) {
                     const top = &tests.items[tests.items.len - 1];
@@ -195,7 +196,7 @@ fn rootMembers(arena: std.mem.Allocator, ts: []const Token, partner: Partners) !
     return out.items;
 }
 fn memberFrom(ts: []const Token, partner: Partners, first: usize) Member {
-    var m: Member = .{ .first = @intCast(first), .last = @intCast(first) }; // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+    var m: Member = .{ .first = @intCast(first), .last = @intCast(first) };
     var k = first;
     while (k < ts.len) : (k += 1) {
         const t = ts[k];
@@ -228,7 +229,7 @@ fn memberFrom(ts: []const Token, partner: Partners, first: usize) Member {
 }
 fn ending(m: Member, end: usize) Member {
     var out = m;
-    out.last = @intCast(@max(end, m.first)); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+    out.last = @intCast(@max(end, m.first));
     return out;
 }
 /// The `;` that ends a declaration, or a function's body brace.
@@ -296,7 +297,7 @@ const Names = struct {
             names.counts[@min(name.len, 63)] += 1;
             const slot = &slots[sketch(name) & (slots.len - 1)];
             names.next[i] = slot.*;
-            slot.* = @intCast(i); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+            slot.* = @intCast(i);
         };
         names.this = this.items;
         return names;
@@ -323,11 +324,11 @@ const Names = struct {
         unreachable;
     }
     fn length(word: []const u8) u64 {
-        return @as(u64, 1) << @intCast(@min(word.len, 63)); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+        return @as(u64, 1) << @intCast(@min(word.len, 63));
     }
     fn sketch(word: []const u8) u12 {
         if (word.len == 0) return 0;
-        return @truncate(word.len *% 1031 +% @as(usize, word[0]) *% 37 +% word[word.len - 1]); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+        return @truncate(word.len *% 1031 +% @as(usize, word[0]) *% 37 +% word[word.len - 1]);
     }
 };
 
@@ -388,8 +389,8 @@ pub const Words = struct {
             self.live[target] = true;
             self.names.forget(target);
         } else if (self.at != target and self.named_by[target] != self.at) {
-            self.named_by[target] = @intCast(self.at); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
-            try self.refs.append(self.arena, .{ .from = @intCast(self.at), .to = target }); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+            self.named_by[target] = @intCast(self.at);
+            try self.refs.append(self.arena, .{ .from = @intCast(self.at), .to = target });
         }
     }
     /// After every word: marks `test` each spec whose token only a test
@@ -397,7 +398,7 @@ pub const Words = struct {
     /// keeps its kind, since dead code is no evidence of a test. `where`
     /// holds the index in the stream of each spec's token.
     pub fn classify(self: *Words, scratch: std.mem.Allocator, specs: []types.Import, where: []const u32) std.mem.Allocator.Error!void {
-        std.debug.assert(specs.len == where.len);
+        aegis.assert.invariant(specs.len == where.len, "specs.len == where.len");
         const reach = try self.reachable(scratch);
         var member: usize = 0;
         var test_range: usize = 0;
@@ -443,7 +444,7 @@ pub const Words = struct {
         @memset(out, .dead);
         var stack: std.ArrayList(u32) = .empty;
         for ([_]Reach{ .live, .test_only }) |mark| {
-            for (self.members, 0..) |m, i| if (if (mark == .live) self.live[i] else m.is_test) try stack.append(arena, @intCast(i)); // aegis: no-danger: source length is bounded below half u32; token/member tables fit u32, and sketches intentionally keep their low bits.
+            for (self.members, 0..) |m, i| if (if (mark == .live) self.live[i] else m.is_test) try stack.append(arena, @intCast(i));
             if (mark == .test_only) try stack.appendSlice(arena, self.seeds.items);
             while (stack.pop()) |i| {
                 if (out[i] != .dead) continue;

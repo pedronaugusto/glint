@@ -20,7 +20,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
     // A read the program declares its own is listed at its escape, which is the declaration.
     for (try Taint.ownedIn(c.allocator, flow, c.file)) |token| try c.at(rule, token, "a read the program declares its own by its escape: no input starts here");
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!site(c, node)) continue;
         switch (tag) {
             // A position into input's own memory is data's to reach; an entry of the program's
@@ -75,7 +75,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, .input);
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tag) {
             // A sum, difference or product overflows on either operand; a quotient or a
             // remainder fails on its divisor (zero, or -1 under the minimum).
@@ -125,7 +125,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const sizes = [_][]const u8{ "n", "len", "new_len", "new_n", "new_capacity", "additional_count", "num", "capacity", "count", "new_size", "size" };
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (!site(c, node)) continue;
@@ -158,7 +158,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     var named = false;
     for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
         .builtin_call_two, .builtin_call_two_comma => {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             named = named or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@errorName");
         },
         else => {},
@@ -166,7 +166,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     if (!named) return;
     const flow = try Taint.get(c, .peer);
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access or !site(c, node)) continue;
@@ -213,7 +213,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         };
         if (held.file.raw() != io_type.file.raw() or held.scope != io_type.scope) continue;
         for (tree.nodes.items(.tag), 0..) |_, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const loop = tree.fullWhile(node) orelse continue;
             if (!within(c, node, decl.node) or !site(c, node)) continue;
             const cond = loop.ast.cond_expr;
@@ -224,7 +224,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 by_input = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs)).reaches(.number);
             }
             if (!unbounded and !by_input) continue;
-            if (gives(c, loop.ast.then_expr, @intCast(d))) continue; // aegis: no-danger: a file's declaration table indexes fit u32.
+            if (gives(c, loop.ast.then_expr, @intCast(d))) continue;
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} that gives '{s}' to nothing: no cancellation point, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it", .{ if (unbounded) "with no bound" else "bound by input", decl.name, decl.name }));
         }
     }
@@ -256,7 +256,7 @@ fn gives(c: *Context, body: Ast.Node.Index, d: u32) bool {
     const last = tree.lastToken(body);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // aegis: no-danger: the AST's node table indexes fit u32.
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
         const ref = model.reference(node) orelse continue;
