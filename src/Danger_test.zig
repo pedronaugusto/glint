@@ -14,6 +14,7 @@ const std_files = [_]sources.Extra{
     \\pub const debug = @import("debug.zig");
     \\pub const time = @import("time.zig");
     \\pub const process = @import("process.zig");
+    \\pub const mem = @import("mem.zig");
     \\pub const array_list = @import("array_list.zig");
     \\pub const hash_map = @import("hash_map.zig");
     \\pub const array_hash_map = @import("array_hash_map.zig");
@@ -22,8 +23,11 @@ const std_files = [_]sources.Extra{
     },
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
-    \\pub const Dir = struct { handle: i32 };
-    \\pub const net = struct { pub const Stream = struct { handle: i32 }; pub const Server = struct { stream: Stream }; };
+    \\pub const Reader = @import("Io/Reader.zig");
+    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } };
+    \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
+    \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
+    \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Condition = struct { state: u32 = 0 };
@@ -75,6 +79,16 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
+    .{ .name = "std/Io/Reader.zig", .bytes =
+    \\buffer: []u8 = &.{},
+    \\pub const Limit = enum(usize) { unlimited = 0, _ };
+    \\pub fn fixed(bytes: []const u8) @This() { _ = bytes; return .{}; }
+    \\pub fn takeByte(r: *@This()) !u8 { _ = r; return 0; }
+    \\pub fn take(r: *@This(), n: usize) ![]u8 { _ = n; return r.buffer; }
+    \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
+    \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
+    },
+    .{ .name = "std/mem.zig", .bytes = "pub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -106,7 +120,9 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "atomic.zig", .target = 2 },
     .{ .from = 0, .spelling = "crypto.zig", .target = 3 },
     .{ .from = 0, .spelling = "debug.zig", .target = 6 },
-    .{ .from = 0, .spelling = "time.zig", .target = 12 },
+    .{ .from = 0, .spelling = "time.zig", .target = 14 },
+    .{ .from = 1, .spelling = "Io/Reader.zig", .target = 12 },
+    .{ .from = 0, .spelling = "mem.zig", .target = 13 },
     .{ .from = 3, .spelling = "crypto/timing_safe.zig", .target = 4 },
     .{ .from = 3, .spelling = "crypto/ed25519.zig", .target = 5 },
     .{ .from = 1, .spelling = "Io/File.zig", .target = 7 },
@@ -124,6 +140,8 @@ fn run(rule: glint.Rule, program: []const u8) !Run {
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = 0, .undecided = 0 };
+    // A fixture std's AstGen refuses is not checked at all: it would pass any count of none.
+    for (report.coverage) |item| try std.testing.expect(item.reason != .invalid_syntax and item.reason != .invalid_lowering);
     for (report.diagnostics) |d| if (d.rule == rule) {
         if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
         result.findings += 1;
@@ -381,4 +399,77 @@ test "A014 finds a borrow of a std container's storage stored in a field" {
         \\pub fn keep(c: *Cache) void { c.view = c.list.items; c.slot = &c.list.items[0]; c.slot = c.map.getPtr(1); }
         \\pub fn local(c: *Cache) u32 { const v = c.list.items; return v[0]; }
     , 3);
+}
+
+const input_program =
+    \\const std = @import("std");
+    \\const aegis = @import("aegis");
+    \\fn pick(v: usize) usize { return v; }
+    \\pub fn handle(r: *std.Io.Reader, table: []const u8, dir: std.Io.Dir, gpa: std.mem.Allocator) !usize {
+    \\    const n = try r.takeByte();
+    \\    const x = table[n];
+    \\    var buf: [16]u8 = undefined;
+    \\    try r.readSliceAll(&buf);
+    \\    const len = buf[0];
+    \\    const part = table[0..len];
+    \\    var i: usize = 0;
+    \\    while (i < len) : (i += 1) {}
+    \\    for (0..n) |_| {}
+    \\    const last = table[table.len - 1];
+    \\    var fr: std.Io.Reader = .fixed("abc");
+    \\    const own = try fr.takeByte();
+    \\    _ = table[own];
+    \\    _ = table[pick(n)];
+    \\    _ = table[pick(3)];
+    \\    const wrapped = aegis.input.Untrusted(u8).init(n);
+    \\    _ = table[wrapped.readForParse()];
+    \\    const name = try r.take(4);
+    \\    try dir.openFile(null, name, .{});
+    \\    const sum = n + 1;
+    \\    const doubled = len * 2;
+    \\    const wrapped_sum = n +% 1;
+    \\    const size = table.len + 1;
+    \\    _ = try gpa.alloc(u8, n);
+    \\    _ = try gpa.alloc(u8, 16);
+    \\    _ = try r.take(n);
+    \\    _ = try r.allocRemaining(gpa, .unlimited);
+    \\    _ = sum;
+    \\    _ = doubled;
+    \\    _ = wrapped_sum;
+    \\    return x + part.len + last + size;
+    \\}
+;
+
+test "A009 finds input that indexes, slices, bounds a loop or names a path, and leaves clean, fixed and refined values" {
+    try expect(pack.untrusted_input, input_program, 6);
+}
+
+test "A010 finds arithmetic on input that can overflow, beside every fallible conversion" {
+    try expect(pack.integers, input_program, 2);
+}
+
+test "A012 finds work sized by input and reads with no limit" {
+    try expect(pack.bounded_work, input_program, 3);
+}
+
+test "A018 finds an error's name written to a peer, not to another writer" {
+    try expect(pack.diagnostics,
+        \\const std = @import("std");
+        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror, log: *std.Io.Writer) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\    try log.print("{s}", .{@errorName(err)});
+        \\}
+    , 1);
+}
+
+test "A020 finds a loop on input or without bound that gives its Io to nothing" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn serve(io: std.Io, r: *std.Io.Reader) void { _ = io; while (true) { _ = r.takeByte() catch return; } }
+        \\pub fn polite(io: std.Io, r: *std.Io.Reader) void { while (true) { io.checkCancel() catch return; _ = r.takeByte() catch return; } }
+        \\pub fn counted(io: std.Io, r: *std.Io.Reader) void { const n = r.takeByte() catch return; var i: u8 = 0; while (i < n) : (i += 1) {} _ = io; }
+        \\pub fn plain(io: std.Io) void { var i: u8 = 0; while (i < 10) : (i += 1) {} _ = io; }
+    , 2);
 }

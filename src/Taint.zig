@@ -1,0 +1,700 @@
+//! The flow facts the danger rules read (designs/aegis.md §7), each computed once for the whole
+//! program: the input fact, which values come from outside it, and the peer fact, which writers
+//! reach a peer.
+//!
+//! Input starts at a read: what a `std.Io.Reader` read gives or writes into the caller's buffer,
+//! and what `Io.File` and `Io.Dir` read of a file's contents. A reader `Reader.fixed` makes over
+//! the program's own bytes carries their fact instead. A peer writer is one a `net.Stream`
+//! gives. The fact flows through locals, captures, indexing and slicing, field reads,
+//! arithmetic and conversions; through a call outside the program given such a value (to its
+//! result, and to a local receiver it is given to); through the program's own calls, to the
+//! parameter in the callee and back by the callee's summary, so a call made with clean
+//! arguments stays clean; and through a store into a field, which holds it everywhere by its
+//! declaration. A slice's `.len` and a comparison are not tainted. aegis's types are the answer
+//! to input: what aegis gives back (an `input.Untrusted` and what its `parse` refines, a checked
+//! integer) is clean. A call whose callee does not resolve, given a tainted value, gives an
+//! unknown one, which a sink reads as undecided, never as passed.
+const std = @import("std");
+const Context = @import("RuleContext.zig");
+const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
+const Project = @import("Project.zig");
+const Governed = @import("Governed.zig");
+const Contract = @import("AegisContract.zig");
+const Ast = std.zig.Ast;
+
+pub const Level = enum(u2) {
+    clean,
+    unknown,
+    tainted,
+
+    pub fn join(a: Level, b: Level) Level {
+        return if (@backingInt(a) >= @backingInt(b)) a else b; // safe: two-bit levels.
+    }
+};
+
+/// What an expression holds, read inside one function: a level of its own, and the
+/// parameters it depends on, fully or (through a call that did not resolve) at most as unknown.
+pub const Dep = struct {
+    level: Level = .clean,
+    params: u64 = 0,
+    maybe: u64 = 0,
+
+    pub fn join(a: Dep, b: Dep) Dep {
+        return .{ .level = a.level.join(b.level), .params = a.params | b.params, .maybe = a.maybe | b.maybe };
+    }
+    fn lowered(a: Dep) Dep {
+        return .{ .level = if (a.level == .tainted) .unknown else a.level, .params = 0, .maybe = a.params | a.maybe };
+    }
+    fn eql(a: Dep, b: Dep) bool {
+        return a.level == b.level and a.params == b.params and a.maybe == b.maybe;
+    }
+};
+
+pub const Fact = enum { input, peer };
+
+const Function = struct {
+    file: Project.FileId,
+    node: Ast.Node.Index,
+    /// Its parameters' declarations in order, the receiver first.
+    params: []const u32,
+    /// What its callers give each parameter.
+    levels: []Level,
+    ret: Dep = .{},
+    /// The parameters whose memory it fills with the fact (a buffer it reads into).
+    fills: u64 = 0,
+};
+
+pub const Flow = struct {
+    solved: bool = false,
+    fact: Fact = .input,
+    functions: std.ArrayList(Function) = .empty,
+    /// Per file, each node's nearest enclosing function, by its index in `functions`.
+    owners: std.AutoHashMapUnmanaged(u32, []const ?u32) = .empty,
+    by_node: std.AutoHashMapUnmanaged(Facts.Key, u32) = .empty,
+    locals: std.AutoHashMapUnmanaged(Facts.Decl, Dep) = .empty,
+    /// Fields and container-level variables, by declaration.
+    globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
+    std_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    aegis_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    reader: ?Facts.Container = null,
+    file: ?Facts.Container = null,
+    dir: ?Facts.Container = null,
+    stream: ?Facts.Container = null,
+    changed: bool = false,
+};
+
+const keys = struct {
+    var input: u8 = 0;
+    var peer: u8 = 0;
+};
+
+/// The program's `fact`, solved the first time a rule asks.
+pub fn get(c: *Context, fact: Fact) Context.Error!*Flow {
+    const flow = try c.facts.memo(Flow, switch (fact) {
+        .input => @intFromPtr(&keys.input),
+        .peer => @intFromPtr(&keys.peer),
+    });
+    if (!flow.solved) {
+        flow.fact = fact;
+        try solve(c, flow);
+        flow.solved = true;
+    }
+    return flow;
+}
+
+fn solve(c: *Context, flow: *Flow) Context.Error!void {
+    try known(c, flow);
+    for (c.project.inputs, 0..) |input, f| {
+        if (!input.selected or input.classification == .@"test") continue;
+        try functionsOf(c, flow, Project.FileId.fromRaw(@intCast(f))); // safe: the project's file table indexes fit u32.
+    }
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        flow.changed = false;
+        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @intCast(i)); // safe: the function table is far below u32.
+        if (!flow.changed) break;
+    }
+}
+
+/// The declarations the fact starts from and stops at: std's reader, file, directory and stream,
+/// std's and aegis's files.
+fn known(c: *Context, flow: *Flow) Context.Error!void {
+    const paths = [_][]const u8{ "Io.Reader", "Io.File", "Io.Dir", "Io.net.Stream" };
+    var found: [paths.len]?Facts.Container = @splat(null);
+    for (paths, &found) |path, *slot| {
+        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| {
+            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+            if (value == .container) slot.* = value.container;
+        }
+    }
+    flow.reader, flow.file, flow.dir, flow.stream = found;
+    for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try reach(c, &flow.std_files, mapping.target);
+    const aegis = try c.facts.publication(Contract.library);
+    for (aegis.files) |file| try flow.aegis_files.put(c.allocator, file.raw(), {});
+}
+
+/// Every file `root` reaches through its own imports.
+fn reach(c: *Context, set: *std.AutoHashMapUnmanaged(u32, void), root: Project.FileId) Context.Error!void {
+    if ((try set.getOrPut(c.allocator, root.raw())).found_existing) return;
+    var stack: std.ArrayList(Project.FileId) = .empty;
+    try stack.append(c.allocator, root);
+    while (stack.pop()) |file| for (c.project.imports) |mapping| {
+        if (!mapping.from.eql(file)) continue;
+        if ((try set.getOrPut(c.allocator, mapping.target.raw())).found_existing) continue;
+        try stack.append(c.allocator, mapping.target);
+    };
+}
+
+/// The file's functions with a body, and each node's owner among them.
+fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const owners = try c.allocator.alloc(?u32, tree.nodes.len);
+    @memset(owners, null);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .fn_decl) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, tree.nodeData(node).node_and_node[0]) orelse continue;
+        var params: std.ArrayList(u32) = .empty;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            const name = param.name_token orelse {
+                try params.append(c.allocator, std.math.maxInt(u32));
+                continue;
+            };
+            var found: u32 = std.math.maxInt(u32);
+            for (model.declarations, 0..) |decl, d| if (decl.kind == .parameter and decl.token == name) {
+                found = @intCast(d); // safe: a file's declaration table indexes fit u32.
+                break;
+            };
+            try params.append(c.allocator, found);
+        }
+        const levels = try c.allocator.alloc(Level, params.items.len);
+        @memset(levels, .clean);
+        try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @intCast(flow.functions.items.len)); // safe: the function table is far below u32.
+        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels });
+    }
+    for (0..tree.nodes.len) |i| {
+        var at: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+            if (tree.nodeTag(parent) == .fn_decl) {
+                owners[i] = flow.by_node.get(.{ .file = file, .node = parent });
+                break;
+            }
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullContainerDecl(&buffer, parent) != null) break;
+        }
+    }
+    try flow.owners.put(c.allocator, file.raw(), owners);
+}
+
+/// The function whose body holds `node`, if the fact reads it.
+pub fn owner(flow: *const Flow, file: Project.FileId, node: Ast.Node.Index) ?u32 {
+    const owners = flow.owners.get(file.raw()) orelse return null;
+    return owners[@backingInt(node)]; // safe: a node index indexes its own tree's table.
+}
+
+/// One round over a function's bindings: what each local, field, parameter and result takes.
+fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    const owners = flow.owners.get(f.file.raw()).?;
+    for (owners, 0..) |own, i| {
+        if (own != function) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        switch (tree.nodeTag(node)) {
+            .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => {
+                const init = (tree.fullVarDecl(node) orelse continue).ast.init_node.unwrap() orelse continue;
+                const d = declaredAt(model, node) orelse continue;
+                try raiseLocal(c, flow, .{ .file = f.file, .index = d }, try dep(c, flow, function, init));
+            },
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                const target, const value = tree.nodeData(node).node_and_node;
+                try store(c, flow, function, target, try dep(c, flow, function, value));
+            },
+            .assign_destructure => {
+                const parts = tree.assignDestructure(node);
+                const value = try dep(c, flow, function, parts.ast.value_expr);
+                for (parts.ast.variables) |variable| {
+                    if (declaredAt(model, variable)) |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value) else try store(c, flow, function, variable, value);
+                }
+            },
+            .@"return" => {
+                const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
+                const now = flow.functions.items[function].ret.join(try dep(c, flow, function, value));
+                if (!now.eql(flow.functions.items[function].ret)) {
+                    flow.functions.items[function].ret = now;
+                    flow.changed = true;
+                }
+            },
+            else => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                if (tree.fullCall(&buffer, node)) |call| try effects(c, flow, function, call);
+                if (isMemcpy(tree, node)) {
+                    var args_buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, node, &args_buffer);
+                    if (args.len == 2) try store(c, flow, function, args[0], try dep(c, flow, function, args[1]));
+                }
+            },
+        }
+    }
+    // Captures take what they bind from.
+    for (model.declarations, 0..) |decl, d| {
+        if (decl.kind != .capture) continue;
+        if (owner(flow, f.file, decl.node) != function) continue;
+        const from = try captured(c, flow, function, decl, @intCast(d)); // safe: a file's declaration table indexes fit u32.
+        try raiseLocal(c, flow, .{ .file = f.file, .index = @intCast(d) }, from); // safe: a file's declaration table indexes fit u32.
+    }
+}
+
+fn isMemcpy(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@memcpy") or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@memmove"),
+        else => false,
+    };
+}
+
+/// What a capture binds: an `if`'s or `while`'s payload its condition, a `switch` prong's the
+/// switch's operand, a `for` capture its input (a range's counter is clean), a `catch`'s error
+/// nothing.
+fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration, d: u32) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    const node = decl.node;
+    if (tree.fullIf(node)) |branch| return if (branch.error_token == decl.token) .{} else dep(c, flow, function, branch.ast.cond_expr);
+    if (tree.fullWhile(node)) |loop| return if (loop.error_token == decl.token) .{} else dep(c, flow, function, loop.ast.cond_expr);
+    if (tree.fullSwitchCase(node) != null) {
+        const parent = model.node_parents[@backingInt(node)] orelse return .{}; // safe: a node index indexes its own tree's parent table.
+        const choice = tree.fullSwitch(parent) orelse return .{};
+        return dep(c, flow, function, choice.ast.condition);
+    }
+    if (tree.fullFor(node)) |loop| {
+        var position: usize = 0;
+        for (model.declarations[0..d]) |earlier| if (earlier.kind == .capture and earlier.node == node) {
+            position += 1;
+        };
+        if (position >= loop.ast.inputs.len) return .{};
+        const input = loop.ast.inputs[position];
+        if (tree.nodeTag(input) == .for_range) return .{};
+        return dep(c, flow, function, input);
+    }
+    return .{};
+}
+
+/// The declaration a `var`/`const` node declares.
+fn declaredAt(model: *const Model, node: Ast.Node.Index) ?u32 {
+    for (model.declarations, 0..) |decl, d| if (decl.node == node and decl.kind == .variable) return @intCast(d); // safe: a file's declaration table indexes fit u32.
+    return null;
+}
+
+fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Error!void {
+    if (value.level == .clean and value.params == 0 and value.maybe == 0) return;
+    const entry = try flow.locals.getOrPut(c.allocator, decl);
+    const before: Dep = if (entry.found_existing) entry.value_ptr.* else .{};
+    const now = before.join(value);
+    entry.value_ptr.* = now;
+    if (!now.eql(before)) flow.changed = true;
+}
+
+fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level) Context.Error!void {
+    if (level == .clean) return;
+    const entry = try flow.globals.getOrPut(c.allocator, decl);
+    const before: Level = if (entry.found_existing) entry.value_ptr.* else .clean;
+    entry.value_ptr.* = before.join(level);
+    if (entry.value_ptr.* != before) flow.changed = true;
+}
+
+/// A store of `value` into `target`: a local, a container-level variable or a field by its
+/// declaration, the local an element or part of it belongs to, or the memory a parameter
+/// points at (the function then fills it).
+fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value: Dep) Context.Error!void {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    switch (tree.nodeTag(target)) {
+        .identifier => {
+            const ref = model.reference(target) orelse return;
+            const d = ref.declaration orelse return;
+            const decl = model.declarations[d];
+            if (decl.kind == .parameter) return;
+            const scope = model.scopes[decl.scope].kind;
+            if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value));
+            return raiseLocal(c, flow, .{ .file = f.file, .index = d }, value);
+        },
+        .field_access => {
+            if (try c.facts.definition(f.file, target)) |decl| {
+                if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return raiseGlobal(c, flow, decl, concrete(flow, function, value));
+            }
+            return store(c, flow, function, tree.nodeData(target).node_and_token[0], value);
+        },
+        .array_access => return store(c, flow, function, tree.nodeData(target).node_and_node[0], value),
+        .deref, .address_of => return store(c, flow, function, tree.nodeData(target).node, value),
+        .grouped_expression, .unwrap_optional => return store(c, flow, function, tree.nodeData(target).node_and_token[0], value),
+        .slice_open, .slice, .slice_sentinel => return store(c, flow, function, (tree.fullSlice(target) orelse return).ast.sliced, value),
+        else => {},
+    }
+}
+
+/// What a parameter's root a store reaches: the parameter's index, when the target is rooted
+/// at one.
+fn rootParam(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index) ?usize {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    var at = target;
+    while (true) switch (tree.nodeTag(at)) {
+        .identifier => {
+            const ref = model.reference(at) orelse return null;
+            const d = ref.declaration orelse return null;
+            return std.mem.findScalar(u32, f.params, d);
+        },
+        .field_access, .grouped_expression, .unwrap_optional => at = tree.nodeData(at).node_and_token[0],
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .deref, .address_of => at = tree.nodeData(at).node,
+        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return null).ast.sliced,
+        else => return null,
+    };
+}
+
+/// A call's effects beyond its result: what it gives the program's own callee's parameters,
+/// what a read fills, what a local receiver takes from what it is given.
+fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!void {
+    const f = flow.functions.items[function];
+    const callee = try resolveCall(c, flow, f.file, call);
+    switch (callee.kind) {
+        .program => |target| {
+            const g = flow.functions.items[target];
+            for (callee.args.items, 0..) |arg, position| {
+                const index = position + callee.skip;
+                if (index >= g.levels.len) break;
+                const level = concrete(flow, function, try dep(c, flow, function, arg));
+                if (level.join(g.levels[index]) != g.levels[index]) {
+                    flow.functions.items[target].levels[index] = level.join(g.levels[index]);
+                    flow.changed = true;
+                }
+                if (g.fills & bit(index) != 0) try fill(c, flow, function, arg);
+            }
+        },
+        .source => {
+            if (try fixedClean(c, flow, function, call)) return;
+            for (callee.args.items) |arg| try fill(c, flow, function, arg);
+        },
+        .outside => {
+            // A local receiver takes what it is given: a list appended to, a hasher updated.
+            if (callee.receiver) |receiver| {
+                var given: Dep = .{};
+                for (callee.args.items) |arg| given = given.join(try dep(c, flow, function, arg));
+                if (given.level != .clean or given.params != 0) try store(c, flow, function, receiver, given);
+            }
+        },
+        .aegis, .none => {},
+    }
+}
+
+/// A read fills `arg`'s memory with the fact: the local it is rooted at, or the parameter's
+/// memory it points into (the function then fills that parameter for its callers).
+fn fill(c: *Context, flow: *Flow, function: u32, arg: Ast.Node.Index) Context.Error!void {
+    if (rootParam(c, flow, function, arg)) |index| {
+        if (flow.functions.items[function].fills & bit(index) == 0) {
+            flow.functions.items[function].fills |= bit(index);
+            flow.changed = true;
+        }
+        return;
+    }
+    try store(c, flow, function, arg, .{ .level = .tainted });
+}
+
+fn bit(index: usize) u64 {
+    return if (index < 64) @as(u64, 1) << @intCast(index) else 0; // safe: the shift is below 64.
+}
+
+/// A dependence read as a level, with what callers give the function's parameters.
+pub fn concrete(flow: *const Flow, function: u32, value: Dep) Level {
+    var level = value.level;
+    const f = flow.functions.items[function];
+    for (f.levels, 0..) |given, index| {
+        if (value.params & bit(index) != 0) level = level.join(given);
+        if (value.maybe & bit(index) != 0 and given != .clean) level = level.join(.unknown);
+    }
+    return level;
+}
+
+const Callee = struct {
+    kind: union(enum) { program: u32, source, outside, aegis, none },
+    /// The arguments in order, the receiver of a method call first.
+    args: std.ArrayList(Ast.Node.Index) = .empty,
+    receiver: ?Ast.Node.Index = null,
+    /// How many parameters precede the first argument (a method's receiver given by the call).
+    skip: usize = 0,
+    decl: ?Facts.Decl = null,
+};
+
+/// What a call reaches: the program's own function, a read, another function outside the
+/// program, aegis, or nothing that resolves.
+fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!Callee {
+    const tree = &c.project.files[file.raw()].tree;
+    var out: Callee = .{ .kind = .none };
+    var method = false;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+        const value = try c.facts.resolve(file, receiver);
+        method = switch (value) {
+            .instance, .pointer, .optional => true,
+            else => false,
+        };
+        if (method) {
+            out.receiver = receiver;
+            try out.args.append(c.allocator, receiver);
+        }
+    }
+    try out.args.appendSlice(c.allocator, call.ast.params);
+    const value = try c.facts.resolve(file, call.ast.fn_expr);
+    const decl = switch (value) {
+        .function => |decl| decl,
+        else => return out,
+    };
+    out.decl = decl;
+    if (flow.aegis_files.contains(decl.file.raw())) {
+        out.kind = .aegis;
+        return out;
+    }
+    const record = c.project.models[decl.file.raw()].declarations[decl.index];
+    if (flow.by_node.get(.{ .file = decl.file, .node = fnDecl(c, decl) orelse record.node })) |target| {
+        if (c.project.inputs[decl.file.raw()].selected) {
+            out.kind = .{ .program = target };
+            return out;
+        }
+    }
+    out.kind = if (try source(c, flow, decl, record.name)) .source else .outside;
+    return out;
+}
+
+/// The `fn_decl` node of a function declaration.
+fn fnDecl(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
+    const model = &c.project.models[decl.file.raw()];
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const parent = model.node_parents[@backingInt(model.declarations[decl.index].node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+    return if (tree.nodeTag(parent) == .fn_decl) parent else null;
+}
+
+/// Whether a function outside the program starts the fact: a read of input, or a peer writer.
+fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.Error!bool {
+    _ = c;
+    const file = decl.file.raw();
+    switch (flow.fact) {
+        .input => {
+            if (flow.reader) |reader| if (reader.file.raw() == file) {
+                for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
+            };
+            if (flow.file) |handle| if (handle.file.raw() == file) {
+                for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (std.mem.eql(u8, name, read)) return true;
+            };
+            if (flow.dir) |dir| if (dir.file.raw() == file) {
+                for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (std.mem.eql(u8, name, read)) return true;
+            };
+            return false;
+        },
+        .peer => {
+            const stream = flow.stream orelse return false;
+            return stream.file.raw() == file and std.mem.eql(u8, name, "writer");
+        },
+    }
+}
+
+/// Whether a read is from a reader `Reader.fixed` made over clean bytes, as a local of the
+/// function: such a read carries the bytes' fact, not input's.
+fn fixedClean(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!bool {
+    if (flow.fact != .input) return false;
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    var receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+    while (true) switch (tree.nodeTag(receiver)) {
+        .address_of => receiver = tree.nodeData(receiver).node,
+        .field_access => receiver = tree.nodeData(receiver).node_and_token[0],
+        else => break,
+    };
+    if (tree.nodeTag(receiver) != .identifier) return false;
+    const ref = model.reference(receiver) orelse return false;
+    const d = ref.declaration orelse return false;
+    const variable = tree.fullVarDecl(model.declarations[d].node) orelse return false;
+    const init = variable.ast.init_node.unwrap() orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const made = tree.fullCall(&buffer, init) orelse return false;
+    const callee = switch (tree.nodeTag(made.ast.fn_expr)) {
+        .field_access => tree.tokenSlice(tree.nodeData(made.ast.fn_expr).node_and_token[1]),
+        .enum_literal => tree.tokenSlice(tree.nodeMainToken(made.ast.fn_expr)),
+        else => return false,
+    };
+    if (!std.mem.eql(u8, callee, "fixed") or made.ast.params.len != 1) return false;
+    return concrete(flow, function, try dep(c, flow, function, made.ast.params[0])) == .clean;
+}
+
+/// What an expression holds, read in `function`.
+pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const model = &c.project.models[f.file.raw()];
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const ref = model.reference(node) orelse return .{};
+            const d = ref.declaration orelse return .{};
+            if (std.mem.findScalar(u32, f.params, d)) |index| return .{ .params = bit(index) };
+            const decl = model.declarations[d];
+            if (decl.kind == .variable or decl.kind == .capture) {
+                const scope = model.scopes[decl.scope].kind;
+                if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean };
+                return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
+            }
+            return .{};
+        },
+        .field_access => {
+            const receiver, const name = tree.nodeData(node).node_and_token;
+            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) return .{};
+            var out = try dep(c, flow, function, receiver);
+            if (try c.facts.definition(f.file, node)) |decl| {
+                if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
+                // A function or a type named through a value is no part of its data.
+                const kind = c.project.models[decl.file.raw()].declarations[decl.index].kind;
+                if (kind == .function) return .{};
+            }
+            return out;
+        },
+        .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
+        .slice_open, .slice, .slice_sentinel => return dep(c, flow, function, (tree.fullSlice(node) orelse return .{}).ast.sliced),
+        .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
+        .deref, .address_of, .@"try", .negation, .negation_wrap, .bit_not => return dep(c, flow, function, tree.nodeData(node).node),
+        .add, .sub, .mul, .div, .mod, .shl, .shr, .shl_sat, .bit_and, .bit_or, .bit_xor, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .array_cat, .@"orelse", .@"catch" => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs));
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@errorName", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField", "@intFromBool" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
+            var buffer: [2]Ast.Node.Index = undefined;
+            var out: Dep = .{};
+            for (Facts.builtinArgs(tree, node, &buffer)) |arg| out = out.join(try dep(c, flow, function, arg));
+            return out;
+        },
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(node).?;
+            var out = try dep(c, flow, function, branch.ast.then_expr);
+            if (branch.ast.else_expr.unwrap()) |e| out = out.join(try dep(c, flow, function, e));
+            return out;
+        },
+        .@"switch", .switch_comma => {
+            var out: Dep = .{};
+            for (tree.fullSwitch(node).?.ast.cases) |case| out = out.join(try dep(c, flow, function, (tree.fullSwitchCase(case) orelse continue).ast.target_expr));
+            return out;
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return labeled(c, flow, function, node),
+        else => {},
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |literal| {
+        var out: Dep = .{};
+        for (literal.ast.fields) |field| out = out.join(try dep(c, flow, function, field));
+        return out;
+    }
+    if (tree.fullArrayInit(&buffer, node)) |literal| {
+        var out: Dep = .{};
+        for (literal.ast.elements) |element| out = out.join(try dep(c, flow, function, element));
+        return out;
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, node)) |call| return result(c, flow, function, call);
+    return .{};
+}
+
+/// A labeled block's value: what its `break`s give it.
+fn labeled(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const lbrace = tree.nodeMainToken(node);
+    if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon) return .{};
+    const label = tree.tokenSlice(lbrace - 2);
+    var out: Dep = .{};
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: the AST's node table indexes fit u32.
+        const token = tree.nodeMainToken(brk);
+        if (token < first or token > last) continue;
+        const target, const value = tree.nodeData(brk).opt_token_and_opt_node;
+        const named = target.unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(named), label)) continue;
+        if (value.unwrap()) |v| out = out.join(try dep(c, flow, function, v));
+    }
+    return out;
+}
+
+/// A call's result: the program's callee's summary read with these arguments, a read's input,
+/// what a function outside the program makes of what it is given, aegis's answer clean, and
+/// unknown from a callee that does not resolve.
+fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const callee = try resolveCall(c, flow, f.file, call);
+    switch (callee.kind) {
+        .aegis => return .{},
+        .program => |target| {
+            const g = flow.functions.items[target];
+            var out: Dep = .{ .level = g.ret.level };
+            for (callee.args.items, 0..) |arg, position| {
+                const index = position + callee.skip;
+                if (g.ret.params & bit(index) != 0) out = out.join(try dep(c, flow, function, arg));
+                if (g.ret.maybe & bit(index) != 0) out = out.join((try dep(c, flow, function, arg)).lowered());
+            }
+            return out;
+        },
+        .source => {
+            if (try fixedClean(c, flow, function, call)) return .{};
+            return .{ .level = .tainted };
+        },
+        .outside => {
+            var out: Dep = .{};
+            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            return out;
+        },
+        .none => {
+            var out: Dep = .{};
+            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            return out.lowered();
+        },
+    }
+}
+
+/// The level of `node` in its file as the solved fact reads it, or clean outside the functions
+/// it reads.
+pub fn levelAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+    const function = owner(flow, file, node) orelse return .clean;
+    return concrete(flow, function, try dep(c, flow, function, node));
+}
+
+/// The program's call or the function outside it that a call reaches, for a sink reading its
+/// arguments by the callee's parameters.
+pub const Reached = struct { decl: ?Facts.Decl, args: []const Ast.Node.Index, skip: usize, std: bool, method: bool };
+pub fn reached(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!Reached {
+    const callee = try resolveCall(c, flow, file, call);
+    const decl = callee.decl;
+    const in_std = if (decl) |d| flow.std_files.contains(d.file.raw()) else false;
+    return .{ .decl = decl, .args = callee.args.items, .skip = callee.skip, .std = in_std, .method = callee.receiver != null };
+}
+
+/// Whether a function outside the program is one of std's.
+pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
+    return flow.std_files.contains(decl.file.raw());
+}
+
+/// The container a fact recognizes std's reader, file, directory and stream by.
+pub fn readerType(flow: *const Flow) ?Facts.Container {
+    return flow.reader;
+}
+pub fn directoryType(flow: *const Flow) ?Facts.Container {
+    return flow.dir;
+}

@@ -36,6 +36,8 @@ comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
 /// The declarations the program dereferences (`p.*`), found per file once.
 dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
+/// Per-run state rules keep across files, by the key they name it with (`memo`).
+memos: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
 /// Every member access in the selected files, by the member's name, found once (`memberUses`).
 member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
 remaining: usize = 100_000,
@@ -2176,6 +2178,19 @@ pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
 
 fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
     return Model.identifier(self.gpa, raw);
+}
+
+/// A `T` this run keeps under `key`, made with its defaults the first time it is asked for: what
+/// a rule computes once for the whole project and reads from each file's check. It lives as
+/// long as the run.
+pub fn memo(self: *Facts, comptime T: type, key: usize) ResolveError!*T {
+    const entry = try self.memos.getOrPut(self.gpa, key);
+    if (!entry.found_existing) {
+        const made = try self.gpa.create(T);
+        made.* = .{};
+        entry.value_ptr.* = made;
+    }
+    return @ptrCast(@alignCast(entry.value_ptr.*)); // safe: the key is the caller's for this type alone.
 }
 
 /// The member accesses (`x.name`) in the project's selected files that spell `name`, each a

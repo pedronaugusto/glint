@@ -7,6 +7,7 @@ const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
 const Shapes = @import("DangerShapes.zig");
+const Flows = @import("DangerFlow.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
@@ -41,15 +42,31 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = recursion, .name = "A006", .group = .family_policy, .purpose = "recursion reachable from untrusted input without a depth bound", .version = 1, .exception = .aegis }, .check = checkRecursion },
     .{ .definition = .{ .id = shared_state, .name = "A007", .group = .family_policy, .purpose = "shared state outside aegis's guards", .exception = .aegis }, .check = checkSharedState },
     .{ .definition = .{ .id = secrets, .name = "A008", .group = .family_policy, .purpose = "secret material outside aegis's Secret and Choice", .exception = .aegis }, .check = checkSecrets },
+    .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput },
     .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic that can fail unchecked", .exception = .aegis }, .check = checkIntegers },
     .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
+    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork },
     .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts },
     .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
     .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },
     .{ .definition = .{ .id = identity, .name = "A016", .group = .family_policy, .purpose = "identifying integers of one type that one may pass for another", .exception = .aegis }, .check = checkIdentity },
     .{ .definition = .{ .id = state_machines, .name = "A017", .group = .family_policy, .purpose = "state machine kept by hand", .exception = .aegis }, .check = checkStateMachines },
+    .{ .definition = .{ .id = diagnostics, .name = "A018", .group = .family_policy, .purpose = "internal text written to a peer", .exception = .aegis }, .check = checkDiagnostics },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
+    .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation },
 };
+fn checkInput(c: *Context) Context.Error!void {
+    if (try begin(c, untrusted_input)) try Flows.input(c, untrusted_input);
+}
+fn checkBoundedWork(c: *Context) Context.Error!void {
+    if (try begin(c, bounded_work)) try Flows.boundedWork(c, bounded_work);
+}
+fn checkDiagnostics(c: *Context) Context.Error!void {
+    if (try begin(c, diagnostics)) try Flows.diagnostics(c, diagnostics);
+}
+fn checkCancellation(c: *Context) Context.Error!void {
+    if (try begin(c, cancellation)) try Flows.cancellation(c, cancellation);
+}
 fn checkSharedState(c: *Context) Context.Error!void {
     if (try begin(c, shared_state)) try Danger.sharedState(c, shared_state);
 }
@@ -57,7 +74,9 @@ fn checkSecrets(c: *Context) Context.Error!void {
     if (try begin(c, secrets)) try Danger.secrets(c, secrets);
 }
 fn checkIntegers(c: *Context) Context.Error!void {
-    if (try begin(c, integers)) try Danger.casts(c, integers);
+    if (!try begin(c, integers)) return;
+    try Danger.casts(c, integers);
+    try Flows.arithmetic(c, integers);
 }
 fn checkUnits(c: *Context) Context.Error!void {
     if (try begin(c, units)) try Danger.units(c, units);

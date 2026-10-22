@@ -84,6 +84,20 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
     return kept.items;
 }
 
+/// The declarations `path` names from module `source`, without reporting: null when no root
+/// imports the module or the path does not resolve. For facts that recognize a declaration and
+/// leave its absence to the rules that read them.
+pub fn declarations(self: *Context, source: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+    var roots: std.ArrayList(Project.FileId) = .empty;
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
+        for (roots.items) |seen| {
+            if (seen.eql(mapping.target)) break;
+        } else try roots.append(self.allocator, mapping.target);
+    };
+    if (roots.items.len == 0) return null;
+    return walk(self, roots.items, path, true);
+}
+
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {
