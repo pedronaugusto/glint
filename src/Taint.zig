@@ -76,6 +76,8 @@ pub const Flow = struct {
     /// Fields and container-level variables, by declaration.
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
     std_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// std's namespaces whose functions make data from data: what they give holds what they take.
+    data_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
     aegis_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
     reader: ?Facts.Container = null,
     file: ?Facts.Container = null,
@@ -130,6 +132,21 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
     }
     flow.reader, flow.file, flow.dir, flow.stream = found;
     for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try reach(c, &flow.std_files, mapping.target);
+    for ([_][]const u8{ "mem", "fmt", "ascii", "unicode", "math", "base64" }) |namespace| {
+        for ((try Governed.declarations(c, "std", namespace)) orelse &.{}) |decl| {
+            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+            if (value != .container) continue;
+            // The namespace's own file and the files it reaches by its relative imports.
+            try flow.data_files.put(c.allocator, value.container.file.raw(), {});
+            var next = std.ArrayList(Project.FileId).empty;
+            try next.append(c.allocator, value.container.file);
+            while (next.pop()) |file| for (c.project.imports) |mapping| {
+                if (!mapping.from.eql(file) or !std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
+                if ((try flow.data_files.getOrPut(c.allocator, mapping.target.raw())).found_existing) continue;
+                try next.append(c.allocator, mapping.target);
+            };
+        }
+    }
     const aegis = try c.facts.publication(Contract.library);
     for (aegis.files) |file| try flow.aegis_files.put(c.allocator, file.raw(), {});
 }
@@ -384,15 +401,25 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
             for (callee.args.items) |arg| try fill(c, flow, function, arg);
         },
         .outside => {
-            // A local receiver takes what it is given: a list appended to, a hasher updated.
-            if (callee.receiver) |receiver| {
+            // A receiver takes what a method adds to it: a list appended to, a map put into, a
+            // writer written to; nothing else a method is given becomes its data.
+            if (callee.receiver) |receiver| if (adds(c, callee.decl)) {
                 var given: Dep = .{};
-                for (callee.args.items) |arg| given = given.join(try dep(c, flow, function, arg));
+                for (callee.args.items[1..]) |arg| given = given.join(try dep(c, flow, function, arg));
                 if (given.level != .clean or given.params != 0) try store(c, flow, function, receiver, given);
-            }
+            };
         },
         .aegis, .none => {},
     }
+}
+
+/// Whether a method adds what it is given to its receiver's data, by its name: `append`,
+/// `insert`, `put`, `push`, `add`, `write` and `print` and their forms.
+fn adds(c: *Context, decl: ?Facts.Decl) bool {
+    const d = decl orelse return false;
+    const name = c.project.models[d.file.raw()].declarations[d.index].name;
+    for ([_][]const u8{ "append", "insert", "put", "push", "add", "write", "print" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
+    return false;
 }
 
 /// A read fills `arg`'s memory with the fact: the local it is rooted at, or the parameter's
@@ -657,6 +684,10 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
             return .{ .level = .tainted };
         },
         .outside => {
+            // A method gives what its receiver holds; a function outside std, or std's data
+            // functions (`mem`, `fmt`, `ascii`, `unicode`, `math`, `base64`), what it is given.
+            if (callee.receiver) |receiver| return dep(c, flow, function, receiver);
+            if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw()) and !flow.data_files.contains(decl.file.raw())) return .{};
             var out: Dep = .{};
             for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
             return out;

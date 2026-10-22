@@ -348,8 +348,8 @@ const Walk = struct {
         while (w.model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
             switch (tree.nodeTag(parent)) {
                 .field_access, .array_access => {
-                    if (tree.nodeData(parent).node_and_token[0] != at and tree.nodeTag(parent) == .field_access) break;
-                    if (tree.nodeTag(parent) == .array_access and tree.nodeData(parent).node_and_node[0] != at) break;
+                    const base = if (tree.nodeTag(parent) == .field_access) tree.nodeData(parent).node_and_token[0] else tree.nodeData(parent).node_and_node[0];
+                    if (base != at) break;
                     // A method called on it may write through its receiver.
                     if (tree.nodeTag(parent) == .field_access) {
                         const grand = w.model.node_parents[@backingInt(parent)] orelse break; // safe: a node index indexes its own tree's parent table.

@@ -40,7 +40,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     errdefer arena.deinit();
     const a = arena.allocator();
     for (options.files, 0..) |setting, i| {
-        // glint-ignore: A004 -- no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+        // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
         if (setting.file.raw() >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file.eql(earlier.file)) return error.InvalidSelection;
     }

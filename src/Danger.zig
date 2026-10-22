@@ -13,7 +13,6 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
-const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Rule = @import("Rule.zig").Rule;
