@@ -33,6 +33,8 @@ pub const state_machines: Rule = @fromBackingInt(@intCast(1116)); // safe: compi
 pub const diagnostics: Rule = @fromBackingInt(@intCast(1117)); // safe: compiled pack identities are reserved stable u16 values.
 pub const unsafe_set: Rule = @fromBackingInt(@intCast(1118)); // safe: compiled pack identities are reserved stable u16 values.
 pub const cancellation: Rule = @fromBackingInt(@intCast(1119)); // safe: compiled pack identities are reserved stable u16 values.
+/// The danger rules: each finds where a danger exists and aegis's type is the answer.
+pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation };
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
     .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },

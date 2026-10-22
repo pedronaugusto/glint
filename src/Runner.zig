@@ -20,6 +20,7 @@ suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
 escapes: std.ArrayList(Report.Escape) = .empty,
+malformed: std.ArrayList(Report.Malformed) = .empty,
 /// What each of the current file's aegis escapes covered, by its index in `suppressions`.
 covered: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
@@ -65,7 +66,13 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         try runner.config.validate();
         try validateRules(runner.config, definitions);
         const file = &project.files[index];
-        runner.suppressions = try Suppression.parseConfigured(a, file, definitions);
+        var malformed: std.ArrayList(Suppression.Malformed) = .empty;
+        runner.suppressions = try Suppression.parseConfigured(a, file, definitions, &malformed);
+        for (malformed.items) |entry| {
+            runner.complete = false;
+            const start = entry.comment.start;
+            try runner.malformed.append(a, .{ .why = entry.why, .span = .{ .file = runner.file, .start = start, .end = entry.comment.end, .line = entry.comment.line + 1, .column = start - file.lines[entry.comment.line] + 1 } });
+        }
         try runner.coverage.append(a, .{ .file = runner.file, .reason = switch (file.status) {
             .parsed => .parsed,
             .invalid_syntax => .invalid_syntax,
@@ -121,7 +128,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
-    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+    return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
 }
 
 /// Whether a rule of the aegis pack ran on the current file.

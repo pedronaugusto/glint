@@ -75,7 +75,10 @@ test "aegis pack accepts adopted gates, takes only the aegis escape and refuses 
     try std.testing.expectEqual(glint.Config.Level.gate, gated.diagnostics[0].level);
     var invalid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // glint-ignore: A001 -- test\n");
     defer invalid.deinit();
-    try std.testing.expectError(error.MalformedSuppression, glint.runConfigured(std.testing.allocator, &invalid, config, .{ .project_rules = &pack.rules }));
+    var refused = try glint.runConfigured(std.testing.allocator, &invalid, config, .{ .project_rules = &pack.rules });
+    defer refused.deinit();
+    try std.testing.expect(!refused.complete);
+    try std.testing.expectEqual(@as(usize, 1), refused.malformed.len); // safe: fixture count is representable.
     var valid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // aegis: internal: a fixture inspecting the representation to test erasure\n");
     defer valid.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &valid, config, .{ .project_rules = &pack.rules });

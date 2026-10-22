@@ -62,7 +62,9 @@ Text, JSON version 1 and SARIF 2.1.0 share stable rule IDs, source spans, rule v
 const future = @import("future");
 ```
 
-One real comment suppresses one rule at one logical site, either inline or immediately before it. A nonempty written reason is required. Strings, malformed directives and ambiguous multiple sites cannot become silent exemptions. Stale records are counted; strict mode makes them incomplete. Legacy suppression spelling is not silently migrated; that remains a later retirement seam.
+One real comment suppresses one rule at one logical site, either inline or immediately before it. A nonempty written reason is required. Strings and ambiguous multiple sites cannot become silent exemptions; a malformed comment is reported where it is and makes the run incomplete. Stale records are counted; strict mode makes them incomplete.
+
+The aegis pack takes one escape instead, `// aegis: <reason>: <why>`, whose reason is one of `no-danger`, `design`, `hot-loop`, `internal` and `boundary`. It covers the pack's findings on its line, and the report lists each escape with what it covered.
 
 ## Limits and ownership
 
@@ -78,9 +80,4 @@ Run `bay check`, `bay lint`, `bay check-token-portable`, and targeted tests such
 
 MIT. See [LICENSE](LICENSE).
 
-G3 adds optional exploratory aegis reports A001–A005 for the published Secret, SecretBytes,
-Guarded, id, units and integer contracts. They find aegis by its published names under the module `aegis`,
-at any revision (`--module aegis=path/to/src/root.zig`, and each namespace module a revision builds), and
-report a published name that no longer resolves. Select reports or gates explicitly; required unknown sites remain incomplete.
-Work remains in progress: generic/flow coverage, real-defect admission and consumer adoption
-are incomplete. See [design](docs/design.md#published-aegis-reports-g3).
+The aegis pack checks a program against aegis, the family's safety library. A001-A006 check aegis's types used as their contracts say. The danger rules A007-A020 find where a danger exists and aegis's type is the answer: shared state, secrets, input, integers, units, bounded work, contracts, lifetimes, ownership, identity, state machines, diagnostics to peers, the operations Zig leaves unchecked, and cancellation. Each reads what the code resolves to; a site it cannot decide is undecided, never passed. The pack finds aegis by its published names under the module `aegis` and std under `std` (`--module aegis=path/to/src/root.zig`, `--zig-lib-path DIR`). See [design](docs/design.md#published-aegis-reports-g3) and [the danger rules](docs/design.md#danger-rules).

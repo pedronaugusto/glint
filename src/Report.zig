@@ -16,6 +16,9 @@ stale_suppressions: usize,
 stale: []const Stale = &.{},
 /// Each aegis escape that covered a finding, with the findings it covered: what the review reads.
 escapes: []const Escape = &.{},
+/// Each comment that reads as a suppression or an escape and is not one; any makes the run
+/// incomplete.
+malformed: []const Malformed = &.{},
 complete: bool,
 /// Assertion metrics, when the configuration asks for them (`Config.metrics`).
 metrics: ?Metrics = null,
@@ -105,6 +108,7 @@ pub const Stale = struct { name: []const u8, span: Span };
 /// line that it covered.
 pub const Escape = struct { span: Span, reason: []const u8, why: []const u8, covered: []const Covered };
 pub const Covered = struct { name: []const u8, span: Span };
+pub const Malformed = struct { why: []const u8, span: Span };
 pub const Format = enum { text, json, sarif };
 pub const WriteError = std.Io.Writer.Error || error{InvalidProject};
 
@@ -126,6 +130,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 try writer.print("coverage: {s}: {s}: {s}\n", .{ project.inputs[coverage.file.raw()].name, @tagName(coverage.reason), coverage.detail }); // safe: enum identities index their owning frozen tables without narrowing.
             };
             for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.inputs[stale.span.file.raw()].name, stale.span.line, stale.span.column, stale.name }); // safe: enum identities index their owning frozen tables without narrowing.
+            for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.inputs[entry.span.file.raw()].name, entry.span.line, entry.span.column, entry.why }); // safe: enum identities index their owning frozen tables without narrowing.
             for (self.escapes) |escape| {
                 try writer.print("escape: {s}:{d}:{d}: {s}: {s} (", .{ project.inputs[escape.span.file.raw()].name, escape.span.line, escape.span.column, escape.reason, escape.why }); // safe: enum identities index their owning frozen tables without narrowing.
                 for (escape.covered, 0..) |covered, i| try writer.print("{s}{s} at {d}:{d}", .{ if (i == 0) "" else ", ", covered.name, covered.span.line, covered.span.column });
@@ -138,6 +143,11 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             for (self.stale, 0..) |stale, i| {
                 if (i != 0) try writer.writeByte(',');
                 try std.json.Stringify.value(.{ .source = project.inputs[stale.span.file.raw()].name, .rule = stale.name, .line = stale.span.line, .column = stale.span.column }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+            }
+            try writer.writeAll("],\"malformed\":[");
+            for (self.malformed, 0..) |entry, i| {
+                if (i != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(.{ .source = project.inputs[entry.span.file.raw()].name, .line = entry.span.line, .column = entry.span.column, .why = entry.why }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
             }
             try writer.writeAll("],\"escapes\":[");
             for (self.escapes, 0..) |escape, i| {

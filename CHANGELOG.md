@@ -4,6 +4,32 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Breaking
+
+- The aegis pack's danger rules (aegis's design §7, enforcement): each finds the sites where a danger exists and aegis's type is the answer, from what the code resolves to.
+  - A007 shared state: std's synchronization (`Io.Mutex`, `Io.RwLock`, `Io.Condition`, `Io.Semaphore`, `Io.Event`, `atomic.Value`, `atomic.Mutex`), the atomic builtins, a mutable container-level `var`.
+  - A008 secrets: `crypto.secureZero`, `crypto.timing_safe.eql` and `compare`, a std.crypto `SecretKey` or `KeyPair` held by value.
+  - A009 input: a value from outside the program that indexes, slices, bounds a loop or names a `Dir` path before an aegis `input.Untrusted` parser refines it.
+  - A010 integers: every `@intCast`, `@truncate`, `@intFromFloat`, `@enumFromInt` and `@fromBackingInt`, and arithmetic on input that can overflow.
+  - A011 units: time crossing to and from std as a raw integer, and arithmetic with a `std.time` constant.
+  - A012 bounded work: an allocation, a container's growth or a read sized by input, and a read with no limit.
+  - A013 contracts: `std.debug.assert` and every `unreachable` where the program runs.
+  - A014 lifetimes: E001's frame escapes, and a borrow of a std container's storage stored in a field.
+  - A015 ownership: a std `File`, `Dir`, `net.Stream`, `net.Server` or `process.Child` held by value in a field or returned, outside `own.Owned`.
+  - A016 identity: two identifying integers of one type in one public signature or struct.
+  - A017 state machines: an enum field written in two or more functions and switched on.
+  - A018 diagnostics: an error's name written to a writer that reaches a peer.
+  - A019 the unsafe set: `@setRuntimeSafety(false)`, the pointer conversions, `extern`, `asm`, and a local read while still `undefined`.
+  - A020 cancellation: a loop on input or without bound, in a function given an `Io`, that gives that `Io` to nothing.
+- The input and peer facts (`Taint.zig`), computed once for the program: what a `Reader`, `File` or `Dir` read gives, and what a `net.Stream` writer reaches, through locals, captures, fields, the program's own calls by their summaries, and std's data functions. A call that does not resolve makes a sink undecided.
+- One escape for the pack: `// aegis: <reason>: <why>` on the site's line or the line before, the reason `no-danger`, `design`, `hot-loop`, `internal` or `boundary`. It covers every pack finding on its line; a `glint-ignore` naming a pack rule is refused, and the categories of the old pack form go. `Report.escapes` lists each escape with the findings it covered; text prints `escape:` lines and JSON an `escapes` list.
+- P001, P002, P004 and E001 are retired into the pack (A010 and A019, A019, A013, A014), with `// safe:` and `// unreachable:`, `Config.casts` and `Config.cast_scope`.
+- A malformed suppression or escape is reported at its comment (`Report.malformed`; text `suppression: FILE:LINE:COL: malformed: WHY`) and makes the run incomplete, where it ended the run with `error.MalformedSuppression` and no site. `Suppression.parseConfigured` takes the list it appends them to.
+
+### Added
+
+- `Facts.memo`, per-run state a rule computes once for the project, and `Facts.memberUses`, the member accesses of a name across the selected files. `Governed.zig` is the one resolver of a declaration named by its path: P006's and the danger rules'.
+
 ## [0.5.1] - 2026-10-22
 
 ### Fixed

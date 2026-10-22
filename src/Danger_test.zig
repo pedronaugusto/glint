@@ -318,9 +318,12 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     try std.testing.expectEqualStrings("A007", report.escapes[0].covered[0].name);
     try std.testing.expectEqualStrings("A010", report.escapes[1].covered[0].name);
     try std.testing.expectEqual(@as(usize, 1), report.stale.len); // safe: fixture counts are representable.
-    var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // aegis: no-danger: one thread\n", &std_files, &std_imports);
+    var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // glint-ignore: A007 -- no-danger: one thread\n", &std_files, &std_imports);
     defer refused.deinit();
-    try std.testing.expectError(error.MalformedSuppression, glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.shared_state, .level = .gate }} }, .{ .project_rules = &pack.rules }));
+    var rejected = try glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.shared_state, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer rejected.deinit();
+    try std.testing.expect(!rejected.complete);
+    try std.testing.expectEqual(@as(usize, 1), rejected.malformed.len); // safe: fixture count is representable.
 }
 
 test "a std path a rule names that does not resolve is undecided, never passed" {
