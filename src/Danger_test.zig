@@ -380,11 +380,12 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\const std = @import("std");
         \\const aegis = @import("aegis");
         \\const Conn = struct { stream: std.Io.net.Stream, log: ?std.Io.File, dir: *std.Io.Dir, pub fn deinit(c: *Conn) void { c.stream.close(); if (c.log) |l| l.close(); c.log.?.close(); } };
-        \\const Options = struct { cwd: std.Io.Dir, out: std.Io.File };
+        \\const Options = struct { cwd: std.Io.Dir, out: std.Io.File, pub fn run(o: Options) void { const cwd = o.cwd; cwd.close(); } };
+        \\const Log = struct { file: ?std.Io.File = null, pub fn deinit(l: *Log) void { if (l.file) |f| f.close(); } };
         \\pub fn open() !std.Io.File { return undefined; }
         \\pub fn child() std.process.Child { return undefined; }
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
-    , 4);
+    , 5);
 }
 
 test "A016 finds identifying integers of one type meeting, not other integers" {

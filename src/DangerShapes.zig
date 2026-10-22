@@ -40,19 +40,31 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether the file releases something named `name`: `name.close(`, `name.deinit(`, `name.kill(`
-/// or `name.wait(`, through an optional's `.?` too.
+/// Whether the file releases the field `name`: `x.name.close(`, `deinit(`, `kill(` or `wait(`,
+/// through an optional's `.?` too, or through a capture of it (`if (x.name) |f| f.close(`).
+/// A local of the same name is not the field.
 fn released(tree: *const Ast, name: []const u8) bool {
     const tags = tree.tokens.items(.tag);
-    var i: usize = 0;
+    var i: usize = 1;
     while (i + 2 < tags.len) : (i += 1) {
-        if (tags[i] != .identifier or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue;
+        if (tags[i] != .identifier or tags[i - 1] != .period or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue; // aegis: no-danger: token indexes fit u32.
         var at = i + 1;
         if (tags[at] == .period_asterisk or (tags[at] == .period and at + 1 < tags.len and tags[at + 1] == .question_mark)) at += if (tags[at] == .period) 2 else 1;
-        if (at + 1 >= tags.len or tags[at] != .period or tags[at + 1] != .identifier) continue;
-        const method = tree.tokenSlice(@intCast(at + 1));
-        for ([_][]const u8{ "close", "deinit", "kill", "wait" }) |release| if (std.mem.eql(u8, method, release)) return true;
+        if (at + 1 < tags.len and tags[at] == .period and tags[at + 1] == .identifier and release(tree.tokenSlice(@intCast(at + 1)))) return true; // aegis: no-danger: token indexes fit u32.
+        // `(x.name) |capture| ... capture.close(`
+        if (at + 3 < tags.len and tags[at] == .r_paren and tags[at + 1] == .pipe and tags[at + 2] == .identifier and tags[at + 3] == .pipe) {
+            const capture = tree.tokenSlice(@intCast(at + 2)); // aegis: no-danger: token indexes fit u32.
+            var k = at + 4;
+            while (k + 2 < tags.len and k < at + 16) : (k += 1) {
+                if (tags[k] == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(k)), capture) and tags[k + 1] == .period and release(tree.tokenSlice(@intCast(k + 2)))) return true; // aegis: no-danger: token indexes fit u32.
+            }
+        }
     }
+    return false;
+}
+
+fn release(method: []const u8) bool {
+    for ([_][]const u8{ "close", "deinit", "kill", "wait" }) |name| if (std.mem.eql(u8, method, name)) return true;
     return false;
 }
 

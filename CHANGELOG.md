@@ -15,7 +15,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
   - A012 bounded work: an allocation, a container's growth or a read sized by a number from input, and a read with no limit.
   - A013 contracts input reaches: a `std.debug.assert` whose condition holds input, an `unreachable` on a branch input chooses, a `catch` or `orelse unreachable` on a call that reads input or is given it. An invariant no input reaches is the program's to state.
   - A014 lifetimes: E001's frame escapes, and a borrow of a std container's storage stored in a field.
-  - A015 ownership: a std `File`, `Dir`, `net.Stream`, `net.Server` or `process.Child` held by value in a field its file releases, or returned, outside `own.Owned`. A field nothing releases borrows its caller's handle.
+  - A015 ownership: a std `File`, `Dir`, `net.Stream`, `net.Server` or `process.Child` held by value in a field its file releases (on the field itself or a capture of it), or returned, outside `own.Owned`. A field nothing releases borrows its caller's handle.
   - A016 identity: two identifying integers of one type in one public signature or struct.
   - A017 state machines: an enum field written in two or more functions and switched on.
   - A018 diagnostics: an error's name written to a writer that reaches a peer: `net.Stream`'s, and the functions `Config.peer_writers` names (each a module and a declaration path; JSON `peer_writers`).
