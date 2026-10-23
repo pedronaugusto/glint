@@ -7,6 +7,7 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Taint = @import("Taint.zig");
+const Range = @import("Range.zig");
 const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -27,23 +28,25 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             // own table a byte or a hash picks is the table's design, a number's to reach.
             .array_access => {
                 const array, const index = tree.nodeData(node).node_and_node;
+                if (try Range.within(c, c.file, index, array, false)) continue;
                 const least: Taint.Level = if (try Taint.levelAt(c, flow, c.file, array) == .clean) .number else .data;
-                try judged(c, rule, index, try Taint.levelAt(c, flow, c.file, index), least, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
+                try judged(c, rule, index, try ranged(c, flow, index), least, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
             .slice_open, .slice, .slice_sentinel => {
                 const slice = tree.fullSlice(node) orelse continue;
-                try sink(c, flow, rule, slice.ast.start, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
-                if (slice.ast.end.unwrap()) |end| try sink(c, flow, rule, end, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
+                // A bound the program checked against the memory's length is its own.
+                if (!try Range.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
+                if (slice.ast.end.unwrap()) |end| if (!try Range.within(c, c.file, end, slice.ast.sliced, true)) try sink(c, flow, rule, end, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
             },
             // A loop a byte bounds runs a byte's count at most: a number bounds one a peer's way.
-            .for_range => if (tree.nodeData(node).node_and_opt_node[1].unwrap()) |end| try judged(c, rule, end, try Taint.levelAt(c, flow, c.file, end), .number, loop_message),
+            .for_range => if (tree.nodeData(node).node_and_opt_node[1].unwrap()) |end| try judged(c, rule, end, try ranged(c, flow, end), .number, loop_message),
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
                 const condition = loop.ast.cond_expr;
                 if (!comparison(tree.nodeTag(condition))) continue;
                 const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                try judged(c, rule, lhs, try Taint.levelAt(c, flow, c.file, lhs), .number, loop_message);
-                try judged(c, rule, rhs, try Taint.levelAt(c, flow, c.file, rhs), .number, loop_message);
+                try judged(c, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
+                try judged(c, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
@@ -81,17 +84,22 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             // remainder fails on its divisor (zero, or -1 under the minimum).
             .add, .mul, .assign_add, .assign_mul => {
                 if (!site(c, node)) continue;
+                // An address moved by input reaches memory, A009's; no overflow check stops it.
+                if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
+                if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
                 try judged(c, rule, node, level, .number, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
                 if (!site(c, node)) continue;
+                if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try Taint.levelAt(c, flow, c.file, lhs);
                 const right = try Taint.levelAt(c, flow, c.file, rhs);
                 const level: Taint.Level = if (right.reaches(.data) or left.reaches(.number)) .number else left.join(right);
+                if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
                 try judged(c, rule, node, level, .number, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
@@ -111,7 +119,9 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
                 if (args.len != 1) continue;
-                try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, args[0]), .data, try c.allocator.print("{s} of input: a peer's value that does not fit stops the program; aegis int.cast returns the error", .{name}));
+                const level = try Taint.levelAt(c, flow, c.file, args[0]);
+                if (level.reaches(.data) and std.mem.eql(u8, name, "@intCast") and try Range.converts(c, c.file, node, args[0])) continue;
+                try judged(c, rule, node, level, .data, try c.allocator.print("{s} of input: a peer's value that does not fit stops the program; aegis int.cast returns the error", .{name}));
             },
             else => {},
         }
@@ -134,11 +144,13 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         if (!reached.std) continue;
         const name = c.project.models[decl.file.raw()].declarations[decl.index].name;
         const from_reader = if (Taint.readerType(flow)) |r| r.file.eql(decl.file) else false;
-        if (from_reader and std.mem.find(u8, name, "Unlimited") != null) {
+        // A reader over the program's own bytes (`Reader.fixed`) reads no peer's size.
+        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and fixedReader(c, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        if (from_reader and !own and std.mem.find(u8, name, "Unlimited") != null) {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
             continue;
         }
-        for (call.ast.params) |arg| if (from_reader and tree.nodeTag(arg) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "unlimited")) {
+        for (call.ast.params) |arg| if (from_reader and !own and tree.nodeTag(arg) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "unlimited")) {
             try c.at(rule, tree.nodeMainToken(arg), try c.allocator.print("{s}(.unlimited): a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
         };
         const names = try parameters(c, decl);
@@ -147,7 +159,10 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             var sized = false;
             for (sizes) |size| sized = sized or std.mem.eql(u8, names[position], size);
             if (!sized) continue;
-            try judged(c, rule, arg, try Taint.levelAt(c, flow, c.file, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
+            // A size checked against the program's own limit (`if (size > max) return`) is
+            // bounded by it.
+            if (try capped(c, flow, arg)) continue;
+            try judged(c, rule, arg, try ranged(c, flow, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
         }
     }
 }
@@ -221,7 +236,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             var by_input = false;
             if (!unbounded and comparison(tree.nodeTag(cond))) {
                 const lhs, const rhs = tree.nodeData(cond).node_and_node;
-                by_input = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs)).reaches(.number);
+                by_input = (try ranged(c, flow, lhs)).join(try ranged(c, flow, rhs)).reaches(.number);
             }
             if (!unbounded and !by_input) continue;
             if (gives(c, loop.ast.then_expr, @intCast(d))) continue;
@@ -269,6 +284,56 @@ fn gives(c: *Context, body: Ast.Node.Index, d: u32) bool {
 /// cannot tell.
 fn sink(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
     try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
+}
+
+/// Whether a reader is one `Reader.fixed` made: a local it initializes, or a field every
+/// assignment in the file gives one.
+fn fixedReader(c: *Context, receiver: Ast.Node.Index) bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    if (tree.nodeTag(receiver) == .identifier) {
+        const ref = model.reference(receiver) orelse return false;
+        const decl = model.declarations[ref.declaration orelse return false];
+        const variable = tree.fullVarDecl(decl.node) orelse return false;
+        return fixedCall(tree, variable.ast.init_node.unwrap() orelse return false);
+    }
+    if (tree.nodeTag(receiver) != .field_access) return false;
+    const spelled = tree.getNodeSource(receiver);
+    var any = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .assign) continue;
+        const lhs, const rhs = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+        if (!std.mem.eql(u8, tree.getNodeSource(lhs), spelled)) continue;
+        if (!fixedCall(tree, rhs)) return false;
+        any = true;
+    }
+    return any;
+}
+
+/// Whether `node` calls `fixed` (`.fixed(bytes)`, `Reader.fixed(bytes)`).
+fn fixedCall(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    const name = switch (tree.nodeTag(call.ast.fn_expr)) {
+        .enum_literal => tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)),
+        .field_access => tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]),
+        else => return false,
+    };
+    return std.mem.eql(u8, name, "fixed");
+}
+
+/// Whether a comparison holding where `node` is read puts it at most a clean value.
+fn capped(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!bool {
+    for (try Range.ceilings(c, c.file, node)) |limit| if (try Taint.levelAt(c, flow, c.file, limit) == .clean) return true;
+    return false;
+}
+
+/// The level of `node`, a number held to 16 bits read as data: a count a short holds, as a
+/// decode of 16 bits gives (Range.zig).
+fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const level = try Taint.levelAt(c, flow, c.file, node);
+    if (level == .number and try Range.small(c, c.file, node)) return .data;
+    return level;
 }
 
 /// A finding where the value is input at `least` (data, or only a number), undecided where the

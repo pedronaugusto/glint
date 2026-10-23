@@ -574,6 +574,151 @@ test "A010 finds arithmetic on a number from input, not on its bytes" {
     try expect(pack.integers, input_program, 1);
 }
 
+test "A010 leaves what a number's range holds: arithmetic that cannot overflow its type and a conversion its destination holds, from a decode's width, a typed local, @as and a constant" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const scale = 100;
+        \\pub fn f(r: *std.Io.Reader, s: []const u8) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    _ = @as(u64, n) * scale;
+        \\    _ = @as(u64, n) + s.len;
+        \\    const top: u8 = @intCast(n >> 24);
+        \\    _ = @as(i64, n) - 5;
+        \\    const day: u5 = @truncate(n);
+        \\    _ = @as(u16, day) * 32 + 1;
+        \\    _ = top;
+        \\    _ = n + 1;
+        \\    const short: u16 = @intCast(n);
+        \\    _ = short;
+        \\    _ = @as(u64, n) - 5;
+        \\    var total: u64 = 0;
+        \\    total += n;
+        \\}
+    , 4);
+}
+
+test "A010 reads the comparisons that hold where a number is used: an earlier check that leaves, the branch it is in, a position into memory and a remainder spelled out" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !u8 {
+        \\    const offset = try r.takeInt(u64, 0);
+        \\    if (offset > bytes.len) return error.Short;
+        \\    const at: usize = @intCast(offset);
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (n < 8) return error.Small;
+        \\    if (n < 16) return @as(u8, @intCast(n)) - 8 + 90;
+        \\    const hour = try r.takeInt(u32, 0);
+        \\    const min = try r.takeInt(u32, 0);
+        \\    if (min < 60 and hour < 24) {
+        \\        const minutes: i32 = @intCast(hour * 60 + min);
+        \\        _ = minutes;
+        \\    }
+        \\    var to: usize = 0;
+        \\    var out: [64]u8 = undefined;
+        \\    to += try r.takeByte();
+        \\    out[to] = 1;
+        \\    const secs = try r.takeInt(i64, 0);
+        \\    const days = @divFloor(secs, 86400);
+        \\    _ = secs - days * 86400;
+        \\    const size = try r.takeInt(u64, 0);
+        \\    _ = bytes.len - at;
+        \\    _ = size - n;
+        \\    var left = size;
+        \\    if (left < 4) return error.Short;
+        \\    left = n;
+        \\    _ = left - 4;
+        \\    return bytes[at];
+        \\}
+    , 2);
+}
+
+test "A010 reads a call's bound from what its function returns, a conversion's destination from the parameter or field it is given to, and leaves an address moved by input" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Kind = enum { sha1, sha256 };
+        \\fn rawLen(k: Kind) usize {
+        \\    return switch (k) {
+        \\        .sha1 => 20,
+        \\        .sha256 => 32,
+        \\    };
+        \\}
+        \\fn consume(n: u3) void {
+        \\    _ = n;
+        \\}
+        \\const Header = struct { low: u8 };
+        \\pub fn f(r: *std.Io.Reader, data: []const u8, k: Kind, out: [*]u8) !Header {
+        \\    const pos = try r.takeInt(u64, 0);
+        \\    const start: usize = @intCast(@min(pos, data.len));
+        \\    if (start + 40 + rawLen(k) > data.len) return error.Short;
+        \\    const bit = try r.takeInt(u32, 0);
+        \\    _ = 8 - bit % 8;
+        \\    consume(@intCast(bit & 7));
+        \\    _ = out + bit;
+        \\    const month = try r.takeInt(i64, 0);
+        \\    _ = if (month > 2) month - 3 else month + 9;
+        \\    _ = @as(u8, @intCast(bit));
+        \\    return .{ .low = @intCast(bit >> 24) };
+        \\}
+    , 1);
+}
+
+test "A009 leaves a position the program checked against the memory's length, and an index a fixed array's length holds" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const table = [_]u8{ 1, 2, 3, 4 };
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i = try r.takeInt(u32, 0);
+        \\    if (i >= buf.len) return error.Short;
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (n > buf.len) return error.Short;
+        \\    const lim: [16]u8 = @splat(0);
+        \\    _ = lim[i & 15];
+        \\    _ = table[i & 3];
+        \\    _ = buf[0..n];
+        \\    _ = buf[i];
+        \\    const j = try r.takeInt(u32, 0);
+        \\    return buf[j];
+        \\}
+    , 1);
+}
+
+test "A009 reads a parser's checks of a position, and A012 a size checked against the program's limit and a fixed reader's unlimited read" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8, gpa: std.mem.Allocator, max_bytes: u64) !void {
+        \\    const at = try r.takeInt(u32, 0);
+        \\    if (bytes.len - at < 4) return error.Short;
+        \\    _ = bytes[at..][0..2];
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (n > bytes.len - at) return error.Short;
+        \\    _ = bytes[at..][0..n];
+        \\    const want = try r.takeInt(u64, 0);
+        \\    if (want > max_bytes) return error.TooLong;
+        \\    _ = try gpa.alloc(u8, @intCast(want));
+        \\    var fixed: std.Io.Reader = .fixed("abc");
+        \\    _ = try fixed.allocRemaining(gpa, .unlimited);
+        \\    _ = try r.allocRemaining(gpa, .unlimited);
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    try expect(pack.bounded_work, program, 1);
+}
+
+test "a number held to 16 bits bounds a loop and sizes work as data does" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    const low: u16 = @intCast(n);
+        \\    for (0..@as(u16, @intCast(n))) |_| {}
+        \\    _ = try gpa.alloc(u8, low);
+        \\    for (0..n) |_| {}
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 1);
+    try expect(pack.bounded_work, program, 0);
+}
+
 test "A012 finds work sized by a number from input and reads with no limit" {
     try expect(pack.bounded_work, input_program, 2);
 }

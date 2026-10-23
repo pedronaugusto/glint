@@ -917,7 +917,12 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
             // A method gives what its receiver holds; a function outside std, or std's data
             // functions (`mem`, `fmt`, `ascii`, `unicode`, `math`, `base64`), what it is given:
             // a position or a count std finds in data is clean, an integer it decodes a number.
-            if (callee.receiver) |receiver| return dep(c, flow, function, receiver);
+            if (callee.receiver) |receiver| {
+                // A std method that answers a `usize` (a container's `count`, a position it
+                // finds) answers a count of memory the program holds.
+                if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw()) and returnsCount(c, decl)) return .{};
+                return dep(c, flow, function, receiver);
+            }
             var data_function = false;
             if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw())) {
                 if (!flow.data_files.contains(decl.file.raw())) return .{};
