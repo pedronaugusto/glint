@@ -726,6 +726,26 @@ test "A010 reads a value's least and greatest and how two values compare: a chec
     , 5);
 }
 
+test "A010 leaves a shift by a bounded amount, an address moved in place and arithmetic its check already evaluated" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, dst: [*]u8, width: u64) !void {
+        \\    const nb = try r.takeInt(u32, 0);
+        \\    if (nb > 15) return error.Big;
+        \\    const bits: u5 = @intCast(nb);
+        \\    _ = (@as(i32, 1) << bits) + 1;
+        \\    var p = dst;
+        \\    p += nb;
+        \\    const used = try r.takeInt(u64, 0);
+        \\    var name: u64 = 0;
+        \\    if (name > width - used) name = width - used;
+        \\    _ = width - used;
+        \\    const big = try r.takeInt(u32, 0);
+        \\    _ = (@as(u64, 1) << @intCast(big & 63)) * 2;
+        \\}
+    , 2);
+}
+
 test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {
     try expect(pack.integers,
         \\const std = @import("std");

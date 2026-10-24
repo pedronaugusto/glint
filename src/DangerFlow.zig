@@ -85,7 +85,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             .add, .mul, .assign_add, .assign_mul => {
                 if (!site(c, node)) continue;
                 // An address moved by input reaches memory, A009's; no overflow check stops it.
-                if (tag == .add and try Range.addresses(c, c.file, node)) continue;
+                if ((tag == .add or tag == .assign_add) and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
                 if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
@@ -94,7 +94,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
                 if (!site(c, node)) continue;
-                if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
+                if ((tag == .sub or tag == .assign_sub) and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try Taint.levelAt(c, flow, c.file, lhs);
                 const right = try Taint.levelAt(c, flow, c.file, rhs);

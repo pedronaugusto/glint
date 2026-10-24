@@ -148,6 +148,7 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
         else => false,
     };
     const lhs, const rhs = tree.nodeData(node).node_and_node;
+    if (!assigns and try evaluatedBefore(c, file, node)) return true;
     for (pointers) |pointer| {
         const typed = if (assigns) try typeOf(c, file, lhs, pointer, 0) else try typeOf(c, file, node, pointer, 0);
         const int = switch (typed) {
@@ -237,6 +238,62 @@ fn refined(c: *Context, file: Project.FileId, node: Ast.Node.Index, out: Interva
     return if (r.empty()) out else r;
 }
 
+/// Whether arithmetic spelled as `node` was evaluated before it on every path, with nothing it
+/// is made of assigned since: in a comparison that is the condition of a branch or loop `node`
+/// is in, or of an earlier `if` among its blocks' statements (`if (x > w - a) x = w - a`). A
+/// value that overflows stops the program there first, at the site that is read.
+fn evaluatedBefore(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            .fn_decl => break,
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.blockStatements(&buffer, parent).?) |statement| {
+                    if (statement == at) break;
+                    const branch = tree.fullIf(statement) orelse continue;
+                    if (try evaluatedIn(c, file, branch.ast.cond_expr, node)) return true;
+                }
+            },
+            else => {
+                if (tree.fullIf(parent)) |branch| {
+                    if (branch.ast.cond_expr != at and try evaluatedIn(c, file, branch.ast.cond_expr, node)) return true;
+                } else if (tree.fullWhile(parent)) |loop| {
+                    if (loop.ast.cond_expr != at and try evaluatedIn(c, file, loop.ast.cond_expr, node)) return true;
+                }
+            },
+        }
+    }
+    return false;
+}
+
+/// Whether `condition` evaluates arithmetic spelled as `node` whenever it is evaluated: in a
+/// comparison's operands, or the left side of an `and` or `or`, which always runs.
+fn evaluatedIn(c: *Context, file: Project.FileId, condition: Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const tag = tree.nodeTag(condition);
+    switch (tag) {
+        .grouped_expression => return evaluatedIn(c, file, tree.nodeData(condition).node_and_token[0], node),
+        .bool_not => return evaluatedIn(c, file, tree.nodeData(condition).node, node),
+        .bool_and, .bool_or => return evaluatedIn(c, file, tree.nodeData(condition).node_and_node[0], node),
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {},
+        else => return false,
+    }
+    const first = tree.firstToken(condition);
+    const last = tree.lastToken(condition);
+    const wanted = tree.nodeTag(node);
+    for (tree.nodes.items(.tag), 0..) |each, i| {
+        if (each != wanted) continue;
+        const earlier: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(earlier);
+        if (token < first or token > last or !same(tree, earlier, node)) continue;
+        if (try kept(c, file, earlier, condition, node)) return true;
+    }
+    return false;
+}
+
 /// Whether `node` is arithmetic on a pointer (`ptr + i`): an address, which no checked
 /// overflow stops.
 pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
@@ -302,19 +359,18 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
         },
         .shl, .assign_shl, .assign_shl_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            const by = literal(tree, rhs) orelse return .any;
-            if (by >= 128) return .any;
-            const out = (try bound(c, file, lhs, pointer, next)).times(.exactly(@as(i132, 1) << @intCast(by)));
+            const by = try shift(c, file, rhs, pointer, next);
+            if (by.most >= 128) return .any;
+            const out = (try bound(c, file, lhs, pointer, next)).times(.{ .least = @as(i132, 1) << @intCast(by.least), .most = @as(i132, 1) << @intCast(by.most) });
             // `<<` drops the bits it shifts out: a product past the type is not the value.
-            if (tree.nodeTag(node) == .shl and !out.within((try typeOf(c, file, node, pointer, next)).values())) return .any;
+            if (tree.nodeTag(node) != .assign_shl_sat and !out.within((try typeOf(c, file, node, pointer, next)).values())) return .any;
             return out;
         },
         .shr => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const left = try bound(c, file, lhs, pointer, next);
-            const by = literal(tree, rhs) orelse return if (left.least >= 0) .{ .least = 0, .most = left.most } else .{ .least = @min(left.least, 0), .most = @max(left.most, 0) };
-            const shift: u8 = @intCast(@min(by, 131));
-            return .{ .least = left.least >> shift, .most = left.most >> shift };
+            const by = try shift(c, file, rhs, pointer, next);
+            return shiftedRight(left, by);
         },
         .bit_and => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -357,6 +413,24 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             };
         },
     }
+}
+
+/// The bits a shift moves by: a shift amount is never below zero, and past 131 every bit is gone.
+fn shift(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!Interval {
+    const tree = &c.project.files[file.raw()].tree;
+    const by: Interval = if (literal(tree, node)) |k| .exactly(k) else try bound(c, file, node, pointer, depth);
+    const out = by.meet(.{ .least = 0, .most = 131 });
+    return if (out.empty()) .{ .least = 0, .most = 131 } else out;
+}
+
+/// A value shifted right by `by` bits: toward zero, further the more it shifts.
+fn shiftedRight(value: Interval, by: Interval) Interval {
+    const fewest: u8 = @intCast(by.least);
+    const furthest: u8 = @intCast(by.most);
+    return .{
+        .least = if (value.least >= 0) value.least >> furthest else value.least >> fewest,
+        .most = if (value.most >= 0) value.most >> fewest else value.most >> furthest,
+    };
 }
 
 /// What one of several operands gives (the branches of an `if` or a `switch`, the sides of an
@@ -692,15 +766,11 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
     if (is(name, &.{"@mod"})) return rest(left, right, true);
     if (is(name, &.{"@rem"})) return rest(left, right, false);
     if (is(name, &.{"@shlExact"})) {
-        const by = literal(tree, args[1]) orelse return .any;
-        if (by >= 128) return .any;
-        return left.times(.exactly(@as(i132, 1) << @intCast(by)));
+        const by = try shift(c, file, args[1], pointer, depth);
+        if (by.most >= 128) return .any;
+        return left.times(.{ .least = @as(i132, 1) << @intCast(by.least), .most = @as(i132, 1) << @intCast(by.most) });
     }
-    if (is(name, &.{"@shrExact"})) {
-        const by = literal(tree, args[1]) orelse return .any;
-        const shift: u8 = @intCast(@min(by, 131));
-        return .{ .least = left.least >> shift, .most = left.most >> shift };
-    }
+    if (is(name, &.{"@shrExact"})) return shiftedRight(left, try shift(c, file, args[1], pointer, depth));
     return .any;
 }
 
