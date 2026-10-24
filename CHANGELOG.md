@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-24
+
 ### Breaking
 
 - `Project.InitError` and `RunError` gain `error.Canceled`, which `Project.init` and `runConfigured` return when their `Options.io` reports a cancel. A switch over either names it.
