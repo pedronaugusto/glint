@@ -1632,8 +1632,13 @@ fn rest(dividend: Interval, divisor: Interval, modulo: bool) Interval {
     };
 }
 
-/// A comparison that holds where a value is read: `small` below `large`, or at most it.
-const Fact = struct { small: Ast.Node.Index, large: Ast.Node.Index, strict: bool };
+/// A comparison that holds where a value is read: `small` below `large`, or at most it, with
+/// the stores on the way that moved what it compares by an amount.
+const Fact = struct { small: Ast.Node.Index, large: Ast.Node.Index, strict: bool, moved: []const Moved = &.{} };
+
+/// A store on every path from a comparison to a read that adds `by` to `target` (takes it away
+/// where `!adds`): what the comparison said of `target` it says there of `target` less `by`.
+const Moved = struct { store: Ast.Node.Index, target: Ast.Node.Index, by: Ast.Node.Index, adds: bool };
 
 /// The comparisons holding at each node, gathered once.
 const Held = struct {
@@ -1737,7 +1742,9 @@ fn held(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition:
         },
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
             const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            if (!try kept(c, file, lhs, condition, use) or !try kept(c, file, rhs, condition, use)) return;
+            var moved: std.ArrayList(Moved) = .empty;
+            if (!try carried(c, file, lhs, condition, use, &moved) or !try carried(c, file, rhs, condition, use, &moved)) return;
+            const shifts = try moved.toOwnedSlice(c.allocator);
             const facts_of: []const Fact = switch (tag) {
                 .less_than => if (truth) &.{.{ .small = lhs, .large = rhs, .strict = true }} else &.{.{ .small = rhs, .large = lhs, .strict = false }},
                 .less_or_equal => if (truth) &.{.{ .small = lhs, .large = rhs, .strict = false }} else &.{.{ .small = rhs, .large = lhs, .strict = true }},
@@ -1754,7 +1761,9 @@ fn held(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition:
                     &.{},
                 else => unreachable,
             };
+            const start = out.items.len;
             try out.appendSlice(c.allocator, facts_of);
+            for (out.items[start..]) |*each| each.moved = shifts;
         },
         else => {},
     }
@@ -1814,6 +1823,84 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
         else => {},
     };
     return true;
+}
+
+/// Whether what `compared` is at `condition` is still known at `use`: nothing between them stores
+/// into what it is made of, or only stores on every path between that add an amount to a name or
+/// field it is spelled with (`at += n` past `if (buf.len - at < n) return`), which `moved` gathers.
+fn carried(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: Ast.Node.Index, use: Ast.Node.Index, moved: *std.ArrayList(Moved)) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    if (literal(tree, compared) != null) return true;
+    const from = tree.lastToken(condition);
+    const to = tree.firstToken(use);
+    if (to <= from) return true;
+    const after = continued(c, file, condition);
+    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(assignment);
+            if (token <= from or token >= to) continue;
+            if (after) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
+            const target, const by = tree.nodeData(assignment).node_and_node;
+            if (!mentions(tree, compared, target)) continue;
+            if ((tag != .assign_add and tag != .assign_sub) or !try movable(c, file, assignment, condition, use)) return false;
+            for (moved.items) |each| {
+                if (each.store == assignment) break;
+            } else try moved.append(c.allocator, .{ .store = assignment, .target = target, .by = by, .adds = tag == .assign_add });
+        },
+        else => {},
+    };
+    return true;
+}
+
+/// A loop's continue expression, where `condition` is the loop's condition: it runs after the
+/// body, before the condition is read again.
+fn continued(c: *Context, file: Project.FileId, condition: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = condition;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .grouped_expression) continue;
+        const loop = tree.fullWhile(parent) orelse return null;
+        return if (loop.ast.cond_expr == at) loop.ast.cont_expr.unwrap() else null;
+    }
+    return null;
+}
+
+/// Whether `store` runs on every path from `condition` to `use`, once: a statement of a block
+/// `use` is in, in no loop `condition` is not in, adding an amount nothing changes before `use`
+/// to a name or field that is not part of it.
+fn movable(c: *Context, file: Project.FileId, store: Ast.Node.Index, condition: Ast.Node.Index, use: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const target, const by = tree.nodeData(store).node_and_node;
+    switch (tree.nodeTag(bare(tree, target))) {
+        .identifier, .field_access => {},
+        else => return false,
+    }
+    if (mentions(tree, by, target)) return false;
+    const block = model.node_parents[@backingInt(store)] orelse return false;
+    switch (tree.nodeTag(block)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+        else => return false,
+    }
+    if (!encloses(model, block, use)) return false;
+    var up = store;
+    while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) break;
+        if (tree.fullWhile(parent) == null and tree.fullFor(parent) == null) continue;
+        if (!encloses(model, parent, condition)) return false;
+    }
+    return kept(c, file, by, store, use);
+}
+
+/// Whether `outer` is `node` or holds it.
+fn encloses(model: anytype, outer: Ast.Node.Index, node: Ast.Node.Index) bool {
+    var at = node;
+    while (true) {
+        if (at == outer) return true;
+        at = model.node_parents[@backingInt(at)] orelse return false;
+    }
 }
 
 /// Whether `whole` is spelled with `part`'s tokens in a row: a name or field it reads.
@@ -2140,11 +2227,30 @@ fn relations(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
         var difference: Linear = .{};
         if (!difference.put(tree, fact.large, false) or !difference.put(tree, fact.small, true)) continue;
         difference.constant -|= @intFromBool(fact.strict);
+        if (!carriedOver(tree, &difference, fact.moved)) continue;
         try out.append(c.allocator, difference);
     }
     const found = try out.toOwnedSlice(c.allocator);
     try memo.relations.put(c.allocator, key, found);
     return found;
+}
+
+/// `difference`, said of what it compares before the stores that moved it, said after them: a
+/// term a store added `by` to stands for itself less `by`. False where a store moved something
+/// that is no whole term.
+fn carriedOver(tree: *const Ast, difference: *Linear, moved: []const Moved) bool {
+    for (moved) |each| {
+        const text = spelled(tree, each.target);
+        var signs: [Linear.max_terms]bool = undefined;
+        var count: usize = 0;
+        for (difference.terms[0..difference.len]) |t| if (!t.length and std.mem.eql(u8, t.text, text)) {
+            signs[count] = t.negative;
+            count += 1;
+        };
+        if (count == 0) return false;
+        for (signs[0..count]) |negative| if (!difference.put(tree, each.by, negative != each.adds)) return false;
+    }
+    return true;
 }
 
 /// The relations what `value` is made of gives where it is read: a call's result (or a constant

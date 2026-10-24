@@ -901,6 +901,37 @@ test "A009 judges a loop by its bound, not by a counter it raises toward it on e
     , 0);
 }
 
+test "A009 carries a check past a store on every path that advances what it compares, not one in a branch or in a loop the check is outside" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: []u8) !void {
+        \\    var at: usize = try r.takeInt(u32, 0);
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (at > out.len) return error.X;
+        \\    if (out.len - at < n) return error.Short;
+        \\    at += n;
+        \\    _ = out[at..];
+        \\    if (out.len - at < 4) return error.Short;
+        \\    _ = out[at..][0..4];
+        \\    at += 4;
+        \\    _ = out[at..];
+        \\    if (n > 0) at += 1;
+        \\    _ = out[at..];
+        \\    var p: usize = try r.takeInt(u32, 0);
+        \\    while (p + 4 <= out.len) {
+        \\        p += 4;
+        \\        _ = out[p..];
+        \\    }
+        \\    var q: usize = try r.takeInt(u32, 0);
+        \\    if (q + 4 > out.len) return error.Short;
+        \\    while (n > 9) {
+        \\        q += 4;
+        \\        _ = out[q..];
+        \\    }
+        \\}
+    , 3);
+}
+
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
