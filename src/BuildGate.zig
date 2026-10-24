@@ -2,6 +2,7 @@
 const std = @import("std");
 const glint = @import("glint");
 const ensign = @import("ensign");
+const aegis = @import("aegis");
 
 pub fn accepted(a: std.mem.Allocator, receipt: []const u8, nonce: []const u8, status: u8, output: []const u8) !bool {
     if (!try glint.Completion.verify(a, receipt, nonce, status, output)) return false;
@@ -59,7 +60,7 @@ fn execute(init: std.process.Init, gate: Gate) !u8 {
         .exited => |code| code,
         else => return 2,
     };
-    const receipt = try std.Io.Dir.cwd().readFileAlloc(init.io, receipt_path, a, .limited(64 * 1024));
+    const receipt = try aegis.own.readFile(init.io, std.Io.Dir.cwd(), receipt_path, a, .fromRaw(64 * 1024));
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     try output.interface.writeAll(result.stdout);

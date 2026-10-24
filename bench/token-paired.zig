@@ -3,15 +3,18 @@ const std = @import("std");
 const fast = @import("glint").token;
 const old = @import("baseline");
 const Stats = @import("allocations.zig");
+const aegis = @import("aegis");
+/// The longest manifest or source a run reads: far past any corpus file.
+const max_source = 64 * 1024 * 1024;
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
     var inputs: std.ArrayList([:0]const u8) = .empty;
     if (args.len > 1) {
-        const manifest = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], a, .unlimited);
+        const manifest = try aegis.own.readFile(init.io, std.Io.Dir.cwd(), args[1], a, .fromRaw(max_source));
         var lines = std.mem.tokenizeScalar(u8, manifest, '\n');
-        while (lines.next()) |path| try inputs.append(a, try std.Io.Dir.cwd().readFileAllocOptions(init.io, path, a, .unlimited, .of(u8), 0));
+        while (lines.next()) |path| try inputs.append(a, try aegis.own.readFileSentinel(init.io, std.Io.Dir.cwd(), path, a, .fromRaw(max_source), 0));
     } else try inputs.append(a, "const dep = @import(\"dep\"); pub fn f() void { _ = dep.read; }");
     var bytes: usize = 0;
     var imports: usize = 0;

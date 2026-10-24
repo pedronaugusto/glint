@@ -125,8 +125,9 @@ pub const Flow = struct {
     stream: ?Facts.Container = null,
     /// The functions the configuration declares write to a peer.
     peer_writers: std.ArrayList(Facts.Decl) = .empty,
-    /// std's `process.run`, whose result holds a child's output.
-    run: std.ArrayList(Facts.Decl) = .empty,
+    /// Functions whose result is what they read: std's `process.run`, which holds a child's output,
+    /// and aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`.
+    reads: std.ArrayList(Facts.Decl) = .empty,
     /// Reads the program declares its own by an escape on their line, as file and token.
     owned: std.array_hash_map.Auto(Owned, void) = .empty,
     /// Per file, the lines an aegis escape stands on.
@@ -194,7 +195,10 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
         const found_writers = (try Governed.declarations(c, declared.module, declared.declaration)) orelse (try Governed.declarationsOfPackage(c, declared.module, declared.declaration)) orelse &.{};
         for (found_writers) |decl| try flow.peer_writers.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     }
-    for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.run.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+    for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+    for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
+        for ((try Governed.declarations(c, "aegis", path)) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+    }
     for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try reach(c, &flow.std_files, mapping.target);
     for ([_][]const u8{ "mem", "fmt", "ascii", "unicode", "math", "base64" }) |namespace| {
         for ((try Governed.declarations(c, "std", namespace)) orelse &.{}) |decl| {
@@ -618,6 +622,12 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
     };
     out.decl = decl;
     if (flow.aegis_files.contains(decl.file.raw())) {
+        // aegis's whole-file reads give a file's bytes, as std's do.
+        const origin = (try c.facts.origin(decl)) orelse decl;
+        for (flow.reads.items) |read| if (std.meta.eql(read, origin)) {
+            out.kind = .source;
+            return out;
+        };
         out.kind = .aegis;
         return out;
     }
@@ -646,7 +656,7 @@ fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.
     const file = decl.file;
     switch (flow.fact) {
         .input => {
-            for (flow.run.items) |run| if (std.meta.eql(run, decl)) return true;
+            for (flow.reads.items) |read| if (std.meta.eql(read, decl)) return true;
             if (flow.reader) |reader| if (reader.file.eql(file)) {
                 for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
             };

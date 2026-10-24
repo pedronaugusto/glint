@@ -217,7 +217,11 @@ pub fn addLint(b: *std.Build, executable: *std.Build.Step.Compile, options: Lint
         .root_source_file = module.root_source_file.?.dirname().path(b, "BuildGate.zig"),
         .target = b.graph.host,
         .optimize = .fast,
-        .imports = &.{ .{ .name = "glint", .module = module }, .{ .name = "ensign", .module = module.import_table.get("ensign") orelse @panic("glint must import ensign") } },
+        .imports = &.{
+            .{ .name = "glint", .module = module },
+            .{ .name = "ensign", .module = module.import_table.get("ensign") orelse @panic("glint must import ensign") },
+            .{ .name = "aegis", .module = module.import_table.get("aegis") orelse @panic("glint must import aegis") },
+        },
     }) });
     const run = b.addRunArtifact(gate);
     run.addArtifactArg2(executable, .{});

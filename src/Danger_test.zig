@@ -527,10 +527,13 @@ test "A009 finds input that indexes or slices input, names a path, and a number 
     try expect(pack.untrusted_input, input_program, 6);
 }
 
-test "A009's input is a child's output and a file's contents, never the path or allocator a read is given, nor a read the program declares its own" {
+test "A009's input is a child's output and a file's contents, aegis's whole-file read's too, never the path or allocator a read is given, nor a read the program declares its own" {
     const program =
         \\const std = @import("std");
+        \\const aegis = @import("aegis");
         \\pub fn load(dir: std.Io.Dir, gpa: std.mem.Allocator, table: []const u8, name: []const u8) !u8 {
+        \\    const whole = try aegis.own.readFile(null, dir, name, gpa, .fromRaw(100));
+        \\    _ = whole[whole[0]];
         \\    const bytes = try dir.readFileAlloc(null, name, gpa, 100);
         \\    const mine = try dir.readFileAlloc(null, "receipt", gpa, 100); // aegis: internal: the receipt this program wrote
         \\    const out = try std.process.run(gpa, null, .{});
@@ -540,7 +543,7 @@ test "A009's input is a child's output and a file's contents, never the path or 
         \\    return out.stdout[out.stdout[0]];
         \\}
     ;
-    try expect(pack.untrusted_input, program, 2);
+    try expect(pack.untrusted_input, program, 3);
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .gate }} }, .{ .project_rules = &pack.rules });

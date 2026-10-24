@@ -30,9 +30,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
+- The input fact starts at aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`, as at std's `Dir.readFileAlloc`: a file's bytes are input whichever reads them.
 - A003 reads `SecretBytes.Writer.init(&owner)` as a borrow of the owner, as a guard's lend is: the writer releases nothing and the owner keeps its release (`errdefer`, `return`), so secret text read from a stream into the owner through its writer is decided.
 - Fixes: a finding may carry edits of its file (`Diagnostic.fix`, `RuleContext.fixedAt`), and `glint.Fix.apply` gives each file's bytes after a run's fixes. A013 makes its sites' `std.debug.assert(c)` `aegis.assert.invariant(c, "c")` (through a private alias too, the aegis import added); a pack finding's line that states its reason the older way (`// safe: why`, `// unreachable: why`) gets the escape, as does the pack's old suppression (`// glint-ignore: A001 -- design: why`, its category the reason); an escape that covers nothing is removed. `--fix` applies them; the report is the run before.
 - `Facts.memo(T)`, per-run state a rule computes once for the project, its type its key, and `Facts.memberUses`, the member accesses of a name across the selected files. `Governed.zig` is the one resolver of a declaration named by its path: P006's and the danger rules'.
+
+### Fixed
+
+- The command line and the build gate read a file whole through `aegis.own.readFile`, so a cancel that lands on the file's length is returned: std's `Dir.readFileAlloc` read on.
 
 ## [0.6.0] - 2026-10-24
 

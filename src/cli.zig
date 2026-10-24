@@ -55,7 +55,7 @@ const Loader = struct {
             };
             if (!permitted) return error.ImportOutsideRoots;
         }
-        const read = try std.Io.Dir.cwd().readFileAllocOptions(self.io, canonical, self.a, .limited(16 * 1024 * 1024), .@"1", 0);
+        const read = try aegis.own.readFileSentinel(self.io, std.Io.Dir.cwd(), canonical, self.a, .fromRaw(16 * 1024 * 1024), 0);
         // A file's bytes are input until the project's budget has taken them.
         const source = try aegis.input.Untrusted([:0]const u8).init(read).parse(self, Loader.take);
         const bytes = source.bytes;
@@ -209,7 +209,7 @@ pub const Arguments = struct {
 fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: []const Rule.Definition) !Options {
     var result: Options = .{ .format = arguments.format, .zig_lib_path = arguments.zig_lib_path };
     if (arguments.config) |path| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4 * 1024 * 1024));
+        const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
         // A configuration file is the checked repository's content: input until parsed.
         result.config = try aegis.input.Untrusted([]const u8).init(bytes).parse(Configuring{ .a = a, .definitions = definitions }, configure);
     } else if (arguments.reviewed) {
@@ -233,7 +233,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
     for (arguments.files_from) |from| {
-        const read = try std.Io.Dir.cwd().readFileAlloc(io, from, a, .limited(4 * 1024 * 1024));
+        const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024));
         const list = try aegis.input.Untrusted([]const u8).init(read).parse(a, fileList);
         try result.files.appendSlice(a, list.paths);
     }
