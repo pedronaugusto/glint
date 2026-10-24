@@ -453,11 +453,25 @@ fn stepped(c: *Context, file: Project.FileId, loop: Ast.full.While, target: Ast.
 /// overflow stops.
 pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
-    const lhs = tree.nodeData(node).node_and_node[0];
-    return switch (try c.facts.resolve(file, bare(tree, lhs))) {
-        .pointer => true,
-        else => false,
-    };
+    return pointerTo(c, file, tree.nodeData(node).node_and_node[0], 0);
+}
+
+/// Whether `node` is a pointer: one it resolves to, an address moved from one (`out.ptr + o`),
+/// or a name with no type of its own given one.
+fn pointerTo(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > depth_limit) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, node);
+    if (try c.facts.resolve(file, at) == .pointer) return true;
+    switch (tree.nodeTag(at)) {
+        .add, .sub, .add_wrap, .sub_wrap => return pointerTo(c, file, tree.nodeData(at).node_and_node[0], depth + 1),
+        .identifier => {
+            const ref = c.project.models[file.raw()].reference(at) orelse return false;
+            const init = (try untyped(c, .{ .file = file, .index = ref.declaration orelse return false })) orelse return false;
+            return pointerTo(c, file, init, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// What an expression's own operation gives, before its type and the comparisons narrow it.
@@ -2094,6 +2108,10 @@ fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, p
     for (try relations(c, file, at)) |each| known.add(each);
     const direct = known.len;
     try definitions(c, file, value, at, pointer, &known);
+    // The names that equal their initializers spelled out, for a second reading below; what the
+    // initializers are made of relates too (`taken.len` is `@min(piece.len, left)`).
+    const spelled_value = try expanded(c, file, value, at);
+    if (spelled_value) |v| try definitions(c, file, v, at, pointer, &known);
     // What the relations just read are made of relates too, one step further (`x.pos <= x.end`
     // brings `x.end <= x.buf.len`).
     const read = known.len;
@@ -2104,11 +2122,8 @@ fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, p
     // relations alike: a check of `end - header_len` speaks of `bytes.len - k` where `end` still
     // holds `data_end`, and `data_end` is `bytes.len - k`.
     var spelled_out: Known = .{};
-    var any = false;
-    const flat = if (try expanded(c, file, value, at)) |v| blk: {
-        any = true;
-        break :blk v;
-    } else value;
+    var any = spelled_value != null;
+    const flat = spelled_value orelse value;
     for (holding) |relation| spelled_out.add(if (try expanded(c, file, relation, at)) |r| blk: {
         any = true;
         break :blk r;
@@ -2325,7 +2340,8 @@ fn carriedOver(tree: *const Ast, difference: *Linear, moved: []const Moved) bool
 
 /// The relations what `value` is made of gives where it is read: a call's result (or a constant
 /// holding one) relates to the call's arguments by its function's summary, while nothing an
-/// argument is made of is assigned since; a local that only grows is at least its initializer.
+/// argument is made of is assigned since; `@min` is at most each operand and `@max` at least
+/// each; a local that only grows is at least its initializer.
 fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, pointer: u16, out: *Known) Context.Error!void {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
@@ -2360,6 +2376,18 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
             }
             source = unwrapped(tree, init);
             named_by = source;
+        }
+        if (tree.nodeTag(source) == .builtin_call_two or tree.nodeTag(source) == .builtin_call_two_comma) {
+            const name = tree.tokenSlice(tree.nodeMainToken(source));
+            const lower = std.mem.eql(u8, name, "@min");
+            if (!lower and !std.mem.eql(u8, name, "@max")) continue;
+            var args_buffer: [2]Ast.Node.Index = undefined;
+            for (Facts.builtinArgs(tree, source, &args_buffer)) |arg| {
+                if (named_by) |given_by| if (!try kept(c, file, arg, given_by, at)) continue;
+                var difference: Linear = .{};
+                if (difference.put(tree, if (lower) arg else node, false) and difference.put(tree, if (lower) node else arg, true)) out.add(difference);
+            }
+            continue;
         }
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, source) orelse continue;

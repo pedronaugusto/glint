@@ -972,6 +972,28 @@ test "A010 reads a private function's parameter by what its calls give it, not a
     , 3);
 }
 
+test "A010 reads @min as at most each operand and @max as at least each, and an address moved from a name that holds one" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, piece: []const u8, in: []const u8, out: []u8) !void {
+        \\    var left = try r.takeInt(u64, 0);
+        \\    const taken = piece[0..@intCast(@min(@as(u64, piece.len), left))];
+        \\    left -= taken.len;
+        \\    const ip = try r.takeInt(u32, 0);
+        \\    if (ip > in.len) return error.Short;
+        \\    const wanted = try r.takeInt(u32, 0);
+        \\    const n = @min(in.len - ip, wanted);
+        \\    _ = in.len - ip - n;
+        \\    _ = wanted - n;
+        \\    const k = @max(wanted, ip);
+        \\    _ = k - ip;
+        \\    _ = ip - n;
+        \\    const m = out.ptr + ip;
+        \\    _ = m - wanted;
+        \\}
+    , 1);
+}
+
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
