@@ -4,6 +4,14 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Breaking
+
+- `Project.InitError` and `RunError` gain `error.Canceled`, which `Project.init` and `runConfigured` return when their `Options.io` reports a cancel. A switch over either names it.
+
+### Added
+
+- `Project.Options.io` and `runConfigured`'s `Options.io`: the caller's `Io`, asked for a cancel before each file is parsed and lowered and before each file's rules run, so a canceled analysis ends with `Canceled` at the next file where it ran the whole project out. The command line passes its own. Without one, nothing is asked, as before.
+
 ## [0.5.2] - 2026-10-24
 
 ### Changed

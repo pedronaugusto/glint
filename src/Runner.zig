@@ -23,8 +23,15 @@ complete: bool = true,
 definitions: []const rules.Definition = &.{},
 file: Project.FileId = Project.FileId.fromRaw(0), // safe: validated file identities and budgeted std source indexes fit u32.
 
-pub const RunError = Suppression.ParseError || Context.Error;
-pub const Options = struct { project_rules: []const Context.Rule = &.{}, files: []const FileConfig = &.{} };
+pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
+pub const Options = struct {
+    project_rules: []const Context.Rule = &.{},
+    files: []const FileConfig = &.{},
+    /// The caller's `Io`, asked for a cancel before each file's rules run:
+    /// a canceled run is `Canceled`. Null: none is asked, and a canceller
+    /// waits for the whole project.
+    io: ?std.Io = null,
+};
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
 pub fn run(gpa: std.mem.Allocator, project: *const Project, config: rules.Config) RunError!Report {
@@ -54,6 +61,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     var total: Report.Metrics.Counts = .{};
     for (project.inputs, 0..) |input, index| {
         if (!input.selected) continue;
+        if (options.io) |io| try io.checkCancel();
         runner.file = Project.FileId.fromRaw(@intCast(index)); // safe: validated file identities and budgeted std source indexes fit u32.
         runner.config = config;
         for (options.files) |setting| if (setting.file.eql(runner.file)) {
