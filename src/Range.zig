@@ -215,6 +215,7 @@ fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, 
     if (out.empty()) out = typed;
     out = try refined(c, file, node, out, pointer, depth);
     try memo.map.put(c.allocator, key, out);
+    try keep(c, .{ .bounds = key });
     return out;
 }
 
@@ -475,6 +476,7 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
     }
     const result = out orelse Interval.any;
     try memo.map.put(c.allocator, key, result);
+    try keep(c, .{ .returns = key });
     return result;
 }
 
@@ -578,6 +580,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
         break :read out orelse .any;
     };
     try stores.ranges.put(c.allocator, key, result);
+    try keep(c, .{ .ranges = key });
     return result;
 }
 
@@ -610,6 +613,19 @@ fn siblings(c: *Context, decl: Facts.Decl) Context.Error![]const Sibling {
     const container = tree.fullContainerDecl(&buffer, model.scopes[record.scope].node) orelse return &.{};
     if (container.layout_token != null or stores.viewed.contains(.{ decl.file.raw(), record.scope })) return &.{};
     if (stores.by_name.get(record.name) != null) return &.{};
+    const proving = try c.facts.memo(Proving);
+    proving.depth += 1;
+    const found = prove: {
+        defer proving.depth -= 1;
+        break :prove try siblingsOf(c, stores, decl, tree, model, record);
+    };
+    try stores.siblings.put(c.allocator, decl, found);
+    try keep(c, .{ .siblings = decl });
+    try endProof(c);
+    return found;
+}
+
+fn siblingsOf(c: *Context, stores: *Stores, decl: Facts.Decl, tree: *const Ast, model: anytype, record: anytype) Context.Error![]const Sibling {
     var out: std.ArrayList(Sibling) = .empty;
     for (model.declarations, 0..) |other, o| {
         if (other.kind != .field or other.scope != record.scope or o == decl.index) continue;
@@ -621,9 +637,50 @@ fn siblings(c: *Context, decl: Facts.Decl) Context.Error![]const Sibling {
         const k = (try siblingLeast(c, stores, decl, .{ .file = decl.file, .index = @intCast(o) }, length_of)) orelse continue;
         try out.append(c.allocator, .{ .decl = .{ .file = decl.file, .index = @intCast(o) }, .name = other.name, .length = length_of, .least = k });
     }
-    const found = try out.toOwnedSlice(c.allocator);
-    try stores.siblings.put(c.allocator, decl, found);
-    return found;
+    return out.toOwnedSlice(c.allocator);
+}
+
+/// Relations being proved: while one is, a reading rests on its placeholder (no relation yet).
+/// What it finds is kept for the proof, which reads it again and again, and dropped when the
+/// outermost proof ends, so it is read again with the relations proved.
+const Proving = struct {
+    depth: u32 = 0,
+    kept: std.ArrayList(Kept) = .empty,
+
+    /// A result kept during a proof, by the memo it is in.
+    const Kept = union(enum) {
+        bounds: struct { u32, u32, u16 },
+        returns: struct { Facts.Decl, u16 },
+        ranges: struct { Facts.Decl, u16 },
+        constants: struct { Facts.Decl, u16 },
+        locals: struct { Facts.Decl, u16 },
+        grows: struct { Facts.Decl, u16 },
+        siblings: Facts.Decl,
+        summaries: Facts.Decl,
+    };
+};
+
+/// Notes a result just kept, to be dropped when the proof it was read in ends.
+fn keep(c: *Context, result: Proving.Kept) Context.Error!void {
+    const proving = try c.facts.memo(Proving);
+    if (proving.depth > 0) try proving.kept.append(c.allocator, result);
+}
+
+/// Drops what the proofs kept, once the outermost has ended.
+fn endProof(c: *Context) Context.Error!void {
+    const proving = try c.facts.memo(Proving);
+    if (proving.depth > 0) return;
+    for (proving.kept.items) |each| switch (each) {
+        .bounds => |key| _ = (try c.facts.memo(Bounds)).map.remove(key),
+        .returns => |key| _ = (try c.facts.memo(Returns)).map.remove(key),
+        .ranges => |key| _ = (try c.facts.memo(Stores)).ranges.remove(key),
+        .constants => |key| _ = (try c.facts.memo(Constants)).bounds.remove(key),
+        .locals => |key| _ = (try c.facts.memo(Constants)).locals.remove(key),
+        .grows => |key| _ = (try c.facts.memo(Constants)).grows.remove(key),
+        .siblings => |key| _ = (try c.facts.memo(Stores)).siblings.remove(key),
+        .summaries => |key| _ = (try c.facts.memo(Summaries)).map.remove(key),
+    };
+    proving.kept.clearRetainingCapacity();
 }
 
 /// The least `g - f` (or `g.len - f`) every store of either leaves, or null where one does not
@@ -935,6 +992,7 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
     try memo.bounds.put(c.allocator, key, .any);
     const out = try bound(c, decl.file, init, pointer, 0);
     try memo.bounds.put(c.allocator, key, out);
+    try keep(c, .{ .constants = key });
     return out;
 }
 
@@ -1011,6 +1069,7 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
         out = if (out) |o| o.join(value) else value;
     } else out orelse .any;
     try memo.locals.put(c.allocator, key, result);
+    try keep(c, .{ .locals = key });
     return result;
 }
 
@@ -1837,6 +1896,7 @@ fn summary(c: *Context, decl: Facts.Decl) Context.Error![]const Relation {
     }
     const found = try out.toOwnedSlice(c.allocator);
     try memo.map.put(c.allocator, origin, found);
+    try keep(c, .{ .summaries = origin });
     return found;
 }
 
@@ -1893,6 +1953,7 @@ fn grows(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!bool {
         }
     } else true;
     try memo.grows.put(c.allocator, key, out);
+    try keep(c, .{ .grows = key });
     return out;
 }
 
