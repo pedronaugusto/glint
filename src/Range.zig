@@ -1294,9 +1294,35 @@ fn integer(value: Facts.Value, pointer: u16) Typed {
 
 /// The type a conversion's result is read into: what `@as` names, a typed constant or
 /// variable it initializes, what it is assigned to, or the function's result it returns; an
-/// index or a slice's bound is a `usize`, and a shift's amount the log of the shifted type's
-/// width (`u6` for a `u64`).
+/// index or a slice's bound is a `usize`, a shift's amount the log of the shifted type's width
+/// (`u6` for a `u64`), and what `@fromBackingInt` is given the backing integer of the type it
+/// makes.
 fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+    return switch ((try readInto(c, file, node, pointer)) orelse return null) {
+        .named => |n| named(c, n.file, n.node, pointer),
+        .stored => |target| switch (try typeOf(c, file, target, pointer, 0)) {
+            .int => |int| int,
+            else => null,
+        },
+        .declared => |decl| switch (integer(try c.facts.declaration(decl), pointer)) {
+            .int => |int| int,
+            else => null,
+        },
+        .int => |int| int,
+    };
+}
+
+/// Where a value is read into, which a conversion's result type comes from: a type expression
+/// naming it, a place it is stored into (in the value's file), a declaration whose type it
+/// takes, or an integer type the read fixes.
+const Into = union(enum) {
+    named: struct { file: Project.FileId, node: Ast.Node.Index },
+    stored: Ast.Node.Index,
+    declared: Facts.Decl,
+    int: Int,
+};
+
+fn readInto(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Into {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     var at = node;
@@ -1304,23 +1330,28 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
         switch (tree.nodeTag(parent)) {
             .grouped_expression, .@"try" => continue,
             .builtin_call_two, .builtin_call_two_comma => {
-                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return null;
+                const name = tree.tokenSlice(tree.nodeMainToken(parent));
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, parent, &buffer);
-                if (args.len != 2 or args[1] != at) return null;
-                return named(c, file, args[0], pointer);
+                if (std.mem.eql(u8, name, "@as")) {
+                    if (args.len != 2 or args[1] != at) return null;
+                    return .{ .named = .{ .file = file, .node = args[0] } };
+                }
+                if (std.mem.eql(u8, name, "@fromBackingInt") or std.mem.eql(u8, name, "@enumFromInt")) {
+                    if (args.len != 1 or args[0] != at) return null;
+                    const kind = (try makes(c, file, parent)) orelse return null;
+                    return .{ .int = ((try backing(c, kind, pointer)) orelse return null).int };
+                }
+                return null;
             },
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
                 if (rhs != at) return null;
-                return switch (try typeOf(c, file, lhs, pointer, 0)) {
-                    .int => |int| int,
-                    else => null,
-                };
+                return .{ .stored = lhs };
             },
             .array_access => {
                 if (tree.nodeData(parent).node_and_node[1] != at) return null;
-                return .{ .bits = pointer, .signed = false };
+                return .{ .int = .{ .bits = pointer, .signed = false } };
             },
             .shl, .shr, .assign_shl, .assign_shr => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
@@ -1329,7 +1360,7 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
                     .int => |int| int,
                     else => return null,
                 };
-                return .{ .bits = if (shifted.bits <= 1) 0 else std.math.log2_int_ceil(u16, shifted.bits), .signed = false };
+                return .{ .int = .{ .bits = if (shifted.bits <= 1) 0 else std.math.log2_int_ceil(u16, shifted.bits), .signed = false } };
             },
             .@"return" => {
                 var scope = parent;
@@ -1337,23 +1368,23 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
                     if (tree.nodeTag(up) != .fn_decl) continue;
                     var buffer: [1]Ast.Node.Index = undefined;
                     const proto = tree.fullFnProto(&buffer, tree.nodeData(up).node_and_node[0]) orelse return null;
-                    return named(c, file, proto.ast.return_type.unwrap() orelse return null, pointer);
+                    return .{ .named = .{ .file = file, .node = proto.ast.return_type.unwrap() orelse return null } };
                 }
                 return null;
             },
             else => {
                 if (tree.fullVarDecl(parent)) |variable| {
                     if (variable.ast.init_node.unwrap() != at) return null;
-                    return named(c, file, variable.ast.type_node.unwrap() orelse return null, pointer);
+                    return .{ .named = .{ .file = file, .node = variable.ast.type_node.unwrap() orelse return null } };
                 }
                 if (tree.fullSlice(parent)) |slice| {
                     if (slice.ast.start != at and slice.ast.end.unwrap() != at) return null;
-                    return .{ .bits = pointer, .signed = false };
+                    return .{ .int = .{ .bits = pointer, .signed = false } };
                 }
                 var call_buffer: [1]Ast.Node.Index = undefined;
-                if (tree.fullCall(&call_buffer, parent)) |call| return argument(c, file, call, at, pointer);
+                if (tree.fullCall(&call_buffer, parent)) |call| return argument(c, file, call, at);
                 var init_buffer: [2]Ast.Node.Index = undefined;
-                if (tree.fullStructInit(&init_buffer, parent)) |_| return field(c, file, parent, at, pointer);
+                if (tree.fullStructInit(&init_buffer, parent)) |_| return field(c, file, parent, at);
                 return null;
             },
         }
@@ -1361,8 +1392,8 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
     return null;
 }
 
-/// The integer type of the parameter `arg` is given to, where the call resolves.
-fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+/// The parameter `arg` is given to, where the call resolves.
+fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Node.Index) Context.Error!?Into {
     const tree = &c.project.files[file.raw()].tree;
     const position_of = std.mem.findScalar(Ast.Node.Index, call.ast.params, arg) orelse return null;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
@@ -1383,13 +1414,13 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
         if (index != position_of + skip) continue;
-        return named(c, decl.file, param.type_expr orelse return null, pointer);
+        return .{ .named = .{ .file = decl.file, .node = param.type_expr orelse return null } };
     }
     return null;
 }
 
-/// The integer type of the field a struct literal's `value` initializes.
-fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+/// The field a struct literal's `value` initializes.
+fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value: Ast.Node.Index) Context.Error!?Into {
     const tree = &c.project.files[file.raw()].tree;
     var holder = try c.facts.literalType(file, literal_node);
     while (true) holder = switch (holder) {
@@ -1404,10 +1435,71 @@ fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value:
     const name = tree.tokenSlice(tree.firstToken(value) - 2);
     const decl = c.facts.member(container, name) orelse return null;
     if (c.project.models[decl.file.raw()].declarations[decl.index].kind != .field) return null;
-    return switch (integer(try c.facts.declaration(decl), pointer)) {
-        .int => |int| int,
+    return .{ .declared = decl };
+}
+
+/// The type a conversion `node` makes (`@fromBackingInt`, `@enumFromInt`), by where its
+/// result is read into.
+fn makes(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Container {
+    var value: Facts.Value = switch ((try readInto(c, file, node, 64)) orelse return null) {
+        .named => |n| try c.facts.resolve(n.file, n.node),
+        .stored => |target| try c.facts.resolve(file, target),
+        .declared => |decl| try c.facts.declaration(decl),
+        .int => return null,
+    };
+    while (true) value = switch (value) {
+        .optional, .error_union => |inner| inner.*,
+        else => break,
+    };
+    return switch (value) {
+        .container, .instance => |k| k,
         else => null,
     };
+}
+
+/// A type's backing integer, and the values of it that make one: every value for a packed
+/// struct and a non-exhaustive enum; for an exhaustive enum its tags', where they run from the
+/// least to the greatest with none missing.
+const Backing = struct { int: Int, values: Interval };
+
+fn backing(c: *Context, kind: Facts.Container, pointer: u16) Context.Error!?Backing {
+    const tree = &c.project.files[kind.file.raw()].tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, c.project.models[kind.file.raw()].scopes[kind.scope].node) orelse return null;
+    const int = (try named(c, kind.file, decl.ast.arg.unwrap() orelse return null, pointer)) orelse return null;
+    switch (tree.tokenTag(decl.ast.main_token)) {
+        .keyword_struct => {
+            const layout = decl.layout_token orelse return null;
+            return if (tree.tokenTag(layout) == .keyword_packed) .{ .int = int, .values = int.values() } else null;
+        },
+        .keyword_enum => {
+            var next: i132 = 0;
+            var tags: ?Interval = null;
+            var count: i132 = 0;
+            for (decl.ast.members) |member| {
+                const tag = tree.fullContainerField(member) orelse continue;
+                if (std.mem.eql(u8, tree.tokenSlice(tag.ast.main_token), "_")) return .{ .int = int, .values = int.values() };
+                const value: i132 = if (tag.ast.value_expr.unwrap()) |v| literal(tree, v) orelse return null else next;
+                tags = if (tags) |t| t.join(.exactly(value)) else .exactly(value);
+                count += 1;
+                next = value + 1;
+            }
+            const all = tags orelse return null;
+            return if (all.most - all.least + 1 == count) .{ .int = int, .values = all } else null;
+        },
+        else => return null,
+    }
+}
+
+/// Whether `@fromBackingInt(operand)` or `@enumFromInt(operand)` at `node` cannot fail: every
+/// value the operand's range holds makes one of the type it makes, at every pointer width.
+pub fn backs(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!bool {
+    const kind = (try makes(c, file, node)) orelse return false;
+    for (pointers) |pointer| {
+        const values = ((try backing(c, kind, pointer)) orelse return false).values;
+        if (!(try bound(c, file, operand, pointer, 0)).within(values)) return false;
+    }
+    return true;
 }
 
 /// The integer type a type expression names.

@@ -825,6 +825,35 @@ test "A010 reads an index's, a slice bound's and a shift amount's destination, a
     , 4);
 }
 
+test "A010 leaves a backing integer's conversion every value of it makes: a packed struct, a non-exhaustive enum, and an exhaustive enum's run of tags the value lies among" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Setting = enum(u16) { a = 1, b = 2, c = 3, _ };
+        \\const Mode = enum(u8) { stored, fast, best };
+        \\const Gapped = enum(u8) { one = 1, three = 3 };
+        \\const Flags = packed struct(u32) { read_only: bool, rest: u31 };
+        \\fn mode(v: u8) Mode {
+        \\    return @fromBackingInt(v);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const id: Setting = @fromBackingInt(@intCast(try r.takeInt(u16, 0)));
+        \\    _ = id;
+        \\    const raw = try r.takeInt(u32, 0);
+        \\    const flags: Flags = @fromBackingInt(@intCast(raw | 1));
+        \\    _ = flags;
+        \\    const m = try r.takeInt(u8, 0);
+        \\    if (m > 2) return error.Bad;
+        \\    const ok: Mode = @fromBackingInt(m);
+        \\    _ = ok;
+        \\    _ = mode(m);
+        \\    const g: Gapped = @fromBackingInt(m);
+        \\    _ = g;
+        \\    const any: Mode = @fromBackingInt(try r.takeInt(u8, 0));
+        \\    _ = any;
+        \\}
+    , 3);
+}
+
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
