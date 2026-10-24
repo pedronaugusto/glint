@@ -194,15 +194,15 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const model = &c.project.models[file.raw()];
             const ref = model.reference(node) orelse return null;
             const d = ref.declaration orelse return null;
-            return constant(c, .{ .file = file, .index = d }, pointer, next);
+            return constant(c, .{ .file = file, .index = d }, pointer);
         },
         .field_access => {
             const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
             // A length of memory the program holds: below half the address space.
             if (std.mem.eql(u8, name, "len")) return length(pointer);
             const decl = (try c.facts.definition(file, node)) orelse return null;
-            if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return stored(c, decl, pointer, next);
-            return constant(c, decl, pointer, next);
+            if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return stored(c, decl, pointer);
+            return constant(c, decl, pointer);
         },
         .grouped_expression, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
         .@"try" => return bound(c, file, tree.nodeData(node).node, pointer, next),
@@ -281,7 +281,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node) orelse return null;
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |decl| returned(c, decl, pointer, next),
+                .function => |decl| returned(c, decl, pointer),
                 else => null,
             };
         },
@@ -292,7 +292,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
 /// its `return`s, each read in its body.
 const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty };
 
-fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?u128 {
     const memo = try c.facts.memo(Returns);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -311,7 +311,7 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
         const token = tree.nodeMainToken(node);
         if (token < first or token > last or enclosing(tree, model, node) != function) continue;
         const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
-        out = wider(out, try bound(c, decl.file, value, pointer, depth));
+        out = wider(out, try bound(c, decl.file, value, pointer, 0));
         if (out == null) break;
     }
     try memo.map.put(c.allocator, key, out);
@@ -350,7 +350,7 @@ const Store = struct { file: Project.FileId, value: ?Ast.Node.Index };
 /// store is not read or a value of its type is made otherwise (bytes viewed as it, a layout
 /// that bytes define). A field whose stores read it again is unbounded while it is read, so
 /// its type bounds it there.
-fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn stored(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?u128 {
     const stores = try c.facts.memo(Stores);
     if (!stores.scanned) {
         stores.scanned = true;
@@ -372,14 +372,14 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     try stores.ranges.put(c.allocator, key, null);
     var out: ?u128 = 0;
     const full = tree.fullContainerField(record.node) orelse return null;
-    if (full.ast.value_expr.unwrap()) |default| out = wider(out, try bound(c, decl.file, default, pointer, depth));
+    if (full.ast.value_expr.unwrap()) |default| out = wider(out, try bound(c, decl.file, default, pointer, 0));
     const lists = [_]?std.ArrayList(Store){ stores.by_field.get(decl), stores.by_name.get(record.name) };
     for (lists) |list| for (if (list) |l| l.items else &.{}) |store| {
         if (out == null) break;
         out = wider(out, try bound(c, store.file, store.value orelse {
             out = null;
             break;
-        }, pointer, depth));
+        }, pointer, 0));
     };
     try stores.ranges.put(c.allocator, key, out);
     return out;
@@ -591,7 +591,7 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
 
 /// What a declaration's value is bounded by: a constant's by its initializer (and its type,
 /// where it spells one); a variable, a parameter, a field or a capture by its type alone.
-fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn constant(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?u128 {
     const model = &c.project.models[decl.file.raw()];
     const tree = &c.project.files[decl.file.raw()].tree;
     const record = model.declarations[decl.index];
@@ -599,7 +599,33 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     const variable = tree.fullVarDecl(record.node) orelse return null;
     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
     const init = variable.ast.init_node.unwrap() orelse return null;
-    return bound(c, decl.file, init, pointer, depth);
+    const memo = try c.facts.memo(Constants);
+    const key = .{ decl, pointer };
+    if (memo.bounds.get(key)) |known| return known;
+    // A constant that reaches itself is read as unbounded while it is being read.
+    try memo.bounds.put(c.allocator, key, null);
+    const out = try bound(c, decl.file, init, pointer, 0);
+    try memo.bounds.put(c.allocator, key, out);
+    return out;
+}
+
+/// Constants' bounds and types, each read once per pointer width from its initializer, so a
+/// chain of constants is read as far as it goes and the depth limit bounds one expression's
+/// nesting alone.
+const Constants = struct {
+    bounds: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty,
+    types: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Typed) = .empty,
+};
+
+/// The type of a constant that spells none: its initializer's.
+fn constantType(c: *Context, decl: Facts.Decl, init: Ast.Node.Index, pointer: u16) Context.Error!Typed {
+    const memo = try c.facts.memo(Constants);
+    const key = .{ decl, pointer };
+    if (memo.types.get(key)) |known| return known;
+    try memo.types.put(c.allocator, key, .unknown);
+    const out = try typeOf(c, decl.file, init, pointer, 0);
+    try memo.types.put(c.allocator, key, out);
+    return out;
 }
 
 /// The integer type `node` computes in.
@@ -642,7 +668,7 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
             } else null;
             // A constant with no type of its own has its initializer's: a number literal's
             // comptime type, which takes the other operand's.
-            if (decl) |d| if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
+            if (decl) |d| if (try untyped(c, d)) |init| return constantType(c, d, init, pointer);
         },
         else => {},
     }

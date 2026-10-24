@@ -662,6 +662,27 @@ test "A010 reads a call's bound from what its function returns, a conversion's d
     , 1);
 }
 
+test "A010 reads a chain of constants as far as it goes: a civil date from seconds stays in range" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i64 {
+        \\    const secs = try r.takeInt(i64, 0);
+        \\    const days = @divFloor(secs, 86400);
+        \\    const rem = secs - days * 86400;
+        \\    const z = @divFloor(days, 2) + 719468;
+        \\    const era = @divFloor(z, 146097);
+        \\    const doe = z - era * 146097;
+        \\    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+        \\    const y = yoe + era * 400;
+        \\    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+        \\    const mp = @divFloor(5 * doy + 2, 153);
+        \\    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+        \\    const m = if (mp < 10) mp + 3 else mp - 9;
+        \\    return y + m + d + @divFloor(rem, 3600);
+        \\}
+    , 0);
+}
+
 test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {
     try expect(pack.integers,
         \\const std = @import("std");
