@@ -375,7 +375,7 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
-test "A015 finds std resources held by value in a field its file releases or returned by value, not borrowed or owned" {
+test "A015 finds std resources held by value in a field its file releases or returned by value, not borrowed, owned or lent" {
     try expect(pack.ownership,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -385,6 +385,8 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\pub fn open() !std.Io.File { return undefined; }
         \\pub fn child() std.process.Child { return undefined; }
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
+        \\fn shut(d: *std.Io.Dir) void { _ = d; }
+        \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
     , 5);
 }
 

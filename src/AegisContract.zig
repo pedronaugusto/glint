@@ -9,6 +9,8 @@ const Ast = std.zig.Ast;
 pub const Kind = enum {
     secret,
     bytes,
+    /// `SecretBytes.Writer`: a `std.Io.Writer` into a `SecretBytes`, which it borrows.
+    bytes_writer,
     guarded,
     guard,
     scalar,
@@ -69,6 +71,7 @@ const modules = [_]Lib.Module{
 const secret_members = [_]Lib.Member{
     .{ .path = "Secret", .role = .secret },
     .{ .path = "SecretBytes", .role = .bytes },
+    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
     .{ .path = "Choice", .role = .choice, .required = false },
 };
 const sync_members = [_]Lib.Member{
@@ -106,6 +109,7 @@ const units_members = [_]Lib.Member{
 const root_members = [_]Lib.Member{
     .{ .path = "Secret", .role = .secret },
     .{ .path = "SecretBytes", .role = .bytes },
+    .{ .path = "SecretBytes.Writer", .role = .bytes_writer, .required = false },
     .{ .path = "Guarded", .role = .guarded },
     .{ .path = "BlockingGuarded", .role = .guarded },
     .{ .path = "RwGuarded", .role = .guarded },
