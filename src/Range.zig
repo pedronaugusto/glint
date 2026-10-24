@@ -446,8 +446,8 @@ fn either(c: *Context, file: Project.FileId, operands: []const Ast.Node.Index, p
     return out orelse .any;
 }
 
-/// What a function returns, read once per function and pointer width: the widest of its
-/// `return`s, each read in its body.
+/// What a function of the program returns, read once per function and pointer width: the
+/// widest of its `return`s, each read in its body.
 const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Interval) = .empty };
 
 fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
@@ -456,10 +456,12 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
     if (memo.map.get(key)) |known| return known;
     // A function that reaches itself is read as unbounded while it is being read.
     try memo.map.put(c.allocator, key, .any);
+    // std's results are their types': what a reader gives is a peer's to choose.
+    const input = c.project.inputs[decl.file.raw()];
+    if (!input.selected or input.classification == .@"test") return .any;
     const tree = &c.project.files[decl.file.raw()].tree;
     const model = &c.project.models[decl.file.raw()];
-    const function = model.declarations[decl.index].node;
-    if (tree.nodeTag(function) != .fn_decl) return .any;
+    const function = definitionOf(tree, model, model.declarations[decl.index].node) orelse return .any;
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
     var out: ?Interval = null;
@@ -474,6 +476,13 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
     const result = out orelse Interval.any;
     try memo.map.put(c.allocator, key, result);
     return result;
+}
+
+/// The `fn_decl` a function's declaration names: the node itself, or the one its prototype heads.
+fn definitionOf(tree: *const Ast, model: anytype, node: Ast.Node.Index) ?Ast.Node.Index {
+    if (tree.nodeTag(node) == .fn_decl) return node;
+    const parent = model.node_parents[@backingInt(node)] orelse return null;
+    return if (tree.nodeTag(parent) == .fn_decl) parent else null;
 }
 
 /// The function a node is in.
@@ -796,6 +805,7 @@ const Constants = struct {
     bounds: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Interval) = .empty,
     types: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Typed) = .empty,
     locals: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Interval) = .empty,
+    grows: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, bool) = .empty,
 };
 
 /// What a local variable holds: the widest of its initializer and its function's stores into
@@ -1135,7 +1145,10 @@ fn rest(dividend: Interval, divisor: Interval, modulo: bool) Interval {
 const Fact = struct { small: Ast.Node.Index, large: Ast.Node.Index, strict: bool };
 
 /// The comparisons holding at each node, gathered once.
-const Held = struct { map: std.AutoHashMapUnmanaged(struct { u32, u32 }, []const Fact) = .empty };
+const Held = struct {
+    map: std.AutoHashMapUnmanaged(struct { u32, u32 }, []const Fact) = .empty,
+    relations: std.AutoHashMapUnmanaged(struct { u32, u32 }, []const Linear) = .empty,
+};
 
 /// The comparisons that hold where `node` is evaluated: the conditions of the branches and
 /// loops it is in and of the `and` and `or` it is the right side of, the negated conditions of
@@ -1288,11 +1301,23 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
     const from = tree.lastToken(condition);
     const to = tree.firstToken(use);
     if (to <= from) return true;
+    // A loop's continue expression runs after its body, before the condition is read again.
+    const after: ?Ast.Node.Index = loop: {
+        const model = &c.project.models[file.raw()];
+        var at = condition;
+        while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+            if (tree.nodeTag(parent) == .grouped_expression) continue;
+            const loop = tree.fullWhile(parent) orelse break :loop null;
+            break :loop if (loop.ast.cond_expr == at) loop.ast.cont_expr.unwrap() else null;
+        }
+        break :loop null;
+    };
     for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
         .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
             const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = tree.nodeMainToken(assignment);
             if (token <= from or token >= to) continue;
+            if (after) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
             if (mentions(tree, compared, tree.nodeData(assignment).node_and_node[0])) return false;
         },
         else => {},
@@ -1384,34 +1409,307 @@ const Linear = struct {
         return out;
     }
 
-    /// What is left of this value once what a comparison says is at least zero (`large -
-    /// small`) is taken away.
-    fn without(self: Linear, tree: *const Ast, fact: Fact) ?Linear {
+    /// What is left of this value once `other` is taken away.
+    fn less(self: Linear, tree: *const Ast, other: Linear) ?Linear {
         var out = self;
-        if (!out.put(tree, fact.small, false) or !out.put(tree, fact.large, true)) return null;
+        out.constant -= other.constant;
+        for (other.terms[0..other.len]) |each| {
+            var flipped = each;
+            flipped.negative = !each.negative;
+            if (!out.term(tree, flipped)) return null;
+        }
         return out;
     }
 };
 
-/// The least value `value` can have at `at`: the comparisons holding there, one at a time with
-/// what is left bounded by its range, or two together that leave nothing (`a <= b` and `b <=
-/// c` put `c - a` at least zero); with `plain`, the terms' own ranges too. -far where nothing
-/// bounds it.
+/// The least value `value` can have at `at`: by the relations holding there (its comparisons,
+/// and what the calls and locals it is made of give), one at a time with what is left bounded
+/// by its range, or two together that leave nothing (`a <= b` and `b <= c` put `c - a` at least
+/// zero); with `plain`, the terms' own ranges too. -far where nothing bounds it.
 fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, pointer: u16, depth: u8, plain: bool) Context.Error!i132 {
     const tree = &c.project.files[file.raw()].tree;
     var out: i132 = if (plain) try evaluated(c, file, value, pointer, depth) else -Interval.far;
-    const holding = try facts(c, file, at);
-    for (holding, 0..) |fact, i| {
-        const left = value.without(tree, fact) orelse continue;
-        const strict: i132 = @intFromBool(fact.strict);
-        out = @max(out, strict + try evaluated(c, file, left, pointer, depth));
+    var known: Known = .{};
+    for (try relations(c, file, at)) |each| known.add(each);
+    try definitions(c, file, value, at, pointer, &known);
+    const holding = known.items[0..known.len];
+    for (holding, 0..) |relation, i| {
+        const left = value.less(tree, relation) orelse continue;
+        out = @max(out, try evaluated(c, file, left, pointer, depth));
         if (left.len == 0) continue;
         for (holding[i + 1 ..]) |other| {
-            const both = left.without(tree, other) orelse continue;
-            if (both.len == 0) out = @max(out, strict + @intFromBool(other.strict) + both.constant);
+            const both = left.less(tree, other) orelse continue;
+            if (both.len == 0) out = @max(out, both.constant);
         }
     }
     return clamp(out);
+}
+
+/// Relations a reading holds at once: each a difference that is at least zero.
+const Known = struct {
+    items: [max]Linear = undefined,
+    len: usize = 0,
+
+    const max = 48;
+
+    fn add(self: *Known, relation: Linear) void {
+        if (self.len == max) return;
+        self.items[self.len] = relation;
+        self.len += 1;
+    }
+};
+
+/// The comparisons holding at `node` as relations, each `large - small` (less one where strict)
+/// at least zero.
+fn relations(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Linear {
+    const memo = try c.facts.memo(Held);
+    const key = .{ file.raw(), @backingInt(node) };
+    if (memo.relations.get(key)) |known| return known;
+    const tree = &c.project.files[file.raw()].tree;
+    var out: std.ArrayList(Linear) = .empty;
+    for (try facts(c, file, node)) |fact| {
+        var difference: Linear = .{};
+        if (!difference.put(tree, fact.large, false) or !difference.put(tree, fact.small, true)) continue;
+        difference.constant -= @intFromBool(fact.strict);
+        try out.append(c.allocator, difference);
+    }
+    const found = try out.toOwnedSlice(c.allocator);
+    try memo.relations.put(c.allocator, key, found);
+    return found;
+}
+
+/// The relations what `value` is made of gives where it is read: a call's result (or a constant
+/// holding one) relates to the call's arguments by its function's summary, while nothing an
+/// argument is made of is assigned since; a local that only grows is at least its initializer.
+fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, pointer: u16, out: *Known) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    for (value.terms[0..value.len]) |each| {
+        if (each.length) continue;
+        var source = unwrapped(tree, each.node);
+        var named_by: ?Ast.Node.Index = null;
+        if (tree.nodeTag(source) == .identifier) {
+            const ref = model.reference(source) orelse continue;
+            const index = ref.declaration orelse continue;
+            const record = model.declarations[index];
+            if (record.kind != .variable) continue;
+            const variable = tree.fullVarDecl(record.node) orelse continue;
+            const init = variable.ast.init_node.unwrap() orelse continue;
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) {
+                if (!try grows(c, .{ .file = file, .index = index }, pointer) or !try kept(c, file, init, record.node, at)) continue;
+                var difference: Linear = .{};
+                if (difference.put(tree, each.node, false) and difference.put(tree, init, true)) out.add(difference);
+                continue;
+            }
+            source = unwrapped(tree, init);
+            named_by = source;
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, source) orelse continue;
+        const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+            .function => |d| d,
+            else => continue,
+        };
+        // A method called on a value takes it as its first parameter.
+        var receiver: ?Ast.Node.Index = null;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+            const lhs = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+            var held_value = try c.facts.resolve(file, lhs);
+            if (held_value == .pointer) held_value = held_value.pointer.*;
+            if (held_value == .instance) receiver = lhs;
+        }
+        for (try summary(c, decl)) |relation| {
+            const arg = if (receiver) |r|
+                (if (relation.param == 0) r else if (relation.param - 1 < call.ast.params.len) call.ast.params[relation.param - 1] else continue)
+            else if (relation.param < call.ast.params.len) call.ast.params[relation.param] else continue;
+            if (named_by) |given| if (!try kept(c, file, arg, given, at)) continue;
+            var difference: Linear = .{};
+            const spread = if (relation.length)
+                difference.putLength(tree, arg) and difference.put(tree, each.node, true)
+            else
+                difference.put(tree, each.node, false) and difference.put(tree, arg, true);
+            if (!spread) continue;
+            difference.constant -= relation.least;
+            out.add(difference);
+        }
+    }
+}
+
+/// A value through what keeps it: `try`, `.?`, and an `orelse` or `catch` whose other side
+/// leaves or gives `null` (the value is then the left side's whenever there is one).
+fn unwrapped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = bare(tree, node);
+    while (true) switch (tree.nodeTag(at)) {
+        .@"try" => at = bare(tree, tree.nodeData(at).node),
+        .unwrap_optional => at = bare(tree, tree.nodeData(at).node_and_token[0]),
+        .@"orelse", .@"catch" => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            if (!leaves(tree, rhs) and !isNull(tree, rhs)) return at;
+            at = bare(tree, lhs);
+        },
+        else => return at,
+    };
+}
+
+fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null");
+}
+
+/// How a function's result relates to a parameter at every `return` of a value: `result -
+/// param >= least`, or, for `length`, `param.len - result >= least`.
+const Relation = struct { param: u16, length: bool, least: i132 };
+
+/// Function summaries, each read once; std's positions by declaration.
+const Summaries = struct {
+    map: std.AutoHashMapUnmanaged(Facts.Decl, []const Relation) = .empty,
+    std_found: bool = false,
+    std_positions: std.AutoHashMapUnmanaged(Facts.Decl, []const Relation) = .empty,
+};
+
+/// std's positions, its documented contracts: a `find` gives a position below the slice's length
+/// (at most it, less the needle's, for a needle), and at least the start it is given.
+const std_positions = [_]struct { name: []const u8, relations: []const Relation }{
+    .{ .name = "mem.findScalar", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findScalarLast", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findAny", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findLastAny", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findNone", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findLastNone", .relations = &.{.{ .param = 1, .length = true, .least = 1 }} },
+    .{ .name = "mem.findScalarPos", .relations = &.{ .{ .param = 1, .length = true, .least = 1 }, .{ .param = 2, .length = false, .least = 0 } } },
+    .{ .name = "mem.findAnyPos", .relations = &.{ .{ .param = 1, .length = true, .least = 1 }, .{ .param = 2, .length = false, .least = 0 } } },
+    .{ .name = "mem.findNonePos", .relations = &.{ .{ .param = 1, .length = true, .least = 1 }, .{ .param = 2, .length = false, .least = 0 } } },
+    .{ .name = "mem.find", .relations = &.{.{ .param = 1, .length = true, .least = 0 }} },
+    .{ .name = "mem.findLast", .relations = &.{.{ .param = 1, .length = true, .least = 0 }} },
+    .{ .name = "mem.findLastLinear", .relations = &.{.{ .param = 1, .length = true, .least = 0 }} },
+    .{ .name = "mem.findPos", .relations = &.{ .{ .param = 1, .length = true, .least = 0 }, .{ .param = 2, .length = false, .least = 0 } } },
+    .{ .name = "mem.findPosLinear", .relations = &.{ .{ .param = 1, .length = true, .least = 0 }, .{ .param = 2, .length = false, .least = 0 } } },
+    .{ .name = "mem.findDiff", .relations = &.{ .{ .param = 1, .length = true, .least = 0 }, .{ .param = 2, .length = true, .least = 0 } } },
+};
+
+/// How `decl`'s result relates to its parameters: std's positions by declaration, a function of
+/// the program's by what holds at each of its `return`s of a value.
+fn summary(c: *Context, decl: Facts.Decl) Context.Error![]const Relation {
+    const memo = try c.facts.memo(Summaries);
+    if (!memo.std_found) {
+        memo.std_found = true;
+        for (std_positions) |known| for ((try Governed.declarations(c, "std", known.name)) orelse &.{}) |each| {
+            try memo.std_positions.put(c.allocator, (try c.facts.origin(each)) orelse each, known.relations);
+        };
+    }
+    const origin = (try c.facts.origin(decl)) orelse decl;
+    if (memo.std_positions.get(origin)) |known| return known;
+    if (memo.map.get(origin)) |known| return known;
+    // A function that reaches itself relates to nothing while it is being read.
+    try memo.map.put(c.allocator, origin, &.{});
+    const input = c.project.inputs[origin.file.raw()];
+    if (!input.selected or input.classification == .@"test") return &.{};
+    const tree = &c.project.files[origin.file.raw()].tree;
+    const model = &c.project.models[origin.file.raw()];
+    const function = definitionOf(tree, model, model.declarations[origin.index].node) orelse return &.{};
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return &.{};
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    var returns: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last or enclosing(tree, model, node) != function) continue;
+        const value = unwrapped(tree, tree.nodeData(node).opt_node.unwrap() orelse continue);
+        if (isNull(tree, value) or tree.nodeTag(value) == .error_value) continue;
+        try returns.append(c.allocator, node);
+    }
+    var out: std.ArrayList(Relation) = .empty;
+    if (returns.items.len > 0) {
+        var it = proto.iterate(tree);
+        var index: u16 = 0;
+        while (it.next()) |param| : (index += 1) {
+            const type_node = param.type_expr orelse continue;
+            const name = param.name_token orelse continue;
+            const use = paramUse(tree, model, function, name) orelse continue;
+            const slice = if (tree.fullPtrType(type_node)) |ptr| ptr.size == .slice else false;
+            const integer_param = (try named(c, origin.file, type_node, 64)) != null;
+            if (!slice and !integer_param) continue;
+            var most: ?i132 = null;
+            for (returns.items) |ret| {
+                const value = unwrapped(tree, tree.nodeData(ret).opt_node.unwrap().?);
+                var difference: Linear = .{};
+                const spread = if (slice)
+                    difference.term(tree, .{ .node = use, .length = true, .negative = false }) and difference.put(tree, value, true)
+                else
+                    difference.put(tree, value, false) and difference.put(tree, use, true);
+                if (!spread) {
+                    most = -Interval.far;
+                    break;
+                }
+                const found = try least(c, origin.file, difference, ret, 64, 0, true);
+                most = if (most) |m| @min(m, found) else found;
+            }
+            const k = most orelse continue;
+            if (k <= -Interval.far) continue;
+            try out.append(c.allocator, .{ .param = index, .length = slice, .least = k });
+        }
+    }
+    const found = try out.toOwnedSlice(c.allocator);
+    try memo.map.put(c.allocator, origin, found);
+    return found;
+}
+
+/// A name in `function`'s body that reads the parameter named at `name`.
+fn paramUse(tree: *const Ast, model: anytype, function: Ast.Node.Index, name: Ast.TokenIndex) ?Ast.Node.Index {
+    var param: ?u32 = null;
+    for (model.declarations, 0..) |decl, d| if (decl.kind == .parameter and decl.token == name) {
+        param = @intCast(d);
+    };
+    const index = param orelse return null;
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        if (refersTo(model, tree, node, index)) return node;
+    }
+    return null;
+}
+
+/// Whether a local only grows: every store into it adds a value never below zero, and
+/// nothing takes its address or stores it otherwise.
+fn grows(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!bool {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const model = &c.project.models[decl.file.raw()];
+    const record = model.declarations[decl.index];
+    const function = enclosing(tree, model, record.node) orelse return false;
+    const memo = try c.facts.memo(Constants);
+    const key = .{ decl, pointer };
+    if (memo.grows.get(key)) |known| return known;
+    try memo.grows.put(c.allocator, key, false);
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    const out = scan: for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        switch (tag) {
+            .assign_add, .assign_add_sat => {
+                const target, const given = tree.nodeData(node).node_and_node;
+                if (!refersTo(model, tree, target, decl.index)) continue;
+                if ((try bound(c, decl.file, given, pointer, 0)).least < 0) break :scan false;
+            },
+            .assign, .assign_sub, .assign_sub_sat, .assign_mul, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap => {
+                if (refersTo(model, tree, tree.nodeData(node).node_and_node[0], decl.index)) break :scan false;
+            },
+            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |each| {
+                if (refersTo(model, tree, each, decl.index)) break :scan false;
+            },
+            .address_of => if (refersTo(model, tree, bare(tree, tree.nodeData(node).node), decl.index)) break :scan false,
+            else => {},
+        }
+    } else true;
+    try memo.grows.put(c.allocator, key, out);
+    return out;
 }
 
 /// The least value a sum can have by its terms' own ranges, where it has at most two.

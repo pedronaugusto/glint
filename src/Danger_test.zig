@@ -91,7 +91,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { _ = s; _ = start; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -744,6 +744,35 @@ test "A010 leaves a shift by a bounded amount, an address moved in place and ari
         \\    _ = (@as(u64, 1) << @intCast(big & 63)) * 2;
         \\}
     , 2);
+}
+
+test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn nextLf(bytes: []const u8, from: usize) ?usize {
+        \\    var i = from;
+        \\    while (i < bytes.len) : (i += 1) if (bytes[i] == '\n') return i;
+        \\    return null;
+        \\}
+        \\fn lineEnd(bytes: []const u8, from: usize) ?usize {
+        \\    return std.mem.findScalarPos(u8, bytes, from, '\n');
+        \\}
+        \\fn anywhere(bytes: []const u8, from: usize) usize {
+        \\    _ = bytes;
+        \\    return from + 7;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const bytes = try r.take(64);
+        \\    const from: usize = try r.takeInt(u16, 0);
+        \\    if (from > bytes.len) return error.Short;
+        \\    const lf = nextLf(bytes, from) orelse return error.NoLine;
+        \\    _ = bytes[from..lf];
+        \\    const end = lineEnd(bytes, from) orelse return error.NoLine;
+        \\    _ = bytes[from..end];
+        \\    const far = anywhere(bytes, from);
+        \\    _ = bytes[from..far];
+        \\}
+    , 1);
 }
 
 test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {
