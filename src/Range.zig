@@ -294,6 +294,7 @@ fn touched(c: *Context, file: Project.FileId, target: Ast.Node.Index, from: Ast.
     const model = &c.project.models[file.raw()];
     const after = tree.lastToken(from);
     const before = tree.firstToken(use);
+    const limit = reach(tree, model, after, use);
     const root = root: {
         var at = bare(tree, target);
         while (tree.nodeTag(at) == .field_access) at = bare(tree, tree.nodeData(at).node_and_token[0]);
@@ -301,6 +302,8 @@ fn touched(c: *Context, file: Project.FileId, target: Ast.Node.Index, from: Ast.
     };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token <= after or token > limit) continue;
         const touches = switch (tag) {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => blk: {
                 const lhs = tree.nodeData(node).node_and_node[0];
@@ -320,8 +323,7 @@ fn touched(c: *Context, file: Project.FileId, target: Ast.Node.Index, from: Ast.
             },
         };
         if (!touches) continue;
-        const token = tree.nodeMainToken(node);
-        if (token > after and token < before) return true;
+        if (token < before) return true;
         var up = node;
         while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) {
             if (tree.nodeTag(parent) == .fn_decl) break;
@@ -2057,6 +2059,20 @@ fn byValue(c: *Context, decl: Facts.Decl) bool {
     return true;
 }
 
+/// The last token a store can be at and still reach `use` from past token `after`: `use`'s own
+/// start, or the end of the outermost loop around `use` that begins past `after` (which runs again
+/// before `use` on its next pass).
+fn reach(tree: *const Ast, model: anytype, after: Ast.TokenIndex, use: Ast.Node.Index) Ast.TokenIndex {
+    var limit = tree.firstToken(use);
+    var at = use;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) break;
+        if (tree.fullWhile(parent) == null and tree.fullFor(parent) == null) continue;
+        if (tree.firstToken(parent) > after) limit = @max(limit, tree.lastToken(parent));
+    }
+    return limit;
+}
+
 /// How many names one value is spelled out through.
 const max_spelled = 8;
 
@@ -2068,8 +2084,11 @@ fn unchanged(c: *Context, file: Project.FileId, index: u32, at: Ast.Node.Index) 
     const model = &c.project.models[file.raw()];
     const declared_at = tree.lastToken(model.declarations[index].node);
     const use = tree.firstToken(at);
+    const limit = reach(tree, model, declared_at, at);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const main = tree.nodeMainToken(node);
+        if (main <= declared_at or main > limit) continue;
         switch (tag) {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
                 if (!refersTo(model, tree, tree.nodeData(node).node_and_node[0], index)) continue;
@@ -2084,8 +2103,7 @@ fn unchanged(c: *Context, file: Project.FileId, index: u32, at: Ast.Node.Index) 
             },
             else => continue,
         }
-        const token = tree.nodeMainToken(node);
-        if (token > declared_at and token < use) return false;
+        if (main < use) return false;
         var up = node;
         while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) {
             if (tree.nodeTag(parent) == .fn_decl) break;
