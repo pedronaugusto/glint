@@ -617,7 +617,7 @@ test "A010 reads the comparisons that hold where a number is used: an earlier ch
         \\    var out: [64]u8 = undefined;
         \\    to += try r.takeByte();
         \\    out[to] = 1;
-        \\    const secs = try r.takeInt(i64, 0);
+        \\    const secs: i64 = try r.takeInt(i48, 0);
         \\    const days = @divFloor(secs, 86400);
         \\    _ = secs - days * 86400;
         \\    const size = try r.takeInt(u64, 0);
@@ -666,7 +666,7 @@ test "A010 reads a chain of constants as far as it goes: a civil date from secon
     try expect(pack.integers,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !i64 {
-        \\    const secs = try r.takeInt(i64, 0);
+        \\    const secs: i64 = try r.takeInt(i48, 0);
         \\    const days = @divFloor(secs, 86400);
         \\    const rem = secs - days * 86400;
         \\    const z = @divFloor(days, 2) + 719468;
@@ -681,6 +681,49 @@ test "A010 reads a chain of constants as far as it goes: a civil date from secon
         \\    return y + m + d + @divFloor(rem, 3600);
         \\}
     , 0);
+}
+
+test "A010 reads a value's least and greatest and how two values compare: a check on either side of zero, two comparisons together, a contract, a local's stores and a checked divisor" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: []u8) !void {
+        \\    const size = try r.takeInt(i32, 0);
+        \\    if (size > 0) _ = @as(u32, @intCast(size));
+        \\    _ = @as(u32, @intCast(size));
+        \\    const n = try r.takeInt(i64, 0);
+        \\    if (n < -1) return error.Low;
+        \\    if (n < 0) return;
+        \\    if (n < 8) _ = @as(u8, @intCast(n)) + 30;
+        \\    const count = try r.takeInt(u32, 0);
+        \\    const i = try r.takeInt(u32, 0);
+        \\    if (i < count) _ = count - 1 - i;
+        \\    _ = count - i;
+        \\    const start = try r.takeInt(u64, 0);
+        \\    const end = try r.takeInt(u64, 0);
+        \\    if (start > end or end > out.len) return error.Range;
+        \\    _ = out.len - start;
+        \\    const used = try r.takeInt(u64, 0);
+        \\    const cap = try r.takeInt(u64, 0);
+        \\    if (used > cap) return error.Over;
+        \\    const more = try r.takeInt(u64, 0);
+        \\    std.debug.assert(more <= cap - used);
+        \\    _ = used + more;
+        \\    const a = try r.takeInt(u32, 0);
+        \\    var at: u32 = 0;
+        \\    if (a < 64) at = a else at = 63;
+        \\    _ = at * 1000;
+        \\    var b: u32 = 0;
+        \\    b = a;
+        \\    _ = b * 1000;
+        \\    const d = try r.takeInt(u32, 0);
+        \\    if (d == 0) return error.Zero;
+        \\    _ = 100 / d;
+        \\    _ = 100 % (d - 1);
+        \\    const s = try r.takeInt(i64, 0);
+        \\    const q = @divFloor(s, 60);
+        \\    _ = q * 60;
+        \\}
+    , 5);
 }
 
 test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {

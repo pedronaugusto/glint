@@ -105,6 +105,8 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             .div, .mod, .assign_div, .assign_mod => {
                 if (!site(c, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
+                // A divisor the program checked is never zero.
+                if (try Range.divides(c, c.file, node)) continue;
                 try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
             .negation => {
