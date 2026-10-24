@@ -592,7 +592,7 @@ test "A010 leaves what a number's range holds: arithmetic that cannot overflow i
         \\    _ = short;
         \\    _ = @as(u64, n) - 5;
         \\    var total: u64 = 0;
-        \\    total += n;
+        \\    for (0..n) |_| total += n;
         \\}
     , 4);
 }
@@ -744,6 +744,33 @@ test "A010 leaves a shift by a bounded amount, an address moved in place and ari
         \\    _ = (@as(u64, 1) << @intCast(big & 63)) * 2;
         \\}
     , 2);
+}
+
+test "A010 reads a name as what it was given while nothing stores into it: an untyped variable's type, and a check spelled with the name or its initializer" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Kind = enum { sha1, sha256,
+        \\    pub fn rawLen(kind: Kind) usize { return switch (kind) { .sha1 => 20, .sha256 => 32 }; }
+        \\};
+        \\pub fn parse(kind: Kind, bytes: []const u8, r: *std.Io.Reader) !void {
+        \\    const header_len = 12 + kind.rawLen();
+        \\    if (bytes.len < header_len + kind.rawLen()) return error.Short;
+        \\    const data_end = bytes.len - kind.rawLen();
+        \\    const count = try r.takeInt(u32, 0);
+        \\    var end = data_end;
+        \\    if (count > 3) {
+        \\        const size = @as(u64, count) * 4;
+        \\        if (size > end - header_len) return error.Corrupt;
+        \\        _ = bytes[end - size .. end];
+        \\        end -= size;
+        \\    }
+        \\    var looped = data_end;
+        \\    while (count > 9) {
+        \\        _ = looped - header_len;
+        \\        looped = count;
+        \\    }
+        \\}
+    , 1);
 }
 
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {

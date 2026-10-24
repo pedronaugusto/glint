@@ -696,7 +696,7 @@ fn siblingLeast(c: *Context, stores: *Stores, f: Facts.Decl, g: Facts.Decl, leng
             const tree = &c.project.files[made.file.raw()].tree;
             var difference: Linear = .{};
             if (literalValue(tree, made.node, g_record.name)) |given| {
-                if (!(if (length_of) difference.putLength(tree, given) else difference.put(tree, given, false))) return null;
+                if (!(if (length_of) difference.putLength(tree, given, false) else difference.put(tree, given, false))) return null;
             } else {
                 const default = (decl_tree.fullContainerField(g_record.node) orelse return null).ast.value_expr.unwrap() orelse return null;
                 if (length_of) {
@@ -737,7 +737,7 @@ fn siblingLeast(c: *Context, stores: *Stores, f: Facts.Decl, g: Facts.Decl, leng
                     if ((try bound(c, store.file, tree.nodeData(value).node_and_node[1], pointer, 0)).least >= 0) continue;
                 }
                 const text = try c.allocator.print("{s}.{s}", .{ spelled(tree, receiver), f_record.name });
-                if (!(if (length_of) difference.putLength(tree, value) else difference.put(tree, value, false))) return null;
+                if (!(if (length_of) difference.putLength(tree, value, false) else difference.put(tree, value, false))) return null;
                 if (!difference.term(.{ .node = null, .text = text, .length = false, .negative = true })) return null;
             }
             out = @min(out, try least(c, store.file, difference, value, pointer, 0, true));
@@ -1148,8 +1148,8 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
                 const ref = c.project.models[file.raw()].reference(node) orelse break :blk null;
                 break :blk if (ref.declaration) |d| Facts.Decl{ .file = file, .index = d } else null;
             } else null;
-            // A constant with no type of its own has its initializer's: a number literal's
-            // comptime type, which takes the other operand's.
+            // A constant or variable with no type of its own has its initializer's: a number
+            // literal's comptime type, which takes the other operand's.
             if (decl) |d| if (try untyped(c, d)) |init| return constantType(c, d, init, pointer);
         },
         else => {},
@@ -1157,14 +1157,22 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
     return integer(try c.facts.resolve(file, node), pointer);
 }
 
-/// A constant's initializer, where it spells no type.
+/// A constant's or a variable's initializer, where it spells no type: a variable takes its
+/// initializer's type as a constant does (`var end = data_end;`).
 fn untyped(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     const record = c.project.models[decl.file.raw()].declarations[decl.index];
     if (record.kind != .variable) return null;
     const tree = &c.project.files[decl.file.raw()].tree;
     const variable = tree.fullVarDecl(record.node) orelse return null;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.type_node.unwrap() != null) return null;
+    if (variable.ast.type_node.unwrap() != null) return null;
     return variable.ast.init_node.unwrap();
+}
+
+/// Whether `decl` is a `const`.
+fn constantDecl(c: *Context, decl: Facts.Decl) bool {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const variable = tree.fullVarDecl(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
+    return tree.tokenTag(variable.ast.mut_token) == .keyword_const;
 }
 
 /// The integer type a resolved value is, seen through an optional or an error union.
@@ -1591,15 +1599,15 @@ const Linear = struct {
         return self.term(Term.of(tree, at, false, negative));
     }
 
-    /// Adds the length of `memory`: of `m[a..]` the length of `m` less `a`, of `m[a..b]` the
-    /// difference of its bounds.
-    fn putLength(self: *Linear, tree: *const Ast, memory: Ast.Node.Index) bool {
+    /// Adds the length of `memory` (takes it away where `negative`): of `m[a..]` the length of
+    /// `m` less `a`, of `m[a..b]` the difference of its bounds.
+    fn putLength(self: *Linear, tree: *const Ast, memory: Ast.Node.Index, negative: bool) bool {
         const at = bare(tree, memory);
         if (tree.fullSlice(at)) |slice| {
-            if (slice.ast.end.unwrap()) |end| return self.put(tree, end, false) and self.put(tree, slice.ast.start, true);
-            return self.putLength(tree, slice.ast.sliced) and self.put(tree, slice.ast.start, true);
+            if (slice.ast.end.unwrap()) |end| return self.put(tree, end, negative) and self.put(tree, slice.ast.start, !negative);
+            return self.putLength(tree, slice.ast.sliced, negative) and self.put(tree, slice.ast.start, !negative);
         }
-        return self.term(Term.of(tree, at, true, false));
+        return self.term(Term.of(tree, at, true, negative));
     }
 
     fn term(self: *Linear, t: Term) bool {
@@ -1650,6 +1658,28 @@ fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, p
     const read = known.len;
     for (direct..read) |i| try definitions(c, file, known.items[i], at, pointer, &known);
     const holding = known.items[0..known.len];
+    out = @max(out, try leastBy(c, file, value, holding, pointer, depth));
+    // Read again with the names that equal their initializers spelled out, in the value and the
+    // relations alike: a check of `end - header_len` speaks of `bytes.len - k` where `end` still
+    // holds `data_end`, and `data_end` is `bytes.len - k`.
+    var spelled_out: Known = .{};
+    var any = false;
+    const flat = if (try expanded(c, file, value, at)) |v| blk: {
+        any = true;
+        break :blk v;
+    } else value;
+    for (holding) |relation| spelled_out.add(if (try expanded(c, file, relation, at)) |r| blk: {
+        any = true;
+        break :blk r;
+    } else relation);
+    if (any) out = @max(out, try leastBy(c, file, flat, spelled_out.items[0..spelled_out.len], pointer, depth));
+    return clamp(out);
+}
+
+/// The least value `value` can have by `holding`: one relation at a time with what is left
+/// bounded by its range, or two together that leave nothing.
+fn leastBy(c: *Context, file: Project.FileId, value: Linear, holding: []const Linear, pointer: u16, depth: u8) Context.Error!i132 {
+    var out: i132 = -Interval.far;
     for (holding, 0..) |relation, i| {
         const left = value.less(relation) orelse continue;
         out = @max(out, try evaluated(c, file, left, pointer, depth));
@@ -1659,7 +1689,129 @@ fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, p
             if (both.len == 0) out = @max(out, both.constant);
         }
     }
-    return clamp(out);
+    return out;
+}
+
+/// `value` with each name that equals its initializer where `at` reads it spelled as that
+/// initializer, as far as the names go: a constant, or a variable nothing has stored into
+/// since, whose initializer still holds at `at`; the length of a name that holds a slice as
+/// the slice's. Null where no name is spelled out.
+fn expanded(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index) Context.Error!?Linear {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var out = value;
+    var changed = false;
+    var steps: u8 = 0;
+    spell: while (steps < max_spelled) : (steps += 1) {
+        for (out.terms[0..out.len], 0..) |each, i| {
+            const node = each.node orelse continue;
+            if (tree.nodeTag(node) != .identifier) continue;
+            const ref = model.reference(node) orelse continue;
+            const index = ref.declaration orelse continue;
+            const record = model.declarations[index];
+            if (record.kind != .variable) continue;
+            const variable = tree.fullVarDecl(record.node) orelse continue;
+            const init = variable.ast.init_node.unwrap() orelse continue;
+            if (each.length and tree.fullSlice(bare(tree, init)) == null) continue;
+            if (!each.length and !try steady(c, file, init, 0)) continue;
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_var and !unchanged(c, file, index, at)) continue;
+            if (!try kept(c, file, init, record.node, at)) continue;
+            var next = out;
+            next.len -= 1;
+            next.terms[i] = next.terms[next.len];
+            if (!(if (each.length) next.putLength(tree, init, each.negative) else next.put(tree, init, each.negative))) continue;
+            out = next;
+            changed = true;
+            continue :spell;
+        }
+        break;
+    }
+    return if (changed) out else null;
+}
+
+/// Whether `node` is a sum each of whose terms gives the same value wherever it is spelled, as
+/// terms are compared by spelling: names, fields, numbers, and calls of functions that take
+/// nothing by pointer (`kind.rawLen()`), not a read from a stream (`try r.takeInt(u32, 0)`),
+/// which gives another value each time.
+fn steady(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > depth_limit) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, node);
+    switch (tree.nodeTag(at)) {
+        .number_literal, .identifier => return true,
+        .add, .sub, .mul => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            return try steady(c, file, lhs, depth + 1) and try steady(c, file, rhs, depth + 1);
+        },
+        .negation => return steady(c, file, tree.nodeData(at).node, depth + 1),
+        .field_access => return steady(c, file, tree.nodeData(at).node_and_token[0], depth + 1),
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, at) orelse return false;
+    const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |d| d,
+        else => return false,
+    };
+    if (!byValue(c, decl)) return false;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access and !try steady(c, file, tree.nodeData(call.ast.fn_expr).node_and_token[0], depth + 1)) return false;
+    for (call.ast.params) |param| if (!try steady(c, file, param, depth + 1)) return false;
+    return true;
+}
+
+/// Whether function `decl` takes each of its parameters by value: none is a pointer or
+/// `anytype`.
+fn byValue(c: *Context, decl: Facts.Decl) bool {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const model = &c.project.models[decl.file.raw()];
+    const function = definitionOf(tree, model, model.declarations[decl.index].node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return false;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        const type_node = param.type_expr orelse return false;
+        if (tree.fullPtrType(type_node) != null) return false;
+    }
+    return true;
+}
+
+/// How many names one value is spelled out through.
+const max_spelled = 8;
+
+/// Whether nothing stores into local `index` between its declaration and `at`: no store between
+/// them, none in a loop that holds `at` and began after it (which runs again before `at` is
+/// reached on the next pass), and its address never taken.
+fn unchanged(c: *Context, file: Project.FileId, index: u32, at: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const declared_at = tree.lastToken(model.declarations[index].node);
+    const use = tree.firstToken(at);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                if (!refersTo(model, tree, tree.nodeData(node).node_and_node[0], index)) continue;
+            },
+            .assign_destructure => {
+                for (tree.assignDestructure(node).ast.variables) |each| if (refersTo(model, tree, each, index)) return false;
+                continue;
+            },
+            .address_of => {
+                if (refersTo(model, tree, bare(tree, tree.nodeData(node).node), index)) return false;
+                continue;
+            },
+            else => continue,
+        }
+        const token = tree.nodeMainToken(node);
+        if (token > declared_at and token < use) return false;
+        var up = node;
+        while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) {
+            if (tree.nodeTag(parent) == .fn_decl) break;
+            if (tree.fullWhile(parent) == null and tree.fullFor(parent) == null) continue;
+            if (tree.firstToken(parent) > declared_at and tree.firstToken(parent) <= use and tree.lastToken(parent) >= use) return false;
+        }
+    }
+    return true;
 }
 
 /// Relations a reading holds at once: each a difference that is at least zero.
@@ -1754,7 +1906,7 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
             if (named_by) |given| if (!try kept(c, file, arg, given, at)) continue;
             var difference: Linear = .{};
             const spread = if (relation.length)
-                difference.putLength(tree, arg) and difference.put(tree, node, true)
+                difference.putLength(tree, arg, false) and difference.put(tree, node, true)
             else
                 difference.put(tree, node, false) and difference.put(tree, arg, true);
             if (!spread) continue;
@@ -1984,7 +2136,10 @@ fn remainder(c: *Context, file: Project.FileId, lhs: Ast.Node.Index, rhs: Ast.No
         const quotient_node, const k = pair;
         if (tree.nodeTag(quotient_node) != .identifier) continue;
         const ref = c.project.models[file.raw()].reference(quotient_node) orelse continue;
-        const init = (try untyped(c, .{ .file = file, .index = ref.declaration orelse continue })) orelse continue;
+        const decl: Facts.Decl = .{ .file = file, .index = ref.declaration orelse continue };
+        // A variable's quotient may be replaced before it is read.
+        if (!constantDecl(c, decl)) continue;
+        const init = (try untyped(c, decl)) orelse continue;
         const y, const by, const floored = switch (tree.nodeTag(init)) {
             .div => .{ tree.nodeData(init).node_and_node[0], tree.nodeData(init).node_and_node[1], true },
             .builtin_call_two, .builtin_call_two_comma => blk: {
@@ -2082,7 +2237,7 @@ fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
 pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     var room: Linear = .{};
-    if (!room.putLength(tree, memory) or !room.put(tree, index, true)) return false;
+    if (!room.putLength(tree, memory, false) or !room.put(tree, index, true)) return false;
     const need: i132 = if (end) 0 else 1;
     for (pointers) |pointer| {
         if (try least(c, file, room, index, pointer, 0, true) < need) return false;
