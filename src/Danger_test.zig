@@ -854,6 +854,53 @@ test "A010 leaves a backing integer's conversion every value of it makes: a pack
     , 3);
 }
 
+test "A009 judges a loop by its bound, not by a counter it raises toward it on every pass, and A010 a bit count by its operand's width" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !void {
+        \\    var i: usize = try r.takeInt(u32, 0);
+        \\    while (i < bytes.len) : (i += 1) {}
+        \\    var at: usize = try r.takeInt(u32, 0);
+        \\    while (at + 8 <= bytes.len) {
+        \\        at += 8;
+        \\    }
+        \\    var n: usize = try r.takeInt(u32, 0);
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var k: usize = try r.takeInt(u32, 0);
+        \\    const step = try r.takeInt(u32, 0);
+        \\    while (k < bytes.len) : (k += step) {}
+        \\    var j: usize = try r.takeInt(u32, 0);
+        \\    while (j < bytes.len) {
+        \\        if (bytes[0] == 1) j += 1;
+        \\    }
+        \\    const count = try r.takeInt(u32, 0);
+        \\    var x: usize = 0;
+        \\    while (x < count) : (x += 1) {}
+        \\}
+    , 4);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn nextLf(bytes: []const u8, from: usize) ?usize {
+        \\    var i = from;
+        \\    while (i + 32 <= bytes.len) : (i += 32) {
+        \\        const v: @Vector(32, u8) = bytes[i..][0..32].*;
+        \\        const hits: u32 = @bitCast(v == @as(@Vector(32, u8), @splat('\n')));
+        \\        if (hits != 0) return i + @ctz(hits);
+        \\    }
+        \\    while (i < bytes.len) : (i += 1) if (bytes[i] == '\n') return i;
+        \\    return null;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) ![]const u8 {
+        \\    const bytes = try r.take(64);
+        \\    const from = try r.takeInt(u32, 0);
+        \\    if (from > bytes.len) return error.Short;
+        \\    const lf = nextLf(bytes, from) orelse return error.None;
+        \\    if (lf > from and bytes[lf - 1] == '\r') return bytes[from .. lf - 1];
+        \\    return bytes[lf..];
+        \\}
+    , 0);
+}
+
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");

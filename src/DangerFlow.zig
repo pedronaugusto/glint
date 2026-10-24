@@ -45,8 +45,17 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const condition = loop.ast.cond_expr;
                 if (!comparison(tree.nodeTag(condition))) continue;
                 const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                try judged(c, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
-                try judged(c, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
+                // A counter the loop raises toward a bound runs at most to it: where it starts
+                // only shortens the loop, so the bound alone is judged.
+                const rising: ?Ast.Node.Index = switch (tree.nodeTag(condition)) {
+                    .less_than, .less_or_equal => lhs,
+                    .greater_than, .greater_or_equal => rhs,
+                    else => null,
+                };
+                for ([_]Ast.Node.Index{ lhs, rhs }) |side| {
+                    if (rising == side and try Range.rises(c, c.file, node, side)) continue;
+                    try judged(c, rule, side, try ranged(c, flow, side), .number, loop_message);
+                }
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;

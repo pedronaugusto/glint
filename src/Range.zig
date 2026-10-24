@@ -388,6 +388,65 @@ fn evaluatedIn(c: *Context, file: Project.FileId, condition: Ast.Node.Index, nod
     return false;
 }
 
+/// Whether `side` of a loop's condition is a counter the loop raises toward the other side:
+/// spelled with at least one name or field the loop adds at least one to on every pass (in its
+/// continue expression or a statement of its body) and stores into in no other way, and with
+/// nothing else it is made of stored into in the loop. The other side then decides how long it
+/// runs.
+pub fn rises(c: *Context, file: Project.FileId, loop_node: Ast.Node.Index, side: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const loop = tree.fullWhile(loop_node) orelse return false;
+    var value: Linear = .{};
+    if (!value.put(tree, side, false)) return false;
+    var raised = false;
+    for (value.terms[0..value.len]) |each| {
+        const node = each.node orelse return false;
+        if (each.negative) return false;
+        switch (try stepped(c, file, loop, node)) {
+            .kept => {},
+            .raised => raised = true,
+            .other => return false,
+        }
+    }
+    return raised;
+}
+
+/// How a loop stores into `target`: never, only by adding at least one on every pass, or
+/// otherwise.
+fn stepped(c: *Context, file: Project.FileId, loop: Ast.full.While, target: Ast.Node.Index) Context.Error!enum { kept, raised, other } {
+    const tree = &c.project.files[file.raw()].tree;
+    const first = tree.firstToken(loop.ast.cond_expr);
+    const last = tree.lastToken(loop.ast.then_expr);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const body: []const Ast.Node.Index = switch (tree.nodeTag(loop.ast.then_expr)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => tree.blockStatements(&buffer, loop.ast.then_expr).?,
+        else => &.{loop.ast.then_expr},
+    };
+    var raised = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                const lhs, const given = tree.nodeData(node).node_and_node;
+                if (!mentions(tree, target, lhs) and !mentions(tree, lhs, target)) continue;
+                if (tag != .assign_add or !same(tree, lhs, target)) return .other;
+                const every_pass = loop.ast.cont_expr.unwrap() == node or std.mem.findScalar(Ast.Node.Index, body, node) != null;
+                if (!every_pass) return .other;
+                for (pointers) |pointer| if ((try bound(c, file, given, pointer, 0)).least < 1) return .other;
+                raised = true;
+            },
+            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |each| {
+                if (mentions(tree, target, each) or mentions(tree, each, target)) return .other;
+            },
+            .address_of => if (mentions(tree, tree.nodeData(node).node, target) or mentions(tree, target, tree.nodeData(node).node)) return .other,
+            else => {},
+        }
+    }
+    return if (raised) .raised else .kept;
+}
+
 /// Whether `node` is arithmetic on a pointer (`ptr + i`): an address, which no checked
 /// overflow stops.
 pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
@@ -1037,8 +1096,19 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
         }
     }.one;
     if (is(name, &.{"@intFromBool"})) return .{ .least = 0, .most = 1 };
-    // A count of bits in a type of at most 65535 bits.
-    if (is(name, &.{ "@ctz", "@clz", "@popCount" })) return .{ .least = 0, .most = std.math.maxInt(u16) };
+    // A count of bits: at most the operand's width (a type has at most 65535), and a count of
+    // trailing or leading zeros below it where the operand is not zero.
+    if (is(name, &.{ "@ctz", "@clz", "@popCount" })) {
+        const bits: i132 = if (args.len == 1) switch (try typeOf(c, file, args[0], pointer, depth)) {
+            .int => |int| int.bits,
+            else => std.math.maxInt(u16),
+        } else std.math.maxInt(u16);
+        if (args.len == 1 and !is(name, &.{"@popCount"})) {
+            const operand = try bound(c, file, args[0], pointer, depth);
+            if (operand.least > 0 or operand.most < 0) return .{ .least = 0, .most = bits - 1 };
+        }
+        return .{ .least = 0, .most = bits };
+    }
     if (is(name, &.{ "@sizeOf", "@alignOf", "@bitSizeOf", "@offsetOf", "@bitOffsetOf" })) return .{ .least = 0, .most = length(pointer) };
     if (args.len == 0) return .any;
     // A conversion keeps its operand's value: `@as` by the type it names, `@intCast` where it
