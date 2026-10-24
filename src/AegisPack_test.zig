@@ -1468,3 +1468,30 @@ test "an owner whose address a function of the program releases on every path is
     // Passed on to a function that releases it, the pointer it was given.
     try expectJudged(head ++ "fn release(owner: *O) void { owner.deinit(); }\nfn on(owner: *O) void { release(owner); }\npub fn f() void { var owner = O.init(1); on(&owner); }", pack.cleanup, true, 0);
 }
+
+test "an owner handed on by its move is transferred where the result is returned, stored or bound, and a call given its address may take it only where it returns" {
+    const head = "const aegis = @import(\"aegis\");\nfn shut(_: *u32) void {}\nconst O = aegis.own.Owned(u32, shut);\nconst R = struct { o: O, n: u32 = 0 };\nfn ready(_: u32) bool { return true; }\nfn g() !void {}\n";
+    // Moved into what is returned, into storage the function does not hold, or into a local
+    // A003 follows from there; returned on one branch and released on the other.
+    try expectJudged(head ++ "pub fn f() !R { var o = O.init(1); errdefer o.deinit(); try g(); return .{ .o = o.move() }; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(slot: *R) !void { var o = O.init(1); errdefer o.deinit(); try g(); slot.* = .{ .o = o.move() }; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() ?O { var o = O.init(1); if (ready(o.lend().get())) return o.move(); o.deinit(); return null; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var o = O.init(1); var x = o.move(); x.deinit(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var o = O.init(1); var x = o.move(); _ = x.lend(); }", pack.cleanup, true, 1);
+    // Released after the move, or by an errdefer on an error exit after it, one in the same
+    // literal included: a witness each.
+    try expectJudged(head ++ "pub fn f(slot: *R) void { var o = O.init(1); slot.* = .{ .o = o.move() }; o.deinit(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(slot: *R) !void { var o = O.init(1); errdefer o.deinit(); slot.* = .{ .o = o.move() }; try g(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(slot: *R) !void { var o = O.init(1); errdefer o.deinit(); slot.* = .{ .o = o.move(), .n = blk: { try g(); break :blk 1; } }; }", pack.cleanup, true, 1);
+    // A function given the owner's address that releases or moves it on every path takes it,
+    // tried or handled; released again by the caller's errdefer, a witness.
+    const register = "fn register(o: *O, out: *R) !void { errdefer o.deinit(); try g(); out.* = .{ .o = o.move() }; }\n";
+    try expectJudged(head ++ register ++ "pub fn f(out: *R) !void { var o = O.init(1); try register(&o, out); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ register ++ "pub fn f(out: *R) void { var o = O.init(1); register(&o, out) catch return; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ register ++ "pub fn f(out: *R) !void { var o = O.init(1); errdefer o.deinit(); try register(&o, out); }", pack.cleanup, true, 1);
+    // One that moves it where it returns and leaves it held on its errors takes it there: the
+    // caller's errdefer covers the rest, an optional one moved by its capture included.
+    try expectJudged(head ++ "fn with(o: *O) !R { try g(); return .{ .o = o.move() }; }\npub fn f() !R { var o = O.init(1); errdefer o.deinit(); return with(&o); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn with(o: *O, w: ?*O) !struct { o: O, w: ?O } { try g(); return .{ .o = o.move(), .w = if (w) |x| x.move() else null }; }\npub fn f() !struct { o: O, w: ?O } { var a = O.init(1); errdefer a.deinit(); var b = O.init(2); errdefer b.deinit(); return with(&a, &b); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn with(o: *O) !R { try g(); return .{ .o = o.move() }; }\npub fn f() !R { var o = O.init(1); return with(&o); }", pack.cleanup, false, 0);
+}

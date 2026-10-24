@@ -853,3 +853,20 @@ test "the fix makes an older written reason or the old pack suppression the esca
         \\}
     , out);
 }
+
+test "an aegis owner or loan holds what it is given: input wrapped is input" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn free(_: *[]const u8) void {}
+        \\const Held = aegis.own.Owned([]const u8, free);
+        \\pub fn f(dir: std.Io.Dir, gpa: std.mem.Allocator, table: []const u8, name: []const u8) !u8 {
+        \\    const bytes = try dir.readFileAlloc(null, name, gpa, 100);
+        \\    var held = Held.init(bytes);
+        \\    defer held.deinit();
+        \\    const lent = held.lend().get();
+        \\    const borrowed = held.borrow().*;
+        \\    return lent[lent[0]] +% borrowed[borrowed[0]] +% table[name.len];
+        \\}
+    , 2);
+}

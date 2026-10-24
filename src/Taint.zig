@@ -26,7 +26,8 @@
 //! callee and back by the callee's summary, so a call made with clean arguments stays clean;
 //! and through a store into the program's own field, which holds it everywhere by its
 //! declaration. aegis's types are the answer to input: what aegis gives back (an
-//! `input.Untrusted` and what its `parse` refines, a checked integer) is clean. A call whose
+//! `input.Untrusted` and what its `parse` refines, a checked integer) is clean, but for an owner
+//! or a loan (`own.Owned`, `own.OwnedIo`, `own.Lent`), which holds what it is given. A call whose
 //! callee does not resolve, given input, gives an unknown value, which a sink reads as
 //! undecided, never as passed.
 const std = @import("std");
@@ -492,7 +493,7 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
                 if (given.level != .clean or given.params != 0) try store(c, flow, function, receiver, given);
             };
         },
-        .aegis, .none => {},
+        .aegis, .holder, .none => {},
     }
 }
 
@@ -587,7 +588,8 @@ pub fn concrete(flow: *const Flow, function: u32, value: Dep) Level {
 }
 
 const Callee = struct {
-    kind: union(enum) { program: u32, source, outside, aegis, none },
+    /// `holder`: a method of an aegis owner or loan (`own.Owned`, `own.OwnedIo`, `own.Lent`).
+    kind: union(enum) { program: u32, source, outside, aegis, holder, none },
     /// The arguments in order, the receiver of a method call first.
     args: std.ArrayList(Ast.Node.Index) = .empty,
     receiver: ?Ast.Node.Index = null,
@@ -628,7 +630,13 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
             out.kind = .source;
             return out;
         };
-        out.kind = .aegis;
+        // An owner or a loan holds what it is given, no answer to input: a handle the program
+        // opened from input is as much input's wrapped as it was bare.
+        const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = c.project.models[origin.file.raw()].declarations[origin.index].scope } };
+        out.kind = if (try c.role(Contract.library, container)) |k| switch (k) {
+            .owned, .lent => .holder,
+            else => .aegis,
+        } else .aegis;
         return out;
     }
     const record = c.project.models[decl.file.raw()].declarations[decl.index];
@@ -903,6 +911,12 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
         .aegis => return .{},
+        // What it holds: `init`'s value, the receiver of `lend`, `get`, `borrow` and `move`.
+        .holder => {
+            var out: Dep = .{};
+            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            return out;
+        },
         .program => |target| {
             const g = flow.functions.items[target];
             var out: Dep = .{ .level = g.ret.level };

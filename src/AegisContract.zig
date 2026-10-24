@@ -27,6 +27,8 @@ pub const Kind = enum {
     reservation,
     /// `Owned` and `OwnedIo`.
     owned,
+    /// `own.Lent`: a copy of an owner's payload lent out, not the holder's to release.
+    lent,
     must_use,
     shared,
     /// Generational storage: `Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap`.
@@ -146,6 +148,7 @@ const root_members = [_]Lib.Member{
     .{ .path = "bounded.Budget.Reservation", .role = .reservation },
     .{ .path = "own.Owned", .role = .owned },
     .{ .path = "own.OwnedIo", .role = .owned },
+    .{ .path = "own.Lent", .role = .lent, .required = false },
     .{ .path = "own.MustUse", .role = .must_use },
     .{ .path = "handle.Pool", .role = .slots },
     .{ .path = "handle.SlotMap", .role = .slots },
