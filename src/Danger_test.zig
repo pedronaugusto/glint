@@ -775,6 +775,56 @@ test "A009 reads where a call's result lies: std's positions, a function's summa
     , 1);
 }
 
+const cursor_program =
+    \\const std = @import("std");
+    \\const Cursor = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = 0,
+    \\    end: usize = 0,
+    \\    fn init(buf: []const u8) Cursor {
+    \\        return .{ .buf = buf, .end = buf.len };
+    \\    }
+    \\    fn advance(c: *Cursor, n: usize) void {
+    \\        std.debug.assert(n <= c.end - c.pos);
+    \\        c.pos += n;
+    \\    }
+    \\    fn rest(c: *const Cursor) []const u8 {
+    \\        return c.buf[c.pos..c.end];
+    \\    }
+    \\};
+    \\const Loose = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = 0,
+    \\    end: usize = 0,
+    \\    fn init(buf: []const u8) Loose {
+    \\        return .{ .buf = buf, .end = buf.len };
+    \\    }
+    \\    fn jump(l: *Loose, to: usize) void {
+    \\        l.pos = to;
+    \\    }
+    \\    fn rest(l: *const Loose) []const u8 {
+    \\        return l.buf[l.pos..l.end];
+    \\    }
+    \\};
+    \\pub fn f(r: *std.Io.Reader) !void {
+    \\    const bytes = try r.take(64);
+    \\    const n: usize = try r.takeInt(u32, 0);
+    \\    var cur = Cursor.init(bytes);
+    \\    if (n > cur.end - cur.pos) return error.Short;
+    \\    cur.advance(n);
+    \\    _ = cur.rest();
+    \\    var loose = Loose.init(bytes);
+    \\    loose.jump(n);
+    \\    _ = loose.end - loose.pos;
+    \\    _ = loose.rest();
+    \\}
+;
+
+test "A009 and A010 read a field's relation to its siblings: a cursor at most its end and the end at most its buffer's length, while every store keeps them" {
+    try expect(pack.integers, cursor_program, 1);
+    try expect(pack.untrusted_input, cursor_program, 1);
+}
+
 test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {
     try expect(pack.integers,
         \\const std = @import("std");

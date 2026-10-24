@@ -525,10 +525,21 @@ const Stores = struct {
     /// stores.
     blind: bool = false,
     ranges: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Interval) = .empty,
+    /// Every struct literal of each type, by the type's file and scope.
+    literals: std.AutoHashMapUnmanaged(struct { u32, u32 }, std.ArrayList(struct { file: Project.FileId, node: Ast.Node.Index })) = .empty,
+    siblings: std.AutoHashMapUnmanaged(Facts.Decl, []const Sibling) = .empty,
 };
 /// A store: the value it gives, read in its file, or none where its range is not read (a
-/// field given by address, a destructure, wrapping arithmetic).
-const Store = struct { file: Project.FileId, value: ?Ast.Node.Index };
+/// field given by address, a destructure, wrapping arithmetic); the field it is made through
+/// (`x.f = v`) or the literal that makes it; and whether it only takes the field down (an
+/// unsigned difference, quotient or mask), which no range reads but a relation does.
+const Store = struct {
+    file: Project.FileId,
+    value: ?Ast.Node.Index,
+    target: ?Ast.Node.Index = null,
+    literal: ?Ast.Node.Index = null,
+    decreases: bool = false,
+};
 
 /// What a field holds at most: the widest of its default and its stores, or null where a
 /// store is not read or a value of its type is made otherwise (bytes viewed as it, a layout
@@ -560,6 +571,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
     const lists = [_]?std.ArrayList(Store){ stores.by_field.get(decl), stores.by_name.get(record.name) };
     const result: Interval = read: {
         for (lists) |list| for (if (list) |l| l.items else &.{}) |store| {
+            if (store.decreases) continue;
             const value = try bound(c, store.file, store.value orelse break :read .any, pointer, 0);
             out = if (out) |o| o.join(value) else value;
         };
@@ -567,6 +579,120 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
     };
     try stores.ranges.put(c.allocator, key, result);
     return result;
+}
+
+/// A relation a field holds to a sibling of its instance wherever it is read: `x.name - x.f >=
+/// least`, or with `length`, `x.name.len - x.f >= least`.
+const Sibling = struct { decl: Facts.Decl, name: []const u8, length: bool, least: i132 };
+
+/// The relations field `decl` holds to its integer and slice siblings (`pos <= end`, `end <=
+/// buf.len`), each re-established by every store of either, read where it is made: a literal by
+/// what it gives both (or their defaults), `x.f = v` by what holds of `v` and `x.g` there, `x.g
+/// = w` by what holds of `w` and `x.f`; a sum that only adds to `g` keeps it. A store whose value
+/// is not read, a store through a name that does not resolve, or a type made otherwise (viewed
+/// as bytes, a layout bytes define) holds none.
+fn siblings(c: *Context, decl: Facts.Decl) Context.Error![]const Sibling {
+    const stores = try c.facts.memo(Stores);
+    if (!stores.scanned) {
+        stores.scanned = true;
+        try scan(c, stores);
+    }
+    if (stores.siblings.get(decl)) |known| return known;
+    // A relation is not read while it is being proved.
+    try stores.siblings.put(c.allocator, decl, &.{});
+    if (stores.blind) return &.{};
+    const input = c.project.inputs[decl.file.raw()];
+    if (!input.selected or input.classification == .@"test") return &.{};
+    const model = &c.project.models[decl.file.raw()];
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const record = model.declarations[decl.index];
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, model.scopes[record.scope].node) orelse return &.{};
+    if (container.layout_token != null or stores.viewed.contains(.{ decl.file.raw(), record.scope })) return &.{};
+    if (stores.by_name.get(record.name) != null) return &.{};
+    var out: std.ArrayList(Sibling) = .empty;
+    for (model.declarations, 0..) |other, o| {
+        if (other.kind != .field or other.scope != record.scope or o == decl.index) continue;
+        if (stores.by_name.get(other.name) != null) continue;
+        const full = tree.fullContainerField(other.node) orelse continue;
+        const type_node = full.ast.type_expr.unwrap() orelse continue;
+        const length_of = if (tree.fullPtrType(type_node)) |ptr| ptr.size == .slice else false;
+        if (!length_of and (try named(c, decl.file, type_node, 64)) == null) continue;
+        const k = (try siblingLeast(c, stores, decl, .{ .file = decl.file, .index = @intCast(o) }, length_of)) orelse continue;
+        try out.append(c.allocator, .{ .decl = .{ .file = decl.file, .index = @intCast(o) }, .name = other.name, .length = length_of, .least = k });
+    }
+    const found = try out.toOwnedSlice(c.allocator);
+    try stores.siblings.put(c.allocator, decl, found);
+    return found;
+}
+
+/// The least `g - f` (or `g.len - f`) every store of either leaves, or null where one does not
+/// bound it.
+fn siblingLeast(c: *Context, stores: *Stores, f: Facts.Decl, g: Facts.Decl, length_of: bool) Context.Error!?i132 {
+    const model = &c.project.models[f.file.raw()];
+    const decl_tree = &c.project.files[f.file.raw()].tree;
+    const f_record = model.declarations[f.index];
+    const g_record = model.declarations[g.index];
+    var out: i132 = Interval.far;
+    for (pointers) |pointer| {
+        if (stores.literals.get(.{ f.file.raw(), f_record.scope })) |literals| for (literals.items) |made| {
+            const tree = &c.project.files[made.file.raw()].tree;
+            var difference: Linear = .{};
+            if (literalValue(tree, made.node, g_record.name)) |given| {
+                if (!(if (length_of) difference.putLength(tree, given) else difference.put(tree, given, false))) return null;
+            } else {
+                const default = (decl_tree.fullContainerField(g_record.node) orelse return null).ast.value_expr.unwrap() orelse return null;
+                if (length_of) {
+                    // Only an empty default's length is known: nothing.
+                    if (!std.mem.eql(u8, spelled(decl_tree, default), "&.{}") and !std.mem.eql(u8, spelled(decl_tree, default), "\"\"")) return null;
+                } else difference.constant +|= (try bound(c, f.file, default, pointer, 0)).least;
+            }
+            if (literalValue(tree, made.node, f_record.name)) |given| {
+                if (!difference.put(tree, given, true)) return null;
+            } else {
+                const default = (decl_tree.fullContainerField(f_record.node) orelse return null).ast.value_expr.unwrap() orelse return null;
+                difference.constant -|= (try bound(c, f.file, default, pointer, 0)).most;
+            }
+            out = @min(out, try least(c, made.file, difference, made.node, pointer, 0, true));
+        };
+        for ([_]Facts.Decl{ f, g }, 0..) |stored_into, side| for (if (stores.by_field.get(stored_into)) |l| l.items else &.{}) |store| {
+            if (store.literal != null) continue;
+            const value = store.value orelse return null;
+            const target = store.target orelse return null;
+            const tree = &c.project.files[store.file.raw()].tree;
+            if (tree.nodeTag(target) != .field_access) return null;
+            const receiver = tree.nodeData(target).node_and_token[0];
+            var difference: Linear = .{};
+            if (side == 0) {
+                // A field that only goes down stays below what it was below.
+                if (store.decreases) continue;
+                const text = try c.allocator.print("{s}.{s}", .{ spelled(tree, receiver), g_record.name });
+                if (!difference.term(.{ .node = null, .text = text, .length = length_of, .negative = false }) or !difference.put(tree, value, true)) return null;
+            } else {
+                // A sum that only adds to the larger side keeps it larger.
+                if (!length_of and (tree.nodeTag(value) == .assign_add or tree.nodeTag(value) == .assign_add_sat)) {
+                    if ((try bound(c, store.file, tree.nodeData(value).node_and_node[1], pointer, 0)).least >= 0) continue;
+                }
+                const text = try c.allocator.print("{s}.{s}", .{ spelled(tree, receiver), f_record.name });
+                if (!(if (length_of) difference.putLength(tree, value) else difference.put(tree, value, false))) return null;
+                if (!difference.term(.{ .node = null, .text = text, .length = false, .negative = true })) return null;
+            }
+            out = @min(out, try least(c, store.file, difference, value, pointer, 0, true));
+        };
+    }
+    if (out >= Interval.far or out <= -Interval.far) return null;
+    return out;
+}
+
+/// What a struct literal gives the field named `name`.
+fn literalValue(tree: *const Ast, literal_node: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const init = tree.fullStructInit(&buffer, literal_node) orelse return null;
+    for (init.ast.fields) |value| {
+        if (tree.firstToken(value) < 2) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(tree.firstToken(value) - 2), name)) return value;
+    }
+    return null;
 }
 
 /// Finds every store into a field in the program's own code, its tests aside.
@@ -581,19 +707,19 @@ fn scan(c: *Context, stores: *Stores) Context.Error!void {
             switch (tag) {
                 .assign => {
                     const target, const value = tree.nodeData(node).node_and_node;
-                    try storeInto(c, stores, file, target, value);
+                    try storeInto(c, stores, file, target, value, false);
                 },
-                .assign_add, .assign_add_sat, .assign_mul, .assign_mul_sat, .assign_shl, .assign_shl_sat, .assign_bit_or, .assign_bit_xor => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], node),
-                .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], null),
+                .assign_add, .assign_add_sat, .assign_mul, .assign_mul_sat, .assign_shl, .assign_shl_sat, .assign_bit_or, .assign_bit_xor => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], node, false),
+                .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], null, false),
                 // A difference, quotient, shift right or remainder never takes an unsigned
                 // value past what it was; a signed one may cross to a larger magnitude.
                 .assign_sub, .assign_sub_sat, .assign_div, .assign_shr, .assign_mod, .assign_bit_and => {
                     const target = tree.nodeData(node).node_and_node[0];
-                    if (!try unsignedAt(c, file, target)) try storeInto(c, stores, file, target, null);
+                    if (try unsignedAt(c, file, target)) try storeInto(c, stores, file, target, node, true) else try storeInto(c, stores, file, target, null, false);
                 },
-                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |variable| try storeInto(c, stores, file, variable, null),
+                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |variable| try storeInto(c, stores, file, variable, null, false),
                 // A field given by address is written by whoever takes it.
-                .address_of => try storeInto(c, stores, file, bare(tree, tree.nodeData(node).node), null),
+                .address_of => try storeInto(c, stores, file, bare(tree, tree.nodeData(node).node), null, false),
                 .call_one, .call_one_comma, .call, .call_comma => try viewed(c, stores, file, node),
                 else => {
                     var literal_buffer: [2]Ast.Node.Index = undefined;
@@ -604,10 +730,18 @@ fn scan(c: *Context, stores: *Stores) Context.Error!void {
                         .optional, .error_union, .pointer => |inner| inner.*,
                         else => break,
                     };
+                    switch (holder) {
+                        .container, .instance => |k| {
+                            const entry = try stores.literals.getOrPut(c.allocator, .{ k.file.raw(), k.scope });
+                            if (!entry.found_existing) entry.value_ptr.* = .empty;
+                            try entry.value_ptr.append(c.allocator, .{ .file = file, .node = node });
+                        },
+                        else => {},
+                    }
                     for (literal_node.ast.fields) |value| {
                         if (tree.firstToken(value) < 2) continue;
                         const name = tree.tokenSlice(tree.firstToken(value) - 2);
-                        const store: Store = .{ .file = file, .value = value };
+                        const store: Store = .{ .file = file, .value = value, .literal = node };
                         switch (holder) {
                             .container, .instance => |k| if (c.facts.member(k, name)) |decl| {
                                 try add(c, stores, decl, null, store);
@@ -624,10 +758,10 @@ fn scan(c: *Context, stores: *Stores) Context.Error!void {
 }
 
 /// Records a store of `value` into `target`, where the target is a field.
-fn storeInto(c: *Context, stores: *Stores, file: Project.FileId, target: Ast.Node.Index, value: ?Ast.Node.Index) Context.Error!void {
+fn storeInto(c: *Context, stores: *Stores, file: Project.FileId, target: Ast.Node.Index, value: ?Ast.Node.Index, decreases: bool) Context.Error!void {
     const tree = &c.project.files[file.raw()].tree;
     if (inTest(tree, &c.project.models[file.raw()], target)) return;
-    const store: Store = .{ .file = file, .value = value };
+    const store: Store = .{ .file = file, .value = value, .target = target, .decreases = decreases };
     switch (tree.nodeTag(target)) {
         .field_access => {
             if (try c.facts.definition(file, target)) |decl| if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return add(c, stores, decl, null, store);
@@ -638,8 +772,8 @@ fn storeInto(c: *Context, stores: *Stores, file: Project.FileId, target: Ast.Nod
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, target, &buffer);
             if (args.len == 2 and tree.nodeTag(args[1]) == .string_literal) {
-                const spelled = tree.tokenSlice(tree.nodeMainToken(args[1]));
-                return add(c, stores, null, spelled[1 .. spelled.len - 1], store);
+                const quoted = tree.tokenSlice(tree.nodeMainToken(args[1]));
+                return add(c, stores, null, quoted[1 .. quoted.len - 1], store);
             }
             // A name the program computes (an `inline for` over a type's fields) may be any of
             // its type's fields, which its type then bounds. Where the type does not resolve
@@ -1349,8 +1483,22 @@ const Linear = struct {
     constant: i132 = 0,
 
     const max_terms = 6;
-    /// A term: a value, or the length of the memory `node` is, taken away where `negative`.
-    const Term = struct { node: Ast.Node.Index, length: bool, negative: bool };
+    /// A term: a value, or the length of the memory it is, taken away where `negative`, by its
+    /// spelling; `node` spells it where the source does (a sibling field a relation names,
+    /// `x.end` from a store to `x.pos`, has none).
+    const Term = struct {
+        node: ?Ast.Node.Index,
+        text: []const u8,
+        length: bool,
+        negative: bool,
+        /// For a sibling a relation names: the field, and the instance it is read on.
+        field: ?Facts.Decl = null,
+        receiver: []const u8 = "",
+
+        fn of(tree: *const Ast, node: Ast.Node.Index, length_of: bool, negative: bool) Term {
+            return .{ .node = node, .text = spelled(tree, node), .length = length_of, .negative = negative };
+        }
+    };
 
     /// Adds `node` (takes it away where `negative`), its sums and differences spread into
     /// terms; false where it has more terms than a comparison is read with.
@@ -1371,11 +1519,11 @@ const Linear = struct {
                 return true;
             },
             .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "len")) {
-                return self.term(tree, .{ .node = bare(tree, tree.nodeData(at).node_and_token[0]), .length = true, .negative = negative });
+                return self.term(Term.of(tree, bare(tree, tree.nodeData(at).node_and_token[0]), true, negative));
             },
             else => {},
         }
-        return self.term(tree, .{ .node = at, .length = false, .negative = negative });
+        return self.term(Term.of(tree, at, false, negative));
     }
 
     /// Adds the length of `memory`: of `m[a..]` the length of `m` less `a`, of `m[a..b]` the
@@ -1386,12 +1534,12 @@ const Linear = struct {
             if (slice.ast.end.unwrap()) |end| return self.put(tree, end, false) and self.put(tree, slice.ast.start, true);
             return self.putLength(tree, slice.ast.sliced) and self.put(tree, slice.ast.start, true);
         }
-        return self.term(tree, .{ .node = at, .length = true, .negative = false });
+        return self.term(Term.of(tree, at, true, false));
     }
 
-    fn term(self: *Linear, tree: *const Ast, t: Term) bool {
+    fn term(self: *Linear, t: Term) bool {
         for (self.terms[0..self.len], 0..) |each, i| {
-            if (each.negative == t.negative or each.length != t.length or !same(tree, each.node, t.node)) continue;
+            if (each.negative == t.negative or each.length != t.length or !std.mem.eql(u8, each.text, t.text)) continue;
             self.len -= 1;
             self.terms[i] = self.terms[self.len];
             return true;
@@ -1410,13 +1558,13 @@ const Linear = struct {
     }
 
     /// What is left of this value once `other` is taken away.
-    fn less(self: Linear, tree: *const Ast, other: Linear) ?Linear {
+    fn less(self: Linear, other: Linear) ?Linear {
         var out = self;
         out.constant -= other.constant;
         for (other.terms[0..other.len]) |each| {
             var flipped = each;
             flipped.negative = !each.negative;
-            if (!out.term(tree, flipped)) return null;
+            if (!out.term(flipped)) return null;
         }
         return out;
     }
@@ -1427,18 +1575,22 @@ const Linear = struct {
 /// by its range, or two together that leave nothing (`a <= b` and `b <= c` put `c - a` at least
 /// zero); with `plain`, the terms' own ranges too. -far where nothing bounds it.
 fn least(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.Index, pointer: u16, depth: u8, plain: bool) Context.Error!i132 {
-    const tree = &c.project.files[file.raw()].tree;
     var out: i132 = if (plain) try evaluated(c, file, value, pointer, depth) else -Interval.far;
     var known: Known = .{};
     for (try relations(c, file, at)) |each| known.add(each);
+    const direct = known.len;
     try definitions(c, file, value, at, pointer, &known);
+    // What the relations just read are made of relates too, one step further (`x.pos <= x.end`
+    // brings `x.end <= x.buf.len`).
+    const read = known.len;
+    for (direct..read) |i| try definitions(c, file, known.items[i], at, pointer, &known);
     const holding = known.items[0..known.len];
     for (holding, 0..) |relation, i| {
-        const left = value.less(tree, relation) orelse continue;
+        const left = value.less(relation) orelse continue;
         out = @max(out, try evaluated(c, file, left, pointer, depth));
         if (left.len == 0) continue;
         for (holding[i + 1 ..]) |other| {
-            const both = left.less(tree, other) orelse continue;
+            const both = left.less(other) orelse continue;
             if (both.len == 0) out = @max(out, both.constant);
         }
     }
@@ -1486,7 +1638,19 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
     const model = &c.project.models[file.raw()];
     for (value.terms[0..value.len]) |each| {
         if (each.length) continue;
-        var source = unwrapped(tree, each.node);
+        // A field read relates to its instance's siblings by what every store keeps.
+        if (each.field) |named_field| {
+            try related(c, named_field, each.receiver, out);
+            continue;
+        }
+        const node = each.node orelse continue;
+        if (tree.nodeTag(node) == .field_access) {
+            const decl = (try c.facts.definition(file, node)) orelse continue;
+            if (c.project.models[decl.file.raw()].declarations[decl.index].kind != .field) continue;
+            try related(c, decl, spelled(tree, tree.nodeData(node).node_and_token[0]), out);
+            continue;
+        }
+        var source = unwrapped(tree, node);
         var named_by: ?Ast.Node.Index = null;
         if (tree.nodeTag(source) == .identifier) {
             const ref = model.reference(source) orelse continue;
@@ -1498,7 +1662,7 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
             if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) {
                 if (!try grows(c, .{ .file = file, .index = index }, pointer) or !try kept(c, file, init, record.node, at)) continue;
                 var difference: Linear = .{};
-                if (difference.put(tree, each.node, false) and difference.put(tree, init, true)) out.add(difference);
+                if (difference.put(tree, node, false) and difference.put(tree, init, true)) out.add(difference);
                 continue;
             }
             source = unwrapped(tree, init);
@@ -1525,13 +1689,27 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
             if (named_by) |given| if (!try kept(c, file, arg, given, at)) continue;
             var difference: Linear = .{};
             const spread = if (relation.length)
-                difference.putLength(tree, arg) and difference.put(tree, each.node, true)
+                difference.putLength(tree, arg) and difference.put(tree, node, true)
             else
-                difference.put(tree, each.node, false) and difference.put(tree, arg, true);
+                difference.put(tree, node, false) and difference.put(tree, arg, true);
             if (!spread) continue;
             difference.constant -= relation.least;
             out.add(difference);
         }
+    }
+}
+
+/// The relations field `decl` read on `receiver` holds to its siblings there.
+fn related(c: *Context, decl: Facts.Decl, receiver: []const u8, out: *Known) Context.Error!void {
+    const name = c.project.models[decl.file.raw()].declarations[decl.index].name;
+    const self_text = try c.allocator.print("{s}.{s}", .{ receiver, name });
+    for (try siblings(c, decl)) |sibling| {
+        var difference: Linear = .{};
+        const text = try c.allocator.print("{s}.{s}", .{ receiver, sibling.name });
+        if (!difference.term(.{ .node = null, .text = text, .length = sibling.length, .negative = false, .field = sibling.decl, .receiver = receiver })) continue;
+        if (!difference.term(.{ .node = null, .text = self_text, .length = false, .negative = true, .field = decl, .receiver = receiver })) continue;
+        difference.constant -= sibling.least;
+        out.add(difference);
     }
 }
 
@@ -1636,7 +1814,7 @@ fn summary(c: *Context, decl: Facts.Decl) Context.Error![]const Relation {
                 const value = unwrapped(tree, tree.nodeData(ret).opt_node.unwrap().?);
                 var difference: Linear = .{};
                 const spread = if (slice)
-                    difference.term(tree, .{ .node = use, .length = true, .negative = false }) and difference.put(tree, value, true)
+                    difference.term(Linear.Term.of(tree, use, true, false)) and difference.put(tree, value, true)
                 else
                     difference.put(tree, value, false) and difference.put(tree, use, true);
                 if (!spread) {
@@ -1718,9 +1896,11 @@ fn evaluated(c: *Context, file: Project.FileId, value: Linear, pointer: u16, dep
     var out: i132 = value.constant;
     for (value.terms[0..value.len]) |each| {
         const range: Interval = if (each.length)
-            if (try fixedLength(c, file, each.node)) |n| .exactly(n) else .{ .least = 0, .most = length(pointer) }
+            if (each.node) |memory| (if (try fixedLength(c, file, memory)) |n| Interval.exactly(n) else Interval{ .least = 0, .most = length(pointer) }) else .{ .least = 0, .most = length(pointer) }
+        else if (each.node) |node|
+            try bound(c, file, node, pointer, depth + 1)
         else
-            try bound(c, file, each.node, pointer, depth + 1);
+            return -Interval.far;
         out +|= if (each.negative) -range.most else range.least;
     }
     return clamp(out);
@@ -1801,7 +1981,12 @@ fn isLength(tree: *const Ast, node: Ast.Node.Index) bool {
 /// Whether two expressions are spelled alike, parentheses and the conversions that keep a
 /// value (`@as`, `@intCast`) aside.
 fn same(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, tree.getNodeSource(bare(tree, a)), " "), std.mem.trim(u8, tree.getNodeSource(bare(tree, b)), " "));
+    return std.mem.eql(u8, spelled(tree, a), spelled(tree, b));
+}
+
+/// How an expression is spelled, parentheses and the conversions that keep a value aside.
+fn spelled(tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    return std.mem.trim(u8, tree.getNodeSource(bare(tree, node)), " ");
 }
 
 fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
