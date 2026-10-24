@@ -845,7 +845,7 @@ test "A010 leaves a backing integer's conversion every value of it makes: a pack
         \\    if (m > 2) return error.Bad;
         \\    const ok: Mode = @fromBackingInt(m);
         \\    _ = ok;
-        \\    _ = mode(m);
+        \\    _ = mode(try r.takeInt(u8, 0));
         \\    const g: Gapped = @fromBackingInt(m);
         \\    _ = g;
         \\    const any: Mode = @fromBackingInt(try r.takeInt(u8, 0));
@@ -928,6 +928,46 @@ test "A009 carries a check past a store on every path that advances what it comp
         \\        q += 4;
         \\        _ = out[q..];
         \\    }
+        \\}
+    , 3);
+}
+
+test "A010 reads a private function's parameter by what its calls give it, not a public one's, one given away as a value or one only tests call" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn seconds(n: i64) u64 {
+        \\    return @as(u64, @intCast(n)) * 1000;
+        \\}
+        \\fn loose(n: i64) u64 {
+        \\    return @intCast(n);
+        \\}
+        \\fn handed(n: i64) u64 {
+        \\    return @intCast(n);
+        \\}
+        \\pub fn exposed(n: i64) u64 {
+        \\    return @intCast(n);
+        \\}
+        \\const S = struct {
+        \\    fn step(s: *S, by: u32) u64 {
+        \\        _ = s;
+        \\        return @as(u32, @intCast(by)) * 2;
+        \\    }
+        \\};
+        \\pub fn f(r: *std.Io.Reader, s: *S) !void {
+        \\    const a = try r.takeInt(i64, 0);
+        \\    if (a > 0 and a < 1000) {
+        \\        _ = seconds(a);
+        \\        _ = handed(a);
+        \\        _ = exposed(a);
+        \\        _ = s.step(@intCast(a));
+        \\    }
+        \\    _ = seconds(5);
+        \\    _ = loose(a);
+        \\    const g = &handed;
+        \\    _ = g;
+        \\}
+        \\test {
+        \\    _ = seconds(-1);
         \\}
     , 3);
 }

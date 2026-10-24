@@ -663,8 +663,76 @@ fn declared(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
             return assigned(c, decl, pointer);
         },
         .capture => captured(c, decl, pointer),
+        .parameter => passed(c, decl, pointer),
         else => .any,
     };
+}
+
+/// What each parameter holds, read once per pointer width.
+const Params = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, Interval) = .empty };
+
+/// What a parameter of a function only its own file calls holds: the widest of what its calls
+/// give it, each read where the call is made. A public or exported function's parameter is its
+/// type, as is one whose function is named other than to call it (given away as a value), and
+/// one only tests call.
+fn passed(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
+    const memo = try c.facts.memo(Params);
+    const key = .{ decl, pointer };
+    if (memo.map.get(key)) |known| return known;
+    // A function that reaches itself gives its parameter its type while it is being read.
+    try memo.map.put(c.allocator, key, .any);
+    const out = try givenByCalls(c, decl, pointer);
+    try memo.map.put(c.allocator, key, out);
+    try keep(c, .{ .params = key });
+    return out;
+}
+
+fn givenByCalls(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const model = &c.project.models[decl.file.raw()];
+    const record = model.declarations[decl.index];
+    const function: u32 = for (model.declarations, 0..) |each, i| {
+        if (each.kind == .function and tree.firstToken(each.node) <= record.token and record.token <= tree.lastToken(each.node)) break @intCast(i);
+    } else return .any;
+    const owner = model.declarations[function];
+    if (owner.public or owner.exported) return .any;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, owner.node) orelse return .any;
+    var place: usize = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| : (place += 1) {
+        if (param.name_token == record.token) break;
+    } else return .any;
+    const name = tree.tokenSlice(owner.token);
+    var out: ?Interval = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const names_it = switch (tag) {
+            .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name) and refersTo(model, tree, node, function),
+            .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), name) and switch (try c.facts.resolve(decl.file, node)) {
+                .function => |d| d.file.eql(decl.file) and d.index == function,
+                else => false,
+            },
+            else => false,
+        };
+        if (!names_it) continue;
+        const parent = model.node_parents[@backingInt(node)] orelse return .any;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, parent) orelse return .any;
+        if (call.ast.fn_expr != node) return .any;
+        if (inTest(tree, model, parent)) continue;
+        // A method called on a value takes it as its first parameter.
+        var skip: usize = 0;
+        if (tag == .field_access) {
+            var receiver = try c.facts.resolve(decl.file, tree.nodeData(node).node_and_token[0]);
+            if (receiver == .pointer) receiver = receiver.pointer.*;
+            if (receiver == .instance) skip = 1;
+        }
+        if (place < skip or place - skip >= call.ast.params.len) return .any;
+        const value = try bound(c, decl.file, call.ast.params[place - skip], pointer, 0);
+        out = if (out) |o| o.join(value) else value;
+    }
+    return out orelse .any;
 }
 
 /// Every store into a field, found once over the program: by the field it resolves to, or,
@@ -811,6 +879,7 @@ const Proving = struct {
         grows: struct { Facts.Decl, u16 },
         siblings: Facts.Decl,
         summaries: Facts.Decl,
+        params: struct { Facts.Decl, u16 },
     };
 };
 
@@ -833,6 +902,7 @@ fn endProof(c: *Context) Context.Error!void {
         .grows => |key| _ = (try c.facts.memo(Constants)).grows.remove(key),
         .siblings => |key| _ = (try c.facts.memo(Stores)).siblings.remove(key),
         .summaries => |key| _ = (try c.facts.memo(Summaries)).map.remove(key),
+        .params => |key| _ = (try c.facts.memo(Params)).map.remove(key),
     };
     proving.kept.clearRetainingCapacity();
 }
