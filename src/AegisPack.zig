@@ -2086,6 +2086,8 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
             };
             if (k == .condition) return true;
         }
+        // A secret's writer borrows the owner it writes into; the owner keeps its release.
+        if (std.mem.eql(u8, name, "init") and try Contract.kind(c, file, data[0], 0) == .bytes_writer) return true;
     }
     if (depth == 8) return false;
     const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;

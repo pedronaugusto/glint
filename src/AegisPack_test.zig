@@ -1076,6 +1076,14 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
     try expectJudged(head ++ "pub fn f(a: *const [4]u8, b: *const [4]u8) bool { const c = aegis.secret.equal(4, a, b); const copy = c; return copy.declassify(\"fixture\"); }", pack.copies, true, 0);
 }
 
+test "a secret's writer borrows the owner it writes into; the owner keeps its release" {
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
+    // Read from a stream into the owner through its writer, then handed out: released on error.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !Bytes { var text = try Bytes.init(gpa, 0); errdefer text.deinit(); var w = Bytes.Writer.init(&text); try w.interface.writeAll(\"x\"); try w.interface.flush(); return text; }", pack.cleanup, true, 0);
+    // The writer releases nothing: an owner left after it is still owed.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { var text = try Bytes.init(gpa, 0); var w = Bytes.Writer.init(&text); w.interface.end = 0; }", pack.cleanup, true, 1);
+}
+
 test "an adoption of a whole byte allocation from the same allocator, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(gpa, buffer, n); }", pack.capacity, true, 0);
