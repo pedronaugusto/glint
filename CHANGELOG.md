@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-24
+
 ### Changed
 
 - Pins aegis 0.1.17 and ensign 0.2.4.
