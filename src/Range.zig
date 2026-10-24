@@ -15,6 +15,7 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Taint = @import("Taint.zig");
 const Ast = std.zig.Ast;
 
 /// An integer type: its width, and whether it is signed.
@@ -456,7 +457,15 @@ fn storeInto(c: *Context, stores: *Stores, file: Project.FileId, target: Ast.Nod
                 const spelled = tree.tokenSlice(tree.nodeMainToken(args[1]));
                 return add(c, stores, null, spelled[1 .. spelled.len - 1], store);
             }
-            stores.blind = true;
+            // A name the program computes (an `inline for` over a type's fields) may be any of
+            // its type's fields, which its type then bounds. Where the type does not resolve
+            // (a generic decoder's), only input stored by it reaches past what the stores say.
+            switch (try typeOfValue(c, file, args[0])) {
+                .container, .instance => |k| try stores.viewed.put(c.allocator, .{ k.file.raw(), k.scope }, {}),
+                else => if (try holdsInput(c, file, value)) {
+                    stores.blind = true;
+                },
+            }
         },
         else => {},
     }
@@ -475,8 +484,10 @@ fn add(c: *Context, stores: *Stores, decl: ?Facts.Decl, name: ?[]const u8, store
     try list.append(c.allocator, store);
 }
 
-/// Marks the type a call views as bytes: `std.mem.asBytes(&x)`, `sliceAsBytes(xs)` and the
-/// `bytesAs*`/`bytesToValue` that name it.
+/// Marks the type whose values a call makes from input's bytes: `bytesAsValue`,
+/// `bytesAsSlice` and `bytesToValue` over input, and `std.mem.asBytes(&x)` or
+/// `sliceAsBytes(xs)` given to a read or as `@memcpy`'s destination for input. A view of the
+/// program's own bytes (a wipe, a table laid over its buffer) holds no value a peer chose.
 fn viewed(c: *Context, stores: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.files[file.raw()].tree;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -490,16 +501,44 @@ fn viewed(c: *Context, stores: *Stores, file: Project.FileId, node: Ast.Node.Ind
     const of_value = std.mem.eql(u8, name, "asBytes") or std.mem.eql(u8, name, "sliceAsBytes");
     if (!named_type and !of_value) return;
     if (call.ast.params.len == 0) return;
-    var value = try c.facts.resolve(file, call.ast.params[0]);
-    while (true) value = switch (value) {
-        .optional, .error_union, .pointer, .array => |inner| inner.*,
-        else => break,
-    };
-    switch (value) {
+    if (named_type and (call.ast.params.len < 2 or !try holdsInput(c, file, call.ast.params[1]))) return;
+    if (of_value and !try takesInput(c, file, node)) return;
+    switch (try typeOfValue(c, file, call.ast.params[0])) {
         .container, .instance => |k| try stores.viewed.put(c.allocator, .{ k.file.raw(), k.scope }, {}),
         .primitive, .scalar => {},
         else => stores.blind = true,
     }
+}
+
+/// What a value or a type names, seen through pointers, optionals, arrays and error unions.
+fn typeOfValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Facts.Value {
+    var value = try c.facts.resolve(file, node);
+    while (true) value = switch (value) {
+        .optional, .error_union, .pointer, .array => |inner| inner.*,
+        else => return value,
+    };
+}
+
+/// Whether a value may hold input: what the input fact gives it, or a store whose value is
+/// not read.
+fn holdsInput(c: *Context, file: Project.FileId, value: ?Ast.Node.Index) Context.Error!bool {
+    const node = value orelse return true;
+    const flow = try Taint.get(c, .input);
+    return try Taint.levelAt(c, flow, file, node) != .clean;
+}
+
+/// Whether bytes a view gives are filled with input where it is made: given to a read, or as
+/// `@memcpy`'s destination for input.
+fn takesInput(c: *Context, file: Project.FileId, view: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const parent = c.project.models[file.raw()].node_parents[@backingInt(view)] orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, parent)) |call| return Taint.isRead(c, try Taint.get(c, .input), file, call);
+    if (tree.nodeTag(parent) != .builtin_call_two and tree.nodeTag(parent) != .builtin_call_two_comma) return false;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@memcpy")) return false;
+    var args_buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, parent, &args_buffer);
+    return args.len == 2 and args[0] == view and try holdsInput(c, file, args[1]);
 }
 
 /// Whether `node` is inside a `test` block.

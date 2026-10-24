@@ -430,6 +430,30 @@ fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value:
         .deref, .address_of => return store(c, flow, function, tree.nodeData(target).node, value),
         .grouped_expression, .unwrap_optional => return store(c, flow, function, tree.nodeData(target).node_and_token[0], value),
         .slice_open, .slice, .slice_sentinel => return store(c, flow, function, (tree.fullSlice(target) orelse return).ast.sliced, value),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) return;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, target, &buffer);
+            if (args.len != 2) return;
+            // The field `@field` names holds the fact by its declaration, as a field read by
+            // name does; every field of the type where the name is computed.
+            var holder = try c.facts.resolve(f.file, args[0]);
+            if (holder == .pointer) holder = holder.pointer.*;
+            const container = switch (holder) {
+                .container, .instance => |k| k,
+                else => return store(c, flow, function, args[0], value),
+            };
+            if (!c.project.inputs[container.file.raw()].selected) return store(c, flow, function, args[0], value);
+            const spelled: ?[]const u8 = if (tree.nodeTag(args[1]) == .string_literal) blk: {
+                const text = tree.tokenSlice(tree.nodeMainToken(args[1]));
+                break :blk text[1 .. text.len - 1];
+            } else null;
+            for (c.project.models[container.file.raw()].declarations, 0..) |decl, d| {
+                if (decl.kind != .field or decl.scope != container.scope) continue;
+                if (spelled) |name| if (!std.mem.eql(u8, decl.name, name)) continue;
+                try raiseGlobal(c, flow, .{ .file = container.file, .index = @intCast(d) }, concrete(flow, function, value));
+            }
+        },
         else => {},
     }
 }

@@ -662,7 +662,7 @@ test "A010 reads a call's bound from what its function returns, a conversion's d
     , 1);
 }
 
-test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address or bytes define it" {
+test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address, input's bytes or a computed name reach it, or its layout is bytes" {
     try expect(pack.integers,
         \\const std = @import("std");
         \\const Weights = struct { count: u32 = 0 };
@@ -670,11 +670,13 @@ test "A010 reads a field by its stores: the widest value its default, its litera
         \\const Grown = struct { n: u32 = 0 };
         \\const Given = struct { n: u32 = 0 };
         \\const Viewed = struct { n: u32 = 0 };
+        \\const Wiped = struct { n: u32 = 0 };
+        \\const Named = struct { n: u32 = 0 };
         \\const Wire = extern struct { n: u32 };
         \\fn fill(n: *u32) void {
         \\    n.* = 7;
         \\}
-        \\pub fn f(r: *std.Io.Reader, w: *Weights, g: *Grown, v: *Given, b: *Viewed) !void {
+        \\pub fn f(r: *std.Io.Reader, w: *Weights, g: *Grown, v: *Given, b: *Viewed, k: *Wiped, q: *Named) !void {
         \\    const n = try r.takeInt(u32, 0);
         \\    if (n >= 255) return error.Long;
         \\    w.count = n + 1;
@@ -692,8 +694,13 @@ test "A010 reads a field by its stores: the widest value its default, its litera
         \\    var x: Wire = undefined;
         \\    x.n = n;
         \\    _ = x.n * 1000;
+        \\    k.n = n;
+        \\    std.crypto.secureZero(u8, std.mem.asBytes(k));
+        \\    _ = k.n * 1000;
+        \\    inline for (.{"n"}) |name| @field(q, name) = n;
+        \\    _ = q.n * 1000;
         \\}
-    , 5);
+    , 6);
 }
 
 test "A009 leaves a position the program checked against the memory's length, and an index a fixed array's length holds" {
