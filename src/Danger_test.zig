@@ -662,6 +662,40 @@ test "A010 reads a call's bound from what its function returns, a conversion's d
     , 1);
 }
 
+test "A010 reads a field by its stores: the widest value its default, its literals and its assignments give it, and its type where a store grows it, takes its address or bytes define it" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Weights = struct { count: u32 = 0 };
+        \\const Open = struct { total: u32 };
+        \\const Grown = struct { n: u32 = 0 };
+        \\const Given = struct { n: u32 = 0 };
+        \\const Viewed = struct { n: u32 = 0 };
+        \\const Wire = extern struct { n: u32 };
+        \\fn fill(n: *u32) void {
+        \\    n.* = 7;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, w: *Weights, g: *Grown, v: *Given, b: *Viewed) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (n >= 255) return error.Long;
+        \\    w.count = n + 1;
+        \\    _ = w.count * 1000;
+        \\    const o: Open = .{ .total = n };
+        \\    _ = o.total * 1000;
+        \\    g.n += n;
+        \\    _ = g.n * 1000;
+        \\    v.n = n;
+        \\    fill(&v.n);
+        \\    _ = v.n * 1000;
+        \\    b.n = n;
+        \\    _ = try r.readSliceAll(std.mem.asBytes(b));
+        \\    _ = b.n * 1000;
+        \\    var x: Wire = undefined;
+        \\    x.n = n;
+        \\    _ = x.n * 1000;
+        \\}
+    , 5);
+}
+
 test "A009 leaves a position the program checked against the memory's length, and an index a fixed array's length holds" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");

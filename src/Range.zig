@@ -200,6 +200,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             // A length of memory the program holds: below half the address space.
             if (std.mem.eql(u8, name, "len")) return length(pointer);
             const decl = (try c.facts.definition(file, node)) orelse return null;
+            if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return stored(c, decl, pointer, next);
             return constant(c, decl, pointer, next);
         },
         .grouped_expression, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
@@ -209,7 +210,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
-        .add, .assign_add => {
+        .add, .assign_add, .assign_add_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
@@ -226,7 +227,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             if (!signed) return bound(c, file, lhs, pointer, next);
             return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
-        .mul => {
+        .mul, .assign_mul, .assign_mul_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
             const right = (try bound(c, file, rhs, pointer, next)) orelse return null;
@@ -237,7 +238,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs));
         },
         .mod => return ((try bound(c, file, tree.nodeData(node).node_and_node[1], pointer, next)) orelse return null) -| 1,
-        .shl => {
+        .shl, .assign_shl, .assign_shl_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return shifted(try bound(c, file, lhs, pointer, next), literal(tree, rhs) orelse return null);
         },
@@ -255,7 +256,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             if (right == null) return left;
             return @min(left.?, right.?);
         },
-        .bit_or, .bit_xor => {
+        .bit_or, .bit_xor, .assign_bit_or, .assign_bit_xor => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
             return filled(128 - @clz(most));
@@ -323,6 +324,191 @@ fn enclosing(tree: *const Ast, model: anytype, node: Ast.Node.Index) ?Ast.Node.I
         if (tree.nodeTag(parent) == .fn_decl) return parent;
     }
     return null;
+}
+
+/// Every store into a field, found once over the program: by the field it resolves to, or,
+/// where its target does not resolve, by the field's name, which every field of that name
+/// then takes. A field holds at most the widest of its stores, each read where it is made.
+const Stores = struct {
+    scanned: bool = false,
+    by_field: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(Store)) = .empty,
+    by_name: std.StringHashMapUnmanaged(std.ArrayList(Store)) = .empty,
+    /// Types whose values the program views as bytes (`std.mem.asBytes`, `bytesAsValue`): their
+    /// fields hold whatever the bytes do.
+    viewed: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty,
+    /// A view or a computed `@field` store whose type does not resolve: no field is read by its
+    /// stores.
+    blind: bool = false,
+    ranges: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty,
+};
+/// A store: the value it gives, read in its file, or none where its range is not read (a
+/// field given by address, a destructure, wrapping arithmetic).
+const Store = struct { file: Project.FileId, value: ?Ast.Node.Index };
+
+/// What a field holds at most: the widest of its default and its stores, or null where a
+/// store is not read or a value of its type is made otherwise (bytes viewed as it, a layout
+/// that bytes define). A field whose stores read it again is unbounded while it is read, so
+/// its type bounds it there.
+fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+    const stores = try c.facts.memo(Stores);
+    if (!stores.scanned) {
+        stores.scanned = true;
+        try scan(c, stores);
+    }
+    if (stores.blind) return null;
+    const input = c.project.inputs[decl.file.raw()];
+    if (!input.selected or input.classification == .@"test") return null;
+    const model = &c.project.models[decl.file.raw()];
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const record = model.declarations[decl.index];
+    // A layout bytes define (`extern`, `packed`) is any bytes a read or a cast gives it.
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, model.scopes[record.scope].node) orelse return null;
+    if (container.layout_token != null) return null;
+    if (stores.viewed.contains(.{ decl.file.raw(), record.scope })) return null;
+    const key = .{ decl, pointer };
+    if (stores.ranges.get(key)) |known| return known;
+    try stores.ranges.put(c.allocator, key, null);
+    var out: ?u128 = 0;
+    const full = tree.fullContainerField(record.node) orelse return null;
+    if (full.ast.value_expr.unwrap()) |default| out = wider(out, try bound(c, decl.file, default, pointer, depth));
+    const lists = [_]?std.ArrayList(Store){ stores.by_field.get(decl), stores.by_name.get(record.name) };
+    for (lists) |list| for (if (list) |l| l.items else &.{}) |store| {
+        if (out == null) break;
+        out = wider(out, try bound(c, store.file, store.value orelse {
+            out = null;
+            break;
+        }, pointer, depth));
+    };
+    try stores.ranges.put(c.allocator, key, out);
+    return out;
+}
+
+/// Finds every store into a field in the program's own code, its tests aside.
+fn scan(c: *Context, stores: *Stores) Context.Error!void {
+    for (c.project.inputs, 0..) |input, f| {
+        if (!input.selected or input.classification == .@"test") continue;
+        const file = Project.FileId.fromRaw(@intCast(f));
+        const tree = &c.project.files[f].tree;
+        const model = &c.project.models[f];
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            switch (tag) {
+                .assign => {
+                    const target, const value = tree.nodeData(node).node_and_node;
+                    try storeInto(c, stores, file, target, value);
+                },
+                .assign_add, .assign_add_sat, .assign_mul, .assign_mul_sat, .assign_shl, .assign_shl_sat, .assign_bit_or, .assign_bit_xor => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], node),
+                .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap => try storeInto(c, stores, file, tree.nodeData(node).node_and_node[0], null),
+                // A difference, quotient, shift right or remainder never takes an unsigned
+                // value past what it was; a signed one may cross to a larger magnitude.
+                .assign_sub, .assign_sub_sat, .assign_div, .assign_shr, .assign_mod, .assign_bit_and => {
+                    const target = tree.nodeData(node).node_and_node[0];
+                    if (!try nonnegative(c, file, target, 64)) try storeInto(c, stores, file, target, null);
+                },
+                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |variable| try storeInto(c, stores, file, variable, null),
+                // A field given by address is written by whoever takes it.
+                .address_of => try storeInto(c, stores, file, bare(tree, tree.nodeData(node).node), null),
+                .call_one, .call_one_comma, .call, .call_comma => try viewed(c, stores, file, node),
+                else => {
+                    var literal_buffer: [2]Ast.Node.Index = undefined;
+                    const literal_node = tree.fullStructInit(&literal_buffer, node) orelse continue;
+                    if (inTest(tree, model, node)) continue;
+                    var holder = try c.facts.literalType(file, node);
+                    while (true) holder = switch (holder) {
+                        .optional, .error_union, .pointer => |inner| inner.*,
+                        else => break,
+                    };
+                    for (literal_node.ast.fields) |value| {
+                        if (tree.firstToken(value) < 2) continue;
+                        const name = tree.tokenSlice(tree.firstToken(value) - 2);
+                        const store: Store = .{ .file = file, .value = value };
+                        switch (holder) {
+                            .container, .instance => |k| if (c.facts.member(k, name)) |decl| {
+                                try add(c, stores, decl, null, store);
+                                continue;
+                            },
+                            else => {},
+                        }
+                        try add(c, stores, null, name, store);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Records a store of `value` into `target`, where the target is a field.
+fn storeInto(c: *Context, stores: *Stores, file: Project.FileId, target: Ast.Node.Index, value: ?Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    if (inTest(tree, &c.project.models[file.raw()], target)) return;
+    const store: Store = .{ .file = file, .value = value };
+    switch (tree.nodeTag(target)) {
+        .field_access => {
+            if (try c.facts.definition(file, target)) |decl| if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .field) return add(c, stores, decl, null, store);
+            return add(c, stores, null, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), store);
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) return;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, target, &buffer);
+            if (args.len == 2 and tree.nodeTag(args[1]) == .string_literal) {
+                const spelled = tree.tokenSlice(tree.nodeMainToken(args[1]));
+                return add(c, stores, null, spelled[1 .. spelled.len - 1], store);
+            }
+            stores.blind = true;
+        },
+        else => {},
+    }
+}
+
+fn add(c: *Context, stores: *Stores, decl: ?Facts.Decl, name: ?[]const u8, store: Store) Context.Error!void {
+    const list = if (decl) |d| blk: {
+        const entry = try stores.by_field.getOrPut(c.allocator, d);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        break :blk entry.value_ptr;
+    } else blk: {
+        const entry = try stores.by_name.getOrPut(c.allocator, name.?);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        break :blk entry.value_ptr;
+    };
+    try list.append(c.allocator, store);
+}
+
+/// Marks the type a call views as bytes: `std.mem.asBytes(&x)`, `sliceAsBytes(xs)` and the
+/// `bytesAs*`/`bytesToValue` that name it.
+fn viewed(c: *Context, stores: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return;
+    const callee = tree.lastToken(call.ast.fn_expr);
+    if (tree.tokenTag(callee) != .identifier) return;
+    const name = tree.tokenSlice(callee);
+    const named_type = for ([_][]const u8{ "bytesAsValue", "bytesAsSlice", "bytesToValue" }) |each| {
+        if (std.mem.eql(u8, name, each)) break true;
+    } else false;
+    const of_value = std.mem.eql(u8, name, "asBytes") or std.mem.eql(u8, name, "sliceAsBytes");
+    if (!named_type and !of_value) return;
+    if (call.ast.params.len == 0) return;
+    var value = try c.facts.resolve(file, call.ast.params[0]);
+    while (true) value = switch (value) {
+        .optional, .error_union, .pointer, .array => |inner| inner.*,
+        else => break,
+    };
+    switch (value) {
+        .container, .instance => |k| try stores.viewed.put(c.allocator, .{ k.file.raw(), k.scope }, {}),
+        .primitive, .scalar => {},
+        else => stores.blind = true,
+    }
+}
+
+/// Whether `node` is inside a `test` block.
+fn inTest(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .test_decl) return true;
+    }
+    return false;
 }
 
 /// What a builtin's operation bounds.
