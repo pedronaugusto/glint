@@ -645,13 +645,19 @@ fn siblingLeast(c: *Context, stores: *Stores, f: Facts.Decl, g: Facts.Decl, leng
                 if (length_of) {
                     // Only an empty default's length is known: nothing.
                     if (!std.mem.eql(u8, spelled(decl_tree, default), "&.{}") and !std.mem.eql(u8, spelled(decl_tree, default), "\"\"")) return null;
-                } else difference.constant +|= (try bound(c, f.file, default, pointer, 0)).least;
+                } else {
+                    const given = (try bound(c, f.file, default, pointer, 0)).least;
+                    if (given <= -Interval.far) return null;
+                    difference.constant +|= given;
+                }
             }
             if (literalValue(tree, made.node, f_record.name)) |given| {
                 if (!difference.put(tree, given, true)) return null;
             } else {
                 const default = (decl_tree.fullContainerField(f_record.node) orelse return null).ast.value_expr.unwrap() orelse return null;
-                difference.constant -|= (try bound(c, f.file, default, pointer, 0)).most;
+                const given = (try bound(c, f.file, default, pointer, 0)).most;
+                if (given >= Interval.far) return null;
+                difference.constant -|= given;
             }
             out = @min(out, try least(c, made.file, difference, made.node, pointer, 0, true));
         };
@@ -1515,7 +1521,7 @@ const Linear = struct {
             },
             .negation => return self.put(tree, tree.nodeData(at).node, !negative),
             .number_literal => if (literal(tree, at)) |value| {
-                self.constant += if (negative) -@as(i132, value) else value;
+                self.constant +|= if (negative) -@as(i132, value) else value;
                 return true;
             },
             .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "len")) {
@@ -1560,7 +1566,7 @@ const Linear = struct {
     /// What is left of this value once `other` is taken away.
     fn less(self: Linear, other: Linear) ?Linear {
         var out = self;
-        out.constant -= other.constant;
+        out.constant -|= other.constant;
         for (other.terms[0..other.len]) |each| {
             var flipped = each;
             flipped.negative = !each.negative;
@@ -1622,7 +1628,7 @@ fn relations(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     for (try facts(c, file, node)) |fact| {
         var difference: Linear = .{};
         if (!difference.put(tree, fact.large, false) or !difference.put(tree, fact.small, true)) continue;
-        difference.constant -= @intFromBool(fact.strict);
+        difference.constant -|= @intFromBool(fact.strict);
         try out.append(c.allocator, difference);
     }
     const found = try out.toOwnedSlice(c.allocator);
@@ -1693,7 +1699,7 @@ fn definitions(c: *Context, file: Project.FileId, value: Linear, at: Ast.Node.In
             else
                 difference.put(tree, node, false) and difference.put(tree, arg, true);
             if (!spread) continue;
-            difference.constant -= relation.least;
+            difference.constant -|= relation.least;
             out.add(difference);
         }
     }
@@ -1708,7 +1714,7 @@ fn related(c: *Context, decl: Facts.Decl, receiver: []const u8, out: *Known) Con
         const text = try c.allocator.print("{s}.{s}", .{ receiver, sibling.name });
         if (!difference.term(.{ .node = null, .text = text, .length = sibling.length, .negative = false, .field = sibling.decl, .receiver = receiver })) continue;
         if (!difference.term(.{ .node = null, .text = self_text, .length = false, .negative = true, .field = decl, .receiver = receiver })) continue;
-        difference.constant -= sibling.least;
+        difference.constant -|= sibling.least;
         out.add(difference);
     }
 }

@@ -806,9 +806,19 @@ const cursor_program =
     \\        return l.buf[l.pos..l.end];
     \\    }
     \\};
+    \\const Far = struct {
+    \\    buf: []const u8,
+    \\    pos: usize = undefined,
+    \\    end: usize = undefined,
+    \\    fn rest(w: *const Far) []const u8 {
+    \\        return w.buf[w.pos..w.end];
+    \\    }
+    \\};
     \\pub fn f(r: *std.Io.Reader) !void {
     \\    const bytes = try r.take(64);
     \\    const n: usize = try r.takeInt(u32, 0);
+    \\    if (n > 4) return error.Big;
+    \\    _ = (Far{ .buf = bytes }).rest();
     \\    var cur = Cursor.init(bytes);
     \\    if (n > cur.end - cur.pos) return error.Short;
     \\    cur.advance(n);
@@ -820,7 +830,7 @@ const cursor_program =
     \\}
 ;
 
-test "A009 and A010 read a field's relation to its siblings: a cursor at most its end and the end at most its buffer's length, while every store keeps them" {
+test "A009 and A010 read a field's relation to its siblings: a cursor at most its end and the end at most its buffer's length, while every store keeps them; a default the reading does not know gives none" {
     try expect(pack.integers, cursor_program, 1);
     try expect(pack.untrusted_input, cursor_program, 1);
 }
