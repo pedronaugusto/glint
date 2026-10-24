@@ -236,7 +236,100 @@ fn refined(c: *Context, file: Project.FileId, node: Ast.Node.Index, out: Interva
     if ((tag == .identifier or tag == .field_access) and try position(c, file, node)) r.most = @min(r.most, length(pointer));
     r.least = @max(r.least, try least(c, file, value, node, pointer, depth, false));
     r.most = @min(r.most, -(try least(c, file, value.negated(), node, pointer, depth, false)));
+    if (tag == .identifier or tag == .field_access) if (try latest(c, file, node, pointer, depth)) |given| {
+        const both = r.meet(given);
+        if (!both.empty()) r = both;
+    };
     return if (r.empty()) out else r;
+}
+
+/// What the latest store to `node` before it gives, where that store is a statement of a block
+/// `node` is in and nothing has touched the value since: `s.bits &= 7;` puts `s.bits` at most 7
+/// until it is stored again, its address is taken or a call is given it.
+fn latest(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Interval {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            .fn_decl => return null,
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const statements = tree.blockStatements(&buffer, parent).?;
+                var k = std.mem.findScalar(Ast.Node.Index, statements, at) orelse continue;
+                while (k > 0) {
+                    k -= 1;
+                    const statement = statements[k];
+                    const value: Interval = switch (tree.nodeTag(statement)) {
+                        .assign => blk: {
+                            const target, const given = tree.nodeData(statement).node_and_node;
+                            if (!same(tree, target, node)) continue;
+                            break :blk try bound(c, file, given, pointer, depth + 1);
+                        },
+                        // A mask by a value never below zero leaves at most it.
+                        .assign_bit_and => blk: {
+                            const target, const mask = tree.nodeData(statement).node_and_node;
+                            if (!same(tree, target, node)) continue;
+                            const by = try bound(c, file, mask, pointer, depth + 1);
+                            if (by.least < 0) return null;
+                            break :blk .{ .least = 0, .most = by.most };
+                        },
+                        else => continue,
+                    };
+                    return if (touched(c, file, node, statement, node)) null else value;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Whether something may change `target` after statement `from` and before `use`: a store to
+/// it or to what it is read through, its address taken, or a call given it or called on it,
+/// between them or in a loop that holds `use` and begins after `from` (which runs again before
+/// `use` on its next pass).
+fn touched(c: *Context, file: Project.FileId, target: Ast.Node.Index, from: Ast.Node.Index, use: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const after = tree.lastToken(from);
+    const before = tree.firstToken(use);
+    const root = root: {
+        var at = bare(tree, target);
+        while (tree.nodeTag(at) == .field_access) at = bare(tree, tree.nodeData(at).node_and_token[0]);
+        break :root at;
+    };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const touches = switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => blk: {
+                const lhs = tree.nodeData(node).node_and_node[0];
+                break :blk mentions(tree, target, lhs) or mentions(tree, lhs, target);
+            },
+            .assign_destructure => blk: {
+                for (tree.assignDestructure(node).ast.variables) |each| if (mentions(tree, target, each) or mentions(tree, each, target)) break :blk true;
+                break :blk false;
+            },
+            .address_of => mentions(tree, tree.nodeData(node).node, root),
+            else => blk: {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node) orelse continue;
+                if (tree.nodeTag(call.ast.fn_expr) == .field_access and mentions(tree, tree.nodeData(call.ast.fn_expr).node_and_token[0], root)) break :blk true;
+                for (call.ast.params) |param| if (mentions(tree, param, root)) break :blk true;
+                break :blk false;
+            },
+        };
+        if (!touches) continue;
+        const token = tree.nodeMainToken(node);
+        if (token > after and token < before) return true;
+        var up = node;
+        while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) {
+            if (tree.nodeTag(parent) == .fn_decl) break;
+            if (tree.fullWhile(parent) == null and tree.fullFor(parent) == null) continue;
+            if (tree.firstToken(parent) > after and tree.firstToken(parent) <= before and tree.lastToken(parent) >= before) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether arithmetic spelled as `node` was evaluated before it on every path, with nothing it
@@ -1200,7 +1293,9 @@ fn integer(value: Facts.Value, pointer: u16) Typed {
 }
 
 /// The type a conversion's result is read into: what `@as` names, a typed constant or
-/// variable it initializes, what it is assigned to, or the function's result it returns.
+/// variable it initializes, what it is assigned to, or the function's result it returns; an
+/// index or a slice's bound is a `usize`, and a shift's amount the log of the shifted type's
+/// width (`u6` for a `u64`).
 fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
@@ -1223,6 +1318,19 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
                     else => null,
                 };
             },
+            .array_access => {
+                if (tree.nodeData(parent).node_and_node[1] != at) return null;
+                return .{ .bits = pointer, .signed = false };
+            },
+            .shl, .shr, .assign_shl, .assign_shr => {
+                const lhs, const rhs = tree.nodeData(parent).node_and_node;
+                if (rhs != at) return null;
+                const shifted = switch (try typeOf(c, file, lhs, pointer, 0)) {
+                    .int => |int| int,
+                    else => return null,
+                };
+                return .{ .bits = if (shifted.bits <= 1) 0 else std.math.log2_int_ceil(u16, shifted.bits), .signed = false };
+            },
             .@"return" => {
                 var scope = parent;
                 while (model.node_parents[@backingInt(scope)]) |up| : (scope = up) {
@@ -1237,6 +1345,10 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
                 if (tree.fullVarDecl(parent)) |variable| {
                     if (variable.ast.init_node.unwrap() != at) return null;
                     return named(c, file, variable.ast.type_node.unwrap() orelse return null, pointer);
+                }
+                if (tree.fullSlice(parent)) |slice| {
+                    if (slice.ast.start != at and slice.ast.end.unwrap() != at) return null;
+                    return .{ .bits = pointer, .signed = false };
                 }
                 var call_buffer: [1]Ast.Node.Index = undefined;
                 if (tree.fullCall(&call_buffer, parent)) |call| return argument(c, file, call, at, pointer);

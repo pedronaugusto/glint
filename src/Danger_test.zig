@@ -625,7 +625,7 @@ test "A010 reads the comparisons that hold where a number is used: an earlier ch
         \\    _ = size - n;
         \\    var left = size;
         \\    if (left < 4) return error.Short;
-        \\    left = n;
+        \\    left = try r.takeInt(u64, 0);
         \\    _ = left - 4;
         \\    return bytes[at];
         \\}
@@ -743,7 +743,7 @@ test "A010 leaves a shift by a bounded amount, an address moved in place and ari
         \\    const big = try r.takeInt(u32, 0);
         \\    _ = (@as(u64, 1) << @intCast(big & 63)) * 2;
         \\}
-    , 2);
+    , 1);
 }
 
 test "A010 reads a name as what it was given while nothing stores into it: an untyped variable's type, and a check spelled with the name or its initializer" {
@@ -793,6 +793,36 @@ test "A010 reads a store that only lowers a variable or only raises it as keepin
         \\    _ = k - 1;
         \\}
     , 2);
+}
+
+test "A010 reads an index's, a slice bound's and a shift amount's destination, and the latest store before a read where nothing has touched the value since" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const S = struct { bits: u32 = 0, buf: u64 = 0 };
+        \\fn reset(s: *S) void { s.bits = 99; }
+        \\pub fn f(r: *std.Io.Reader, items: []u8, s: *S) !void {
+        \\    const v = try r.takeInt(i32, 0);
+        \\    if (v >= 0) _ = items[@intCast(v)];
+        \\    _ = items[@intCast(v)];
+        \\    const w = try r.takeInt(u64, 0);
+        \\    _ = items[@intCast(w & 15)..@intCast(w & 31)];
+        \\    var bits = try r.takeInt(u32, 0);
+        \\    bits &= 31;
+        \\    _ = w >> @intCast(bits);
+        \\    _ = w >> @intCast(bits + 40);
+        \\    s.bits = try r.takeInt(u32, 0);
+        \\    s.bits &= 7;
+        \\    s.buf &= (@as(u64, 1) << @intCast(s.bits)) - 1;
+        \\    s.bits &= 7;
+        \\    reset(s);
+        \\    _ = w >> @intCast(s.bits);
+        \\    bits &= 31;
+        \\    while (w > 4) {
+        \\        _ = w >> @intCast(bits);
+        \\        bits = try r.takeInt(u32, 0);
+        \\    }
+        \\}
+    , 4);
 }
 
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
@@ -898,6 +928,9 @@ test "A010 reads a field by its stores: the widest value its default, its litera
         \\fn fill(n: *u32) void {
         \\    n.* = 7;
         \\}
+        \\fn wire(x: *const Wire) u32 {
+        \\    return x.n * 1000;
+        \\}
         \\pub fn f(r: *std.Io.Reader, w: *Weights, g: *Grown, v: *Given, b: *Viewed, k: *Wiped, q: *Named) !void {
         \\    const n = try r.takeInt(u32, 0);
         \\    if (n >= 255) return error.Long;
@@ -915,7 +948,7 @@ test "A010 reads a field by its stores: the widest value its default, its litera
         \\    _ = b.n * 1000;
         \\    var x: Wire = undefined;
         \\    x.n = n;
-        \\    _ = x.n * 1000;
+        \\    _ = wire(&x);
         \\    k.n = n;
         \\    std.crypto.secureZero(u8, std.mem.asBytes(k));
         \\    _ = k.n * 1000;
