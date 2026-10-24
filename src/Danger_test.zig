@@ -773,6 +773,28 @@ test "A010 reads a name as what it was given while nothing stores into it: an un
     , 1);
 }
 
+test "A010 reads a store that only lowers a variable or only raises it as keeping it within what it held, on that side" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(in: *std.Io.Reader, at: usize) !void {
+        \\    const consumed = try in.takeInt(u32, 0);
+        \\    var n: usize = consumed >> 3;
+        \\    if (n > at) {
+        \\        n = at;
+        \\    }
+        \\    _ = n * 8;
+        \\    var m: usize = consumed >> 3;
+        \\    m = at;
+        \\    _ = m * 8;
+        \\    var k: i64 = try in.takeInt(i32, 0);
+        \\    const low = try in.takeInt(i64, 0);
+        \\    if (k > low) k = low;
+        \\    _ = k + 1;
+        \\    _ = k - 1;
+        \\}
+    , 2);
+}
+
 test "A009 reads where a call's result lies: std's positions, a function's summary from its returns, and a local that only grows" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");

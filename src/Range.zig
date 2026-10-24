@@ -1008,7 +1008,9 @@ const Constants = struct {
 
 /// What a local variable holds: the widest of its initializer and its function's stores into
 /// it, each read where it is made (so a position advanced under `pos + n <= buf.len` holds
-/// at most the length). A store that reads the variable without a comparison bounding it
+/// at most the length). A store of a value the comparisons there put at most the variable
+/// (`if (n > max) n = max;`) never takes it past what it held, only down to that value's least,
+/// and one of a value put at least it, only up to its greatest. A store that reads the variable without a comparison bounding it
 /// grows it to its type, as does a store the reading does not follow: wrapping arithmetic, a
 /// destructure, or its address given away. A container-level variable is its type.
 fn assigned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval {
@@ -1038,7 +1040,13 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!Interval 
             .assign => blk: {
                 const target, const given = tree.nodeData(node).node_and_node;
                 if (!refersTo(model, tree, target, decl.index)) continue;
-                break :blk try bound(c, decl.file, given, pointer, 0);
+                const value = try bound(c, decl.file, given, pointer, 0);
+                if (out == null) break :blk value;
+                var lowered: Linear = .{};
+                if (!lowered.put(tree, target, false) or !lowered.put(tree, given, true)) break :blk value;
+                if (try least(c, decl.file, lowered, node, pointer, 0, false) >= 0) break :blk .{ .least = value.least, .most = -Interval.far };
+                if (try least(c, decl.file, lowered.negated(), node, pointer, 0, false) >= 0) break :blk .{ .least = Interval.far, .most = value.most };
+                break :blk value;
             },
             .assign_add, .assign_add_sat, .assign_mul, .assign_mul_sat, .assign_shl, .assign_shl_sat, .assign_bit_or, .assign_bit_xor => blk: {
                 if (!refersTo(model, tree, tree.nodeData(node).node_and_node[0], decl.index)) continue;
