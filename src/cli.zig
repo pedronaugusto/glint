@@ -334,9 +334,9 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .traversal_failure;
     try loader.imports();
     record.outcome = .tool_failure;
-    var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{});
+    var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io });
     defer project.deinit();
-    var report = try Runner.runConfigured(gpa, &project, configured.config, .{ .project_rules = project_rules });
+    var report = try Runner.runConfigured(gpa, &project, configured.config, .{ .project_rules = project_rules, .io = io });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);

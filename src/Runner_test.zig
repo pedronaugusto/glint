@@ -538,3 +538,24 @@ test "review Z006 accepts a name a generic reads on its type parameter that an o
         try std.testing.expectEqual(@as(usize, if (generic) 1 else 2), report.diagnostics.len); // safe: fixture counts are representable.
     }
 }
+
+/// An `Io` on which every task has been asked to stop.
+const Canceled = @import("shakedown").Layer(u8, .{
+    .checkCancel = struct {
+        fn checkCancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    }.checkCancel,
+});
+
+test "a canceled analysis ends at the next file, building the project or running its rules; with no io it runs on" {
+    const sources = [_]glint.Project.Input{ .{ .name = "a.zig", .bytes = "const a = 1;" }, .{ .name = "b.zig", .bytes = "const b = 2;" } };
+    var canceled: Canceled = .init(std.testing.io, 0);
+    try std.testing.expectError(error.Canceled, glint.Project.init(std.testing.allocator, &sources, &.{}, .{ .io = canceled.io() }));
+    var project = try glint.Project.init(std.testing.allocator, &sources, &.{}, .{});
+    defer project.deinit();
+    const config: glint.Config = .{};
+    try std.testing.expectError(error.Canceled, glint.runConfigured(std.testing.allocator, &project, config, .{ .io = canceled.io() }));
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .io = std.testing.io });
+    defer report.deinit();
+}

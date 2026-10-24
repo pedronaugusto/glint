@@ -46,9 +46,18 @@ pub const Input = struct {
 /// A module edge selected and resolved by the caller, never by a path hash.
 pub const Import = struct { from: FileId, spelling: []const u8, target: FileId };
 /// Per-source limits for front-end work.
-pub const Options = struct { lowering: bool = true, limits: File.Limits = .{}, files: usize = 4096, bytes: usize = 128 * 1024 * 1024 };
+pub const Options = struct {
+    lowering: bool = true,
+    limits: File.Limits = .{},
+    files: usize = 4096,
+    bytes: usize = 128 * 1024 * 1024,
+    /// The caller's `Io`, asked for a cancel before each file is parsed and
+    /// lowered: a canceled build is `Canceled`. Null: none is asked, and a
+    /// canceller waits for every file.
+    io: ?std.Io = null,
+};
 /// Construction errors always propagate; no unread/allocation failure is clean.
-pub const InitError = File.InitError || Model.InitError || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded, SnapshotLimit };
+pub const InitError = File.InitError || Model.InitError || std.Io.Cancelable || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded, SnapshotLimit };
 /// A handle from another snapshot is invalid.
 pub const QueryError = error{InvalidHandle};
 
@@ -68,6 +77,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     var initialized: usize = 0;
     errdefer for (files[0..initialized]) |*file| file.deinit();
     for (inputs, 0..) |input, index| {
+        if (options.io) |io| try io.checkCancel();
         files[index] = try File.initWithLowering(gpa, input.bytes, options.limits, options.lowering);
         initialized += 1;
         models[index] = try Model.init(&files[index]);
