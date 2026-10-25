@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-25
+
 ### Breaking
 
 - The aegis pack's danger rules (aegis's design §7, enforcement): each finds the sites where a danger exists and aegis's type is the answer, from what the code resolves to.
