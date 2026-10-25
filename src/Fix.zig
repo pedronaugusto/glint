@@ -27,7 +27,7 @@ pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Er
 pub fn escapeOf(a: std.mem.Allocator, file: *const File, line: u32, rule: []const u8, message: []const u8) std.mem.Allocator.Error![]const Report.Edit {
     const reason: []const u8 = if (std.mem.eql(u8, rule, "A019") and (std.mem.startsWith(u8, message, "extern") or std.mem.startsWith(u8, message, "inline assembly")))
         "boundary"
-    else if (std.mem.startsWith(u8, message, "@setRuntimeSafety(false)"))
+    else if (std.mem.startsWith(u8, message, "@setRuntimeSafety"))
         "hot-loop"
     else
         "no-danger";

@@ -870,3 +870,43 @@ test "an aegis owner or loan holds what it is given: input wrapped is input" {
         \\}
     , 2);
 }
+
+test "A019 reads @setRuntimeSafety on the build mode in each mode: off where the build keeps the checks, undecided on anything else" {
+    // fiat-crypto's form: checked only in debug, so off in safe builds.
+    try expect(pack.unsafe_set,
+        \\const mode = @import("builtin").mode;
+        \\pub fn f(a: u64, b: u64) u64 {
+        \\    @setRuntimeSafety(mode == .debug);
+        \\    return a +% b;
+        \\}
+    , 1);
+    // Through the builtin import and a constant: off nowhere the build keeps checks.
+    try expect(pack.unsafe_set,
+        \\const builtin = @import("builtin");
+        \\const checked = builtin.mode == .debug or builtin.mode == .safe;
+        \\pub fn f(a: u64, b: u64) u64 {
+        \\    @setRuntimeSafety(checked);
+        \\    return a +% b;
+        \\}
+        \\pub fn g(a: u64, b: u64) u64 {
+        \\    @setRuntimeSafety(!(builtin.mode == .fast) and .small != builtin.mode);
+        \\    return a +% b;
+        \\}
+    , 0);
+    // Off in both checked modes, and a condition on something else.
+    try expect(pack.unsafe_set,
+        \\const builtin = @import("builtin");
+        \\pub fn f(a: u64, b: u64) u64 {
+        \\    @setRuntimeSafety(builtin.mode == .fast);
+        \\    return a +% b;
+        \\}
+    , 1);
+    const other = try run(pack.unsafe_set,
+        \\const flags = struct { var checked: bool = true; };
+        \\pub fn f(a: u64, b: u64) u64 {
+        \\    @setRuntimeSafety(flags.checked);
+        \\    return a +% b;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), other.undecided);
+}

@@ -175,6 +175,67 @@ fn testCondition(a: std.mem.Allocator, tree: *const Ast, model: *const Model, no
         else => return null,
     }
 }
+
+/// The build modes a compile-time condition over `builtin.mode` holds in: `mode == .debug`,
+/// `!=`, `!`, `and`, `or`, `true` and `false`, through the builtin import's and the mode's
+/// lexical aliases and a constant that names such a condition. Null for anything else.
+pub fn modes(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!?Modes {
+    if (depth >= 32) return null;
+    switch (tree.nodeTag(node)) {
+        .bool_not => return if (try modes(a, tree, model, tree.nodeData(node).node, depth + 1)) |held| held.complement() else null,
+        .grouped_expression => return modes(a, tree, model, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"comptime" => return modes(a, tree, model, tree.nodeData(node).node, depth + 1),
+        .bool_and, .bool_or => {
+            const sides = tree.nodeData(node).node_and_node;
+            const left = (try modes(a, tree, model, sides[0], depth + 1)) orelse return null;
+            const right = (try modes(a, tree, model, sides[1], depth + 1)) orelse return null;
+            return if (tree.nodeTag(node) == .bool_and) left.intersectWith(right) else left.unionWith(right);
+        },
+        .equal_equal, .bang_equal => {
+            const sides = tree.nodeData(node).node_and_node;
+            const named = for ([_][2]Ast.Node.Index{ sides, .{ sides[1], sides[0] } }) |pair| {
+                if (tree.nodeTag(pair[1]) != .enum_literal or !try modeValue(a, tree, model, pair[0], depth + 1)) continue;
+                break std.meta.stringToEnum(std.builtin.OptimizeMode, try identifier(a, tree.tokenSlice(tree.nodeMainToken(pair[1])))) orelse return null;
+            } else return null;
+            const equal: Modes = .initOne(named);
+            return if (tree.nodeTag(node) == .equal_equal) equal else equal.complement();
+        },
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (std.mem.eql(u8, name, "true")) return .full;
+            if (std.mem.eql(u8, name, "false")) return .empty;
+            const ref = model.reference(node) orelse return null;
+            const d = ref.declaration orelse return null;
+            const v = tree.fullVarDecl(model.declarations[d].node) orelse return null;
+            if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return null;
+            return modes(a, tree, model, v.ast.init_node.unwrap() orelse return null, depth + 1);
+        },
+        else => return null,
+    }
+}
+/// A set of build modes.
+pub const Modes = std.EnumSet(std.builtin.OptimizeMode);
+
+/// Whether `node` is `builtin.mode`, through lexical aliases.
+fn modeValue(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!bool {
+    if (depth >= 32) return false;
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const ref = model.reference(node) orelse return false;
+            const d = ref.declaration orelse return false;
+            const v = tree.fullVarDecl(model.declarations[d].node) orelse return false;
+            if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return false;
+            return modeValue(a, tree, model, v.ast.init_node.unwrap() orelse return false, depth + 1);
+        },
+        .field_access => {
+            const data = tree.nodeData(node).node_and_token;
+            if (!std.mem.eql(u8, try identifier(a, tree.tokenSlice(data[1])), "mode")) return false;
+            return builtinAlias(a, tree, model, data[0], depth + 1);
+        },
+        else => return false,
+    }
+}
+
 fn builtinAlias(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!bool {
     if (depth >= 32) return false;
     if (tree.nodeTag(node) == .identifier) {

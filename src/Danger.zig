@@ -13,6 +13,7 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
@@ -437,7 +438,20 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             const literal = if (tree.nodeTag(args[0]) == .identifier) tree.tokenSlice(tree.nodeMainToken(args[0])) else "";
             if (std.mem.eql(u8, literal, "false")) {
                 try c.at(rule, token, "@setRuntimeSafety(false): bounds, overflow and union checks off; only a measured hot loop validated at its boundary");
-            } else if (!std.mem.eql(u8, literal, "true")) try c.unknown(rule, node, .comptime_dependent);
+                continue;
+            }
+            // A condition on the build mode: off in the modes whose checks it turns off. A mode
+            // that builds without them (fast, small) loses nothing to it.
+            const on = (try Model.modes(c.allocator, tree, &c.project.models[c.file.raw()], args[0], 0)) orelse {
+                try c.unknown(rule, node, .comptime_dependent);
+                continue;
+            };
+            var off: Model.Modes = .initMany(&.{ .debug, .safe });
+            off.setIntersection(on.complement());
+            var it = off.iterator();
+            const first = it.next() orelse continue;
+            const names = if (it.next() != null) "debug and safe" else @tagName(first);
+            try c.at(rule, token, try c.allocator.print("@setRuntimeSafety off in {s} builds: bounds, overflow and union checks off where the build keeps them; only a measured hot loop validated at its boundary", .{names}));
             continue;
         }
         for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@intFromPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
