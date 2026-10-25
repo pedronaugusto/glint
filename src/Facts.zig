@@ -181,7 +181,7 @@ pub fn deinit(self: *Facts) void {
 /// module's name to, and each member is the declaration its path names from that root. Found
 /// once per run and shared by every rule.
 pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
-    const key = @intFromPtr(library.modules.ptr); // aegis: no-danger: the address names the library only for this run, which the caller keeps alive.
+    const key = @intFromPtr(library.modules.ptr);
     if (self.publications.get(key)) |found| return found;
     var entries: std.ArrayList(Entry) = .empty;
     var gaps: std.ArrayList(Gap) = .empty;

@@ -2591,10 +2591,10 @@ fn checkCapacity(c: *Context) Context.Error!void {
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") or call.ast.params.len != 3) continue;
+        if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") or call.ast.params.len != 2) continue;
         if (try requiredOwner(c, data[0], capacity, data[1]) != .bytes) continue;
-        if (try wholeAllocation(c, node, call.ast.params[0], call.ast.params[1])) continue;
-        if (tree.fullSlice(call.ast.params[1])) |slice| {
+        if (try wholeAllocation(c, node, call.ast.params[0])) continue;
+        if (tree.fullSlice(call.ast.params[0])) |slice| {
             if (slice.ast.end.unwrap() != null) try c.at(capacity, tree.nodeMainToken(node), "SecretBytes.adopt receives an explicitly bounded slice: full allocator capacity/exclusive ownership must be retained; extent is undecided");
         }
         try c.undecided(capacity, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "slice syntax cannot prove full allocator extent, provenance, alignment or exclusive transfer; runtime wipe/free obligations remain");
@@ -2602,18 +2602,17 @@ fn checkCapacity(c: *Context) Context.Error!void {
 }
 
 /// Whether an adoption's `allocation` is a whole byte allocation the adoption takes over alone,
-/// made by the allocator it is given (`gpa`, named the same way), so the extent is the
-/// allocation's and the alignment a byte's: `a.alloc(u8, n)`, `a.dupe(u8, bytes)` or
-/// `a.print(format, args)`, through `try`, a `catch` or `orelse` that does not complete, a local
-/// it initializes, an `if` capture of it, what a function of this file returns on every path
-/// that gives a value, or a parameter of a private function every call of which passes one.
-/// Nothing else may hold it once it is taken: no use of a local follows, and none waits in a
-/// `defer` or `errdefer`, which would free or reach memory the owner now holds. Any other shape
-/// stays a review site.
-fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, gpa: Ast.Node.Index, allocation: Ast.Node.Index) Context.Error!bool {
+/// so the extent is the allocation's and the alignment a byte's: `a.alloc(u8, n)`, `a.dupe(u8,
+/// bytes)` or `a.print(format, args)`, through `try`, a `catch` or `orelse` that does not
+/// complete, a local it initializes, an `if` capture of it, what a function of this file returns
+/// on every path that gives a value, or a parameter of a private function every call of which
+/// passes one. Nothing else may hold it once it is taken: no use of a local follows, and none
+/// waits in a `defer` or `errdefer`, which would free or reach memory the owner now holds. Any
+/// other shape stays a review site. The owner is unmanaged: the allocator its `deinit` is given
+/// is the caller's to keep the one that made the allocation.
+fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, allocation: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const want = (try pathOf(c, gpa)) orelse return false;
-    return wholeBytes(c, allocation, want, &.{}, tree.lastToken(adoption), 0);
+    return wholeBytes(c, allocation, null, &.{}, tree.lastToken(adoption), 0);
 }
 
 /// A value named as a path: a declaration of the checked file, then members of it (`s.gpa`).
@@ -2704,7 +2703,7 @@ fn argumentAt(c: *Context, function: u32, call_node: Ast.Node.Index, position: u
 /// Whether `node`, read in the function the innermost of `frames` calls, is a whole byte
 /// allocation of the allocator `want` names in the function the outermost call is in, held
 /// by nothing else after `until` (see `wholeAllocation`).
-fn wholeBytes(c: *Context, node: Ast.Node.Index, want: Path, frames: []const Frame, until: Ast.TokenIndex, depth: usize) Context.Error!bool {
+fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Frame, until: Ast.TokenIndex, depth: usize) Context.Error!bool {
     if (depth == 16) return false;
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
@@ -2760,9 +2759,10 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: Path, frames: []const Fra
         else
             std.mem.eql(u8, name, "print") and call.ast.params.len == 2;
         if (made) {
+            const expected = want orelse return true;
             const giver = (try pathOf(c, data[0])) orelse return false;
             const read = (try outward(c, giver, frames)) orelse return false;
-            return samePaths(read, want);
+            return samePaths(read, expected);
         }
     }
     // A function of this file: what it returns on every path that gives a value.
@@ -2837,7 +2837,7 @@ fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenInde
 /// Whether every call of the function whose parameter `index` is passes a whole allocation
 /// there, of the allocator `want` names in the function, read at the call: the function is
 /// private to this file and named only as the callee of calls.
-fn passedWhole(c: *Context, index: u32, want: Path, depth: usize) Context.Error!bool {
+fn passedWhole(c: *Context, index: u32, want: ?Path, depth: usize) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.models[c.file.raw()];
     const function: u32 = for (model.declarations, 0..) |d, i| {
@@ -2863,7 +2863,7 @@ fn passedWhole(c: *Context, index: u32, want: Path, depth: usize) Context.Error!
         const call = tree.fullCall(&buffer, parent) orelse return false;
         if (call.ast.fn_expr != use) return false;
         const frame: Frame = .{ .function = function, .call = parent };
-        const read = (try outward(c, want, &.{frame})) orelse return false;
+        const read: ?Path = if (want) |expected| (try outward(c, expected, &.{frame})) orelse return false else null;
         const argument = argumentAt(c, function, parent, position) orelse return false;
         if (!try wholeBytes(c, argument, read, &.{}, tree.lastToken(parent), depth + 1)) return false;
     }

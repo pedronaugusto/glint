@@ -454,7 +454,12 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, token, try c.allocator.print("@setRuntimeSafety off in {s} builds: bounds, overflow and union checks off where the build keeps them; only a measured hot loop validated at its boundary", .{names}));
             continue;
         }
-        for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@intFromPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
+        // An address read out of a pointer (`@intFromPtr`) is never undefined behavior, and the
+        // parent of an interface field (`@alignCast(@fieldParentPtr("interface", w))`, std's
+        // own reader and writer pattern) is aligned by construction. Every other @alignCast is
+        // a site: a consumer may build the package ReleaseFast, where nothing checks it.
+        if (std.mem.eql(u8, name, "@alignCast") and parentOf(tree, node)) continue;
+        for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt" }) |cast| if (std.mem.eql(u8, name, cast)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };
     }
@@ -469,6 +474,20 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         if (tree.tokenTag(keyword) != .keyword_extern or c.inTest(decl.token)) continue;
         try c.at(rule, keyword, try c.allocator.print("extern '{s}': a declaration whose definition Zig does not check; only the raw call, at the package's seam", .{decl.name}));
     }
+}
+
+/// Whether an `@alignCast` takes a `@fieldParentPtr`: the struct a field is in, aligned as that
+/// struct is.
+fn parentOf(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return false;
+    var arg = args[0];
+    while (tree.nodeTag(arg) == .grouped_expression) arg = tree.nodeData(arg).node_and_token[0];
+    return switch (tree.nodeTag(arg)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "@fieldParentPtr"),
+        else => false,
+    };
 }
 
 /// A014's frame escapes (Escapes.zig).

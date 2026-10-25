@@ -24,7 +24,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
-    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } };
+    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } };
     \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
@@ -75,7 +75,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -282,9 +282,13 @@ test "A010 finds conversions of input and division by it, not of the program's o
     , 3);
 }
 
-test "A019 finds the unchecked operations, the escape covering one" {
+test "A019 finds the unchecked operations, the escape covering one, never an address read or an interface field's parent" {
     try expect(pack.unsafe_set,
         \\extern fn write(fd: c_int) c_int;
+        \\const Sink = struct { interface: u64, n: u32 };
+        \\fn of(w: *u64) *Sink {
+        \\    return @alignCast(@fieldParentPtr("interface", w));
+        \\}
         \\pub fn f(p: *const u8, a: usize) usize {
         \\    @setRuntimeSafety(false);
         \\    const q: *u8 = @constCast(p);
@@ -294,7 +298,7 @@ test "A019 finds the unchecked operations, the escape covering one" {
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
-    , 6);
+    , 5);
 }
 
 test "A014 finds a pointer into the frame carried out of the call" {
@@ -909,4 +913,206 @@ test "A019 reads @setRuntimeSafety on the build mode in each mode: off where the
         \\}
     );
     try std.testing.expectEqual(@as(usize, 1), other.undecided);
+}
+
+test "A010 reads a signed value held at zero or above, a digit checked against character literals, a variable by every value it is given, a fallback that leaves, a bit cleared under its loop's condition and a magnitude" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !u64 {
+        \\    const secs = try r.takeInt(i64, 0);
+        \\    if (secs < 0) return error.Negative;
+        \\    const time: u64 = @intCast(secs);
+        \\    const max = try r.takeInt(i64, 0);
+        \\    const limit: ?u64 = if (max > 0) @intCast(max) else null;
+        \\    _ = limit;
+        \\    const digit = try r.takeInt(u32, 0);
+        \\    if (digit < '0' or digit > '9') return error.NotADigit;
+        \\    _ = digit - '0';
+        \\    var found: ?usize = null;
+        \\    for (0..4) |i| {
+        \\        const offset = try r.takeInt(u64, 0);
+        \\        if (offset > bytes.len) return error.Short;
+        \\        const at: usize = @intCast(offset);
+        \\        if (i == 2) found = at;
+        \\    }
+        \\    const fanout = found orelse return error.Missing;
+        \\    _ = fanout + 1024;
+        \\    var word = try r.takeInt(u64, 0);
+        \\    while (word != 0) {
+        \\        word &= word - 1;
+        \\    }
+        \\    const zone = try r.takeInt(i32, 0);
+        \\    _ = @as(i32, @intCast(@abs(zone)));
+        \\    const raw = try r.takeInt(i64, 0);
+        \\    _ = @as(u64, @intCast(raw));
+        \\    return time;
+        \\}
+    , 1);
+}
+
+test "A009 reads a constant added to a checked position, a start held at most its slice's end, a clamp and a name for a checked value" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !void {
+        \\    const fanout: usize = @intCast(try r.takeInt(u32, 0));
+        \\    if (fanout + 1024 > bytes.len) return error.Short;
+        \\    _ = bytes[fanout + 255 * 4 ..][0..4];
+        \\    const at = try r.takeInt(u64, 0);
+        \\    const size: usize = 4096;
+        \\    if (at >= size) return error.Past;
+        \\    const off: usize = @intCast(at);
+        \\    _ = bytes[off..size];
+        \\    const count = try r.takeInt(u32, 0);
+        \\    const taken = @as(usize, count) * 4;
+        \\    const end = bytes.len;
+        \\    if (taken > end - 8) return error.Short;
+        \\    _ = bytes[end - taken .. end];
+        \\    const lines = bytes.len;
+        \\    var start: usize = @intCast(try r.takeInt(u32, 0));
+        \\    if (start > lines) start = lines;
+        \\    _ = bytes[0..start];
+        \\    const far: usize = @intCast(try r.takeInt(u32, 0));
+        \\    _ = bytes[far..];
+        \\}
+    , 1);
+}
+
+test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, io: std.Io, bytes: []const u8) !usize {
+        \\    const count = try r.takeInt(u32, 0);
+        \\    var i: u32 = 0;
+        \\    while (i < count) : (i += 1) {
+        \\        try io.checkCancel();
+        \\    }
+        \\    const entries = try r.takeInt(u32, 0);
+        \\    for (0..entries) |_| _ = try r.takeByte();
+        \\    var cp: []const u8 = bytes;
+        \\    var n = try r.takeInt(u32, 0);
+        \\    while (n > 0) : (n -= 1) {
+        \\        const slash = std.mem.findScalar(u8, cp, '/') orelse return error.Short;
+        \\        cp = cp[slash + 1 ..];
+        \\    }
+        \\    var word = try r.takeInt(u64, 0);
+        \\    var bits: usize = 0;
+        \\    while (word != 0) {
+        \\        bits += 1;
+        \\        word &= word - 1;
+        \\    }
+        \\    const steps = try r.takeInt(u32, 0);
+        \\    for (0..steps) |_| bits += 1;
+        \\    return bits;
+        \\}
+    , 1);
+}
+
+fn runWidths(rule: glint.Rule, program: []const u8, widths: []const u16) !Run {
+    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }}, .pointer_widths = widths }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var result: Run = .{ .findings = 0, .undecided = 0 };
+    for (report.diagnostics) |d| if (d.rule == rule) {
+        result.findings += 1;
+    };
+    return result;
+}
+
+test "A010 reads a range at the pointer widths of the package's targets: a u32 count times a small constant overflows only a 32-bit usize" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    const count = try r.takeInt(u32, 0);
+        \\    return @as(usize, count) * 20;
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 1), (try runWidths(pack.integers, program, &.{})).findings);
+    try std.testing.expectEqual(@as(usize, 1), (try runWidths(pack.integers, program, &.{ 32, 64 })).findings);
+    try std.testing.expectEqual(@as(usize, 0), (try runWidths(pack.integers, program, &.{64})).findings);
+    try std.testing.expectError(error.InvalidSelection, (glint.Config{ .pointer_widths = &.{48} }).validate());
+}
+
+test "A010 leaves what a file or directory handle answers of itself, though input made the handle" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, io: std.Io) !i64 {
+        \\    const dir: std.Io.Dir = .{ .handle = @truncate(try r.takeInt(u64, 0)) };
+        \\    const size = try dir.statFile(io, "HEAD");
+        \\    _ = @as(i64, @intCast(size));
+        \\    const inode = try r.takeInt(u64, 0);
+        \\    return @intCast(inode);
+        \\}
+    , 1);
+}
+
+test "A012 reads a size an aegis Limit checked as bounded by it" {
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !void {
+        \\    const blobs: aegis.bounded.Limit(u64) = .init(1 << 20);
+        \\    const a = try r.takeInt(u64, 0);
+        \\    try blobs.check(a);
+        \\    _ = try gpa.alloc(u8, a);
+        \\    const b = try r.takeInt(u64, 0);
+        \\    if (blobs.exceeds(b)) return error.TooLarge;
+        \\    _ = try gpa.alloc(u8, b);
+        \\    const n = try r.takeInt(u64, 0);
+        \\    _ = try gpa.alloc(u8, n);
+        \\}
+    , 1);
+}
+
+test "A010 reads a plain struct's field by every value the program stores in it, never one a reflection may fill or one that changes in place, and a value made at zero or above" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Index = struct { fanout_at: usize, count: u32, total: usize = 0, seen: usize = 0 };
+        \\const Header = extern struct { at: u64 };
+        \\const Parsed = struct { at: usize };
+        \\fn open(r: *std.Io.Reader, bytes: []const u8) !Index {
+        \\    const raw = try r.takeInt(u64, 0);
+        \\    if (raw > bytes.len) return error.Short;
+        \\    const fanout: usize = @intCast(raw);
+        \\    if (fanout + 1024 > bytes.len) return error.Short;
+        \\    var index: Index = .{ .fanout_at = fanout, .count = try r.takeInt(u32, 0) };
+        \\    index.total += try r.takeInt(u32, 0);
+        \\    return index;
+        \\}
+        \\fn fill(comptime T: type, r: *std.Io.Reader) !T {
+        \\    var out: T = undefined;
+        \\    out.at = @intCast(try r.takeInt(u32, 0));
+        \\    return out;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !usize {
+        \\    const index = try open(r, bytes);
+        \\    _ = index.fanout_at + @as(usize, 255) * 4;
+        \\    _ = index.total + 1;
+        \\    const header: Header = .{ .at = try r.takeInt(u64, 0) };
+        \\    _ = header.at + 1;
+        \\    const parsed = try fill(Parsed, r);
+        \\    _ = parsed.at + 1;
+        \\    const year = try r.takeInt(i64, 0);
+        \\    _ = @as(u64, @intCast(@max(year, 0)));
+        \\    _ = @as(u64, @intCast(@mod(year, 12)));
+        \\    _ = @as(u64, @intCast(year & 0o7777));
+        \\    return index.seen;
+        \\}
+    , 4);
+}
+
+test "A020 counts a refill through a reader made from the function's Io as a cancellation point, never one passed in or over the program's own bytes" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn drain(io: std.Io, file: std.Io.File, buffer: []u8) void {
+        \\    var reader = file.reader(io, buffer);
+        \\    const r = &reader.interface;
+        \\    while (true) _ = r.takeByte() catch return;
+        \\}
+        \\pub fn spin(io: std.Io, bytes: []const u8) void {
+        \\    _ = io;
+        \\    var fixed: std.Io.Reader = .fixed(bytes);
+        \\    while (true) _ = fixed.takeByte() catch return;
+        \\}
+    , 1);
 }

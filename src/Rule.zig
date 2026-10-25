@@ -64,6 +64,10 @@ pub const Config = struct {
     /// The functions whose result writes to a peer, as the packages that own them declare
     /// (A018's sinks beside std's `net.Stream.writer`).
     peer_writers: []const PeerWriter = &.{},
+    /// The pointer widths of the targets the package builds for: A010 and the ranges the flow
+    /// rules read hold a value at each (`usize` is as wide as the pointer). Empty reads both 32
+    /// and 64 bits, for a package that does not say.
+    pointer_widths: []const u16 = &.{},
 
     pub const Level = enum { off, report, gate };
     pub const Selection = struct { rule: Rule, level: Level };
@@ -114,6 +118,7 @@ pub const Config = struct {
             } else if (entry.declaration.len == 0 or std.mem.findScalar(u8, entry.declaration, '.') != null) return error.InvalidSelection;
         }
         for (self.selections, 0..) |selection, i| for (self.selections[0..i]) |earlier| if (selection.rule == earlier.rule) return error.InvalidSelection;
+        for (self.pointer_widths) |width| if (width != 16 and width != 32 and width != 64) return error.InvalidSelection;
         for (self.enabled, 0..) |enabled, index| {
             if (!enabled) continue;
             var known = false;

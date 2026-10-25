@@ -40,8 +40,8 @@ test "aegis pack access copies scalar and capacity reports" {
         \\    const a = Checked(u32).init(1);
         \\    _ = a.raw() + 2;
         \\    _ = @as(u8, @intCast(a.raw()));
-        \\    var b = try Bytes.adopt(gpa, allocation[0..n], n);
-        \\    defer b.deinit();
+        \\    var b = try Bytes.adopt(allocation[0..n], n);
+        \\    defer b.deinit(gpa);
         \\    _ = b.allocation;
         \\}
     );
@@ -169,7 +169,7 @@ test "adopted gates retain unresolved obligations and known unrelated receivers"
         .{ pack.access, "pub fn f(comptime T: type, v: *T) void { _ = v.material; }" },
         .{ pack.copies, "pub fn f(v: anytype) *const u32 { return v.expose(); }" },
         .{ pack.cleanup, "pub fn f(m: anytype) void { var v = m.T.init(1); _ = &v; }" },
-        .{ pack.capacity, "pub fn f(T: type, gpa: anytype, bytes: []u8) void { _ = T.adopt(gpa, bytes, 0); }" },
+        .{ pack.capacity, "pub fn f(T: type, bytes: []u8) void { _ = T.adopt(bytes, 0); }" },
     };
     inline for (cases) |case| {
         var project = try fixture(case[1]);
@@ -264,8 +264,8 @@ test "adopted aegis gates preserve escaped operation spellings" {
         \\    const a = Checked(u32).init(1);
         \\    _ = a.raw() + 2;
         \\    _ = @as(u8, @intCast(a.raw()));
-        \\    var b = try Bytes.adopt(gpa, allocation[0..n], n);
-        \\    defer b.deinit();
+        \\    var b = try Bytes.adopt(allocation[0..n], n);
+        \\    defer b.deinit(gpa);
         \\    _ = b.allocation;
         \\}
     ;
@@ -366,11 +366,10 @@ const flat_bytes =
     \\const std = @import("std");
     \\allocation: []u8,
     \\used_len: usize,
-    \\gpa: std.mem.Allocator,
-    \\pub fn adopt(gpa: std.mem.Allocator, allocation: []u8, used_len: usize) !@This() {
-    \\    return .{ .allocation = allocation, .used_len = used_len, .gpa = gpa };
+    \\pub fn adopt(allocation: []u8, used_len: usize) !@This() {
+    \\    return .{ .allocation = allocation, .used_len = used_len };
     \\}
-    \\pub fn deinit(self: *@This()) void { _ = self; }
+    \\pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void { _ = self; _ = gpa; }
 ;
 const flat_int = scalarFile(&.{ "Checked", "Saturating", "Ranged" });
 const flat_id = scalarFile(&.{ "Id", "NonZero", "Counter" });
@@ -417,8 +416,8 @@ const every_site =
     \\    const a = aegis.int.Checked(u32).init(1);
     \\    _ = a.raw() + 2;
     \\    _ = @as(u8, @intCast(a.raw()));
-    \\    var b = try aegis.SecretBytes.adopt(gpa, allocation[0..n], n);
-    \\    defer b.deinit();
+    \\    var b = try aegis.SecretBytes.adopt(allocation[0..n], n);
+    \\    defer b.deinit(gpa);
     \\    _ = b.allocation;
     \\}
 ;
@@ -1079,34 +1078,35 @@ test "generational storage, staged payloads, machines, scopes, unparsed input an
 test "a secret's writer borrows the owner it writes into; the owner keeps its release" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     // Read from a stream into the owner through its writer, then handed out: released on error.
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !Bytes { var text = try Bytes.init(gpa, 0); errdefer text.deinit(); var w = Bytes.Writer.init(&text); try w.interface.writeAll(\"x\"); try w.interface.flush(); return text; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !Bytes { var text = try Bytes.init(gpa, 0); errdefer text.deinit(gpa); var w = Bytes.Writer.init(&text, gpa); try w.interface.writeAll(\"x\"); try w.interface.flush(); return text; }", pack.cleanup, true, 0);
     // The writer releases nothing: an owner left after it is still owed.
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { var text = try Bytes.init(gpa, 0); var w = Bytes.Writer.init(&text); w.interface.end = 0; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { var text = try Bytes.init(gpa, 0); var w = Bytes.Writer.init(&text, gpa); w.interface.end = 0; }", pack.cleanup, true, 1);
 }
 
-test "an adoption of a whole byte allocation from the same allocator, handed over alone, is decided" {
+test "an adoption of a whole byte allocation, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(gpa, buffer, n); }", pack.capacity, true, 0);
-    try expectJudged(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(s.gpa, buffer, n); }", pack.capacity, true, 0);
-    // Another allocator, a pending errdefer, a later use or an element wider than a byte stay review sites.
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(gpa, buffer, n); }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(gpa, buffer, n); return b; }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(gpa, buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(gpa, buffer[0..n], n); }", pack.capacity, false, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    // The owner is unmanaged: which allocator made the allocation is the caller's to give its
+    // deinit, so another allocator's allocation is decided at the adoption too.
+    try expectJudged(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    // A pending errdefer, a later use or an element wider than a byte stay review sites.
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
 }
 
 test "an adoption of a private function's parameter is decided by every call's argument, through what a function returns" {
-    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\nfn adopted(gpa: std.mem.Allocator, bytes: []u8) Bytes { return Bytes.adopt(gpa, bytes, bytes.len) catch unreachable; }\n";
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\nfn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\n";
     const session = "const S = struct {\n    gpa: std.mem.Allocator,\n    fn ask(s: *S, quiet: bool) !?[]u8 { if (quiet) { if (try s.helper()) |answer| return answer; return null; } const copy = try s.gpa.dupe(u8, \"x\"); return copy; }\n    fn helper(s: *S) !?[]u8 { if (s.gpa.vtable == undefined) return error.Unavailable; return try s.gpa.dupe(u8, \"y\"); }\n};\n";
-    // Each argument a whole allocation of the allocator passed beside it: printed, duplicated,
-    // allocated into a local used only before, and returned by a method on every path that gives one.
-    try expectJudged(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa, s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(s.gpa, buffer); b.deinit(); var c = adopted(s.gpa, try s.ask(true) orelse return); c.deinit(); }", pack.capacity, true, 0);
-    // A call passing what another allocator made, a public function, a returned local a `defer`
-    // frees, or a local read after the call stay review sites.
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, other: std.mem.Allocator) !void { var a = adopted(gpa, try other.dupe(u8, \"x\")); a.deinit(); }", pack.capacity, false, 0);
-    try expectJudged("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(gpa: std.mem.Allocator, bytes: []u8) Bytes { return Bytes.adopt(gpa, bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(gpa, try gpa.dupe(u8, \"x\")); a.deinit(); }", pack.capacity, false, 0);
-    try expectJudged(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(gpa, try made(gpa)); a.deinit(); }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(gpa, buffer); a.deinit(); buffer[0] = 0; }", pack.capacity, false, 0);
+    // Each argument a whole allocation: printed, duplicated, allocated into a local used only
+    // before, and returned by a method on every path that gives one.
+    try expectJudged(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(s.gpa); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(buffer); b.deinit(s.gpa); var c = adopted(try s.ask(true) orelse return); c.deinit(s.gpa); }", pack.capacity, true, 0);
+    // A public function, a returned local a `defer` frees, or a local read after the call stay
+    // review sites.
+    try expectJudged("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try gpa.dupe(u8, \"x\")); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudged(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try made(gpa)); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(buffer); a.deinit(gpa); buffer[0] = 0; }", pack.capacity, false, 0);
 }
 
 test "an owner released on error by errdefer, carried out in what is returned, or moved out of a dead local is decided" {

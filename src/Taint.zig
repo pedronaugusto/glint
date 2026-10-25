@@ -9,7 +9,8 @@
 //! makes over the program's own bytes carries their fact instead, and a read on a line carrying
 //! an aegis escape is one the program declares its own (a file it wrote itself): no input
 //! starts there, and the escape lists it. Arguments and the environment are the operator's,
-//! not a peer's. A peer writer is one a `net.Stream` gives.
+//! not a peer's, and what a file or directory handle answers of itself (a `stat`, the names a
+//! directory lists) the system's. A peer writer is one a `net.Stream` gives.
 //!
 //! Input is data (bytes, and what the program computes from them) or a number: an integer a
 //! peer chooses past a byte's range, which std decodes from data (`readInt`, `parseInt`,
@@ -945,6 +946,11 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
                 // A std method that answers a `usize` (a container's `count`, a position it
                 // finds) answers a count of memory the program holds.
                 if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw()) and returnsCount(c, decl)) return .{};
+                // What std's file and directory handles answer that is no read of a file's
+                // contents (a `stat`, the names an iteration gives, a handle they open) is the
+                // operating system's, never a peer's: a handle a peer's path opened holds the
+                // path's fact, not what the system says of it.
+                if (callee.decl) |decl| if (systemAnswer(c, flow, decl)) return .{};
                 return dep(c, flow, function, receiver);
             }
             var data_function = false;
@@ -1036,6 +1042,19 @@ pub fn conditionAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Nod
 /// Whether a call reads input: a read the fact starts at.
 pub fn isRead(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!bool {
     return (try resolveCall(c, flow, file, call)).kind == .source;
+}
+
+/// Whether a function is declared in std's `Io.File` or `Io.Dir`, or a container inside one
+/// (`Dir.Iterator`): one that reads contents is a source, found before this.
+fn systemAnswer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
+    const model = &c.project.models[decl.file.raw()];
+    for ([_]?Facts.Container{ flow.file, flow.dir }) |each| {
+        const handle = each orelse continue;
+        if (!handle.file.eql(decl.file)) continue;
+        var scope: ?u32 = model.declarations[decl.index].scope;
+        while (scope) |s| : (scope = model.scopes[s].parent) if (s == handle.scope) return true;
+    }
+    return false;
 }
 
 /// Whether a function outside the program is one of std's.

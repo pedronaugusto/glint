@@ -4,6 +4,30 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `Config.pointer_widths` (JSON `pointer_widths`): the pointer widths of the targets the package builds for, 16, 32 or 64 bits. A010 and the ranges the flow rules read hold a value at each, so a `u32` count times a small constant widened to `usize` is a finding only for a package with a 32-bit target; empty reads both 32 and 64 bits, as before.
+
+### Fixed
+
+A009 and A010 were mostly false alarms on relic (none of 40 sampled sites was real). Each class is fixed where the ranges and the input fact are read:
+
+- A guard that dominates the use now holds in more of the forms a parser writes:
+  - a constant added to a checked position (`if (fanout + 1024 > bytes.len) return` before `bytes[fanout + 255 * 4 ..]`);
+  - a constant local naming a checked value or a length (`const off: usize = @intCast(at);`, `const n = buf.len;`);
+  - a clamp (`if (start > n) start = n;`);
+  - character literals (`if (c < '0' or c > '9') return` before `c - '0'`);
+  - a signed value held at zero or above before it is converted to an unsigned type (`if (secs < 0) return`, `if (value > 0) @intCast(value)`);
+  - a slice start held at most its own end (`b[end - size .. end]` where `size` was checked against what is left, `b[at..size]` after `if (at >= size) return`).
+- A variable is bounded by every value it is given, each read where it is given, and `x orelse return …` by `x` alone, so an offset checked against the length in a loop and kept stays checked. A use inside the assignment that changes the value (`word &= word - 1`) is read before the store, and `@abs` is unsigned.
+- A field of a plain struct the program declares is bounded by its default and every value the program stores in it, each read where it is stored (`.fanout_at = fanout` after the length check), so arithmetic on a parsed index's offsets reads the check. A field changed in place, whose address is taken, of an `extern` or `packed` struct (which a reinterpretation fills), or of a struct named as a call's argument (which reflection may fill) is still bounded by its type alone. A fact about `x + k` bounds `x` too.
+- `@max(x, 0)`, `@mod(x, k)` by a positive `k` and `x & mask` are at zero or above, so converting them to an unsigned type reads no sign.
+- A loop is no finding of A009 where each pass consumes input, advances a slice past what it took, or checks for cancelation, so a peer's count runs it no longer than its data or the caller allows; nor is `while (x != 0)` that clears a bit of `x` or shifts it, which ends within `x`'s width.
+- What a file or directory handle answers of itself (a `stat`, a directory's names, a handle it opens) is the system's, no peer's input, even where input made the handle.
+- A019 no longer finds `@intFromPtr`, which is never undefined behavior, nor `@alignCast(@fieldParentPtr(…))`, the parent of an interface field (std's own reader and writer pattern), aligned by construction. Every other `@alignCast` is still a site: a consumer may build the package ReleaseFast, where nothing checks it. (review-io: uplink.)
+- A020 counts a call on a reader or writer made from the function's `Io` (`file.reader(io, &buffer)`, through `&reader.interface` too) as the loop's cancellation point: its refill or drain goes through that `Io`. A reader passed in, or one `Reader.fixed` made, is still none. (review-io: chronicle.)
+- A012 reads a size an aegis `bounded.Limit` checked (`try limit.check(n)`, `limit.check(n) catch return …`, `if (limit.exceeds(n)) return …`) as bounded by it, as its message asks. (bay's blob limit.)
+
 ## [0.7.0] - 2026-10-25
 
 ### Breaking

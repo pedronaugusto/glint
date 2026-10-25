@@ -410,6 +410,7 @@ pub const Configuration = struct {
     metrics: bool = false,
     fact_budget: usize = 100_000,
     peer_writers: []const Rule.Config.PeerWriter = &.{},
+    pointer_widths: []const u16 = &.{},
     pub const Setting = struct { id: []const u8, level: Rule.Config.Level };
 };
 fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule.Config.Level) !void {
@@ -443,6 +444,7 @@ fn configure(context: Configuring, bytes: []const u8) ConfigureError!Rule.Config
     config.metrics = document.metrics;
     config.fact_budget = document.fact_budget;
     config.peer_writers = document.peer_writers;
+    config.pointer_widths = document.pointer_widths;
     for (document.rules, 0..) |setting, i| {
         for (document.rules[0..i]) |earlier| if (std.mem.eql(u8, setting.id, earlier.id)) return error.InvalidSelection;
         const id = Rule.parseConfigured(setting.id, definitions) orelse return error.UnknownRule;
