@@ -8,6 +8,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - `Config.pointer_widths` (JSON `pointer_widths`): the pointer widths of the targets the package builds for, 16, 32 or 64 bits. A010 and the ranges the flow rules read hold a value at each, so a `u32` count times a small constant widened to `usize` is a finding only for a package with a 32-bit target; empty reads both 32 and 64 bits, as before.
 
+### Changed
+
+- A005 reads aegis 0.2.0's unmanaged `SecretBytes.adopt(allocation, live_len)`: an adoption is decided where the allocation is a whole byte allocation handed over alone. It no longer asks that the allocator that made it be the one passed beside it; the owner holds none, and the allocator its `deinit` is given is the caller's to keep.
+
 ### Fixed
 
 A009 and A010 were mostly false alarms on relic (none of 40 sampled sites was real). Each class is fixed where the ranges and the input fact are read:
