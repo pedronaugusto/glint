@@ -273,8 +273,9 @@ pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []con
     const line = if (args.len == 0) args else args[1..];
     const request = switch (ensign.parse(Request, a, line, .{ .diagnostic = &diagnostic }) catch |err| return refused(err, diagnostic, problems)) {
         .parsed => |parsed| parsed,
-        // `Request` leaves `--help` to the arguments and has no version.
-        .help, .version => unreachable,
+        // `Request` leaves `--help` to the arguments and has no version, and only
+        // `parseArgs` answers a completion.
+        .help, .version, .complete => unreachable,
     };
     const requested = try Result.request(request.result, request.run_id);
     var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .version = 1, .completed = false, .outcome = .running, .sources = 0, .findings = 0, .suppressed = 0, .output_bytes = 0, .output_sha256 = "" };
@@ -314,6 +315,8 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
             try version.write(writer);
             return told(writer, record);
         },
+        // Only `parseArgs` answers a completion; these are the arguments themselves.
+        .complete => unreachable,
     };
     const configured = try options(a, io, arguments, definitions);
     if (configured.files.items.len == 0) return error.MissingSource;

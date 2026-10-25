@@ -485,7 +485,7 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .inline_store => &.{ "storage", "used", "head" },
         .buffer => &.{ "storage", "gpa", "maximum", "used", "head" },
         .limit => &.{"maximum"},
-        .budget => &.{ "ceiling", "taken" },
+        .budget => &.{ "ceiling", "taken", "unsettled" },
         .reservation => &.{ "budget", "amount", "live" },
         .owned => &.{ "data", "state" },
         .lent => &.{"data"},
