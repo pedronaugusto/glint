@@ -474,7 +474,18 @@ test "A019 finds a local read while still undefined, and leaves written, filled 
         \\pub fn length(r: []const u8) u8 { var b: [8]u8 = undefined; const n = @min(r.len, b.len); @memcpy(b[0..n], r[0..n]); return b[0]; }
         \\const P = struct { a: u8 };
         \\pub fn named() u8 { var p: P = undefined; @field(p, "a") = 1; return p.a; }
-    , 3);
+        \\pub fn cpuid(leaf: u32) [2]u32 {
+        \\    var eax: u32 = undefined;
+        \\    var ebx: u32 = undefined;
+        \\    asm volatile ("cpuid"
+        \\        : [_] "={eax}" (eax),
+        \\          [_] "={ebx}" (ebx),
+        \\        : [_] "{eax}" (leaf),
+        \\    );
+        \\    return .{ eax, ebx };
+        \\}
+        \\pub fn tied() u32 { var v: u32 = undefined; asm volatile ("" : [_] "=r" (v) : [_] "r" (v)); return v; }
+    , 6); // 3 reads, `tied`'s input read before its output is written, and each `asm` itself
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {

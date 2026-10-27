@@ -332,7 +332,8 @@ fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index)
 /// A019's `undefined` reads: a `var` declared `undefined` in a function's body, read before every
 /// path to the read writes it. A write is an assignment to it or into it, its address taken or
 /// a part of it sliced (what a call fills through the pointer it is given is that call's
-/// contract), or a method called on it; a path through a loop or a branch that writes it on some
+/// contract), a method called on it, or an `asm` output bound to it (`"={eax}" (eax)`), written
+/// once the `asm` has read its inputs; a path through a loop or a branch that writes it on some
 /// paths only ends the walk, never a guess.
 pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
@@ -364,12 +365,23 @@ const Walk = struct {
     local: u32,
     /// The identifiers that name the local, in source order.
     mentions: std.ArrayList(Ast.Node.Index) = .empty,
+    /// The `asm` outputs bound to the local, by the token naming it, with the `asm` they are in.
+    outputs: std.ArrayList(struct { token: Ast.TokenIndex, asm_node: Ast.Node.Index }) = .empty,
     read: ?Ast.TokenIndex = null,
 
     fn collect(w: *Walk) Context.Error!void {
+        const name = w.model.declarations[w.local].name;
         for (w.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tag == .asm_output) {
+                // `[a] "b" (c)` names its variable by the token before `)`; `(-> T)` returns one.
+                const lhs, const rparen = w.tree.nodeData(node).opt_node_and_token;
+                if (lhs != .none or !std.mem.eql(u8, w.tree.tokenSlice(rparen - 1), name)) continue;
+                const asm_node = w.enclosingAsm(rparen) orelse continue;
+                try w.outputs.append(w.c.allocator, .{ .token = rparen - 1, .asm_node = asm_node });
+                continue;
+            }
+            if (tag != .identifier) continue;
             const ref = w.model.reference(node) orelse continue;
             if (ref.declaration == w.local) try w.mentions.append(w.c.allocator, node);
         }
@@ -441,6 +453,11 @@ const Walk = struct {
             const use = w.classify(mention) orelse continue;
             if (earliest == null or use.key < earliest.?.key) earliest = .{ .key = use.key, .write = use.write, .token = token };
         }
+        for (w.outputs.items) |output| {
+            if (output.token < first or output.token > last) continue;
+            const key = w.tree.lastToken(output.asm_node);
+            if (earliest == null or key < earliest.?.key) earliest = .{ .key = key, .write = true, .token = output.token };
+        }
         const found = earliest orelse return .unwritten;
         if (found.write) return .written;
         w.read = found.token;
@@ -510,9 +527,22 @@ const Walk = struct {
         return first == operand;
     }
 
+    /// The innermost `asm` expression whose tokens hold `token`.
+    fn enclosingAsm(w: *const Walk, token: Ast.TokenIndex) ?Ast.Node.Index {
+        var found: ?Ast.Node.Index = null;
+        for (w.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"asm") continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (token < w.tree.firstToken(node) or token > w.tree.lastToken(node)) continue;
+            if (found == null or w.tree.firstToken(node) > w.tree.firstToken(found.?)) found = node;
+        }
+        return found;
+    }
+
     fn mentioned(w: *Walk, node: Ast.Node.Index) bool {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
+        for (w.outputs.items) |output| if (output.token >= first and output.token <= last) return true;
         for (w.mentions.items) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token >= first and token <= last) return true;
