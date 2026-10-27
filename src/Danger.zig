@@ -75,7 +75,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         const origin = (try c.facts.origin(decl)) orelse decl;
         var secret = false;
         for (keys) |key| secret = secret or std.meta.eql(key, decl) or std.meta.eql(key, origin);
-        if (!secret or !std.meta.eql(decl, origin) and c.project.inputs[decl.file.raw()].selected) continue;
+        if (!secret or (!std.meta.eql(decl, origin) and c.project.inputs[decl.file.raw()].selected)) continue;
         if (try borrowedOrSealed(c, node)) continue;
         // A secret type compared with another is named, not held.
         if (model.node_parents[@backingInt(node)]) |parent| switch (tree.nodeTag(parent)) { // safe: a node index indexes its own tree's parent table

@@ -174,6 +174,35 @@ test "review private imports used through the actual file identity are not dead"
     try check(.Z013, "const object = @import(\"dep\"); const Other = struct { pub const object = 1; }; pub const exposed = Other.object;", 1);
 }
 
+test "Z034 finds operators Zig 0.18 refuses to order without parentheses, and leaves the orders it keeps" {
+    // Bitwise operators mixed, arithmetic with bitwise, a product with a remainder, `and` with
+    // `or`, `orelse` with arithmetic, a chained shift and a chained remainder.
+    try check(.Z034,
+        \\pub fn f(a: u32, b: u32, c: u32, p: bool, q: bool, r: bool, x: ?u32) void {
+        \\    _ = a | b & c;
+        \\    _ = a + b << 2;
+        \\    _ = a * b % c;
+        \\    _ = p and q or r;
+        \\    _ = x orelse b + 1;
+        \\    _ = a << 1 << 2;
+        \\    _ = a % b % c;
+        \\}
+    , 7);
+    try check(.Z034,
+        \\pub fn f(a: u32, b: u32, c: u32, p: bool, q: bool, x: ?u32) void {
+        \\    _ = a + b * c;
+        \\    _ = a * b + c;
+        \\    _ = a & b == c;
+        \\    _ = a + b < c and p;
+        \\    _ = (a | b) & c;
+        \\    _ = a & b & c;
+        \\    _ = x orelse 0;
+        \\    _ = p or q or p;
+        \\    _ = a - b - c;
+        \\}
+    , 0);
+}
+
 test "G2 Z026 family reason policy includes cleanup and distinguishes handled errors" {
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch {}; defer fallible() catch {}; }", 2);
     try check(.Z026, "fn fallible() error{Failure}!void {} pub fn f() void { fallible() catch { return; }; }", 0);

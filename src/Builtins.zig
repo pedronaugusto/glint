@@ -6,6 +6,7 @@ const Model = @import("Model.zig");
 const names = @import("names.zig");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
+const Report = @import("Report.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
 const RunError = Context.Error;
@@ -18,6 +19,7 @@ pub fn check(context: *Context) RunError!void {
     try priorityRules(context);
     try amendedPolicies(context);
     try syntaxRules(context);
+    try precedence(context);
     try contextRules(context);
     try sourcePolicies(context);
     try functionLengths(context);
@@ -35,6 +37,89 @@ fn parser(self: *Context) RunError!void {
         file.tree.renderError(err, &writer.writer) catch return error.OutOfMemory;
         const offset = file.tree.tokenStart(err.token) + file.tree.errorOffset(err);
         try self.emit(.Z003, offset, offset, try writer.toOwnedSlice());
+    }
+}
+
+/// The groups Zig 0.18's parser orders binary operators by.
+const Operators = enum { product, mod, sum, shift, bit_and, bit_xor, bit_or, comparison, bool_and, bool_or, @"orelse", @"catch" };
+
+fn operators(tag: Ast.Node.Tag) ?Operators {
+    return switch (tag) {
+        .mul, .div, .mul_wrap, .mul_sat, .merge_error_sets => .product,
+        .mod => .mod,
+        .add, .sub, .array_cat, .add_wrap, .sub_wrap, .add_sat, .sub_sat => .sum,
+        .shl, .shl_sat, .shr => .shift,
+        .bit_and => .bit_and,
+        .bit_xor => .bit_xor,
+        .bit_or => .bit_or,
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .comparison,
+        .bool_and => .bool_and,
+        .bool_or => .bool_or,
+        .@"orelse" => .@"orelse",
+        .@"catch" => .@"catch",
+        else => null,
+    };
+}
+
+/// Whether Zig 0.18 orders an operator of `outer` over an operand of `inner` without
+/// parentheses. Arithmetic and bitwise operators bind tighter than comparisons, which bind
+/// tighter than `and` and `or`; a product or a remainder tighter than a sum. Every other pair
+/// meets unordered: a product and a remainder, two bitwise operators, arithmetic and bitwise,
+/// `and` and `or`, and `orelse` or `catch` with any other. A remainder and a shift do not chain,
+/// as a comparison does not (Zig 0.17 already refuses the comparison).
+fn ordered(outer: Operators, inner: Operators) bool {
+    const Major = enum { arithmetic, bitwise, comparison, boolean, recovery };
+    const major = struct {
+        fn of(group: Operators) Major {
+            return switch (group) {
+                .product, .mod, .sum => .arithmetic,
+                .shift, .bit_and, .bit_xor, .bit_or => .bitwise,
+                .comparison => .comparison,
+                .bool_and, .bool_or => .boolean,
+                .@"orelse", .@"catch" => .recovery,
+            };
+        }
+    }.of;
+    if (outer == inner) return outer != .mod and outer != .shift;
+    const a = major(outer);
+    const b = major(inner);
+    if (a == .recovery or b == .recovery) return false;
+    if (a == b) return a == .arithmetic and (outer == .sum or inner == .sum);
+    const rank = struct {
+        fn of(m: Major) u2 {
+            return switch (m) {
+                .arithmetic, .bitwise => 2,
+                .comparison => 1,
+                .boolean, .recovery => 0,
+            };
+        }
+    }.of;
+    return rank(a) != rank(b);
+}
+
+/// Z034: two operators the next Zig's parser refuses to order without parentheses (Zig
+/// master's "ambiguous operator precedence"), read as Zig 0.17 orders them. The fix
+/// parenthesizes the operand as 0.17 groups it, which keeps what the expression means.
+fn precedence(self: *Context) RunError!void {
+    if (!self.config.has(.Z034)) return;
+    const index = self.file.raw(); // safe: selected identity indexes this frozen project.
+    const tree = &self.project.files[index].tree;
+    const parents = self.project.models[index].node_parents;
+    for (tree.nodes.items(.tag), 0..) |tag, n| {
+        const inner = operators(tag) orelse continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        const parent = parents[n] orelse continue;
+        const outer = operators(tree.nodeTag(parent)) orelse continue;
+        if (ordered(outer, inner)) continue;
+        const operand_start = tree.tokenStart(tree.firstToken(node));
+        const last = tree.lastToken(node);
+        const operand_end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len));
+        const outer_token = tree.nodeMainToken(parent);
+        const inner_token = tree.nodeMainToken(node);
+        const at = tree.tokenStart(inner_token);
+        const message = try self.allocator.print("'{s}' and '{s}' meet without parentheses, which Zig 0.18 refuses as ambiguous; parenthesize the operand", .{ tree.tokenSlice(outer_token), tree.tokenSlice(inner_token) });
+        const edits = try self.allocator.dupe(Report.Edit, &.{ .{ .start = operand_start, .end = operand_start, .text = "(" }, .{ .start = operand_end, .end = operand_end, .text = ")" } });
+        try self.emitFixed(.Z034, at, at + @as(u32, @intCast(tree.tokenSlice(inner_token).len)), message, &.{}, edits);
     }
 }
 

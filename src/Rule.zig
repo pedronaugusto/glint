@@ -16,6 +16,7 @@ pub const Rule = enum(u16) {
     Z026 = 26,
     Z031 = 31,
     Z032 = 32,
+    Z034 = 34,
     P003 = 42,
     P005 = 44,
     P006 = 45,
@@ -24,7 +25,7 @@ pub const Rule = enum(u16) {
 
     pub fn group(self: Rule) Group {
         return switch (self) {
-            .Z003, .Z011, .Z013, .Z026, .D001 => .correctness,
+            .Z003, .Z011, .Z013, .Z026, .Z034, .D001 => .correctness,
             .Z012, .Z016, .P003, .P005, .P006 => .family_policy,
             else => .zig_style,
         };
@@ -36,6 +37,7 @@ pub const Rule = enum(u16) {
             .P006 => "resolved declaration is disallowed by project policy",
             .D001 => "private declaration its file names nowhere",
             .Z003 => "syntax incompatibility",
+            .Z034 => "operator precedence the next Zig refuses",
             .Z011 => "deprecated API migration",
             .Z013 => "dead private import binding",
             .Z012 => "public API type cannot be named by its caller",
@@ -160,7 +162,7 @@ pub const Config = struct {
 };
 
 test "review inventory excludes removed identities without compatibility aliases" {
-    try std.testing.expectEqual(@as(usize, 18), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
+    try std.testing.expectEqual(@as(usize, 19), std.meta.tags(Rule).len); // safe: explicit compile-time type selection; the value is representable in that type.
     try std.testing.expect(Rule.parse("Z008") == null);
     // Folded into the aegis pack's danger rules (A010, A013, A014, A019), never aliased.
     for ([_][]const u8{ "P001", "P002", "P004", "E001" }) |id| try std.testing.expect(Rule.parse(id) == null);
