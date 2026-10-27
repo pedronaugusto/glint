@@ -30,7 +30,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const array, const index = tree.nodeData(node).node_and_node;
                 if (try Range.within(c, c.file, index, array, false)) continue;
                 const least: Taint.Level = if (try Taint.levelAt(c, flow, c.file, array) == .clean) .number else .data;
-                try judged(c, rule, index, try ranged(c, flow, index), least, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
+                try judged(c, flow, rule, index, try ranged(c, flow, index), least, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
             .slice_open, .slice, .slice_sentinel => {
                 const slice = tree.fullSlice(node) orelse continue;
@@ -45,7 +45,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const parent = c.project.models[c.file.raw()].node_parents[@backingInt(node)] orelse continue;
                 const loop = tree.fullFor(parent) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                try judged(c, rule, end, try ranged(c, flow, end), .number, loop_message);
+                try judged(c, flow, rule, end, try ranged(c, flow, end), .number, loop_message);
             },
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
@@ -53,8 +53,8 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 if (!comparison(tree.nodeTag(condition))) continue;
                 if (try consumes(c, flow, loop.ast.then_expr) or clears(tree, condition, loop.ast.then_expr)) continue;
                 const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                try judged(c, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
-                try judged(c, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
+                try judged(c, flow, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
+                try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
@@ -98,7 +98,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
                 if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
-                try judged(c, rule, node, level, .number, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
+                try judged(c, flow, rule, node, level, .number, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
@@ -109,16 +109,16 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 const right = try Taint.levelAt(c, flow, c.file, rhs);
                 const level: Taint.Level = if (right.reaches(.data) or left.reaches(.number)) .number else left.join(right);
                 if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
-                try judged(c, rule, node, level, .number, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
+                try judged(c, flow, rule, node, level, .number, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
                 if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
-                try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
+                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
             .negation => {
                 if (!site(c, node)) continue;
-                try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .number, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
+                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .number, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
@@ -130,7 +130,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (args.len != 1) continue;
                 const level = try Taint.levelAt(c, flow, c.file, args[0]);
                 if (level.reaches(.data) and std.mem.eql(u8, name, "@intCast") and try Range.converts(c, c.file, node, args[0])) continue;
-                try judged(c, rule, node, level, .data, try c.allocator.print("{s} of input: a peer's value that does not fit stops the program; aegis int.cast returns the error", .{name}));
+                try judged(c, flow, rule, node, level, .data, try c.allocator.print("{s} of input: a peer's value that does not fit stops the program; aegis int.cast returns the error", .{name}));
             },
             else => {},
         }
@@ -171,7 +171,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             // A size checked against the program's own limit (`if (size > max) return`) is
             // bounded by it.
             if (try capped(c, flow, arg)) continue;
-            try judged(c, rule, arg, try ranged(c, flow, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
+            try judged(c, flow, rule, arg, try ranged(c, flow, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
         }
     }
 }
@@ -198,7 +198,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
         for (call.ast.params) |arg| carries = carries or errorName(tree, arg);
         if (!carries) continue;
         const writer = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-        try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, writer), .data, "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read");
+        try judged(c, null, rule, node, try Taint.levelAt(c, flow, c.file, writer), .data, "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read");
     }
 }
 
@@ -342,7 +342,7 @@ fn gives(c: *Context, body: Ast.Node.Index, d: u32) bool {
 /// A sink in the checked file: a finding where the value is input, undecided where the fact
 /// cannot tell.
 fn sink(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
-    try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
+    try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
 }
 
 /// Whether a reader is one `Reader.fixed` made: a local it initializes, or a field every
@@ -397,10 +397,24 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
 
 /// A finding where the value is input at `least` (data, or only a number), undecided where the
 /// fact cannot tell.
-fn judged(c: *Context, rule: Rule, node: Ast.Node.Index, level: Taint.Level, least: Taint.Level, message: []const u8) Context.Error!void {
+/// Reports `node` where its level reaches `least`, naming the read its input came from where
+/// `flow` is the input fact and the walk back finds one (`input from src/config.zig:683
+/// `file.readAll``), so a package fixes each source once at its parser.
+fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, level: Taint.Level, least: Taint.Level, message: []const u8) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
-    if (level.reaches(least)) try c.at(rule, tree.nodeMainToken(node), message);
+    if (!level.reaches(least)) return;
+    const fact = flow orelse return c.at(rule, tree.nodeMainToken(node), message);
+    const from = (try Taint.sourceOf(c, fact, c.file, node)) orelse return c.at(rule, tree.nodeMainToken(node), message);
+    const file = &c.project.files[from.file.raw()];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const read = file.tree.fullCall(&buffer, from.node).?;
+    const line = file.line(file.tree.tokenStart(file.tree.firstToken(from.node))) + 1;
+    // The callee as written, on one line: a chain split over lines is joined without its breaks.
+    var spelled: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, file.tree.getNodeSource(read.ast.fn_expr), " \t\r\n");
+    while (it.next()) |part| try spelled.appendSlice(c.allocator, part);
+    try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s} (input from {s}:{d} `{s}`)", .{ message, c.project.inputs[from.file.raw()].name, line, spelled.items }));
 }
 
 /// Production code that runs with the program.

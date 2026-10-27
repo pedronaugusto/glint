@@ -8,6 +8,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - `Config.pointer_widths` (JSON `pointer_widths`): the pointer widths of the targets the package builds for, 16, 32 or 64 bits. A010 and the ranges the flow rules read hold a value at each, so a `u32` count times a small constant widened to `usize` is a finding only for a package with a 32-bit target; empty reads both 32 and 64 bits, as before.
 
+- A flow finding names the read its input came from: `(input from src/fs/fs.zig:1708 `aegis.own.readFile`)`, the first read found walking back from the site through the expression's parts that carry input, a local's initializer, assignments and filling reads, the program's callees' returns, the arguments a parameter's callers give it, and what the program stores into a field anywhere. A package fixes input once per source at its parser by grouping findings by it (on relic, 652 of 998 flow findings name one, 180 of them one config read).
+
 ### Changed
 
 - A005 reads aegis 0.2.0's unmanaged `SecretBytes.adopt(allocation, live_len)`: an adoption is decided where the allocation is a whole byte allocation handed over alone. It no longer asks that the allocator that made it be the one passed beside it; the owner holds none, and the allocator its `deinit` is given is the caller's to keep.

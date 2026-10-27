@@ -1094,6 +1094,61 @@ test "A010 leaves float arithmetic, which gives an infinity where an integer's s
     try std.testing.expectEqualSlices(u32, &.{8}, result.lines[0..result.findings]);
 }
 
+test "a flow finding names the read its input came from: through a caller's argument, a callee's return and a local" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn header(r: *std.Io.Reader) !u32 {
+        \\    const raw = try r.takeInt(u32, 0);
+        \\    return raw;
+        \\}
+        \\fn use(count: u32, table: []const u8) u8 {
+        \\    return table[count];
+        \\}
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const count = try header(r);
+        \\    return use(count, table);
+        \\}
+    , &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var named: usize = 0;
+    for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
+        try std.testing.expectEqual(@as(u32, 7), d.span.line);
+        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:3 `r.takeInt`)"));
+        named += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), named);
+}
+
+test "a flow finding names the read that filled the field its input is held in, wherever the program stored it" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Graph = struct { count: u32 = 0 };
+        \\fn load(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    graph.count = try r.takeInt(u32, 0);
+        \\}
+        \\fn lookup(graph: *const Graph, table: []const u8) u8 {
+        \\    return table[graph.count];
+        \\}
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var graph: Graph = .{};
+        \\    try load(&graph, r);
+        \\    return lookup(&graph, table);
+        \\}
+    , &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var named: usize = 0;
+    for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
+        try std.testing.expectEqual(@as(u32, 7), d.span.line);
+        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:4 `r.takeInt`)"));
+        named += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), named);
+}
+
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");

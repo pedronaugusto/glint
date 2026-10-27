@@ -1107,3 +1107,289 @@ pub fn ownedIn(a: std.mem.Allocator, flow: *const Flow, file: Project.FileId) er
     for (flow.owned.keys()) |read| if (read.file.eql(file)) try out.append(a, read.token);
     return out.items;
 }
+
+/// Where input that reaches a node was read: a read call the program makes.
+pub const Origin = struct { file: Project.FileId, node: Ast.Node.Index };
+
+/// The read that input reaching `node` comes from, found by walking back from it: through the
+/// parts of its expression that carry input, a local's initializer, its assignments and the
+/// reads that fill it, the program's callees' returns and the arguments a parameter's callers
+/// give it. The first read found, or null where the walk ends without one (a field the program
+/// stores elsewhere, a walk too long). Read only to name a finding's source.
+pub fn sourceOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Origin {
+    const function = owner(flow, file, node) orelse return null;
+    var walk: Walk = .{ .c = c, .flow = flow };
+    return walk.from(function, node, 0);
+}
+
+const Walk = struct {
+    c: *Context,
+    flow: *Flow,
+    seen: std.AutoHashMapUnmanaged(struct { u32, Ast.Node.Index }, void) = .empty,
+    steps: u32 = 0,
+
+    const step_limit = 4000;
+
+    fn carries(w: *Walk, function: u32, node: Ast.Node.Index) Context.Error!bool {
+        return concrete(w.flow, function, try dep(w.c, w.flow, function, node)) != .clean;
+    }
+
+    fn from(w: *Walk, function: u32, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
+        if (depth > 48 or w.steps >= step_limit) return null;
+        w.steps += 1;
+        if ((try w.seen.getOrPut(w.c.allocator, .{ function, node })).found_existing) return null;
+        const f = w.flow.functions.items[function];
+        const tree = &w.c.project.files[f.file.raw()].tree;
+        const model = &w.c.project.models[f.file.raw()];
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, node)) |made| return w.throughCall(function, node, made, depth);
+        if (tree.nodeTag(node) == .identifier) {
+            const ref = model.reference(node) orelse return null;
+            const d = ref.declaration orelse return null;
+            if (std.mem.findScalar(u32, f.params, d)) |index| return w.callers(function, index, depth);
+            const decl = model.declarations[d];
+            const scope = model.scopes[decl.scope].kind;
+            if (scope == .file or scope == .container) return w.stored(.{ .file = f.file, .index = d }, depth);
+            return w.local(function, d, depth);
+        }
+        // A field holds what the program stores in it anywhere, by its declaration.
+        if (tree.nodeTag(node) == .field_access) if (try w.c.facts.definition(f.file, node)) |decl| {
+            if ((w.flow.globals.get(decl) orelse .clean) != .clean) if (try w.stored(decl, depth)) |found| return found;
+        };
+        for (try children(w.c, f.file, node)) |child| {
+            if (!try w.carries(function, child)) continue;
+            if (try w.from(function, child, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+
+    fn throughCall(w: *Walk, function: u32, node: Ast.Node.Index, at: Ast.full.Call, depth: u8) Context.Error!?Origin {
+        const f = w.flow.functions.items[function];
+        const callee = try resolveCall(w.c, w.flow, f.file, at);
+        switch (callee.kind) {
+            .source => return .{ .file = f.file, .node = node },
+            .aegis => return null,
+            .program => |target| {
+                const g = w.flow.functions.items[target];
+                const tree = &w.c.project.files[g.file.raw()].tree;
+                for (try children(w.c, g.file, g.node)) |part| if (try w.returned(target, tree, part, depth)) |found| return found;
+            },
+            .holder, .outside, .none => {},
+        }
+        for (callee.args.items) |arg| {
+            if (!try w.carries(function, arg)) continue;
+            if (try w.from(function, arg, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+
+    /// The `return`s within `node` of `function`'s own body, walked back.
+    fn returned(w: *Walk, function: u32, tree: *const Ast, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
+        if (w.steps >= step_limit) return null;
+        w.steps += 1;
+        if (tree.nodeTag(node) == .fn_decl or tree.nodeTag(node) == .fn_proto or tree.nodeTag(node) == .fn_proto_one or tree.nodeTag(node) == .fn_proto_simple or tree.nodeTag(node) == .fn_proto_multi) return null;
+        if (tree.nodeTag(node) == .@"return") {
+            const value = tree.nodeData(node).opt_node.unwrap() orelse return null;
+            if (!try w.carries(function, value)) return null;
+            return w.from(function, value, depth + 1);
+        }
+        const g = w.flow.functions.items[function];
+        for (try children(w.c, g.file, node)) |part| if (try w.returned(function, tree, part, depth)) |found| return found;
+        return null;
+    }
+
+    /// A local's initializer, what is assigned to it and the reads that fill it.
+    fn local(w: *Walk, function: u32, d: u32, depth: u8) Context.Error!?Origin {
+        const f = w.flow.functions.items[function];
+        const tree = &w.c.project.files[f.file.raw()].tree;
+        const model = &w.c.project.models[f.file.raw()];
+        const decl = model.declarations[d];
+        const scope = model.scopes[decl.scope].kind;
+        if (scope == .file or scope == .container) return null;
+        if (try w.from(function, decl.node, depth + 1)) |found| return found;
+        const owners = w.flow.owners.get(f.file.raw()) orelse return null;
+        for (owners, 0..) |own, i| {
+            if (own != function) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tree.nodeTag(node) == .assign) {
+                const target, const value = tree.nodeData(node).node_and_node;
+                if (rootDecl(model, tree, target) != d or !try w.carries(function, value)) continue;
+                if (try w.from(function, value, depth + 1)) |found| return found;
+                continue;
+            }
+            var buffer: [1]Ast.Node.Index = undefined;
+            const made = tree.fullCall(&buffer, node) orelse continue;
+            for (made.ast.params) |arg| if (rootDecl(model, tree, arg) == d) {
+                const callee = try resolveCall(w.c, w.flow, f.file, made);
+                if (callee.kind == .source) return .{ .file = f.file, .node = node };
+            };
+        }
+        return null;
+    }
+
+    /// What the program stores in a field or a container-level variable: a value assigned or
+    /// given in a literal, or a read that fills it.
+    fn stored(w: *Walk, decl: Facts.Decl, depth: u8) Context.Error!?Origin {
+        const stores = try storeSites(w.c, w.flow);
+        for ((stores.map.get(decl) orelse return null).items) |site| {
+            const f = w.flow.functions.items[site.function];
+            if (site.read) return .{ .file = f.file, .node = site.node };
+            if (!try w.carries(site.function, site.node)) continue;
+            if (try w.from(site.function, site.node, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+
+    /// What the program's callers of `function` give its parameter `index`.
+    fn callers(w: *Walk, function: u32, index: usize, depth: u8) Context.Error!?Origin {
+        const sites = try callSites(w.c, w.flow);
+        for ((sites.map.get(function) orelse return null).items) |site| {
+            const f = w.flow.functions.items[site.caller];
+            const tree = &w.c.project.files[f.file.raw()].tree;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const made = tree.fullCall(&buffer, site.node) orelse continue;
+            const callee = try resolveCall(w.c, w.flow, f.file, made);
+            if (index < callee.skip) continue;
+            const position = index - callee.skip;
+            if (position >= callee.args.items.len) continue;
+            const arg = callee.args.items[position];
+            if (!try w.carries(site.caller, arg)) continue;
+            if (try w.from(site.caller, arg, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+};
+
+/// The declaration an expression is rooted at: `x`, `x.field`, `x[i]`, `&x`, `x[a..b]`.
+fn rootDecl(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?u32 {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .identifier => return (model.reference(at) orelse return null).declaration,
+        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .address_of, .deref => at = tree.nodeData(at).node,
+        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return null).ast.sliced,
+        else => return null,
+    };
+}
+
+/// Each node's children, by file, built once from the parent table.
+const Children = struct { map: std.AutoHashMapUnmanaged(u32, []const []const Ast.Node.Index) = .empty };
+
+fn children(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {
+    const memo = try c.facts.memo(Children);
+    const all = memo.map.get(file.raw()) orelse blk: {
+        const model = &c.project.models[file.raw()];
+        const lists = try c.allocator.alloc(std.ArrayList(Ast.Node.Index), model.node_parents.len);
+        @memset(lists, .empty);
+        for (model.node_parents, 0..) |parent, i| if (parent) |p| try lists[@backingInt(p)].append(c.allocator, @fromBackingInt(@intCast(i)));
+        const out = try c.allocator.alloc([]const Ast.Node.Index, lists.len);
+        for (lists, out) |list, *each| each.* = list.items;
+        try memo.map.put(c.allocator, file.raw(), out);
+        break :blk out;
+    };
+    return all[@backingInt(node)]; // safe: a node index indexes its own tree's parent table.
+}
+
+/// The program's calls of each of its functions, by callee, built once per flow.
+const CallSites = struct {
+    built: bool = false,
+    map: std.AutoHashMapUnmanaged(u32, std.ArrayList(struct { caller: u32, node: Ast.Node.Index })) = .empty,
+};
+
+fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
+    const memo = try c.facts.memo(CallSites);
+    if (memo.built) return memo;
+    memo.built = true;
+    var files = flow.owners.iterator();
+    while (files.next()) |entry| {
+        const file: Project.FileId = .fromRaw(entry.key_ptr.*);
+        const tree = &c.project.files[file.raw()].tree;
+        for (entry.value_ptr.*, 0..) |own, i| {
+            const caller = own orelse continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            var buffer: [1]Ast.Node.Index = undefined;
+            const made = tree.fullCall(&buffer, node) orelse continue;
+            const callee = try resolveCall(c, flow, file, made);
+            const target = switch (callee.kind) {
+                .program => |t| t,
+                else => continue,
+            };
+            const list = try memo.map.getOrPut(c.allocator, target);
+            if (!list.found_existing) list.value_ptr.* = .empty;
+            try list.value_ptr.append(c.allocator, .{ .caller = caller, .node = node });
+        }
+    }
+    return memo;
+}
+
+/// Where the program stores into each field and container-level variable, by declaration: the
+/// value it assigns or gives in a literal, or the read that fills it. Built once per flow.
+const StoreSites = struct {
+    built: bool = false,
+    map: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(StoreSite)) = .empty,
+};
+const StoreSite = struct { function: u32, node: Ast.Node.Index, read: bool };
+
+fn storeSites(c: *Context, flow: *Flow) Context.Error!*StoreSites {
+    const memo = try c.facts.memo(StoreSites);
+    if (memo.built) return memo;
+    memo.built = true;
+    var files = flow.owners.iterator();
+    while (files.next()) |entry| {
+        const file: Project.FileId = .fromRaw(entry.key_ptr.*);
+        const tree = &c.project.files[file.raw()].tree;
+        for (entry.value_ptr.*, 0..) |own, i| {
+            const function = own orelse continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tree.nodeTag(node) == .assign) {
+                const target, const value = tree.nodeData(node).node_and_node;
+                const decl = (try storedDecl(c, file, target)) orelse continue;
+                try addStore(c, memo, decl, .{ .function = function, .node = value, .read = false });
+                continue;
+            }
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullStructInit(&buffer, node)) |literal| {
+                const fields = (try literalFields(c, file, node, literal)) orelse continue;
+                for (fields, literal.ast.fields) |decl, value| try addStore(c, memo, decl, .{ .function = function, .node = value, .read = false });
+                continue;
+            }
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            const made = tree.fullCall(&call_buffer, node) orelse continue;
+            if ((try resolveCall(c, flow, file, made)).kind != .source) continue;
+            for (made.ast.params) |arg| if (try storedDecl(c, file, arg)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
+        }
+    }
+    return memo;
+}
+
+fn addStore(c: *Context, memo: *StoreSites, decl: Facts.Decl, site: StoreSite) Context.Error!void {
+    const list = try memo.map.getOrPut(c.allocator, decl);
+    if (!list.found_existing) list.value_ptr.* = .empty;
+    try list.value_ptr.append(c.allocator, site);
+}
+
+/// The field or container-level variable an expression stores into: `x.field`, `x.field[i]`,
+/// `&x.field`, `global`.
+fn storedDecl(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .field_access => {
+            const decl = (try c.facts.definition(file, at)) orelse return null;
+            const kind = c.project.models[decl.file.raw()].declarations[decl.index].kind;
+            return if (kind == .field or kind == .variable) decl else null;
+        },
+        .identifier => {
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const decl = model.declarations[d];
+            const scope = model.scopes[decl.scope].kind;
+            return if (decl.kind == .variable and (scope == .file or scope == .container)) .{ .file = file, .index = d } else null;
+        },
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .address_of, .deref => at = tree.nodeData(at).node,
+        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return null).ast.sliced,
+        else => return null,
+    };
+}
