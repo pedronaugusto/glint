@@ -8,7 +8,6 @@ pub const Record = struct {
     version: u32,
     run_id: []const u8,
     completed: bool,
-    // aegis: no-danger: the result protocol's field, which the CLI sets to the failure its next phase would be and verify reads once; no function refuses a transition
     outcome: Outcome,
     sources: usize,
     findings: usize,

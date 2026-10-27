@@ -10,6 +10,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - A007 leaves a synchronization type that is only compared, itself or what its constructor makes (`T == std.Io.Mutex`, `T != std.atomic.Value(u32)` in a comptime check that refuses it), which holds none (strand's descriptor.zig and owner.zig).
 - A012 leaves a size std only moves a position by (`Reader.toss` after a decode): a std parameter that no call, loop, local or return takes does the same work whatever its value. warp's lz4 escape on that line now suppresses nothing.
 - A006 does not enter a function that returns a type or takes only comptime parameters (`comptime T: type, comptime seen: []const type`): no value read at run time reaches it, and its depth is the types' it is given. On strand, 10 of its 12 findings were such descriptors; `same` and `zero`, which take runtime values with the type, remain.
+- A017 reports an enum state moved on its own value: a write under a switch or a condition on the field (`switch (f.state) { .start => f.state = .value, ... }`), there or where the function that writes it is called. A kind set where its value is built or read (a table's layout, a date's kind) is data, and so is a field rewritten on the records a loop walks (`for (slots) |*s|`, `&slots[at]` with `at` the loop's). On strand, csv's `mode`, toml's `kind` and zon's `arm` are no longer findings, while its parser frames and zon's `pending` remain; xenoglyph's bidi classes are no longer one.
 
 ## [0.7.1] - 2026-10-27
 

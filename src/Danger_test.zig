@@ -433,6 +433,51 @@ test "A017 finds an enum state written in two functions and switched on" {
         \\};
         \\pub fn run(j: *Job) void { j.step(); }
     , 1);
+    // The holder moves it in the switch itself.
+    try expect(pack.state_machines,
+        \\const Phase = enum { idle, running, done };
+        \\const Job = struct {
+        \\    phase: Phase = .idle,
+        \\    fn reset(j: *Job) void { j.phase = .idle; }
+        \\    fn step(j: *Job) void { switch (j.phase) { .idle => j.phase = .running, .running => j.phase = .done, .done => {} } }
+        \\};
+        \\pub fn run(j: *Job) void { j.step(); j.reset(); }
+    , 1);
+    // A parser's frame, a record its decoder moves through the frame on top.
+    try expect(pack.state_machines,
+        \\const State = enum { start, value, after_value };
+        \\const Frame = struct { state: State };
+        \\const Decoder = struct {
+        \\    frames: [4]Frame = undefined,
+        \\    depth: usize = 0,
+        \\    fn top(d: *Decoder) *Frame { return &d.frames[d.depth]; }
+        \\    fn open(d: *Decoder) void { d.top().state = .start; }
+        \\    fn step(d: *Decoder) void { const f = d.top(); switch (f.state) { .start => f.state = .value, .value => f.state = .after_value, .after_value => {} } }
+        \\};
+        \\pub fn run(d: *Decoder) void { d.open(); d.step(); }
+    , 1);
+}
+
+test "A017 leaves a kind set where its value is built, and records an algorithm rewrites" {
+    // A table's layout, set by whichever builder made it.
+    try expect(pack.state_machines,
+        \\const Kind = enum { single, double };
+        \\const Table = struct {
+        \\    kind: Kind = .single,
+        \\    fn buildSingle(t: *Table) void { t.kind = .single; }
+        \\    fn buildDouble(t: *Table) void { t.kind = .double; }
+        \\    fn width(t: *const Table) u8 { return switch (t.kind) { .single => 1, .double => 2 }; }
+        \\};
+        \\pub fn run(t: *Table, wide: bool) u8 { if (wide) t.buildDouble() else t.buildSingle(); return t.width(); }
+    , 0);
+    // Classes the rules refine on their own value, record by record, from outside the record.
+    try expect(pack.state_machines,
+        \\const Class = enum { mark, letter, number, neutral };
+        \\const Slot = struct { class: Class };
+        \\fn marks(slots: []Slot, before: Class) void { for (slots) |*s| if (s.class == .mark) { s.class = before; }; }
+        \\fn numbers(slots: []Slot) void { var p: ?usize = 0; while (p) |at| : (p = if (at + 1 < slots.len) at + 1 else null) { const s = &slots[at]; switch (s.class) { .number => s.class = .neutral, else => {} } } }
+        \\pub fn run(slots: []Slot) usize { marks(slots, .letter); numbers(slots); var n: usize = 0; for (slots) |s| switch (s.class) { .letter => n += 1, else => {} }; return n; }
+    , 0);
 }
 
 test "A021 finds a second lock taken while a guard is held, unless both are ranked by Order" {
