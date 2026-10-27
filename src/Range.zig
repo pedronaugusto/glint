@@ -950,6 +950,7 @@ fn gather(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
                 for (tree.blockStatements(&buffer, parent).?) |statement| {
                     if (statement == at) break;
                     try limited(c, file, &out, statement, node);
+                    try subtracted(c, file, &out, statement, node);
                     try reserved(c, file, &out, statement, node);
                     try asserted(c, file, &out, statement, node);
                     try succeeded(c, file, &out, statement, node);
@@ -973,12 +974,14 @@ fn gather(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
             },
             else => {
                 if (tree.fullIf(parent)) |branch| {
+                    if (branch.ast.cond_expr != at) try subtracted(c, file, &out, branch.ast.cond_expr, node);
                     if (branch.ast.then_expr == at) {
                         try held(c, file, &out, branch.ast.cond_expr, true, node);
                         if (branch.payload_token != null) try searchFacts(c, file, &out, branch.ast.cond_expr, node);
                     }
                     if (branch.ast.else_expr.unwrap() == at) try held(c, file, &out, branch.ast.cond_expr, false, node);
                 } else if (tree.fullWhile(parent)) |loop| {
+                    if (loop.ast.cond_expr != at) try subtracted(c, file, &out, loop.ast.cond_expr, node);
                     if (loop.ast.then_expr == at or loop.ast.cont_expr.unwrap() == at) {
                         try held(c, file, &out, loop.ast.cond_expr, true, node);
                         if (loop.payload_token != null) try searchFacts(c, file, &out, loop.ast.cond_expr, node);
@@ -999,6 +1002,79 @@ fn read(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), access: As
     const memory, const index = tree.nodeData(at).node_and_node;
     if (!try kept(c, file, memory, since orelse access, use) or !try kept(c, file, index, since orelse access, use)) return;
     try out.append(c.allocator, .{ .small = index, .large = memory, .strict = true, .read = true });
+}
+
+/// What a difference computed before the use left: `a - b` of unsigned operands, evaluated on
+/// every path through `statement` (`if (len > in.len - ip) return` before `in[ip..]`), puts
+/// `b` at most `a` past it, while nothing between assigns either. A difference that would
+/// underflow stops the program there, at the subtraction, which A010 judges itself.
+fn subtracted(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), statement: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    switch (tree.nodeTag(statement)) {
+        .@"defer", .@"errdefer" => return,
+        else => {},
+    }
+    const last = tree.lastToken(statement);
+    const all = try differences(c, file);
+    const Span = struct { tree: *const Ast, first: Ast.TokenIndex };
+    const start = std.sort.partitionPoint(Ast.Node.Index, all, Span{ .tree = tree, .first = tree.firstToken(statement) }, struct {
+        fn before(span: Span, node: Ast.Node.Index) bool {
+            return span.tree.nodeMainToken(node) < span.first;
+        }
+    }.before);
+    for (all[start..]) |difference| {
+        if (tree.nodeMainToken(difference) > last) break;
+        if (!always(c, file, difference, statement)) continue;
+        const typed = try typeOf(c, file, difference, 64, 0);
+        if (typed != .int or typed.int.signed) continue;
+        const lhs, const rhs = tree.nodeData(difference).node_and_node;
+        if (!try kept(c, file, lhs, difference, use) or !try kept(c, file, rhs, difference, use)) continue;
+        try out.append(c.allocator, .{ .small = rhs, .large = lhs, .strict = false });
+    }
+}
+
+/// The subtractions of each file, in source order, for `subtracted`.
+const Differences = struct { files: std.AutoHashMapUnmanaged(usize, []const Ast.Node.Index) = .empty };
+
+fn differences(c: *Context, file: Project.FileId) Context.Error![]const Ast.Node.Index {
+    const memo = try c.facts.memo(Differences);
+    const entry = try memo.files.getOrPut(c.allocator, file.raw());
+    if (entry.found_existing) return entry.value_ptr.*;
+    const tree = &c.project.files[file.raw()].tree;
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| if (tag == .sub) try found.append(c.allocator, @fromBackingInt(@intCast(i)));
+    std.mem.sort(Ast.Node.Index, found.items, tree, struct {
+        fn less(t: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+            return t.nodeMainToken(a) < t.nodeMainToken(b);
+        }
+    }.less);
+    entry.value_ptr.* = found.items;
+    return found.items;
+}
+
+/// Whether `node` is evaluated whenever `root`, which holds it, is: not in a branch's body, a
+/// loop's body, a switch's prong, or the right side of an `and`, `or`, `orelse` or `catch`.
+fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, root: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = node;
+    while (at != root) {
+        const parent = model.node_parents[@backingInt(at)] orelse return false;
+        switch (tree.nodeTag(parent)) {
+            .bool_and, .bool_or, .@"orelse", .@"catch" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
+            .@"switch", .switch_comma => if (tree.nodeData(parent).node_and_extra[0] != at) return false,
+            .fn_decl, .@"defer", .@"errdefer" => return false,
+            else => if (tree.fullIf(parent)) |branch| {
+                if (branch.ast.cond_expr != at) return false;
+            } else if (tree.fullWhile(parent)) |loop| {
+                if (loop.ast.cond_expr != at) return false;
+            } else if (tree.fullFor(parent)) |loop| {
+                if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return false;
+            },
+        }
+        at = parent;
+    }
+    return true;
 }
 
 /// What a method call that succeeded checked: `try r.f(…)` where `f`, in this file, fails
@@ -1282,19 +1358,35 @@ fn charged(c: *Context, file: Project.FileId, amount: Ast.Node.Index) Context.Er
 /// after it, and `if (x < y) x = y;` at least `y`, while nothing after assigns either.
 fn clamped(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), branch: Ast.full.If, statement: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.files[file.raw()].tree;
-    var then = branch.ast.then_expr;
-    switch (tree.nodeTag(then)) {
-        .block, .block_semicolon, .block_two, .block_two_semicolon => {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const statements = tree.blockStatements(&buffer, then).?;
-            if (statements.len != 1) return;
-            then = statements[0];
-        },
-        else => {},
-    }
-    if (tree.nodeTag(then) != .assign) return;
-    const target, const value = tree.nodeData(then).node_and_node;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements: []const Ast.Node.Index = tree.blockStatements(&buffer, branch.ast.then_expr) orelse &.{branch.ast.then_expr};
     const condition = bare(tree, branch.ast.cond_expr);
+    // The clamp is the block's one assignment of a side of the condition to the other; the
+    // block's other statements are assignments of neither (`n = r.at; status = .end_of_buffer;`).
+    var clamp: ?Ast.Node.Index = null;
+    for (statements) |statement_in| {
+        if (tree.nodeTag(statement_in) != .assign) continue;
+        const assigned_to = tree.nodeData(statement_in).node_and_node[0];
+        const compared = switch (tree.nodeTag(condition)) {
+            .greater_than, .greater_or_equal, .less_than, .less_or_equal => tree.nodeData(condition).node_and_node,
+            else => return,
+        };
+        if (!same(tree, assigned_to, compared[0]) and !same(tree, assigned_to, compared[1])) continue;
+        if (clamp != null) return;
+        clamp = statement_in;
+    }
+    const then = clamp orelse return;
+    for (statements) |other| {
+        if (other == then) continue;
+        switch (tree.nodeTag(other)) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                const lhs = tree.nodeData(other).node_and_node[0];
+                if (same(tree, lhs, tree.nodeData(then).node_and_node[0]) or same(tree, lhs, tree.nodeData(then).node_and_node[1])) return;
+            },
+            else => return,
+        }
+    }
+    const target, const value = tree.nodeData(then).node_and_node;
     const lhs, const rhs = switch (tree.nodeTag(condition)) {
         .greater_than, .greater_or_equal, .less_than, .less_or_equal => tree.nodeData(condition).node_and_node,
         else => return,
@@ -1585,7 +1677,7 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
             const most = (try bound(c, file, index, pointer, 0)) orelse return false;
             if (if (end) most <= n else most < n) continue;
         }
-        if (!keeps(c, file, held_here, index, memory, end)) return false;
+        if (!try keeps(c, file, held_here, index, memory, end)) return false;
     }
     return true;
 }
@@ -1617,13 +1709,14 @@ pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: A
 /// other than the length where another fact puts it at most the length (`i < buf.len` and
 /// `i + 1 != buf.len` put `i + 1` below it). A constant local naming the index or the length
 /// (`const off = at;`, `const n = buf.len;`), or a capture naming a search, is read as it.
-fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) bool {
+fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     const index_base, const j = shift(tree, index);
     // `index_base + most` is at most the length.
     var most: ?i128 = null;
     for (held_here) |fact| {
         if (fact.differs) continue;
+        if (try covered(c, file, fact, index, memory, end)) return true;
         if (fact.read) {
             if (!same(tree, fact.large, memory)) continue;
             const base, const k = shift(tree, fact.small);
@@ -1663,6 +1756,64 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
     }
     return if (end) j <= m else j < m;
 }
+
+/// Whether a sum the length bounds covers the position: `l1 + l2 + 6 <= in.len` keeps
+/// `in[6 + l1 ..]` and `in[6..][0..l1]`. The position's parts, with the starts of the slices
+/// it is taken from, are each a part of the sum, and the sum's other parts are unsigned, so
+/// the position is at most the sum.
+fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
+    if (fact.differs or fact.read) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    var needed: Terms = .{};
+    var base = bare(tree, memory);
+    while (tree.nodeTag(base) == .slice_open) {
+        const slice = tree.fullSlice(base).?;
+        if (!needed.add(tree, slice.ast.start)) return false;
+        base = bare(tree, slice.ast.sliced);
+    }
+    if (!needed.add(tree, index)) return false;
+    if (!lengthOf(c, file, fact.large, base)) return false;
+    var whole: Terms = .{};
+    if (!whole.add(tree, fact.small) or whole.len < 2) return false;
+    var used: [Terms.capacity]bool = @splat(false);
+    for (needed.nodes[0..needed.len]) |term| {
+        for (whole.nodes[0..whole.len], 0..) |part, i| {
+            if (used[i] or !oneValue(c, file, part, term)) continue;
+            used[i] = true;
+            break;
+        } else return false;
+    }
+    for (whole.nodes[0..whole.len], used[0..whole.len]) |part, taken| if (!taken) {
+        const typed = try typeOf(c, file, part, 64, 0);
+        if (typed != .int or typed.int.signed) return false;
+    };
+    const room = whole.constant + @intFromBool(fact.strict) - needed.constant;
+    return if (end) room >= 0 else room >= 1;
+}
+
+/// A sum as its parts and the constants added in it: `6 + l1 + l2` is `l1`, `l2` and 6.
+const Terms = struct {
+    const capacity = 8;
+    nodes: [capacity]Ast.Node.Index = undefined,
+    len: usize = 0,
+    constant: i128 = 0,
+
+    fn add(terms: *Terms, tree: *const Ast, node: Ast.Node.Index) bool {
+        const at = bare(tree, node);
+        if (literal(tree, at)) |k| {
+            terms.constant += k;
+            return true;
+        }
+        if (tree.nodeTag(at) == .add) {
+            const a, const b = tree.nodeData(at).node_and_node;
+            return terms.add(tree, a) and terms.add(tree, b);
+        }
+        if (terms.len == capacity) return false;
+        terms.nodes[terms.len] = at;
+        terms.len += 1;
+        return true;
+    }
+};
 
 /// What is left after `index` is at least `k`, or above zero: `index` is below the length.
 fn remains(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) bool {

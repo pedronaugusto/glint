@@ -1351,6 +1351,138 @@ test "A009 reads a position its guards keep within the memory: a strict check a 
     , 4);
 }
 
+test "A009 reads a difference computed before the use: its subtrahend is at most its minuend past it" {
+    // The guard's difference, a local's and a field chain's (warp's marked.zig) each stopped the
+    // program had it underflowed, so the start is within the memory past it.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Stream = struct { in: []const u8, ip: usize };
+        \\pub fn f(r: *std.Io.Reader, s: *Stream) !void {
+        \\    const in = try r.take(64);
+        \\    const ip: usize = try r.takeInt(u8, 0);
+        \\    const len: usize = try r.takeInt(u8, 0);
+        \\    if (len > in.len - ip) return error.Short;
+        \\    _ = in[ip..];
+        \\    const at: usize = try r.takeInt(u8, 0);
+        \\    const left = in.len - at;
+        \\    _ = left;
+        \\    _ = in[at..];
+        \\    s.ip = try r.takeInt(u8, 0);
+        \\    s.in = in;
+        \\    if (len > s.in.len - s.ip) return error.Short;
+        \\    _ = s.in[s.ip..];
+        \\}
+    , 0);
+    // A difference only a branch computes, one an `and` may skip, and one whose operand
+    // changes after it keep nothing.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, flag: bool) !void {
+        \\    const in = try r.take(64);
+        \\    var ip: usize = try r.takeInt(u8, 0);
+        \\    if (flag) _ = in.len - ip;
+        \\    _ = in[ip..];
+        \\    if (flag and in.len - ip > 4) {}
+        \\    _ = in[ip..];
+        \\    _ = in.len - ip;
+        \\    ip += try r.takeInt(u8, 0);
+        \\    _ = in[ip..];
+        \\}
+    , 3);
+}
+
+test "A009 reads a sum the length bounds as bounding each of its parts' sums" {
+    // warp's huffman streams: four lengths, their sum and the header checked against the input.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const in = try r.take(64);
+        \\    const l1: usize = try r.takeInt(u16, .little);
+        \\    const l2: usize = try r.takeInt(u16, .little);
+        \\    const l3: usize = try r.takeInt(u16, .little);
+        \\    if (l1 + l2 + l3 + 6 > in.len) return error.Bad;
+        \\    _ = in[6..][0..l1];
+        \\    _ = in[6 + l1 ..][0..l2];
+        \\    _ = in[6 + l1 + l2 ..][0..l3];
+        \\    _ = in[6 + l1 + l2 + l3 ..];
+        \\}
+    , 0);
+    // A part the sum does not hold, and the whole sum as an index (at most the length, not
+    // below it), are not kept.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const in = try r.take(64);
+        \\    const l1: usize = try r.takeInt(u16, .little);
+        \\    const l2: usize = try r.takeInt(u16, .little);
+        \\    const l4: usize = try r.takeInt(u16, .little);
+        \\    if (l1 + l2 > in.len) return error.Bad;
+        \\    _ = in[l1..][0..l4];
+        \\    _ = in[l1 + l2];
+        \\}
+    , 2);
+}
+
+test "A010 reads a clamp among the block's other assignments before a difference" {
+    // warp's zstd bit reader: the clamp beside the status it sets.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, at: *usize) !bool {
+        \\    var n: usize = try r.takeInt(u8, .little);
+        \\    var short = false;
+        \\    if (n > at.*) {
+        \\        n = at.*;
+        \\        short = true;
+        \\    }
+        \\    at.* -= n;
+        \\    return short;
+        \\}
+    , 0);
+    // A block that may change the clamped value again keeps nothing.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, at: *usize, more: bool) !void {
+        \\    var n: usize = try r.takeInt(u8, .little);
+        \\    if (n > at.*) {
+        \\        n = at.*;
+        \\        if (more) n += 1;
+        \\    }
+        \\    at.* -= n;
+        \\}
+    , 1);
+}
+
+test "A010 takes no input into a comptime parameter, which the program fixes when it is compiled" {
+    // warp's match copy: an inline prong's period, chosen by an input offset, as a comptime
+    // divisor; given at run time, the same divisor is input's.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn spread(comptime period: usize) usize {
+        \\    var sum: usize = 0;
+        \\    for (0..16) |i| sum +%= i % period;
+        \\    return sum;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    const offset: usize = try r.takeInt(u8, .little);
+        \\    return switch (offset) {
+        \\        inline 1...7 => |period| spread(period),
+        \\        else => 0,
+        \\    };
+        \\}
+    , 0);
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn spread(period: usize) usize {
+        \\    var sum: usize = 0;
+        \\    for (0..16) |i| sum +%= i % period;
+        \\    return sum;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    return spread(try r.takeInt(u8, .little));
+        \\}
+    , 1);
+}
+
 test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
