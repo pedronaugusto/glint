@@ -1,6 +1,5 @@
 //! Atomic completed-run sidecar. Consumers verify nonce, exit, length and digest.
 const std = @import("std");
-const Result = @This();
 const Completion = @import("Completion.zig");
 
 pub const Outcome = Completion.Outcome;

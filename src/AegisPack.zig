@@ -2869,24 +2869,3 @@ fn passedWhole(c: *Context, index: u32, want: ?Path, depth: usize) Context.Error
     }
     return true;
 }
-
-/// Whether two expressions name the same value the same way: one declaration, or the same
-/// members of the same declaration (`self.gpa`).
-fn samePath(c: *Context, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
-    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
-    if (tree.nodeTag(a) != tree.nodeTag(b)) return false;
-    switch (tree.nodeTag(a)) {
-        .identifier => {
-            const x = (model.reference(a) orelse return false).declaration orelse return false;
-            const y = (model.reference(b) orelse return false).declaration orelse return false;
-            return x == y;
-        },
-        .field_access => {
-            const x = tree.nodeData(a).node_and_token;
-            const y = tree.nodeData(b).node_and_token;
-            return std.mem.eql(u8, tree.tokenSlice(x[1]), tree.tokenSlice(y[1])) and samePath(c, x[0], y[0]);
-        },
-        else => return false,
-    }
-}

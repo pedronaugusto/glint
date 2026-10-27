@@ -1,7 +1,7 @@
 //! Own benchmark: parsing, std lowering, cold project/binding and shared rules.
 const std = @import("std");
 const glint = @import("glint");
-const Stats = @import("allocations.zig");
+const Stats = @import("Stats.zig");
 const smoke = @import("builtin").optimize == .debug;
 
 pub fn main(init: std.process.Init) !void {

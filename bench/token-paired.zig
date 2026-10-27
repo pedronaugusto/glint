@@ -2,7 +2,7 @@
 const std = @import("std");
 const fast = @import("glint").token;
 const old = @import("baseline");
-const Stats = @import("allocations.zig");
+const Stats = @import("Stats.zig");
 const aegis = @import("aegis");
 /// The longest manifest or source a run reads: far past any corpus file.
 const max_source = 64 * 1024 * 1024;
