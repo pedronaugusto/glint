@@ -85,16 +85,21 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/Io/Reader.zig", .bytes =
     \\buffer: []u8 = &.{},
+    \\seek: usize = 0,
+    \\end: usize = 0,
     \\pub const Limit = enum(usize) { unlimited = 0, _ };
     \\pub fn fixed(bytes: []const u8) @This() { _ = bytes; return .{}; }
     \\pub fn takeByte(r: *@This()) !u8 { _ = r; return 0; }
     \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }
-    \\pub fn take(r: *@This(), n: usize) ![]u8 { _ = n; return r.buffer; }
+    \\pub fn fill(r: *@This(), n: usize) !void { if (r.seek + n > r.end) return error.EndOfStream; }
+    \\pub fn take(r: *@This(), n: usize) ![]u8 { try r.fill(n); return r.buffer; }
+    \\pub fn toss(r: *@This(), n: usize) void { r.seek += n; assert(r.seek <= r.end); }
+    \\fn assert(ok: bool) void { if (!ok) unreachable; }
     \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -751,6 +756,17 @@ test "a number held to 16 bits bounds a loop and sizes work as data does" {
 
 test "A012 finds work sized by a number from input and reads with no limit" {
     try expect(pack.bounded_work, input_program, 2);
+}
+
+test "A012 leaves a size std only moves a position by, and finds one it passes on" {
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    r.toss(n);
+        \\    _ = try r.take(n);
+        \\}
+    , 1);
 }
 
 test "A018 finds an error's name written to a peer, not to another writer" {

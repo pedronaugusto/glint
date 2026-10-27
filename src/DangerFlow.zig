@@ -171,6 +171,8 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             // A size checked against the program's own limit (`if (size > max) return`) is
             // bounded by it.
             if (try capped(c, flow, arg)) continue;
+            // A size the callee only moves a position by (`Reader.toss`) takes no work.
+            if (try constant(c, decl, position)) continue;
             try judged(c, flow, rule, arg, try ranged(c, flow, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
         }
     }
@@ -379,6 +381,69 @@ fn fixedCall(tree: *const Ast, node: Ast.Node.Index) bool {
         else => return false,
     };
     return std.mem.eql(u8, name, "fixed");
+}
+
+/// Per std function and parameter, whether the work it does stays the same whatever the
+/// parameter's value.
+const Constant = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, usize }, bool) = .empty };
+
+/// Whether std's function `decl` does the same work whatever its parameter at `position`: the
+/// parameter is only added to a field or compared (`r.seek += n; assert(r.seek <= r.end)`), and
+/// never passed to a call, made a loop's bound, held in a local or returned, where it could size
+/// work. A function without a body (a pointer's, a vtable's) may do anything.
+fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
+    const memo = try c.facts.memo(Constant);
+    if (memo.map.get(.{ decl, position })) |known| return known;
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const model = &c.project.models[decl.file.raw()];
+    const names = try parameters(c, decl);
+    const result = done: {
+        if (position >= names.len or names[position].len == 0) break :done false;
+        const function = model.node_parents[@backingInt(model.declarations[decl.index].node)] orelse break :done false; // safe: a declaration's node indexes its own tree's parent table.
+        if (tree.nodeTag(function) != .fn_decl) break :done false;
+        const body = tree.nodeData(function).node_and_node[1];
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(node);
+            if (token < first or token > last or !std.mem.eql(u8, tree.tokenSlice(token), names[position])) continue;
+            if (grows(tree, model.node_parents, node, body)) break :done false;
+        }
+        break :done true;
+    };
+    try memo.map.put(c.allocator, .{ decl, position }, result);
+    return result;
+}
+
+/// Whether the use `node` of a parameter can size work before the walk up reaches `body`: an
+/// argument of a call (not `assert`'s) or a builtin, a loop's bound, a local's value or what
+/// the function returns.
+fn grows(tree: *const Ast, parents: []const ?Ast.Node.Index, node: Ast.Node.Index, body: Ast.Node.Index) bool {
+    var at = node;
+    while (parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        if (at == body) return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, parent)) |call| {
+            if (at == call.ast.fn_expr) continue;
+            const callee = tree.nodeMainToken(call.ast.fn_expr);
+            const name = if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.tokenSlice(callee + 1) else tree.tokenSlice(callee);
+            return !std.mem.eql(u8, name, "assert");
+        }
+        if (tree.fullWhile(parent)) |loop| if (at == loop.ast.cond_expr) return true;
+        if (tree.fullFor(parent)) |loop| for (loop.ast.inputs) |each| if (at == each) return true;
+        if (tree.fullVarDecl(parent)) |local| if (local.ast.init_node.unwrap() == at) return true;
+        switch (tree.nodeTag(parent)) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma, .@"return" => return true,
+            .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
+                const target = tree.nodeData(parent).node_and_node[0];
+                if (at != target and tree.nodeTag(target) == .identifier and !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Whether a comparison holding where `node` is read puts it at most a clean value.
