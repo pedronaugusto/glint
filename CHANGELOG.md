@@ -17,6 +17,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
   - a position already read, by a switch's operand or a comparison (`b[i]` compared before `b[i]` is used);
   - what an aegis `assert.invariant` checked, one step through another comparison (`a <= b and b <= m.len` before `m[a..b]`);
   - where a std search put the position it found (`while (std.mem.findScalarPos(u8, b, from, x)) |at|` before `b[from..at]`);
+  - a guard past an assignment in a branch the use's path does not take (`at += 1` in an `if`'s branch, the use in its `else if`), where no loop between runs both;
   - what a method of the same file checked of its receiver where its call succeeded (`switch (try self.byte())`, with `byte` returning `self.input[self.at]` only `if (self.at < self.input.len)`).
   On strand, A009 goes from 87 findings to 71. The rest are positions strand's own helpers return and writes into an output its caller sizes, which an escape names.
 - A012 reads a count an aegis `bounded.Budget` reservation charged, itself or as a checked multiple (`budget.reserve(int.Checked(usize).init(@sizeOf(T)).mul(n).raw())`), as bounded by the budget.

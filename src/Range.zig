@@ -1354,6 +1354,7 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
             const token = tree.nodeMainToken(assignment);
             if (token <= from or token >= to) continue;
             if (skipped) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
+            if (apart(c, file, assignment, use, condition)) continue;
             // A use inside the assignment is read before its store (`x &= x - 1`).
             if (to <= tree.lastToken(assignment)) continue;
             if (same(tree, tree.nodeData(assignment).node_and_node[0], compared)) return false;
@@ -1361,6 +1362,45 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
         else => {},
     };
     return true;
+}
+
+/// Whether `assignment` and `use` are in branches no path takes both of: one in an `if`'s
+/// then branch and the other in its `else`, or in two prongs of one switch, with no loop
+/// between that branching and `since` (the comparison), which would run one branch and then
+/// the other.
+fn apart(c: *Context, file: Project.FileId, assignment: Ast.Node.Index, use: Ast.Node.Index, since: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const token = tree.firstToken(use);
+    const inside = struct {
+        fn range(t: *const Ast, node: Ast.Node.Index, at: Ast.TokenIndex) bool {
+            return at >= t.firstToken(node) and at <= t.lastToken(node);
+        }
+    }.range;
+    var at = assignment;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) return false;
+        const exclusive = exclusive: {
+            if (tree.fullIf(parent)) |branch| {
+                const otherwise = branch.ast.else_expr.unwrap() orelse break :exclusive false;
+                break :exclusive (at == branch.ast.then_expr and inside(tree, otherwise, token)) or (at == otherwise and inside(tree, branch.ast.then_expr, token));
+            }
+            if (tree.fullSwitchCase(at) == null or inside(tree, at, token)) break :exclusive false;
+            const s = tree.fullSwitch(parent) orelse break :exclusive false;
+            for (s.ast.cases) |case| if (case != at and inside(tree, case, token)) break :exclusive true;
+            break :exclusive false;
+        };
+        if (!exclusive) continue;
+        // A loop around the branching that `since` is outside of runs both branches in turn.
+        const guard = tree.firstToken(since);
+        var around = parent;
+        while (model.node_parents[@backingInt(around)]) |outer| : (around = outer) {
+            if (tree.nodeTag(outer) == .fn_decl) break;
+            if ((tree.fullWhile(outer) != null or tree.fullFor(outer) != null) and !inside(tree, outer, guard)) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 /// The bound a fact gives its smaller side: the larger side's, one less where it is strictly

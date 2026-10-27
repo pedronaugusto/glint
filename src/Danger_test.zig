@@ -1322,6 +1322,11 @@ test "A009 reads a position its guards keep within the memory: a strict check a 
         \\    const e: usize = try r.takeInt(u8, 0);
         \\    aegis.assert.invariant(s <= e and e <= bytes.len, "s <= e and e <= bytes.len");
         \\    _ = bytes[s..e];
+        \\    var next: usize = try r.takeInt(u8, 0);
+        \\    if (next >= bytes.len) return error.Bad;
+        \\    if (bytes[next] == '0') {
+        \\        next += 1;
+        \\    } else if (bytes[next] >= '1') _ = bytes[next];
         \\}
     , 0);
     // A position only other than the length, one read from other memory, and one at most a
@@ -1335,8 +1340,15 @@ test "A009 reads a position its guards keep within the memory: a strict check a 
         \\    if (at != bytes.len) _ = bytes[at];
         \\    if (at < other.len and other[at] == 'x') _ = bytes[at];
         \\    if (at <= e) _ = bytes[at];
+        \\    var next: usize = try r.takeInt(u8, 0);
+        \\    if (next >= bytes.len) return;
+        \\    while (other.len > 0) {
+        \\        if (other[0] == 'x') {
+        \\            next += 1;
+        \\        } else _ = bytes[next];
+        \\    }
         \\}
-    , 3);
+    , 4);
 }
 
 test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
