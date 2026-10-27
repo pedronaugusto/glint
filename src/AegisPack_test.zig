@@ -1549,3 +1549,27 @@ test "A002 decides a shim whose parameters' types are reflected from a function 
     };
     try std.testing.expectEqual(@as(usize, 0), undecided);
 }
+
+test "A006 names each call that untrusted input reaches and that does not resolve, by its place and spelling" {
+    var project = try fixture(
+        \\const aegis = @import("aegis");
+        \\const ext = @import("missing");
+        \\const Text = aegis.input.Untrusted([]const u8);
+        \\pub fn read(text: Text) usize {
+        \\    return walk(text.readForParse());
+        \\}
+        \\fn walk(bytes: []const u8) usize {
+        \\    const sum = ext.hash(bytes);
+        \\    return sum.len();
+        \\}
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.recursion, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    var named = false;
+    for (report.coverage) |entry| if (entry.rule != null and entry.rule.? == pack.recursion) {
+        named = std.mem.find(u8, entry.detail, ":8 `ext.hash`") != null and std.mem.find(u8, entry.detail, ":9 `sum.len`") != null;
+    };
+    try std.testing.expect(named);
+}

@@ -33,10 +33,12 @@ const Walk = struct {
     stack: std.ArrayList(Facts.Decl) = .empty,
     edges: std.ArrayList(Edge) = .empty,
     done: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
-    unresolved: u32 = 0,
+    /// The calls on the walk from the current entry that do not resolve, named for the report.
+    unresolved: std.ArrayList(Unresolved) = .empty,
     reported: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
 
     const Edge = struct { at: Facts.Decl, call: Ast.Node.Index };
+    const Unresolved = struct { file: @import("Project.zig").FileId, call: Ast.Node.Index };
 };
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
@@ -79,12 +81,22 @@ fn takesUntrusted(c: *Context, tree: *const Ast, proto: Ast.Node.Index) Context.
 }
 
 fn entry(self: *Walk, start: Facts.Decl, token: Ast.TokenIndex) Context.Error!void {
-    self.unresolved = 0;
+    self.unresolved.clearRetainingCapacity();
     self.done.clearRetainingCapacity();
     try visit(self, start, token);
-    if (self.unresolved != 0) {
+    if (self.unresolved.items.len != 0) {
         const tree = try self.c.project.syntax(try self.c.source());
-        try self.c.undecided(self.rule, tree.tokenStart(token), .unresolved, try self.c.allocator.print("{d} calls reachable from untrusted input do not resolve; recursion through them is undecided", .{self.unresolved}));
+        // Each by its place and spelling: an unresolved call is settled by giving it a type.
+        var names: std.Io.Writer.Allocating = .init(self.c.allocator);
+        for (self.unresolved.items, 0..) |one, i| {
+            const file = &self.c.project.files[one.file.raw()]; // safe: resolved declarations name frozen project files.
+            const at = file.line(file.tree.tokenStart(file.tree.firstToken(one.call))) + 1;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const callee = file.tree.getNodeSource(file.tree.fullCall(&buffer, one.call).?.ast.fn_expr);
+            // An allocating writer fails only when its allocation does.
+            names.writer.print("{s}{s}:{d} `{s}`", .{ if (i == 0) "" else ", ", self.c.project.inputs[one.file.raw()].name, at, callee }) catch return error.OutOfMemory;
+        }
+        try self.c.undecided(self.rule, tree.tokenStart(token), .unresolved, try self.c.allocator.print("{d} calls reachable from untrusted input do not resolve ({s}); recursion through them is undecided", .{ self.unresolved.items.len, names.written() }));
     }
 }
 
@@ -98,7 +110,7 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
         const call = tree.fullCall(&buffer, call_node).?;
         const callee = try self.c.facts.resolve(function.file, call.ast.fn_expr);
         if (callee != .function) {
-            if (callee == .unknown) self.unresolved += 1;
+            if (callee == .unknown) try self.unresolved.append(self.c.allocator, .{ .file = function.file, .call = call_node });
             continue;
         }
         if (!selected(self.c, callee.function.file)) continue;
