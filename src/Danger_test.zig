@@ -196,6 +196,9 @@ test "A007 leaves constants, thread-local state, aliases' uses, borrows and test
         \\const aegis = @import("aegis");
         \\const Id = enum(u32) { _ };
         \\var cell: aegis.Atomic(Id) = .init(@fromBackingInt(0));
+        \\fn plain(comptime T: type) void {
+        \\    if (T == std.Io.Mutex or T != std.atomic.Value(u32)) @compileError("a lock is no data");
+        \\}
     , 1);
 }
 
