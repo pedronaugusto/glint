@@ -217,6 +217,10 @@ test "G2 Z012 family API report respects public aliases receivers and suppressio
     try check(.Z012, "const Hidden = struct {}; pub fn create() ?*Hidden { return null; }", 1);
     try check(.Z012, "const Hidden = struct {}; pub const Visible = Hidden; pub fn create() Hidden { return .{}; }", 0);
     try check(.Z012, "pub const Visible = struct { pub fn read(self: @This()) void { _ = self; } };", 0);
+    // A private container's methods are named by nobody outside the file (reactor's backend sinks).
+    try check(.Z012, "const Hidden = struct {}; const Sink = struct { pub fn complete(s: *Sink, h: *Hidden) void { _ = s; _ = h; } };", 0);
+    try check(.Z012, "const Hidden = struct {}; pub const Api = struct { const Sink = struct { pub fn take() Hidden { return .{}; } }; };", 0);
+    try check(.Z012, "const Hidden = struct {}; pub const Api = struct { pub fn take() Hidden { return .{}; } };", 1);
     try check(.Z012, "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
 }
 
