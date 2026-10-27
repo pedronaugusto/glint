@@ -4,10 +4,6 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
-### Added
-
-- Z034: two binary operators Zig 0.18's parser refuses to order without parentheses (Zig master's "ambiguous operator precedence"), read in the tree Zig 0.17 builds. That covers a product and a remainder, two different bitwise operators, arithmetic with bitwise, `and` with `or`, `orelse` or `catch` with any other operator, and a chained shift or remainder. Its fix parenthesizes the operand as 0.17 groups it, which keeps the meaning. Not in the generic default selection: a policy reports or gates it, so a package fixes these before it moves to Zig 0.18. glint's own six sites are parenthesized.
-
 ### Fixed
 
 - Z012 reads a `pub fn` as a public signature only where every container around it, up to the file, is held by a public or exported declaration. A method of a struct a private declaration holds is named by nobody outside the file, so the private types it takes are no finding (reactor's backend sinks, called through `anytype`, and its tests' harnesses: 19 of the 25 findings in its car).
@@ -16,6 +12,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
   - a sum the length bounds, for each sum of its parts (`if (l1 + l2 + l3 + 6 > in.len) return` before `in[6 + l1 ..][0..l2]`), its other parts unsigned;
   - a clamp among the other assignments of its block (`if (n > r.at) { n = r.at; status = .end_of_buffer; }`);
   - a comptime parameter takes nothing its callers pass from input: the program fixes it when it is compiled (an inline prong's period as a divisor).
+
+## [0.7.3] - 2026-10-27
+
+### Added
+
+- Z034: two binary operators Zig 0.18's parser refuses to order without parentheses (Zig master's "ambiguous operator precedence"), read in the tree Zig 0.17 builds. That covers a product and a remainder, two different bitwise operators, arithmetic with bitwise, `and` with `or`, `orelse` or `catch` with any other operator, and a chained shift or remainder. Its fix parenthesizes the operand as 0.17 groups it, which keeps the meaning. Not in the generic default selection: a policy reports or gates it, so a package fixes these before it moves to Zig 0.18. glint's own six sites are parenthesized.
 
 ## [0.7.2] - 2026-10-27
 
