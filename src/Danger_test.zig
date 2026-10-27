@@ -1115,7 +1115,7 @@ test "a flow finding names the read its input came from: through a caller's argu
     var named: usize = 0;
     for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
         try std.testing.expectEqual(@as(u32, 7), d.span.line);
-        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:3 `r.takeInt`)"));
+        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:3 `r.takeInt` via consumer:10 `header`)"));
         named += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), named);
