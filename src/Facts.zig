@@ -116,11 +116,15 @@ pub const Entry = struct { role: u32, target: Target };
 pub const Target = union(enum) { function: Decl, container: Container };
 pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
-/// file (Project.Input.absent), so the code that needs it is not compiled in this build.
+/// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
+/// (`param_types[6]` of a table whose functions take at most six), so the code that needs it
+/// is not compiled in this build.
 /// `generic`: it depends on a type or `anytype` parameter that calls from outside the
 /// project's reading bind (a consumer's, or a use other than a call), so each binding decides
 /// it where it is made; what is read of it (its type information, its parts) stays so.
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic };
+/// `std_internal`: std reads it from `root` or `builtin` (`root.std_options`, the target),
+/// which no library's reading binds, so it is a type or value std computes for itself.
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, std_internal };
 pub const Value = union(enum) {
     unknown: Unknown,
     primitive: []const u8,
@@ -534,6 +538,16 @@ pub fn mayCopy(self: *Facts, name: []const u8) ResolveError!bool {
 fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
     return &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
 }
+
+/// Whether `spelling` is Zig's own `root` or `builtin` imported by one of std's files: what
+/// std computes from the program it is in and the target it is built for.
+fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError!bool {
+    if (!std.mem.eql(u8, spelling, "root") and !std.mem.eql(u8, spelling, "builtin")) return false;
+    const known = try self.memo(Standard);
+    if (known.reached == null) known.reached = try self.standardFiles();
+    return known.reached.?[file.raw()]; // safe: a file identity indexes the frozen file table.
+}
+const Standard = struct { reached: ?[]const bool = null };
 
 /// The files std's module reaches: its own generics are std's, not the program's.
 fn standardFiles(self: *Facts) ResolveError![]const bool {
@@ -1118,7 +1132,12 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidLiteral => return .{ .unknown = .computed_import },
         };
-        const target = self.project.imported(file, spelling) orelse return .{ .unknown = if (self.project.absent(file, spelling)) .absent else .missing_mapping };
+        const target = self.project.imported(file, spelling) orelse return .{ .unknown = if (self.project.absent(file, spelling))
+            .absent
+        else if (try self.zigOwn(file, spelling))
+            .std_internal
+        else
+            .missing_mapping };
         return .{ .container = .{ .file = target, .scope = 0 } };
     }
     if (std.mem.eql(u8, name, "@This")) {
@@ -2369,7 +2388,8 @@ fn elementOf(self: *Facts, base: Value, tree: *const Ast, index_node: Ast.Node.I
                     try mapped.append(self.gpa, (try self.reflectedElement(one.reflected, tree, index_node)) orelse continue);
                 } else try mapped.append(self.gpa, try self.elementOf(one, tree, index_node));
             }
-            if (mapped.items.len == 0) return .{ .unknown = .unsupported };
+            // No function of the choice has the parameter: Zig compiles this code in no build.
+            if (mapped.items.len == 0) return .{ .unknown = .absent };
             return self.choose(mapped.items);
         },
         // A tuple's element: the one a number names, or, for an index known only as the

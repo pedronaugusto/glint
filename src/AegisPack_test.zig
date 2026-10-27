@@ -1495,3 +1495,57 @@ test "an owner handed on by its move is transferred where the result is returned
     try expectJudged(head ++ "fn with(o: *O, w: ?*O) !struct { o: O, w: ?O } { try g(); return .{ .o = o.move(), .w = if (w) |x| x.move() else null }; }\npub fn f() !struct { o: O, w: ?O } { var a = O.init(1); errdefer a.deinit(); var b = O.init(2); errdefer b.deinit(); return with(&a, &b); }", pack.cleanup, true, 0);
     try expectJudged(head ++ "fn with(o: *O) !R { try g(); return .{ .o = o.move() }; }\npub fn f() !R { var o = O.init(1); return with(&o); }", pack.cleanup, false, 0);
 }
+
+test "A002 decides a shim whose parameters' types are reflected from a function type, passed on as a tuple a generic copies, and an arm for an arity no function has" {
+    var project = try fixture(
+        \\const std = @import("std");
+        \\const VTable = struct { two: *const fn (?*anyopaque, u32) void, three: *const fn (?*anyopaque, u32, []const u8) void };
+        \\const Core = struct { cwd: u32 = 0 };
+        \\fn keep(c: *const Core, args: anytype) @TypeOf(args) {
+        \\    var local = args;
+        \\    inline for (0..args.len) |i| {
+        \\        if (@TypeOf(args[i]) == u32) local[i] = c.cwd;
+        \\    }
+        \\    return local;
+        \\}
+        \\fn invoke(comptime name: []const u8, u: ?*anyopaque, args: anytype, ret: usize) void {
+        \\    _ = name;
+        \\    _ = ret;
+        \\    const c: *const Core = @ptrCast(@alignCast(u));
+        \\    const local = keep(c, args);
+        \\    _ = local;
+        \\}
+        \\pub fn slot(comptime name: []const u8) @FieldType(VTable, name) {
+        \\    const info = @typeInfo(@typeInfo(@FieldType(VTable, name)).pointer.child).@"fn";
+        \\    const params = info.param_types;
+        \\    return switch (params.len) {
+        \\        2 => &struct {
+        \\            fn f(u: ?*anyopaque, a: params[1].?) void {
+        \\                return invoke(name, u, .{a}, @returnAddress());
+        \\            }
+        \\        }.f,
+        \\        3 => &struct {
+        \\            fn f(u: ?*anyopaque, a: params[1].?, b: params[2].?) void {
+        \\                return invoke(name, u, .{ a, b }, @returnAddress());
+        \\            }
+        \\        }.f,
+        \\        // No function of the table takes four: Zig compiles this arm in no build.
+        \\        4 => &struct {
+        \\            fn f(u: ?*anyopaque, a: params[1].?, b: params[2].?, d: params[3].?) void {
+        \\                return invoke(name, u, .{ a, b, d }, @returnAddress());
+        \\            }
+        \\        }.f,
+        \\        else => unreachable,
+        \\    };
+        \\}
+    );
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), count(report, pack.copies));
+    var undecided: usize = 0;
+    for (report.coverage) |entry| if (entry.rule != null and entry.rule.? == pack.copies) {
+        undecided += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 0), undecided);
+}
