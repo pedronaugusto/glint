@@ -1088,7 +1088,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         var call_buffer: [1]Ast.Node.Index = undefined;
         const acquisition = switch (tree.nodeTag(init)) {
             .@"try" => tree.nodeData(init).node,
-            .@"catch" => tree.nodeData(init).node_and_node[0],
+            .@"catch", .@"orelse" => tree.nodeData(init).node_and_node[0],
             else => init,
         };
         const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
@@ -2183,6 +2183,8 @@ const Flow = struct {
     /// and not at all after it.
     fn releasesIn(f: Flow, body: Ast.Node.Index) Context.Error!bool {
         if (try release(f.c, body, f.token, f.kind)) return true;
+        // `defer session.releaseWrite(&held)`: a function that releases it on every path.
+        if (try f.consumed(body) == .always) return true;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = f.tree.blockStatements(&buffer, body) orelse return false;
         var released = false;

@@ -637,6 +637,11 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     try expectJudged(head ++ "fn take(h: anytype) void { if (ready()) h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, false, 0);
     // Handed to a function that releases it on every path, the call releases it.
     try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, true, 0);
+    // So does such a call deferred, of a guard a failing acquisition or an `orelse` gives
+    // (cloak's `defer session.releaseWrite(&held)`); one that may keep it held stays undecided.
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); defer take(&held); held.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.tryAcquire() orelse return; defer take(&held); held.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { if (ready()) h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); defer take(&held); }", pack.cleanup, false, 0);
     // Lent to a function that hands it back held, it is still the caller's to release.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); while (ready()) held.deinit(); }", pack.cleanup, false, 0);
