@@ -4,6 +4,27 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A019's `undefined` reads count an `asm` output bound to the local (`"={eax}" (eax)`) as a write, made once the `asm` has read its inputs, so `cpuid`'s registers declared `undefined` and returned are no finding (warp's cpu.zig).
+- A007 leaves a synchronization type that is only compared, itself or what its constructor makes (`T == std.Io.Mutex`, `T != std.atomic.Value(u32)` in a comptime check that refuses it), which holds none (strand's descriptor.zig and owner.zig).
+- A012 leaves a size std only moves a position by (`Reader.toss` after a decode): a std parameter that no call, loop, local or return takes does the same work whatever its value. warp's lz4 escape on that line now suppresses nothing.
+- A006 does not enter a function that returns a type or takes only comptime parameters (`comptime T: type, comptime seen: []const type`): no value read at run time reaches it, and its depth is the types' it is given. On strand, 10 of its 12 findings were such descriptors; `same` and `zero`, which take runtime values with the type, remain.
+- A009 reads more of the guards a parser writes:
+  - a strict check carried one past to a slice's bound (`if (at >= b.len or …) return` before `b[at + 1 ..]`);
+  - a check that a position differs from the length, where another puts it at most the length (`at < b.len` and `at + 1 == b.len or …` before `b[at + 1]`);
+  - a loop's condition past its continue expression (`while (at < b.len) : (at += 1) switch (b[at])`);
+  - a position already read, by a switch's operand or a comparison (`b[i]` compared before `b[i]` is used);
+  - what an aegis `assert.invariant` checked, one step through another comparison (`a <= b and b <= m.len` before `m[a..b]`);
+  - where a std search put the position it found (`while (std.mem.findScalarPos(u8, b, from, x)) |at|` before `b[from..at]`);
+  - a guard past an assignment in a branch the use's path does not take (`at += 1` in an `if`'s branch, the use in its `else if`), where no loop between runs both;
+  - what a method of the same file checked of its receiver where its call succeeded (`switch (try self.byte())`, with `byte` returning `self.input[self.at]` only `if (self.at < self.input.len)`).
+  On strand, A009 goes from 87 findings to 71. The rest are positions strand's own helpers return and writes into an output its caller sizes, which an escape names.
+- A012 reads a count an aegis `bounded.Budget` reservation charged, itself or as a checked multiple (`budget.reserve(int.Checked(usize).init(@sizeOf(T)).mul(n).raw())`), as bounded by the budget.
+- A003 reads a deferred call of a function that releases the owner on every path as its release (`defer session.releaseWrite(&held)`), as it read the call undeferred, and checks a guard an `orelse` gives (`tryAcquire() orelse return`) as one a `try` or `catch` gives. On cloak, the 5 undecided `BlockingGuarded` writes of its TLS session are decided, and a sixth is checked.
+- The pack's tests load aegis's `assert.zig`, so a fixture's `aegis.assert.invariant` resolves as a program's does.
+- A017 reports an enum state moved on its own value: a write under a switch or a condition on the field (`switch (f.state) { .start => f.state = .value, ... }`), there or where the function that writes it is called. A kind set where its value is built or read (a table's layout, a date's kind) is data, and so is a field rewritten on the records a loop walks (`for (slots) |*s|`, `&slots[at]` with `at` the loop's). On strand, csv's `mode`, toml's `kind` and zon's `arm` are no longer findings, while its parser frames and zon's `pending` remain; xenoglyph's bidi classes are no longer one.
+
 ## [0.7.1] - 2026-10-27
 
 ### Added

@@ -637,6 +637,11 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
     try expectJudged(head ++ "fn take(h: anytype) void { if (ready()) h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, false, 0);
     // Handed to a function that releases it on every path, the call releases it.
     try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); take(&held); }", pack.cleanup, true, 0);
+    // So does such a call deferred, of a guard a failing acquisition or an `orelse` gives
+    // (cloak's `defer session.releaseWrite(&held)`); one that may keep it held stays undecided.
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); defer take(&held); held.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.tryAcquire() orelse return; defer take(&held); held.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn take(h: anytype) void { if (ready()) h.deinit(); }\npub fn f(g: *G(u32)) void { var held = g.acquire(); defer take(&held); }", pack.cleanup, false, 0);
     // Lent to a function that hands it back held, it is still the caller's to release.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); hand(&held); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); while (ready()) held.deinit(); }", pack.cleanup, false, 0);
@@ -1249,6 +1254,10 @@ test "A006 accepts a depth the cycle moves and compares, and recursion no untrus
     // Through a helper that keeps the depth.
     try expectJudged(head ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn enter(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; }\n fn value(p: *Parser) error{TooDeep}!void { try p.enter(); if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };\npub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }", pack.recursion, true, 0);
     try expectJudged(head ++ "pub fn count(bytes: []const u8) usize { return if (bytes.len == 0) 0 else 1 + count(bytes[1..]); }", pack.recursion, true, 0);
+    // Recursion over a type, on comptime parameters alone or making a type, is the types' depth.
+    try expectJudged(head ++ "pub fn read(text: Text) usize { _ = text.readForParse(); return @intFromBool(deep(u8, &.{})) + @sizeOf(Wrap(u8)); }\nfn deep(comptime T: type, comptime seen: []const type) bool { return switch (@typeInfo(T)) { .pointer => |i| deep(i.child, seen ++ .{T}), else => false }; }\nfn Wrap(comptime T: type) type { return if (@sizeOf(T) > 8) T else Wrap([2]T); }", pack.recursion, true, 0);
+    // A runtime value given with the type follows the data of a type that holds itself.
+    try expectJudged(head ++ "pub fn read(text: Text) bool { const b = text.readForParse(); return same([]const u8, b, b); }\nfn same(comptime T: type, a: T, b: T) bool { return switch (@typeInfo(T)) { .pointer => |i| same(i.child, a[0], b[0]), else => a == b }; }", pack.recursion, true, 1);
 }
 
 test "A001 finds public text built by a literal, by the type the literal takes from its place" {

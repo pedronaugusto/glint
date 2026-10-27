@@ -85,16 +85,21 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/Io/Reader.zig", .bytes =
     \\buffer: []u8 = &.{},
+    \\seek: usize = 0,
+    \\end: usize = 0,
     \\pub const Limit = enum(usize) { unlimited = 0, _ };
     \\pub fn fixed(bytes: []const u8) @This() { _ = bytes; return .{}; }
     \\pub fn takeByte(r: *@This()) !u8 { _ = r; return 0; }
     \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }
-    \\pub fn take(r: *@This(), n: usize) ![]u8 { _ = n; return r.buffer; }
+    \\pub fn fill(r: *@This(), n: usize) !void { if (r.seek + n > r.end) return error.EndOfStream; }
+    \\pub fn take(r: *@This(), n: usize) ![]u8 { try r.fill(n); return r.buffer; }
+    \\pub fn toss(r: *@This(), n: usize) void { r.seek += n; assert(r.seek <= r.end); }
+    \\fn assert(ok: bool) void { if (!ok) unreachable; }
     \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self; _ = n; return &.{}; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -196,6 +201,9 @@ test "A007 leaves constants, thread-local state, aliases' uses, borrows and test
         \\const aegis = @import("aegis");
         \\const Id = enum(u32) { _ };
         \\var cell: aegis.Atomic(Id) = .init(@fromBackingInt(0));
+        \\fn plain(comptime T: type) void {
+        \\    if (T == std.Io.Mutex or T != std.atomic.Value(u32)) @compileError("a lock is no data");
+        \\}
     , 1);
 }
 
@@ -425,6 +433,51 @@ test "A017 finds an enum state written in two functions and switched on" {
         \\};
         \\pub fn run(j: *Job) void { j.step(); }
     , 1);
+    // The holder moves it in the switch itself.
+    try expect(pack.state_machines,
+        \\const Phase = enum { idle, running, done };
+        \\const Job = struct {
+        \\    phase: Phase = .idle,
+        \\    fn reset(j: *Job) void { j.phase = .idle; }
+        \\    fn step(j: *Job) void { switch (j.phase) { .idle => j.phase = .running, .running => j.phase = .done, .done => {} } }
+        \\};
+        \\pub fn run(j: *Job) void { j.step(); j.reset(); }
+    , 1);
+    // A parser's frame, a record its decoder moves through the frame on top.
+    try expect(pack.state_machines,
+        \\const State = enum { start, value, after_value };
+        \\const Frame = struct { state: State };
+        \\const Decoder = struct {
+        \\    frames: [4]Frame = undefined,
+        \\    depth: usize = 0,
+        \\    fn top(d: *Decoder) *Frame { return &d.frames[d.depth]; }
+        \\    fn open(d: *Decoder) void { d.top().state = .start; }
+        \\    fn step(d: *Decoder) void { const f = d.top(); switch (f.state) { .start => f.state = .value, .value => f.state = .after_value, .after_value => {} } }
+        \\};
+        \\pub fn run(d: *Decoder) void { d.open(); d.step(); }
+    , 1);
+}
+
+test "A017 leaves a kind set where its value is built, and records an algorithm rewrites" {
+    // A table's layout, set by whichever builder made it.
+    try expect(pack.state_machines,
+        \\const Kind = enum { single, double };
+        \\const Table = struct {
+        \\    kind: Kind = .single,
+        \\    fn buildSingle(t: *Table) void { t.kind = .single; }
+        \\    fn buildDouble(t: *Table) void { t.kind = .double; }
+        \\    fn width(t: *const Table) u8 { return switch (t.kind) { .single => 1, .double => 2 }; }
+        \\};
+        \\pub fn run(t: *Table, wide: bool) u8 { if (wide) t.buildDouble() else t.buildSingle(); return t.width(); }
+    , 0);
+    // Classes the rules refine on their own value, record by record, from outside the record.
+    try expect(pack.state_machines,
+        \\const Class = enum { mark, letter, number, neutral };
+        \\const Slot = struct { class: Class };
+        \\fn marks(slots: []Slot, before: Class) void { for (slots) |*s| if (s.class == .mark) { s.class = before; }; }
+        \\fn numbers(slots: []Slot) void { var p: ?usize = 0; while (p) |at| : (p = if (at + 1 < slots.len) at + 1 else null) { const s = &slots[at]; switch (s.class) { .number => s.class = .neutral, else => {} } } }
+        \\pub fn run(slots: []Slot) usize { marks(slots, .letter); numbers(slots); var n: usize = 0; for (slots) |s| switch (s.class) { .letter => n += 1, else => {} }; return n; }
+    , 0);
 }
 
 test "A021 finds a second lock taken while a guard is held, unless both are ranked by Order" {
@@ -474,7 +527,18 @@ test "A019 finds a local read while still undefined, and leaves written, filled 
         \\pub fn length(r: []const u8) u8 { var b: [8]u8 = undefined; const n = @min(r.len, b.len); @memcpy(b[0..n], r[0..n]); return b[0]; }
         \\const P = struct { a: u8 };
         \\pub fn named() u8 { var p: P = undefined; @field(p, "a") = 1; return p.a; }
-    , 3);
+        \\pub fn cpuid(leaf: u32) [2]u32 {
+        \\    var eax: u32 = undefined;
+        \\    var ebx: u32 = undefined;
+        \\    asm volatile ("cpuid"
+        \\        : [_] "={eax}" (eax),
+        \\          [_] "={ebx}" (ebx),
+        \\        : [_] "{eax}" (leaf),
+        \\    );
+        \\    return .{ eax, ebx };
+        \\}
+        \\pub fn tied() u32 { var v: u32 = undefined; asm volatile ("" : [_] "=r" (v) : [_] "r" (v)); return v; }
+    , 6); // 3 reads, `tied`'s input read before its output is written, and each `asm` itself
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {
@@ -737,6 +801,17 @@ test "a number held to 16 bits bounds a loop and sizes work as data does" {
 
 test "A012 finds work sized by a number from input and reads with no limit" {
     try expect(pack.bounded_work, input_program, 2);
+}
+
+test "A012 leaves a size std only moves a position by, and finds one it passes on" {
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    r.toss(n);
+        \\    _ = try r.take(n);
+        \\}
+    , 1);
 }
 
 test "A018 finds an error's name written to a peer, not to another writer" {
@@ -1214,6 +1289,113 @@ test "A010 leaves what a file or directory handle answers of itself, though inpu
         \\    _ = @as(i64, @intCast(size));
         \\    const inode = try r.takeInt(u64, 0);
         \\    return @intCast(inode);
+        \\}
+    , 1);
+}
+
+test "A009 reads a position its guards keep within the memory: a strict check a slice's bound passes by one, a check other than the length, a loop's condition past its continue expression, a read before, an aegis invariant and a std search" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const bytes = try r.take(64);
+        \\    var at: usize = try r.takeInt(u8, 0);
+        \\    if (at >= bytes.len or bytes[at] != '"') return error.Bad;
+        \\    _ = bytes[at + 1 ..];
+        \\    while (at < bytes.len) : (at += 1) switch (bytes[at]) {
+        \\        ' ' => {},
+        \\        else => break,
+        \\    };
+        \\    while (at < bytes.len) {
+        \\        if (bytes[at] == '\\') {
+        \\            if (at + 1 == bytes.len or bytes[at + 1] != 'u') return error.Bad;
+        \\            _ = bytes[at + 2 ..];
+        \\        }
+        \\        at += 1;
+        \\    }
+        \\    var from: usize = try r.takeInt(u8, 0);
+        \\    while (std.mem.findScalarPos(u8, bytes, from, '\\')) |slash| {
+        \\        _ = bytes[from..slash];
+        \\        from = slash + 1;
+        \\    }
+        \\    const s: usize = try r.takeInt(u8, 0);
+        \\    const e: usize = try r.takeInt(u8, 0);
+        \\    aegis.assert.invariant(s <= e and e <= bytes.len, "s <= e and e <= bytes.len");
+        \\    _ = bytes[s..e];
+        \\    var next: usize = try r.takeInt(u8, 0);
+        \\    if (next >= bytes.len) return error.Bad;
+        \\    if (bytes[next] == '0') {
+        \\        next += 1;
+        \\    } else if (bytes[next] >= '1') _ = bytes[next];
+        \\}
+    , 0);
+    // A position only other than the length, one read from other memory, and one at most a
+    // value nothing bounds are not kept.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, other: []const u8) !void {
+        \\    const bytes = try r.take(64);
+        \\    const at: usize = try r.takeInt(u8, 0);
+        \\    const e: usize = try r.takeInt(u8, 0);
+        \\    if (at != bytes.len) _ = bytes[at];
+        \\    if (at < other.len and other[at] == 'x') _ = bytes[at];
+        \\    if (at <= e) _ = bytes[at];
+        \\    var next: usize = try r.takeInt(u8, 0);
+        \\    if (next >= bytes.len) return;
+        \\    while (other.len > 0) {
+        \\        if (other[0] == 'x') {
+        \\            next += 1;
+        \\        } else _ = bytes[next];
+        \\    }
+        \\}
+    , 4);
+}
+
+test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Parser = struct {
+        \\    input: []const u8,
+        \\    at: usize,
+        \\    fn byte(self: *const Parser) error{Bad}!u8 {
+        \\        return if (self.at < self.input.len) self.input[self.at] else error.Bad;
+        \\    }
+        \\    fn more(self: *const Parser) error{Bad}!void {
+        \\        if (self.at >= self.input.len) return error.Bad;
+        \\    }
+        \\    fn step(self: *Parser, other: *const Parser) error{Bad}!void {
+        \\        switch (try self.byte()) {
+        \\            'a' => _ = self.input[self.at],
+        \\            else => {},
+        \\        }
+        \\        try self.more();
+        \\        _ = self.input[self.at];
+        \\        try other.more();
+        \\        self.at += 1;
+        \\        _ = self.input[self.at];
+        \\    }
+        \\};
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    var p: Parser = .{ .input = try r.take(8), .at = try r.takeInt(u8, 0) };
+        \\    const q = p;
+        \\    try p.step(&q);
+        \\}
+    , 1);
+}
+
+test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !void {
+        \\    var budget: aegis.bounded.Budget(usize) = .init(1 << 20);
+        \\    const n = try r.takeInt(u32, 0);
+        \\    const bytes = aegis.int.Checked(usize).init(8).mul(n) catch return error.TooLarge;
+        \\    var charge = budget.reserve(bytes.raw()) catch return error.TooLarge;
+        \\    _ = &charge;
+        \\    _ = try gpa.alloc(u64, n);
+        \\    const m = try r.takeInt(u32, 0);
+        \\    _ = try gpa.alloc(u64, m);
         \\}
     , 1);
 }

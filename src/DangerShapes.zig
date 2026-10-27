@@ -1,6 +1,6 @@
 //! The danger rules read from the shapes of declarations and statements (designs/aegis.md §7):
 //! a std resource without its one owner (A015), two identifying integers of one type meeting
-//! in one signature (A016), an enum state written from several places and switched on (A017),
+//! in one signature (A016), an enum state its holder moves by hand on its own value (A017),
 //! a borrow of a std container's storage kept in a field (A014), and a local read while it is
 //! still `undefined` (A019).
 const std = @import("std");
@@ -227,8 +227,13 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
     return variable.visib_token != null;
 }
 
-/// A017: an enum state written by two or more functions and switched on, a state machine kept
-/// by hand: nothing says which transitions are allowed.
+/// A017: an enum state written by two or more functions, switched on, and moved on its own value:
+/// a state machine kept by hand, where nothing says which transitions are allowed. A move is a
+/// write under a switch or a condition on the field (`switch (f.state) { .start => f.state =
+/// .value, ... }`), there or where the function that writes it is called. A kind set where its
+/// value is built or read (a table's layout, a date's kind) is data, and so is a field rewritten
+/// on the records a loop walks (`for (slots) |*s|`, `&slots[at]` with `at` the loop's): an
+/// algorithm refining each record (bidi's classes), not one object moving through states.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
@@ -238,6 +243,8 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         const state = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         if (!isEnum(c, state)) continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
+        var uses: std.ArrayList(Facts.Key) = .empty;
+        var writes: std.ArrayList(Facts.Key) = .empty;
         var writers: std.ArrayList(Facts.Key) = .empty;
         var switched = false;
         for (try c.facts.memberUses(decl.name)) |use| {
@@ -246,8 +253,10 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             const receiver = try c.facts.resolve(use.file, use_tree.nodeData(use.node).node_and_token[0]);
             const owner = byPointer(receiver) orelse continue;
             if (!owner.file.eql(holder.file) or owner.scope != holder.scope) continue;
+            try uses.append(c.allocator, use);
             const parent = use_model.node_parents[@backingInt(use.node)] orelse continue; // safe: a node index indexes its own tree's parent table.
             if (use_tree.nodeTag(parent) == .assign and use_tree.nodeData(parent).node_and_node[0] == use.node) {
+                try writes.append(c.allocator, .{ .file = use.file, .node = parent });
                 const function = enclosingFunction(use_model, use_tree, parent) orelse continue;
                 for (writers.items) |seen| {
                     if (seen.file.eql(use.file) and seen.node == function) break;
@@ -255,8 +264,88 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             }
             if (use_tree.fullSwitch(parent)) |s| switched = switched or s.ast.condition == use.node;
         }
-        if (writers.items.len >= 2 and switched) try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
+        if (writers.items.len < 2 or !switched or !try moved(c, uses.items, writes.items)) continue;
+        try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions, moved on its own value and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
     }
+}
+
+/// Whether one of `writes` is a move: made on one object, not on the records a loop walks, under
+/// a switch or a condition on the field (one of `uses`), or in a function a call under one makes.
+fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Context.Error!bool {
+    for (writes) |write| {
+        const tree = &c.project.files[write.file.raw()].tree;
+        const model = &c.project.models[write.file.raw()];
+        const receiver = tree.nodeData(tree.nodeData(write.node).node_and_node[0]).node_and_token[0];
+        if (walked(tree, model, receiver)) continue;
+        const function = enclosingFunction(model, tree, write.node) orelse continue;
+        if (conditioned(tree, model, uses, write.file, write.node, function)) return true;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, function) orelse continue;
+        const name = tree.tokenSlice(proto.name_token orelse continue);
+        for (try c.facts.memberUses(name)) |call| {
+            const callee = try c.facts.resolve(call.file, call.node);
+            if (callee != .function or !callee.function.file.eql(write.file)) continue;
+            if (model.declarations[callee.function.index].node != tree.nodeData(function).node_and_node[0]) continue;
+            const call_tree = &c.project.files[call.file.raw()].tree;
+            const call_model = &c.project.models[call.file.raw()];
+            const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
+            if (conditioned(call_tree, call_model, uses, call.file, call.node, caller)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a write's receiver is a record a loop walks: the loop's element capture, an element
+/// indexed by a loop's capture, or a local made from one (`const s = &slots[at];`).
+fn walked(tree: *const Ast, model: *const Model, receiver: Ast.Node.Index) bool {
+    switch (tree.nodeTag(receiver)) {
+        .array_access => return loopCapture(tree, model, tree.nodeData(receiver).node_and_node[1]),
+        .address_of => return walked(tree, model, tree.nodeData(receiver).node),
+        .grouped_expression => return walked(tree, model, tree.nodeData(receiver).node_and_token[0]),
+        .identifier => {},
+        else => return false,
+    }
+    if (loopCapture(tree, model, receiver)) return true;
+    const reference = model.reference(receiver) orelse return false;
+    const d = reference.declaration orelse return false;
+    if (model.declarations[d].kind != .variable) return false;
+    const local = tree.fullVarDecl(model.declarations[d].node) orelse return false;
+    return walked(tree, model, local.ast.init_node.unwrap() orelse return false);
+}
+
+/// Whether `node` names a capture of a `for` or `while` loop.
+fn loopCapture(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    if (tree.nodeTag(node) != .identifier) return false;
+    const reference = model.reference(node) orelse return false;
+    const d = reference.declaration orelse return false;
+    const owner = model.declarations[d].node;
+    return model.declarations[d].kind == .capture and (tree.fullFor(owner) != null or tree.fullWhile(owner) != null);
+}
+
+/// Whether `node` sits in a branch a switch or an `if`/`while` on one of `uses` selects, within
+/// `function`.
+fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, file: @import("Project.zig").FileId, node: Ast.Node.Index, function: Ast.Node.Index) bool {
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        if (parent == function) return false;
+        const condition = if (tree.fullSwitch(parent)) |s|
+            s.ast.condition
+        else if (tree.fullIf(parent)) |branch|
+            branch.ast.cond_expr
+        else if (tree.fullWhile(parent)) |loop|
+            loop.ast.cond_expr
+        else
+            continue;
+        if (condition == at) continue;
+        const first = tree.firstToken(condition);
+        const last = tree.lastToken(condition);
+        for (uses) |use| {
+            if (!use.file.eql(file)) continue;
+            const token = tree.nodeMainToken(use.node);
+            if (token >= first and token <= last) return true;
+        }
+    }
+    return false;
 }
 
 fn isEnum(c: *Context, value: Facts.Container) bool {
@@ -332,7 +421,8 @@ fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index)
 /// A019's `undefined` reads: a `var` declared `undefined` in a function's body, read before every
 /// path to the read writes it. A write is an assignment to it or into it, its address taken or
 /// a part of it sliced (what a call fills through the pointer it is given is that call's
-/// contract), or a method called on it; a path through a loop or a branch that writes it on some
+/// contract), a method called on it, or an `asm` output bound to it (`"={eax}" (eax)`), written
+/// once the `asm` has read its inputs; a path through a loop or a branch that writes it on some
 /// paths only ends the walk, never a guess.
 pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
@@ -364,12 +454,23 @@ const Walk = struct {
     local: u32,
     /// The identifiers that name the local, in source order.
     mentions: std.ArrayList(Ast.Node.Index) = .empty,
+    /// The `asm` outputs bound to the local, by the token naming it, with the `asm` they are in.
+    outputs: std.ArrayList(struct { token: Ast.TokenIndex, asm_node: Ast.Node.Index }) = .empty,
     read: ?Ast.TokenIndex = null,
 
     fn collect(w: *Walk) Context.Error!void {
+        const name = w.model.declarations[w.local].name;
         for (w.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tag == .asm_output) {
+                // `[a] "b" (c)` names its variable by the token before `)`; `(-> T)` returns one.
+                const lhs, const rparen = w.tree.nodeData(node).opt_node_and_token;
+                if (lhs != .none or !std.mem.eql(u8, w.tree.tokenSlice(rparen - 1), name)) continue;
+                const asm_node = w.enclosingAsm(rparen) orelse continue;
+                try w.outputs.append(w.c.allocator, .{ .token = rparen - 1, .asm_node = asm_node });
+                continue;
+            }
+            if (tag != .identifier) continue;
             const ref = w.model.reference(node) orelse continue;
             if (ref.declaration == w.local) try w.mentions.append(w.c.allocator, node);
         }
@@ -441,6 +542,11 @@ const Walk = struct {
             const use = w.classify(mention) orelse continue;
             if (earliest == null or use.key < earliest.?.key) earliest = .{ .key = use.key, .write = use.write, .token = token };
         }
+        for (w.outputs.items) |output| {
+            if (output.token < first or output.token > last) continue;
+            const key = w.tree.lastToken(output.asm_node);
+            if (earliest == null or key < earliest.?.key) earliest = .{ .key = key, .write = true, .token = output.token };
+        }
         const found = earliest orelse return .unwritten;
         if (found.write) return .written;
         w.read = found.token;
@@ -510,9 +616,22 @@ const Walk = struct {
         return first == operand;
     }
 
+    /// The innermost `asm` expression whose tokens hold `token`.
+    fn enclosingAsm(w: *const Walk, token: Ast.TokenIndex) ?Ast.Node.Index {
+        var found: ?Ast.Node.Index = null;
+        for (w.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"asm") continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (token < w.tree.firstToken(node) or token > w.tree.lastToken(node)) continue;
+            if (found == null or w.tree.firstToken(node) > w.tree.firstToken(found.?)) found = node;
+        }
+        return found;
+    }
+
     fn mentioned(w: *Walk, node: Ast.Node.Index) bool {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
+        for (w.outputs.items) |output| if (output.token >= first and output.token <= last) return true;
         for (w.mentions.items) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token >= first and token <= last) return true;

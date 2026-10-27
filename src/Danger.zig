@@ -520,10 +520,18 @@ fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime mes
     return held.items;
 }
 
-/// Whether a type named at `node` stands behind a pointer, or names a member of the type.
+/// Whether a type named at `node` stands behind a pointer, names a member of the type, or is
+/// only compared (`T == std.Io.Mutex`, a comptime check that refuses the type): none holds one.
 fn borrowed(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
     if (model.node_parents[@backingInt(node)]) |parent| { // safe: a node index indexes its own tree's parent table
         if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return true;
+        // The type itself, or what its constructor makes (`std.atomic.Value(u32)`), compared.
+        var compared = parent;
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, parent)) |made| if (made.ast.fn_expr == node) {
+            compared = model.node_parents[@backingInt(parent)] orelse parent; // safe: a node index indexes its own tree's parent table
+        };
+        if (tree.nodeTag(compared) == .equal_equal or tree.nodeTag(compared) == .bang_equal) return true;
     }
     var at = node;
     while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table

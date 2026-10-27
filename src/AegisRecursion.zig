@@ -9,6 +9,8 @@
 //! a depth it compares: a parameter it compares and passes on the cycle as `p + k` or `p - k`,
 //! or a field it compares and moves with `+=` or `-=`, itself or through a function it calls.
 //! A comparison with a length (`at < bytes.len`) is a position in the input, not a bound.
+//! A function that returns a type, or takes only comptime parameters, recurses over the types
+//! it is given, not over input, and the walk does not enter it.
 //! A bound kept further away, such as in an aegis `Budget`, is not seen, so the site is
 //! reported and a written suppression names it. A call that does not resolve leaves what it
 //! reaches undecided; the walk records how many such calls an entry reaches.
@@ -113,7 +115,7 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
             if (callee == .unknown) try self.unresolved.append(self.c.allocator, .{ .file = function.file, .call = call_node });
             continue;
         }
-        if (!selected(self.c, callee.function.file)) continue;
+        if (!selected(self.c, callee.function.file) or compileTime(self, callee.function)) continue;
         try self.edges.append(self.c.allocator, .{ .at = function, .call = call_node });
         defer _ = self.edges.pop();
         const back = for (self.stack.items, 0..) |on, i| {
@@ -122,6 +124,31 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
         if (back) |i| try cycle(self, i, token) else try visit(self, callee.function, token);
     }
     try self.done.put(self.c.allocator, function, {});
+}
+
+/// Whether a function's recursion is fixed by the program, not by input: it returns a type, so
+/// it runs only at compile time, or every parameter it takes is comptime (`comptime T: type`,
+/// `comptime seen: []const type`), so no value read at run time reaches it and its depth is the
+/// types' it is given (strand's descriptors).
+fn compileTime(self: *Walk, f: Facts.Decl) bool {
+    const tree = &self.c.project.files[f.file.raw()].tree; // safe: resolved declarations name frozen project files.
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.c.project.models[f.file.raw()].declarations[f.index].node) orelse return false; // safe: resolved declarations name frozen project tables.
+    if (proto.ast.return_type.unwrap()) |result| if (typeKeyword(tree, result)) return true;
+    var parameters = proto.iterate(tree);
+    var any = false;
+    while (parameters.next()) |parameter| {
+        any = true;
+        const declared = if (parameter.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false;
+        const typed = if (parameter.type_expr) |expr| typeKeyword(tree, expr) else false;
+        if (!declared and !typed) return false;
+    }
+    return any;
+}
+
+/// Whether a type expression is the type `type`.
+fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// The cycle from `stack[from]` back to it through the current edges.
