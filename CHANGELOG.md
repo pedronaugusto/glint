@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-27
+
 ### Fixed
 
 - A019's `undefined` reads count an `asm` output bound to the local (`"={eax}" (eax)`) as a write, made once the `asm` has read its inputs, so `cpuid`'s registers declared `undefined` and returned are no finding (warp's cpu.zig).
