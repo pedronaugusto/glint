@@ -48,6 +48,7 @@ const sources = [_]Source{
     .{ .name = "src/Atomic.zig", .bytes = @embedFile("aegis-atomic") },
     .{ .name = "src/Order.zig", .bytes = @embedFile("aegis-order") },
     .{ .name = "src/err.zig", .bytes = @embedFile("aegis-err") },
+    .{ .name = "src/assert.zig", .bytes = @embedFile("aegis-assert") },
 };
 const root = 1;
 const secret = 2;
@@ -90,9 +91,10 @@ const handle_index = 38;
 const atomic = 39;
 const order = 40;
 const err = 41;
+const assert_file = 42;
 
 /// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
-fn imports() [61]Project.Import {
+fn imports() [62]Project.Import {
     return .{
         .{ .from = file(root), .spelling = "secret.zig", .target = file(secret) },
         .{ .from = file(root), .spelling = "sync.zig", .target = file(sync) },
@@ -149,6 +151,7 @@ fn imports() [61]Project.Import {
         .{ .from = file(sync), .spelling = "Order.zig", .target = file(order) },
         .{ .from = file(order), .spelling = "Condition.zig", .target = file(condition) },
         .{ .from = file(root), .spelling = "err.zig", .target = file(err) },
+        .{ .from = file(root), .spelling = "assert.zig", .target = file(assert_file) },
         .{ .from = file(0), .spelling = "aegis", .target = file(root) },
         .{ .from = file(0), .spelling = "aegis.secret", .target = file(secret) },
         .{ .from = file(0), .spelling = "aegis.sync", .target = file(sync) },

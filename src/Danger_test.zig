@@ -99,7 +99,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -1289,6 +1289,101 @@ test "A010 leaves what a file or directory handle answers of itself, though inpu
         \\    _ = @as(i64, @intCast(size));
         \\    const inode = try r.takeInt(u64, 0);
         \\    return @intCast(inode);
+        \\}
+    , 1);
+}
+
+test "A009 reads a position its guards keep within the memory: a strict check a slice's bound passes by one, a check other than the length, a loop's condition past its continue expression, a read before, an aegis invariant and a std search" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const bytes = try r.take(64);
+        \\    var at: usize = try r.takeInt(u8, 0);
+        \\    if (at >= bytes.len or bytes[at] != '"') return error.Bad;
+        \\    _ = bytes[at + 1 ..];
+        \\    while (at < bytes.len) : (at += 1) switch (bytes[at]) {
+        \\        ' ' => {},
+        \\        else => break,
+        \\    };
+        \\    while (at < bytes.len) {
+        \\        if (bytes[at] == '\\') {
+        \\            if (at + 1 == bytes.len or bytes[at + 1] != 'u') return error.Bad;
+        \\            _ = bytes[at + 2 ..];
+        \\        }
+        \\        at += 1;
+        \\    }
+        \\    var from: usize = try r.takeInt(u8, 0);
+        \\    while (std.mem.findScalarPos(u8, bytes, from, '\\')) |slash| {
+        \\        _ = bytes[from..slash];
+        \\        from = slash + 1;
+        \\    }
+        \\    const s: usize = try r.takeInt(u8, 0);
+        \\    const e: usize = try r.takeInt(u8, 0);
+        \\    aegis.assert.invariant(s <= e and e <= bytes.len, "s <= e and e <= bytes.len");
+        \\    _ = bytes[s..e];
+        \\}
+    , 0);
+    // A position only other than the length, one read from other memory, and one at most a
+    // value nothing bounds are not kept.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, other: []const u8) !void {
+        \\    const bytes = try r.take(64);
+        \\    const at: usize = try r.takeInt(u8, 0);
+        \\    const e: usize = try r.takeInt(u8, 0);
+        \\    if (at != bytes.len) _ = bytes[at];
+        \\    if (at < other.len and other[at] == 'x') _ = bytes[at];
+        \\    if (at <= e) _ = bytes[at];
+        \\}
+    , 3);
+}
+
+test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Parser = struct {
+        \\    input: []const u8,
+        \\    at: usize,
+        \\    fn byte(self: *const Parser) error{Bad}!u8 {
+        \\        return if (self.at < self.input.len) self.input[self.at] else error.Bad;
+        \\    }
+        \\    fn more(self: *const Parser) error{Bad}!void {
+        \\        if (self.at >= self.input.len) return error.Bad;
+        \\    }
+        \\    fn step(self: *Parser, other: *const Parser) error{Bad}!void {
+        \\        switch (try self.byte()) {
+        \\            'a' => _ = self.input[self.at],
+        \\            else => {},
+        \\        }
+        \\        try self.more();
+        \\        _ = self.input[self.at];
+        \\        try other.more();
+        \\        self.at += 1;
+        \\        _ = self.input[self.at];
+        \\    }
+        \\};
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    var p: Parser = .{ .input = try r.take(8), .at = try r.takeInt(u8, 0) };
+        \\    const q = p;
+        \\    try p.step(&q);
+        \\}
+    , 1);
+}
+
+test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !void {
+        \\    var budget: aegis.bounded.Budget(usize) = .init(1 << 20);
+        \\    const n = try r.takeInt(u32, 0);
+        \\    const bytes = aegis.int.Checked(usize).init(8).mul(n) catch return error.TooLarge;
+        \\    var charge = budget.reserve(bytes.raw()) catch return error.TooLarge;
+        \\    _ = &charge;
+        \\    _ = try gpa.alloc(u64, n);
+        \\    const m = try r.takeInt(u32, 0);
+        \\    _ = try gpa.alloc(u64, m);
         \\}
     , 1);
 }

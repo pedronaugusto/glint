@@ -194,6 +194,7 @@ fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_de
         .{ "aegis-handle-secondary", "src/handle/secondary.zig" },
         .{ "aegis-handle-domain", "src/handle/Domain.zig" },
         .{ "aegis-handle-index", "src/handle/index.zig" },
+        .{ "aegis-assert", "src/assert.zig" },
     };
     for (files) |file| sources.addAnonymousImport(file[0], .{ .root_source_file = aegis_dependency.path(file[1]), .target = target });
     return sources;
