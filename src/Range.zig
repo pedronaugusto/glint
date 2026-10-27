@@ -702,7 +702,7 @@ pub fn floating(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context
     var value = try c.facts.resolve(file, at);
     while (true) value = switch (value) {
         .optional, .error_union => |inner| inner.*,
-        .primitive => |name| return name.len >= 2 and (name[0] == 'f' and std.ascii.isDigit(name[1])) or std.mem.eql(u8, name, "comptime_float"),
+        .primitive => |name| return (name.len >= 2 and (name[0] == 'f' and std.ascii.isDigit(name[1]))) or std.mem.eql(u8, name, "comptime_float"),
         else => return false,
     };
 }
@@ -1628,13 +1628,13 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
             if (!same(tree, fact.large, memory)) continue;
             const base, const k = shift(tree, fact.small);
             const step: i128 = @intFromBool(fact.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse k + step, k + step);
+            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
             continue;
         }
         if (lengthOf(c, file, fact.large, memory)) {
             const base, const k = shift(tree, fact.small);
             const step: i128 = @intFromBool(fact.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse k + step, k + step);
+            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
             continue;
         }
         if (remains(c, file, fact, index, memory, end)) return true;
@@ -1643,7 +1643,7 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
             if (next.differs or next.read or !lengthOf(c, file, next.large, memory) or !oneValue(c, file, fact.large, next.small)) continue;
             const base, const k = shift(tree, fact.small);
             const step: i128 = @as(i128, @intFromBool(fact.strict)) + @intFromBool(next.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse k + step, k + step);
+            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
         }
     }
     var m = most orelse return false;

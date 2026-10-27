@@ -14,7 +14,7 @@ The public seam is `RuleContext`, `ProjectRule`, `RuleDefinition`, `runConfigure
 
 The context provides immutable checked model handles, conservative value/declaration resolution, primary/related diagnostic spans and explicit `undecided` coverage. The common runner copies temporary messages, orders diagnostics, applies real-comment suppression, and renders text, JSON version 1 and SARIF 2.1.0. Custom metadata appears in every format and coverage. Rule authors retain responsibility for their predicate; a callback cannot make unknown analysis complete by suppressing a finding.
 
-`Config.selections` chooses `off`, `report` or `gate`. `FileConfig` overrides code options for an explicit FileId; callers select these IDs with their path dialect. Generic defaults remain Z003/Z013. `reviewed()` reports 18 IDs; `family()` reports the same selection. Neither profile asserts family-green adoption. Unknown facts required by a selected gate make the run incomplete. Severity/group and acceptance level are distinct.
+`Config.selections` chooses `off`, `report` or `gate`. `FileConfig` overrides code options for an explicit FileId; callers select these IDs with their path dialect. Generic defaults remain Z003/Z013. `reviewed()` reports 19 IDs; `family()` reports the same selection. Neither profile asserts family-green adoption. Unknown facts required by a selected gate make the run incomplete. Severity/group and acceptance level are distinct.
 
 ## Rules and policy options
 
@@ -23,6 +23,7 @@ The context provides immutable checked model handles, conservative value/declara
 | Z001, Z005, Z006, Z009, Z014, Z031, Z032 | Zig naming/style subset over known kinds; preserve established external ABI names. Unknown kinds are coverage. |
 | Z003 | Std parser/lowering compatibility; rejected input is incomplete. |
 | Z011 | Resolved deprecated call with declaration witness. |
+| Z034 | Two binary operators Zig 0.18's parser refuses to order without parentheses ("ambiguous operator precedence"), read in the tree Zig 0.17 builds: an unparenthesized operand whose group the operator over it is unordered with (a product and a remainder, two bitwise operators, arithmetic and bitwise, `and` and `or`, `orelse` or `catch` with any other), or a chained shift or remainder. The fix parenthesizes the operand as 0.17 groups it, keeping its meaning. Not in the generic default selection. |
 | Z012 | Explicit family report: concrete private signature container without a public alias. Pointer/optional/error-union payload shapes and enclosing receiver identity are retained; unknown type shapes are coverage. |
 | Z013 | Dead private import binding after lexical/member identity checks; unknown same-name members are not dead. |
 | Z016 | Resolved std assertion conjunction advisory; no rewrite or evaluation-effect claim. |

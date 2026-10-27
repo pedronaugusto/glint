@@ -1993,7 +1993,7 @@ const Flow = struct {
             if (f.tree.nodeTag(parent) != .field_access or f.tree.nodeData(parent).node_and_token[0] != candidate) return .other;
             const member = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(parent).node_and_token[1]));
             // A move hands the owner on, as a release ends it (`kept`).
-            if (releaseName(f.kind, member) or f.kind == .owned and std.mem.eql(u8, member, "move")) return .other;
+            if (releaseName(f.kind, member) or (f.kind == .owned and std.mem.eql(u8, member, "move"))) return .other;
             found = .members;
         }
         return found;
