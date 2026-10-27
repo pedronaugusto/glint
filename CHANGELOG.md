@@ -12,6 +12,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 - Pins aegis 0.2.1, the 0.2 line: `SecretBytes` holds no allocator.
 - A005 reads aegis 0.2.0's unmanaged `SecretBytes.adopt(allocation, live_len)`: an adoption is decided where the allocation is a whole byte allocation handed over alone. It no longer asks that the allocator that made it be the one passed beside it; the owner holds none, and the allocator its `deinit` is given is the caller's to keep.
+- Pins ensign 0.3.1.
 
 ### Fixed
 

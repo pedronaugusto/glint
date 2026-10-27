@@ -11,8 +11,8 @@
         },
 
         .ensign = .{
-            .url = "git+https://github.com/pedronaugusto/ensign?ref=aegis-0.2#d69e65fb7708844450ce34f0b17bb540b0b6fc72",
-            .hash = "ensign-0.3.0-6eMTDzOjBQDBZ0kVHFX0I1taobSZIT7KQVGKbGCnaFNX",
+            .url = "git+https://github.com/pedronaugusto/ensign?ref=v0.3.1#271c75f60534b7e9eb1c79ae6d3b8f94c28be705",
+            .hash = "ensign-0.3.1-6eMTD7ejBQCKWv4nIZ0aJ1sZp8iqcM98FSGwKTnd4mVJ",
         },
     },
     .dev_dependencies = .{
