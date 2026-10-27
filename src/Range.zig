@@ -16,6 +16,7 @@ const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
+const Governed = @import("Governed.zig");
 const Ast = std.zig.Ast;
 
 /// An integer type: its width, and whether it is signed.
@@ -312,11 +313,24 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node) orelse return null;
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |decl| returned(c, decl, pointer, next),
+                .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse returned(c, decl, pointer, next),
                 else => null,
             };
         },
     }
+}
+
+/// `std.math.maxInt(T)` of an integer type `T`: its greatest value, so a guard `x <=
+/// std.math.maxInt(u32)` bounds `x` as a literal would.
+fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call, pointer: u16) Context.Error!?u128 {
+    if (call.ast.params.len != 1) return null;
+    for ((try Governed.declarations(c, "std", "math.maxInt")) orelse return null) |each| {
+        if (!each.file.eql(decl.file) or each.index != decl.index) continue;
+        const int = (try named(c, file, call.ast.params[0], pointer)) orelse return null;
+        if (int.bits == 0) return 0;
+        return filled(int.bits - @intFromBool(int.signed));
+    }
+    return null;
 }
 
 /// What a function returns at most, read once per function and pointer width: the widest of

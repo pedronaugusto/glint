@@ -18,6 +18,7 @@ const std_files = [_]sources.Extra{
     \\pub const array_list = @import("array_list.zig");
     \\pub const hash_map = @import("hash_map.zig");
     \\pub const array_hash_map = @import("array_hash_map.zig");
+    \\pub const math = @import("math.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -116,6 +117,9 @@ const std_files = [_]sources.Extra{
     \\pub const s_per_day = s_per_hour * 24;
     \\pub const s_per_week = s_per_day * 7;
     },
+    .{ .name = "std/math.zig", .bytes =
+    \\pub inline fn maxInt(comptime T: type) comptime_int { const info = @typeInfo(T); const bit_count = info.int.bits; if (bit_count == 0) return 0; return (1 << (bit_count - @intFromBool(info.int.signedness == .signed))) - 1; }
+    },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .spelling = "std", .target = 0 },
@@ -133,6 +137,7 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "array_list.zig", .target = 9 },
     .{ .from = 0, .spelling = "hash_map.zig", .target = 10 },
     .{ .from = 0, .spelling = "array_hash_map.zig", .target = 11 },
+    .{ .from = 0, .spelling = "math.zig", .target = 15 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -975,6 +980,30 @@ test "A009 reads a constant added to a checked position, a start held at most it
         \\    _ = bytes[far..];
         \\}
     , 1);
+}
+
+test "A010 reads std.math.maxInt of an integer type as the constant it is, in a guard joined by or and and" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    const wide: i64 = try r.takeInt(i64, 0);
+        \\    if (wide < 1 or wide > std.math.maxInt(u32)) return error.Range;
+        \\    const narrow: u32 = @intCast(wide);
+        \\    const width: i64 = try r.takeInt(i64, 0);
+        \\    const kept: u16 = if (width > 0 and width <= std.math.maxInt(u16)) @intCast(width) else 0;
+        \\    const signed: i64 = try r.takeInt(i64, 0);
+        \\    if (signed < 0 or signed > std.math.maxInt(i16)) return error.Range;
+        \\    const small: i16 = @intCast(signed);
+        \\    const loose: i64 = try r.takeInt(i64, 0);
+        \\    if (loose > std.math.maxInt(u32)) return error.Range;
+        \\    const unsure: u16 = @intCast(loose);
+        \\    _ = .{ narrow, kept, small, unsure };
+        \\    return 0;
+        \\}
+    );
+    // Only the conversion its guard does not hold: at most a u32, read into a u16.
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{13}, result.lines[0..result.findings]);
 }
 
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
