@@ -28,7 +28,10 @@
 //! and through a store into the program's own field, which holds it everywhere by its
 //! declaration. aegis's types are the answer to input: what aegis gives back (an
 //! `input.Untrusted` and what its `parse` refines, a checked integer) is clean, but for an owner
-//! or a loan (`own.Owned`, `own.OwnedIo`, `own.Lent`), which holds what it is given. A call whose
+//! or a loan (`own.Owned`, `own.OwnedIo`, `own.Lent`), which holds what it is given. The parser
+//! is where input is answered, so it reads input: `readForParse` gives the peer's value, and the
+//! parser `Untrusted.parse` is handed takes it as its value parameter, so its own checks are read
+//! as any reader's are and a boundary hides none of them. A call whose
 //! callee does not resolve, given input, gives an unknown value, which a sink reads as
 //! undecided, never as passed.
 const std = @import("std");
@@ -494,8 +497,29 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
                 if (given.level != .clean or given.params != 0) try store(c, flow, function, receiver, given);
             };
         },
-        .aegis, .holder, .none => {},
+        .aegis => try parsed(c, flow, f.file, call, callee.decl.?),
+        .holder, .none => {},
     }
+}
+
+/// `Untrusted.parse(context, parser)` calls the program's `parser(context, value)` with the
+/// peer's value: the parser reads input, and its own checks are read as any reader's are. Only
+/// what it returns, the refined result, is clean.
+fn parsed(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!void {
+    const origin = (try c.facts.origin(decl)) orelse decl;
+    const record = c.project.models[origin.file.raw()].declarations[origin.index];
+    if (!std.mem.eql(u8, record.name, "parse") or call.ast.params.len == 0) return;
+    const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = record.scope } };
+    if (try c.role(Contract.library, container) != .untrusted) return;
+    const parser = switch (try c.facts.resolve(file, call.ast.params[call.ast.params.len - 1])) {
+        .function => |function| function,
+        else => return,
+    };
+    const target = flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return }) orelse return;
+    const levels = flow.functions.items[target].levels;
+    if (levels.len < 2 or levels[1].join(.data) == levels[1]) return;
+    levels[1] = levels[1].join(.data);
+    flow.changed = true;
 }
 
 /// Whether a method adds what it is given to its receiver's data: it takes its receiver by
@@ -634,7 +658,14 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
         // An owner or a loan holds what it is given, no answer to input: a handle the program
         // opened from input is as much input's wrapped as it was bare.
         const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = c.project.models[origin.file.raw()].declarations[origin.index].scope } };
-        out.kind = if (try c.role(Contract.library, container)) |k| switch (k) {
+        const role = try c.role(Contract.library, container);
+        // What an `input.Untrusted` hands its parser is the peer's value itself: only what the
+        // parser makes of it is the answer to input.
+        if (role == .untrusted and std.mem.eql(u8, c.project.models[origin.file.raw()].declarations[origin.index].name, "readForParse")) {
+            out.kind = .source;
+            return out;
+        }
+        out.kind = if (role) |k| switch (k) {
             .owned, .lent => .holder,
             else => .aegis,
         } else .aegis;

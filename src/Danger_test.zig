@@ -1050,6 +1050,33 @@ test "A002 reads a type std computes from root, as std's VTable's handles are, a
     try std.testing.expectEqual(@as(usize, 0), result.findings);
 }
 
+test "A009 reads a parser handed to input.Untrusted.parse as reading input, and readForParse's value as input; only the parse's refined result is clean" {
+    const result = try run(pack.untrusted_input,
+        \\const aegis = @import("aegis");
+        \\const Reading = struct { limit: usize };
+        \\const Header = struct { count: u32 };
+        \\fn parseFormat(reading: Reading, bytes: []const u8) error{Short}!Header {
+        \\    if (bytes.len < reading.limit) return error.Short;
+        \\    const at = @as(usize, bytes[0]) << 8 | bytes[1];
+        \\    const probe = bytes[at];
+        \\    return .{ .count = probe };
+        \\}
+        \\pub fn parse(bytes: []const u8, table: []const u8) !u8 {
+        \\    const header = try aegis.input.Untrusted([]const u8).init(bytes).parse(Reading{ .limit = 4 }, parseFormat);
+        \\    if (header.count >= table.len) return error.Short;
+        \\    return table[header.count];
+        \\}
+        \\pub fn direct(text: aegis.input.Untrusted([]const u8)) u8 {
+        \\    const b = text.readForParse();
+        \\    const at = @as(usize, b[0]) << 8 | b[1];
+        \\    return b[at];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The parser's own index and the direct reader's; never the refined result's use.
+    try std.testing.expectEqualSlices(u32, &.{ 7, 18 }, result.lines[0..result.findings]);
+}
+
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
