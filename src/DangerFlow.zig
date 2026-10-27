@@ -81,7 +81,8 @@ const loop_message = "a number from input bounds a loop: a peer chooses how long
 /// number (decoded, or grown by a shift or a product) is the peer's to choose. A conversion or
 /// arithmetic on the program's own values is checked by that build and is no peer's to reach;
 /// where the checks are off (`@setRuntimeSafety(false)`, ReleaseFast) the danger is A019's.
-/// `@truncate` keeps the low bits by intent and is no conversion that fails.
+/// `@truncate` keeps the low bits by intent and is no conversion that fails. Float arithmetic
+/// gives an infinity or a NaN where an integer's would stop, so it is none of A010's.
 pub fn integers(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, .input);
     const tree = &c.project.files[c.file.raw()].tree;
@@ -91,7 +92,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             // A sum, difference or product overflows on either operand; a quotient or a
             // remainder fails on its divisor (zero, or -1 under the minimum).
             .add, .mul, .assign_add, .assign_mul => {
-                if (!site(c, node)) continue;
+                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 // An address moved by input reaches memory, A009's; no overflow check stops it.
                 if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -101,7 +102,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
-                if (!site(c, node)) continue;
+                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try Taint.levelAt(c, flow, c.file, lhs);
@@ -111,7 +112,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 try judged(c, rule, node, level, .number, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
-                if (!site(c, node)) continue;
+                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
                 try judged(c, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },

@@ -684,6 +684,28 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
     return integer(try c.facts.resolve(file, node), pointer);
 }
 
+/// Whether an operation is on floats: an operand is a float literal or of a float type. A float
+/// overflows to an infinity and divides by zero to one, never stopping the program.
+pub fn floating(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, node);
+    switch (tree.nodeTag(at)) {
+        .number_literal => return std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(at))) == .float,
+        .add, .sub, .mul, .div, .mod, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            return try floating(c, file, lhs) or try floating(c, file, rhs);
+        },
+        .negation => return floating(c, file, tree.nodeData(at).node),
+        else => {},
+    }
+    var value = try c.facts.resolve(file, at);
+    while (true) value = switch (value) {
+        .optional, .error_union => |inner| inner.*,
+        .primitive => |name| return name.len >= 2 and (name[0] == 'f' and std.ascii.isDigit(name[1])) or std.mem.eql(u8, name, "comptime_float"),
+        else => return false,
+    };
+}
+
 /// A constant's initializer, where it spells no type.
 fn untyped(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     const record = c.project.models[decl.file.raw()].declarations[decl.index];

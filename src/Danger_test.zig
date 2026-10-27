@@ -1077,6 +1077,23 @@ test "A009 reads a parser handed to input.Untrusted.parse as reading input, and 
     try std.testing.expectEqualSlices(u32, &.{ 7, 18 }, result.lines[0..result.findings]);
 }
 
+test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !f64 {
+        \\    const raw = try r.takeInt(u64, 0);
+        \\    const s: f64 = @floatFromInt(raw);
+        \\    const rate = 1e9 / s;
+        \\    const total = s + rate * 2.5;
+        \\    const count = try r.takeInt(u64, 0);
+        \\    _ = 1000 / count;
+        \\    return total - s;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{8}, result.lines[0..result.findings]);
+}
+
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
