@@ -4,20 +4,29 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A019's `undefined` reads count an `asm` output bound to the local (`"={eax}" (eax)`) as a write, made once the `asm` has read its inputs, so `cpuid`'s registers declared `undefined` and returned are no finding (warp's cpu.zig).
+- A007 leaves a synchronization type that is only compared, itself or what its constructor makes (`T == std.Io.Mutex`, `T != std.atomic.Value(u32)` in a comptime check that refuses it), which holds none (strand's descriptor.zig and owner.zig).
+- A012 leaves a size std only moves a position by (`Reader.toss` after a decode): a std parameter that no call, loop, local or return takes does the same work whatever its value. warp's lz4 escape on that line now suppresses nothing.
+- A006 does not enter a function that returns a type or takes only comptime parameters (`comptime T: type, comptime seen: []const type`): no value read at run time reaches it, and its depth is the types' it is given. On strand, 10 of its 12 findings were such descriptors; `same` and `zero`, which take runtime values with the type, remain.
+
+## [0.7.1] - 2026-10-27
+
 ### Added
 
 - `Config.pointer_widths` (JSON `pointer_widths`): the pointer widths of the targets the package builds for, 16, 32 or 64 bits. A010 and the ranges the flow rules read hold a value at each, so a `u32` count times a small constant widened to `usize` is a finding only for a package with a 32-bit target; empty reads both 32 and 64 bits, as before.
-
 - A flow finding names the read its input came from: `(input from src/fs/fs.zig:1708 `aegis.own.readFile`)`, the first read found walking back from the site through the expression's parts that carry input, a local's initializer, assignments and filling reads, the program's callees' returns, the arguments a parameter's callers give it, and what the program stores into a field anywhere. Where the read is inside a function the program calls for its result (a file reader it wraps), the finding also names that call: `(input from src/fs/fs.zig:1708 `aegis.own.readFile` via src/odb/midx.zig:81 `fs.readFileAlloc`)`, the caller whose parser it belongs to. A package fixes input once per source at its parser by grouping findings by it (on relic, 652 of 998 flow findings name one, 180 of them one config read).
 
 ### Changed
 
+- Pins aegis 0.2.1, the 0.2 line: `SecretBytes` holds no allocator.
 - A005 reads aegis 0.2.0's unmanaged `SecretBytes.adopt(allocation, live_len)`: an adoption is decided where the allocation is a whole byte allocation handed over alone. It no longer asks that the allocator that made it be the one passed beside it; the owner holds none, and the allocator its `deinit` is given is the caller's to keep.
+- Pins ensign 0.3.1.
 
 ### Fixed
 
 A009 and A010 were mostly false alarms on relic (none of 40 sampled sites was real). Each class is fixed where the ranges and the input fact are read:
-
 - A guard that dominates the use now holds in more of the forms a parser writes:
   - a constant added to a checked position (`if (fanout + 1024 > bytes.len) return` before `bytes[fanout + 255 * 4 ..]`);
   - a constant local naming a checked value or a length (`const off: usize = @intCast(at);`, `const n = buf.len;`);
