@@ -268,7 +268,7 @@ fn fieldEnd(ts: []const Token, partner: Partners, start: usize) usize {
     return ts.len - 1;
 }
 
-const Reach = enum { dead, live, test_only };
+pub const Reach = enum { dead, live, test_only };
 
 /// The names of container-level members that are not roots, the only ones
 /// a reference can change: by their lengths, then by a slot of length and

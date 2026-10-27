@@ -2447,11 +2447,6 @@ fn prototype(self: *const Facts, value: Value) ?Key {
     };
 }
 
-/// A function's declared result as a type, `!T` an error union of it.
-fn returnTypeOf(self: *Facts, decl: Decl) ResolveError!Value {
-    return self.resultOf(self.prototype(.{ .function = decl }).?); // unreachable: a function has a prototype
-}
-
 /// The result a prototype declares, as a type, `!T` an error union of it.
 fn resultOf(self: *Facts, proto: Key) ResolveError!Value {
     const target_tree = &self.project.files[proto.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
