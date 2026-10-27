@@ -32,6 +32,8 @@ const std_files = [_]sources.Extra{
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
+    \\pub const Handle = @import("root").Handle;
+    \\pub const VTable = struct { close: *const fn (?*anyopaque, Handle) void, write: *const fn (?*anyopaque, Handle, []const u8) void };
     \\pub const Condition = struct { state: u32 = 0 };
     \\pub const Semaphore = struct { permits: usize = 0 };
     \\pub const Event = enum(u32) { unset, set };
@@ -1004,6 +1006,48 @@ test "A010 reads std.math.maxInt of an integer type as the constant it is, in a 
     // Only the conversion its guard does not hold: at most a u32, read into a u16.
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
     try std.testing.expectEqualSlices(u32, &.{13}, result.lines[0..result.findings]);
+}
+
+test "A010 reads the left side of an or as holding where its right side is read: an index past the length leaves before the length less it" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\const Bytes = struct { index: u32, len: u32 };
+        \\pub fn f(r: *std.Io.Reader, extra: []const u32) !void {
+        \\    const v: Bytes = .{ .index = try r.takeInt(u32, 0), .len = try r.takeInt(u32, 0) };
+        \\    if (v.index > extra.len or v.len > extra.len - v.index) return error.Short;
+        \\    const i = try r.takeInt(u32, 0);
+        \\    if (i > extra.len or 4 > extra.len - i) return error.Short;
+        \\    const j = try r.takeInt(u32, 0);
+        \\    if (4 > extra.len - j) return error.Short;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{9}, result.lines[0..result.findings]);
+}
+
+test "A002 reads a type std computes from root, as std's VTable's handles are, as std's own: copying it copies no aegis owner" {
+    const result = try run(pack.copies,
+        \\const std = @import("std");
+        \\fn keep(args: anytype) @TypeOf(args) {
+        \\    var local = args;
+        \\    _ = &local;
+        \\    return local;
+        \\}
+        \\pub fn slot(comptime name: []const u8) @FieldType(std.Io.VTable, name) {
+        \\    const params = @typeInfo(@typeInfo(@FieldType(std.Io.VTable, name)).pointer.child).@"fn".param_types;
+        \\    return switch (params.len) {
+        \\        3 => &struct {
+        \\            fn f(u: ?*anyopaque, a: params[1].?, b: params[2].?) void {
+        \\                _ = u;
+        \\                _ = keep(.{ a, b });
+        \\            }
+        \\        }.f,
+        \\        else => unreachable,
+        \\    };
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 0), result.findings);
 }
 
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
