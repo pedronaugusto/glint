@@ -1108,8 +1108,11 @@ pub fn ownedIn(a: std.mem.Allocator, flow: *const Flow, file: Project.FileId) er
     return out.items;
 }
 
-/// Where input that reaches a node was read: a read call the program makes.
-pub const Origin = struct { file: Project.FileId, node: Ast.Node.Index };
+/// Where input that reaches a node was read: a read call the program makes, and, where the read
+/// is inside a function the walk entered through its result, the call of that function (`via`):
+/// the caller of a file reader the program wraps, where that caller's parser belongs.
+pub const Origin = struct { file: Project.FileId, node: Ast.Node.Index, via: ?Site = null };
+pub const Site = struct { file: Project.FileId, node: Ast.Node.Index };
 
 /// The read that input reaching `node` comes from, found by walking back from it: through the
 /// parts of its expression that carry input, a local's initializer, its assignments and the
@@ -1172,7 +1175,12 @@ const Walk = struct {
             .program => |target| {
                 const g = w.flow.functions.items[target];
                 const tree = &w.c.project.files[g.file.raw()].tree;
-                for (try children(w.c, g.file, g.node)) |part| if (try w.returned(target, tree, part, depth)) |found| return found;
+                for (try children(w.c, g.file, g.node)) |part| if (try w.returned(target, tree, part, depth)) |found| {
+                    // The innermost call into the function that holds the read names it.
+                    var named = found;
+                    if (named.via == null) named.via = .{ .file = f.file, .node = node };
+                    return named;
+                };
             },
             .holder, .outside, .none => {},
         }

@@ -406,15 +406,25 @@ fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, lev
     if (!level.reaches(least)) return;
     const fact = flow orelse return c.at(rule, tree.nodeMainToken(node), message);
     const from = (try Taint.sourceOf(c, fact, c.file, node)) orelse return c.at(rule, tree.nodeMainToken(node), message);
-    const file = &c.project.files[from.file.raw()];
+    const read = try callSite(c, .{ .file = from.file, .node = from.node });
+    const text = if (from.via) |via|
+        try c.allocator.print("{s} (input from {s} via {s})", .{ message, read, try callSite(c, via) })
+    else
+        try c.allocator.print("{s} (input from {s})", .{ message, read });
+    try c.at(rule, tree.nodeMainToken(node), text);
+}
+
+/// A call as `file:line `callee``, the callee as written on one line: a chain split over lines
+/// is joined without its breaks.
+fn callSite(c: *Context, at: Taint.Site) Context.Error![]const u8 {
+    const file = &c.project.files[at.file.raw()];
     var buffer: [1]Ast.Node.Index = undefined;
-    const read = file.tree.fullCall(&buffer, from.node).?;
-    const line = file.line(file.tree.tokenStart(file.tree.firstToken(from.node))) + 1;
-    // The callee as written, on one line: a chain split over lines is joined without its breaks.
+    const made = file.tree.fullCall(&buffer, at.node).?;
+    const line = file.line(file.tree.tokenStart(file.tree.firstToken(at.node))) + 1;
     var spelled: std.ArrayList(u8) = .empty;
-    var it = std.mem.tokenizeAny(u8, file.tree.getNodeSource(read.ast.fn_expr), " \t\r\n");
+    var it = std.mem.tokenizeAny(u8, file.tree.getNodeSource(made.ast.fn_expr), " \t\r\n");
     while (it.next()) |part| try spelled.appendSlice(c.allocator, part);
-    try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s} (input from {s}:{d} `{s}`)", .{ message, c.project.inputs[from.file.raw()].name, line, spelled.items }));
+    return c.allocator.print("{s}:{d} `{s}`", .{ c.project.inputs[at.file.raw()].name, line, spelled.items });
 }
 
 /// Production code that runs with the program.
