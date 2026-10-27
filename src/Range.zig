@@ -1516,6 +1516,26 @@ fn ordered(c: *Context, file: Project.FileId, node: Ast.Node.Index, lhs: Ast.Nod
     if (tree.nodeTag(lhs) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(lhs).node_and_token[1]), "len")) {
         if (try indexes(c, file, rhs, tree.nodeData(lhs).node_and_token[0])) return true;
     }
+    if (same(tree, rhs, lhs)) return true;
+    // A difference of unsigned operands is at most what it is taken from (were it to underflow,
+    // the program stops there, at the subtraction A010 judges itself).
+    const taken_from = bare(tree, rhs);
+    if (tree.nodeTag(taken_from) == .sub and same(tree, tree.nodeData(taken_from).node_and_node[0], lhs)) {
+        const typed = try typeOf(c, file, taken_from, pointer, 0);
+        if (typed == .int and !typed.int.signed) return true;
+    }
+    // A constant minimum is at most each of its arguments: at most `lhs` where one is, and
+    // nothing between assigns `lhs` (`const n = @min(max, op - start);` before `op - n`).
+    if (constantOf(c, file, bare(tree, rhs))) |local| if (local.ast.init_node.unwrap()) |init| {
+        const call = bare(tree, init);
+        switch (tree.nodeTag(call)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call)), "@min") and try kept(c, file, lhs, call, node)) {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (Facts.builtinArgs(tree, call, &buffer)) |arg| if (try ordered(c, file, node, lhs, arg, pointer)) return true;
+            },
+            else => {},
+        }
+    };
     const taken = literal(tree, rhs);
     for (try facts(c, file, node)) |fact| {
         if (!same(tree, fact.large, lhs)) {

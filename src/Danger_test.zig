@@ -1483,6 +1483,32 @@ test "A010 takes no input into a comptime parameter, which the program fixes whe
     , 1);
 }
 
+test "A010 reads a constant minimum as at most each of its arguments, and a difference as at most what it is taken from" {
+    // warp's speculative decoder: the history taken back from the output's position.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const max = 64;
+        \\pub fn f(r: *std.Io.Reader, op: usize, start: usize, out: []u8) !void {
+        \\    _ = try r.takeInt(u8, .little);
+        \\    const len: usize = try r.takeInt(u8, .little);
+        \\    const n = @min(max, op - start);
+        \\    const dict = @min(max - n, len);
+        \\    _ = max - n - dict;
+        \\    _ = out[op - n .. op];
+        \\}
+    , 0);
+    // A minimum's argument assigned after it is no bound on what it is now.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, start: usize) !usize {
+        \\    var op: usize = try r.takeInt(u8, .little);
+        \\    const n = @min(op, start);
+        \\    op = try r.takeInt(u8, .little);
+        \\    return op - n;
+        \\}
+    , 1);
+}
+
 test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");

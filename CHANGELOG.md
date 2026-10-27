@@ -12,6 +12,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
   - a sum the length bounds, for each sum of its parts (`if (l1 + l2 + l3 + 6 > in.len) return` before `in[6 + l1 ..][0..l2]`), its other parts unsigned;
   - a clamp among the other assignments of its block (`if (n > r.at) { n = r.at; status = .end_of_buffer; }`);
   - a comptime parameter takes nothing its callers pass from input: the program fixes it when it is compiled (an inline prong's period as a divisor).
+- A009 and A010 read a constant minimum as at most each of its arguments, while nothing between assigns what it is compared with, and a difference of unsigned operands as at most what it is taken from (`const n = @min(max, op - start);` before `out[op - n .. op]`, and `e.available_out -= n` after `n = @min(e.available_out, out.len)`): on warp, A009 348 to 347 and A010 721 to 717.
 
 ## [0.7.3] - 2026-10-27
 
