@@ -407,6 +407,56 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\fn shut(d: *std.Io.Dir) void { _ = d; }
         \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
     , 5);
+    // A function each of whose returns reads what is already held hands over no owner:
+    // shakedown's simulated working directory and standard streams, std's own stdio, a pipe end
+    // named by the handle it is given.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const Slot = struct { file: std.Io.File, open: bool };
+        \\const Process = struct { cwd: ?std.Io.Dir, stdio: [3]Slot };
+        \\const Context = struct { process: ?*Process, cwd: ?std.Io.Dir };
+        \\const closed: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+        \\pub fn cwdOf(ctx: *const Context) ?std.Io.Dir {
+        \\    if (ctx.process) |p| return p.cwd;
+        \\    return ctx.cwd;
+        \\}
+        \\pub fn translate(p: *const Process, file: std.Io.File, i: usize) std.Io.File {
+        \\    if (i > 2) return file;
+        \\    const s = p.stdio[i];
+        \\    return if (s.open) s.file else closed;
+        \\}
+        \\pub fn standard(i: usize) std.Io.File {
+        \\    return switch (i) {
+        \\        0 => std.Io.File.stdin(),
+        \\        1 => std.Io.File.stdout(),
+        \\        else => std.Io.File.stderr(),
+        \\    };
+        \\}
+        \\pub fn pipeFile(handle: std.Io.File.Handle) std.Io.File {
+        \\    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        \\}
+    , 0);
+    // A field moved out through a variable, a field of what was just opened, and an open are
+    // owners handed over.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const Conn = struct { stream: std.Io.net.Stream };
+        \\fn connect() !Conn { return undefined; }
+        \\pub fn take(c: *Conn) std.Io.net.Stream {
+        \\    const s = c.stream;
+        \\    c.stream = undefined;
+        \\    var moved = s;
+        \\    _ = &moved;
+        \\    return moved;
+        \\}
+        \\pub fn fresh() !std.Io.net.Stream {
+        \\    const c = try connect();
+        \\    return c.stream;
+        \\}
+        \\pub fn open(dir: std.Io.Dir, io: std.Io) !std.Io.File {
+        \\    return dir.openFile(io, "x", .{});
+        \\}
+    , 3);
 }
 
 test "A016 finds identifying integers of one type meeting, not other integers" {

@@ -15,7 +15,8 @@ const Ast = std.zig.Ast;
 
 /// A015: a std resource held by value in a field its file releases (`close`, `deinit`), or
 /// returned by the program's own function, outside aegis's `own.Owned`. A field nothing in its
-/// file releases borrows a handle its caller owns (an options or context struct).
+/// file releases borrows a handle its caller owns (an options or context struct), and a function
+/// each of whose returns reads what is already held hands over no owner (`views`).
 pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     const paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
     const resources = try containersOf(c, rule, &paths);
@@ -35,9 +36,100 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         const which = find(resources, held) orelse continue;
         if (decl.kind == .field and !released(tree, decl.name)) continue;
+        if (decl.kind == .function and views(tree, model, decl)) continue;
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once", .{ what, decl.name, how, paths[which] }));
+    }
+}
+
+/// Whether every return of a function reads a resource someone already holds, so it hands over
+/// no owner: a parameter passed back, a field read (the field's declaration is where its owner is
+/// judged) of something itself held, a declared constant, std's process-wide `stdin`, `stdout` or
+/// `stderr`, which nobody closes, or a literal naming a handle it was given (`.{ .handle = handle
+/// }`). A variable (a field moved out first) or what a call made is an owner handed over.
+fn views(tree: *const Ast, model: *const Model, decl: Model.Declaration) bool {
+    const body = body: {
+        const parent = model.node_parents[@backingInt(decl.node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        if (tree.nodeTag(parent) != .fn_decl) return false;
+        break :body tree.nodeData(parent).node_and_node[1];
+    };
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    var returns: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const value = tree.nodeData(node).opt_node.unwrap() orelse return false;
+        if (!viewed(tree, model, value, 0)) return false;
+        returns += 1;
+    }
+    return returns != 0;
+}
+
+fn viewed(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8) bool {
+    if (depth == 16) return false;
+    const next = depth + 1;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return viewed(tree, model, tree.nodeData(node).node_and_token[0], next),
+        .unwrap_optional => return viewed(tree, model, tree.nodeData(node).node_and_token[0], next),
+        .array_access => return viewed(tree, model, tree.nodeData(node).node_and_node[0], next),
+        .@"orelse" => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return viewed(tree, model, lhs, next) and viewed(tree, model, rhs, next);
+        },
+        .field_access => {
+            var root = node;
+            while (tree.nodeTag(root) == .field_access or tree.nodeTag(root) == .unwrap_optional or tree.nodeTag(root) == .array_access) root = switch (tree.nodeTag(root)) {
+                .array_access => tree.nodeData(root).node_and_node[0],
+                else => tree.nodeData(root).node_and_token[0],
+            };
+            return tree.nodeTag(root) == .identifier and viewed(tree, model, root, next);
+        },
+        .identifier => {
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
+            const reference = model.reference(node) orelse return false;
+            const d = reference.declaration orelse return false;
+            const record = model.declarations[d];
+            if (record.kind == .parameter or record.kind == .capture) return true;
+            if (record.kind != .variable) return false;
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+            // A declared constant, or a local one made from what is already held.
+            return switch (model.scopes[record.scope].kind) {
+                .file, .container => true,
+                else => viewed(tree, model, variable.ast.init_node.unwrap() orelse return false, next),
+            };
+        },
+        .@"switch", .switch_comma => {
+            const full = tree.fullSwitch(node).?;
+            for (full.ast.cases) |case| if (!viewed(tree, model, tree.fullSwitchCase(case).?.ast.target_expr, next)) return false;
+            return true;
+        },
+        else => {
+            if (tree.fullIf(node)) |branch| {
+                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+                return viewed(tree, model, branch.ast.then_expr, next) and viewed(tree, model, otherwise, next);
+            }
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&buffer, node)) |call| {
+                if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+                const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+                for ([_][]const u8{ "stdin", "stdout", "stderr" }) |standard| if (std.mem.eql(u8, name, standard)) return true;
+                return false;
+            }
+            var init_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullStructInit(&init_buffer, node)) |literal| {
+                for (literal.ast.fields) |value| {
+                    if (tree.firstToken(value) < 2 or !std.mem.eql(u8, tree.tokenSlice(tree.firstToken(value) - 2), "handle")) continue;
+                    return viewed(tree, model, value, next);
+                }
+                return false;
+            }
+            return false;
+        },
     }
 }
 
