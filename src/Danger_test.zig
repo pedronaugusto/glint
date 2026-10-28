@@ -1222,6 +1222,42 @@ test "A009 reads a parser handed to input.Untrusted.parse as reading input, and 
     try std.testing.expectEqualSlices(u32, &.{ 7, 18 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a parser's returned literal as the parse refines it: its numbers clean through the parse, its memory still input, and a direct call's numbers input" {
+    const result = try run(pack.untrusted_input,
+        \\const aegis = @import("aegis");
+        \\const Count = struct { count: u32, bytes: u8, rest: []const u8 };
+        \\const Header = struct { count: usize, stream: []const u8 };
+        \\fn parseCount(_: void, in: []const u8) error{Short}!Count {
+        \\    if (in.len < 3) return error.Short;
+        \\    return if (in[0] < 0x80) .{ .count = in[0], .bytes = 1, .rest = in[1..] } else .{ .count = @as(u32, in[1]) << 8 | in[2], .bytes = 3, .rest = in[3..] };
+        \\}
+        \\fn header(in: []const u8) error{Short}!Header {
+        \\    const parsed = try aegis.input.Untrusted([]const u8).init(in).parse({}, parseCount);
+        \\    return .{ .count = parsed.count, .stream = in[parsed.bytes..] };
+        \\}
+        \\pub fn counted(in: []const u8, table: []const u8) !u8 {
+        \\    const h = try header(in);
+        \\    var n = h.count;
+        \\    while (n > 0) : (n -= 1) {}
+        \\    return table[h.count];
+        \\}
+        \\pub fn rest(in: []const u8) !void {
+        \\    const parsed = try aegis.input.Untrusted([]const u8).init(in).parse({}, parseCount);
+        \\    var n = @as(usize, parsed.rest[0]) << 8 | parsed.rest[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+        \\pub fn direct(text: aegis.input.Untrusted([]const u8)) !void {
+        \\    const raw = try parseCount({}, text.readForParse());
+        \\    var n = raw.count;
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The loops the parsed memory's bytes and the direct call's count bound; never the parsed
+    // count's, through the header it is stored in.
+    try std.testing.expectEqualSlices(u32, &.{ 21, 26 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

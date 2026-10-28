@@ -110,6 +110,8 @@ const Function = struct {
     fills: u64 = 0,
     /// Its comptime parameters: fixed when the program is compiled, so no input reaches them.
     fixed: u64 = 0,
+    /// It is handed to aegis's `Untrusted.parse`: what it returns reaches the program refined.
+    parser: bool = false,
 };
 
 pub const Flow = struct {
@@ -170,6 +172,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
         if (!reads(c.configOf(file), flow.fact)) continue;
         try functionsOf(c, flow, file);
     }
+    try parsers(c, flow);
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         flow.changed = false;
@@ -184,6 +187,24 @@ fn reads(config: @import("Rule.zig").Config, fact: Fact) bool {
         .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation) or config.has(pack.contracts),
         .peer => config.has(pack.diagnostics),
     };
+}
+
+/// Marks each function the program hands to `Untrusted.parse`, before the rounds, so what its
+/// returned literals hold is settled from the first round.
+fn parsers(c: *Context, flow: *Flow) Context.Error!void {
+    var files = flow.owners.iterator();
+    while (files.next()) |entry| {
+        const file = Project.FileId.fromRaw(entry.key_ptr.*);
+        const tree = &c.project.files[file.raw()].tree;
+        for (entry.value_ptr.*, 0..) |own, i| {
+            if (own == null) continue;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
+            const callee = try resolveCall(c, flow, file, call);
+            if (callee.kind != .aegis) continue;
+            if (try parserOf(c, flow, file, call, callee.decl.?)) |target| flow.functions.items[target].parser = true;
+        }
+    }
 }
 
 /// The declarations the fact starts from and stops at: std's reader, file, directory and stream,
@@ -338,7 +359,13 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
                 if (tree.fullCall(&buffer, node)) |call| try effects(c, flow, function, call);
                 var literal_buffer: [2]Ast.Node.Index = undefined;
                 if (tree.fullStructInit(&literal_buffer, node)) |literal| if (try literalFields(c, f.file, node, literal)) |fields| {
-                    for (literal.ast.fields, fields) |value, field| try raiseGlobal(c, flow, field, concrete(flow, function, try dep(c, flow, function, value)));
+                    // A parser's result holds its numbers as its own value (`dep`): the parse
+                    // refines them, a direct call gives them as they were read.
+                    const refined = f.parser and returned(tree, model, node);
+                    for (literal.ast.fields, fields) |value, field| {
+                        if (refined and valueField(c, field)) continue;
+                        try raiseGlobal(c, flow, field, concrete(flow, function, try dep(c, flow, function, value)));
+                    }
                 };
                 if (isMemcpy(tree, node)) {
                     var args_buffer: [2]Ast.Node.Index = undefined;
@@ -513,20 +540,25 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
 /// peer's value: the parser reads input, and its own checks are read as any reader's are. Only
 /// what it returns, the refined result, is clean.
 fn parsed(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!void {
-    const origin = (try c.facts.origin(decl)) orelse decl;
-    const record = c.project.models[origin.file.raw()].declarations[origin.index];
-    if (!std.mem.eql(u8, record.name, "parse") or call.ast.params.len == 0) return;
-    const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = record.scope } };
-    if (try c.role(Contract.library, container) != .untrusted) return;
-    const parser = switch (try c.facts.resolve(file, call.ast.params[call.ast.params.len - 1])) {
-        .function => |function| function,
-        else => return,
-    };
-    const target = flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return }) orelse return;
+    const target = (try parserOf(c, flow, file, call, decl)) orelse return;
     const levels = flow.functions.items[target].levels;
     if (levels.len < 2 or levels[1].join(.data) == levels[1]) return;
     levels[1] = levels[1].join(.data);
     flow.changed = true;
+}
+
+/// The program's function an `Untrusted.parse(context, parser)` call hands its value to.
+fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!?u32 {
+    const origin = (try c.facts.origin(decl)) orelse decl;
+    const record = c.project.models[origin.file.raw()].declarations[origin.index];
+    if (!std.mem.eql(u8, record.name, "parse") or call.ast.params.len == 0) return null;
+    const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = record.scope } };
+    if (try c.role(Contract.library, container) != .untrusted) return null;
+    const parser = switch (try c.facts.resolve(file, call.ast.params[call.ast.params.len - 1])) {
+        .function => |function| function,
+        else => return null,
+    };
+    return flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return null });
 }
 
 /// Whether a method adds what it is given to its receiver's data: it takes its receiver by
@@ -879,8 +911,16 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, node)) |literal| {
         // A literal of a known type holds its fields' facts by their declarations; a tuple or
-        // a literal whose type does not resolve holds what it is given.
-        if (try literalFields(c, f.file, node, literal) != null) return .{};
+        // a literal whose type does not resolve holds what it is given. A parser's result
+        // holds its numbers itself: clean through the parse, input through a direct call.
+        if (try literalFields(c, f.file, node, literal)) |fields| {
+            if (!f.parser or !returned(tree, model, node)) return .{};
+            var out: Dep = .{};
+            for (literal.ast.fields, fields) |value, field| if (valueField(c, field)) {
+                out = out.join(try dep(c, flow, function, value));
+            };
+            return out;
+        }
         var out: Dep = .{};
         for (literal.ast.fields) |field| out = out.join(try dep(c, flow, function, field));
         return out;
@@ -917,6 +957,35 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
         field.* = decl;
     }
     return fields;
+}
+
+/// Whether a literal is what its function returns: a `return`'s operand, or an arm of an `if`
+/// or a `switch` that is.
+fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        switch (tree.nodeTag(parent)) {
+            .@"return" => return true,
+            .grouped_expression => {},
+            .@"if", .if_simple => {
+                const branch = tree.fullIf(parent).?;
+                if (at != branch.ast.then_expr and at.toOptional() != branch.ast.else_expr) return false;
+            },
+            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => if (at != tree.fullSwitchCase(parent).?.ast.target_expr) return false,
+            .@"switch", .switch_comma => if (at == tree.fullSwitch(parent).?.ast.condition) return false,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Whether a field's declared type is a number or a `bool`: a value, no memory a peer's bytes
+/// could stand behind.
+fn valueField(c: *Context, decl: Facts.Decl) bool {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const field = tree.fullContainerField(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
+    const declared = field.ast.type_expr.unwrap() orelse return false;
+    return tree.nodeTag(declared) == .identifier and Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)));
 }
 
 /// A labeled block's value: what its `break`s give it.
