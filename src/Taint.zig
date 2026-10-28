@@ -108,6 +108,8 @@ const Function = struct {
     ret: Dep = .{},
     /// The parameters whose memory it fills with the fact (a buffer it reads into).
     fills: u64 = 0,
+    /// Its comptime parameters: fixed when the program is compiled, so no input reaches them.
+    fixed: u64 = 0,
 };
 
 pub const Flow = struct {
@@ -248,8 +250,12 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, tree.nodeData(node).node_and_node[0]) orelse continue;
         var params: std.ArrayList(u32) = .empty;
+        var fixed: u64 = 0;
         var it = proto.iterate(tree);
         while (it.next()) |param| {
+            if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) {
+                fixed |= bit(params.items.len);
+            };
             const name = param.name_token orelse {
                 try params.append(c.allocator, std.math.maxInt(u32));
                 continue;
@@ -264,7 +270,7 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
         const levels = try c.allocator.alloc(Level, params.items.len);
         @memset(levels, .clean);
         try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @intCast(flow.functions.items.len));
-        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels });
+        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .fixed = fixed });
     }
     for (0..tree.nodes.len) |i| {
         var at: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -475,6 +481,7 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
             for (callee.args.items, 0..) |arg, position| {
                 const index = position + callee.skip;
                 if (index >= g.levels.len) break;
+                if (g.fixed & bit(index) != 0) continue;
                 const level = concrete(flow, function, try dep(c, flow, function, arg));
                 if (level.join(g.levels[index]) != g.levels[index]) {
                     flow.functions.items[target].levels[index] = level.join(g.levels[index]);

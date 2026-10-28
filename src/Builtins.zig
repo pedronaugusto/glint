@@ -243,6 +243,7 @@ fn amendedPolicies(self: *Context) RunError!void {
     const tree = &self.project.files[index].tree;
     if (self.config.has(.Z012)) for (self.project.models[index].declarations) |decl| {
         if (decl.kind != .function or !decl.public) continue;
+        if (!reachable(&self.project.models[index], decl.scope)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const function = tree.fullFnProto(&buffer, decl.node).?;
         if (function.ast.return_type.unwrap()) |t| try privateType(self, t, decl.token, 0);
@@ -257,6 +258,25 @@ fn amendedPolicies(self: *Context) RunError!void {
             if (statements.len == 0) try self.at(.Z026, tree.nodeMainToken(node), "empty catch discards an error; write a reason at this site");
         }
     };
+}
+
+/// Whether a caller outside the file can name what is declared in `scope`: each container around
+/// it held by a public or exported declaration, up to the file. A container a private declaration
+/// holds is named by nobody outside, so its `pub` methods are no public signature (reactor's
+/// backend sinks, called through `anytype`; a test's harness).
+fn reachable(model: *const Model, scope: u32) bool {
+    var at: ?u32 = scope;
+    while (at) |s| : (at = model.scopes[s].parent) {
+        if (model.scopes[s].kind != .container) continue;
+        const node = @backingInt(model.scopes[s].node);
+        if (node >= model.node_parents.len) continue;
+        const holder = model.node_parents[node] orelse continue;
+        for (model.declarations) |d| if (d.kind == .variable and d.node == holder) {
+            if (!d.public and !d.exported) return false;
+            break;
+        };
+    }
+    return true;
 }
 
 fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth: usize) RunError!void {
