@@ -304,8 +304,9 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             // What is left of a value once its quotient by `k` is taken away (`y - @divFloor(y,
             // k) * k`) is a remainder, below `k`.
             if (try remainder(c, file, lhs, rhs)) |k| return ((try bound(c, file, k, pointer, next)) orelse return null) -| 1;
-            // An unsigned difference that does not underflow is at most what it takes from.
-            if (!signed) return bound(c, file, lhs, pointer, next);
+            // An unsigned difference that does not underflow is at most what it takes from, less
+            // a constant it takes (an underflow stops the program: A010's to judge).
+            if (!signed) return ((try bound(c, file, lhs, pointer, next)) orelse return null) -| (literal(tree, rhs) orelse 0);
             return sum(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next));
         },
         .mul => {

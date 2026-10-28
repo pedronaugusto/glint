@@ -99,7 +99,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -1942,6 +1942,52 @@ test "A020 reads a cancellation point the loop reaches through the project's fun
         "pub fn f(io: std.Io, s: *Socket) void {\n    _ = io;\n    while (true) s.reader.interface.toss(1);\n}\n",
         "pub fn f(io: std.Io, s: *Socket) void {\n    _ = io;\n    while (true) if (!idle(s)) return;\n}\n",
     }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A009 reads an unsigned difference as at most what it is taken from less the constant it takes" {
+    // relic's resolve undo: a `u2` stage other than zero, less one, picks one of three.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Entry = struct { stage: u2 = 0, mode: u32 = 0 };
+        \\const Item = struct { modes: [3]u32 };
+        \\fn record(item: *Item, entry: Entry) void {
+        \\    if (entry.stage == 0) return;
+        \\    item.modes[entry.stage - 1] = entry.mode;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, items: []Item) !void {
+        \\    const b = try r.take(4);
+        \\    const flags = std.mem.readInt(u32, b[0..4], .big);
+        \\    items[0].modes[0] = flags;
+        \\    record(&items[0], .{ .stage = @truncate((flags >> 12) & 3), .mode = flags });
+        \\}
+    , 0);
+    // Less too small a constant, nothing taken, or a value no constant names, it stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\const Entry = struct { stage: u2 = 0, by: u2 = 0, mode: u32 = 0 };
+        \\const Item = struct { modes: [3]u32, pair: [2]u32 };
+        \\fn record(item: *Item, entry: Entry) void {
+        \\    if (entry.stage == 0) return;
+        \\
+    ;
+    const tail =
+        \\}
+        \\pub fn f(r: *std.Io.Reader, items: []Item) !void {
+        \\    const b = try r.take(4);
+        \\    const flags = std.mem.readInt(u32, b[0..4], .big);
+        \\    items[0].modes[0] = flags;
+        \\    items[0].pair[0] = flags;
+        \\    record(&items[0], .{ .stage = @truncate((flags >> 12) & 3), .by = @truncate(flags & 3), .mode = flags });
+        \\}
+    ;
+    inline for (.{
+        "    item.pair[entry.stage - 1] = entry.mode;\n",
+        "    item.modes[entry.stage] = entry.mode;\n",
+        "    if (entry.by > entry.stage) return;\n    item.pair[entry.stage - entry.by] = entry.mode;\n",
+    }) |body| expect(pack.untrusted_input, head ++ body ++ tail, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
