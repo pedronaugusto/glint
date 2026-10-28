@@ -176,6 +176,11 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, tree.nodeMainToken(arg), try c.allocator.print("{s}(.unlimited): a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
         };
         const names = try parameters(c, decl);
+        // A fixed reader's take, peek or discard views or skips bytes the program already
+        // holds and fails past them: no work a peer sizes, unless the read allocates.
+        var allocates = false;
+        for (names) |each| allocates = allocates or std.mem.eql(u8, each, "gpa") or std.mem.eql(u8, each, "allocator");
+        if (own and !allocates) continue;
         for (reached.args, 0..) |arg, position| {
             if (position >= names.len) break;
             var sized = false;

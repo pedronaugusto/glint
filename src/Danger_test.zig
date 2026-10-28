@@ -98,6 +98,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
+    \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     },
     .{ .name = "std/mem.zig", .bytes = "pub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
@@ -1991,4 +1992,35 @@ test "A009 reads an unsigned difference as at most what it is taken from less th
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
+}
+
+test "A012 reads a take, peek or discard on a fixed reader as no work a peer sizes, an allocating read as work" {
+    // relic's index extensions: each one's size, taken from the file's bytes it already holds.
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(in: *std.Io.Reader, body: []const u8) ![]u8 {
+        \\    var r: std.Io.Reader = .fixed(body);
+        \\    const size = try in.takeInt(u32, 0);
+        \\    return r.take(size);
+        \\}
+    , 0);
+    // A stream's take is a peer's size, and so is a fixed reader's read that allocates.
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(in: *std.Io.Reader, body: []const u8, gpa: std.mem.Allocator) ![]u8 {
+        \\    var r: std.Io.Reader = .fixed(body);
+        \\    const size = try in.takeInt(u32, 0);
+        \\    _ = try in.take(size);
+        \\    _ = gpa;
+        \\    return r.take(0);
+        \\}
+    , 1);
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(in: *std.Io.Reader, body: []const u8, gpa: std.mem.Allocator) ![]u8 {
+        \\    var r: std.Io.Reader = .fixed(body);
+        \\    const size = try in.takeInt(u32, 0);
+        \\    return r.readAlloc(gpa, size);
+        \\}
+    , 1);
 }
