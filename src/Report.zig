@@ -95,7 +95,15 @@ pub const Diagnostic = struct {
     fix: []const Edit = &.{},
 };
 /// One replacement of a file's bytes from `start` to `end` with `text`.
-pub const Edit = struct { start: u32, end: u32, text: []const u8 };
+pub const Edit = struct {
+    start: u32,
+    end: u32,
+    text: []const u8,
+    /// A bracket one finding opens or closes around its own operand: two findings' brackets
+    /// at one offset nest (`((a - b) >> 31) ^ 1`), so each is made, where an edit findings
+    /// share otherwise is made once.
+    nests: bool = false,
+};
 pub const Coverage = struct {
     file: Project.FileId,
     rule: ?rules.Rule = null,

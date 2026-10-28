@@ -118,7 +118,7 @@ fn precedence(self: *Context) RunError!void {
         const inner_token = tree.nodeMainToken(node);
         const at = tree.tokenStart(inner_token);
         const message = try self.allocator.print("'{s}' and '{s}' meet without parentheses, which Zig 0.18 refuses as ambiguous; parenthesize the operand", .{ tree.tokenSlice(outer_token), tree.tokenSlice(inner_token) });
-        const edits = try self.allocator.dupe(Report.Edit, &.{ .{ .start = operand_start, .end = operand_start, .text = "(" }, .{ .start = operand_end, .end = operand_end, .text = ")" } });
+        const edits = try self.allocator.dupe(Report.Edit, &.{ .{ .start = operand_start, .end = operand_start, .text = "(", .nests = true }, .{ .start = operand_end, .end = operand_end, .text = ")", .nests = true } });
         try self.emitFixed(.Z034, at, at + @as(u32, @intCast(tree.tokenSlice(inner_token).len)), message, &.{}, edits);
     }
 }

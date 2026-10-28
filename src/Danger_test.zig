@@ -2142,3 +2142,21 @@ test "A009 reads a constant margin: a cursor at most the length less a constant,
         return err;
     };
 }
+
+test "Z034's fix nests the parentheses two findings open at one offset" {
+    // warp's lzma range decoder: a difference shifted, the shift in an exclusive or.
+    const once = try fixed(.Z034,
+        \\pub fn mask(code: u32, range: u32) u32 {
+        \\    return 0 -% (code -% range >> 31 ^ 1);
+        \\}
+    );
+    defer std.testing.allocator.free(once);
+    try std.testing.expectEqualStrings(
+        \\pub fn mask(code: u32, range: u32) u32 {
+        \\    return 0 -% (((code -% range) >> 31) ^ 1);
+        \\}
+    , once);
+    const twice = try fixed(.Z034, once);
+    defer std.testing.allocator.free(twice);
+    try std.testing.expectEqualStrings(once, twice);
+}

@@ -15,7 +15,7 @@ pub const Changed = struct { file: Project.FileId, bytes: []const u8, edits: usi
 /// A rule's fix, copied into the report's storage.
 pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Error![]const Report.Edit {
     const out = try a.alloc(Report.Edit, fix.len);
-    for (fix, out) |e, *o| o.* = .{ .start = e.start, .end = e.end, .text = try a.dupe(u8, e.text) };
+    for (fix, out) |e, *o| o.* = .{ .start = e.start, .end = e.end, .text = try a.dupe(u8, e.text), .nests = e.nests };
     return out;
 }
 
@@ -79,7 +79,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         var made: usize = 0;
         var last: ?Report.Edit = null;
         for (edits.items) |e| {
-            if (last) |l| if (l.start == e.start and l.end == e.end and std.mem.eql(u8, l.text, e.text)) continue;
+            if (last) |l| if (!e.nests and l.start == e.start and l.end == e.end and std.mem.eql(u8, l.text, e.text)) continue;
             if (e.start < at) continue;
             try bytes.appendSlice(a, source[at..e.start]);
             try bytes.appendSlice(a, e.text);
