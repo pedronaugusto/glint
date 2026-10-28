@@ -2014,7 +2014,7 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
             if (apart(c, file, assignment, use, condition)) continue;
             // A use inside the assignment is read before its store (`x &= x - 1`).
             if (to <= tree.lastToken(assignment)) continue;
-            if (same(tree, tree.nodeData(assignment).node_and_node[0], compared)) return false;
+            if (reads(c, file, compared, tree.nodeData(assignment).node_and_node[0], 0)) return false;
         },
         // Its address handed on (`advance(&i)`) lets what takes it write it.
         .address_of => {
@@ -2023,11 +2023,40 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
             if (token <= from or token >= to) continue;
             if (skipped) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
             if (apart(c, file, taken, use, condition)) continue;
-            if (same(tree, tree.nodeData(taken).node, compared)) return false;
+            if (reads(c, file, compared, tree.nodeData(taken).node, 0)) return false;
         },
         else => {},
     };
     return true;
+}
+
+/// Whether a compared value reads what a store writes: the store's target spelled as a whole
+/// part of it (`in` of `in.len`, `ip` of `ip + 1`, `s.buf` of `s.buf.len`; not `s.pos` of
+/// `s.end`), or of the expression a constant it is names (`in_end` of `in.len - 32`).
+fn reads(c: *Context, file: Project.FileId, compared: Ast.Node.Index, target: Ast.Node.Index, depth: u8) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const written_to = bare(tree, target);
+    const want_first = tree.firstToken(written_to);
+    const want = tree.lastToken(written_to) - want_first + 1;
+    const at = bare(tree, compared);
+    const first = tree.firstToken(at);
+    const last = tree.lastToken(at);
+    var start = first;
+    while (start + want - 1 <= last) : (start += 1) {
+        // A part begins where no `.` names it a field of something else.
+        if (start > 0 and tree.tokenTag(start - 1) == .period) continue;
+        for (0..want) |k| {
+            const a: Ast.TokenIndex = @intCast(start + k);
+            const b: Ast.TokenIndex = @intCast(want_first + k);
+            if (tree.tokenTag(a) != tree.tokenTag(b) or !std.mem.eql(u8, tree.tokenSlice(a), tree.tokenSlice(b))) break;
+        } else {
+            // And ends where nothing continues it but a field, an index or a call on it.
+            const next = start + want;
+            if (next > last or tree.tokenTag(next) != .identifier) return true;
+        }
+    }
+    if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| return reads(c, file, init, target, depth + 1);
+    return false;
 }
 
 /// Whether `assignment` and `use` are in branches no path takes both of: one in an `if`'s

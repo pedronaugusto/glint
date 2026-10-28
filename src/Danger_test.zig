@@ -1313,6 +1313,55 @@ test "A010 reads a conversion into a type that fills its backing integer as safe
     try std.testing.expectEqualSlices(u32, &.{ 5, 10 }, result.lines[0..result.findings]);
 }
 
+test "A009 ends a length's fact where its memory is assigned between the check and the use, through a constant naming the length too" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn margin(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const ip: usize = try r.takeInt(u32, 0);
+        \\    const in_end = in.len - 32;
+        \\    if (ip <= in_end) {
+        \\        in = in[16..];
+        \\        return in[ip + 1 ..][0..16][0];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn spelled(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const ip: usize = try r.takeInt(u32, 0);
+        \\    if (ip <= in.len - 32) {
+        \\        in = in[16..];
+        \\        return in[ip + 1 ..][0..16][0];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn plain(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const ip: usize = try r.takeInt(u32, 0);
+        \\    if (ip < in.len) {
+        \\        in = in[16..];
+        \\        return in[ip];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn kept(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    var at: usize = 0;
+        \\    const ip: usize = try r.takeInt(u32, 0);
+        \\    if (ip < in.len) {
+        \\        at = 1;
+        \\        in[0] = @intCast(at);
+        \\        return in[ip];
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // Each use after its memory was assigned; never the one whose memory only had an element
+    // stored.
+    try std.testing.expectEqualSlices(u32, &.{ 8, 17, 26 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
