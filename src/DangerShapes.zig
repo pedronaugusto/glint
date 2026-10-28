@@ -599,6 +599,20 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
         if (tree.nodeMainToken(node) > end) return false;
         const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
         if (tree.nodeTag(parent) != .field_access) return false;
+        // A list freed at all, wherever the free is written (a `defer` before the store runs
+        // after it), leaves the borrow pointing at freed memory.
+        const member = tree.tokenSlice(tree.nodeData(parent).node_and_token[1]);
+        for ([_][]const u8{ "deinit", "clearAndFree", "shrinkAndFree", "toOwnedSlice", "toOwnedSliceSentinel", "moveToUnmanaged", "clearRetainingCapacity" }) |frees| {
+            if (std.mem.eql(u8, member, frees)) return false;
+        }
+        var up_from = node;
+        while (model.node_parents[@backingInt(up_from)]) |outer| : (up_from = outer) { // safe: a node index indexes its own tree's parent table.
+            switch (tree.nodeTag(outer)) {
+                .@"defer", .@"errdefer" => return false,
+                .fn_decl => break,
+                else => {},
+            }
+        }
     }
     return true;
 }

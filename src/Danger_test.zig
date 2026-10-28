@@ -2031,7 +2031,7 @@ test "A015 reads a function std's Io calls through its vtable as returning what 
     , 2);
 }
 
-test "A014 reads a local list nothing grows once its items are stored as no borrow a growth moves" {
+test "A014 reads a local list nothing grows or frees once its items are stored as no borrow a growth moves" {
     // parley's agreed task ids, collected into a local list and stored once it is full.
     try expect(pack.lifetimes,
         \\const std = @import("std");
@@ -2056,6 +2056,9 @@ test "A014 reads a local list nothing grows once its items are stored as no borr
         "    var held: std.ArrayList(u32) = .{};\n    grow(&held);\n    agreed.ids = held.items;\n    _ = from;\n}\n",
         "    var held: std.ArrayList(u32) = .{};\n    for (from) |id| {\n        held.append(id);\n        agreed.ids = held.items;\n    }\n}\n",
         "    const list = &agreed.list;\n    list.append(from[0]);\n    agreed.ids = list.items;\n}\n",
+        // Freed, by a `defer` written before the store or a `deinit` after it.
+        "    var held: std.ArrayList(u32) = .{};\n    defer held.deinit();\n    held.append(from[0]);\n    agreed.ids = held.items;\n}\n",
+        "    var held: std.ArrayList(u32) = .{};\n    errdefer held.clearAndFree();\n    held.append(from[0]);\n    agreed.ids = held.items;\n}\n",
     }) |body| expect(pack.lifetimes, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
