@@ -33,7 +33,7 @@ const std_files = [_]sources.Extra{
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Handle = @import("root").Handle;
-    \\pub const VTable = struct { close: *const fn (?*anyopaque, Handle) void, write: *const fn (?*anyopaque, Handle, []const u8) void };
+    \\pub const VTable = struct { close: *const fn (?*anyopaque, Handle) void, write: *const fn (?*anyopaque, Handle, []const u8) void, processSpawn: *const fn (?*anyopaque) void };
     \\pub const Condition = struct { state: u32 = 0 };
     \\pub const Semaphore = struct { permits: usize = 0 };
     \\pub const Event = enum(u32) { unset, set };
@@ -1841,4 +1841,32 @@ test "A010 reads a shift amount's conversion as into the log of the shifted valu
         \\    return if (bits > 128) 0 else @as(u128, 1) << @intCast(bits);
         \\}
     , 1);
+}
+
+test "A015 reads a function std's Io calls through its vtable as returning what the caller of the operation owns" {
+    // conduit's routed spawn, given to a layer as the `processSpawn` slot.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const State = struct { base: std.Io };
+        \\pub fn routedSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    const state: *State = @ptrCast(@alignCast(userdata.?));
+        \\    return std.process.spawn(state.base, options);
+        \\}
+        \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
+        \\pub const Routed = Layer(.{ .processSpawn = &routedSpawn });
+    , 0);
+    // Named in a slot no vtable declares, or taking no userdata, it hands over an owner.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const State = struct { base: std.Io };
+        \\pub fn routedSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    const state: *State = @ptrCast(@alignCast(userdata.?));
+        \\    return std.process.spawn(state.base, options);
+        \\}
+        \\pub fn spawn(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    return std.process.spawn(io, options);
+        \\}
+        \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
+        \\pub const Routed = Layer(.{ .start = &routedSpawn, .processSpawn = spawn });
+    , 2);
 }

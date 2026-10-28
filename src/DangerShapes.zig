@@ -8,6 +8,7 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
+const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -23,7 +24,8 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     if (resources.len == 0) return;
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
-    for (model.declarations) |decl| {
+    var vtable: ?Facts.Container = null;
+    for (model.declarations, 0..) |decl, index| {
         if (c.inTest(decl.token)) continue;
         const written: Ast.Node.Index = switch (decl.kind) {
             .field => (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue,
@@ -37,6 +39,10 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         const which = find(resources, held) orelse continue;
         if (decl.kind == .field and !released(tree, decl.name)) continue;
         if (decl.kind == .function and views(tree, model, decl)) continue;
+        if (decl.kind == .function) {
+            if (vtable == null) vtable = (try containersOf(c, rule, &.{"Io.VTable"}))[0];
+            if (try implements(c, @intCast(index), vtable.?)) continue;
+        }
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once", .{ what, decl.name, how, paths[which] }));
@@ -67,6 +73,43 @@ fn views(tree: *const Ast, model: *const Model, decl: Model.Declaration) bool {
         returns += 1;
     }
     return returns != 0;
+}
+
+/// Whether a function is one std's `Io` calls through its vtable: it takes the `?*anyopaque`
+/// userdata first and is named, not called, as a literal's value for a field `Io.VTable`
+/// declares (`.processSpawn = seam.routedSpawn`). The vtable fixes its signature, and the
+/// caller of the `Io` operation owns what it returns, as with std's own implementations.
+fn implements(c: *Context, index: u32, vtable: Facts.Container) Context.Error!bool {
+    if (vtable.scope == std.math.maxInt(u32)) return false;
+    const decl = c.project.models[c.file.raw()].declarations[index];
+    const own = &c.project.files[c.file.raw()].tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = own.fullFnProto(&proto_buffer, decl.node) orelse return false;
+    var params = proto.iterate(own);
+    const first = params.next() orelse return false;
+    if (!std.mem.eql(u8, own.getNodeSource(first.type_expr orelse return false), "?*anyopaque")) return false;
+    for (c.project.inputs, 0..) |input, f| {
+        if (!input.selected) continue;
+        const file = Project.FileId.fromRaw(@intCast(f));
+        const tree = &c.project.files[f].tree;
+        for (tree.nodes.items(.tag), 0..) |_, i| {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullStructInit(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
+            for (literal.ast.fields) |value| {
+                var named = value;
+                if (tree.nodeTag(named) == .address_of) named = tree.nodeData(named).node;
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(named)), decl.name)) continue;
+                if (tree.firstToken(value) < 2) continue;
+                const slot = c.facts.member(vtable, tree.tokenSlice(tree.firstToken(value) - 2)) orelse continue;
+                if (c.project.models[slot.file.raw()].declarations[slot.index].kind != .field) continue;
+                switch (try c.facts.resolve(file, named)) {
+                    .function => |d| if (d.file.eql(c.file) and d.index == index) return true,
+                    else => {},
+                }
+            }
+        }
+    }
+    return false;
 }
 
 fn viewed(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8) bool {
