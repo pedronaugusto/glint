@@ -600,9 +600,14 @@ const Stores = struct {
     /// The names given to a call as arguments: a type a function fills by reflection (`std.json`
     /// parsing a `Config`, `bytesToValue(Header, …)`) has fields no store sets.
     arguments: std.StringHashMapUnmanaged(void) = .empty,
+    /// The structs whose bytes something may write that no store shows: a value of one viewed as
+    /// bytes (`std.mem.asBytes`) or reinterpreted (`@ptrCast`, `@bitCast`, `@memcpy`), a pointer
+    /// to one handed to a function outside the program (a reader, an `extern`), whose writes are
+    /// not read, or one stored into through a name not known as it compiles (`@field(x, name)`).
+    exposed: std.AutoHashMapUnmanaged(struct { Project.FileId, u32 }, void) = .empty,
     /// A store's file and node: an assignment (or one that changes the field in place, or takes
     /// its address), or a struct literal's field value.
-    const Site = struct { file: Project.FileId, node: Ast.Node.Index, kind: enum { assign, changes, literal } };
+    const Site = struct { file: Project.FileId, node: Ast.Node.Index, kind: enum { assign, changes, literal, named } };
 };
 
 fn stores(c: *Context) Context.Error!*Stores {
@@ -615,6 +620,7 @@ fn stores(c: *Context) Context.Error!*Stores {
         const tree = &f.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            try expose(c, memo, file, node);
             const target: Ast.Node.Index, const kind: @FieldType(Stores.Site, "kind") = switch (tag) {
                 .assign => .{ tree.nodeData(node).node_and_node[0], .assign },
                 .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => .{ tree.nodeData(node).node_and_node[0], .changes },
@@ -643,11 +649,117 @@ fn stores(c: *Context) Context.Error!*Stores {
                     continue;
                 },
             };
+            // `@field(x, "name") = v` stores into the field it names.
+            if (fieldBuiltin(tree, target)) |named_field| {
+                if (named_field.name) |name| try add(c, memo, name, .{ .file = file, .node = node, .kind = if (kind == .assign) .named else .changes });
+                continue;
+            }
             if (tree.nodeTag(target) != .field_access) continue;
             try add(c, memo, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), .{ .file = file, .node = node, .kind = kind });
         }
     }
     return memo;
+}
+
+/// `@field(holder, name)`: its holder, and its name where a string literal spells it.
+fn fieldBuiltin(tree: *const Ast, node: Ast.Node.Index) ?struct { holder: Ast.Node.Index, name: ?[]const u8 } {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return null;
+    const holder, const name_node = tree.nodeData(node).opt_node_and_opt_node;
+    const name = name_node.unwrap() orelse return null;
+    const spelled: ?[]const u8 = if (tree.nodeTag(name) == .string_literal) blk: {
+        const text = tree.tokenSlice(tree.nodeMainToken(name));
+        break :blk if (text.len >= 2) text[1 .. text.len - 1] else null;
+    } else null;
+    return .{ .holder = holder.unwrap() orelse return null, .name = spelled };
+}
+
+/// Marks the structs a node lets something write without a store: see `Stores.exposed`.
+fn expose(c: *Context, memo: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (std.mem.eql(u8, name, "@field")) {
+                const named_field = fieldBuiltin(tree, node) orelse return;
+                if (named_field.name == null) try exposeValue(c, memo, file, named_field.holder);
+                return;
+            }
+            for ([_][]const u8{ "@ptrCast", "@bitCast", "@memcpy", "@memset", "@memmove" }) |reinterpret| if (std.mem.eql(u8, name, reinterpret)) {
+                for (args) |arg| try exposeValue(c, memo, file, arg);
+                // What a reinterpretation makes is its destination's: bytes viewed as a struct.
+                if (try destined(c, file, node)) |into| switch (into) {
+                    .named => |type_node| try exposeType(c, memo, try c.facts.resolve(type_node.file, type_node.node)),
+                    .assigned => |lhs| try exposeValue(c, memo, file, lhs),
+                    .field => |decl| try exposeType(c, memo, try c.facts.declaration(decl)),
+                    else => {},
+                };
+                return;
+            };
+        },
+        else => {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node) orelse return;
+            const callee = try c.facts.resolve(file, call.ast.fn_expr);
+            const own = switch (callee) {
+                .function => |decl| c.project.inputs[decl.file.raw()].selected,
+                else => false,
+            };
+            // std's byte views write through the bytes they give.
+            const viewed = if (tree.nodeTag(call.ast.fn_expr) == .field_access) blk: {
+                const method = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+                break :blk std.mem.eql(u8, method, "asBytes") or std.mem.eql(u8, method, "sliceAsBytes") or std.mem.eql(u8, method, "bytesAsValue") or std.mem.eql(u8, method, "bytesAsSlice");
+            } else false;
+            if (own and !viewed) return;
+            for (call.ast.params) |arg| {
+                // A struct handed over by value is a copy: what is written is not it.
+                if (!viewed and tree.nodeTag(arg) != .address_of) {
+                    var value = try c.facts.resolve(file, arg);
+                    while (value == .optional) value = value.optional.*;
+                    if (value != .pointer) continue;
+                }
+                try exposeValue(c, memo, file, arg);
+            }
+            if (viewed) if (try destined(c, file, node)) |into| switch (into) {
+                .named => |type_node| try exposeType(c, memo, try c.facts.resolve(type_node.file, type_node.node)),
+                else => {},
+            };
+        },
+    }
+}
+
+fn exposeValue(c: *Context, memo: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.files[file.raw()].tree;
+    var at = node;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .address_of => tree.nodeData(at).node,
+        .grouped_expression => tree.nodeData(at).node_and_token[0],
+        else => break,
+    };
+    try exposeType(c, memo, try c.facts.resolve(file, at));
+}
+
+/// Marks the struct a value is, points to or holds an array of.
+fn exposeType(c: *Context, memo: *Stores, value: Facts.Value) Context.Error!void {
+    var inner_value = value;
+    while (true) inner_value = switch (inner_value) {
+        .pointer, .optional, .array, .error_union => |inner| inner.*,
+        else => break,
+    };
+    const k = switch (inner_value) {
+        .instance, .container => |k| k,
+        .alternatives => |each| {
+            for (each) |one| try exposeType(c, memo, one);
+            return;
+        },
+        else => return,
+    };
+    try memo.exposed.put(c.allocator, .{ k.file, k.scope }, {});
 }
 
 fn add(c: *Context, memo: *Stores, name: []const u8, site: Stores.Site) Context.Error!void {
@@ -683,6 +795,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     const found = try stores(c);
     const type_name = containerName(c, decl.file, container_node) orelse return null;
     if (found.arguments.contains(type_name)) return null;
+    if (found.exposed.contains(.{ decl.file, record.scope })) return null;
     var out: ?u128 = 0;
     if (field_decl.ast.value_expr.unwrap()) |default| if (!empty(tree, default)) {
         out = try bound(c, decl.file, default, pointer, depth);
@@ -692,6 +805,27 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
         if (out == null) break;
         const site_tree = &c.project.files[site.file.raw()].tree;
         switch (site.kind) {
+            // `@field(x, "name") = v`: a store to the field of x's struct it names.
+            .named => {
+                const target = site_tree.nodeData(site.node).node_and_node[0];
+                const field_holder = (fieldBuiltin(site_tree, target) orelse continue).holder;
+                var holder_value = try c.facts.resolve(site.file, field_holder);
+                while (true) holder_value = switch (holder_value) {
+                    .pointer, .optional => |inner| inner.*,
+                    else => break,
+                };
+                const container = switch (holder_value) {
+                    .instance, .container => |k| k,
+                    // A holder whose type is not known may be this one.
+                    else => {
+                        out = null;
+                        continue;
+                    },
+                };
+                if (!container.file.eql(decl.file) or container.scope != record.scope) continue;
+                const value = site_tree.nodeData(site.node).node_and_node[1];
+                if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
+            },
             .assign, .changes => {
                 const target = if (site_tree.nodeTag(site.node) == .address_of) site_tree.nodeData(site.node).node else site_tree.nodeData(site.node).node_and_node[0];
                 const reached = (try c.facts.definition(site.file, target)) orelse continue;

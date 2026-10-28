@@ -100,7 +100,7 @@ const std_files = [_]sources.Extra{
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -2453,4 +2453,45 @@ test "A010 reads an address moved from a pointer through a constant as an addres
         \\    return m - offset;
         \\}
     , 1);
+}
+
+test "A010 reads a field by its stores only while nothing writes its struct's bytes unseen: a byte view, a reinterpretation, its address handed outside the program, a store through a computed name" {
+    // Stores the program makes, a literal-named `@field` among them, and a struct its own
+    // function writes through the address it is given, keep their fields' ranges.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Weights = struct { count: u32 = 0 };
+        \\const Named = struct { n: u32 = 0 };
+        \\const Set = struct { n: u32 = 0 };
+        \\fn set(s: *Set, v: u32) void {
+        \\    s.n = v & 0xff;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, w: *Weights, q: *Named, t: *Set) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    if (n >= 255) return error.Long;
+        \\    w.count = n + 1;
+        \\    _ = w.count * 1000;
+        \\    @field(q, "n") = n;
+        \\    _ = q.n * 1000;
+        \\    set(t, n);
+        \\    _ = t.n * 1000;
+        \\}
+    , 0);
+    // Input's bytes written over the struct, its address handed to std, its bytes reinterpreted,
+    // a computed name, and a literal-named store of a peer's value each leave a field unbounded.
+    const head =
+        \\const std = @import("std");
+        \\const S = struct { n: u32 = 0 };
+        \\
+    ;
+    inline for (.{
+        "pub fn f(r: *std.Io.Reader, b: *S) !u32 {\n    const n = try r.takeInt(u32, 0);\n    if (n >= 255) return error.Long;\n    b.n = n;\n    try r.readSliceAll(std.mem.asBytes(b));\n    return b.n * 1000;\n}\n",
+        "pub fn f(r: *std.Io.Reader, b: *S) !u32 {\n    const n = try r.takeInt(u32, 0);\n    if (n >= 255) return error.Long;\n    b.n = n;\n    var x: S = .{};\n    try r.readSliceAll(@ptrCast(&x));\n    return b.n * 1000;\n}\n",
+        "pub fn f(r: *std.Io.Reader, bytes: *[4]u8) !u32 {\n    const n = try r.takeInt(u32, 0);\n    if (n >= 255) return error.Long;\n    const b: *S = @ptrCast(@alignCast(bytes));\n    b.n = n;\n    return b.n * 1000;\n}\n",
+        "pub fn f(r: *std.Io.Reader, b: *S) !u32 {\n    const n = try r.takeInt(u32, 0);\n    if (n >= 255) return error.Long;\n    b.n = n;\n    inline for (.{\"n\"}) |name| @field(b, name) = try r.takeInt(u32, 0);\n    return b.n * 1000;\n}\n",
+        "pub fn f(r: *std.Io.Reader, b: *S) !u32 {\n    const n = try r.takeInt(u32, 0);\n    if (n >= 255) return error.Long;\n    b.n = n;\n    @field(b, \"n\") = try r.takeInt(u32, 0);\n    return b.n * 1000;\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
 }
