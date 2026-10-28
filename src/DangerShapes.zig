@@ -512,6 +512,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
         const target, const value = tree.nodeData(node).node_and_node;
         if (tree.nodeTag(target) != .field_access or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
+        if (try settled(c, node, value)) continue;
         try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a borrow of a std container's storage ({s}) stored in a field: the next growth moves it; aegis handle keys or scope references stay valid", .{what}));
     }
 }
@@ -544,6 +545,62 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const Facts.Container, no
             return null;
         },
     }
+}
+
+/// Whether the borrowed container is a local nothing grows once the store is made: declared
+/// in the function by value (no pointer to one held elsewhere), each of its mentions a member
+/// of it (`held.append(`, `held.items`, never `&held` or `held` handed on, so no alias grows
+/// it), none after the store, and the store in no loop inside the local's scope that a next
+/// pass could grow it in. Once the function returns the list is gone, and with it every way to
+/// move its storage (parley's agreed task ids, collected into an arena list).
+fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    var at = value;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .grouped_expression, .unwrap_optional => tree.nodeData(at).node_and_token[0],
+        .address_of => tree.nodeData(at).node,
+        .array_access => tree.nodeData(at).node_and_node[0],
+        .slice_open, .slice, .slice_sentinel => (tree.fullSlice(at) orelse return false).ast.sliced,
+        .field_access => break,
+        else => {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, at) orelse return false;
+            if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+            at = call.ast.fn_expr;
+            break;
+        },
+    };
+    const receiver = tree.nodeData(at).node_and_token[0];
+    if (tree.nodeTag(receiver) != .identifier) return false;
+    const local = (model.reference(receiver) orelse return false).declaration orelse return false;
+    const record = model.declarations[local];
+    if (record.kind != .variable) return false;
+    switch (model.scopes[record.scope].kind) {
+        .file, .container => return false,
+        else => {},
+    }
+    if ((try c.facts.resolve(c.file, receiver)) != .instance) return false;
+    // A loop between the local's scope and the store runs the store again after a growth.
+    var up = store;
+    while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) { // safe: a node index indexes its own tree's parent table.
+        if (parent == model.scopes[record.scope].node) break;
+        switch (tree.nodeTag(parent)) {
+            .while_simple, .while_cont, .@"while", .for_simple, .@"for" => return false,
+            else => {},
+        }
+    }
+    const end = tree.lastToken(store);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const reference = model.reference(node) orelse continue;
+        if (reference.declaration != local) continue;
+        if (tree.nodeMainToken(node) > end) return false;
+        const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        if (tree.nodeTag(parent) != .field_access) return false;
+    }
+    return true;
 }
 
 /// Whether a value is a container declared in one of std's container namespaces.

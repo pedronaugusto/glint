@@ -1870,3 +1870,34 @@ test "A015 reads a function std's Io calls through its vtable as returning what 
         \\pub const Routed = Layer(.{ .start = &routedSpawn, .processSpawn = spawn });
     , 2);
 }
+
+test "A014 reads a local list nothing grows once its items are stored as no borrow a growth moves" {
+    // parley's agreed task ids, collected into a local list and stored once it is full.
+    try expect(pack.lifetimes,
+        \\const std = @import("std");
+        \\const Agreed = struct { ids: []u32 = &.{} };
+        \\pub fn agree(agreed: *Agreed, from: []const u32) void {
+        \\    var held: std.ArrayList(u32) = .{};
+        \\    for (from) |id| held.append(id);
+        \\    agreed.ids = held.items;
+        \\}
+    , 0);
+    // Grown after the store, handed on where an alias may grow it, stored in a loop that grows
+    // it on the next pass, or a list someone else holds, each stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\const Agreed = struct { ids: []u32 = &.{}, list: std.ArrayList(u32) = .{} };
+        \\fn grow(list: *std.ArrayList(u32)) void { list.append(1); }
+        \\pub fn agree(agreed: *Agreed, from: []const u32) void {
+        \\
+    ;
+    inline for (.{
+        "    var held: std.ArrayList(u32) = .{};\n    agreed.ids = held.items;\n    held.append(from[0]);\n}\n",
+        "    var held: std.ArrayList(u32) = .{};\n    grow(&held);\n    agreed.ids = held.items;\n    _ = from;\n}\n",
+        "    var held: std.ArrayList(u32) = .{};\n    for (from) |id| {\n        held.append(id);\n        agreed.ids = held.items;\n    }\n}\n",
+        "    const list = &agreed.list;\n    list.append(from[0]);\n    agreed.ids = list.items;\n}\n",
+    }) |body| expect(pack.lifetimes, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
