@@ -4,6 +4,10 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A009 judges a pointer moved by input (`out.ptr + o`, `m - offset`, `p += n`): no length checks the address it reaches, unless the offset is shown below the length of the memory the pointer came from. It was left to A009 and A009 never judged it, so a package may see findings it had not.
+
 ## [0.7.5] - 2026-10-28
 
 ### Changed

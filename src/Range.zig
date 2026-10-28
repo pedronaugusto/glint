@@ -310,6 +310,18 @@ pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
     return pointerValue(c, file, tree.nodeData(node).node_and_node[0], 0);
 }
 
+/// Whether pointer arithmetic stays within the memory its pointer came from: an offset below
+/// the length of `x` for `x.ptr + o`.
+pub fn movedWithin(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const base, const moved = tree.nodeData(node).node_and_node;
+    const at = bare(tree, base);
+    if (tree.nodeTag(at) != .field_access) return false;
+    const memory, const name = tree.nodeData(at).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return false;
+    return within(c, file, moved, memory, false);
+}
+
 /// Whether a value is a pointer: one it resolves to, an address moved from one (`p + i`,
 /// `p - i`), or a constant naming either (`const m = out.ptr + o_lit;`).
 fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {

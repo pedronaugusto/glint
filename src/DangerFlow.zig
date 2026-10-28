@@ -41,6 +41,13 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 if (!before_end and !try Range.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
                 if (slice.ast.end.unwrap()) |end| if (!try Range.within(c, c.file, end, slice.ast.sliced, true)) try sink(c, flow, rule, end, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
             },
+            // A pointer moved by input reaches the address a peer chooses: no length checks it,
+            // unless its offset is shown within the memory it came from (`x.ptr + o`, `o < x.len`).
+            .add, .sub, .add_wrap, .sub_wrap, .assign_add, .assign_sub, .assign_add_wrap, .assign_sub_wrap => {
+                if (!try Range.addresses(c, c.file, node) or try Range.movedWithin(c, c.file, node)) continue;
+                const offset = tree.nodeData(node).node_and_node[1];
+                try judged(c, flow, rule, offset, try ranged(c, flow, offset), .data, "input moves a pointer: a peer chooses the address it reaches; parse it into a refined type with aegis input.Untrusted");
+            },
             // A loop a byte bounds runs a byte's count at most: a number bounds one a peer's way.
             .for_range => if (tree.nodeData(node).node_and_opt_node[1].unwrap()) |end| {
                 const parent = c.project.models[c.file.raw()].node_parents[@backingInt(node)] orelse continue;

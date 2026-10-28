@@ -1258,6 +1258,36 @@ test "A009 reads a parser's returned literal as the parse refines it: its number
     try std.testing.expectEqualSlices(u32, &.{ 21, 26 }, result.lines[0..result.findings]);
 }
 
+test "A009 judges a pointer moved by input: no length checks the address it reaches, unless the offset is within the memory it came from" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn moved(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, 0);
+        \\    const offset: usize = try r.takeInt(u32, 0);
+        \\    const m = out.ptr + o;
+        \\    const src = m - offset;
+        \\    return src[0];
+        \\}
+        \\pub fn indexed(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, 0);
+        \\    return (out.ptr + o)[0];
+        \\}
+        \\pub fn stepped(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    var p = out.ptr;
+        \\    p += try r.takeInt(u32, 0);
+        \\    return p[0];
+        \\}
+        \\pub fn checked(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, 0);
+        \\    if (o >= out.len) return error.Short;
+        \\    return (out.ptr + o)[0];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // Each offset moved by input; never the one checked against its memory's length.
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 11, 15 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
