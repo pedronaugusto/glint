@@ -1777,3 +1777,68 @@ test "A020 counts a refill through a reader made from the function's Io as a can
         \\}
     , 1);
 }
+
+test "A010 reads a type made from its backing integer as holding the operand where each value it can have is one of the type's" {
+    // uplink's h2 frame types and DNS codes, warp's xz check and zstd block kind, hold's zip hosts.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\const Frame = enum(u8) { data = 0, headers = 1, priority_update = 0x10, _ };
+        \\const Check = enum(u4) { none = 0, crc32 = 1, crc64 = 4, sha256 = 0xa, _ };
+        \\const Kind = enum(u2) { raw, rle, compressed, reserved };
+        \\const Mode = enum(u8) { a, b, c, d };
+        \\const Bits = packed struct(u8) { low: u4, high: u4 };
+        \\const Header = struct { frame: Frame, check: Check };
+        \\fn host(bits: Bits) u8 { return @backingInt(bits); }
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const bytes = try r.take(4);
+        \\    const made_by: u16 = try r.takeInt(u16, .little);
+        \\    const h: u24 = try r.takeInt(u24, .little);
+        \\    const header: Header = .{ .frame = @fromBackingInt(@intCast(bytes[3])), .check = @fromBackingInt(@intCast(@as(u4, @truncate(bytes[2])))) };
+        \\    const kind: Kind = @fromBackingInt(@as(u2, @truncate(h >> 1)));
+        \\    var mode: Mode = .a;
+        \\    mode = @enumFromInt(bytes[1] & 3);
+        \\    const frame: ?Frame = @fromBackingInt(@intCast(made_by >> 8));
+        \\    return @backingInt(header.frame) +% @backingInt(header.check) +% @backingInt(kind) +% @backingInt(mode) +% @backingInt(frame.?) +% host(@fromBackingInt(bytes[0]));
+        \\}
+    , 0);
+    // An exhaustive enum's unnamed values stay findings, as does an operand wider than the
+    // tags named from zero, and a conversion into the backing integer that may not fit.
+    const head =
+        \\const std = @import("std");
+        \\const Gap = enum(u4) { none = 0, crc32 = 1, crc64 = 4 };
+        \\const Mode = enum(u8) { a, b, c, d };
+        \\const Open = enum(u8) { a, _ };
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const bytes = try r.take(4);
+        \\
+    ;
+    inline for (.{
+        "    const check: Gap = @fromBackingInt(@as(u4, @truncate(bytes[0])));\n    return @backingInt(check);\n}\n",
+        "    const mode: Mode = @fromBackingInt(bytes[1] & 7);\n    return @backingInt(mode);\n}\n",
+        "    const wide: u16 = try r.takeInt(u16, .little);\n    const open: Open = @fromBackingInt(@intCast(wide));\n    return @backingInt(open) +% bytes[0];\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A010 reads a shift amount's conversion as into the log of the shifted value's width" {
+    // glint's own `filled`: a width checked below 128 shifts a u128.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u128 {
+        \\    const bits: u16 = try r.takeInt(u16, .little);
+        \\    var mask: u64 = 1;
+        \\    mask <<= @intCast(bits & 63);
+        \\    return if (bits >= 128) mask else (@as(u128, 1) << @intCast(bits)) - 1;
+        \\}
+    , 0);
+    // An amount past the width stays a finding.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u128 {
+        \\    const bits: u16 = try r.takeInt(u16, .little);
+        \\    return if (bits > 128) 0 else @as(u128, 1) << @intCast(bits);
+        \\}
+    , 1);
+}

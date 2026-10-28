@@ -139,6 +139,9 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (args.len != 1) continue;
                 const level = try Taint.levelAt(c, flow, c.file, args[0]);
                 if (level.reaches(.data) and std.mem.eql(u8, name, "@intCast") and try Range.converts(c, c.file, node, args[0])) continue;
+                // A type whose values are each of its backing integers, or the operand's
+                // range among the tags it names, holds whatever the operand is.
+                if (level.reaches(.data) and !std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@intFromFloat") and try Range.fills(c, c.file, node, args[0])) continue;
                 try judged(c, flow, rule, node, level, .data, try c.allocator.print("{s} of input: a peer's value that does not fit stops the program; aegis int.cast returns the error", .{name}));
             },
             else => {},
