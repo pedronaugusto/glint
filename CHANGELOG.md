@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-10-28
+
 ### Changed
 
 - A009 and A010 read a plain struct's field by the values the program stores in it only while nothing writes the struct's bytes where no store shows it: a value of it viewed as bytes (`std.mem.asBytes`, `bytesAsValue`) or reinterpreted (`@ptrCast`, `@bitCast`, `@memcpy`), a pointer to it handed to a function outside the program (a reader, an `extern`), or a store through a name not known as it compiles (`@field(x, name)`). Any of them drops every field of that struct to its type's range. A literal-named `@field(x, "n") = v` is a store to `n`. These were missed since 0.7.1 (input read over a struct with `readSliceAll(std.mem.asBytes(b))` left its fields at their stored values), so a package may see findings it had not.
