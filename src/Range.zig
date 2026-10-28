@@ -15,6 +15,7 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Model = @import("Model.zig");
 const Contract = @import("AegisContract.zig");
 const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
@@ -195,7 +196,17 @@ fn nonnegative(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
     return nonnegativeAt(c, file, node, node, pointer, 0);
 }
 
+/// What a nonnegativity reading takes as given: a local whose every value is being shown at
+/// zero or above (so its own reads in them are, by induction), and an assignment left out,
+/// the one a negation being judged makes of the local (`x = -x`), whose value no read before
+/// it sees.
+const Assumed = struct { local: ?u32 = null, skip: ?Ast.Node.Index = null };
+
 fn nonnegativeAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!bool {
+    return nonnegativeIn(c, file, node, at, pointer, depth, .{});
+}
+
+fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8, assumed: Assumed) Context.Error!bool {
     if (depth > depth_limit) return false;
     const next = depth + 1;
     switch (try typeOf(c, file, node, pointer, 0)) {
@@ -215,35 +226,66 @@ fn nonnegativeAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
             const lhs, const rhs = tree.nodeData(value).node_and_node;
             return literal(tree, lhs) != null or literal(tree, rhs) != null;
         },
-        .add, .mul => {
+        .add, .mul, .add_sat, .mul_sat => {
             const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return try nonnegativeAt(c, file, lhs, at, pointer, next) and try nonnegativeAt(c, file, rhs, at, pointer, next);
+            return try nonnegativeIn(c, file, lhs, at, pointer, next, assumed) and try nonnegativeIn(c, file, rhs, at, pointer, next, assumed);
         },
         .div => {
             const lhs, const rhs = tree.nodeData(value).node_and_node;
-            return (literal(tree, rhs) orelse 0) > 0 and try nonnegativeAt(c, file, lhs, at, pointer, next);
+            return (literal(tree, rhs) orelse 0) > 0 and try nonnegativeIn(c, file, lhs, at, pointer, next, assumed);
         },
         .builtin_call_two, .builtin_call_two_comma => {
             const name = tree.tokenSlice(tree.nodeMainToken(value));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, value, &buffer);
             if (std.mem.eql(u8, name, "@abs")) return true;
-            if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeAt(c, file, args[0], at, pointer, next);
+            if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
             if (args.len != 2) return false;
-            if (std.mem.eql(u8, name, "@as")) return nonnegativeAt(c, file, args[1], at, pointer, next);
+            if (std.mem.eql(u8, name, "@as")) return nonnegativeIn(c, file, args[1], at, pointer, next, assumed);
             if (std.mem.eql(u8, name, "@max")) return literal(tree, args[0]) != null or literal(tree, args[1]) != null;
             if (std.mem.eql(u8, name, "@mod")) return (literal(tree, args[1]) orelse 0) > 0;
-            if (std.mem.eql(u8, name, "@divTrunc") or std.mem.eql(u8, name, "@divFloor")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeAt(c, file, args[0], at, pointer, next);
+            if (std.mem.eql(u8, name, "@rem")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
+            if (std.mem.eql(u8, name, "@divTrunc") or std.mem.eql(u8, name, "@divFloor")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
         },
         .identifier => {
             const model = &c.project.models[file.raw()];
             const d = (model.reference(value) orelse return false).declaration orelse return false;
+            if (assumed.local == d) return true;
             const record = model.declarations[d];
             if (record.kind != .variable) return false;
             const variable = tree.fullVarDecl(record.node) orelse return false;
             const init = variable.ast.init_node.unwrap() orelse return false;
-            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const and !try kept(c, file, value, record.node, at)) return false;
-            return nonnegativeAt(c, file, init, init, pointer, next);
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_const or try kept(c, file, value, record.node, at)) return nonnegativeIn(c, file, init, init, pointer, next, assumed);
+            // A variable every value of which is at zero or above: its initializer and what
+            // each assignment gives it, its own reads in them taken as such.
+            if (assumed.local != null) return false;
+            const inductive: Assumed = .{ .local = d, .skip = assumed.skip };
+            if (!try nonnegativeIn(c, file, init, init, pointer, next, inductive)) return false;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                switch (tag) {
+                    .assign, .assign_add, .assign_mul, .assign_add_sat, .assign_mul_sat => {},
+                    .assign_sub, .assign_sub_wrap, .assign_add_wrap, .assign_mul_wrap, .assign_sub_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
+                        const target = tree.nodeData(assignment).node_and_node[0];
+                        if (tree.nodeTag(target) == .identifier) if (model.reference(target)) |r| if (r.declaration == d) return false;
+                        continue;
+                    },
+                    else => continue,
+                }
+                const target, const given = tree.nodeData(assignment).node_and_node;
+                if (tree.nodeTag(target) != .identifier) continue;
+                const ref = model.reference(target) orelse continue;
+                if (ref.declaration != d) continue;
+                if (assumed.skip == assignment) continue;
+                if (!try nonnegativeIn(c, file, given, given, pointer, next, inductive)) return false;
+            }
+            // Its address handed on lets a callee write it.
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .address_of) continue;
+                const operand = tree.nodeData(@fromBackingInt(@intCast(i))).node;
+                if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |r| if (r.declaration == d) return false;
+            }
+            return true;
         },
         else => {},
     }
@@ -861,8 +903,54 @@ fn unsignedAll(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
 
 /// Whether negating `node` cannot overflow: a signed value that is not negative is no minimum.
 pub fn negates(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    for (widths(c)) |pointer| if (!try nonnegative(c, file, node, pointer)) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    // `x = -x` outside a loop: the value it makes is no value the negation reads.
+    var assumed: Assumed = .{};
+    if (model.node_parents[@backingInt(node)]) |negation| if (model.node_parents[@backingInt(negation)]) |parent| {
+        if (tree.nodeTag(parent) == .assign and same(tree, tree.nodeData(parent).node_and_node[0], node) and !looped(tree, model, parent)) assumed.skip = parent;
+    };
+    for (widths(c)) |pointer| {
+        if (try nonnegativeIn(c, file, node, node, pointer, 0, assumed)) continue;
+        // A value widened to a type of more bits (`-@as(i64, offset)` of an `i32`) is no
+        // minimum of the wider type.
+        if (!try widened(c, file, node, pointer)) return false;
+    }
     return true;
+}
+
+/// Whether a value is `@as(T, x)` with `x` of an integer type narrower than `T`.
+fn widened(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    switch (tree.nodeTag(at)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return false,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@as")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, at, &buffer);
+    if (args.len != 2) return false;
+    const wide = (try named(c, file, args[0], pointer)) orelse return false;
+    const narrow = switch (try typeOf(c, file, args[1], pointer, 0)) {
+        .int => |int| int,
+        else => return false,
+    };
+    return (narrow.wide orelse narrow.bits) < wide.bits;
+}
+
+/// Whether a node is inside a loop's body, within its function.
+fn looped(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        switch (tree.nodeTag(parent)) {
+            .while_simple, .while_cont, .@"while", .for_simple, .@"for" => return true,
+            .fn_decl => return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Whether an operation is on floats: an operand is a float literal or of a float type. A float
@@ -1765,6 +1853,15 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
             if (to <= tree.lastToken(assignment)) continue;
             if (same(tree, tree.nodeData(assignment).node_and_node[0], compared)) return false;
         },
+        // Its address handed on (`advance(&i)`) lets what takes it write it.
+        .address_of => {
+            const taken: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(taken);
+            if (token <= from or token >= to) continue;
+            if (skipped) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
+            if (apart(c, file, taken, use, condition)) continue;
+            if (same(tree, tree.nodeData(taken).node, compared)) return false;
+        },
         else => {},
     };
     return true;
@@ -2357,17 +2454,71 @@ pub fn ceilings(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context
     return out.items;
 }
 
+/// Whether a value is std's `mem.Allocator`.
+fn allocator(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    var value_of = try c.facts.resolve(file, node);
+    if (value_of == .pointer) value_of = value_of.pointer.*;
+    const k = switch (value_of) {
+        .instance => |k| k,
+        else => return false,
+    };
+    for ((try Governed.declarations(c, "std", "mem.Allocator")) orelse return false) |decl| {
+        const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        if (value == .container and value.container.file.eql(k.file) and value.container.scope == k.scope) return true;
+    }
+    return false;
+}
+
+/// The union field a prong's capture takes by value (`.set => |s|`): the prong's one item names
+/// it, and the switch's operand is a union declaring it.
+fn prongField(c: *Context, capture: Facts.Decl) Context.Error!?Facts.Decl {
+    const model = &c.project.models[capture.file.raw()];
+    const tree = &c.project.files[capture.file.raw()].tree;
+    const case_node = model.declarations[capture.index].node;
+    const case = tree.fullSwitchCase(case_node) orelse return null;
+    const payload = case.payload_token orelse return null;
+    if (tree.tokenTag(payload) == .asterisk or case.ast.values.len != 1) return null;
+    const item = case.ast.values[0];
+    if (tree.nodeTag(item) != .enum_literal) return null;
+    const switch_node = model.node_parents[@backingInt(case_node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+    const full = tree.fullSwitch(switch_node) orelse return null;
+    var operand = try c.facts.resolve(capture.file, full.ast.condition);
+    if (operand == .pointer) operand = operand.pointer.*;
+    const container = switch (operand) {
+        .instance, .container => |k| k,
+        else => return null,
+    };
+    const member = c.facts.member(container, tree.tokenSlice(tree.nodeMainToken(item))) orelse return null;
+    if (c.project.models[member.file.raw()].declarations[member.index].kind != .field) return null;
+    return member;
+}
+
 /// The declared length of the fixed array a name holds, or points to (`var buf: [256]u8`,
 /// `const t = [_]u8{ ... }`, a field `table: *const [256][4]u8`), its length a constant.
 fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?u128 {
-    const decl = (try c.facts.definition(file, memory)) orelse return null;
-    const record = c.project.models[decl.file.raw()].declarations[decl.index];
+    var decl = (try c.facts.definition(file, memory)) orelse return null;
+    var record = c.project.models[decl.file.raw()].declarations[decl.index];
+    // A prong's capture of a union's field (`.set => |s|`) has that field's type.
+    if (record.kind == .capture) {
+        decl = (try prongField(c, decl)) orelse return null;
+        record = c.project.models[decl.file.raw()].declarations[decl.index];
+    }
     const decl_tree = &c.project.files[decl.file.raw()].tree;
     const type_node: ?Ast.Node.Index = switch (record.kind) {
         .variable => blk: {
             const variable = decl_tree.fullVarDecl(record.node) orelse return null;
             if (variable.ast.type_node.unwrap()) |t| break :blk t;
             const init = variable.ast.init_node.unwrap() orelse return null;
+            // What an allocator's `create(T)` makes points to one `T`.
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            var made = init;
+            if (decl_tree.nodeTag(made) == .@"try") made = decl_tree.nodeData(made).node;
+            if (decl_tree.fullCall(&call_buffer, made)) |call| {
+                if (call.ast.params.len != 1 or decl_tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+                if (!std.mem.eql(u8, decl_tree.tokenSlice(decl_tree.nodeData(call.ast.fn_expr).node_and_token[1]), "create")) return null;
+                if (!try allocator(c, decl.file, decl_tree.nodeData(call.ast.fn_expr).node_and_token[0])) return null;
+                break :blk call.ast.params[0];
+            }
             var buffer: [2]Ast.Node.Index = undefined;
             const literal_init = decl_tree.fullArrayInit(&buffer, init) orelse return null;
             const array_type = literal_init.ast.type_expr.unwrap() orelse return null;

@@ -100,7 +100,7 @@ const std_files = [_]sources.Extra{
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -2300,4 +2300,133 @@ test "A009 reads a call that passes its argument through, an empty asm tied to i
         std.debug.print("VARIANT<<{s}>>\n", .{head});
         return err;
     };
+}
+
+test "A009 reads the length a union field's capture or an allocator's create points to: a byte indexes 256 entries" {
+    // relic's regular expressions: a bracket's set, made by `create([256]bool)` from the
+    // pattern's bytes and read through a prong's capture. The capture's own reading is shown on
+    // relic's matchers (ere.zig's backtracker and VM), whose taint no fixture here reaches.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Node = union(enum) { set: *const [256]bool, byte: u8 };
+        \\fn matches(node: Node, c: u8) bool {
+        \\    return switch (node) {
+        \\        .set => |s| s[c],
+        \\        .byte => |b| c == b,
+        \\    };
+        \\}
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !bool {
+        \\    const pattern = try r.take(256);
+        \\    const set = try gpa.create([256]bool);
+        \\    @memcpy(set[0..64], @as([]const bool, @ptrCast(pattern[0..64])));
+        \\    set[pattern[64]] = true;
+        \\    var nodes: [2]Node = undefined;
+        \\    nodes[0] = .{ .byte = pattern[65] };
+        \\    nodes[1] = .{ .set = set };
+        \\    return matches(nodes[1], pattern[66]) or matches(nodes[0], pattern[67]);
+        \\}
+    , 0);
+    // A wider index, or a set of fewer entries, stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\const Node = union(enum) { set: *const [256]bool, small: *const [128]bool, byte: u8 };
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !bool {
+        \\    const pattern = try r.take(256);
+        \\    const w = std.mem.readInt(u32, pattern[0..4], .big);
+        \\
+    ;
+    inline for (.{
+        "    const set = try gpa.create([256]bool);\n    @memcpy(set[0..64], @as([]const bool, @ptrCast(pattern[0..64])));\n    set[w] = true;\n    return set[0];\n}\n",
+        "    const set = try gpa.create([128]bool);\n    @memcpy(set[0..64], @as([]const bool, @ptrCast(pattern[0..64])));\n    set[pattern[64]] = true;\n    _ = w;\n    return set[0];\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A010 reads a negation's operand by every value its variable is given, a saturating sum of digits, a remainder, and a widened value" {
+    // relic's date parsers: a sign applied to digits read with `*|` and `+|`, a zone's
+    // minutes negated in place, git's `tz` integer, an offset widened before it is negated.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn digits(s: []const u8, neg: bool) i64 {
+        \\    var v: i64 = 0;
+        \\    var i: usize = 0;
+        \\    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) v = v *| 10 +| (s[i] - '0');
+        \\    return if (neg) -v else v;
+        \\}
+        \\fn zone(date: []const u8, sign: u8) i32 {
+        \\    var ofs: i64 = 0;
+        \\    var j: usize = 0;
+        \\    while (j < date.len and date[j] >= '0' and date[j] <= '9') : (j += 1) ofs = ofs *| 10 +| (date[j] - '0');
+        \\    if (ofs > 9999) return 0;
+        \\    var minutes: i32 = @intCast(@divTrunc(ofs, 100) * 60 + @mod(ofs, 100));
+        \\    if (sign == '-') minutes = -minutes;
+        \\    return minutes;
+        \\}
+        \\fn tz(offset_minutes: i32) i32 {
+        \\    const abs: i32 = @intCast(@abs(offset_minutes));
+        \\    const v = @divTrunc(abs, 60) * 100 + @rem(abs, 60);
+        \\    return if (offset_minutes < 0) -v else v;
+        \\}
+        \\fn widened(offset: i32, secs: i64) bool {
+        \\    return offset < 0 and -@as(i64, offset) * 60 > secs;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !i64 {
+        \\    const s = try r.take(16);
+        \\    const n = try r.takeInt(i64, 0);
+        \\    const o = try r.takeInt(i32, 0);
+        \\    _ = widened(o, n);
+        \\    return digits(s, s[0] == '-') +| zone(s[2..], s[1]) +| tz(@intCast(o & 0xffff));
+        \\}
+    , 0);
+    // A variable given a negative value elsewhere or through its address, a product that may be
+    // the minimum, and a full-width value stay findings.
+    const head =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i64 {
+        \\    const n = try r.takeInt(i64, 0);
+        \\
+    ;
+    inline for (.{
+        "    var v: i64 = 0;\n    v = n;\n    return -v;\n}\n",
+        "    var v: i64 = @max(n, 0);\n    set(&v, n);\n    return -v;\n}\nfn set(p: *i64, x: i64) void {\n    p.* = x;\n}\n",
+        "    const v = @divTrunc(n, 2) * 2;\n    return -v;\n}\n",
+        "    const w: i64 = n;\n    return -@as(i64, w);\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A009 ends a comparison's fact where the compared value's address is handed on, which lets the callee write it" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn advance(i: *usize, by: usize) void {
+        \\    i.* += by;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const buf = try r.take(64);
+        \\    var i: usize = try r.takeInt(u32, 0);
+        \\    if (i < buf.len) {
+        \\        advance(&i, buf[0]);
+        \\        return buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+    , 1);
+    // Its address taken before the comparison, or in another branch, leaves the fact.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn advance(i: *usize, by: usize) void {
+        \\    i.* += by;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const buf = try r.take(64);
+        \\    var i: usize = try r.takeInt(u32, 0);
+        \\    advance(&i, 1);
+        \\    if (i < buf.len) return buf[i] else advance(&i, 2);
+        \\    return 0;
+        \\}
+    , 0);
 }
