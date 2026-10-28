@@ -1336,7 +1336,8 @@ fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16)
 pub fn fills(c: *Context, file: Project.FileId, call: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!bool {
     for (widths(c)) |pointer| {
         const backing = (try backed(c, file, call, pointer)) orelse return false;
-        if (backing.filled == backing.tag.room()) continue;
+        // A type that fills its backing integer still holds no value past it: a wider or a
+        // signed operand converts only where it is shown within it.
         if (!try nonnegative(c, file, operand, pointer)) return false;
         const magnitude = (try bound(c, file, operand, pointer, 0)) orelse return false;
         if (magnitude > backing.filled) return false;

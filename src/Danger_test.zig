@@ -1288,6 +1288,31 @@ test "A009 judges a pointer moved by input: no length checks the address it reac
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 11, 15 }, result.lines[0..result.findings]);
 }
 
+test "A010 reads a conversion into a type that fills its backing integer as safe only for an operand within it: not a wider one, nor a signed one" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\const Open = enum(u8) { a, _ };
+        \\pub fn wide(r: *std.Io.Reader) !u8 {
+        \\    const w: u16 = try r.takeInt(u16, 0);
+        \\    const open: Open = @enumFromInt(w);
+        \\    return @intFromEnum(open);
+        \\}
+        \\pub fn signed(r: *std.Io.Reader) !u8 {
+        \\    const s: i16 = try r.takeInt(i16, 0);
+        \\    const open: Open = @enumFromInt(s);
+        \\    return @intFromEnum(open);
+        \\}
+        \\pub fn narrow(r: *std.Io.Reader) !u8 {
+        \\    const b: u8 = try r.takeInt(u8, 0);
+        \\    const open: Open = @enumFromInt(b);
+        \\    return @intFromEnum(open);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The wider and the signed operand; never the byte.
+    try std.testing.expectEqualSlices(u32, &.{ 5, 10 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
