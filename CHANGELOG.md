@@ -4,6 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-28
+
 ### Fixed
 
 - Z012 reads a `pub fn` as a public signature only where every container around it, up to the file, is held by a public or exported declaration. A method of a struct a private declaration holds is named by nobody outside the file, so the private types it takes are no finding (reactor's backend sinks, called through `anytype`, and its tests' harnesses: 19 of the 25 findings in its car).
