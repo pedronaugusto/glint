@@ -114,10 +114,19 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             .div, .mod, .assign_div, .assign_mod => {
                 if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
-                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
+                if (try Range.nonzero(c, c.file, rhs)) continue;
+                var level = try Taint.levelAt(c, flow, c.file, rhs);
+                // The length of memory a peer sized is the peer's to make zero (`x % buf.len`
+                // over an empty read), though a length is no peer's number.
+                var divisor = rhs;
+                while (tree.nodeTag(divisor) == .grouped_expression) divisor = tree.nodeData(divisor).node_and_token[0];
+                if (tree.nodeTag(divisor) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(divisor).node_and_token[1]), "len")) {
+                    if ((try Taint.levelAt(c, flow, c.file, tree.nodeData(divisor).node_and_token[0])).reaches(.data)) level = level.join(.data);
+                }
+                try judged(c, flow, rule, node, level, .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
             .negation => {
-                if (!site(c, node)) continue;
+                if (!site(c, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .number, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {

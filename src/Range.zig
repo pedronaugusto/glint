@@ -79,6 +79,9 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
             else => return false,
         };
         const subtracts = tag == .sub or tag == .assign_sub;
+        // A midpoint, `a + (b - a) / k`, is at most `b`: it fits where `b` does (the
+        // difference's own underflow is judged where it is taken).
+        if (tag == .add and midpoint(tree, lhs, rhs)) continue;
         // A remainder spelled out (`y - @divFloor(y, k) * k`) is below `k` and never below 0
         // where `y` is not.
         if (tag == .sub and try remainder(c, file, lhs, rhs) != null) continue;
@@ -170,35 +173,78 @@ fn upper(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.I
 }
 
 /// Whether `node` cannot be negative: it is of an unsigned integer type, or a comparison
-/// holding where it is read puts it at a literal or above (`if (x < 0) return`, `if (x > 0)`).
+/// holding where it is read puts it at a literal or above (`if (x < 0) return`, `if (x > 0)`),
+/// or it is made of what cannot be: a literal, a magnitude (`@abs`), a conversion of such a
+/// value, a sum, product or quotient by a positive literal of such values, or a local
+/// initialized with one that nothing assigns before the read.
 fn nonnegative(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!bool {
+    return nonnegativeAt(c, file, node, node, pointer, 0);
+}
+
+fn nonnegativeAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!bool {
+    if (depth > depth_limit) return false;
+    const next = depth + 1;
     switch (try typeOf(c, file, node, pointer, 0)) {
         .int => |int| if (!int.signed) return true,
         else => {},
     }
     const tree = &c.project.files[file.raw()].tree;
-    for (try facts(c, file, node)) |fact| {
+    for (try facts(c, file, at)) |fact| {
         if (literal(tree, fact.small) != null and same(tree, fact.large, node)) return true;
     }
     // What an operation makes at zero or above: `@max(x, 0)`, `@mod(x, k)` by a positive `k`
     // (its sign is the divisor's), `x & mask` by a literal mask.
-    const at = bare(tree, node);
-    switch (tree.nodeTag(at)) {
+    const value = bare(tree, node);
+    if (literal(tree, value) != null) return true;
+    switch (tree.nodeTag(value)) {
         .bit_and => {
-            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
             return literal(tree, lhs) != null or literal(tree, rhs) != null;
         },
+        .add, .mul => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            return try nonnegativeAt(c, file, lhs, at, pointer, next) and try nonnegativeAt(c, file, rhs, at, pointer, next);
+        },
+        .div => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            return (literal(tree, rhs) orelse 0) > 0 and try nonnegativeAt(c, file, lhs, at, pointer, next);
+        },
         .builtin_call_two, .builtin_call_two_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            const name = tree.tokenSlice(tree.nodeMainToken(value));
             var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, at, &buffer);
+            const args = Facts.builtinArgs(tree, value, &buffer);
+            if (std.mem.eql(u8, name, "@abs")) return true;
+            if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeAt(c, file, args[0], at, pointer, next);
             if (args.len != 2) return false;
+            if (std.mem.eql(u8, name, "@as")) return nonnegativeAt(c, file, args[1], at, pointer, next);
             if (std.mem.eql(u8, name, "@max")) return literal(tree, args[0]) != null or literal(tree, args[1]) != null;
             if (std.mem.eql(u8, name, "@mod")) return (literal(tree, args[1]) orelse 0) > 0;
+            if (std.mem.eql(u8, name, "@divTrunc") or std.mem.eql(u8, name, "@divFloor")) return (literal(tree, args[1]) orelse 0) > 0 and try nonnegativeAt(c, file, args[0], at, pointer, next);
+        },
+        .identifier => {
+            const model = &c.project.models[file.raw()];
+            const d = (model.reference(value) orelse return false).declaration orelse return false;
+            const record = model.declarations[d];
+            if (record.kind != .variable) return false;
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            const init = variable.ast.init_node.unwrap() orelse return false;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const and !try kept(c, file, value, record.node, at)) return false;
+            return nonnegativeAt(c, file, init, init, pointer, next);
         },
         else => {},
     }
     return false;
+}
+
+/// Whether `a + half` is `a + (b - a) / k` with a literal `k` of at least one.
+fn midpoint(tree: *const Ast, a: Ast.Node.Index, half: Ast.Node.Index) bool {
+    const q = bare(tree, half);
+    if (tree.nodeTag(q) != .div) return false;
+    const dividend, const divisor = tree.nodeData(q).node_and_node;
+    if ((literal(tree, divisor) orelse 0) < 1) return false;
+    const d = bare(tree, dividend);
+    if (tree.nodeTag(d) != .sub) return false;
+    return same(tree, tree.nodeData(d).node_and_node[1], a);
 }
 
 /// Whether `node` is arithmetic on a pointer (`ptr + i`): an address, which no checked
@@ -226,6 +272,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const model = &c.project.models[file.raw()];
             const ref = model.reference(node) orelse return null;
             const d = ref.declaration orelse return null;
+            if (prong(c, .{ .file = file, .index = d })) |range| return range.most;
             return constant(c, .{ .file = file, .index = d }, pointer, next);
         },
         .field_access => {
@@ -679,10 +726,128 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
             // A constant with no type of its own has its initializer's: a number literal's
             // comptime type, which takes the other operand's.
             if (decl) |d| if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
+            if (decl) |d| if (try element(c, d, pointer)) |typed| return typed;
         },
         else => {},
     }
     return integer(try c.facts.resolve(file, node), pointer);
+}
+
+/// The type of a `for` capture taking an element of memory (`for (bytes) |b|` over a
+/// `[]const u8` is a `u8`), or of a range's index (`usize`); null for anything else.
+fn element(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Typed {
+    const model = &c.project.models[decl.file.raw()];
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const record = model.declarations[decl.index];
+    if (record.kind != .capture) return null;
+    const loop = tree.fullFor(record.node) orelse return null;
+    if (tree.tokenTag(record.token - 1) == .asterisk) return null;
+    var token = loop.payload_token;
+    var index: usize = 0;
+    while (tree.tokenTag(token) != .pipe) : (token += 1) {
+        if (tree.tokenTag(token) != .identifier) continue;
+        if (token == record.token) break;
+        index += 1;
+    } else return null;
+    if (index >= loop.ast.inputs.len) return null;
+    const input = loop.ast.inputs[index];
+    if (tree.nodeTag(input) == .for_range) return .{ .int = .{ .bits = pointer, .signed = false } };
+    var value = try c.facts.resolve(decl.file, input);
+    while (true) switch (value) {
+        .pointer, .array => |inner| value = inner.*,
+        else => break,
+    };
+    return switch (integer(value, pointer)) {
+        .int => |int| .{ .int = int },
+        else => null,
+    };
+}
+
+/// The least and greatest value an inline prong's capture takes: its prong's items, each a
+/// literal or a range of literals (`inline 1...7 => |period|`). Null for any other capture.
+const Reach = struct { least: u128, most: u128 };
+fn prong(c: *Context, decl: Facts.Decl) ?Reach {
+    const model = &c.project.models[decl.file.raw()];
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const record = model.declarations[decl.index];
+    if (record.kind != .capture) return null;
+    const case = tree.fullSwitchCase(record.node) orelse return null;
+    if (case.inline_token == null or case.payload_token != record.token or case.ast.values.len == 0) return null;
+    var out: Reach = .{ .least = std.math.maxInt(u128), .most = 0 };
+    for (case.ast.values) |item| {
+        const low, const high = if (tree.nodeTag(item) == .switch_range) tree.nodeData(item).node_and_node else .{ item, item };
+        const a = literal(tree, low) orelse return null;
+        const b = literal(tree, high) orelse return null;
+        out = .{ .least = @min(out.least, a), .most = @max(out.most, b) };
+    }
+    return out;
+}
+
+/// Whether a divisor cannot be zero: a literal other than zero, `@max(k, x)` with `k` at least
+/// one, an inline prong's capture whose items are all above zero, a constant naming one, or a
+/// value a comparison holding where it is read puts above zero (`if (n == 0) return`, `if (x >=
+/// 1)`, or above another value that cannot be negative: the `else` of `if (a >= len)`).
+pub fn nonzero(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return nonzeroAt(c, file, node, node, 0);
+}
+
+fn nonzeroAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > depth_limit) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    const value = bare(tree, node);
+    if (literal(tree, value)) |k| return k != 0;
+    switch (tree.nodeTag(value)) {
+        .builtin_call_two, .builtin_call_two_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@max")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (Facts.builtinArgs(tree, value, &buffer)) |arg| if ((literal(tree, arg) orelse 0) >= 1) return true;
+        },
+        .identifier => {
+            const model = &c.project.models[file.raw()];
+            if (model.reference(value)) |ref| if (ref.declaration) |d| {
+                if (prong(c, .{ .file = file, .index = d })) |range| if (range.least >= 1) return true;
+            };
+            if (constantOf(c, file, value)) |local| if (local.ast.init_node.unwrap()) |init| {
+                if (try nonzeroAt(c, file, init, at, depth + 1)) return true;
+            };
+        },
+        else => {},
+    }
+    for (try gather(c, file, at)) |fact| {
+        if (fact.read) continue;
+        // Other than zero, and not negative: no -1 that overflows a signed minimum.
+        if (fact.differs) {
+            if (!(same(tree, fact.small, value) and literal(tree, fact.large) == 0) and !(same(tree, fact.large, value) and literal(tree, fact.small) == 0)) continue;
+            for (widths(c)) |pointer| {
+                if (!try nonnegative(c, file, value, pointer)) break;
+            } else return true;
+            continue;
+        }
+        if (!same(tree, fact.large, value)) continue;
+        if (literal(tree, fact.small)) |k| {
+            if (k >= 1 or fact.strict) return true;
+            continue;
+        }
+        if (!fact.strict) continue;
+        for (widths(c)) |pointer| {
+            if (!try nonnegative(c, file, fact.small, pointer)) break;
+        } else return true;
+    }
+    return false;
+}
+
+/// Whether a value is of an unsigned integer type at every pointer width.
+fn unsignedAll(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    for (widths(c)) |pointer| switch (try typeOf(c, file, node, pointer, 0)) {
+        .int => |int| if (int.signed) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// Whether negating `node` cannot overflow: a signed value that is not negative is no minimum.
+pub fn negates(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    for (widths(c)) |pointer| if (!try nonnegative(c, file, node, pointer)) return false;
+    return true;
 }
 
 /// Whether an operation is on floats: an operand is a float literal or of a float type. A float
@@ -1254,10 +1419,11 @@ fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition
                 .greater_or_equal => if (truth) &.{.{ .small = rhs, .large = lhs, .strict = false }} else &.{.{ .small = lhs, .large = rhs, .strict = true }},
                 .equal_equal, .bang_equal => if (truth == (tag == .equal_equal))
                     &.{ .{ .small = lhs, .large = rhs, .strict = false }, .{ .small = rhs, .large = lhs, .strict = false } }
-                else if (literal(tree, rhs) == 0)
-                    // An unsigned value other than zero is at least one.
+                else if (literal(tree, rhs) == 0 and try unsignedAll(c, file, lhs))
+                    // An unsigned value other than zero is at least one; a signed one may be
+                    // below zero.
                     &.{.{ .small = rhs, .large = lhs, .strict = true }}
-                else if (literal(tree, lhs) == 0)
+                else if (literal(tree, lhs) == 0 and try unsignedAll(c, file, rhs))
                     &.{.{ .small = lhs, .large = rhs, .strict = true }}
                 else
                     &.{},
@@ -1788,13 +1954,13 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
     var base = bare(tree, memory);
     while (tree.nodeTag(base) == .slice_open) {
         const slice = tree.fullSlice(base).?;
-        if (!needed.add(tree, slice.ast.start)) return false;
+        if (!needed.add(c, file, slice.ast.start, 0)) return false;
         base = bare(tree, slice.ast.sliced);
     }
-    if (!needed.add(tree, index)) return false;
+    if (!needed.add(c, file, index, 0)) return false;
     if (!lengthOf(c, file, fact.large, base)) return false;
     var whole: Terms = .{};
-    if (!whole.add(tree, fact.small) or whole.len < 2) return false;
+    if (!whole.add(c, file, fact.small, 0) or whole.len == 0 or (whole.len < 2 and whole.constant == 0)) return false;
     var used: [Terms.capacity]bool = @splat(false);
     for (needed.nodes[0..needed.len]) |term| {
         for (whole.nodes[0..whole.len], 0..) |part, i| {
@@ -1811,14 +1977,16 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
     return if (end) room >= 0 else room >= 1;
 }
 
-/// A sum as its parts and the constants added in it: `6 + l1 + l2` is `l1`, `l2` and 6.
+/// A sum as its parts and the constants added in it: `6 + l1 + l2` is `l1`, `l2` and 6, and
+/// a constant naming a sum is that sum (`const records_at = id_end + 4;`).
 const Terms = struct {
     const capacity = 8;
     nodes: [capacity]Ast.Node.Index = undefined,
     len: usize = 0,
     constant: i128 = 0,
 
-    fn add(terms: *Terms, tree: *const Ast, node: Ast.Node.Index) bool {
+    fn add(terms: *Terms, c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) bool {
+        const tree = &c.project.files[file.raw()].tree;
         const at = bare(tree, node);
         if (literal(tree, at)) |k| {
             terms.constant += k;
@@ -1826,8 +1994,11 @@ const Terms = struct {
         }
         if (tree.nodeTag(at) == .add) {
             const a, const b = tree.nodeData(at).node_and_node;
-            return terms.add(tree, a) and terms.add(tree, b);
+            return terms.add(c, file, a, depth) and terms.add(c, file, b, depth);
         }
+        if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
+            if (tree.nodeTag(bare(tree, init)) == .add) return terms.add(c, file, init, depth + 1);
+        };
         if (terms.len == capacity) return false;
         terms.nodes[terms.len] = at;
         terms.len += 1;

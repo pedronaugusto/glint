@@ -1559,6 +1559,105 @@ test "A010 reads a constant minimum as at most each of its arguments, and a diff
     , 1);
 }
 
+test "A010 reads a midpoint, a nonnegative negation, a divisor that cannot be zero and a byte a for capture takes" {
+    // relic's binary searches and zone parser, warp's zstd and match copy, uplink's hpack nibbles.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn spread(comptime period: usize, step: usize) usize { return step % period; }
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    var lo: u32 = try r.takeInt(u32, .little);
+        \\    var hi: u32 = try r.takeInt(u32, .little);
+        \\    while (lo < hi) {
+        \\        const mid = lo + (hi - lo) / 2;
+        \\        if (mid > 7) hi = mid else lo = hi;
+        \\    }
+        \\    const zone: i16 = try r.takeInt(i16, .little);
+        \\    const magnitude: i32 = @intCast(@abs(@as(i32, zone)));
+        \\    const minutes: i32 = @divTrunc(magnitude, 100) * 60 + @mod(magnitude, 100);
+        \\    const signed: i32 = if (zone < 0) -minutes else minutes;
+        \\    const n: usize = try r.takeInt(u8, .little);
+        \\    var sum: usize = @intCast(signed & 0xff);
+        \\    sum +%= 2048 / @max(1, n);
+        \\    if (n == 0) return sum;
+        \\    sum +%= 4096 / n;
+        \\    const offset: usize = try r.takeInt(u8, .little);
+        \\    switch (offset) {
+        \\        inline 1...7 => |period| sum +%= 16 % period,
+        \\        else => {},
+        \\    }
+        \\    const in = try r.take(16);
+        \\    for (in) |byte| sum +%= @as(u4, @intCast(byte >> 4));
+        \\    return sum;
+        \\}
+    , 0);
+    // The unsafe forms stay findings, each its own: a plain sum, a negated input, a divisor
+    // only read, a prong that holds zero, a signed divisor only other than zero (it may be -1),
+    // and a byte grown past a byte.
+    const head =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i64 {
+        \\
+    ;
+    inline for (.{
+        "    const lo: u32 = try r.takeInt(u32, .little);\n    const hi: u32 = try r.takeInt(u32, .little);\n    return lo + hi;\n}\n",
+        "    const v: i64 = try r.takeInt(i64, .little);\n    return -v;\n}\n",
+        "    const n: usize = try r.takeInt(u8, .little);\n    return @intCast(4096 / n);\n}\n",
+        "    const n: usize = try r.takeInt(u8, .little);\n    switch (n) {\n        inline 0...3 => |k| return @intCast(16 % k),\n        else => return 0,\n    }\n}\n",
+        "    const v: i64 = try r.takeInt(i64, .little);\n    const d: i64 = try r.takeInt(i64, .little);\n    if (d == 0) return 0;\n    return @divTrunc(v, d) +% @rem(v, 3) +% @divTrunc(v, 1) +% v % d;\n}\n",
+        "    const in = try r.take(16);\n    var digits: u8 = 0;\n    for (in) |byte| digits = digits * 10 +% byte;\n    return digits;\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A009 reads a sum a constant names" {
+    // chronicle's stream index: the records' start named, and checked against the input.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    const rest = try r.take(64);
+        \\    const id_end = 1 + @as(usize, rest[0]);
+        \\    const records_at = id_end + 4;
+        \\    if (rest.len < records_at) return error.Bad;
+        \\    _ = rest[1..id_end];
+        \\    return std.mem.readInt(u32, rest[id_end..][0..4], .little);
+        \\}
+    , 0);
+    // A guard on a smaller sum keeps no larger one.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const rest = try r.take(64);
+        \\    const id_end = 1 + @as(usize, rest[0]);
+        \\    if (rest.len < id_end) return error.Bad;
+        \\    _ = rest[id_end + 4 ..];
+        \\}
+    , 1);
+}
+
+test "A010 reads a remainder by the length of memory input sized as input's divisor, unless the memory is known not to be empty" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const ring = try r.take(16);
+        \\    const table: [8]u8 = @splat(0);
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (ring.len == 0) return error.Bad;
+        \\    return table[i % table.len] +% ring[i % ring.len];
+        \\}
+    , 0);
+    // An empty read divides by zero.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const ring = try r.take(16);
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    return ring[i % ring.len];
+        \\}
+    , 1);
+}
+
 test "A009 reads what a method of the file checked of its receiver, where the call succeeded" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
