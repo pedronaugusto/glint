@@ -1567,6 +1567,17 @@ fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition
                 else => unreachable,
             };
             try out.appendSlice(c.allocator, facts_of);
+            // `x -% 1 < a` of an unsigned `x` holds exactly where `1 <= x <= a`: at zero the
+            // difference wraps to the type's greatest value, which nothing is below.
+            for (facts_of) |fact| {
+                if (!fact.strict) continue;
+                const less = bare(tree, fact.small);
+                if (tree.nodeTag(less) != .sub_wrap) continue;
+                const x, const one = tree.nodeData(less).node_and_node;
+                if (literal(tree, one) != 1 or !try unsignedAll(c, file, x)) continue;
+                try out.append(c.allocator, .{ .small = x, .large = fact.large, .strict = false });
+                try out.append(c.allocator, .{ .small = one, .large = x, .strict = false });
+            }
         },
         else => {},
     }

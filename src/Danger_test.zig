@@ -2237,3 +2237,31 @@ test "A009 reads the length of an array a field points to: a byte indexes 256 en
         return err;
     };
 }
+
+test "A010 reads a wrapping comparison of a value less one as the value from one to the bound" {
+    // warp's lz4 fast loop: an offset from 1 to `at`, as one comparison.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    const at: usize = try r.takeInt(u32, 0);
+        \\    const offset: usize = try r.takeInt(u16, 0);
+        \\    if (offset -% 1 < at) return at - offset;
+        \\    if (at > offset -% 1) return offset - 1;
+        \\    return 0;
+        \\}
+    , 0);
+    // Less two, a signed value, or a comparison that may hold at zero stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i64 {
+        \\
+    ;
+    inline for (.{
+        "    const at: usize = try r.takeInt(u32, 0);\n    const offset: usize = try r.takeInt(u16, 0);\n    if (offset -% 2 < at) return @intCast(at - offset);\n    return 0;\n}\n",
+        "    const at: i64 = try r.takeInt(i64, 0);\n    const offset: i64 = try r.takeInt(i64, 0);\n    if (offset -% 1 < at) return at - offset;\n    return 0;\n}\n",
+        "    const at: usize = try r.takeInt(u32, 0);\n    const offset: usize = try r.takeInt(u16, 0);\n    if (offset -% 1 <= at) return @intCast(at - offset);\n    return 0;\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
