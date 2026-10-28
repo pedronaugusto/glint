@@ -27,6 +27,12 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - A method called on a value whose type a generic's binding gives (`s.context.eql(a, b)` in parallax's `Interner(T, Context)`) is decided, not undecided, where every governed function of its name is a namespace's: no type has it as a method, so a binding reaches one only through an alias its type declares. A governed method of a std type stays undecided there.
 - A008 finds an operation a container's alias names at the alias (`const eql = std.crypto.timing_safe.eql;`), and A011 a unit constant reached through one at its arithmetic: neither was found before.
 - The fix applier makes each finding's own parenthesis where two open or close at one offset: Z034's nest (`((code -% range) >> 31) ^ 1`, warp's lzma range decoder), where it kept one.
+- A009 and A010 read C integer types across the family's targets: the narrowest width where a value goes into one (`c_long` is 32 bits, as on Windows), the widest where one is read (64 bits on other 64-bit targets), and `c_char` by either sign (bay's warp frames). They were unknown, so no guard cleared them.
+- A009 reads the length of an array a field or local points to (`*const [256][4]u8`), a length a constant names, a union field's through a prong's capture (`.set => |s|`), and what an allocator's `create([256]bool)` makes: a byte indexes 256 entries (relic's multi-pack index, pack index, commit graph and regular-expression sets).
+- A009 and A010 read a wrapping comparison of an unsigned value less one, `x -% 1 < a`, as the value from one to the bound (warp's lz4 offsets), and a call that passes its argument through (an empty `asm` tied to it, as an optimization barrier) as that argument, a sum less a constant as its parts and the constant taken off (warp's `chainless(ip + 3)`).
+- A010 reads a negation's operand by every value its variable is given (its own reads in them by induction, a negation in place `x = -x` outside a loop left out), a saturating sum, a remainder of a value at zero or above, and a value widened to a type of more bits (`-@as(i64, offset)` of an `i32`): relic's date parsers.
+- A010 reads an address moved from a pointer through a constant (`const m = out.ptr + o_lit;` then `m - offset`) as an address, which A009 judges where it reaches memory (warp's zstd sequences).
+- A comparison's fact ends where the compared value's address is handed on (`advance(&i)` between `i < buf.len` and `buf[i]`): the callee may write it. It was kept, which cleared sites it should not have.
 
 ## [0.7.4] - 2026-10-28
 
