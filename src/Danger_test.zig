@@ -2430,3 +2430,27 @@ test "A009 ends a comparison's fact where the compared value's address is handed
         \\}
     , 0);
 }
+
+test "A010 reads an address moved from a pointer through a constant as an address, A009's where it reaches memory" {
+    // warp's zstd sequences: `const m = out.ptr + o_lit;` then `m - offset`.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o_lit: usize = try r.takeInt(u32, 0);
+        \\    const offset: usize = try r.takeInt(u32, 0);
+        \\    const m = out.ptr + o_lit;
+        \\    const src = m - offset;
+        \\    return src[0];
+        \\}
+    , 0);
+    // The same arithmetic on a number stays one.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    const o_lit: usize = try r.takeInt(u32, 0);
+        \\    const offset: usize = try r.takeInt(u32, 0);
+        \\    const m = o_lit;
+        \\    return m - offset;
+        \\}
+    , 1);
+}

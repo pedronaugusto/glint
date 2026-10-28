@@ -307,11 +307,27 @@ fn midpoint(tree: *const Ast, a: Ast.Node.Index, half: Ast.Node.Index) bool {
 /// overflow stops.
 pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
-    const lhs = tree.nodeData(node).node_and_node[0];
-    return switch (try c.facts.resolve(file, bare(tree, lhs))) {
-        .pointer => true,
-        else => false,
-    };
+    return pointerValue(c, file, tree.nodeData(node).node_and_node[0], 0);
+}
+
+/// Whether a value is a pointer: one it resolves to, an address moved from one (`p + i`,
+/// `p - i`), or a constant naming either (`const m = out.ptr + o_lit;`).
+fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 4) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, node);
+    switch (try c.facts.resolve(file, at)) {
+        .pointer => return true,
+        else => {},
+    }
+    switch (tree.nodeTag(at)) {
+        .add, .sub, .add_wrap, .sub_wrap => return pointerValue(c, file, tree.nodeData(at).node_and_node[0], depth + 1),
+        .identifier => {
+            const local = constantOf(c, file, at) orelse return false;
+            return pointerValue(c, file, local.ast.init_node.unwrap() orelse return false, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// What an expression's own operation bounds, before its type does.
