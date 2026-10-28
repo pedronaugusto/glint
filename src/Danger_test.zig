@@ -185,7 +185,26 @@ test "A007 finds std's synchronization, raw atomics and mutable container state"
         \\const Io = std.Io;
         \\const T = struct { l: Io.RwLock, c: Io.Condition, s: Io.Semaphore, e: Io.Event, m: std.atomic.Mutex };
         \\var detected: std.atomic.Value(u8) = .init(0);
-    , 6);
+    , 5);
+}
+
+test "A007 leaves an Io.Event, which guards no data, and a container var a build chooses an aegis cell or void for" {
+    // conduit's exit signals and test hooks.
+    try expect(pack.shared_state,
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\const aegis = @import("aegis");
+        \\const Child = struct { exited: std.Io.Event = .unset };
+        \\var before_exit_watch: if (builtin.is_test) aegis.Atomic(?*const fn (*Child) void) else void = if (builtin.is_test) .init(null) else {};
+    , 0);
+    // A branch that is a plain type, or a lock beside the event, stays a finding.
+    try expect(pack.shared_state,
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\const aegis = @import("aegis");
+        \\const Child = struct { exited: std.Io.Event = .unset, lock: std.Io.Mutex = .init };
+        \\var hook: if (builtin.is_test) ?*const fn (*Child) void else void = if (builtin.is_test) null else {};
+    , 2);
 }
 
 test "A007 leaves constants, thread-local state, aliases' uses, borrows and test code alone" {

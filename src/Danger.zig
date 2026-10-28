@@ -21,9 +21,10 @@ const Taint = @import("Taint.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-/// A007: shared state outside aegis's guards.
+/// A007: shared state outside aegis's guards. `Io.Event` is none: a signal set once, which
+/// guards no data of its own (what it announces is judged where it is held).
 pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
-    const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "Io.Event", "atomic.Value", "atomic.Mutex" };
+    const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "atomic.Value", "atomic.Mutex" };
     const held = try governedHeld(c, rule, &sync, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
     const tree = &c.project.files[c.file.raw()].tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
@@ -47,9 +48,23 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
         // aegis type (`Atomic`, `Guarded`, `Once`, ...) is held by its answer.
         if (variable.ast.type_node.unwrap()) |kind| {
             if (within(tree, held, kind)) continue;
-            if (try c.role(Contract.library, try c.facts.resolve(c.file, kind)) != null) continue;
+            if (try guards(c, try c.facts.resolve(c.file, kind))) continue;
         }
         try c.at(rule, decl.token, try c.allocator.print("container-level var '{s}': mutable state any thread may reach; aegis Guarded, Atomic, Once or Lazy holds it, or Confined checks its one owner", .{decl.name}));
+    }
+}
+
+/// Whether a container variable's type holds its state under aegis: an aegis type, or a choice
+/// the build makes (`if (builtin.is_test) aegis.Atomic(T) else void`) each of whose types is
+/// one or `void`, which holds no state.
+fn guards(c: *Context, value: Facts.Value) Context.Error!bool {
+    switch (value) {
+        .alternatives => |each| {
+            for (each) |one| if (!try guards(c, one)) return false;
+            return true;
+        },
+        .primitive => |name| return std.mem.eql(u8, name, "void"),
+        else => return try c.role(Contract.library, value) != null,
     }
 }
 
