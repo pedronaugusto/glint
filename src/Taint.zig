@@ -843,18 +843,7 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
             }
             return .{};
         },
-        .field_access => {
-            const receiver, const name = tree.nodeData(node).node_and_token;
-            if (std.mem.eql(u8, tree.tokenSlice(name), "len") or std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
-            var out = try dep(c, flow, function, receiver);
-            if (try c.facts.definition(f.file, node)) |decl| {
-                if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
-                // A function or a type named through a value is no part of its data.
-                const kind = c.project.models[decl.file.raw()].declarations[decl.index].kind;
-                if (kind == .function) return .{};
-            } else out = out.join(.{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
-            return out;
-        },
+        .field_access => return fieldRead(c, flow, function, node),
         .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
         .slice_open, .slice, .slice_sentinel => return dep(c, flow, function, (tree.fullSlice(node) orelse return .{}).ast.sliced),
         .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
@@ -968,6 +957,26 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
     return out;
 }
 
+/// A field read: what its receiver holds, and what the program stores in the field by its
+/// declaration, or in each choice's field of that name where the receiver's type is one of several.
+fn fieldRead(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    const receiver, const name = tree.nodeData(node).node_and_token;
+    if (std.mem.eql(u8, tree.tokenSlice(name), "len") or std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
+    var out = try dep(c, flow, function, receiver);
+    if (try c.facts.definition(f.file, node)) |decl| {
+        // A field of a value the compiler evaluated holds that value's, not what the program
+        // stores in the field elsewhere.
+        if (flow.globals.get(decl)) |level| if (!try constant(c, f.file, receiver, 0)) {
+            out = out.join(.{ .level = level });
+        };
+        // A function or a type named through a value is no part of its data.
+        if (c.project.models[decl.file.raw()].declarations[decl.index].kind == .function) return .{};
+    } else out = out.join(.{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
+    return out;
+}
+
 /// The field declarations a struct literal's values initialize, in order, when its type
 /// resolves and names each of them.
 fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, literal: Ast.full.StructInit) Context.Error!?[]const Facts.Decl {
@@ -990,6 +999,72 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
         field.* = decl;
     }
     return fields;
+}
+
+/// Whether a value is a container-level constant's, which the compiler evaluates: the
+/// constant, an element or field of one, or a local constant initialized from one.
+fn constant(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 16) return false;
+    const tree = &c.project.files[file.raw()].tree;
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const ref = c.project.models[file.raw()].reference(node) orelse return false;
+            return constantDecl(c, .{ .file = file, .index = ref.declaration orelse return false }, depth);
+        },
+        .field_access => {
+            const decl = (try c.facts.definition(file, node)) orelse return false;
+            return switch (c.project.models[decl.file.raw()].declarations[decl.index].kind) {
+                .variable => constantDecl(c, decl, depth),
+                .field => constant(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+                else => false,
+            };
+        },
+        .array_access => return constant(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        .grouped_expression => return constant(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        else => return false,
+    }
+}
+
+/// Whether a declaration is a constant whose value the compiler evaluates: a container-level
+/// `const` holding no address but a literal's, or a local `const` initialized from one.
+fn constantDecl(c: *Context, decl: Facts.Decl, depth: u8) Context.Error!bool {
+    const model = &c.project.models[decl.file.raw()];
+    const record = model.declarations[decl.index];
+    if (record.kind != .variable) return false;
+    const tree = &c.project.files[decl.file.raw()].tree;
+    const variable = tree.fullVarDecl(record.node) orelse return false;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+    const init = variable.ast.init_node.unwrap() orelse return false;
+    switch (model.scopes[record.scope].kind) {
+        .file, .container => {},
+        else => return constant(c, decl.file, init, depth + 1),
+    }
+    // A pointer to a variable reads that variable's memory, which the program stores into.
+    if (variable.ast.type_node.unwrap()) |declared| switch (tree.nodeTag(declared)) {
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => {
+            if (tree.fullPtrType(declared).?.size == .one) return false;
+        },
+        else => {},
+    };
+    if (!literalAddress(tree, init)) return false;
+    // A block's value is what its `break`s give it.
+    var pending: std.ArrayList(Ast.Node.Index) = .empty;
+    try pending.append(c.allocator, init);
+    while (pending.pop()) |at| {
+        if (tree.nodeTag(at) == .@"break") if (tree.nodeData(at).opt_token_and_opt_node[1].unwrap()) |value| {
+            if (!literalAddress(tree, value)) return false;
+        };
+        try pending.appendSlice(c.allocator, try children(c, decl.file, at));
+    }
+    return true;
+}
+
+/// Whether a value is no address, or the address of a literal.
+fn literalAddress(tree: *const Ast, node: Ast.Node.Index) bool {
+    if (tree.nodeTag(node) != .address_of) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const operand = tree.nodeData(node).node;
+    return tree.fullArrayInit(&buffer, operand) != null or tree.fullStructInit(&buffer, operand) != null;
 }
 
 /// Whether a literal is what its function returns: a `return`'s operand, or an arm of an `if`

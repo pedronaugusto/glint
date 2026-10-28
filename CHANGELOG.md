@@ -33,6 +33,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- A009, A010 and A012 read a field of a value the compiler evaluates (a container-level `const` table, an element or field of one, or a local `const` copied from one) as that value's, not as what the program stores in the field elsewhere: a type a decoder fills from input and a comptime table share (warp's brotli `codes.Range`, whose `block_counts` the encoder writes by) made every encoder read of the table input. A constant holding the address of a variable, directly or through a block's `break`, stays read by the field's stores.
 - A010 reads more of what keeps arithmetic in range, from the family's rule survey:
   - a midpoint, `lo + (hi - lo) / 2`, is at most `hi`;
   - negating a value that cannot be negative cannot overflow: a magnitude (`@abs`), a conversion of one, a sum, product or positive quotient of such values, or a local initialized with one;

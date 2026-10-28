@@ -1534,6 +1534,49 @@ test "A009 reads a truncation and wrapping arithmetic as the peer's number in a 
     try std.testing.expectEqualSlices(u32, &.{ 5, 8 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a field of a constant the compiler evaluates as the constant's, not what a decoder stores in that field elsewhere" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Range = struct { offset: u32, extra: u5 };
+        \\const table = blk: {
+        \\    var r: [4]Range = undefined;
+        \\    for (&r, 0..) |*x, i| x.* = .{ .offset = @intCast(i * 8), .extra = 2 };
+        \\    break :blk r;
+        \\};
+        \\var mutable: [4]Range = undefined;
+        \\var cell: Range = .{ .offset = 0, .extra = 0 };
+        \\const pointed = blk: {
+        \\    break :blk &cell;
+        \\};
+        \\fn distance(r: *std.Io.Reader) !Range {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    return .{ .offset = n, .extra = 3 };
+        \\}
+        \\pub fn encode(code: u2) void {
+        \\    const e = table[code];
+        \\    var n: usize = e.offset;
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var m: usize = table[code].offset;
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+        \\pub fn decode(r: *std.Io.Reader) !void {
+        \\    const d = try distance(r);
+        \\    var n: usize = d.offset;
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+        \\pub fn fromVar(code: u2) void {
+        \\    var n: usize = mutable[code].offset;
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var m: usize = pointed.offset;
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The decoder's own loop, and the loops over a variable table and a constant's pointer to a
+    // variable; never the constant table's.
+    try std.testing.expectEqualSlices(u32, &.{ 27, 31, 33 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
