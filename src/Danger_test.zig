@@ -1362,6 +1362,33 @@ test "A009 ends a length's fact where its memory is assigned between the check a
     try std.testing.expectEqualSlices(u32, &.{ 8, 17, 26 }, result.lines[0..result.findings]);
 }
 
+test "A010 reads a negation's variable as written by every form that writes it: a destructuring, a store through its address, an asm output" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn destructured(r: *std.Io.Reader) !i32 {
+        \\    var x: i32 = 0;
+        \\    var y: i32 = 0;
+        \\    x, y = .{ try r.takeInt(i32, 0), 0 };
+        \\    return -x +% y;
+        \\}
+        \\pub fn pointed(r: *std.Io.Reader) !i32 {
+        \\    var x: i32 = 0;
+        \\    const p = &x;
+        \\    p.* = try r.takeInt(i32, 0);
+        \\    return -x;
+        \\}
+        \\pub fn counted(n: u8) i32 {
+        \\    var x: i32 = 0;
+        \\    var i: u8 = 0;
+        \\    while (i < n) : (i += 1) x += 1;
+        \\    return -x;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The destructured and the pointed-to input; never the count.
+    try std.testing.expectEqualSlices(u32, &.{ 6, 12 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

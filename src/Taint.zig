@@ -457,6 +457,11 @@ fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value:
             if (decl.kind == .parameter) return;
             const scope = model.scopes[decl.scope].kind;
             if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value));
+            // A store through a local holding another's address (`const p = &x; p.* = v`)
+            // writes that other.
+            if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
+                if (tree.nodeTag(init) == .address_of) try store(c, flow, function, tree.nodeData(init).node, value);
+            };
             return raiseLocal(c, flow, .{ .file = f.file, .index = d }, value);
         },
         .field_access => {

@@ -279,17 +279,42 @@ fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
                 if (assumed.skip == assignment) continue;
                 if (!try nonnegativeIn(c, file, given, given, pointer, next, inductive)) return false;
             }
-            // Its address handed on lets a callee write it.
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag != .address_of) continue;
-                const operand = tree.nodeData(@fromBackingInt(@intCast(i))).node;
-                if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |r| if (r.declaration == d) return false;
-            }
+            // Any other write is none the induction reads: its address handed on lets a callee
+            // write it, and a destructuring or an `asm` output writes it directly.
+            if (try written(c, file, d)) return false;
             return true;
         },
         else => {},
     }
     return false;
+}
+
+/// Whether a local is written other than by an assignment to its name: its address taken, a
+/// destructuring assignment naming it, or an `asm` output.
+fn written(c: *Context, file: Project.FileId, d: u32) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .address_of => {
+                const operand = tree.nodeData(node).node;
+                if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |r| if (r.declaration == d) return true;
+            },
+            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |variable| {
+                if (tree.nodeTag(variable) == .identifier) if (model.reference(variable)) |r| if (r.declaration == d) return true;
+            },
+            .asm_output => if (outputNames(tree, node, model.declarations[d].name)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether an `asm` output writes the variable `name` (`[out] "=r" (name)`).
+fn outputNames(tree: *const Ast, output: Ast.Node.Index, name: []const u8) bool {
+    const rparen = tree.nodeData(output).opt_node_and_token[1];
+    return tree.tokenTag(rparen - 1) == .identifier and std.mem.eql(u8, tree.tokenSlice(rparen - 1), name);
 }
 
 /// Whether `a + half` is `a + (b - a) / k` with a literal `k` of at least one.
@@ -2015,6 +2040,26 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
             // A use inside the assignment is read before its store (`x &= x - 1`).
             if (to <= tree.lastToken(assignment)) continue;
             if (reads(c, file, compared, tree.nodeData(assignment).node_and_node[0], 0)) return false;
+        },
+        // A destructuring assignment writes each variable it names, an `asm` output its own.
+        .assign_destructure => {
+            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(assignment);
+            if (token <= from or token >= to) continue;
+            if (skipped) |cont| if (token >= tree.firstToken(cont) and token <= tree.lastToken(cont)) continue;
+            if (apart(c, file, assignment, use, condition)) continue;
+            for (tree.assignDestructure(assignment).ast.variables) |variable| if (reads(c, file, compared, variable, 0)) return false;
+        },
+        .asm_output => {
+            const output: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(output);
+            if (token <= from or token >= to) continue;
+            const out_name = tree.nodeData(output).opt_node_and_token[1] - 1;
+            if (tree.tokenTag(out_name) != .identifier) continue;
+            const at = bare(tree, compared);
+            for (tree.firstToken(at)..tree.lastToken(at) + 1) |k| {
+                if (std.mem.eql(u8, tree.tokenSlice(@intCast(k)), tree.tokenSlice(out_name))) return false;
+            }
         },
         // Its address handed on (`advance(&i)`) lets what takes it write it.
         .address_of => {
