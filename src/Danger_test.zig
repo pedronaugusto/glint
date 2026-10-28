@@ -2200,3 +2200,40 @@ test "A010 reads C integer types by their narrowest width where a value goes int
         return err;
     };
 }
+
+test "A009 reads the length of an array a field points to: a byte indexes 256 entries" {
+    // relic's multi-pack index, pack index and commit-graph fanouts: an object name's first byte.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const buckets = 256;
+        \\const Index = struct { fanout_table: *const [256][4]u8, direct: *const [buckets]u32 };
+        \\fn fanout(index: *const Index, bucket: u8) u32 {
+        \\    return std.mem.readInt(u32, &index.fanout_table[bucket], .big) +% index.direct[bucket];
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    const b = try r.take(2048);
+        \\    const index: Index = .{ .fanout_table = @ptrCast(b[0..1024]), .direct = @ptrCast(@alignCast(b[1024..2048])) };
+        \\    return fanout(&index, b[0]);
+        \\}
+    , 0);
+    // A wider index, or a slice with no declared length, stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\const Index = struct { fanout_table: *const [256][4]u8, rows: []const [4]u8 };
+        \\
+    ;
+    const tail =
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    const b = try r.take(2048);
+        \\    const index: Index = .{ .fanout_table = @ptrCast(b[0..1024]), .rows = @ptrCast(b[1024..2048]) };
+        \\    return fanout(&index, b[0], try r.takeInt(u16, 0));
+        \\}
+    ;
+    inline for (.{
+        "fn fanout(index: *const Index, bucket: u8, wide: u16) u32 {\n    _ = bucket;\n    return std.mem.readInt(u32, &index.fanout_table[wide], .big);\n}\n",
+        "fn fanout(index: *const Index, bucket: u8, wide: u16) u32 {\n    _ = wide;\n    return std.mem.readInt(u32, &index.rows[bucket], .big);\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body ++ tail, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}

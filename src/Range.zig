@@ -2267,7 +2267,8 @@ pub fn ceilings(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context
     return out.items;
 }
 
-/// The declared length of the fixed array a name holds (`var buf: [256]u8`, `const t = [_]u8{ ... }`).
+/// The declared length of the fixed array a name holds, or points to (`var buf: [256]u8`,
+/// `const t = [_]u8{ ... }`, a field `table: *const [256][4]u8`), its length a constant.
 fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?u128 {
     const decl = (try c.facts.definition(file, memory)) orelse return null;
     const record = c.project.models[decl.file.raw()].declarations[decl.index];
@@ -2289,8 +2290,13 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
         .parameter => null,
         else => null,
     };
-    const t = type_node orelse return null;
+    var t = type_node orelse return null;
+    // A pointer to one array (`*const [256][4]u8`) is indexed as the array is.
+    if (decl_tree.fullPtrType(t)) |pointer| {
+        if (pointer.size != .one) return null;
+        t = pointer.ast.child_type;
+    }
     if (decl_tree.nodeTag(t) != .array_type and decl_tree.nodeTag(t) != .array_type_sentinel) return null;
     const length_node = if (decl_tree.nodeTag(t) == .array_type) decl_tree.nodeData(t).node_and_node[0] else decl_tree.nodeData(t).node_and_extra[0];
-    return literal(decl_tree, length_node) orelse return null;
+    return (try valueOf(c, decl.file, length_node, 0)) orelse null;
 }
