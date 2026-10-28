@@ -2160,3 +2160,43 @@ test "Z034's fix nests the parentheses two findings open at one offset" {
     defer std.testing.allocator.free(twice);
     try std.testing.expectEqualStrings(once, twice);
 }
+
+test "A010 reads C integer types by their narrowest width where a value goes into one, their widest where one is read, and c_char by either sign" {
+    // bay's warp frames: a guard against the 32-bit bound clears a conversion into `c_ulong`
+    // and `c_int`; a `c_char` held at 0 to 127 fits it on every target.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const v = try r.takeInt(u64, 0);
+        \\    if (v > 0xffff_ffff) return;
+        \\    const window: c_ulong = @intCast(v);
+        \\    const count: c_int = @intCast(v & 0x7fff_ffff);
+        \\    const b = try r.takeByte();
+        \\    const ch: c_char = @intCast(b & 0x7f);
+        \\    _ = .{ window, count, ch };
+        \\}
+        \\fn narrow(ch: c_char) u8 {
+        \\    if (ch < 0) return 0;
+        \\    return @intCast(ch);
+        \\}
+        \\pub fn g(r: *std.Io.Reader) !u8 {
+        \\    return narrow(@intCast(try r.takeByte() & 0x7f));
+        \\}
+    , 0);
+    // A guard only a 64-bit `c_ulong` holds, a byte into `c_char` (above 127 on a signed
+    // target), a `c_char` that may be negative into `u8`, and a `c_ulong` read into a `u32`
+    // (64 bits where it is long), each stays a finding.
+    const head =
+        \\const std = @import("std");
+        \\
+    ;
+    inline for (.{
+        "pub fn f(r: *std.Io.Reader) !c_ulong {\n    const v = try r.takeInt(u64, 0);\n    if (v > 0xffff_ffff_ffff) return 0;\n    return @intCast(v);\n}\n",
+        "pub fn f(r: *std.Io.Reader) !c_char {\n    const b = try r.takeByte();\n    return @intCast(b);\n}\n",
+        "fn narrow(ch: c_char) u8 {\n    return @intCast(ch);\n}\npub fn f(r: *std.Io.Reader) !u8 {\n    return narrow(@bitCast(try r.takeByte()));\n}\n",
+        "fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n",
+    }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}

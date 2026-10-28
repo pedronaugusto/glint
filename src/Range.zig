@@ -20,14 +20,26 @@ const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
 const Ast = std.zig.Ast;
 
-/// An integer type: its width, and whether it is signed.
+/// An integer type: its width, and whether it is signed. A C type's width can differ between
+/// targets at one pointer width (`c_long` is 32 bits on Windows, 64 elsewhere on 64-bit
+/// ones): `bits` is its narrowest there and `wide` its widest. `c_char`'s sign differs too
+/// (`either`): it may be negative, and may reach 255.
 pub const Int = struct {
     bits: u16,
     signed: bool,
+    wide: ?u16 = null,
+    either: bool = false,
 
-    /// The greatest magnitude the type holds.
+    /// The greatest magnitude the type holds on every target: what a conversion into it or
+    /// arithmetic in it must stay within.
     fn room(self: Int) u128 {
         return filled(if (self.signed) self.bits -| 1 else self.bits);
+    }
+
+    /// The greatest magnitude a value of the type can have on some target.
+    fn reach(self: Int) u128 {
+        const bits = self.wide orelse self.bits;
+        return filled(if (self.signed and !self.either) bits -| 1 else bits);
     }
 };
 
@@ -46,10 +58,12 @@ const Typed = union(enum) {
         if (b == .literal) return a;
         const x = a.int;
         const y = b.int;
-        if (x.signed == y.signed) return .{ .int = .{ .bits = @max(x.bits, y.bits), .signed = x.signed } };
+        const wide: ?u16 = if (x.wide == null and y.wide == null) null else @max(x.wide orelse x.bits, y.wide orelse y.bits);
+        const either = x.either or y.either;
+        if (x.signed == y.signed) return .{ .int = .{ .bits = @max(x.bits, y.bits), .signed = x.signed, .wide = wide, .either = either } };
         const signed = if (x.signed) x else y;
         const unsigned = if (x.signed) y else x;
-        return .{ .int = .{ .bits = @max(signed.bits, unsigned.bits + 1), .signed = true } };
+        return .{ .int = .{ .bits = @max(signed.bits, unsigned.bits + 1), .signed = true, .wide = if (wide) |w| @max(w, unsigned.bits + 1) else null, .either = either } };
     }
 };
 
@@ -124,7 +138,7 @@ pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand
         };
         // A signed value may be negative, which no unsigned type holds, unless a comparison
         // where it is read keeps it at zero or above.
-        if (from.signed and !into.signed and !try nonnegative(c, file, operand, pointer)) return false;
+        if (from.signed and (!into.signed or into.either) and !try nonnegative(c, file, operand, pointer)) return false;
         const magnitude = (try bound(c, file, operand, pointer, 0)) orelse return false;
         if (magnitude > into.room()) return false;
     }
@@ -146,7 +160,7 @@ fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, 
     if (depth > depth_limit) return null;
     const own = try operation(c, file, node, pointer, depth);
     const typed: ?u128 = switch (try typeOf(c, file, node, pointer, depth)) {
-        .int => |int| int.room(),
+        .int => |int| int.reach(),
         else => null,
     };
     var out = narrower(own, typed);
@@ -377,7 +391,7 @@ fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.C
         if (!each.file.eql(decl.file) or each.index != decl.index) continue;
         const int = (try named(c, file, call.ast.params[0], pointer)) orelse return null;
         if (int.bits == 0) return 0;
-        return filled(int.bits - @intFromBool(int.signed));
+        return int.reach();
     }
     return null;
 }
@@ -711,7 +725,7 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
             for ([_][]const u8{ "@ctz", "@clz", "@popCount", "@intFromBool" }) |count| if (std.mem.eql(u8, name, count)) return .literal;
             // A magnitude is unsigned, as wide as its operand.
             if (std.mem.eql(u8, name, "@abs") and args.len == 1) return switch (try typeOf(c, file, args[0], pointer, next)) {
-                .int => |int| .{ .int = .{ .bits = int.bits, .signed = false } },
+                .int => |int| .{ .int = .{ .bits = int.bits, .signed = false, .wide = int.wide } },
                 else => |other| other,
             };
             for ([_][]const u8{ "@min", "@max", "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem" }) |peer| if (std.mem.eql(u8, name, peer) and args.len == 2) {
@@ -883,6 +897,20 @@ fn untyped(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     return variable.ast.init_node.unwrap();
 }
 
+/// A C integer type across the family's targets at one pointer width: `char` 8 bits of
+/// either sign, `short` 16, `int` 32, `long` 32 on Windows and 32-bit targets and the
+/// pointer's width elsewhere, `long long` 64.
+fn cType(name: []const u8, pointer: u16) Typed {
+    const unsigned = name.len > 1 and name[0] == 'u';
+    const base = if (unsigned) name[1..] else name;
+    if (std.mem.eql(u8, name, "char")) return .{ .int = .{ .bits = 8, .signed = true, .either = true } };
+    if (std.mem.eql(u8, base, "short")) return .{ .int = .{ .bits = 16, .signed = !unsigned } };
+    if (std.mem.eql(u8, base, "int")) return .{ .int = .{ .bits = 32, .signed = !unsigned } };
+    if (std.mem.eql(u8, base, "long")) return .{ .int = .{ .bits = 32, .signed = !unsigned, .wide = @max(pointer, 32) } };
+    if (std.mem.eql(u8, base, "longlong")) return .{ .int = .{ .bits = 64, .signed = !unsigned } };
+    return .unknown;
+}
+
 /// The integer type a resolved value is, seen through an optional or an error union.
 fn integer(value: Facts.Value, pointer: u16) Typed {
     switch (value) {
@@ -891,6 +919,7 @@ fn integer(value: Facts.Value, pointer: u16) Typed {
             if (std.mem.eql(u8, name, "comptime_int")) return .literal;
             if (std.mem.eql(u8, name, "usize")) return .{ .int = .{ .bits = pointer, .signed = false } };
             if (std.mem.eql(u8, name, "isize")) return .{ .int = .{ .bits = pointer, .signed = true } };
+            if (std.mem.startsWith(u8, name, "c_")) return cType(name[2..], pointer);
             if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return .unknown;
             const bits = std.fmt.parseUnsigned(u16, name[1..], 10) catch return .unknown;
             return .{ .int = .{ .bits = bits, .signed = name[0] == 'i' } };
