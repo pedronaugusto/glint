@@ -2107,3 +2107,38 @@ test "A011 keeps a method a generic's bound type gives undecided, as std's own t
     );
     try std.testing.expectEqual(@as(usize, 1), result.undecided);
 }
+
+test "A009 reads a constant margin: a cursor at most the length less a constant, then parts within the constant" {
+    // warp's fast loops: lz4's `in_end = in.len - 32` and `op + len <= out.len - 64`, zstd's
+    // and inflate's named margins.
+    const head =
+        \\const std = @import("std");
+        \\const margin = 258 + 16;
+        \\pub fn f(r: *std.Io.Reader, out: []u8) !void {
+        \\    const in = try r.take(4096);
+        \\    var ip: usize = try r.takeInt(u32, 0);
+        \\    var op: usize = try r.takeInt(u32, 0);
+        \\    _ = &ip;
+        \\    _ = &op;
+        \\
+    ;
+    inline for (.{
+        "    if (in.len < 32) return;\n    const in_end = in.len - 32;\n    if (ip <= in_end) {\n        _ = in[ip];\n        _ = in[ip + 1 ..][0..16];\n        _ = in[ip..][0..32];\n    }\n    _ = out;\n}\n",
+        "    if (out.len < 64) return;\n    const out_end = out.len - 64;\n    const len: usize = 8;\n    if (op + len <= out_end) {\n        out[op..][0..8].* = in[0..8].*;\n        out[op + 8 ..][0..8].* = in[0..8].*;\n        out[op + 16 ..][0..2].* = in[0..2].*;\n    }\n}\n",
+        "    if (op + margin <= out.len) out[op + 258 ..][0..16].* = in[0..16].*;\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 0) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // A part past the margin, a saturating difference (zero where the length is short of the
+    // margin, which leaves the cursor anywhere below it), and a margin no constant names stay
+    // findings.
+    inline for (.{
+        "    if (in.len < 32) return;\n    const in_end = in.len - 32;\n    if (ip <= in_end) _ = in[ip + 33 ..];\n    _ = out;\n}\n",
+        "    if (op <= out.len -| 32) out[op..][0..16].* = in[0..16].*;\n}\n",
+        "    const n = in[0];\n    if (ip + n <= in.len) _ = in[ip + 16 ..];\n    _ = out;\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}

@@ -2062,13 +2062,25 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
     var base = bare(tree, memory);
     while (tree.nodeTag(base) == .slice_open) {
         const slice = tree.fullSlice(base).?;
-        if (!needed.add(c, file, slice.ast.start, 0)) return false;
+        if (!try needed.add(c, file, slice.ast.start, 0)) return false;
         base = bare(tree, slice.ast.sliced);
     }
-    if (!needed.add(c, file, index, 0)) return false;
-    if (!lengthOf(c, file, fact.large, base)) return false;
+    if (!try needed.add(c, file, index, 0)) return false;
     var whole: Terms = .{};
-    if (!whole.add(c, file, fact.small, 0) or whole.len == 0 or (whole.len < 2 and whole.constant == 0)) return false;
+    // A length less a constant (`x <= in.len - 32`, or a constant naming it, `in_end`) is
+    // the length with the constant on the other side: reached, the difference did not
+    // underflow, so `x + 32 <= in.len`.
+    var large = bare(tree, fact.large);
+    if (tree.nodeTag(large) != .sub) if (constantOf(c, file, large)) |local| if (local.ast.init_node.unwrap()) |init| {
+        large = bare(tree, init);
+    };
+    if (tree.nodeTag(large) == .sub) {
+        const whole_length, const margin = tree.nodeData(large).node_and_node;
+        const k = (try valueOf(c, file, bare(tree, margin), 0)) orelse return false;
+        if (!lengthOf(c, file, whole_length, base)) return false;
+        whole.constant += k;
+    } else if (!lengthOf(c, file, fact.large, base)) return false;
+    if (!try whole.add(c, file, fact.small, 0) or whole.len == 0 or (whole.len < 2 and whole.constant == 0)) return false;
     var used: [Terms.capacity]bool = @splat(false);
     for (needed.nodes[0..needed.len]) |term| {
         for (whole.nodes[0..whole.len], 0..) |part, i| {
@@ -2085,6 +2097,38 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
     return if (end) room >= 0 else room >= 1;
 }
 
+/// A constant's value: a literal, a sum, difference or product of constants, or a constant
+/// declaration naming one, in this file or another (`margin`, `bits_.margin`, `258 + 16`).
+fn valueOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!?u64 {
+    if (depth > 4) return null;
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, node);
+    if (literal(tree, at)) |k| return k;
+    switch (tree.nodeTag(at)) {
+        .add, .sub, .mul => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const a = (try valueOf(c, file, lhs, depth + 1)) orelse return null;
+            const b = (try valueOf(c, file, rhs, depth + 1)) orelse return null;
+            return switch (tree.nodeTag(at)) {
+                .add => std.math.add(u64, a, b) catch null,
+                .sub => std.math.sub(u64, a, b) catch null,
+                else => std.math.mul(u64, a, b) catch null,
+            };
+        },
+        .identifier, .field_access => {
+            const decl = (try c.facts.definition(file, at)) orelse return null;
+            const model = &c.project.models[decl.file.raw()];
+            const record = model.declarations[decl.index];
+            if (record.kind != .variable) return null;
+            const declared = &c.project.files[decl.file.raw()].tree;
+            const variable = declared.fullVarDecl(record.node) orelse return null;
+            if (declared.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+            return valueOf(c, decl.file, variable.ast.init_node.unwrap() orelse return null, depth + 1);
+        },
+        else => return null,
+    }
+}
+
 /// A sum as its parts and the constants added in it: `6 + l1 + l2` is `l1`, `l2` and 6, and
 /// a constant naming a sum is that sum (`const records_at = id_end + 4;`).
 const Terms = struct {
@@ -2093,16 +2137,16 @@ const Terms = struct {
     len: usize = 0,
     constant: i128 = 0,
 
-    fn add(terms: *Terms, c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) bool {
+    fn add(terms: *Terms, c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
         const tree = &c.project.files[file.raw()].tree;
         const at = bare(tree, node);
-        if (literal(tree, at)) |k| {
+        if (try valueOf(c, file, at, 0)) |k| {
             terms.constant += k;
             return true;
         }
         if (tree.nodeTag(at) == .add) {
             const a, const b = tree.nodeData(at).node_and_node;
-            return terms.add(c, file, a, depth) and terms.add(c, file, b, depth);
+            return try terms.add(c, file, a, depth) and try terms.add(c, file, b, depth);
         }
         if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
             if (tree.nodeTag(bare(tree, init)) == .add) return terms.add(c, file, init, depth + 1);
