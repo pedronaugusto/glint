@@ -78,7 +78,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -1897,6 +1897,51 @@ test "A014 reads a local list nothing grows once its items are stored as no borr
         "    var held: std.ArrayList(u32) = .{};\n    for (from) |id| {\n        held.append(id);\n        agreed.ids = held.items;\n    }\n}\n",
         "    const list = &agreed.list;\n    list.append(from[0]);\n    agreed.ids = list.items;\n}\n",
     }) |body| expect(pack.lifetimes, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A020 reads a cancellation point the loop reaches through the project's functions: a call given an Io a value holds, checkCancel, a read on a std stream reader's interface" {
+    // uplink's connection loop (its socket holds the Io), relic's fetch-pack packets (read
+    // from the transport's stream reader).
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Socket = struct { io: std.Io, file: std.Io.File, reader: std.Io.File.Reader };
+        \\fn awaitRequest(s: *Socket) bool {
+        \\    s.io.checkCancel() catch return false;
+        \\    return true;
+        \\}
+        \\fn readPacket(s: *Socket) !u8 {
+        \\    return s.reader.interface.takeByte();
+        \\}
+        \\fn send(io: std.Io, s: *Socket) void { _ = io; _ = s; }
+        \\pub fn serve(io: std.Io, s: *Socket) void {
+        \\    _ = io;
+        \\    while (true) if (!awaitRequest(s)) return;
+        \\}
+        \\pub fn fetch(io: std.Io, s: *Socket) !void {
+        \\    _ = io;
+        \\    while (true) if (try readPacket(s) == 0) break;
+        \\}
+        \\pub fn pump(io: std.Io, s: *Socket) void {
+        \\    _ = io;
+        \\    while (true) send(s.io, s);
+        \\}
+    , 0);
+    // A reader passed in may be a fixed one over the program's bytes, a toss never refills, and
+    // a function that reaches no Io is no cancellation point.
+    const head =
+        \\const std = @import("std");
+        \\const Socket = struct { io: std.Io, file: std.Io.File, reader: std.Io.File.Reader };
+        \\fn idle(s: *Socket) bool { return s.file.handle != 0; }
+        \\
+    ;
+    inline for (.{
+        "pub fn f(io: std.Io, r: *std.Io.Reader) void {\n    _ = io;\n    while (true) _ = r.takeByte() catch return;\n}\n",
+        "pub fn f(io: std.Io, s: *Socket) void {\n    _ = io;\n    while (true) s.reader.interface.toss(1);\n}\n",
+        "pub fn f(io: std.Io, s: *Socket) void {\n    _ = io;\n    while (true) if (!idle(s)) return;\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
