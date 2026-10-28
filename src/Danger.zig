@@ -185,7 +185,9 @@ pub fn units(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     for (sites.items) |site| {
-        if (site.through_alias or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
+        // A constant named through an alias a container declares is converted where the
+        // alias is used: the alias itself is no arithmetic.
+        if ((site.through_alias and !site.alias_declared) or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
         const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
         if (!arithmetic(tree.nodeTag(parent))) continue;
         try c.at(rule, site.token, try c.allocator.print("std.{s} in arithmetic: a unit converted by hand; aegis units.Duration converts between units and checks the result", .{constants[site.index]}));
@@ -207,7 +209,7 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     for (sites.items) |site| {
-        if (site.through_alias or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
+        if ((site.through_alias and !site.alias_declared) or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
         if (sameUnit(tree, model, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
     }
@@ -584,9 +586,24 @@ fn governed(c: *Context, rule: Rule, paths: []const []const u8, operation: bool,
     try Governed.sites(c, rule, found, &sites);
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
-        if (operation and !atRuntime(c, site.node)) continue;
+        // An operation is judged where it runs, or where a container's declaration names it
+        // (`const eql = std.crypto.timing_safe.eql;`): the program takes it up there, whether
+        // it calls it or binds it into a generic's context, whose call runs in that generic.
+        if (operation and !atRuntime(c, site.node) and !declaredAs(c, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print(message, .{paths[site.index]}));
     }
+}
+
+/// Whether a reference is the whole value of a constant a file or container declares.
+fn declaredAs(c: *const Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
+    const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table
+    const variable = tree.fullVarDecl(parent) orelse return false;
+    if (variable.ast.init_node.unwrap() != node) return false;
+    const holder = model.node_parents[@backingInt(parent)] orelse return true; // safe: a node index indexes its own tree's parent table
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.fullContainerDecl(&buffer, holder) != null or tree.nodeTag(holder) == .root;
 }
 
 /// Whether the code at `node` runs when the program runs: inside a function's body that does

@@ -43,6 +43,9 @@ pub const Site = struct {
     decl: Facts.Decl,
     /// Reached through an alias the program declares: the alias is a site where it is made.
     through_alias: bool,
+    /// The alias is a container's declaration, evaluated as the program compiles: it is no
+    /// site where the program runs, so a rule on what runs reads this use as the site.
+    alias_declared: bool = false,
 };
 
 /// Each target's declarations in this project. A source nothing names, or a path that does not
@@ -147,6 +150,12 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
         const reached = try reach(self, node, tag, spelled, governed);
         const decls = switch (reached) {
             .unknown => |why| {
+                // A method called on a value whose type a generic's binding gives
+                // (`s.context.eql(a, b)` in `Interner(T, Context)`) is that type's. Where every
+                // governed declaration of that name is a free function, no type has it as a
+                // method of its own: the binding reaches one only through an alias its type
+                // declares, which is that alias's site.
+                if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
                 try self.unknown(rule, node, why);
                 continue;
             },
@@ -157,10 +166,38 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
             // `reach` gives a definition first and its origin second: a match on the origin of
             // a different declaration came through the program's alias.
             const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.inputs[decls[d - 1].file.raw()].selected;
-            try out.append(self.allocator, .{ .token = site, .node = node, .index = g.index, .decl = decl, .through_alias = alias });
+            const declared = alias and switch (self.project.models[decls[d - 1].file.raw()].scopes[self.project.models[decls[d - 1].file.raw()].declarations[decls[d - 1].index].scope].kind) {
+                .file, .container => true,
+                else => false,
+            };
+            try out.append(self.allocator, .{ .token = site, .node = node, .index = g.index, .decl = decl, .through_alias = alias, .alias_declared = declared });
             break :found;
         };
     }
+}
+
+/// Whether every governed declaration named `name` is a function of a namespace: a container
+/// with no fields, so no value's method.
+fn free(self: *Context, governed: []const Governed, name: []const u8) bool {
+    for (governed) |g| {
+        if (!std.mem.eql(u8, g.name, name)) continue;
+        for (g.decls) |decl| {
+            const model = &self.project.models[decl.file.raw()];
+            const scope = model.declarations[decl.index].scope;
+            if (model.declarations[decl.index].kind != .function) return false;
+            for (model.declarations) |other| if (other.kind == .field and other.scope == scope) return false;
+        }
+    }
+    return true;
+}
+
+/// Whether a member access is the callee of a call.
+fn methodCall(self: *Context, member: Ast.Node.Index) bool {
+    const tree = &self.project.files[self.file.raw()].tree;
+    const parent = self.project.models[self.file.raw()].node_parents[@backingInt(member)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    return call.ast.fn_expr == member;
 }
 
 fn matches(self: *Context, g: Governed, decl: Facts.Decl) bool {

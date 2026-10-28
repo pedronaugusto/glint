@@ -2043,3 +2043,67 @@ test "A012 reads a take, peek or discard on a fixed reader as no work a peer siz
         \\}
     , 1);
 }
+
+test "A008 decides a method called through a generic's bound type where the binding names it" {
+    // parallax's interner: its context's equality, whatever context a consumer binds.
+    try expect(pack.secrets,
+        \\const std = @import("std");
+        \\pub fn Interner(comptime T: type, comptime Context: type) type {
+        \\    return struct {
+        \\        context: Context,
+        \\        items: []const T,
+        \\        pub fn find(s: *const @This(), item: T) ?usize {
+        \\            for (s.items, 0..) |x, i| if (s.context.eql(x, item)) return i;
+        \\            return null;
+        \\        }
+        \\    };
+        \\}
+    , 0);
+    // A binding that names std's timing-safe comparison is found where it names it.
+    try expect(pack.secrets,
+        \\const std = @import("std");
+        \\pub fn Interner(comptime T: type, comptime Context: type) type {
+        \\    return struct {
+        \\        context: Context,
+        \\        items: []const T,
+        \\        pub fn find(s: *const @This(), item: T) ?usize {
+        \\            for (s.items, 0..) |x, i| if (s.context.eql(x, item)) return i;
+        \\            return null;
+        \\        }
+        \\    };
+        \\}
+        \\const Timed = struct { pub const eql = std.crypto.timing_safe.eql; };
+        \\pub const Keys = Interner([4]u8, Timed);
+    , 1);
+}
+
+test "A008 finds a hand comparison an alias a container declares names, at the alias" {
+    try expect(pack.secrets,
+        \\const std = @import("std");
+        \\const eql = std.crypto.timing_safe.eql;
+        \\pub fn f(a: [4]u8, b: [4]u8) bool { return eql([4]u8, a, b); }
+        \\pub fn g(a: [4]u8, b: [4]u8) bool { const local = std.crypto.timing_safe.eql; return local([4]u8, a, b); }
+    , 2);
+}
+
+test "A011 finds a unit converted by hand through an alias a container declares, at the arithmetic" {
+    try expect(pack.units,
+        \\const std = @import("std");
+        \\const ns_per_ms = std.time.ns_per_ms;
+        \\pub fn f(ms: u64) u64 { return ms * ns_per_ms; }
+        \\pub fn g() u64 { return ns_per_ms; }
+    , 1);
+}
+
+test "A011 keeps a method a generic's bound type gives undecided, as std's own type may be the binding" {
+    const result = try run(pack.units,
+        \\const std = @import("std");
+        \\pub fn Timer(comptime D: type) type {
+        \\    return struct {
+        \\        left: D,
+        \\        pub fn ms(t: *const @This()) i64 { return t.left.toMilliseconds(); }
+        \\    };
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.undecided);
+}
