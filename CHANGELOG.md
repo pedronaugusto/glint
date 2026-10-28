@@ -4,16 +4,8 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ## [Unreleased]
 
-## [0.7.4] - 2026-10-28
-
 ### Fixed
 
-- Z012 reads a `pub fn` as a public signature only where every container around it, up to the file, is held by a public or exported declaration. A method of a struct a private declaration holds is named by nobody outside the file, so the private types it takes are no finding (reactor's backend sinks, called through `anytype`, and its tests' harnesses: 19 of the 25 findings in its car).
-- A009 and A010 read more of the checks a decoder makes, from warp's reports (A009 385 to 348, A010 730 to 721 on warp 3825b15):
-  - a difference computed before the use, on every path to it: `a - b` of unsigned operands puts `b` at most `a` past it (`if (len > in.len - ip) return` before `in[ip..]`), where an underflow would have stopped the program at the subtraction, which A010 judges there;
-  - a sum the length bounds, for each sum of its parts (`if (l1 + l2 + l3 + 6 > in.len) return` before `in[6 + l1 ..][0..l2]`), its other parts unsigned;
-  - a clamp among the other assignments of its block (`if (n > r.at) { n = r.at; status = .end_of_buffer; }`);
-  - a comptime parameter takes nothing its callers pass from input: the program fixes it when it is compiled (an inline prong's period as a divisor).
 - A010 reads more of what keeps arithmetic in range, from the family's rule survey:
   - a midpoint, `lo + (hi - lo) / 2`, is at most `hi`;
   - negating a value that cannot be negative cannot overflow: a magnitude (`@abs`), a conversion of one, a sum, product or positive quotient of such values, or a local initialized with one;
@@ -24,6 +16,17 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - A comparison that a value differs from zero puts it at least one only where it is unsigned: a signed value other than zero may be below it (`if (d == 0) return` before `x % d` left -1, which overflows a signed minimum, unreported).
 - A009 reads a sum a constant names as that sum (`const records_at = id_end + 4;` checked against the input keeps `rest[id_end..][0..4]`).
 - A009 and A010 read a constant minimum as at most each of its arguments, while nothing between assigns what it is compared with, and a difference of unsigned operands as at most what it is taken from (`const n = @min(max, op - start);` before `out[op - n .. op]`, and `e.available_out -= n` after `n = @min(e.available_out, out.len)`): on warp, A009 348 to 347 and A010 721 to 717.
+
+## [0.7.4] - 2026-10-28
+
+### Fixed
+
+- Z012 reads a `pub fn` as a public signature only where every container around it, up to the file, is held by a public or exported declaration. A method of a struct a private declaration holds is named by nobody outside the file, so the private types it takes are no finding (reactor's backend sinks, called through `anytype`, and its tests' harnesses: 19 of the 25 findings in its car).
+- A009 and A010 read more of the checks a decoder makes, from warp's reports (A009 385 to 348, A010 730 to 721 on warp 3825b15):
+  - a difference computed before the use, on every path to it: `a - b` of unsigned operands puts `b` at most `a` past it (`if (len > in.len - ip) return` before `in[ip..]`), where an underflow would have stopped the program at the subtraction, which A010 judges there;
+  - a sum the length bounds, for each sum of its parts (`if (l1 + l2 + l3 + 6 > in.len) return` before `in[6 + l1 ..][0..l2]`), its other parts unsigned;
+  - a clamp among the other assignments of its block (`if (n > r.at) { n = r.at; status = .end_of_buffer; }`);
+  - a comptime parameter takes nothing its callers pass from input: the program fixes it when it is compiled (an inline prong's period as a divisor).
 
 ## [0.7.3] - 2026-10-27
 
