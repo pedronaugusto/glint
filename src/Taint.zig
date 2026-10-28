@@ -395,28 +395,32 @@ fn isMemcpy(tree: *const Ast, node: Ast.Node.Index) bool {
 /// switch's operand, a `for` capture its input (a range's counter is clean), a `catch`'s error
 /// nothing.
 fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration, d: u32) Context.Error!Dep {
-    const f = flow.functions.items[function];
-    const tree = &c.project.files[f.file.raw()].tree;
-    const model = &c.project.models[f.file.raw()];
+    const from = binding(c, flow.functions.items[function].file, decl, d) orelse return .{};
+    return dep(c, flow, function, from);
+}
+
+/// What a capture binds: the condition of its `if`, `while` or `switch`, or its `for`'s input;
+/// null for an error capture or a range's index.
+fn binding(c: *Context, file: Project.FileId, decl: Model.Declaration, d: u32) ?Ast.Node.Index {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
     const node = decl.node;
-    if (tree.fullIf(node)) |branch| return if (branch.error_token == decl.token) .{} else dep(c, flow, function, branch.ast.cond_expr);
-    if (tree.fullWhile(node)) |loop| return if (loop.error_token == decl.token) .{} else dep(c, flow, function, loop.ast.cond_expr);
+    if (tree.fullIf(node)) |branch| return if (branch.error_token == decl.token) null else branch.ast.cond_expr;
+    if (tree.fullWhile(node)) |loop| return if (loop.error_token == decl.token) null else loop.ast.cond_expr;
     if (tree.fullSwitchCase(node) != null) {
-        const parent = model.node_parents[@backingInt(node)] orelse return .{}; // safe: a node index indexes its own tree's parent table.
-        const choice = tree.fullSwitch(parent) orelse return .{};
-        return dep(c, flow, function, choice.ast.condition);
+        const parent = model.node_parents[@backingInt(node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+        return (tree.fullSwitch(parent) orelse return null).ast.condition;
     }
     if (tree.fullFor(node)) |loop| {
         var position: usize = 0;
         for (model.declarations[0..d]) |earlier| if (earlier.kind == .capture and earlier.node == node) {
             position += 1;
         };
-        if (position >= loop.ast.inputs.len) return .{};
+        if (position >= loop.ast.inputs.len) return null;
         const input = loop.ast.inputs[position];
-        if (tree.nodeTag(input) == .for_range) return .{};
-        return dep(c, flow, function, input);
+        return if (tree.nodeTag(input) == .for_range) null else input;
     }
-    return .{};
+    return null;
 }
 
 /// The declaration a `var`/`const` node declares.
@@ -457,6 +461,8 @@ fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value:
             if (decl.kind == .parameter) return;
             const scope = model.scopes[decl.scope].kind;
             if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value));
+            // A store through a capture (`for (&a) |*x| x.* = v`) reaches what it binds.
+            if (decl.kind == .capture) if (binding(c, f.file, decl, d)) |from| try store(c, flow, function, from, value);
             return raiseLocal(c, flow, .{ .file = f.file, .index = d }, value);
         },
         .field_access => {
@@ -1054,13 +1060,21 @@ fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     return false;
 }
 
-/// Whether a field's declared type is a number or a `bool`: a value, no memory a peer's bytes
-/// could stand behind.
+/// Whether a field's declared type holds values and no memory a peer's bytes could stand
+/// behind: a number or a `bool`, or an optional or array of one held by value.
 fn valueField(c: *Context, decl: Facts.Decl) bool {
     const tree = &c.project.files[decl.file.raw()].tree;
     const field = tree.fullContainerField(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
-    const declared = field.ast.type_expr.unwrap() orelse return false;
-    return tree.nodeTag(declared) == .identifier and Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)));
+    return valueType(tree, field.ast.type_expr.unwrap() orelse return false);
+}
+
+fn valueType(tree: *const Ast, declared: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(declared)) {
+        .identifier => Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared))),
+        .optional_type => valueType(tree, tree.nodeData(declared).node),
+        .array_type, .array_type_sentinel => valueType(tree, tree.fullArrayType(declared).?.ast.elem_type),
+        else => false,
+    };
 }
 
 /// A labeled block's value: what its `break`s give it.

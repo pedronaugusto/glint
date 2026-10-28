@@ -1301,6 +1301,70 @@ test "A009 reads a field of a constant the compiler evaluates as the constant's,
     try std.testing.expectEqualSlices(u32, &.{ 27, 31, 33 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a parser's returned arrays and optionals of numbers as refined through the parse, and as input through a direct call or a store outside it" {
+    const result = try run(pack.untrusted_input,
+        \\const aegis = @import("aegis");
+        \\const Table = struct { norm: [4]u16, log: u4, compressed: ?u32 };
+        \\const Held = struct { norm: [4]u16 };
+        \\fn readTable(_: void, in: []const u8) error{Short}!Table {
+        \\    if (in.len < 8) return error.Short;
+        \\    var norm: [4]u16 = undefined;
+        \\    for (&norm, 0..) |*n, i| n.* = @as(u16, in[2 * i]) << 8 | in[2 * i + 1];
+        \\    const compressed: ?u32 = if (in[0] == 0) null else @as(u32, in[1]) << 8 | in[2];
+        \\    return .{ .norm = norm, .log = 3, .compressed = compressed };
+        \\}
+        \\pub fn parsed(in: []const u8) !void {
+        \\    const t = try aegis.input.Untrusted([]const u8).init(in).parse({}, readTable);
+        \\    var n: usize = t.norm[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var m: usize = t.compressed orelse 0;
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+        \\pub fn direct(text: aegis.input.Untrusted([]const u8)) !void {
+        \\    const t = try readTable({}, text.readForParse());
+        \\    var n: usize = t.norm[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+        \\pub fn stored(text: aegis.input.Untrusted([]const u8)) void {
+        \\    const b = text.readForParse();
+        \\    var t: Held = undefined;
+        \\    t.norm[0] = @as(u16, b[0]) << 8 | b[1];
+        \\    var n: usize = t.norm[0];
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The direct call's and the store's; never the parse's.
+    try std.testing.expectEqualSlices(u32, &.{ 21, 28 }, result.lines[0..result.findings]);
+}
+
+test "A009 reads a store through a capture as a store to what it binds: a `for` over an array's address, an optional's payload" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn filled(r: *std.Io.Reader) !void {
+        \\    var a: [4]u32 = undefined;
+        \\    for (&a) |*x| x.* = try r.takeInt(u32, 0);
+        \\    var n: usize = a[0];
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+        \\pub fn payload(r: *std.Io.Reader) !void {
+        \\    var held: ?u32 = 0;
+        \\    if (held) |*x| x.* = try r.takeInt(u32, 0);
+        \\    var n: usize = held orelse 0;
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+        \\pub fn counted() void {
+        \\    var a: [4]u32 = undefined;
+        \\    for (&a, 0..) |*x, i| x.* = @intCast(i);
+        \\    var n: usize = a[0];
+        \\    while (n > 0) : (n -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The input stored through each capture; never the counter's.
+    try std.testing.expectEqualSlices(u32, &.{ 6, 12 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
