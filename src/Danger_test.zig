@@ -2265,3 +2265,39 @@ test "A010 reads a wrapping comparison of a value less one as the value from one
         return err;
     };
 }
+
+test "A009 reads a call that passes its argument through, an empty asm tied to it, as that argument" {
+    // warp's lz4 and snappy fast loops: `chainless(ip + 3)`, an optimization barrier.
+    const tail =
+        \\pub fn f(r: *std.Io.Reader, out: []u8) !void {
+        \\    const in = try r.take(4096);
+        \\    var ip: usize = try r.takeInt(u32, 0);
+        \\    _ = &ip;
+        \\    if (in.len < 32) return;
+        \\    const in_end = in.len - 32;
+        \\    if (ip <= in_end) {
+        \\        const past_offset = through(ip + 3);
+        \\        out[0..16].* = in[past_offset - 2 ..][0..16].*;
+        \\    }
+        \\}
+    ;
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\inline fn through(x: usize) usize {
+        \\    return switch (builtin.cpu.arch) {
+        \\        .aarch64, .x86_64 => asm ("" : [out] "=r" (-> usize) : [in] "0" (x)),
+        \\        else => x,
+        \\    };
+        \\}
+        \\
+    ++ tail, 0);
+    // An asm that does something, or a function that moves its argument, is no identity.
+    inline for (.{
+        "const std = @import(\"std\");\nconst builtin = @import(\"builtin\");\ninline fn through(x: usize) usize {\n    return switch (builtin.cpu.arch) {\n        .x86_64 => asm (\"add %[out], 64\" : [out] \"=r\" (-> usize) : [in] \"0\" (x)),\n        else => x,\n    };\n}\n",
+        "const std = @import(\"std\");\ninline fn through(x: usize) usize {\n    return x + 64;\n}\n",
+    }) |head| expect(pack.untrusted_input, head ++ tail, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{head});
+        return err;
+    };
+}

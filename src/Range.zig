@@ -2137,6 +2137,71 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
     return if (end) room >= 0 else room >= 1;
 }
 
+/// The argument a call passes through unchanged: a function of one parameter each of whose
+/// returns is that parameter, or an `asm` with an empty template whose one output is tied
+/// (`"0"`) to its one input, the parameter, as an optimization barrier is (warp's
+/// `chainless(ip + 3)` is `ip + 3`).
+fn identity(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.files[file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    if (call.ast.params.len != 1) return null;
+    const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |d| d,
+        else => return null,
+    };
+    const model = &c.project.models[decl.file.raw()];
+    const callee = &c.project.files[decl.file.raw()].tree;
+    const proto_node = model.declarations[decl.index].node;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = callee.fullFnProto(&proto_buffer, proto_node) orelse return null;
+    var params = proto.iterate(callee);
+    const param = params.next() orelse return null;
+    if (params.next() != null) return null;
+    const name = callee.tokenSlice(param.name_token orelse return null);
+    const fn_decl = model.node_parents[@backingInt(proto_node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+    if (callee.nodeTag(fn_decl) != .fn_decl) return null;
+    const body = callee.nodeData(fn_decl).node_and_node[1];
+    var returns: usize = 0;
+    for (callee.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (callee.nodeMainToken(at) < callee.firstToken(body) or callee.nodeMainToken(at) > callee.lastToken(body)) continue;
+        const value = callee.nodeData(at).opt_node.unwrap() orelse return null;
+        if (!passes(callee, value, name, 0)) return null;
+        returns += 1;
+    }
+    return if (returns == 0) null else call.ast.params[0];
+}
+
+/// Whether an expression is the parameter `name` unchanged: itself, a branch or prong each of
+/// which is, or an empty `asm` tying its output to it.
+fn passes(tree: *const Ast, node: Ast.Node.Index, name: []const u8, depth: u8) bool {
+    if (depth > 4) return false;
+    const at = bare(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), name),
+        .@"switch", .switch_comma => {
+            const full = tree.fullSwitch(at).?;
+            for (full.ast.cases) |case| if (!passes(tree, tree.fullSwitchCase(case).?.ast.target_expr, name, depth + 1)) return false;
+            return true;
+        },
+        else => {
+            if (tree.fullIf(at)) |branch| {
+                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+                return passes(tree, branch.ast.then_expr, name, depth + 1) and passes(tree, otherwise, name, depth + 1);
+            }
+            const asm_node = tree.fullAsm(at) orelse return false;
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(asm_node.ast.template)), "\"\"")) return false;
+            if (asm_node.outputs.len != 1 or asm_node.inputs.len != 1) return false;
+            const input = asm_node.inputs[0];
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(input) + 2), "\"0\"")) return false;
+            const operand = tree.nodeData(input).node_and_token[0];
+            return tree.nodeTag(operand) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operand)), name);
+        },
+    }
+}
+
 /// A constant's value: a literal, a sum, difference or product of constants, or a constant
 /// declaration naming one, in this file or another (`margin`, `bits_.margin`, `258 + 16`).
 fn valueOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!?u64 {
@@ -2188,9 +2253,23 @@ const Terms = struct {
             const a, const b = tree.nodeData(at).node_and_node;
             return try terms.add(c, file, a, depth) and try terms.add(c, file, b, depth);
         }
-        if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
-            if (tree.nodeTag(bare(tree, init)) == .add) return terms.add(c, file, init, depth + 1);
-        };
+        // Less a constant: the sum and the constant taken off it.
+        if (tree.nodeTag(at) == .sub) {
+            const a, const b = tree.nodeData(at).node_and_node;
+            if (try valueOf(c, file, b, 0)) |k| {
+                terms.constant -= k;
+                return terms.add(c, file, a, depth);
+            }
+        }
+        if (depth < 4) {
+            if (try identity(c, file, at)) |through| return terms.add(c, file, through, depth + 1);
+            if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
+                switch (tree.nodeTag(bare(tree, init))) {
+                    .add, .sub => return terms.add(c, file, init, depth + 1),
+                    else => if (try identity(c, file, bare(tree, init)) != null) return terms.add(c, file, init, depth + 1),
+                }
+            };
+        }
         if (terms.len == capacity) return false;
         terms.nodes[terms.len] = at;
         terms.len += 1;
