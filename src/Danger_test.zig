@@ -1481,6 +1481,31 @@ test "A009 reads a parse's result as refined only where its parser shows the val
     try std.testing.expectEqualSlices(u32, &.{ 25, 27 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a truncation and wrapping arithmetic as the peer's number in a wide type, data only where the value is shown small" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn wide(r: *std.Io.Reader) !void {
+        \\    const big = try r.takeInt(u64, 0);
+        \\    var n: u32 = @truncate(big);
+        \\    while (n > 0) : (n -= 1) {}
+        \\    const a = try r.takeInt(u32, 0);
+        \\    var m: u32 = a +% 1;
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+        \\pub fn small(r: *std.Io.Reader, table: *const [256]u8) !u8 {
+        \\    const big = try r.takeInt(u64, 0);
+        \\    var n: u8 = @truncate(big);
+        \\    while (n > 0) : (n -= 1) {}
+        \\    const word = try r.takeInt(u32, 0);
+        \\    return table[(word *% 2654435761) >> 24];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The wide truncation's loop and the wrapped sum's; never the byte's, nor the hash shifted to
+    // a table's bits.
+    try std.testing.expectEqualSlices(u32, &.{ 5, 8 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

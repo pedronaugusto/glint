@@ -17,9 +17,10 @@
 //! `takeInt`) or the program assembles from it by a shift or a product. A position std finds in
 //! data, a count a read returns, a slice's `.len` and `.ptr`, the least of a value and a clean
 //! bound, a count of bits (`@ctz`, `@clz`, `@popCount`) and a comparison are clean: memory or
-//! a width the program holds bounds them. What a decode of 16 bits or fewer gives, a mask or a
-//! remainder by the program's own value, a truncation and wrapping arithmetic stay in a range
-//! the program chose: data, never a number.
+//! a width the program holds bounds them. What a decode of 16 bits or fewer gives, and a mask
+//! or a remainder by the program's own value, stay in a range the program chose: data, never a
+//! number. A truncation and wrapping arithmetic keep a number in their type's range, which a
+//! wide type gives the peer: a sink reads them as data only where the value is shown small.
 //!
 //! The fact flows through locals, captures, indexing and slicing, field reads, arithmetic and
 //! conversions; through a call outside the program given such a value (to its result, and to a
@@ -872,12 +873,10 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
             if (left.clean() or right.clean()) return left.join(right).narrowed();
             return left.join(right);
         },
-        // Wrapping arithmetic stays in its type's range by intent (a hash, a checksum): data.
-        .add_wrap, .sub_wrap, .mul_wrap => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs)).narrowed();
-        },
-        .add, .div, .shr, .bit_or, .bit_xor, .add_sat, .array_cat, .@"orelse", .@"catch" => {
+        // Wrapping arithmetic stays in its type's range, which is the peer's to choose in a wide
+        // type: a sink reads it as data only where the result is shown small (a hash shifted to
+        // a table's bits).
+        .add_wrap, .sub_wrap, .mul_wrap, .add, .div, .shr, .bit_or, .bit_xor, .add_sat, .array_cat, .@"orelse", .@"catch" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs));
         },
@@ -901,8 +900,8 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
                 if (std.mem.eql(u8, name, "@min") and each.clean()) return .{};
                 out = out.join(each);
             }
-            // A truncation keeps the bits a narrower type holds: a peer's value in its range.
-            if (std.mem.eql(u8, name, "@truncate")) return out.narrowed();
+            // A truncation keeps the bits its type holds, a peer's choice in a wide one: a sink
+            // reads it as data only where the type is shown small.
             return out;
         },
         .@"if", .if_simple => {
