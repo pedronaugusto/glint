@@ -262,7 +262,7 @@ test "A008 leaves borrowed keys, sealed keys, public keys and compared key types
     , 0);
 }
 
-test "A011 finds time crossing as a raw integer and units converted by hand, not raw nanoseconds compared or subtracted" {
+test "A011 finds time crossing as a raw integer and units converted by hand wherever a constant goes and as the program compiles, not raw nanoseconds compared or subtracted" {
     try expect(pack.units,
         \\const std = @import("std");
         \\pub fn f(ms: i64, d: std.Io.Duration) i64 {
@@ -273,9 +273,19 @@ test "A011 finds time crossing as a raw integer and units converted by hand, not
         \\    return d.toMilliseconds() + @as(i64, @intCast(d.nanoseconds));
         \\}
     , 4);
+    // A factor handed on raw, one computed as the program compiles, and one through a local's
+    // name: each a conversion by hand, at the constant.
     try expect(pack.units,
         \\const std = @import("std");
+        \\const timeout_ns = 5 * std.time.ns_per_s;
         \\pub fn f() u64 { return std.time.ns_per_ms; }
+        \\pub fn g(ms: u64) u64 {
+        \\    const per = std.time.ns_per_ms;
+        \\    return ms * per + timeout_ns;
+        \\}
+    , 3);
+    try expect(pack.units,
+        \\const std = @import("std");
         \\pub fn late(now: std.Io.Timestamp, end: std.Io.Timestamp, left: std.Io.Duration) bool {
         \\    if (left.nanoseconds <= 0) return true;
         \\    return now.nanoseconds >= end.nanoseconds or end.nanoseconds - now.nanoseconds < left.nanoseconds;
@@ -331,7 +341,7 @@ test "A010 finds conversions of input and division by it, not of the program's o
     , 3);
 }
 
-test "A019 finds the unchecked operations, the escape covering one, never an address read or an interface field's parent" {
+test "A019 finds the unchecked operations, an interface field's parent and its alignment among them, the escape covering one, never an address read" {
     try expect(pack.unsafe_set,
         \\extern fn write(fd: c_int) c_int;
         \\const Sink = struct { interface: u64, n: u32 };
@@ -347,7 +357,7 @@ test "A019 finds the unchecked operations, the escape covering one, never an add
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
-    , 5);
+    , 7);
 }
 
 test "A014 finds a pointer into the frame carried out of the call" {
@@ -4304,4 +4314,44 @@ test "A009 reads std's Zig tree as its parse's check where a parser handed to in
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
+}
+
+test "A007 reads only aegis's guards as holding a container var's state, and a sync type's value named through it as held" {
+    // An id and a Shared handle guard nothing; a lock's `init` named through its type is one.
+    try expect(pack.shared_state,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const Tag = struct {};
+        \\var next: aegis.id.Id(Tag, u32) = @enumFromInt(0);
+        \\pub fn f() void {
+        \\    var lock = std.Io.Mutex.init;
+        \\    std.Io.Mutex.lock(&lock);
+        \\}
+    , 2);
+    try expect(pack.shared_state,
+        \\const aegis = @import("aegis");
+        \\var cell: aegis.Atomic(u32) = .init(0);
+    , 0);
+}
+
+test "A013 reads std's assert called through any alias the program declares, public too, and leaves one taken as a value undecided" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\pub const check = std.debug.assert;
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    check(b < 4);
+        \\    return b;
+        \\}
+    , 1);
+    const result = try run(pack.contracts,
+        \\const std = @import("std");
+        \\fn apply(f: *const fn (bool) void, ok: bool) void {
+        \\    f(ok);
+        \\}
+        \\pub fn g(r: *std.Io.Reader) !void {
+        \\    apply(&std.debug.assert, try r.takeByte() < 4);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.undecided);
 }

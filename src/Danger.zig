@@ -54,9 +54,11 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether a container variable's type holds its state under aegis: an aegis type, or a choice
-/// the build makes (`if (builtin.is_test) aegis.Atomic(T) else void`) each of whose types is
-/// one or `void`, which holds no state.
+/// Whether a container variable's type holds its state under one of aegis's guards (`Guarded`
+/// and its kin, `Condition`, `Once`, `Lazy`, `Confined`, `Atomic`), or is a choice the build makes
+/// (`if (builtin.is_test) aegis.Atomic(T) else void`) each of whose types is one or `void`, which
+/// holds no state. Another aegis type (an id, a `Shared` handle, an externally serialized
+/// `Counter`) guards nothing.
 fn guards(c: *Context, value: Facts.Value) Context.Error!bool {
     switch (value) {
         .alternatives => |each| {
@@ -64,7 +66,10 @@ fn guards(c: *Context, value: Facts.Value) Context.Error!bool {
             return true;
         },
         .primitive => |name| return std.mem.eql(u8, name, "void"),
-        else => return try c.role(Contract.library, value) != null,
+        else => return switch ((try c.role(Contract.library, value)) orelse return false) {
+            .guarded, .condition, .once, .confined, .atomic => true,
+            else => false,
+        },
     }
 }
 
@@ -182,20 +187,18 @@ pub fn units(c: *Context, rule: Rule) Context.Error!void {
     const found = try Governed.resolve(c, rule, &targets, &indexes);
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
     for (sites.items) |site| {
-        // A constant named through an alias a container declares is converted where the
-        // alias is used: the alias itself is no arithmetic.
-        if ((site.through_alias and !site.alias_declared) or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
-        const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
-        if (!arithmetic(tree.nodeTag(parent))) continue;
-        try c.at(rule, site.token, try c.allocator.print("std.{s} in arithmetic: a unit converted by hand; aegis units.Duration converts between units and checks the result", .{constants[site.index]}));
+        // A unit converted by hand is one whether the program runs it or computes it as it
+        // compiles, and wherever the constant goes (a local, an argument): each use is the site.
+        // An alias the program declares is the site where it is made.
+        if (site.through_alias or c.inTest(site.token)) continue;
+        try c.at(rule, site.token, try c.allocator.print("std.{s}: a unit converted by hand; aegis units.Duration converts between units and checks the result", .{constants[site.index]}));
     }
 }
 
-/// A011's doors: each raw-integer crossing of std's time. Two raw nanosecond counts compared or
-/// subtracted, or one compared with zero, keep their unit: no conversion happens there.
+/// A011's doors: each raw-integer crossing of std's time, as the program runs or compiles. Two
+/// raw nanosecond counts compared or subtracted, or one compared with zero, keep their unit: no
+/// conversion happens there.
 fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!void {
     const targets = try c.allocator.alloc(Governed.Target, paths.len);
     const indexes = try c.allocator.alloc(usize, paths.len);
@@ -209,7 +212,7 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     for (sites.items) |site| {
-        if ((site.through_alias and !site.alias_declared) or c.inTest(site.token) or !atRuntime(c, site.node)) continue;
+        if (site.through_alias or c.inTest(site.token)) continue;
         if (sameUnit(tree, model, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
     }
@@ -328,6 +331,8 @@ fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     var calls: std.ArrayList(Ast.Node.Index) = .empty;
+    // A call through an alias the program declares is read by what its callee reaches.
+    try aliasCalls(c, found[0].decls, &calls);
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
         const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
@@ -336,7 +341,10 @@ fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
             try calls.append(c.allocator, parent);
             continue;
         };
-        try aliasCalls(c, parent, &calls);
+        // An alias's declaration is no call; the assert taken as a value is called where it
+        // goes, which this reading does not follow.
+        if (tree.fullVarDecl(parent)) |variable| if (variable.ast.init_node.unwrap() == site.node) continue;
+        if (atRuntime(c, site.node)) try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
         if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
@@ -355,26 +363,22 @@ fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
     }
 }
 
-/// The calls through a private alias of std's assert (`const assert = std.debug.assert;`).
-fn aliasCalls(c: *Context, value: Ast.Node.Index, calls: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
+/// The calls in this file through an alias the program declares of std's assert (`const check =
+/// std.debug.assert;`), public or private, in any of its files, and an alias of one: each call
+/// whose callee is a declaration other than std's that reaches one of `assert_decls`.
+fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    const variable = tree.fullVarDecl(value) orelse return;
-    if (variable.visib_token != null) return;
-    var declared: ?u32 = null;
-    for (model.declarations, 0..) |decl, d| if (decl.node == value and decl.kind == .variable) {
-        declared = @intCast(d);
-    };
-    const alias = declared orelse return;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
+    for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const ref = model.reference(node) orelse continue;
-        if (ref.declaration != alias) continue;
-        const parent = model.node_parents[@backingInt(node)] orelse continue; // safe: a node index indexes its own tree's parent table
         var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, parent) orelse continue;
-        if (call.ast.fn_expr == node) try calls.append(c.allocator, parent);
+        const call = tree.fullCall(&buffer, node) orelse continue;
+        const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
+        const origin = (try c.facts.origin(callee)) orelse continue;
+        if (std.meta.eql(callee, origin)) continue;
+        for (assert_decls) |each| if (std.meta.eql(each, origin)) {
+            try calls.append(c.allocator, node);
+            break;
+        };
     }
 }
 
@@ -471,12 +475,12 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, token, try c.allocator.print("@setRuntimeSafety off in {s} builds: bounds, overflow and union checks off where the build keeps them; only a measured hot loop validated at its boundary", .{names}));
             continue;
         }
-        // An address read out of a pointer (`@intFromPtr`) is never undefined behavior, and the
-        // parent of an interface field (`@alignCast(@fieldParentPtr("interface", w))`, std's
-        // own reader and writer pattern) is aligned by construction. Every other @alignCast is
-        // a site: a consumer may build the package ReleaseFast, where nothing checks it.
-        if (std.mem.eql(u8, name, "@alignCast") and parentOf(tree, node)) continue;
-        for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt" }) |cast| if (std.mem.eql(u8, name, cast)) {
+        // An address read out of a pointer (`@intFromPtr`) is never undefined behavior. The
+        // parent a field's pointer is taken to (`@fieldParentPtr`, std's reader and writer
+        // pattern) is that parent only where the pointer is that field's, which no build checks,
+        // and so is the alignment `@alignCast` asserts of it: a consumer may build the package
+        // ReleaseFast, where nothing checks either.
+        for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };
     }
@@ -491,20 +495,6 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         if (tree.tokenTag(keyword) != .keyword_extern or c.inTest(decl.token)) continue;
         try c.at(rule, keyword, try c.allocator.print("extern '{s}': a declaration whose definition Zig does not check; only the raw call, at the package's seam", .{decl.name}));
     }
-}
-
-/// Whether an `@alignCast` takes a `@fieldParentPtr`: the struct a field is in, aligned as that
-/// struct is.
-fn parentOf(tree: *const Ast, node: Ast.Node.Index) bool {
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 1) return false;
-    var arg = args[0];
-    while (tree.nodeTag(arg) == .grouped_expression) arg = tree.nodeData(arg).node_and_token[0];
-    return switch (tree.nodeTag(arg)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "@fieldParentPtr"),
-        else => false,
-    };
 }
 
 /// A014's frame escapes (Escapes.zig).
@@ -525,23 +515,28 @@ fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime mes
     const found = try Governed.resolve(c, rule, targets, indexes);
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
     var held: std.ArrayList(Ast.TokenIndex) = .empty;
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
-        if (borrowed(tree, model, site.node)) continue;
+        if (try borrowed(c, site.node)) continue;
         try held.append(c.allocator, site.token);
         try c.at(rule, site.token, try c.allocator.print(message, .{paths[site.index]}));
     }
     return held.items;
 }
 
-/// Whether a type named at `node` stands behind a pointer, names a member of the type, or is
-/// only compared (`T == std.Io.Mutex`, a comptime check that refuses the type): none holds one.
-fn borrowed(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
+/// Whether a type named at `node` stands behind a pointer, names a member of the type that is
+/// no value of it (a function, a type: `Io.Event.Error`), or is only compared (`T ==
+/// std.Io.Mutex`, a comptime check that refuses the type): none holds one. A member that is a
+/// value (`std.Io.Mutex.init`) is one held.
+fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
     if (model.node_parents[@backingInt(node)]) |parent| { // safe: a node index indexes its own tree's parent table
-        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return true;
+        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return switch (try c.facts.resolve(c.file, parent)) {
+            .function, .container, .error_set, .primitive, .fn_type => true,
+            else => false,
+        };
         // The type itself, or what its constructor makes (`std.atomic.Value(u32)`), compared.
         var compared = parent;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -636,12 +631,5 @@ fn builtinName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
     return switch (tree.nodeTag(node)) {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => tree.tokenSlice(tree.nodeMainToken(node)),
         else => null,
-    };
-}
-
-fn arithmetic(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .add, .sub, .mul, .div, .mod, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => true,
-        else => false,
     };
 }

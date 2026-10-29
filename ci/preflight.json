@@ -32,7 +32,7 @@
     ],
     "escapes": {
       "no-danger": 7,
-      "internal": 1
+      "internal": 7
     }
   },
   "fuzz": {

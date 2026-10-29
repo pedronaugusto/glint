@@ -202,16 +202,16 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
 }
 
 fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Runner's own sink field.
     try runner.emitRelated(rule, start, end, message, related, fix);
 }
 fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Runner's own sink field.
     for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
     return runner.base;
 }
 fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {
-    const runner: *Runner = @fieldParentPtr("sink", sink);
+    const runner: *Runner = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Runner's own sink field.
     var owned = coverage;
     owned.detail = try runner.a.dupe(u8, coverage.detail);
     if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;
