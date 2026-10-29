@@ -845,7 +845,7 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
                 // A function or a type named through a value is no part of its data.
                 const kind = c.project.models[decl.file.raw()].declarations[decl.index].kind;
                 if (kind == .function) return .{};
-            }
+            } else out = out.join(.{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
             return out;
         },
         .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
@@ -938,6 +938,29 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, node)) |call| return result(c, flow, function, call);
     return .{};
+}
+
+/// A field read through a value whose type is one of several (a generic's result over each
+/// of its instantiations, `Untrusted.parse` over each parser): what the program stores in the
+/// field of that name in each of them.
+fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: Ast.Node.Index, name: []const u8) Context.Error!Level {
+    var out: Level = .clean;
+    const value = try c.facts.resolve(file, receiver);
+    for (if (value == .alternatives) value.alternatives else &.{value}) |each| {
+        var held = each;
+        while (true) held = switch (held) {
+            .pointer, .optional, .error_union => |inner| inner.*,
+            else => break,
+        };
+        const container = switch (held) {
+            .container, .instance => |k| k,
+            else => continue,
+        };
+        const decl = c.facts.member(container, name) orelse continue;
+        if (c.project.models[decl.file.raw()].declarations[decl.index].kind != .field) continue;
+        out = out.join(flow.globals.get(decl) orelse .clean);
+    }
+    return out;
 }
 
 /// The field declarations a struct literal's values initialize, in order, when its type

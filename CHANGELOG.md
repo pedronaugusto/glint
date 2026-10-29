@@ -11,6 +11,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 - A comparison's fact ends at a store to any part of what it compares, or its address taken: the memory of a length (`in = in[16..]` between `ip < in.len` and `in[ip]`), the variable of a sum (`ip` of `ip + 1`), and the expression a constant names (`in_end` of `in.len - 32`). Only a store to the compared expression itself ended it.
 - A014 reads no list as settled once it is freed at all: a `defer` or `errdefer` that frees it, written before the store, runs after it; nor one whose storage a member call frees or hands off (`deinit`, `clearAndFree`, `toOwnedSlice`).
 - A destructuring assignment (`x, y = .{ ... }`), an `asm` output and a store through a local holding the variable's address (`const p = &x; p.* = v`) write the variable: a negation's induction counts them as writes it does not model, a comparison's fact ends at them, and input stored through the pointer reaches the variable. Each was missed.
+- A field read through a value whose type is one of several (a generic's result over its instantiations, `Untrusted.parse`'s over each parser a file gives it) holds what the program stores in that field in each of them. The read found no declaration and took none: a second parser in a file made every parse result's fields clean.
 
 ## [0.7.5] - 2026-10-28
 

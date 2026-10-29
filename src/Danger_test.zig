@@ -1389,6 +1389,33 @@ test "A010 reads a negation's variable as written by every form that writes it: 
     try std.testing.expectEqualSlices(u32, &.{ 6, 12 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a field through a value whose type is one of several by each one's stores: a parse's result over each parser it is given" {
+    const result = try run(pack.untrusted_input,
+        \\const aegis = @import("aegis");
+        \\const Head = struct { rest: []const u8 };
+        \\const Tail = struct { rest: []const u8 };
+        \\fn head(_: void, b: []const u8) error{Short}!Head {
+        \\    if (b.len < 2) return error.Short;
+        \\    return .{ .rest = b[1..] };
+        \\}
+        \\fn tail(_: void, b: []const u8) error{Short}!Tail {
+        \\    if (b.len < 2) return error.Short;
+        \\    return .{ .rest = b[0 .. b.len - 1] };
+        \\}
+        \\pub fn f(bytes: []const u8) !void {
+        \\    const h = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, head);
+        \\    var n = @as(usize, h.rest[0]) << 8 | h.rest[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\    const t = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, tail);
+        \\    var m = @as(usize, t.rest[0]) << 8 | t.rest[1];
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // Each loop the parsed memory's bytes bound, whichever parser the result is read from.
+    try std.testing.expectEqualSlices(u32, &.{ 15, 18 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
