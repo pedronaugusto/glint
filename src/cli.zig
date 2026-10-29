@@ -240,8 +240,10 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
     for (arguments.files_from) |from| {
-        const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024));
-        const list = try aegis.input.Untrusted([]const u8).init(read).parse(a, fileList);
+        // The list is the caller's selection of files, its command line written to a file: as
+        // trusted as the positional files, never the checked repository's content.
+        const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024)); // aegis: no-danger(A009): the caller's own list of the files to check.
+        const list = try fileList(a, read);
         try result.files.appendSlice(a, list.paths);
     }
     return result;
