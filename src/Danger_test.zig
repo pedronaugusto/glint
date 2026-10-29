@@ -1676,7 +1676,7 @@ test "A009 reads a parse's number as refined only where its parser compares it o
     };
 }
 
-test "A009 clears a pointer moved within its memory only where it is read at its first element: what is left past the offset is all the comparison shows" {
+test "A009 clears a pointer moved within its memory only where it is moved forward and read at its first element: what is left past the offset is all the comparison shows" {
     const result = try run(pack.untrusted_input,
         \\const std = @import("std");
         \\pub fn plus5(r: *std.Io.Reader, out: []u8) !u8 {
@@ -1704,13 +1704,24 @@ test "A009 clears a pointer moved within its memory only where it is read at its
         \\    if (o >= out.len) return error.Short;
         \\    return (out.ptr + o)[0..1];
         \\}
+        \\pub fn minus(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o < out.len) return (out.ptr - o)[0];
+        \\    return 0;
+        \\}
+        \\pub fn minusWrap(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o < out.len) return (out.ptr -% o)[0];
+        \\    return 0;
+        \\}
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    // The read five past, the sixteen bytes, the pointer kept; never a first element's read.
-    try std.testing.expectEqualSlices(u32, &.{ 4, 9, 14 }, result.lines[0..result.findings]);
+    // The read five past, the sixteen bytes, the pointer kept, a pointer moved back below the
+    // memory whatever its offset is below; never a first element's read past a forward move.
+    try std.testing.expectEqualSlices(u32, &.{ 4, 9, 14, 29, 34 }, result.lines[0..result.findings]);
 }
 
-test "A009 ends a comparison's fact at a store through another name for its memory: a pointer taken, a method or call given it, a pointer parameter of its type, a value holding it" {
+test "A009 ends a comparison's fact at a store through another name for its memory: a pointer taken, a method or call given it, a pointer parameter of its type, a value holding it, and memory behind a pointer at any store through one and any call" {
     const result = try run(pack.untrusted_input,
         \\const std = @import("std");
         \\const S = struct {
@@ -1818,8 +1829,295 @@ test "A009 ends a comparison's fact at a store through another name for its memo
         \\}
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    // Each store through another name, never one to a part the comparison doesn't read.
-    try std.testing.expectEqualSlices(u32, &.{ 28, 36, 44, 54, 62, 70, 80 }, result.lines[0..result.findings]);
+    // Each store through another name; and in `apart`, memory behind a pointer is ended by any
+    // store through a pointer and any call, while a local slice no other name reaches keeps
+    // its fact past both.
+    try std.testing.expectEqualSlices(u32, &.{ 28, 36, 44, 54, 62, 70, 80, 93 }, result.lines[0..result.findings]);
+}
+
+test "A009 ends a comparison's fact at any call that may write its memory, a store through any pointer that may reach it, and a loop's back edge" {
+    // The second probe review's aliases: a call that writes a global, a store through a global
+    // pointer, an optional capture, a pointer held in a field set after its declaration, a loop
+    // that stores after the use, a pointer reassigned after its initializer.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { buf: []u8 };
+        \\fn cut(s: *S) void {
+        \\    s.buf = s.buf[16..];
+        \\}
+        \\fn cutSlice(b: *[]u8) void {
+        \\    b.* = b.*[16..];
+        \\}
+        \\fn id(p: *S) *S {
+        \\    return p;
+        \\}
+        \\fn idErr(p: *S) !*S {
+        \\    return p;
+        \\}
+        \\var g: []u8 = &.{};
+        \\fn shrinkGlobal() void {
+        \\    g = g[16..];
+        \\}
+        \\var gp: *[]u8 = undefined;
+        \\// 1. a call given the address of a local
+        \\pub fn addrArg(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        cut(&s);
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 2. a call given the address of the slice itself
+        \\pub fn addrSlice(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var buf = start;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        cutSlice(&buf);
+        \\        return buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 3. a pointer to a pointer
+        \\pub fn doublePtr(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var buf = start;
+        \\    var p = &buf;
+        \\    const pp = &p;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        pp.*.* = buf[16..];
+        \\        return buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 4. a global, written by a call with no arguments
+        \\pub fn global(r: *std.Io.Reader) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < g.len) {
+        \\        shrinkGlobal();
+        \\        return g[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 5. a global pointer to a local
+        \\pub fn globalPtr(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var buf = start;
+        \\    gp = &buf;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        gp.* = buf[16..];
+        \\        return buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 6. a pointer returned by a function
+        \\pub fn returned(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    const p = id(&s);
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 7. a pointer through an error union
+        \\pub fn errUnion(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    const p = try idErr(&s);
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 8. an optional pointer captured
+        \\pub fn optCapture(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    const o: ?*S = &s;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        if (o) |p| p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 9. a struct field holding the pointer, set after its declaration
+        \\pub fn fieldHolder(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    var h: struct { p: *S } = undefined;
+        \\    h.p = &s;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        h.p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 10. a loop whose store is after the use in the text, before it on the next pass
+        \\pub fn loop(r: *std.Io.Reader, start: []u8) !u32 {
+        \\    var buf = start;
+        \\    var total: u32 = 0;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        var k: u8 = 0;
+        \\        while (k < 4) : (k += 1) {
+        \\            total += buf[i];
+        \\            buf = buf[1..];
+        \\        }
+        \\    }
+        \\    return total;
+        \\}
+        \\// 11. std.mem.swap given the address
+        \\pub fn swapped(r: *std.Io.Reader, start: []u8, other: []u8) !u8 {
+        \\    var buf = start;
+        \\    var o = other;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        std.mem.swap([]u8, &buf, &o);
+        \\        return buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 12. a pointer variable reassigned after its init
+        \\pub fn ptrReassigned(r: *std.Io.Reader, s0: S, t0: S) !u8 {
+        \\    var s = s0;
+        \\    var t = t0;
+        \\    var p = &t;
+        \\    p = &s;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 13. a slice of structs, the element's pointer
+        \\pub fn element(r: *std.Io.Reader, items: []S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (items.len == 0) return 0;
+        \\    if (i < items[0].buf.len) {
+        \\        const p = &items[0];
+        \\        p.buf = p.buf[16..];
+        \\        return items[0].buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 14. two parameter pointers that may be one
+        \\pub fn twoParams(r: *std.Io.Reader, a: *S, b: *S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < a.buf.len) {
+        \\        b.buf = b.buf[0..1];
+        \\        return a.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 15. memcpy over the struct's bytes
+        \\pub fn memcpyOver(r: *std.Io.Reader, s0: S, t: S) !u8 {
+        \\    var s = s0;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        @memcpy(std.mem.asBytes(&s), std.mem.asBytes(&t));
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\// 16. the safe twins: a store to an unrelated local, a field of one struct apart from the
+        \\// compared one, a call that cannot write memory, a local slice no other name reaches
+        \\const P = struct { buf: []u8, pos: usize = 0 };
+        \\pub fn safeLocal(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var buf = start;
+        \\    _ = &buf;
+        \\    var n: usize = 0;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        n += 1;
+        \\        cut(&S{ .buf = start });
+        \\        return buf[i] +% @as(u8, @truncate(n));
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn safeField(r: *std.Io.Reader, p: *P) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < p.buf.len) {
+        \\        p.pos += 1;
+        \\        _ = std.mem.findScalar(u8, p.buf, 0);
+        \\        return p.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn safeLoop(r: *std.Io.Reader, start: []u8) !u32 {
+        \\    const buf = start;
+        \\    var total: u32 = 0;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < buf.len) {
+        \\        var k: u8 = 0;
+        \\        while (k < 4) : (k += 1) total += buf[i];
+        \\    }
+        \\    return total;
+        \\}
+    );
+    // Each of the fifteen; never a store to another local, a field apart from the compared one,
+    // std's search given a const view, or a loop that stores nothing it compares.
+    try std.testing.expectEqualSlices(u32, &.{ 26, 36, 48, 57, 68, 79, 90, 101, 113, 125, 138, 151, 162, 171, 181 }, result.lines[0..result.findings]);
+}
+
+test "A009 trusts a reader as fixed only where std's Reader.fixed made it, by its declaration, and nothing writes it after" {
+    // The second probe review's readers: a project function named `fixed` handing back the
+    // peer's reader, one given the peer's reader, a fixed reader reassigned or repointed.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const ns = struct {
+        \\    var peer: *std.Io.Reader = undefined;
+        \\    fn fixed(_: []const u8) *std.Io.Reader {
+        \\        return peer;
+        \\    }
+        \\    fn given(r: *std.Io.Reader) *std.Io.Reader {
+        \\        return r;
+        \\    }
+        \\};
+        \\pub fn named(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    ns.peer = r;
+        \\    const rd = ns.fixed("abcd");
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn param(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const rd = ns.given(r);
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn reassigned(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    var rd: std.Io.Reader = .fixed("abcd");
+        \\    rd = r.*;
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn repointed(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    var own: std.Io.Reader = .fixed("abcd");
+        \\    var rd = &own;
+        \\    rd = r;
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn handed(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    var rd: std.Io.Reader = .fixed("abcd");
+        \\    const p = &rd;
+        \\    p.* = r.*;
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn part(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    var rd: std.Io.Reader = .fixed("abcd");
+        \\    rd.buffer = try r.take(16);
+        \\    return out[try rd.takeInt(u32, .little)];
+        \\}
+        \\pub fn ownBytes(out: []u8) !u8 {
+        \\    var rd: std.Io.Reader = .fixed("abcd");
+        \\    var spelled = std.Io.Reader.fixed("abcd");
+        \\    return out[try rd.takeInt(u32, .little)] ^ out[try spelled.takeInt(u32, .little)];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // Each reader but the two std's fixed made over the program's bytes and nothing wrote.
+    try std.testing.expectEqualSlices(u32, &.{ 14, 18, 23, 29, 35, 40 }, result.lines[0..result.findings]);
 }
 
 test "A010 reads each variable a literal is destructured into by its own element: a constant beside a number from input is no input" {

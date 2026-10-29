@@ -23,13 +23,13 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!site(c, node)) continue;
         switch (tag) {
-            // A position into input's own memory is data's to reach; an entry of the program's
-            // own table a byte or a hash picks is the table's design, a number's to reach.
+            // A position input reaches is a finding unless it is shown within the memory: a
+            // table the program sized to the index's range (`[256]` by a byte) holds every
+            // value, a shorter or unknown one not.
             .array_access => {
                 const array, const index = tree.nodeData(node).node_and_node;
                 if (try Range.within(c, c.file, index, array, false)) continue;
-                const least: Taint.Level = if (try Taint.levelAt(c, flow, c.file, array) == .clean) .number else .data;
-                try judged(c, flow, rule, index, try ranged(c, flow, index), least, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
+                try judged(c, flow, rule, index, try Taint.levelAt(c, flow, c.file, index), .data, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
             .slice_open, .slice, .slice_sentinel => {
                 const slice = tree.fullSlice(node) orelse continue;
@@ -53,14 +53,18 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
                 try judged(c, flow, rule, end, try ranged(c, flow, end), .number, loop_message);
             },
+            // Each comparison of the condition, joined by `and`, `or` and `!` as it may be.
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
-                const condition = loop.ast.cond_expr;
-                if (!comparison(tree.nodeTag(condition))) continue;
-                if (try consumes(c, flow, loop.ast.then_expr) or clears(tree, condition, loop.ast.then_expr)) continue;
-                const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                try judged(c, flow, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
-                try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
+                if (try consumes(c, flow, loop.ast.then_expr)) continue;
+                var compared: std.ArrayList(Ast.Node.Index) = .empty;
+                try comparisons(c, loop.ast.cond_expr, &compared);
+                for (compared.items) |condition| {
+                    if (clears(c, condition, loop.ast.then_expr)) continue;
+                    const lhs, const rhs = tree.nodeData(condition).node_and_node;
+                    try judged(c, flow, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
+                    try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
+                }
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
@@ -81,11 +85,11 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
 
 const loop_message = "a number from input bounds a loop: a peer chooses how long it runs; parse it into a refined type with aegis input.Untrusted";
 
-/// A010: integer conversions of input and arithmetic on a number from input, where a peer's
-/// value that does not fit stops the program (a panic under the safe build every package
-/// ships). Data's arithmetic stays within a byte's range of the program's own values; a
-/// number (decoded, or grown by a shift or a product) is the peer's to choose. A conversion or
-/// arithmetic on the program's own values is checked by that build and is no peer's to reach;
+/// A010: integer conversions of input and arithmetic on input, where a peer's value that does
+/// not fit stops the program (a panic under the safe build every package ships): each one
+/// unless its operands' ranges show it fits (Range.zig), a byte's as much as a decoded
+/// number's. A conversion or arithmetic on the program's own values is checked by that build
+/// and is no peer's to reach;
 /// where the checks are off (`@setRuntimeSafety(false)`, ReleaseFast) the danger is A019's.
 /// `@truncate` keeps the low bits by intent and is no conversion that fails. Float arithmetic
 /// gives an infinity or a NaN where an integer's would stop, so it is none of A010's.
@@ -103,19 +107,17 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
-                if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
-                try judged(c, flow, rule, node, level, .number, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
+                if (level.reaches(.data) and try Range.fits(c, c.file, node)) continue;
+                try judged(c, flow, rule, node, level, .data, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
                 if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try Taint.levelAt(c, flow, c.file, lhs);
-                const right = try Taint.levelAt(c, flow, c.file, rhs);
-                const level: Taint.Level = if (right.reaches(.data) or left.reaches(.number)) .number else left.join(right);
-                if (level.reaches(.number) and try Range.fits(c, c.file, node)) continue;
-                try judged(c, flow, rule, node, level, .number, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
+                const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
+                if (level.reaches(.data) and try Range.fits(c, c.file, node)) continue;
+                try judged(c, flow, rule, node, level, .data, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
                 if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
@@ -133,7 +135,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             },
             .negation => {
                 if (!site(c, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
-                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .number, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
+                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .data, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
@@ -172,7 +174,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const name = c.project.models[decl.file.raw()].declarations[decl.index].name;
         const from_reader = if (Taint.readerType(flow)) |r| r.file.eql(decl.file) else false;
         // A reader over the program's own bytes (`Reader.fixed`) reads no peer's size.
-        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and fixedReader(c, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
         if (from_reader and !own and std.mem.find(u8, name, "Unlimited") != null) {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
             continue;
@@ -277,13 +279,14 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether a body reaches a cancellation point: a call that can return `error.Canceled` and
-/// passes it on. A function of the project can where its body reaches one; another (std's
-/// `checkCancel`, an `Io` operation's `Cancelable`) by its declared error set. A call is none
-/// for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name, nor where what
-/// it returns is caught and its `Canceled` dropped. A callee chosen per target (`const wait =
-/// if (windows) waitWindows else waitPosix`, or a method of a type so chosen) is one where
-/// every choice is.
+/// Whether a body reaches a cancellation point on every pass: a call that can return
+/// `error.Canceled` and passes it on (`passedOn`), on no path some pass skips (`always`), but
+/// in the loop judged, behind one of two periodic forms (`periodic`). A function of the project
+/// can return it where its body reaches one so; another (std's `checkCancel`, an `Io`
+/// operation's `Cancelable`) by its declared error set. A call is none for being given an `Io`
+/// (`Clock.now(io)` cannot cancel), nor for its name. A callee chosen per target (`const wait =
+/// if (windows) waitWindows else waitPosix`, or a method of a type so chosen) is one where every
+/// choice is; a pointer to a function, or a vtable's, is none.
 fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 16) return false;
     const tree = &c.project.files[file.raw()].tree;
@@ -295,8 +298,8 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (!passedOn(c, file, node, if (depth == 0) body else null)) continue;
-        if (depth == 0 and once(c, file, node, body)) continue;
+        if (!passedOn(c, file, node)) continue;
+        if (!always(c, file, node, body, depth == 0)) continue;
         const callee = try c.facts.resolve(file, call.ast.fn_expr);
         const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
         const every = for (choices) |choice| {
@@ -330,15 +333,12 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
 }
 
 /// Whether a call passes on the `error.Canceled` it returns: under a `try`, returned, or caught
-/// (`catch`, or an `if`'s `else |err|`) by a handler that returns it, gives it as the value of
-/// a whole that is returned, or re-arms it (`catch |e| return e`, `return r.fail(e)`, `return
-/// f() catch |e| switch (e) { error.Canceled => error.Canceled, ... }`, `io.recancel()`), in
-/// the prong `error.Canceled` takes where the handler switches on it. In
-/// the loop judged (`loop`, the loop's body) a handler that leaves the loop ends it, which is all
-/// a cancel asks there (`catch return`, `catch break`). A handler that drops it (`catch {}`,
-/// `error.Canceled => continue`), or a function that turns it into a value (`catch return
-/// false`), lets the loop run on.
-fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index, loop: ?Ast.Node.Index) bool {
+/// (`catch`, or an `if`'s `else |err|`) by a handler whose path for it (`handled`) returns it.
+/// A handler that drops it (`catch {}`, `error.Canceled => continue`), ends the loop without it
+/// (`catch break`, `catch return`), turns it into a value or another error (`catch return
+/// false`, `return isFatal(e)`) or re-arms it for a later point (`io.recancel()`) lets the
+/// task run on.
+fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     var at = call;
@@ -349,26 +349,27 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index, loop: ?Ast.
             const caught, const handler = tree.nodeData(parent).node_and_node;
             if (caught != at) return false;
             const catch_token = tree.nodeMainToken(parent);
-            return handled(c, file, parent, handler, if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null, loop);
+            return handled(c, file, parent, handler, if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null);
         },
         // `if (call) |v| ... else |err| ...`: the else branch is its handler.
         .@"if", .if_simple => {
             const branch = tree.fullIf(parent).?;
             if (branch.ast.cond_expr != at) return false;
             const capture = branch.error_token orelse return false;
-            return handled(c, file, parent, branch.ast.else_expr.unwrap() orelse return false, capture, loop);
+            return handled(c, file, parent, branch.ast.else_expr.unwrap() orelse return false, capture);
         },
         else => return false,
     };
     return false;
 }
 
-/// Whether the handler of a call's error passes `error.Canceled` on: in the prong it takes,
-/// where the handler switches on it (the one naming it, or `else`), a return or re-arming of
-/// it, or, where the whole (`whole`, the `catch` or `if`) is returned or tried, the error
-/// itself as the prong's value (`return f() catch |e| switch (e) { error.Canceled =>
-/// error.Canceled, ... }`).
-fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex, loop: ?Ast.Node.Index) bool {
+/// Whether the path `error.Canceled` takes through a call's handler passes it on: the prong
+/// it takes where the handler switches on it (the one naming it, or `else`), or the whole
+/// handler, either returns it itself (`return e`, `return error.Canceled`, as its last
+/// statement with nothing before it that may leave) from a function whose result is an error
+/// union, or is it as its value where the whole (`whole`, the `catch` or `if`) is returned or
+/// tried (`return f() catch |e| switch (e) { error.Canceled => error.Canceled, ... }`).
+fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex) bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
@@ -385,11 +386,47 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
         break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
     };
     const names = [_]?Ast.TokenIndex{ capture, payload };
-    if (handles(c, file, prong, &names, loop)) return true;
+    if (returnsIt(c, file, prong, &names)) return true;
     // The prong's value is the error, and the whole is returned or tried.
-    var value = prong;
+    if (!isIt(tree, prong, &names)) return false;
+    var at = whole;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .grouped_expression => {},
+        .@"try" => return true,
+        .@"return" => return errorResult(c, file, parent),
+        else => return false,
+    };
+    return false;
+}
+
+/// Whether a handler's path returns what it caught itself: `return x` with `x` the error
+/// (`isIt`), alone or as a block's last statement with nothing before it that may leave, from
+/// a function whose result is an error union, where the error goes on as one.
+fn returnsIt(c: *Context, file: Project.FileId, path: Ast.Node.Index, names: []const ?Ast.TokenIndex) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    var at = path;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    switch (tree.nodeTag(at)) {
+        .@"return" => {
+            const value = tree.nodeData(at).opt_node.unwrap() orelse return false;
+            return isIt(tree, value, names) and errorResult(c, file, at);
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, at).?;
+            if (statements.len == 0) return false;
+            for (statements[0 .. statements.len - 1]) |statement| if (leavesIn(tree, statement)) return false;
+            return returnsIt(c, file, statements[statements.len - 1], names);
+        },
+        else => return false,
+    }
+}
+
+/// Whether a value is the error caught: a name it was captured by, or `error.Canceled`.
+fn isIt(tree: *const Ast, node: Ast.Node.Index, names: []const ?Ast.TokenIndex) bool {
+    var value = node;
     while (tree.nodeTag(value) == .grouped_expression) value = tree.nodeData(value).node_and_token[0];
-    const yields = switch (tree.nodeTag(value)) {
+    return switch (tree.nodeTag(value)) {
         .error_value => namesCanceled(tree, value),
         .identifier => for (names) |name| {
             const n = name orelse continue;
@@ -397,101 +434,126 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
         } else false,
         else => false,
     };
-    if (!yields) return false;
-    var at = whole;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .grouped_expression => {},
-        .@"try", .@"return" => return true,
-        else => return false,
-    };
-    return false;
 }
 
-/// Whether a call in a loop's body runs on one pass only: under an `if` that compares a
-/// variable with a constant (`if (i == 0)`) and sets it nowhere in what it guards. A check
-/// every so many passes (`i % 1024 == 0`, a countdown set again where it reaches zero) is one
-/// every pass reaches in turn.
-fn once(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Node.Index) bool {
+/// Whether the function holding `node` returns an error union (`!T`, `E!T`): what it returns
+/// of an error type goes on as an error, not as a value.
+fn errorResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
-    var at = call;
+    var at = node;
+    const function = while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) break parent;
+    } else return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return false;
+    const result = proto.ast.return_type.unwrap() orelse return false;
+    if (tree.nodeTag(result) == .error_union) return true;
+    const before = tree.firstToken(result);
+    return before > 0 and tree.tokenTag(before - 1) == .bang;
+}
+
+/// Whether `node` runs on every pass of the body `body` (a loop's, or a function's): on no
+/// branch, prong, inner loop or right side of an `and`, `or`, `orelse` or `catch`, and after no
+/// statement that may leave the pass (a `continue`, `break` or `return` in it). Where `periodic`,
+/// a branch in one of the two periodic forms (`periodic`) runs on a pass in turn.
+fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.Index, every_so_often: bool) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = node;
     while (at != body) {
-        const parent = model.node_parents[@backingInt(at)] orelse return false;
-        defer at = parent;
-        const branch = tree.fullIf(parent) orelse continue;
-        if (at == branch.ast.cond_expr) continue;
-        const condition = branch.ast.cond_expr;
-        switch (tree.nodeTag(condition)) {
-            .equal_equal, .less_than, .less_or_equal, .greater_than, .greater_or_equal => {},
-            else => continue,
+        const parent = model.node_parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        switch (tree.nodeTag(parent)) {
+            .bool_and, .bool_or, .@"orelse", .@"catch" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
+            .@"switch", .switch_comma => if (tree.nodeData(parent).node_and_extra[0] != at) return false,
+            .fn_decl, .@"defer", .@"errdefer" => return false,
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.blockStatements(&buffer, parent).?) |statement| {
+                    if (statement == at) break;
+                    if (leavesIn(tree, statement)) return false;
+                }
+            },
+            else => if (tree.fullIf(parent)) |branch| {
+                if (branch.ast.cond_expr != at and !(every_so_often and at == branch.ast.then_expr and periodic(c, file, branch, body))) return false;
+            } else if (tree.fullWhile(parent)) |loop| {
+                if (loop.ast.cond_expr != at) return false;
+            } else if (tree.fullFor(parent)) |loop| {
+                if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return false;
+            },
         }
-        const lhs, const rhs = tree.nodeData(condition).node_and_node;
-        const counter = if (tree.nodeTag(rhs) == .number_literal) lhs else if (tree.nodeTag(lhs) == .number_literal) rhs else continue;
-        switch (tree.nodeTag(counter)) {
-            .identifier, .field_access => {},
-            else => continue,
-        }
-        // Set again where it guards: a countdown, so a check every so many passes.
-        const name = tree.getNodeSource(counter);
-        const first = tree.firstToken(at);
-        const last = tree.lastToken(at);
-        const reset = for (tree.nodes.items(.tag), 0..) |tag, i| {
-            switch (tag) {
-                .assign, .assign_add, .assign_sub => {},
-                else => continue,
-            }
-            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = tree.nodeMainToken(assignment);
-            if (token < first or token > last) continue;
-            if (std.mem.eql(u8, tree.getNodeSource(tree.nodeData(assignment).node_and_node[0]), name)) break true;
-        } else false;
-        if (!reset) return true;
+        at = parent;
     }
-    return false;
+    return true;
+}
+
+/// Whether a branch in a loop's body runs every so many passes: `if (x % k == 0)` with `k` a
+/// constant other than zero and `x` stepped by one every pass, or a countdown `if (x == 0)`
+/// that sets `x` to a constant other than zero on every path through the branch, with `x`
+/// stepped down every pass. Any other condition may hold once, or never.
+fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    var condition = branch.ast.cond_expr;
+    while (tree.nodeTag(condition) == .grouped_expression) condition = tree.nodeData(condition).node_and_token[0];
+    if (tree.nodeTag(condition) != .equal_equal) return false;
+    const lhs, const rhs = tree.nodeData(condition).node_and_node;
+    const compared = if (isZero(tree, rhs)) lhs else if (isZero(tree, lhs)) rhs else return false;
+    var value = compared;
+    while (tree.nodeTag(value) == .grouped_expression) value = tree.nodeData(value).node_and_token[0];
+    if (tree.nodeTag(value) == .mod) {
+        const counter, const by = tree.nodeData(value).node_and_node;
+        if (tree.nodeTag(counter) != .identifier or tree.nodeTag(by) != .number_literal or isZero(tree, by)) return false;
+        return stepped(c, file, counter, body, .assign_add, null);
+    }
+    if (tree.nodeTag(value) != .identifier) return false;
+    return stepped(c, file, value, body, .assign_sub, branch.ast.then_expr);
+}
+
+/// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`) every pass of the loop whose body is
+/// `body`, by its continue expression or a statement on every pass, and nothing else in the
+/// loop assigns it but, where `reset` is given, a constant other than zero set on every path
+/// through that branch.
+fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast.Node.Index, step: Ast.Node.Tag, reset: ?Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const declared = (model.reference(counter) orelse return false).declaration orelse return false;
+    const loop_node = model.node_parents[@backingInt(body)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    const cont: ?Ast.Node.Index = if (tree.fullWhile(loop_node)) |loop| loop.ast.cont_expr.unwrap() else null;
+    var steps = false;
+    var resets = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {},
+            else => continue,
+        }
+        const token = tree.nodeMainToken(node);
+        if (token < tree.firstToken(loop_node) or token > tree.lastToken(loop_node)) continue;
+        const target, const value = tree.nodeData(node).node_and_node;
+        if (tree.nodeTag(target) != .identifier) continue;
+        if ((model.reference(target) orelse continue).declaration != declared) continue;
+        const one = tree.nodeTag(value) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "1");
+        if (tag == step and one and (node == cont or always(c, file, node, body, false))) {
+            if (steps) return false;
+            steps = true;
+            continue;
+        }
+        if (reset) |branch| if (tag == .assign and tree.nodeTag(value) == .number_literal and !isZero(tree, value) and always(c, file, node, branch, false)) {
+            resets = true;
+            continue;
+        };
+        return false;
+    }
+    return steps and (reset == null or resets);
+}
+
+fn isZero(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "0");
 }
 
 fn namesCanceled(tree: *const Ast, node: Ast.Node.Index) bool {
     for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| {
         if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Canceled")) return true;
-    }
-    return false;
-}
-
-/// Whether a handler passes on what it caught (named by `names`, the capture and the prong's):
-/// a `return` of it or of `error.Canceled`, a call of `recancel`, or, in the judged loop's
-/// body, a `return` or a `break` of that loop.
-fn handles(c: *Context, file: Project.FileId, handler: Ast.Node.Index, names: []const ?Ast.TokenIndex, loop: ?Ast.Node.Index) bool {
-    const tree = &c.project.files[file.raw()].tree;
-    const model = &c.project.models[file.raw()];
-    const first = tree.firstToken(handler);
-    const last = tree.lastToken(handler);
-    for (first..last + 1) |token| {
-        if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "recancel") and tree.tokenTag(@intCast(token + 1)) == .l_paren) return true;
-    }
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"return" and tag != .@"break") continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
-        if (token < first or token > last) continue;
-        if (tag == .@"break") {
-            // An unlabeled `break` whose innermost loop is the one judged.
-            const body = loop orelse continue;
-            if (tree.nodeData(node).opt_token_and_opt_node[0] != .none) continue;
-            var at = node;
-            const inner = while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
-                if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) break parent;
-            } else continue;
-            const then = if (tree.fullWhile(inner)) |w| w.ast.then_expr else tree.fullFor(inner).?.ast.then_expr;
-            if (then == body) return true;
-            continue;
-        }
-        if (loop != null) return true;
-        const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
-        if (namesCanceled(tree, value)) return true;
-        for (tree.firstToken(value)..tree.lastToken(value) + 1) |t| for (names) |name| {
-            const n = name orelse continue;
-            if (tree.tokenTag(@intCast(t)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(t)), tree.tokenSlice(n))) return true;
-        };
     }
     return false;
 }
@@ -546,42 +608,6 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 /// cannot tell.
 fn sink(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
     try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
-}
-
-/// Whether a reader is one `Reader.fixed` made: a local it initializes, or a field every
-/// assignment in the file gives one.
-fn fixedReader(c: *Context, receiver: Ast.Node.Index) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    if (tree.nodeTag(receiver) == .identifier) {
-        const ref = model.reference(receiver) orelse return false;
-        const decl = model.declarations[ref.declaration orelse return false];
-        const variable = tree.fullVarDecl(decl.node) orelse return false;
-        return fixedCall(tree, variable.ast.init_node.unwrap() orelse return false);
-    }
-    if (tree.nodeTag(receiver) != .field_access) return false;
-    const spelled = tree.getNodeSource(receiver);
-    var any = false;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .assign) continue;
-        const lhs, const rhs = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-        if (!std.mem.eql(u8, tree.getNodeSource(lhs), spelled)) continue;
-        if (!fixedCall(tree, rhs)) return false;
-        any = true;
-    }
-    return any;
-}
-
-/// Whether `node` calls `fixed` (`.fixed(bytes)`, `Reader.fixed(bytes)`).
-fn fixedCall(tree: *const Ast, node: Ast.Node.Index) bool {
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return false;
-    const name = switch (tree.nodeTag(call.ast.fn_expr)) {
-        .enum_literal => tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)),
-        .field_access => tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]),
-        else => return false,
-    };
-    return std.mem.eql(u8, name, "fixed");
 }
 
 /// Per std function and parameter, whether the work it does stays the same whatever the
@@ -693,11 +719,27 @@ fn callSite(c: *Context, at: Taint.Site) Context.Error![]const u8 {
     return c.allocator.print("{s}:{d} `{s}`", .{ c.project.inputs[at.file.raw()].name, line, spelled.items });
 }
 
-/// Production code that runs with the program.
-/// Whether each pass of a loop's body consumes input or lets its task be canceled, so a
-/// peer's count runs it no longer than the data it sent or the caller allows: the body reads
-/// from input (a reader's `take`, a file's read), advances a slice past what it took (`cp =
-/// cp[slash + 1 ..]`), or checks for cancelation (`io.checkCancel()`).
+/// The comparisons a condition joins by `and`, `or` and `!`.
+fn comparisons(c: *Context, condition: Ast.Node.Index, out: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
+    const tree = &c.project.files[c.file.raw()].tree;
+    switch (tree.nodeTag(condition)) {
+        .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(condition).node_and_node;
+            try comparisons(c, lhs, out);
+            try comparisons(c, rhs, out);
+        },
+        .bool_not => try comparisons(c, tree.nodeData(condition).node, out),
+        .grouped_expression => try comparisons(c, tree.nodeData(condition).node_and_token[0], out),
+        else => if (comparison(tree.nodeTag(condition))) try out.append(c.allocator, condition),
+    }
+}
+
+/// Whether every pass of a loop's body consumes input or lets its task be canceled, so a peer's
+/// count runs it no longer than the data it sent or the caller allows: on every pass (`always`)
+/// the body takes at least a byte from a reader (`takeByte`, `takeInt`, or a take, discard or
+/// read of a count shown above zero), advances a slice past a part shown above zero (`cp =
+/// cp[slash + 1 ..]`), or checks for cancelation and passes it on (`try io.checkCancel()`). A
+/// peek, a read whose count may be zero, and one on a branch some pass skips consume nothing.
 fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[c.file.raw()].tree;
     const first = tree.firstToken(body);
@@ -710,20 +752,38 @@ fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!
             const target, const value = tree.nodeData(node).node_and_node;
             if (tree.nodeTag(value) != .slice_open) continue;
             const slice = tree.fullSlice(value).?;
-            if (std.mem.eql(u8, tree.getNodeSource(slice.ast.sliced), tree.getNodeSource(target)) and tree.nodeTag(slice.ast.start) != .number_literal) return true;
+            if (!std.mem.eql(u8, tree.getNodeSource(slice.ast.sliced), tree.getNodeSource(target))) continue;
+            if (try Range.nonzero(c, c.file, slice.ast.start) and always(c, c.file, node, body, false)) return true;
             continue;
         }
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]), "checkCancel")) return true;
-        if (try Taint.isRead(c, flow, c.file, call)) return true;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+        const counted = std.mem.eql(u8, name, "take") or std.mem.eql(u8, name, "discard") or std.mem.eql(u8, name, "toss") or std.mem.eql(u8, name, "readSliceAll");
+        const whole = std.mem.eql(u8, name, "takeByte") or std.mem.eql(u8, name, "takeByteSigned") or std.mem.eql(u8, name, "takeInt") or std.mem.eql(u8, name, "takeVarInt") or std.mem.eql(u8, name, "takeLeb128") or std.mem.eql(u8, name, "takeEnum");
+        const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Range.nonzero(c, c.file, call.ast.params[0]) else false;
+        if (taken and try Taint.isRead(c, flow, c.file, call) and always(c, c.file, node, body, false)) return true;
+        if (std.mem.eql(u8, name, "checkCancel") and passedOn(c, c.file, node) and always(c, c.file, node, body, false)) return true;
     }
     return false;
 }
 
-/// Whether `while (x != 0)` clears a bit of `x` (`x &= x - 1`) or shifts it right on every
-/// pass: it runs at most `x`'s width of times.
-fn clears(tree: *const Ast, condition: Ast.Node.Index, body: Ast.Node.Index) bool {
+/// Whether a statement holds a `continue`, `break` or `return`.
+fn leavesIn(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (first..last + 1) |token| switch (tree.tokenTag(@intCast(token))) {
+        .keyword_continue, .keyword_break, .keyword_return => return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether `while (x != 0)` clears a bit of `x` (`x &= x - 1`) or shifts it right (`x >>= k`,
+/// `k` above zero) on every pass: it runs at most `x`'s width of times.
+fn clears(c: *Context, condition: Ast.Node.Index, body: Ast.Node.Index) bool {
+    const tree = &c.project.files[c.file.raw()].tree;
     if (tree.nodeTag(condition) != .bang_equal) return false;
     const value, const zero = tree.nodeData(condition).node_and_node;
     if (tree.nodeTag(zero) != .number_literal or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(zero)), "0")) return false;
@@ -731,12 +791,17 @@ fn clears(tree: *const Ast, condition: Ast.Node.Index, body: Ast.Node.Index) boo
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, body) orelse return false;
     for (statements) |statement| {
+        // A statement before that may leave the pass leaves the bit set.
+        if (leavesIn(tree, statement)) return false;
         const target, const operand = switch (tree.nodeTag(statement)) {
             .assign_bit_and, .assign_shr => tree.nodeData(statement).node_and_node,
             else => continue,
         };
         if (!std.mem.eql(u8, tree.getNodeSource(target), name)) continue;
-        if (tree.nodeTag(statement) == .assign_shr) return true;
+        if (tree.nodeTag(statement) == .assign_shr) {
+            if (tree.nodeTag(operand) != .number_literal or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operand)), "0")) continue;
+            return true;
+        }
         if (tree.nodeTag(operand) != .sub) continue;
         const minuend, const one = tree.nodeData(operand).node_and_node;
         if (std.mem.eql(u8, tree.getNodeSource(minuend), name) and std.mem.eql(u8, tree.getNodeSource(one), "1")) return true;

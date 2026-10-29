@@ -330,8 +330,15 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
             .assign, .assign_add, .assign_sub, .assign_div, .assign_mod, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_add_sat, .assign_sub_sat => {
                 const target, const value = tree.nodeData(node).node_and_node;
                 var held = try dep(c, flow, function, value);
-                // A product that feeds its own target accumulates a number (`n = n * 10 + d`).
-                if (tree.nodeTag(node) == .assign and accumulates(tree, model, target, value)) held = held.widened();
+                // A sum or a product that feeds its own target accumulates a number past any
+                // range what it adds holds (`n = n * 10 + d`, `total += b`).
+                switch (tree.nodeTag(node)) {
+                    .assign => if (accumulates(tree, model, target, value)) {
+                        held = held.widened();
+                    },
+                    .assign_add, .assign_add_wrap, .assign_add_sat => held = held.widened(),
+                    else => {},
+                }
                 try store(c, flow, function, target, held);
             },
             .assign_mul, .assign_shl, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => {
@@ -367,8 +374,11 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
                     // refines them, a direct call gives them as they were read.
                     const refined = f.parser and returned(tree, model, node);
                     for (literal.ast.fields, fields) |value, field| {
-                        if (refined and try shownField(c, f.file, value, field)) continue;
-                        try raiseGlobal(c, flow, field, concrete(flow, function, try dep(c, flow, function, value)));
+                        // A number the parser shows the range of reaches the program as data
+                        // held to that range, which a sink judges as it judges any value's.
+                        var level = concrete(flow, function, try dep(c, flow, function, value));
+                        if (refined and level == .number and try shownField(c, f.file, value, field)) level = .data;
+                        try raiseGlobal(c, flow, field, level);
                     }
                 };
                 if (isMemcpy(tree, node)) {
@@ -532,13 +542,15 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
             for (callee.args.items, 0..) |arg, position| if (buffers & bit(position) != 0) try fill(c, flow, function, arg);
         },
         .outside => {
-            // A receiver takes what a method adds to it: a list appended to, a map put into, a
-            // writer written to; nothing else a method is given becomes its data.
-            if (callee.receiver) |receiver| if (adds(c, callee.decl)) {
-                var given: Dep = .{};
-                for (callee.args.items[1..]) |arg| given = given.join(try dep(c, flow, function, arg));
-                if (given.level != .clean or given.params != 0) try store(c, flow, function, receiver, given);
-            };
+            // What a function outside the program is given may go into any memory it is given
+            // by a mutable pointer: a list appended to, a map put into, a hasher updated, a
+            // writer written to, a destination copied into.
+            const decl = callee.decl orelse return;
+            var given: Dep = .{};
+            for (callee.args.items) |arg| given = given.join(try dep(c, flow, function, arg));
+            if (given.clean()) return;
+            const writes = mutableParams(c, decl);
+            for (callee.args.items, 0..) |arg, position| if (writes & bit(position) != 0) try store(c, flow, function, arg, given);
         },
         .aegis => try parsed(c, flow, f.file, call, callee.decl.?),
         .holder, .none => {},
@@ -570,23 +582,27 @@ fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call,
     return flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return null });
 }
 
-/// Whether a method adds what it is given to its receiver's data: it takes its receiver by
-/// mutable pointer, and its name is `append`, `insert`, `put`, `push`, `add`, `write` or `print`
-/// or a form of one. An allocator's `print` takes its receiver by value and adds nothing to it.
-fn adds(c: *Context, decl: ?Facts.Decl) bool {
-    const d = decl orelse return false;
-    const name = c.project.models[d.file.raw()].declarations[d.index].name;
-    var named = false;
-    for ([_][]const u8{ "append", "insert", "put", "push", "add", "write", "print" }) |prefix| named = named or std.mem.startsWith(u8, name, prefix);
-    if (!named) return false;
-    const tree = &c.project.files[d.file.raw()].tree;
+/// The parameters a function may write through, by position, the receiver first: each one a
+/// mutable pointer or slice (`*List`, `[]u8`), or of a type the declaration does not spell
+/// (`anytype`). An allocator's `print` takes its receiver by value and writes nothing of it.
+fn mutableParams(c: *Context, decl: Facts.Decl) u64 {
+    const tree = &c.project.files[decl.file.raw()].tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, c.project.models[d.file.raw()].declarations[d.index].node) orelse return false;
+    const proto = tree.fullFnProto(&buffer, c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return 0;
+    var out: u64 = 0;
     var it = proto.iterate(tree);
-    const receiver = it.next() orelse return false;
-    const kind = receiver.type_expr orelse return false;
-    const pointer = tree.fullPtrType(kind) orelse return false;
-    return pointer.const_token == null;
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        const kind = param.type_expr orelse {
+            out |= bit(position);
+            continue;
+        };
+        var at = kind;
+        if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
+        const pointer = tree.fullPtrType(at) orelse continue;
+        if (pointer.const_token == null) out |= bit(position);
+    }
+    return out;
 }
 
 /// The parameters a read writes its bytes into, by position, the receiver first: a mutable
@@ -743,44 +759,82 @@ fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.
     }
 }
 
-/// Whether a read is from a reader `Reader.fixed` made over clean bytes, as a local of the
-/// function: such a read carries the bytes' fact, not input's.
+/// Whether a read is from a reader std's `Reader.fixed` made over clean bytes (`fixedBytes`):
+/// such a read carries the bytes' fact, not input's.
 fn fixedClean(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!bool {
     if (flow.fact != .input) return false;
     const f = flow.functions.items[function];
     const tree = &c.project.files[f.file.raw()].tree;
-    const model = &c.project.models[f.file.raw()];
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    var receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-    while (true) switch (tree.nodeTag(receiver)) {
-        .address_of => receiver = tree.nodeData(receiver).node,
-        .field_access => receiver = tree.nodeData(receiver).node_and_token[0],
-        else => break,
-    };
-    if (tree.nodeTag(receiver) != .identifier) return false;
-    const ref = model.reference(receiver) orelse return false;
-    const d = ref.declaration orelse return false;
-    const variable = tree.fullVarDecl(model.declarations[d].node) orelse return false;
-    const init = variable.ast.init_node.unwrap() orelse return false;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const made = tree.fullCall(&buffer, init) orelse return false;
-    const callee = switch (tree.nodeTag(made.ast.fn_expr)) {
-        .field_access => tree.tokenSlice(tree.nodeData(made.ast.fn_expr).node_and_token[1]),
-        .enum_literal => tree.tokenSlice(tree.nodeMainToken(made.ast.fn_expr)),
-        else => return false,
-    };
-    if (!std.mem.eql(u8, callee, "fixed") or made.ast.params.len != 1) return false;
-    return concrete(flow, function, try dep(c, flow, function, made.ast.params[0])) == .clean;
+    const bytes = (try fixedBytes(c, flow, f.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) orelse return false;
+    return concrete(flow, function, try dep(c, flow, function, bytes)) == .clean;
 }
 
-/// Whether `value` multiplies or shifts the local `target` names: an assignment that grows it.
+/// The bytes a reader is made over, where it is a local of a function the fact reads that
+/// std's `Io.Reader.fixed` makes, resolved by its declaration (`std.Io.Reader.fixed(bytes)`, or
+/// `.fixed(bytes)` into a variable of std's reader type), and nothing in the function writes
+/// it after: no assignment to it or a part of it, and no address of it handed on (`&rd`),
+/// which would let another name make it the peer's reader.
+pub fn fixedBytes(c: *Context, flow: *const Flow, file: Project.FileId, receiver: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const reader = flow.reader orelse return null;
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    if (tree.nodeTag(receiver) != .identifier) return null;
+    const function = owner(flow, file, receiver) orelse return null;
+    const d = (model.reference(receiver) orelse return null).declaration orelse return null;
+    const record = model.declarations[d];
+    if (record.kind != .variable or owner(flow, file, record.node) != function) return null;
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    const init = variable.ast.init_node.unwrap() orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const made = tree.fullCall(&buffer, init) orelse return null;
+    if (made.ast.params.len != 1) return null;
+    const fixed = c.facts.member(reader, "fixed") orelse return null;
+    const by_std = switch (tree.nodeTag(made.ast.fn_expr)) {
+        .enum_literal => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(made.ast.fn_expr)), "fixed") and switch (try c.facts.literalType(file, init)) {
+            .container, .instance => |k| k.file.eql(reader.file) and k.scope == reader.scope,
+            else => false,
+        },
+        else => switch (try c.facts.resolve(file, made.ast.fn_expr)) {
+            .function => |decl| std.meta.eql((try c.facts.origin(decl)) orelse decl, fixed),
+            else => false,
+        },
+    };
+    if (!by_std) return null;
+    const owners = flow.owners.get(file.raw()) orelse return null;
+    for (owners, 0..) |own, i| {
+        if (own != function) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tree.nodeTag(node)) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                if (rootDecl(model, tree, tree.nodeData(node).node_and_node[0]) == d) return null;
+            },
+            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |each| {
+                if (rootDecl(model, tree, each) == d) return null;
+            },
+            .address_of => {
+                if (rootDecl(model, tree, tree.nodeData(node).node) != d) continue;
+                // An address discarded (`_ = &rd;`) reaches nothing.
+                const parent = model.node_parents[@backingInt(node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+                if (tree.nodeTag(parent) != .assign) return null;
+                const target, const value = tree.nodeData(parent).node_and_node;
+                if (value != node or tree.nodeTag(target) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return null;
+            },
+            else => {},
+        }
+    }
+    return made.ast.params[0];
+}
+
+/// Whether `value` adds to, multiplies or shifts the local `target` names: an assignment that
+/// grows it.
 fn accumulates(tree: *const Ast, model: *const Model, target: Ast.Node.Index, value: Ast.Node.Index) bool {
     if (tree.nodeTag(target) != .identifier) return false;
     const declared = (model.reference(target) orelse return false).declaration orelse return false;
     const first = tree.firstToken(value);
     const last = tree.lastToken(value);
     for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-        .mul, .mul_wrap, .mul_sat, .shl, .shl_sat => {
+        .mul, .mul_wrap, .mul_sat, .shl, .shl_sat, .add, .add_wrap, .add_sat => {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = tree.nodeMainToken(node);
             if (token < first or token > last) continue;
@@ -821,7 +875,10 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
         },
         .field_access => {
             const receiver, const name = tree.nodeData(node).node_and_token;
-            if (std.mem.eql(u8, tree.tokenSlice(name), "len") or std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
+            // An address is no number a peer chooses; a length is one within the memory the
+            // program holds: data, which a sink judges against what it reaches.
+            if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
+            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) return (try dep(c, flow, function, receiver)).narrowed();
             var out = try dep(c, flow, function, receiver);
             if (try c.facts.definition(f.file, node)) |decl| {
                 if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
@@ -839,8 +896,8 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
         // the program's own value is bounded by it, a peer's value within that range: data.
         .sub, .sub_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            if (isLen(tree, lhs)) return .{};
-            return (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs));
+            const out = (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs));
+            return if (isLen(tree, lhs)) out.narrowed() else out;
         },
         .bit_and, .mod => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -865,21 +922,7 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return (try dep(c, flow, function, lhs)).widened().join(try dep(c, flow, function, rhs));
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@errorName", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField", "@intFromBool", "@ctz", "@clz", "@popCount" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
-            var buffer: [2]Ast.Node.Index = undefined;
-            var out: Dep = .{};
-            for (Facts.builtinArgs(tree, node, &buffer)) |arg| {
-                const each = try dep(c, flow, function, arg);
-                // The least of a value and a clean bound is bounded by it.
-                if (std.mem.eql(u8, name, "@min") and each.clean()) return .{};
-                out = out.join(each);
-            }
-            // A truncation keeps the bits its type holds, a peer's choice in a wide one: a sink
-            // reads it as data only where the type is shown small.
-            return out;
-        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return builtinDep(c, flow, function, node),
         .@"if", .if_simple => {
             const branch = tree.fullIf(node).?;
             var out = try dep(c, flow, function, branch.ast.then_expr);
@@ -892,6 +935,12 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
             return out;
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => return labeled(c, flow, function, node),
+        // A comparison's truth is input's choice where what it compares is: a bool, data.
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs)).narrowed();
+        },
+        .bool_not => return (try dep(c, flow, function, tree.nodeData(node).node)).narrowed(),
         else => {},
     }
     var buffer: [2]Ast.Node.Index = undefined;
@@ -918,7 +967,45 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
     }
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, node)) |call| return result(c, flow, function, call);
-    return .{};
+    return composed(c, flow, function, node);
+}
+
+/// What a builtin's result holds: nothing for one the program fixes as it compiles (a size, a
+/// type, a name), what its operands hold for any other.
+fn builtinDep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
+    const tree = &c.project.files[flow.functions.items[function].file.raw()].tree;
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@errorName", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
+    var buffer: [2]Ast.Node.Index = undefined;
+    var out: Dep = .{};
+    var bounded = false;
+    for (Facts.builtinArgs(tree, node, &buffer)) |arg| {
+        const each = try dep(c, flow, function, arg);
+        // The least of a value and a clean bound is held to it.
+        if (std.mem.eql(u8, name, "@min") and each.clean()) bounded = true;
+        out = out.join(each);
+    }
+    // A count of bits, a bool's integer and a least under a clean bound stay in a range
+    // the program chose: data, which a sink judges against what it reaches. A
+    // truncation keeps the bits its type holds, a peer's choice in a wide one: a sink
+    // reads it as data only where the type is shown small.
+    for ([_][]const u8{ "@intFromBool", "@ctz", "@clz", "@popCount" }) |count| bounded = bounded or std.mem.eql(u8, name, count);
+    return if (bounded) out.narrowed() else out;
+}
+
+/// What any other expression holds: what its parts hold (`a ** n`, an `asm`'s inputs, a loop's
+/// value), but for one the program fixes as it compiles: a type, a declaration, a `comptime`
+/// block, a literal.
+fn composed(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    switch (tree.nodeTag(node)) {
+        .@"comptime", .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi, .test_decl, .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .merge_error_sets, .anyframe_type, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => return .{},
+        else => {},
+    }
+    var out: Dep = .{};
+    for (try children(c, f.file, node)) |part| out = out.join(try dep(c, flow, function, part));
+    return out;
 }
 
 /// A field read through a value whose type is one of several (a generic's result over each
@@ -1036,19 +1123,20 @@ fn unrefined(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Con
             const declared = field.ast.type_expr.unwrap() orelse continue;
             if (!try Range.integral(c, f.file, declared)) continue;
             const given = if (elements) |each| (if (position < each.len) each[position] else continue) else value;
-            if (elements != null and try Range.shown(c, f.file, given, f.file, declared)) continue;
-            try unrefinedBy(c, flow, function, given);
+            try unrefinedBy(c, flow, function, given, elements != null and try Range.shown(c, f.file, given, f.file, declared));
         }
         return;
     }
     // A result that is no number (a checked path, a name, a list) is the parser's refinement.
-    if (!try Range.integral(c, f.file, payload) or try Range.shown(c, f.file, value, f.file, payload)) return;
-    try unrefinedBy(c, flow, function, value);
+    if (!try Range.integral(c, f.file, payload)) return;
+    try unrefinedBy(c, flow, function, value, try Range.shown(c, f.file, value, f.file, payload));
 }
 
-/// A parser's result holds `value`'s input as given.
-fn unrefinedBy(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Context.Error!void {
-    const level = concrete(flow, function, try dep(c, flow, function, value));
+/// A parser's result holds `value`'s input as given: a number whose range it shows (`shown`)
+/// as data held to that range.
+fn unrefinedBy(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index, shown: bool) Context.Error!void {
+    var level = concrete(flow, function, try dep(c, flow, function, value));
+    if (shown and level == .number) level = .data;
     const now = flow.functions.items[function].unrefined.join(level);
     if (now != flow.functions.items[function].unrefined) {
         flow.functions.items[function].unrefined = now;
@@ -1113,38 +1201,34 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
         .source => {
             if (try fixedClean(c, flow, function, call)) return .{};
             const decl = callee.decl.?;
-            // A read into the caller's buffer returns how much it read: a count the buffer bounds.
-            if (try bufferParams(c, decl) != 0 and returnsCount(c, decl)) return .{};
+            // A read into the caller's buffer returns how much it read: a count the buffer
+            // bounds, a peer's within it.
+            if (try bufferParams(c, decl) != 0 and returnsCount(c, decl)) return .{ .level = .data };
             if (flow.fact == .input and decodes(c, decl)) return .{ .level = if (narrow(c, f.file, call)) .data else .number };
             return .{ .level = .data };
         },
         .outside => {
-            // A method gives what its receiver holds; a function outside std, or std's data
-            // functions (`mem`, `fmt`, `ascii`, `unicode`, `math`, `base64`), what it is given:
-            // a position or a count std finds in data is clean, an integer it decodes a number.
-            if (callee.receiver) |receiver| {
-                // A std method that answers a `usize` (a container's `count`, a position it
-                // finds) answers a count of memory the program holds.
-                if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw()) and returnsCount(c, decl)) return .{};
-                // What std's file and directory handles answer that is no read of a file's
-                // contents (a `stat`, the names an iteration gives, a handle they open) is the
-                // operating system's, never a peer's: a handle a peer's path opened holds the
-                // path's fact, not what the system says of it.
-                if (callee.decl) |decl| if (systemAnswer(c, flow, decl)) return .{};
-                return dep(c, flow, function, receiver);
-            }
-            var data_function = false;
-            if (callee.decl) |decl| if (flow.std_files.contains(decl.file.raw())) {
-                if (!flow.data_files.contains(decl.file.raw())) return .{};
-                if (returnsCount(c, decl)) return .{};
-                data_function = true;
-            };
+            // What std's file and directory handles answer that is no read of a file's contents
+            // (a `stat`, the names an iteration gives, a handle they open) is the operating
+            // system's, never a peer's: a handle a peer's path opened holds the path's fact, not
+            // what the system says of it.
+            if (callee.decl) |decl| if (callee.receiver != null and systemAnswer(c, flow, decl)) return .{};
+            // A function outside the program gives what it is given, its receiver among it.
             var out: Dep = .{};
             for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
-            if (data_function and decodes(c, callee.decl.?)) return if (narrow(c, f.file, call)) out else out.widened();
-            // A value clamped between the program's own bounds is bounded by them.
-            if (data_function and std.mem.eql(u8, c.project.models[callee.decl.?.file.raw()].declarations[callee.decl.?.index].name, "clamp") and call.ast.params.len == 3) {
-                if ((try dep(c, flow, function, call.ast.params[1])).clean() and (try dep(c, flow, function, call.ast.params[2])).clean()) return .{};
+            const decl = callee.decl orelse return out;
+            if (!flow.std_files.contains(decl.file.raw())) return out;
+            // A std function that answers a `usize` (a container's `count`, a position it finds
+            // in data) answers a count of memory the program holds: a peer's within it.
+            if (returnsCount(c, decl)) return out.narrowed();
+            // A std function outside its data namespaces (`mem`, `fmt`, `ascii`, `unicode`,
+            // `math`, `base64`), or one of them that decodes an integer, may make any number of
+            // what it is given (`std.json` parsing a struct, a hash of the bytes). A decode of 16
+            // bits or fewer stays in their range.
+            if (callee.receiver == null and (!flow.data_files.contains(decl.file.raw()) or decodes(c, decl))) return if (narrow(c, f.file, call)) out else out.widened();
+            // A value clamped between the program's own bounds is held to them.
+            if (std.mem.eql(u8, c.project.models[decl.file.raw()].declarations[decl.index].name, "clamp") and call.ast.params.len == 3) {
+                if ((try dep(c, flow, function, call.ast.params[1])).clean() and (try dep(c, flow, function, call.ast.params[2])).clean()) return out.narrowed();
             }
             return out;
         },
