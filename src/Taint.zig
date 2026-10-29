@@ -882,6 +882,7 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
             var out = try dep(c, flow, function, receiver);
             if (try c.facts.definition(f.file, node)) |decl| {
                 if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
+                if (try stdIs(c, decl, &zig_text)) out = out.join(.{ .level = .data });
                 // A function or a type named through a value is no part of its data.
                 const kind = c.project.models[decl.file.raw()].declarations[decl.index].kind;
                 if (kind == .function) return .{};
@@ -1213,6 +1214,13 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
             // system's, never a peer's: a handle a peer's path opened holds the path's fact, not
             // what the system says of it.
             if (callee.decl) |decl| if (callee.receiver != null and systemAnswer(c, flow, decl)) return .{};
+            if (callee.decl) |decl| {
+                // std's Zig parser, called by a parser the program hands to input.Untrusted.parse,
+                // is that parse's check: each node, token and extra index of the tree it gives
+                // indexes the tree's own tables. The text the tree carries stays input.
+                if (f.parser and try stdIs(c, decl, &.{"zig.Ast.parse"})) return .{};
+                if (try stdIs(c, decl, &zig_text)) return .{ .level = .data };
+            }
             // A function outside the program gives what it is given, its receiver among it.
             var out: Dep = .{};
             for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
@@ -1318,6 +1326,18 @@ fn systemAnswer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
         var scope: ?u32 = model.declarations[decl.index].scope;
         while (scope) |s| : (scope = model.scopes[s].parent) if (s == handle.scope) return true;
     }
+    return false;
+}
+
+/// What std's Zig tree and its lowering give of the file's text: a peer's bytes, wherever the
+/// tree's structure is the parse's.
+const zig_text = [_][]const u8{ "zig.Ast.source", "zig.Ast.tokenSlice", "zig.Ast.getNodeSource", "zig.Zir.string_bytes", "zig.Zir.nullTerminatedString" };
+
+/// Whether `decl` is std's declaration at one of `paths`.
+fn stdIs(c: *Context, decl: Facts.Decl, paths: []const []const u8) Context.Error!bool {
+    for (paths) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |each| {
+        if (std.meta.eql(each, decl)) return true;
+    };
     return false;
 }
 

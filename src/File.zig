@@ -1,5 +1,6 @@
 //! Owned immutable front-end input. AST spans supplement, never replace, std ZIR.
 const std = @import("std");
+const aegis = @import("aegis");
 const File = @This();
 
 arena: std.heap.ArenaAllocator,
@@ -31,8 +32,8 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
     errdefer arena.deinit();
     const a = arena.allocator();
     const source = try a.dupeSentinel(u8, bytes, 0);
-    try sourceComplexity(source, limits);
-    const tree = try std.zig.Ast.parse(a, source, .{});
+    const front = try aegis.input.Untrusted([:0]const u8).init(source).parse(Reading{ .a = a, .limits = limits }, parseZig);
+    const tree = front.tree;
     var status: Status = if (tree.errors.len == 0) .parsed else .invalid_syntax;
     var zir: ?std.zig.Zir = null;
     if (bytes.len > limits.bytes or tree.nodes.len > limits.nodes) {
@@ -44,13 +45,28 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
         if (zir.?.hasCompileErrors()) status = .invalid_lowering;
         if (zir.?.instructions.len > limits.instructions) status = .budget_exhausted;
     }
+    return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = front.lines, .comments = front.comments };
+}
+
+/// What a file's bytes are once read as Zig, and the input boundary of all glint builds from
+/// them: the tree, each line's start and each comment's span.
+const Front = struct { tree: std.zig.Ast, lines: []const u32, comments: []const Comment };
+const Reading = struct { a: std.mem.Allocator, limits: Limits };
+
+/// The check is std's Zig parser, behind the lexical budget that keeps its work bounded: every
+/// node and token index its tree holds indexes the tree's own tables, and every line start
+/// and comment span this scan records is a position in the source. What the rules read of
+/// them is the tree's, not a peer's choice.
+fn parseZig(reading: Reading, source: [:0]const u8) InitError!Front {
+    try sourceComplexity(source, reading.limits);
+    const tree = try std.zig.Ast.parse(reading.a, source, .{});
     var lines: std.ArrayList(u32) = .empty;
-    try lines.append(a, 0);
+    try lines.append(reading.a, 0);
     for (source, 0..) |byte, offset| if (byte == '\n') {
-        try lines.append(a, @intCast(offset + 1));
+        try lines.append(reading.a, @intCast(offset + 1));
     };
-    const comment_list = try scanComments(a, source, lines.items);
-    return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = try lines.toOwnedSlice(a), .comments = comment_list };
+    const comments = try scanComments(reading.a, source, lines.items);
+    return .{ .tree = tree, .lines = try lines.toOwnedSlice(reading.a), .comments = comments };
 }
 
 // std's char-literal lowering assumes a complete UTF8 sequence. Check its

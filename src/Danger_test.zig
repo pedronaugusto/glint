@@ -19,6 +19,7 @@ const std_files = [_]sources.Extra{
     \\pub const hash_map = @import("hash_map.zig");
     \\pub const array_hash_map = @import("array_hash_map.zig");
     \\pub const math = @import("math.zig");
+    \\pub const zig = @import("zig.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -131,6 +132,15 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/math.zig", .bytes =
     \\pub inline fn maxInt(comptime T: type) comptime_int { const info = @typeInfo(T); const bit_count = info.int.bits; if (bit_count == 0) return 0; return (1 << (bit_count - @intFromBool(info.int.signedness == .signed))) - 1; }
     },
+    .{ .name = "std/zig.zig", .bytes =
+    \\pub const Ast = struct {
+    \\    source: []const u8,
+    \\    nodes: []const u32,
+    \\    pub fn parse(gpa: anytype, source: []const u8, mode: anytype) error{OutOfMemory}!Ast { _ = gpa; _ = mode; return .{ .source = source, .nodes = &.{} }; }
+    \\    pub fn nodeData(tree: Ast, node: u32) u32 { return tree.nodes[node]; }
+    \\    pub fn tokenSlice(tree: Ast, token: u32) []const u8 { return tree.source[token..]; }
+    \\};
+    },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .spelling = "std", .target = 0 },
@@ -149,6 +159,7 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "hash_map.zig", .target = 10 },
     .{ .from = 0, .spelling = "array_hash_map.zig", .target = 11 },
     .{ .from = 0, .spelling = "math.zig", .target = 15 },
+    .{ .from = 0, .spelling = "zig.zig", .target = 16 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -4246,4 +4257,31 @@ test "A020 reads a check a function body may return before as no cancellation po
         \\    while (i < n) : (i += 1) try step(io, i);
         \\}
     , 1);
+}
+
+test "A009 reads std's Zig tree as its parse's check where a parser handed to input.Untrusted.parse makes it, and the text it carries as input" {
+    const head =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const Front = struct { tree: std.zig.Ast };
+        \\fn parseZig(_: void, source: []const u8) error{OutOfMemory}!Front {
+        \\    return .{ .tree = try std.zig.Ast.parse({}, source, .{}) };
+        \\}
+        \\
+    ;
+    try expect(pack.untrusted_input, head ++
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);
+        \\    return table[front.tree.nodes[front.tree.nodeData(3)]];
+        \\}
+    , 0);
+    // A tree std's parser makes outside a parse, and the tree's text: its source and a token's.
+    inline for (.{
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const tree = try std.zig.Ast.parse({}, try r.take(16), .{});\n    return table[tree.nodeData(3)];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.source[0]];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.tokenSlice(0)[0]];\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
 }
