@@ -1,8 +1,9 @@
 //! The fixes a run's findings carry, applied: each a set of edits of one file's bytes that
 //! replaces a raw site with aegis's answer where the answer follows from the site alone
 //! (designs/aegis.md §7). The pack's old suppression (`// glint-ignore: A001 -- design: why`)
-//! becomes its escape naming that rule, an escape in the older form names the rules it covers,
-//! and an escape that covers nothing goes. No fix writes an escape a site did not already have:
+//! becomes its escape naming that rule, an escape in the older form names the rules a record of
+//! an earlier run shows it covered and that still find something there, and an escape that
+//! covers nothing goes. No fix writes an escape a site did not already have:
 //! a reason is the author's to state. A site whose answer is a design choice carries no fix.
 const std = @import("std");
 const Project = @import("Project.zig");
@@ -19,10 +20,51 @@ pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Er
     return out;
 }
 
+/// An escape a run before this one reported, with the rules it covered then: a line of the
+/// report's text, `escape: src/a.zig:12:30: no-danger: why (A010 at 12:5, A013 at 12:9)`, or
+/// preflight's record of it, `glint: escape: src/a.zig:12:30: no-danger: why (A010, A013)`.
+pub const Escaped = struct { path: []const u8, line: u32, rules: []const []const u8 };
+
+pub const Options = struct {
+    /// The escapes of a run before, by which an escape in the older form is named: a migration
+    /// aid, for the release that named the rules escapes cover.
+    escapes_before: []const Escaped = &.{},
+};
+
+/// The escapes a report's text lists, each line holding `escape: ` (a caller's prefix before it
+/// aside); other lines are left. A line that holds it and is no escape's is
+/// `error.InvalidEscapeRecord`.
+pub fn escapeRecord(a: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory, InvalidEscapeRecord }![]const Escaped {
+    var out: std.ArrayList(Escaped) = .empty;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const at = std.mem.find(u8, line, "escape: ") orelse continue;
+        const rest = line[at + "escape: ".len ..];
+        // `path:line:column: `, then the reason and why, then the rules covered in parentheses.
+        const path_end = std.mem.findScalar(u8, rest, ':') orelse return error.InvalidEscapeRecord;
+        const line_end = std.mem.findScalarPos(u8, rest, path_end + 1, ':') orelse return error.InvalidEscapeRecord;
+        const number = std.fmt.parseInt(u32, rest[path_end + 1 .. line_end], 10) catch return error.InvalidEscapeRecord;
+        if (rest.len == 0 or rest[rest.len - 1] != ')') return error.InvalidEscapeRecord;
+        const open = std.mem.findScalarLast(u8, rest, '(') orelse return error.InvalidEscapeRecord;
+        if (open <= line_end) return error.InvalidEscapeRecord;
+        var rules: std.ArrayList([]const u8) = .empty;
+        // Each entry's rule, its place after it where glint's own report gives one (`A010 at 4:18`).
+        var entries = std.mem.tokenizeScalar(u8, rest[open + 1 .. rest.len - 1], ',');
+        while (entries.next()) |entry| {
+            var words = std.mem.tokenizeScalar(u8, entry, ' ');
+            try rules.append(a, words.next() orelse return error.InvalidEscapeRecord);
+        }
+        if (path_end == 0) return error.InvalidEscapeRecord;
+        try out.append(a, .{ .path = rest[0..path_end], .line = number, .rules = rules.items });
+    }
+    return out.items;
+}
+
 /// Each file a run's fixes change, with its bytes after them: every finding's fix and the
 /// removal of every escape that covered nothing. Overlapping edits keep the first; an edit two
 /// findings share is made once.
-pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report) std.mem.Allocator.Error![]const Changed {
+pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) std.mem.Allocator.Error![]const Changed {
     var by_file: std.array_hash_map.Auto(u32, std.ArrayList(Report.Edit)) = .empty;
     for (report.diagnostics) |d| {
         if (d.fix.len == 0) continue;
@@ -39,7 +81,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
     }
     for (report.malformed) |entry| {
         const file = &project.files[entry.span.file.raw()];
-        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, file, report, entry.span)) orelse continue;
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file.raw());
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
@@ -85,21 +127,32 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
     return null;
 }
 
-/// The rules an escape in the older form (`// aegis: <reason>: <why>`) covered on this run,
-/// written into it (`// aegis: <reason>(A009, A010): <why>`). One that covered nothing goes as
-/// a stale escape instead.
-fn unnamedEscape(a: std.mem.Allocator, file: *const File, report: *const Report, span: Report.Span) std.mem.Allocator.Error!?Report.Edit {
+/// The rules an escape in the older form (`// aegis: <reason>: <why>`) covers, written into it
+/// (`// aegis: <reason>(A009, A010): <why>`): each one the record of a run before shows it
+/// covered and that finds something on its line now. A finding new since that run is no rule
+/// it was written for, so its owner judges it; an escape the record does not hold, or holds
+/// with none of today's rules, is left for its owner to name. One that covers nothing goes as a
+/// stale escape instead.
+fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
+    const file = &project.files[span.file.raw()];
     const text = file.source[span.start..span.end];
     if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
+    const recorded = for (before) |escaped| {
+        if (escaped.line == span.line and std.mem.eql(u8, escaped.path, project.inputs[span.file.raw()].name)) break escaped;
+    } else return null;
     for (report.escapes) |escape| {
         if (!escape.span.file.eql(span.file) or escape.span.start != span.start) continue;
         var names: std.ArrayList(u8) = .empty;
         var seen: std.ArrayList([]const u8) = .empty;
         for (escape.covered) |covered| {
+            for (recorded.rules) |rule| {
+                if (std.mem.eql(u8, rule, covered.name)) break;
+            } else continue;
             for (seen.items) |earlier_name| {
                 if (std.mem.eql(u8, earlier_name, covered.name)) break;
             } else try seen.append(a, covered.name);
         }
+        if (seen.items.len == 0) return null;
         std.mem.sort([]const u8, seen.items, {}, lessName);
         for (seen.items, 0..) |name, i| {
             if (i != 0) try names.appendSlice(a, ", ");

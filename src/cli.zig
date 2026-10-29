@@ -24,6 +24,8 @@ const Options = struct {
     zig_lib_path: ?[]const u8 = null,
     /// Apply the findings' fixes to the files they are in.
     fix: bool = false,
+    /// The escapes of a run before, by which the fix names an escape in the older form.
+    escapes_before: []const Fix.Escaped = &.{},
 };
 
 const Loader = struct {
@@ -174,6 +176,7 @@ pub const Arguments = struct {
     strict_suppressions: bool = false,
     metrics: bool = false,
     fix: bool = false,
+    escapes_before: ?[]const u8 = null,
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
@@ -201,6 +204,7 @@ pub const Arguments = struct {
             .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
             .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
             .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
+            .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form with only the rules listed for it there that find something now, and leaves one not listed to its owner" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
@@ -235,6 +239,11 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.strict_suppressions) result.config.strict_suppressions = true;
     if (arguments.metrics) result.config.metrics = true;
     result.fix = arguments.fix;
+    if (arguments.escapes_before) |path| {
+        const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(16 * 1024 * 1024));
+        // A record is a file another run wrote, which the fix reads as input until parsed.
+        result.escapes_before = try aegis.input.Untrusted([]const u8).init(bytes).parse(a, Fix.escapeRecord);
+    }
     try result.roots.appendSlice(a, arguments.root);
     for (arguments.module) |mapping| try result.modules.append(a, named(mapping) orelse return error.InvalidModule);
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
@@ -365,7 +374,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.output_sha256 = try result_a.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
     if (configured.fix) {
         var made: usize = 0;
-        const changed = try Fix.apply(a, &project, &report);
+        const changed = try Fix.apply(a, &project, &report, .{ .escapes_before = configured.escapes_before });
         for (changed) |file| {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project.inputs[file.file.raw()].name, .data = file.bytes });
             made += file.edits;

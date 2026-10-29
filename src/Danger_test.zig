@@ -1014,9 +1014,78 @@ fn fixed(rule: glint.Rule, program: []const u8) ![]u8 {
     defer report.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const changed = try glint.Fix.apply(arena.allocator(), &project, &report);
+    const changed = try glint.Fix.apply(arena.allocator(), &project, &report, .{});
     if (changed.len == 0) return std.testing.allocator.dupe(u8, program);
     return std.testing.allocator.dupe(u8, changed[0].bytes);
+}
+
+/// `program` after the fixes of a run of `rules`, with the escapes a run before reported, and
+/// that run's report.
+fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !struct { bytes: []u8, stale: usize } {
+    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    defer project.deinit();
+    var selections: [8]glint.Config.Selection = undefined;
+    for (rules, 0..) |rule, i| selections[i] = .{ .rule = rule, .level = .gate };
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = selections[0..rules.len] }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const before = try glint.Fix.escapeRecord(arena.allocator(), record);
+    const changed = try glint.Fix.apply(arena.allocator(), &project, &report, .{ .escapes_before = before });
+    const bytes = if (changed.len == 0) program else changed[0].bytes;
+    return .{ .bytes = try std.testing.allocator.dupe(u8, bytes), .stale = report.stale.len };
+}
+
+test "the fix names an escape in the older form only with rules a run before shows it covered and that find something now, and keeps an escape whose rules did not run" {
+    const older =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const x = try r.takeInt(i64, .little);
+        \\    return table[@intCast(x)]; // aegis: no-danger: probe
+        \\}
+        \\
+    ;
+    const both: []const glint.Rule = &.{ pack.untrusted_input, pack.integers };
+    // A009 and A010 both find something on the line; the record holds A010 only, so A009, new
+    // since, is left to the owner.
+    {
+        const out = try fixedBy(both, older, "glint: escape: consumer:4:32: no-danger: probe (A010)\nglint: 3 files\n");
+        defer std.testing.allocator.free(out.bytes);
+        try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A010): probe") != null);
+    }
+    {
+        const out = try fixedBy(both, older, "escape: consumer:4:32: no-danger: probe (A009 at 4:18, A010 at 4:18, A013 at 4:5)\n");
+        defer std.testing.allocator.free(out.bytes);
+        try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A009, A010): probe") != null);
+    }
+    // No record of the escape, or one of another line or rules that find nothing now: nothing
+    // is written, and the escape stays for its owner to name.
+    inline for (.{ "", "glint: escape: consumer:9:32: no-danger: probe (A010)\n", "glint: escape: consumer:4:32: no-danger: probe (A013)\n" }) |record| {
+        const out = try fixedBy(both, older, record);
+        defer std.testing.allocator.free(out.bytes);
+        try std.testing.expectEqualStrings(older, out.bytes);
+    }
+    // An escape is stale only where every rule it names ran: a run of A009 alone keeps an
+    // escape naming A010, and one naming A009 and A010.
+    inline for (.{ "no-danger(A010)", "no-danger(A009, A013)" }) |escape| {
+        const named = "pub fn f() u8 {\n    return 0; // aegis: " ++ escape ++ ": probe\n}\n";
+        const out = try fixedBy(&.{pack.untrusted_input}, named, "");
+        defer std.testing.allocator.free(out.bytes);
+        try std.testing.expectEqual(@as(usize, 0), out.stale);
+        try std.testing.expectEqualStrings(named, out.bytes);
+    }
+    // Where it ran and found nothing, it goes.
+    {
+        const named = "pub fn f() u8 {\n    return 0; // aegis: no-danger(A010): probe\n}\n";
+        const out = try fixedBy(&.{ pack.untrusted_input, pack.integers }, named, "");
+        defer std.testing.allocator.free(out.bytes);
+        try std.testing.expectEqual(@as(usize, 1), out.stale);
+        try std.testing.expect(std.mem.find(u8, out.bytes, "aegis:") == null);
+    }
+    // A record line that names an escape and is not one is refused.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(arena.allocator(), "glint: escape: consumer:x:1: no-danger: why (A010)\n"));
 }
 
 test "A013's fix makes std's assert on input aegis's invariant, through a private alias too, and imports aegis" {
@@ -1061,7 +1130,7 @@ test "A013's fix makes std's assert on input aegis's invariant, through a privat
     , alias);
 }
 
-test "the fix names the rules an older escape covers, makes the old pack suppression the escape, removes an escape that covers nothing, and writes no escape a site did not have" {
+test "the fix makes the old pack suppression the escape, removes an escape whose rules ran and found nothing, and writes no escape a site did not have" {
     const out = try fixed(pack.unsafe_set,
         \\pub fn f(p: *const u8) *u8 {
         \\    // safe: the caller passes memory it owns
@@ -1086,16 +1155,18 @@ test "the fix names the rules an older escape covers, makes the old pack suppres
         \\    return @constCast(p);
         \\}
         \\pub fn g() u8 {
-        \\    return 1;
+        \\    return 1; // aegis: design: nor here
         \\}
         \\pub fn h(p: *const u8) *u8 {
         \\    // aegis: boundary(A019): the kernel's handle
         \\    return @constCast(p);
         \\}
         \\pub fn k(p: *const u8) *u8 {
-        \\    return @constCast(p); // aegis: boundary(A019): the kernel's handle
+        \\    return @constCast(p); // aegis: boundary: the kernel's handle
         \\}
     , out);
+    // An escape in the older form is named only from a record of a run before, and is stale
+    // only where the whole pack ran: this run is A019's alone.
 }
 
 test "an aegis owner or loan holds what it is given: input wrapped is input" {

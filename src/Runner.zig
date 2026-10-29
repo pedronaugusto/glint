@@ -114,7 +114,8 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         };
         if (file.status != .parsed) runner.complete = false;
         // Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
-        // stale when a pack rule ran and none of its findings stood on the line.
+        // stale when every rule it names ran and none of their findings stood on the line (an
+        // escape in the older form, every pack rule).
         for (runner.suppressions, 0..) |suppression, i| {
             const start = suppression.comment.start;
             const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 };
@@ -128,7 +129,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
                 }
                 if (suppression.used) {
                     try runner.escapes.append(a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
-                } else if (runner.packRan(options.project_rules)) {
+                } else if (runner.escapeRan(suppression, options.project_rules)) {
                     if (runner.config.strict_suppressions) runner.complete = false;
                     try runner.stale.append(a, .{ .name = "aegis", .span = span });
                 }
@@ -151,9 +152,14 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
 }
 
 /// Whether a rule of the aegis pack ran on the current file.
-fn packRan(self: *const Runner, project_rules: []const Context.Rule) bool {
-    for (project_rules) |rule| if (rule.definition.exception == .aegis and self.config.has(rule.definition.id)) return true;
-    return false;
+/// Whether every rule an escape covers ran: those it names, or, in the older form, the pack.
+fn escapeRan(self: *const Runner, escape: Suppression, project_rules: []const Context.Rule) bool {
+    if (!escape.unnamed) {
+        for (escape.covers[0..escape.covers_len]) |rule| if (!self.config.has(rule)) return false;
+        return true;
+    }
+    for (project_rules) |rule| if (rule.definition.exception == .aegis and !self.config.has(rule.definition.id)) return false;
+    return true;
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {
