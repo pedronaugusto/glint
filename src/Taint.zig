@@ -393,7 +393,7 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .capture) continue;
         if (owner(flow, f.file, decl.node) != function) continue;
-        const from = try captured(c, flow, function, decl, @intCast(d));
+        const from = try captured(c, flow, function, decl);
         try raiseLocal(c, flow, .{ .file = f.file, .index = @intCast(d) }, from);
     }
 }
@@ -408,7 +408,7 @@ fn isMemcpy(tree: *const Ast, node: Ast.Node.Index) bool {
 /// What a capture binds: an `if`'s or `while`'s payload its condition, a `switch` prong's the
 /// switch's operand, a `for` capture its input (a range's counter is clean), a `catch`'s error
 /// nothing.
-fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration, d: u32) Context.Error!Dep {
+fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration) Context.Error!Dep {
     const f = flow.functions.items[function];
     const tree = &c.project.files[f.file.raw()].tree;
     const model = &c.project.models[f.file.raw()];
@@ -421,10 +421,7 @@ fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration, d:
         return dep(c, flow, function, choice.ast.condition);
     }
     if (tree.fullFor(node)) |loop| {
-        var position: usize = 0;
-        for (model.declarations[0..d]) |earlier| if (earlier.kind == .capture and earlier.node == node) {
-            position += 1;
-        };
+        const position = Model.capturePosition(tree, loop, decl.token) orelse return .{};
         if (position >= loop.ast.inputs.len) return .{};
         const input = loop.ast.inputs[position];
         if (tree.nodeTag(input) == .for_range) return .{};
@@ -1176,10 +1173,14 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
         // A parse gives what its parser returns refined, but for the values it showed no range
-        // of; aegis's other functions give the program's own.
+        // of. aegis's other functions give what they are given: a conversion (`int.cast`), a
+        // checked sum or an id's `raw` holds the peer's choice as much as its operand did,
+        // though the checks the conversion makes are aegis's.
         .aegis => {
-            const target = (try parserOf(c, flow, f.file, call, callee.decl.?)) orelse return .{};
-            return .{ .level = flow.functions.items[target].unrefined };
+            if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| return .{ .level = flow.functions.items[target].unrefined };
+            var out: Dep = .{};
+            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            return out;
         },
         // What it holds: `init`'s value, the receiver of `lend`, `get`, `borrow` and `move`.
         .holder => {
@@ -1417,7 +1418,7 @@ const Walk = struct {
         const callee = try resolveCall(w.c, w.flow, f.file, at);
         switch (callee.kind) {
             .source => return .{ .file = f.file, .node = node },
-            .aegis => return null,
+            .aegis => if (try parserOf(w.c, w.flow, f.file, at, callee.decl.?) != null) return null,
             .program => |target| {
                 const g = w.flow.functions.items[target];
                 const tree = &w.c.project.files[g.file.raw()].tree;

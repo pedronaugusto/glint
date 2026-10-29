@@ -1996,13 +1996,7 @@ fn prongNames(self: *Facts, file: Project.FileId, whole: Ast.full.Switch, name: 
 
 fn element(self: *Facts, env: ?*const Env, file: Project.FileId, loop: Ast.full.For, name: Ast.TokenIndex) ResolveError!Value {
     const tree = &self.project.files[file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    var position: usize = 0;
-    var token = loop.payload_token;
-    while (tree.tokenTag(token) != .pipe) : (token += 1) {
-        if (tree.tokenTag(token) != .identifier) continue;
-        if (token == name) break;
-        position += 1;
-    } else return .{ .unknown = .unsupported };
+    const position = Model.capturePosition(tree, loop, name) orelse return .{ .unknown = .unsupported };
     if (position >= loop.ast.inputs.len) return .{ .unknown = .unsupported };
     const input = loop.ast.inputs[position];
     if (tree.nodeTag(input) == .for_range) return .scalar;

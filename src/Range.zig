@@ -2919,6 +2919,7 @@ fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
 /// array's declared length. Such a position the program has checked, and no peer's choice
 /// of it reaches past the memory.
 pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
+    if (try ownId(c, file, index, memory)) return true;
     // A remainder by the memory's length is below it (a zero length stops the remainder), and
     // so is a `for` counter over its length or beside it.
     if (try remainderOf(c, file, index, memory)) return true;
@@ -2954,6 +2955,151 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     return true;
 }
 
+/// Whether `index` is a table's own id read as its integer, `t[@backingInt(id)]`: `id`'s type
+/// is the `Id` the table's element type declares (`ownerOf`), and `t` is memory of that
+/// element (`[]T`, `[N]T`, `*[N]T`). Such an id is made only by `@fromBackingInt` or
+/// `@enumFromInt`, and A009 reports each of those that does not count the table's entries
+/// (`madeId`, `countsEntries`), so it names one of them. The type does not tell which table
+/// of that element: an id of one table read in another of the same element, or in one the
+/// program has shrunk since, is the program's to keep apart.
+pub fn ownId(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, index);
+    switch (tree.nodeTag(at)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return false,
+    }
+    const name = tree.tokenSlice(tree.nodeMainToken(at));
+    if (!std.mem.eql(u8, name, "@backingInt") and !std.mem.eql(u8, name, "@intFromEnum")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, at, &buffer);
+    if (args.len != 1) return false;
+    const id = switch (try c.facts.resolve(file, args[0])) {
+        .instance => |k| k,
+        else => return false,
+    };
+    const owner = ownerOf(c, id) orelse return false;
+    const entries = (try elementOf(c, file, memory)) orelse return false;
+    return owner.file.eql(entries.file) and owner.scope == entries.scope;
+}
+
+/// The container whose own id `id` is: `id` is an enum with a backing integer whose one member
+/// is `_` (no named value, so none is made without a conversion), declared by the name `Id`
+/// directly in that container.
+fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
+    if (id.made_by != null or id.symbolic) return null;
+    const tree = &c.project.files[id.file.raw()].tree;
+    const model = &c.project.models[id.file.raw()];
+    const scope = model.scopes[id.scope];
+    if (scope.kind != .container) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const declared = tree.fullContainerDecl(&buffer, scope.node) orelse return null;
+    if (tree.tokenTag(declared.ast.main_token) != .keyword_enum or declared.ast.arg == .none) return null;
+    var open = false;
+    for (declared.ast.members) |member| {
+        const each = tree.fullContainerField(member) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(each.ast.main_token), "_")) return null;
+        open = true;
+    }
+    if (!open) return null;
+    if (!std.mem.eql(u8, containerName(c, id.file, scope.node) orelse return null, "Id")) return null;
+    const holder = scope.parent orelse return null;
+    if (model.scopes[holder].kind != .container) return null;
+    return .{ .file = id.file, .scope = holder };
+}
+
+/// The element of memory indexed by position: a slice's or many-item pointer's, an array's,
+/// or the array's a pointer to one points at.
+fn elementOf(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?Facts.Container {
+    var value = try c.facts.resolve(file, memory);
+    if (value == .pointer) value = value.pointer.*;
+    if (value == .array) value = value.array.*;
+    return switch (value) {
+        .instance => |k| k,
+        else => null,
+    };
+}
+
+/// What a `@fromBackingInt` or `@enumFromInt` makes, as A009 reads it: a table's own id (the
+/// container whose `Id` it is), another type, or a type the place its result is read into
+/// does not name.
+pub const Made = union(enum) { id: Facts.Container, other, unknown };
+
+pub fn madeId(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Error!Made {
+    var made = switch ((try destined(c, file, call)) orelse return .unknown) {
+        .named => |type_node| try c.facts.resolve(type_node.file, type_node.node),
+        .assigned => |lhs| try c.facts.resolve(file, lhs),
+        .field => |decl| try c.facts.declaration(decl),
+        .backing, .shifted => return .other,
+    };
+    while (made == .optional) made = made.optional.*;
+    return switch (made) {
+        .container, .instance => |k| if (ownerOf(c, k)) |owner| .{ .id = owner } else .other,
+        .unknown => .unknown,
+        else => .other,
+    };
+}
+
+/// Whether a conversion making `owner`'s id counts the entries of a table of `owner`: its
+/// operand is shown within that table, as a `for` counter over it (`for (t, 0..) |_, i|`) or
+/// its length less what cannot be zero (`t.len - 1`, after an append).
+pub fn countsEntries(c: *Context, file: Project.FileId, call: Ast.Node.Index, owner: Facts.Container) Context.Error!bool {
+    const tree = &c.project.files[file.raw()].tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, call, &buffer);
+    if (args.len != 1) return false;
+    const operand = bare(tree, args[0]);
+    switch (tree.nodeTag(operand)) {
+        .sub => {
+            const whole = bare(tree, tree.nodeData(operand).node_and_node[0]);
+            if (tree.nodeTag(whole) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(whole).node_and_token[1]), "len")) return false;
+            const table = tree.nodeData(whole).node_and_token[0];
+            if (!try entriesOf(c, file, table, owner)) return false;
+            return within(c, file, args[0], table, false);
+        },
+        // A counter from zero beside the table taken first: below its length when the loop
+        // began, and a table whose ids are kept only grows.
+        .identifier => {
+            const model = &c.project.models[file.raw()];
+            const d = (model.reference(operand) orelse return false).declaration orelse return false;
+            const record = model.declarations[d];
+            if (record.kind != .capture) return false;
+            const loop = tree.fullFor(record.node) orelse return false;
+            const taken = Model.capturePosition(tree, loop, record.token) orelse return false;
+            if (taken == 0 or taken >= loop.ast.inputs.len or tree.nodeTag(loop.ast.inputs[taken]) != .for_range) return false;
+            const start, const end = tree.nodeData(loop.ast.inputs[taken]).node_and_opt_node;
+            if (literal(tree, start) != 0 or end != .none) return false;
+            return entriesOf(c, file, loop.ast.inputs[0], owner);
+        },
+        else => return false,
+    }
+}
+
+/// Whether `table` is memory of `owner`'s entries.
+fn entriesOf(c: *Context, file: Project.FileId, table: Ast.Node.Index, owner: Facts.Container) Context.Error!bool {
+    const entries = (try elementOf(c, file, table)) orelse return false;
+    return entries.file.eql(owner.file) and entries.scope == owner.scope;
+}
+
+/// Whether a selected file declares a table's own id: where none does, a conversion whose
+/// type does not resolve makes none.
+pub fn declaresIds(c: *Context) Context.Error!bool {
+    const memo = try c.facts.memo(DeclaresIds);
+    if (memo.known) |known| return known;
+    const out = found: for (c.project.models, 0..) |model, f| {
+        const file: Project.FileId = .fromRaw(@intCast(f));
+        if (!c.project.inputs[f].selected) continue;
+        for (model.scopes, 0..) |scope, s| {
+            if (scope.kind != .container) continue;
+            if (ownerOf(c, .{ .file = file, .scope = @intCast(s) }) != null) break :found true;
+        }
+    } else false;
+    memo.known = out;
+    return out;
+}
+
+const DeclaresIds = struct { known: ?bool = null };
+
 /// Whether `index` is a remainder by `memory`'s length of a value at zero or above: `x %
 /// m.len`, `@mod(x, m.len)`, `@rem(x, m.len)`.
 fn remainderOf(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
@@ -2988,10 +3134,7 @@ fn counted(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast
     const record = model.declarations[d];
     if (record.kind != .capture) return false;
     const loop = tree.fullFor(record.node) orelse return false;
-    var taken: usize = 0;
-    for (model.declarations[0..d]) |earlier| if (earlier.kind == .capture and earlier.node == record.node) {
-        taken += 1;
-    };
+    const taken = Model.capturePosition(tree, loop, record.token) orelse return false;
     if (taken >= loop.ast.inputs.len or tree.nodeTag(loop.ast.inputs[taken]) != .for_range) return false;
     const start, const end = tree.nodeData(loop.ast.inputs[taken]).node_and_opt_node;
     if (literal(tree, start) != 0) return false;

@@ -959,6 +959,89 @@ test "A009 leaves a position the program checked against the memory's length, an
     , 1);
 }
 
+test "A009 trusts a table's own id by its type, and reports each id made from an integer that does not count the table's entries" {
+    // A table's own id indexes and slices it (lines 8-10); ids counted over it (13) or its
+    // length less one after an append (23) are made. Findings: an id made from input (18), a
+    // constant (19), a counter over another table (21), input made another element's id (25)
+    // indexing this table (26), an id with a named value (27), an id declared outside its
+    // element (28), arithmetic on an id (29), and the length itself, one past the end (31).
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\const Other = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\const Named = struct { name: u8, pub const Id = enum(u32) { first, _ }; };
+        \\const LooseId = enum(u32) { _ };
+        \\const Table = struct {
+        \\    entries: []Entry, others: []Other, named: []Named, list: std.ArrayList(Entry),
+        \\    fn at(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\    fn slice(t: *const Table, id: Entry.Id) []Entry { return t.entries[0..@backingInt(id)]; }
+        \\    fn range(t: *const Table, id: Entry.Id) []Entry { return t.entries[@backingInt(id)..]; }
+        \\    fn total(t: *const Table) u8 {
+        \\        var sum: u8 = 0;
+        \\        for (t.entries, 0..) |_, i| sum +%= t.at(@fromBackingInt(@intCast(i)));
+        \\        return sum;
+        \\    }
+        \\};
+        \\pub fn f(r: *std.Io.Reader, t: *Table) !u8 {
+        \\    const peer: Entry.Id = @fromBackingInt(try r.takeInt(u32, 0));
+        \\    const fixed: Entry.Id = @fromBackingInt(7);
+        \\    var sum: u8 = t.at(peer) +% t.at(fixed) +% t.total();
+        \\    for (t.others, 0..) |_, i| sum +%= t.at(@fromBackingInt(@intCast(i)));
+        \\    try t.list.append(.{ .name = 1 });
+        \\    const added: Entry.Id = @fromBackingInt(@intCast(t.list.items.len - 1));
+        \\    sum +%= t.at(added);
+        \\    const other_id: Other.Id = @fromBackingInt(try r.takeInt(u32, 0));
+        \\    sum +%= t.entries[@backingInt(other_id)].name;
+        \\    sum +%= t.named[@backingInt(@as(Named.Id, @fromBackingInt(try r.takeInt(u32, 0))))].name;
+        \\    sum +%= t.entries[@backingInt(@as(LooseId, @fromBackingInt(try r.takeInt(u32, 0))))].name;
+        \\    sum +%= t.entries[@backingInt(peer) + 1].name;
+        \\    _ = t.slice(peer).len + t.range(peer).len;
+        \\    return sum +% t.at(@fromBackingInt(@intCast(t.entries.len)));
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 18, 19, 21, 25, 26, 27, 28, 29, 31 }, result.lines[0..result.findings]);
+}
+
+test "A009 reads a for capture as the input at its own position, a discarded capture counted" {
+    // The counter beside the peer's bytes indexes the buffer (line 5); what the peer's bytes
+    // give does not, though the capture before it is discarded (line 6): it is no counter, and
+    // its value is the peer's.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const peer = try r.take(4);
+        \\    var sum: u8 = 0;
+        \\    for (0..buf.len, peer) |i, _| sum +%= buf[i];
+        \\    for (0..buf.len, peer) |_, v| sum +%= buf[v];
+        \\    return sum;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{6}, result.lines[0..result.findings]);
+}
+
+test "A009 holds what an aegis function other than a parse gives at the fact it was given: a conversion, a checked sum and an id's integer stay the peer's" {
+    // The peer's value through int.cast (line 6), a checked sum (7) and an id made and read
+    // back (8) indexes a table no longer than a byte; the program's own value through them
+    // (9) does not.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const Slot = aegis.id.Id(struct {}, u32);
+        \\pub fn f(r: *std.Io.Reader, table: []const u8, own: u32) !u8 {
+        \\    const peer = try r.takeInt(u32, .little);
+        \\    var sum: u8 = table[try aegis.int.cast(u8, peer)];
+        \\    sum +%= table[(try aegis.int.Checked(u32).init(peer).add(1)).raw()];
+        \\    sum +%= table[Slot.fromRaw(peer).raw()];
+        \\    sum +%= table[Slot.fromRaw(own % @as(u32, @intCast(table.len))).raw()];
+        \\    return sum;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 7, 8 }, result.lines[0..result.findings]);
+}
+
 test "A009 reads a parser's checks of a position, and A012 a size checked against the program's limit and a fixed reader's unlimited read" {
     const program =
         \\const std = @import("std");

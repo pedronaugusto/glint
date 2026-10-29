@@ -540,6 +540,18 @@ fn capture(a: std.mem.Allocator, tree: *const Ast, scopes: []Scope, list: *std.A
     try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = node, .token = name, .scope = scope, .kind = .capture });
 }
 
+/// The position among a `for` loop's captures of the one named at `token`, a discarded `_`
+/// counted: the input it takes is the loop's input at that position.
+pub fn capturePosition(tree: *const Ast, loop: Ast.full.For, token: Ast.TokenIndex) ?usize {
+    var position: usize = 0;
+    var at = loop.payload_token;
+    while (tree.tokenTag(at) != .pipe) : (at += 1) {
+        if (at == token) return position;
+        if (tree.tokenTag(at) == .comma) position += 1;
+    }
+    return null;
+}
+
 pub fn identifier(a: std.mem.Allocator, raw: []const u8) InitError![]const u8 {
     if (!std.mem.startsWith(u8, raw, "@\"")) return raw;
     return std.zig.string_literal.parseAlloc(a, raw[1..]) catch |err| switch (err) {

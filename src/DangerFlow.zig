@@ -66,6 +66,19 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                     try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
                 }
             },
+            // A table trusts its own ids to name its entries (Range.ownId): one made from an
+            // integer is a finding unless it counts the table's entries, whatever the
+            // integer's fact. Where the type it makes does not resolve and the program declares
+            // such ids, it may be one.
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (!std.mem.eql(u8, name, "@fromBackingInt") and !std.mem.eql(u8, name, "@enumFromInt")) continue;
+                switch (try Range.madeId(c, c.file, node)) {
+                    .other => {},
+                    .unknown => if (try Range.declaresIds(c)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a conversion whose type does not resolve may make a table's own id"),
+                    .id => |owner| if (!try Range.countsEntries(c, c.file, node, owner)) try c.at(rule, tree.nodeMainToken(node), "a table's own id made from an integer: its table trusts the id to name an entry; make ids only by counting its entries (`for (t, 0..) |_, i|`, `t.len - 1` after an append)"),
+                }
+            },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, node) orelse continue;
