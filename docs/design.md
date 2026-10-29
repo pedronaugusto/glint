@@ -185,8 +185,9 @@ at its boundary: name the measurement), `internal` (inside a safe type), `bounda
 call, only the raw call). The rules are the pack rules it covers, at least one; the why is not
 empty. An escape covers the findings of the rules it names on its line, and `Report.escapes` lists
 it with each finding it covered, so a review reads what each one hides; one that covers nothing
-where every rule it names ran is stale (a run of other rules says nothing of it). An escape in the older form, naming no rules, covers every pack finding on its line and is
-reported malformed: the run is incomplete until the fix names its rules. A `glint-ignore` naming a pack rule is malformed. The comment does
+where every rule it names ran is stale (a run of other rules says nothing of it). An escape in the older form, naming no rules, hides nothing: its line's pack findings stay
+findings, their fixes held back, and are recorded as what it covers for the fix to name; it is
+reported malformed, and the run is incomplete until its rules are named. A `glint-ignore` naming a pack rule is malformed. The comment does
 not prove its reason. It cannot erase undecided coverage or certify incomplete execution.
 
 These are explicitly adopted operation checks. Gate selection does not claim general security, flow or lifetime proof, and generic defaults remain unchanged.

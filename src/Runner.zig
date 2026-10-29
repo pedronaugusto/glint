@@ -177,20 +177,28 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 };
-    for (self.suppressions, 0..) |*suppression, i| if (try suppression.matches(rule, metadata.exception == .aegis, line, start)) {
-        self.suppressed += 1;
+    // An escape in the older form names no rule it was judged for: what it covers is recorded
+    // for the fix to name, and stays a finding, its fix held back, until its rules are named.
+    var held = false;
+    for (self.suppressions, 0..) |*suppression, i| {
+        if (!try suppression.matches(rule, metadata.exception == .aegis, line, start)) continue;
         if (suppression.escape != null) {
             const entry = try self.covered.getOrPut(self.a, i);
             if (!entry.found_existing) entry.value_ptr.* = .empty;
             try entry.value_ptr.append(self.a, .{ .name = metadata.name, .span = span });
         }
+        if (suppression.unnamed) {
+            held = true;
+            break;
+        }
+        self.suppressed += 1;
         return;
-    };
+    }
     try self.diagnostics.append(self.a, .{ .rule = rule, .name = metadata.name, .rule_version = metadata.version, .class = switch (metadata.group) {
         .correctness => .correctness,
         .zig_style => .zig_style,
         .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} });
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0 and !held) try Fix.copy(self.a, fix) else &.{} });
 }
 
 fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {

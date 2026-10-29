@@ -340,8 +340,12 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
             },
             .assign_destructure => {
                 const parts = tree.assignDestructure(node);
-                const value = try dep(c, flow, function, parts.ast.value_expr);
-                for (parts.ast.variables) |variable| {
+                const whole = try dep(c, flow, function, parts.ast.value_expr);
+                // A literal of as many elements gives each variable its own (`x, y = .{ 5, n }`).
+                var buffer: [2]Ast.Node.Index = undefined;
+                const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&buffer, parts.ast.value_expr)) |literal| (if (literal.ast.elements.len == parts.ast.variables.len) literal.ast.elements else null) else null;
+                for (parts.ast.variables, 0..) |variable, at| {
+                    const value = if (elements) |each| try dep(c, flow, function, each[at]) else whole;
                     if (declaredAt(model, variable)) |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value) else try store(c, flow, function, variable, value);
                 }
             },

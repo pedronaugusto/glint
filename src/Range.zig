@@ -414,8 +414,9 @@ fn firstRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
     return (literal(tree, end) orelse return false) <= 1;
 }
 
-/// Whether a value is a pointer: one it resolves to, an address moved from one (`p + i`,
-/// `p - i`), or a constant naming either (`const m = out.ptr + o_lit;`).
+/// Whether a value is a pointer: one it resolves to, its address as an integer
+/// (`@intFromPtr(p)`), an address moved from one (`p + i`, `p - i`), or a constant naming
+/// either (`const m = out.ptr + o_lit;`).
 fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 4) return false;
     const tree = &c.project.files[file.raw()].tree;
@@ -430,6 +431,7 @@ fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: 
             const local = constantOf(c, file, at) orelse return false;
             return pointerValue(c, file, local.ast.init_node.unwrap() orelse return false, depth + 1);
         },
+        .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@intFromPtr"),
         else => return false,
     }
 }

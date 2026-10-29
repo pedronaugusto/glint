@@ -392,8 +392,9 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     try std.testing.expectEqualStrings("A010", report.escapes[1].covered[0].name);
     try std.testing.expectEqual(@as(usize, 1), report.stale.len); // safe: fixture counts are representable.
     try std.testing.expect(report.complete);
-    // An escape covers only the rules it names; one naming none still covers its line's pack
-    // findings, but the run that reads it is incomplete.
+    // An escape covers only the rules it names; one naming none hides nothing: its line's pack
+    // findings stay findings, recorded as what it covers for the fix to name, and the run that
+    // reads it is incomplete.
     var other = try sources.projectWithSources(std.testing.allocator,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !u4 {
@@ -408,8 +409,11 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     defer other.deinit();
     var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.untrusted_input, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
     defer named.deinit();
-    try std.testing.expectEqual(@as(usize, 1), named.diagnostics.len); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 2), named.diagnostics.len); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(u32, 4), named.diagnostics[0].span.line);
+    try std.testing.expectEqual(@as(u32, 8), named.diagnostics[1].span.line);
+    try std.testing.expectEqual(@as(usize, 1), named.escapes.len); // safe: fixture counts are representable.
+    try std.testing.expectEqualStrings("A010", named.escapes[0].covered[0].name);
     try std.testing.expect(!named.complete);
     try std.testing.expectEqual(@as(usize, 1), named.malformed.len); // safe: fixture counts are representable.
     var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // glint-ignore: A007 -- no-danger: one thread\n", &std_files, &std_imports);
@@ -1816,6 +1820,44 @@ test "A009 ends a comparison's fact at a store through another name for its memo
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
     // Each store through another name, never one to a part the comparison doesn't read.
     try std.testing.expectEqualSlices(u32, &.{ 28, 36, 44, 54, 62, 70, 80 }, result.lines[0..result.findings]);
+}
+
+test "A010 reads each variable a literal is destructured into by its own element: a constant beside a number from input is no input" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i32 {
+        \\    var x: i32 = 0;
+        \\    var y: i32 = 0;
+        \\    x, y = .{ 5, try r.takeInt(i32, .little) };
+        \\    return -x +% y;
+        \\}
+    , 0);
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !i32 {
+        \\    var x: i32 = 0;
+        \\    var y: i32 = 0;
+        \\    x, y = .{ try r.takeInt(i32, .little), 5 };
+        \\    return -x +% y;
+        \\}
+    , 1);
+}
+
+test "A009 judges an address input moves as an integer (`@ptrFromInt(@intFromPtr(p) + o)`) as it judges a pointer moved by input" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn intptr(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    const p: [*]u8 = @ptrFromInt(@intFromPtr(out.ptr) + o);
+        \\    return p[0];
+        \\}
+        \\pub fn fixed(out: []u8) u8 {
+        \\    const p: [*]u8 = @ptrFromInt(@intFromPtr(out.ptr) + 4);
+        \\    return p[0];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{4}, result.lines[0..result.findings]);
 }
 
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {

@@ -16,6 +16,9 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- An escape in the older form, naming no rules, hides nothing: its line's findings stay in the report's diagnostics, their fixes held back, recorded as what it covers for the fix to name. It covered every pack finding there, so a finding added later went unseen.
+- A destructuring of a literal of as many elements (`x, y = .{ 5, try r.takeInt(i32, .little) }`) gives each variable its own element: the whole literal's input reached each, so `-x` of the constant was a finding.
+- A009 judges an address moved as an integer (`@ptrFromInt(@intFromPtr(out.ptr) + o)`) as it judges a pointer moved (`out.ptr + o`): only A019 saw the conversion, so an escape of A019 at a true boundary hid the address a peer chose.
 - An escape is stale, and `--fix` removes it, only where every rule it names ran (an escape in the older form, every pack rule): a run of some rules (`--only A009`) removed escapes naming others.
 - A comparison's fact ends at a store through another name for what it compares: a pointer taken to it (`const p = &s;` then `p.buf = ...` or `p.* = ...`), the pointer it is read through (`s.* = ...` where `s: *S`), a method on it or a call given its pointer (`s.shrink()`, `cut(s)`), another pointer parameter of its type, which a caller may pass as the same, and a value holding its address. Each left `i < s.buf.len` holding at `s.buf[i]` after the length had changed.
 - A009 clears a pointer moved within its memory (`x.ptr + o`, `o < x.len`) only where it is read at its first element (`[0]`, `[0..1]`): the comparison leaves `x.len - o` bytes, at least one. A read further on, a longer slice, or the moved pointer kept or given on is judged, where the comparison cleared every read through it.
