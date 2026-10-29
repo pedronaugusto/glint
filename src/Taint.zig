@@ -1018,8 +1018,32 @@ fn unrefined(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Con
     const proto = tree.fullFnProto(&proto_buffer, tree.nodeData(f.node).node_and_node[0]) orelse return;
     var payload = proto.ast.return_type.unwrap() orelse return;
     if (tree.nodeTag(payload) == .error_union) payload = tree.nodeData(payload).node_and_node[1];
+    // A tuple's numbers are read one by one, each against its field's type; a tuple the parser
+    // holds in a value of its own gives every number it holds.
+    var container_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&container_buffer, payload)) |container| {
+        var elements_buffer: [2]Ast.Node.Index = undefined;
+        const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&elements_buffer, value)) |literal| literal.ast.elements else null;
+        var position: usize = 0;
+        for (container.ast.members) |member| {
+            const field = tree.fullContainerField(member) orelse continue;
+            if (!field.ast.tuple_like) continue;
+            defer position += 1;
+            const declared = field.ast.type_expr.unwrap() orelse continue;
+            if (!try Range.integral(c, f.file, declared)) continue;
+            const given = if (elements) |each| (if (position < each.len) each[position] else continue) else value;
+            if (elements != null and try Range.shown(c, f.file, given, f.file, declared)) continue;
+            try unrefinedBy(c, flow, function, given);
+        }
+        return;
+    }
     // A result that is no number (a checked path, a name, a list) is the parser's refinement.
     if (!try Range.integral(c, f.file, payload) or try Range.shown(c, f.file, value, f.file, payload)) return;
+    try unrefinedBy(c, flow, function, value);
+}
+
+/// A parser's result holds `value`'s input as given.
+fn unrefinedBy(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Context.Error!void {
     const level = concrete(flow, function, try dep(c, flow, function, value));
     const now = flow.functions.items[function].unrefined.join(level);
     if (now != flow.functions.items[function].unrefined) {

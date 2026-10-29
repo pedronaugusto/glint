@@ -1568,6 +1568,38 @@ test "A009 reads a truncation and wrapping arithmetic as the peer's number in a 
     try std.testing.expectEqualSlices(u32, &.{ 5, 8 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a parse's number as refined only where its parser compares it or holds it to 16 bits: never for a wider type than its source, nor a tuple's, nor beside another parser" {
+    // The review's probes: a `u32` returned as `u64`/`usize` or into a `u64` field, a tuple, and
+    // a second parser whose result has no such field.
+    const head =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const E = error{Short};
+        \\
+    ;
+    inline for (.{
+        "fn p(_: void, b: []const u8) E!u64 {\n    if (b.len < 4) return error.Short;\n    return std.mem.readInt(u32, b[0..4], .little);\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const n = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[n];\n}\n",
+        "const W = struct { count: u64 };\nfn p(_: void, b: []const u8) E!W {\n    if (b.len < 4) return error.Short;\n    return .{ .count = std.mem.readInt(u32, b[0..4], .little) };\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const w = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[w.count];\n}\n",
+        "const W = struct { count: u64 };\nfn p(_: void, b: []const u8) E!W {\n    if (b.len < 4) return error.Short;\n    const n: u32 = std.mem.readInt(u32, b[0..4], .little);\n    return .{ .count = n };\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const w = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[w.count];\n}\n",
+        "fn p(_: void, b: []const u8) E!usize {\n    if (b.len < 4) return error.Short;\n    const n: u32 = std.mem.readInt(u32, b[0..4], .little);\n    return n;\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const n = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[n];\n}\n",
+        "fn p(_: void, b: []const u8) E!struct { u32, u32 } {\n    if (b.len < 8) return error.Short;\n    return .{ std.mem.readInt(u32, b[0..4], .little), std.mem.readInt(u32, b[4..8], .little) };\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const t = try aegis.input.Untrusted([]const u8).init(try r.take(8)).parse({}, p);\n    return table[t[0]];\n}\n",
+        "const Inner = struct { n: u32 };\nconst Outer = struct { inner: Inner };\nfn p(_: void, b: []const u8) E!Outer {\n    if (b.len < 4) return error.Short;\n    return .{ .inner = .{ .n = std.mem.readInt(u32, b[0..4], .little) } };\n}\nfn q(_: void, b: []const u8) E!?u32 {\n    if (b.len < 4) return error.Short;\n    return std.mem.readInt(u32, b[0..4], .little);\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const o = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[o.inner.n];\n}\npub fn other(r: *std.Io.Reader) !?u32 {\n    return try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, q);\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // A count checked below its table, two bytes put together into a wide field, a tuple of
+    // bytes: each shown.
+    inline for (.{
+        "const W = struct { count: u32 };\nfn p(_: void, b: []const u8) E!W {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n >= 16) return error.Short;\n    return .{ .count = n };\n}\npub fn f(r: *std.Io.Reader, table: *const [16]u8) !u8 {\n    const w = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, p);\n    return table[w.count];\n}\n",
+        "const W = struct { count: u64 };\nfn p(_: void, b: []const u8) E!W {\n    if (b.len < 2) return error.Short;\n    return .{ .count = @as(u16, b[0]) << 8 | b[1] };\n}\npub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const w = try aegis.input.Untrusted([]const u8).init(try r.take(2)).parse({}, p);\n    var n: usize = w.count;\n    while (n > 0) : (n -= 1) {}\n    return table[0];\n}\n",
+        "fn p(_: void, b: []const u8) E!struct { u32, u32 } {\n    if (b.len < 2) return error.Short;\n    return .{ b[0], b[1] };\n}\npub fn f(r: *std.Io.Reader) !usize {\n    const t = try aegis.input.Untrusted([]const u8).init(try r.take(2)).parse({}, p);\n    var n: usize = t[0];\n    while (n > 0) : (n -= 1) {}\n    return t[1];\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 0) catch |err| {
+        std.debug.print("SAFE<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

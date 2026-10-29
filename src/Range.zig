@@ -147,10 +147,11 @@ pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand
 }
 
 /// Whether a value is shown narrower than the integer type `declared` (in `declared_file`)
-/// gives it, at every pointer width: a comparison, an operation or a narrower source puts its
-/// greatest below the type's own (`return first` of a `u8` into a `u17`, a count checked below
-/// its limit). A `bool` holds no number; a value of the type's whole range, or a type the
-/// reading does not know, shows none.
+/// gives it, at every pointer width: held to 16 bits (a byte, two bytes put together), or put
+/// below the type's greatest by a comparison where it is read (a count checked below its
+/// limit). A wider source is no bound: a `u32` a peer sent fills a `u64` field with a peer's
+/// number. A `bool` holds no number; a value of the type's whole range, or a type the reading
+/// does not know, shows none.
 pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_file: Project.FileId, declared: Ast.Node.Index) Context.Error!bool {
     const types = &c.project.files[declared_file.raw()].tree;
     if (types.nodeTag(declared) == .identifier and std.mem.eql(u8, types.tokenSlice(types.nodeMainToken(declared)), "bool")) return true;
@@ -158,8 +159,30 @@ pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_
         const into = (try named(c, declared_file, declared, pointer)) orelse return false;
         const most = (try bound(c, file, value, pointer, 0)) orelse return false;
         if (most >= into.reach()) return false;
+        if (most <= std.math.maxInt(u16)) continue;
+        if (!try nonnegative(c, file, value, pointer)) return false;
+        const compared = (try upper(c, file, unwrapped(c, file, value), value, pointer, 0)) orelse return false;
+        if (compared >= into.reach()) return false;
     }
     return true;
+}
+
+/// The value a conversion or grouping holds (`@as(u64, n)`, `(n)`), whose comparisons are its.
+fn unwrapped(c: *Context, file: Project.FileId, value: Ast.Node.Index) Ast.Node.Index {
+    const tree = &c.project.files[file.raw()].tree;
+    var at = value;
+    while (true) {
+        switch (tree.nodeTag(at)) {
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .builtin_call_two, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(at));
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, at, &buffer);
+                if (std.mem.eql(u8, name, "@as") and args.len == 2) at = args[1] else if (std.mem.eql(u8, name, "@intCast") and args.len == 1) at = args[0] else return at;
+            },
+            else => return at,
+        }
+    }
 }
 
 /// Whether a type expression names an integer type.

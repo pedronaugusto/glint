@@ -1357,6 +1357,10 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
     var kept: std.ArrayList(Value) = .empty;
     for (choices) |choice| switch (choice) {
         .primitive, .scalar => continue,
+        // An optional or error union has no member a name reads, and an array only its length:
+        // the choice that holds one is another.
+        .optional, .error_union => continue,
+        .array => if (!std.mem.eql(u8, name, "len")) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
         // A type that declares no such member, likewise.
         .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
         .pointer => |to| switch (to.*) {
