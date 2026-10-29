@@ -1,9 +1,9 @@
 //! The fixes a run's findings carry, applied: each a set of edits of one file's bytes that
 //! replaces a raw site with aegis's answer where the answer follows from the site alone
-//! (designs/aegis.md §7). A written reason the family kept beside a site (`// safe: why`,
-//! `// unreachable: why`) becomes the pack's escape, as does the pack's old suppression
-//! (`// glint-ignore: A001 -- design: why`), and an escape that covers nothing goes.
-//! A site whose answer is a design choice carries no fix.
+//! (designs/aegis.md §7). The pack's old suppression (`// glint-ignore: A001 -- design: why`)
+//! becomes its escape naming that rule, an escape in the older form names the rules it covers,
+//! and an escape that covers nothing goes. No fix writes an escape a site did not already have:
+//! a reason is the author's to state. A site whose answer is a design choice carries no fix.
 const std = @import("std");
 const Project = @import("Project.zig");
 const File = @import("File.zig");
@@ -17,32 +17,6 @@ pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Er
     const out = try a.alloc(Report.Edit, fix.len);
     for (fix, out) |e, *o| o.* = .{ .start = e.start, .end = e.end, .text = try a.dupe(u8, e.text), .nests = e.nests };
     return out;
-}
-
-/// The escape a pack finding's line already states in the family's older words: the comment
-/// `// safe: <why>` or `// unreachable: <why>` on the finding's line, or alone on the line
-/// before it, rewritten `// aegis: <reason>: <why>`. The reason follows from the site: a C or
-/// OS declaration or assembly is a boundary, safety switched off a hot loop, anything else
-/// a site where the written reason says the danger is absent.
-pub fn escapeOf(a: std.mem.Allocator, file: *const File, line: u32, rule: []const u8, message: []const u8) std.mem.Allocator.Error![]const Report.Edit {
-    const reason: []const u8 = if (std.mem.eql(u8, rule, "A019") and (std.mem.startsWith(u8, message, "extern") or std.mem.startsWith(u8, message, "inline assembly")))
-        "boundary"
-    else if (std.mem.startsWith(u8, message, "@setRuntimeSafety"))
-        "hot-loop"
-    else
-        "no-danger";
-    for (file.comments) |comment| {
-        const on_line = comment.line == line;
-        const before = comment.line + 1 == line and std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t").len == 0;
-        if (!on_line and !before) continue;
-        const text = file.source[comment.start..comment.end];
-        for ([_][]const u8{ "// safe: ", "// unreachable: " }) |prefix| if (std.mem.startsWith(u8, text, prefix)) {
-            const edits = try a.alloc(Report.Edit, 1);
-            edits[0] = .{ .start = comment.start, .end = comment.start + @as(u32, @intCast(prefix.len)), .text = try a.print("// aegis: {s}: ", .{reason}) };
-            return edits;
-        };
-    }
-    return &.{};
 }
 
 /// Each file a run's fixes change, with its bytes after them: every finding's fix and the
@@ -65,7 +39,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
     }
     for (report.malformed) |entry| {
         const file = &project.files[entry.span.file.raw()];
-        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse continue;
+        const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, file, report, entry.span)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file.raw());
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
@@ -104,10 +78,42 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
     const rest = text[separator + 4 ..];
     const colon = std.mem.findScalar(u8, rest, ':') orelse return null;
     const categories = [_][2][]const u8{ .{ "no-danger", "no-danger" }, .{ "design", "design" }, .{ "measured-boundary", "hot-loop" }, .{ "safe-type-internals", "internal" }, .{ "c-os-boundary", "boundary" } };
+    const rule = std.mem.trim(u8, text["// glint-ignore: ".len..separator], " ");
     for (categories) |category| if (std.mem.eql(u8, std.mem.trim(u8, rest[0..colon], " "), category[0])) {
-        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}:{s}", .{ category[1], rest[colon + 1 ..] }) };
+        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}({s}):{s}", .{ category[1], rule, rest[colon + 1 ..] }) };
     };
     return null;
+}
+
+/// The rules an escape in the older form (`// aegis: <reason>: <why>`) covered on this run,
+/// written into it (`// aegis: <reason>(A009, A010): <why>`). One that covered nothing goes as
+/// a stale escape instead.
+fn unnamedEscape(a: std.mem.Allocator, file: *const File, report: *const Report, span: Report.Span) std.mem.Allocator.Error!?Report.Edit {
+    const text = file.source[span.start..span.end];
+    if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
+    for (report.escapes) |escape| {
+        if (!escape.span.file.eql(span.file) or escape.span.start != span.start) continue;
+        var names: std.ArrayList(u8) = .empty;
+        var seen: std.ArrayList([]const u8) = .empty;
+        for (escape.covered) |covered| {
+            for (seen.items) |earlier_name| {
+                if (std.mem.eql(u8, earlier_name, covered.name)) break;
+            } else try seen.append(a, covered.name);
+        }
+        std.mem.sort([]const u8, seen.items, {}, lessName);
+        for (seen.items, 0..) |name, i| {
+            if (i != 0) try names.appendSlice(a, ", ");
+            try names.appendSlice(a, name);
+        }
+        const reason_end = std.mem.findScalarPos(u8, text, "// aegis:".len, ':') orelse return null;
+        const reason = std.mem.trim(u8, text["// aegis:".len..reason_end], " ");
+        return .{ .start = span.start, .end = span.end, .text = try a.print("// aegis: {s}({s}):{s}", .{ reason, names.items, text[reason_end + 1 ..] }) };
+    }
+    return null;
+}
+
+fn lessName(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.order(u8, x, y) == .lt;
 }
 
 fn earlier(_: void, x: Report.Edit, y: Report.Edit) bool {
@@ -128,15 +134,12 @@ fn removal(file: *const File, start: u32, end: u32) Report.Edit {
     return .{ .start = from, .end = end, .text = "" };
 }
 
-test "an older reason becomes the escape, an unused escape goes, overlapping edits keep the first" {
-    var file = try File.init(std.testing.allocator, "const a = 1; // safe: one byte\n// unreachable: never\nconst b = 2;\nconst c = 3; // aegis: no-danger: stale\n", .{});
+test "the pack's old suppression becomes the escape naming its rule, an unused escape goes" {
+    var file = try File.init(std.testing.allocator, "const a = 1; // glint-ignore: A010 -- design: one byte\nconst c = 3; // aegis: no-danger(A009): stale\n", .{});
     defer file.deinit();
     const a = file.arena.allocator();
-    const first = try escapeOf(a, &file, 0, "A010", "@intCast of input");
-    try std.testing.expectEqualStrings("// aegis: no-danger: ", first[0].text);
-    const second = try escapeOf(a, &file, 2, "A013", "unreachable");
-    try std.testing.expectEqual(@as(usize, 1), second.len); // safe: a fixture count.
-    try std.testing.expectEqualStrings("// unreachable: ", file.source[second[0].start..second[0].end]);
-    const gone = removal(&file, file.comments[2].start, file.comments[2].end);
-    try std.testing.expectEqualStrings(" // aegis: no-danger: stale", file.source[gone.start..gone.end]);
+    const old = (try oldSuppression(a, &file, file.comments[0].start, file.comments[0].end)).?;
+    try std.testing.expectEqualStrings("// aegis: design(A010): one byte", old.text);
+    const gone = removal(&file, file.comments[1].start, file.comments[1].end);
+    try std.testing.expectEqualStrings(" // aegis: no-danger(A009): stale", file.source[gone.start..gone.end]);
 }

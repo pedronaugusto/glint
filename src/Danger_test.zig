@@ -330,7 +330,7 @@ test "A019 finds the unchecked operations, the escape covering one, never an add
         \\    const q: *u8 = @constCast(p);
         \\    const r: *u32 = @ptrCast(@alignCast(q));
         \\    _ = r;
-        \\    const s: *u8 = @ptrFromInt(a); // aegis: boundary: an address the kernel hands back
+        \\    const s: *u8 = @ptrFromInt(a); // aegis: boundary(A019): an address the kernel hands back
         \\    _ = s;
         \\    return @intFromPtr(p);
         \\}
@@ -372,13 +372,13 @@ test "A014 leaves static storage, pointers, copies and undone stores alone" {
 test "the aegis escape covers the pack's findings on its line, is listed with them, and refuses glint-ignore" {
     var project = try sources.projectWithSources(std.testing.allocator,
         \\const std = @import("std");
-        \\// aegis: internal: the counter aegis's own Atomic would wrap; measured in bench/count.zig
+        \\// aegis: internal(A007): the counter aegis's own Atomic would wrap; measured in bench/count.zig
         \\var hits: u32 = 0;
         \\pub fn f(r: *std.Io.Reader) !u4 {
         \\    const b = try r.takeByte();
-        \\    return @intCast(b); // aegis: no-danger: the peer's protocol sends a nibble here
+        \\    return @intCast(b); // aegis: no-danger(A010): the peer's protocol sends a nibble here
         \\}
-        \\pub fn g() void {} // aegis: design: nothing here
+        \\pub fn g() void {} // aegis: design(A010): nothing here
     , &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.shared_state, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
@@ -389,6 +389,27 @@ test "the aegis escape covers the pack's findings on its line, is listed with th
     try std.testing.expectEqualStrings("A007", report.escapes[0].covered[0].name);
     try std.testing.expectEqualStrings("A010", report.escapes[1].covered[0].name);
     try std.testing.expectEqual(@as(usize, 1), report.stale.len); // safe: fixture counts are representable.
+    try std.testing.expect(report.complete);
+    // An escape covers only the rules it names; one naming none still covers its line's pack
+    // findings, but the run that reads it is incomplete.
+    var other = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u4 {
+        \\    const b = try r.takeByte();
+        \\    return @intCast(b); // aegis: no-danger(A009): another rule's
+        \\}
+        \\pub fn g(r: *std.Io.Reader) !u4 {
+        \\    const b = try r.takeByte();
+        \\    return @intCast(b); // aegis: no-danger: every rule's
+        \\}
+    , &std_files, &std_imports);
+    defer other.deinit();
+    var named = try glint.runConfigured(std.testing.allocator, &other, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.untrusted_input, .level = .gate }, .{ .rule = pack.integers, .level = .gate } } }, .{ .project_rules = &pack.rules });
+    defer named.deinit();
+    try std.testing.expectEqual(@as(usize, 1), named.diagnostics.len); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(u32, 4), named.diagnostics[0].span.line);
+    try std.testing.expect(!named.complete);
+    try std.testing.expectEqual(@as(usize, 1), named.malformed.len); // safe: fixture counts are representable.
     var refused = try sources.projectWithSources(std.testing.allocator, "var hits: u32 = 0; // glint-ignore: A007 -- no-danger: one thread\n", &std_files, &std_imports);
     defer refused.deinit();
     var rejected = try glint.runConfigured(std.testing.allocator, &refused, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.shared_state, .level = .gate }} }, .{ .project_rules = &pack.rules });
@@ -705,7 +726,7 @@ test "A009's input is a child's output and a file's contents, aegis's whole-file
         \\    const whole = try aegis.own.readFile(null, dir, name, gpa, .fromRaw(100));
         \\    _ = whole[whole[0]];
         \\    const bytes = try dir.readFileAlloc(null, name, gpa, 100);
-        \\    const mine = try dir.readFileAlloc(null, "receipt", gpa, 100); // aegis: internal: the receipt this program wrote
+        \\    const mine = try dir.readFileAlloc(null, "receipt", gpa, 100); // aegis: internal(A009): the receipt this program wrote
         \\    const out = try std.process.run(gpa, null, .{});
         \\    _ = table[name[0]];
         \\    _ = mine[mine[0]];
@@ -1004,33 +1025,39 @@ test "A013's fix makes std's assert on input aegis's invariant, through a privat
     , alias);
 }
 
-test "the fix makes an older written reason or the old pack suppression the escape, and removes an escape that covers nothing" {
+test "the fix names the rules an older escape covers, makes the old pack suppression the escape, removes an escape that covers nothing, and writes no escape a site did not have" {
     const out = try fixed(pack.unsafe_set,
         \\pub fn f(p: *const u8) *u8 {
         \\    // safe: the caller passes memory it owns
         \\    return @constCast(p);
         \\}
         \\pub fn g() u8 {
-        \\    // aegis: no-danger: nothing here any more
+        \\    // aegis: no-danger(A019): nothing here any more
         \\    return 1; // aegis: design: nor here
         \\}
         \\pub fn h(p: *const u8) *u8 {
         \\    // glint-ignore: A019 -- c-os-boundary: the kernel's handle
         \\    return @constCast(p);
         \\}
+        \\pub fn k(p: *const u8) *u8 {
+        \\    return @constCast(p); // aegis: boundary: the kernel's handle
+        \\}
     );
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(
         \\pub fn f(p: *const u8) *u8 {
-        \\    // aegis: no-danger: the caller passes memory it owns
+        \\    // safe: the caller passes memory it owns
         \\    return @constCast(p);
         \\}
         \\pub fn g() u8 {
         \\    return 1;
         \\}
         \\pub fn h(p: *const u8) *u8 {
-        \\    // aegis: boundary: the kernel's handle
+        \\    // aegis: boundary(A019): the kernel's handle
         \\    return @constCast(p);
+        \\}
+        \\pub fn k(p: *const u8) *u8 {
+        \\    return @constCast(p); // aegis: boundary(A019): the kernel's handle
         \\}
     , out);
 }

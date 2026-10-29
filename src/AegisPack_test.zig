@@ -79,7 +79,7 @@ test "aegis pack accepts adopted gates, takes only the aegis escape and refuses 
     defer refused.deinit();
     try std.testing.expect(!refused.complete);
     try std.testing.expectEqual(@as(usize, 1), refused.malformed.len); // safe: fixture count is representable.
-    var valid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // aegis: internal: a fixture inspecting the representation to test erasure\n");
+    var valid = try fixture("const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; } // aegis: internal(A001): a fixture inspecting the representation to test erasure\n");
     defer valid.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &valid, config, .{ .project_rules = &pack.rules });
     defer report.deinit();

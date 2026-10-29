@@ -92,9 +92,9 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     }
     const mappings = try a.dupe(Import, imports);
     for (mappings, 0..) |*mapping, index| {
-        // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+        // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
         if (mapping.from.raw() >= inputs.len) return error.InvalidMapping; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
-        // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+        // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
         if (mapping.target.raw() >= inputs.len) return error.InvalidMapping; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
         for (mappings[0..index]) |earlier| if (mapping.from.eql(earlier.from) and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
         mapping.spelling = try a.dupe(u8, mapping.spelling);
@@ -112,7 +112,7 @@ pub fn deinit(self: *Project) void {
 
 /// Creates a handle for an existing source.
 pub fn handle(self: *const Project, file: FileId) QueryError!Handle {
-    // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
     if (file.raw() >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     return .{ .file = file, .snapshot = self.identity };
 }
@@ -193,13 +193,13 @@ pub fn comments(self: *const Project, h: Handle) QueryError![]const File.Comment
 }
 /// Validates distinct node identity before converting to std's AST index.
 pub fn node(self: *const Project, h: Handle, id: NodeId) QueryError!std.zig.Ast.Node.Index {
-    // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
     if (id.raw() >= (try self.syntax(h)).nodes.len) return error.InvalidHandle;
     return @fromBackingInt(id.raw());
 }
 /// Validates distinct token identity before crossing the std boundary.
 pub fn token(self: *const Project, h: Handle, id: TokenId) QueryError!std.zig.Ast.TokenIndex {
-    // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
     if (id.raw() >= (try self.syntax(h)).tokens.len) return error.InvalidHandle;
     return id.raw();
 }
@@ -217,7 +217,7 @@ fn nextIdentity() error{SnapshotLimit}!u64 {
 }
 
 fn checkedIndex(self: *const Project, source_handle: Handle) QueryError!usize {
-    // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+    // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
     if (source_handle.snapshot != self.identity or source_handle.file.raw() >= self.files.len) return error.InvalidHandle; // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
     return source_handle.file.raw(); // safe: explicit types represent bounded fixture/source indexes; enum identities belong to validated frozen tables.
 }

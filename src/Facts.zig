@@ -2210,7 +2210,7 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
         made.* = .{};
         entry.value_ptr.* = made;
     }
-    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal: the key is this type's own name.
+    return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal(A019): the key is this type's own name.
 }
 
 /// The member accesses (`x.name`) in the project's selected files that spell `name`, each a

@@ -116,7 +116,7 @@ pub const Coverage = struct {
 /// A suppression that suppressed nothing: the rule it names (`aegis` for an escape) and its
 /// comment's site.
 pub const Stale = struct { name: []const u8, span: Span };
-/// An aegis escape (`// aegis: <reason>: <why>`) at its comment, and the pack's findings on its
+/// An aegis escape (`// aegis: <reason>(<rule>, ...): <why>`) at its comment, and the pack's findings on its
 /// line that it covered.
 pub const Escape = struct { span: Span, reason: []const u8, why: []const u8, covered: []const Covered };
 pub const Covered = struct { name: []const u8, span: Span };

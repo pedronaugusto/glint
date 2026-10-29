@@ -52,7 +52,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     errdefer arena.deinit();
     const a = arena.allocator();
     for (options.files, 0..) |setting, i| {
-        // aegis: no-danger: an identity checked against the length of the table it indexes; the comparison is the bound
+        // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
         if (setting.file.raw() >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file.eql(earlier.file)) return error.InvalidSelection;
     }
@@ -119,6 +119,13 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             const start = suppression.comment.start;
             const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 };
             if (suppression.escape) |reason| {
+                // An escape in the older form covers what any pack rule finds on its line, a
+                // finding added later too: it is read so the fix can name what it covers, and
+                // the run that reads one is incomplete.
+                if (suppression.unnamed) {
+                    runner.complete = false;
+                    try runner.malformed.append(a, .{ .why = "an aegis escape names the rules it covers: `// aegis: <reason>(<rule>, ...): <why>`", .span = span });
+                }
                 if (suppression.used) {
                     try runner.escapes.append(a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
                 } else if (runner.packRan(options.project_rules)) {
@@ -175,20 +182,20 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         .correctness => .correctness,
         .zig_style => .zig_style,
         .family_policy => .family_policy,
-    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else if (metadata.exception == .aegis) try Fix.escapeOf(self.a, file, line, metadata.name, message) else &.{} });
+    }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} });
 }
 
 fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal: this sink is created only from an aligned live Runner.
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal(A019): this sink is created only from an aligned live Runner.
     try runner.emitRelated(rule, start, end, message, related, fix);
 }
 fn sinkConfig(data: *anyopaque, file: Project.FileId) rules.Config {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: no-danger: this sink is created only from an aligned live Runner.
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: no-danger(A019): this sink is created only from an aligned live Runner.
     for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
     return runner.base;
 }
 fn sinkCoverage(data: *anyopaque, coverage: Report.Coverage) Context.Error!void {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal: this sink is created only from an aligned live Runner.
+    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal(A019): this sink is created only from an aligned live Runner.
     var owned = coverage;
     owned.detail = try runner.a.dupe(u8, coverage.detail);
     if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;

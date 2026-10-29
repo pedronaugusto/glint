@@ -1,7 +1,7 @@
 //! The aegis pack's danger rules whose predicates need no flow fact (designs/aegis.md §7): each
 //! finds the sites where a danger exists and aegis's type is the answer, from what the code
 //! resolves to, never from a name it merely spells. A site that stands raw carries the pack's
-//! escape, `// aegis: <reason>: <why>`; one the rule cannot decide is undecided.
+//! escape, `// aegis: <reason>(<rule>, ...): <why>`; one the rule cannot decide is undecided.
 //!
 //! Every rule reads production code only: test inputs and test blocks are not shipped. An
 //! operation the program runs only as it compiles (in a `comptime` block, a function returning
