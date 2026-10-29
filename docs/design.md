@@ -87,7 +87,7 @@ Integer ranges (`Range.zig`) say how large a value of input can be, so a sink as
 
 A field's fact is its declaration's, shared by every value of its type (a table the decoder fills and the encoder builds alike), and a range reads a field by its type alone: counts a parser checked where it opened a file, a decoder's and an encoder's state, and calendar fields are the sizing's remaining noise (aegis's design §7 records the samples).
 
-Fixes: a finding may carry edits of its file. A013 rewrites its sites' `std.debug.assert(c)` as `aegis.assert.invariant(c, "c")`, through a private alias too, and adds the aegis import after std's when the file has none. A pack finding on a line that states its reason the older way (`// safe: why`, `// unreachable: why`, on its line or alone on the line before) gets the escape with that reason: `boundary` for `extern` and `asm`, `hot-loop` for safety switched off, `no-danger` otherwise. The pack's old suppression (`// glint-ignore: A001 -- <category>: <why>`) becomes the escape, its category the reason (`measured-boundary` is `hot-loop`, `safe-type-internals` `internal`, `c-os-boundary` `boundary`). An escape that covers nothing is removed. `Fix.apply` makes each file's bytes; `--fix` writes them. A site whose answer is a design choice (an `unreachable` to become `assert.never` or an error, a conversion whose source width glint does not know) has no fix.
+Fixes: a finding may carry edits of its file. A013 rewrites its sites' `std.debug.assert(c)` as `aegis.assert.invariant(c, "c")`, through a private alias too, and adds the aegis import after std's when the file has none. An escape in the older form (`// aegis: <reason>: <why>`) gets the rules it covered on the run written in (`// aegis: <reason>(A009, A010): <why>`). The pack's old suppression (`// glint-ignore: A001 -- <category>: <why>`) becomes the escape naming its rule, its category the reason (`measured-boundary` is `hot-loop`, `safe-type-internals` `internal`, `c-os-boundary` `boundary`). An escape that covers nothing is removed. No fix writes an escape a site did not have: a `// safe:` or `// unreachable:` comment stays a comment. `Fix.apply` makes each file's bytes; `--fix` writes them; the package's owner reads the diff. A site whose answer is a design choice (an `unreachable` to become `assert.never` or an error, a conversion whose source width glint does not know) has no fix.
 
 ## Build helper and completion
 
@@ -178,13 +178,15 @@ findings acceptance. The library's own files, those its `aegis` root imports, ar
 and full byte capacity, cleanup before free, borrow invalidation on successful reserve, one semantic
 owner/guard and same-execution release remain runtime/caller obligations. Lint is not erasure proof.
 
-The pack has one escape, `// aegis: <reason>: <why>`, on the site's line or the line before. The
-reason is one of five (aegis's design §7): `no-danger` (the danger does not exist there),
-`design` (a design removes the class: name it), `hot-loop` (a measured loop validated once at its
-boundary: name the measurement), `internal` (inside a safe type), `boundary` (a C or OS call, only
-the raw call). The why is not empty. One escape covers every pack finding on its line, and
-`Report.escapes` lists it with each finding it covered, so a review reads what each one hides; one
-that covers nothing is stale. A `glint-ignore` naming a pack rule is malformed. The comment does
+The pack has one escape, `// aegis: <reason>(<rule>, ...): <why>`, on the site's line or the line
+before. The reason is one of five (aegis's design §7): `no-danger` (the danger does not exist
+there), `design` (a design removes the class: name it), `hot-loop` (a measured loop validated once
+at its boundary: name the measurement), `internal` (inside a safe type), `boundary` (a C or OS
+call, only the raw call). The rules are the pack rules it covers, at least one; the why is not
+empty. An escape covers the findings of the rules it names on its line, and `Report.escapes` lists
+it with each finding it covered, so a review reads what each one hides; one that covers nothing is
+stale. An escape in the older form, naming no rules, covers every pack finding on its line and is
+reported malformed: the run is incomplete until the fix names its rules. A `glint-ignore` naming a pack rule is malformed. The comment does
 not prove its reason. It cannot erase undecided coverage or certify incomplete execution.
 
 These are explicitly adopted operation checks. Gate selection does not claim general security, flow or lifetime proof, and generic defaults remain unchanged.
