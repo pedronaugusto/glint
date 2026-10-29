@@ -19,8 +19,6 @@ const Ast = std.zig.Ast;
 pub fn input(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, .input);
     const tree = &c.project.files[c.file.raw()].tree;
-    // A read the program declares its own is listed at its escape, which is the declaration.
-    for (try Taint.ownedIn(c.allocator, flow, c.file)) |token| try c.at(rule, token, "a read the program declares its own by its escape: no input starts here");
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!site(c, node)) continue;

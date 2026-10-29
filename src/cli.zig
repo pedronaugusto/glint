@@ -205,7 +205,7 @@ pub const Arguments = struct {
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
             .package = .{ .value_name = "NAME=DIR", .section = "Inputs", .help = "The package whose files a directory holds, repeated" },
-            .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check, one a line, repeated" },
+            .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
         },
         .conflicts = &.{&.{ .only, .reviewed, .family, .config }},
@@ -240,25 +240,28 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     for (arguments.package) |mapping| try result.packages.append(a, named(mapping) orelse return error.InvalidPackage);
     try result.files.appendSlice(a, arguments.files);
     for (arguments.files_from) |from| {
-        // The list is the caller's selection of files, its command line written to a file: as
-        // trusted as the positional files, never the checked repository's content.
-        const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024)); // aegis: no-danger(A009): the caller's own list of the files to check.
-        const list = try fileList(a, read);
-        try result.files.appendSlice(a, list.paths);
+        const read = try aegis.own.readFile(io, std.Io.Dir.cwd(), from, a, .fromRaw(4 * 1024 * 1024));
+        // A list is a file, which may be what a repository holds: its paths are parsed into
+        // ones under the directory glint runs in before any is opened.
+        try result.files.appendSlice(a, try aegis.input.Untrusted([]const u8).init(read).parse(a, fileList));
     }
     return result;
 }
 
-/// The files a `--files-from` list names, one a line, blank lines aside.
-const FileList = struct { paths: []const []const u8 };
-fn fileList(a: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!FileList {
+/// The files a `--files-from` list names, one a line, blank lines aside: each a relative path
+/// with no `..` part, so a file under the directory glint runs in.
+fn fileList(a: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory, FileListPathOutside }![]const []const u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         const path = std.mem.trim(u8, line, "\r");
-        if (path.len > 0) try paths.append(a, path);
+        if (path.len == 0) continue;
+        if (std.Io.Dir.path.isAbsolute(path)) return error.FileListPathOutside;
+        var parts = std.mem.tokenizeAny(u8, path, "/\\");
+        while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.FileListPathOutside;
+        try paths.append(a, path);
     }
-    return .{ .paths = paths.items };
+    return paths.items;
 }
 
 /// `NAME=VALUE`, neither empty.

@@ -6,9 +6,9 @@
 //! caller's buffer (a peer's socket, a child's pipe, stdin, a file, an archive's or a
 //! repository's content through the readers over them), what `Io.File` and `Io.Dir` read of a
 //! file's contents, and the output `process.run` collects from a child. A reader `Reader.fixed`
-//! makes over the program's own bytes carries their fact instead, and a read on a line carrying
-//! an aegis escape is one the program declares its own (a file it wrote itself): no input
-//! starts there, and the escape lists it. Arguments and the environment are the operator's,
+//! makes over the program's own bytes carries their fact instead. An escape never makes a read
+//! the program's own: it covers the findings its rules have on its line, and what the read
+//! gives is input wherever it goes. Arguments and the environment are the operator's,
 //! not a peer's, and what a file or directory handle answers of itself (a `stat`, the names a
 //! directory lists) the system's. A peer writer is one a `net.Stream` gives.
 //!
@@ -43,7 +43,6 @@ const Range = @import("Range.zig");
 const Project = @import("Project.zig");
 const Governed = @import("Governed.zig");
 const Contract = @import("AegisContract.zig");
-const Suppression = @import("Suppression.zig");
 const Ast = std.zig.Ast;
 
 /// How far a value is input's, each level holding the ones below it: clean; unknown, through a
@@ -98,8 +97,6 @@ pub const Dep = struct {
 
 pub const Fact = enum { input, peer };
 
-pub const Owned = struct { file: Project.FileId, token: Ast.TokenIndex };
-
 const Function = struct {
     file: Project.FileId,
     node: Ast.Node.Index,
@@ -143,10 +140,6 @@ pub const Flow = struct {
     /// Functions whose result is what they read: std's `process.run`, which holds a child's output,
     /// and aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`.
     reads: std.ArrayList(Facts.Decl) = .empty,
-    /// Reads the program declares its own by an escape on their line, as file and token.
-    owned: std.array_hash_map.Auto(Owned, void) = .empty,
-    /// Per file, the lines an aegis escape stands on.
-    escaped: std.AutoHashMapUnmanaged(u32, []const u32) = .empty,
     changed: bool = false,
 };
 
@@ -530,7 +523,7 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
             }
         },
         .source => {
-            if (try fixedClean(c, flow, function, call) or try declaredOwn(c, flow, f.file, call)) return;
+            if (try fixedClean(c, flow, function, call)) return;
             const buffers = try bufferParams(c, callee.decl.?);
             for (callee.args.items, 0..) |arg, position| if (buffers & bit(position) != 0) try fill(c, flow, function, arg);
         },
@@ -610,27 +603,6 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!u64 {
         };
     }
     return out;
-}
-
-/// Whether a read stands on a line an aegis escape covers: the program declares the bytes its
-/// own (a file it wrote itself), so the read starts no input, and A009 lists it at the escape.
-fn declaredOwn(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!bool {
-    if (flow.fact != .input) return false;
-    const source_file = &c.project.files[file.raw()];
-    const lines = flow.escaped.get(file.raw()) orelse lines: {
-        var malformed: std.ArrayList(Suppression.Malformed) = .empty;
-        var found: std.ArrayList(u32) = .empty;
-        for (try Suppression.parseConfigured(c.allocator, source_file, c.definitions, &malformed)) |suppression| {
-            if (suppression.escape != null) try found.append(c.allocator, suppression.line);
-        }
-        try flow.escaped.put(c.allocator, file.raw(), found.items);
-        break :lines found.items;
-    };
-    const token = source_file.tree.nodeMainToken(call.ast.fn_expr);
-    const line = source_file.line(source_file.tree.tokenStart(token));
-    if (std.mem.findScalar(u32, lines, line) == null) return false;
-    try flow.owned.put(c.allocator, .{ .file = file, .token = token }, {});
-    return true;
 }
 
 /// A read fills `arg`'s memory with the fact: the local it is rooted at, or the parameter's
@@ -1111,7 +1083,7 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
             return out;
         },
         .source => {
-            if (try fixedClean(c, flow, function, call) or try declaredOwn(c, flow, f.file, call)) return .{};
+            if (try fixedClean(c, flow, function, call)) return .{};
             const decl = callee.decl.?;
             // A read into the caller's buffer returns how much it read: a count the buffer bounds.
             if (try bufferParams(c, decl) != 0 and returnsCount(c, decl)) return .{};
@@ -1248,13 +1220,6 @@ pub fn readerType(flow: *const Flow) ?Facts.Container {
 }
 pub fn directoryType(flow: *const Flow) ?Facts.Container {
     return flow.dir;
-}
-
-/// The reads in `file` the program declares its own, by their callee's token.
-pub fn ownedIn(a: std.mem.Allocator, flow: *const Flow, file: Project.FileId) error{OutOfMemory}![]const Ast.TokenIndex {
-    var out: std.ArrayList(Ast.TokenIndex) = .empty;
-    for (flow.owned.keys()) |read| if (read.file.eql(file)) try out.append(a, read.token);
-    return out.items;
 }
 
 /// Where input that reaches a node was read: a read call the program makes, and, where the read

@@ -719,7 +719,7 @@ test "A009 finds input that indexes or slices input, names a path, and a number 
     try expect(pack.untrusted_input, input_program, 6);
 }
 
-test "A009's input is a child's output and a file's contents, aegis's whole-file read's too, never the path or allocator a read is given, nor a read the program declares its own" {
+test "A009's input is a child's output and a file's contents, aegis's whole-file read's too, never the path or allocator a read is given; an escape on a read's line makes it no less input" {
     const program =
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -735,14 +735,48 @@ test "A009's input is a child's output and a file's contents, aegis's whole-file
         \\    return out.stdout[out.stdout[0]];
         \\}
     ;
-    try expect(pack.untrusted_input, program, 3);
+    try expect(pack.untrusted_input, program, 4);
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(@as(usize, 1), report.escapes.len); // safe: fixture counts are representable.
-    try std.testing.expectEqualStrings("A009", report.escapes[0].covered[0].name);
-    try std.testing.expectEqual(@as(usize, 0), report.stale.len); // safe: fixture counts are representable.
+    // The escape covers nothing on its own line: it is stale, and the use below is a finding.
+    try std.testing.expectEqual(@as(usize, 0), report.escapes.len); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 1), report.stale.len); // safe: fixture counts are representable.
+}
+
+test "every flow rule reads what an escaped read gives as input in each function it reaches" {
+    // The review's probe: one escape on a peer's read, and the index, the conversion, the
+    // allocation and the loop it feeds in other functions.
+    const program =
+        \\const std = @import("std");
+        \\fn header(r: *std.Io.Reader) !u32 {
+        \\    return r.takeInt(u32, .little); // aegis: no-danger(A009): probe
+        \\}
+        \\pub fn index(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const n: usize = try header(r);
+        \\    return table[n];
+        \\}
+        \\pub fn cast(r: *std.Io.Reader) !u8 {
+        \\    return @intCast(try header(r));
+        \\}
+        \\pub fn alloc(r: *std.Io.Reader, gpa: std.mem.Allocator) ![]u8 {
+        \\    return gpa.alloc(u8, try header(r));
+        \\}
+        \\pub fn spin(r: *std.Io.Reader) !u64 {
+        \\    var t: u64 = 0;
+        \\    var i: u32 = 0;
+        \\    const n = try header(r);
+        \\    while (i < n) : (i += 1) t +%= i;
+        \\    return t;
+        \\}
+    ;
+    const indexed = try run(pack.untrusted_input, program);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 19 }, indexed.lines[0..indexed.findings]);
+    const converted = try run(pack.integers, program);
+    try std.testing.expectEqualSlices(u32, &.{10}, converted.lines[0..converted.findings]);
+    const allocated = try run(pack.bounded_work, program);
+    try std.testing.expectEqualSlices(u32, &.{13}, allocated.lines[0..allocated.findings]);
 }
 
 test "positions std finds in input, a read's count and a value under a clean bound are clean; a number assembled by hand is a number, and a 16-bit decode is data" {

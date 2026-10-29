@@ -106,6 +106,20 @@ test "completion unread required import is a traversal failure" {
     try expectOutcome(&tmp, "traversal_failure");
 }
 
+test "a --files-from list names files under the directory glint runs in: an absolute path or a `..` part is refused before anything opens" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    for ([_][]const u8{ "/etc/hosts\n", "src/../../outside.zig\n", "ok.zig\n..\\up.zig\n" }) |listed| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "list.txt", .data = listed });
+        const list = try resultPath(a, &tmp, "list.txt");
+        defer a.free(list);
+        try std.testing.expectError(error.FileListPathOutside, cli.execute(a, std.testing.io, &.{ "glint", "--files-from", list }, &output.writer, &quiet.writer));
+    }
+}
+
 test "completion canceled input publishes failure and cannot inherit old success" {
     const shakedown = @import("shakedown");
     const a = std.testing.allocator;
