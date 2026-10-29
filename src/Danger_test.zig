@@ -611,7 +611,7 @@ test "A017 finds an enum state written in two functions and switched on" {
     , 1);
 }
 
-test "A017 leaves a kind set where its value is built, and records an algorithm rewrites" {
+test "A017 leaves a kind set where its value is built, and finds a state each record a loop walks is moved through" {
     // A table's layout, set by whichever builder made it.
     try expect(pack.state_machines,
         \\const Kind = enum { single, double };
@@ -623,14 +623,15 @@ test "A017 leaves a kind set where its value is built, and records an algorithm 
         \\};
         \\pub fn run(t: *Table, wide: bool) u8 { if (wide) t.buildDouble() else t.buildSingle(); return t.width(); }
     , 0);
-    // Classes the rules refine on their own value, record by record, from outside the record.
+    // Classes rules refine on their own value, record by record, from outside the record: each
+    // record's state moved by hand, which nothing here tells from a connection's.
     try expect(pack.state_machines,
         \\const Class = enum { mark, letter, number, neutral };
         \\const Slot = struct { class: Class };
         \\fn marks(slots: []Slot, before: Class) void { for (slots) |*s| if (s.class == .mark) { s.class = before; }; }
         \\fn numbers(slots: []Slot) void { var p: ?usize = 0; while (p) |at| : (p = if (at + 1 < slots.len) at + 1 else null) { const s = &slots[at]; switch (s.class) { .number => s.class = .neutral, else => {} } } }
         \\pub fn run(slots: []Slot) usize { marks(slots, .letter); numbers(slots); var n: usize = 0; for (slots) |s| switch (s.class) { .letter => n += 1, else => {} }; return n; }
-    , 0);
+    , 1);
 }
 
 test "A021 finds a second lock taken while a guard is held, unless both are ranked by Order" {
@@ -666,7 +667,7 @@ test "A021 finds a second lock taken while a guard is held, unless both are rank
     , 1);
 }
 
-test "A019 finds a local read while still undefined, and leaves written, filled and branch-written ones, an array's length and a field written by name" {
+test "A019 finds a local read while still undefined, one written on some paths only among them, and leaves written, filled and branch-written ones, an array's length and a field written by name" {
     try expect(pack.unsafe_set,
         \\fn fill(b: []u8) void { b[0] = 1; }
         \\pub fn bad() u8 { var x: u8 = undefined; const y = x + 1; x = 2; return y; }
@@ -691,7 +692,13 @@ test "A019 finds a local read while still undefined, and leaves written, filled 
         \\    return .{ eax, ebx };
         \\}
         \\pub fn tied() u32 { var v: u32 = undefined; asm volatile ("" : [_] "=r" (v) : [_] "r" (v)); return v; }
-    , 6); // 3 reads, `tied`'s input read before its output is written, and each `asm` itself
+    , 7); // 4 reads (`some`'s when `c` is false), `tied`'s input read before its output is written, and each `asm` itself
+    // Every branch that reaches the read writes it, the others leave; a range of literals runs.
+    try expect(pack.unsafe_set,
+        \\pub fn left(c: bool) u8 { var x: u8 = undefined; if (c) { x = 1; } else return 0; return x; }
+        \\pub fn ranged() u8 { var b: [2]u8 = undefined; for (0..2) |i| b[i] = 1; return b[0]; }
+        \\pub fn loopLeft(n: usize) u8 { var x: u8 = undefined; for (0..n) |_| { x = 1; } return x; }
+    , 1);
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {
@@ -4364,4 +4371,30 @@ test "A013 reads std's assert called through any alias the program declares, pub
         \\}
     );
     try std.testing.expectEqual(@as(usize, 1), result.undecided);
+}
+
+test "A015 reads a capture as a view only where what it binds is one" {
+    // A file a call opened, unwrapped by a capture and returned, is an owner handed over.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\pub fn open(dir: std.Io.Dir, io: std.Io) ?std.Io.File {
+        \\    if (dir.openFile(io, "a", .{})) |f| return f else |_| return null;
+        \\}
+    , 1);
+}
+
+test "A021 holds a guard until a release of its own block runs, and one bound by no declaration to the block's end" {
+    const head =
+        \\const aegis = @import("aegis");
+        \\const A = aegis.Guarded(u32);
+        \\
+    ;
+    inline for (.{
+        "pub fn f(a: *A, b: *A, c: bool) void {\n    var g = a.acquire();\n    if (c) g.deinit();\n    var h = b.acquire();\n    h.deinit();\n}\n",
+        "pub fn f(a: *A, b: *A) void {\n    a.acquire().data.* += 1;\n    var h = b.acquire();\n    h.deinit();\n}\n",
+    }) |body| expect(pack.lock_order, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    try expect(pack.lock_order, head ++ "pub fn f(a: *A, b: *A) void {\n    var g = a.acquire();\n    g.deinit();\n    var h = b.acquire();\n    h.deinit();\n}\n", 0);
 }

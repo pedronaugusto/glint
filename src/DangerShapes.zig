@@ -37,7 +37,7 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         };
         const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         const which = find(resources, held) orelse continue;
-        if (decl.kind == .field and !released(tree, decl.name)) continue;
+        if (decl.kind == .field and !releasedAnywhere(c, decl.name)) continue;
         if (decl.kind == .function and try views(c, resources, decl)) continue;
         if (decl.kind == .function) {
             if (vtable == null) vtable = (try containersOf(c, rule, &.{"Io.VTable"}))[0];
@@ -140,7 +140,13 @@ fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index,
             const reference = model.reference(node) orelse return false;
             const d = reference.declaration orelse return false;
             const record = model.declarations[d];
-            if (record.kind == .parameter or record.kind == .capture) return true;
+            if (record.kind == .parameter) return true;
+            // A capture holds what it binds: a view where that is one (an owner a call made,
+            // unwrapped, is handed over).
+            if (record.kind == .capture) {
+                const bound: ?Ast.Node.Index = if (tree.fullIf(record.node)) |branch| branch.ast.cond_expr else if (tree.fullWhile(record.node)) |loop| loop.ast.cond_expr else if (tree.fullFor(record.node)) |loop| (if (loop.ast.inputs.len == 1) loop.ast.inputs[0] else null) else null;
+                return viewed(c, resources, bound orelse return false, next);
+            }
             if (record.kind != .variable) return false;
             const variable = tree.fullVarDecl(record.node) orelse return false;
             if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
@@ -190,6 +196,15 @@ fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index,
     }
 }
 
+/// Whether any of the program's files releases a field named `name`: wherever the owner is
+/// released, the field holds one.
+fn releasedAnywhere(c: *Context, name: []const u8) bool {
+    for (c.project.inputs, 0..) |input, f| {
+        if (input.selected and released(&c.project.files[f].tree, name)) return true;
+    }
+    return false;
+}
+
 /// Whether the file releases the field `name`: `x.name.close(`, `deinit(`, `kill(` or `wait(`,
 /// through an optional's `.?` too, or through a capture of it (`if (x.name) |f| f.close(`).
 /// A local of the same name is not the field.
@@ -222,15 +237,18 @@ fn release(method: []const u8) bool {
 /// `BlockingGuarded`, `RwGuarded`, `SpinRwGuarded`, `Order.Ordered`) while it acquires another:
 /// two tasks that take two locks in two orders deadlock. The site is the second acquisition,
 /// unless both are ranked (`acquireOrdered`, `readOrdered`, `writeOrdered`, their forms), which
-/// `Order` checks in Debug. A guard is held from its acquisition to its `deinit` or `release`, or
-/// to its block's end when that is deferred. One function's own acquisitions only: a call made
-/// while holding a guard is not followed.
+/// `Order` checks in Debug. A guard is held from its acquisition to a `deinit` or `release` of it
+/// that is a statement of its own block (one under a branch may not run), or to the block's end
+/// when that is deferred, or when the guard is bound by no declaration of its own. An acquisition
+/// on a receiver that does not resolve is undecided in a function that takes a guard. One
+/// function's own acquisitions only: a call made while holding a guard is not followed.
 pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
     const Held = struct { first: Ast.TokenIndex, last: Ast.TokenIndex, ranked: bool };
     var held: std.ArrayList(Held) = .empty;
     var acquisitions: std.ArrayList(struct { node: Ast.Node.Index, ranked: bool }) = .empty;
+    var unresolved: std.ArrayList(struct { node: Ast.Node.Index, why: Facts.Unknown }) = .empty;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
@@ -241,19 +259,33 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
         var acquires = false;
         for ([_][]const u8{ "acquire", "read", "write", "tryAcquire", "tryRead", "tryWrite" }) |prefix| acquires = acquires or std.mem.startsWith(u8, method, prefix);
         if (!acquires or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
-        if (try c.role(Contract.library, try c.facts.resolve(c.file, receiver)) != .guarded) continue;
+        const owner = try c.facts.resolve(c.file, receiver);
+        if (owner == .unknown) {
+            try unresolved.append(c.allocator, .{ .node = node, .why = owner.unknown });
+            continue;
+        }
+        if (try c.role(Contract.library, owner) != .guarded) continue;
         const ranked = std.mem.find(u8, method, "Ordered") != null;
         try acquisitions.append(c.allocator, .{ .node = node, .ranked = ranked });
         // The guard's local, and how long it is held.
         const parent = model.node_parents[@backingInt(node)] orelse continue; // safe: a node index indexes its own tree's parent table.
         var at = parent;
         while (tree.nodeTag(at) == .@"try" or tree.nodeTag(at) == .@"catch" or tree.nodeTag(at) == .grouped_expression) at = model.node_parents[@backingInt(at)] orelse break; // safe: a node index indexes its own tree's parent table.
-        const variable = tree.fullVarDecl(at) orelse continue;
-        const name = tree.tokenSlice(variable.ast.mut_token + 1);
         const block = enclosingBlock(tree, model, at) orelse continue;
-        const end = releaseOf(tree, name, tree.lastToken(at), tree.lastToken(block));
+        const variable = tree.fullVarDecl(at) orelse {
+            try held.append(c.allocator, .{ .first = tree.lastToken(node), .last = tree.lastToken(block), .ranked = ranked });
+            continue;
+        };
+        const name = tree.tokenSlice(variable.ast.mut_token + 1);
+        const end = releaseOf(tree, block, at, name);
         try held.append(c.allocator, .{ .first = tree.lastToken(at), .last = end, .ranked = ranked });
     }
+    // What does not resolve may be a guard where the function takes one.
+    for (unresolved.items) |each| for (acquisitions.items) |known| {
+        if (enclosingFunction(model, tree, known.node) != enclosingFunction(model, tree, each.node)) continue;
+        try c.unknown(rule, each.node, each.why);
+        break;
+    };
     for (acquisitions.items) |second| {
         const token = tree.nodeMainToken(second.node);
         for (held.items) |first| {
@@ -278,21 +310,23 @@ fn enclosingBlock(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?
     return null;
 }
 
-/// Where a guard named `name` is released after `from`: its `deinit(` or `release(` called
-/// outside a `defer`, or the block's end.
-fn releaseOf(tree: *const Ast, name: []const u8, from: Ast.TokenIndex, block_end: Ast.TokenIndex) Ast.TokenIndex {
-    const tags = tree.tokens.items(.tag);
-    var i: usize = from + 1;
-    while (i + 2 < block_end) : (i += 1) {
-        if (tags[i] != .identifier or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue;
-        if (tags[i + 1] != .period or tags[i + 2] != .identifier) continue;
-        const method = tree.tokenSlice(@intCast(i + 2));
-        if (!std.mem.eql(u8, method, "deinit") and !std.mem.eql(u8, method, "release")) continue;
-        // A deferred release runs at the block's end.
-        if (i >= 1 and (tags[i - 1] == .keyword_defer or tags[i - 1] == .keyword_errdefer)) return block_end;
-        return @intCast(i);
+/// Where a guard named `name`, declared by the statement `declared` of `block`, is released: the
+/// first later statement of the block that is its `deinit(` or `release(` call, or the block's
+/// end (a deferred release runs there, and one under a branch may not run at all).
+fn releaseOf(tree: *const Ast, block: Ast.Node.Index, declared: Ast.Node.Index, name: []const u8) Ast.TokenIndex {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return tree.lastToken(block);
+    const start = std.mem.findScalar(Ast.Node.Index, statements, declared) orelse return tree.lastToken(block);
+    for (statements[start + 1 ..]) |statement| {
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, statement) orelse continue;
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (tree.nodeTag(receiver) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(receiver)), name)) continue;
+        const spelled = tree.tokenSlice(method);
+        if (std.mem.eql(u8, spelled, "deinit") or std.mem.eql(u8, spelled, "release")) return tree.firstToken(statement);
     }
-    return block_end;
+    return tree.lastToken(block);
 }
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
@@ -380,9 +414,8 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// a state machine kept by hand, where nothing says which transitions are allowed. A move is a
 /// write under a switch or a condition on the field (`switch (f.state) { .start => f.state =
 /// .value, ... }`), there or where the function that writes it is called. A kind set where its
-/// value is built or read (a table's layout, a date's kind) is data, and so is a field rewritten
-/// on the records a loop walks (`for (slots) |*s|`, `&slots[at]` with `at` the loop's): an
-/// algorithm refining each record (bidi's classes), not one object moving through states.
+/// value is built or read (a table's layout, a date's kind) is data. A field moved on the records
+/// a loop walks is moved on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
@@ -418,14 +451,12 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether one of `writes` is a move: made on one object, not on the records a loop walks, under
-/// a switch or a condition on the field (one of `uses`), or in a function a call under one makes.
+/// Whether one of `writes` is a move: under a switch or a condition on the field (one of `uses`),
+/// or in a function a call under one makes.
 fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Context.Error!bool {
     for (writes) |write| {
         const tree = &c.project.files[write.file.raw()].tree;
         const model = &c.project.models[write.file.raw()];
-        const receiver = tree.nodeData(tree.nodeData(write.node).node_and_node[0]).node_and_token[0];
-        if (walked(tree, model, receiver)) continue;
         const function = enclosingFunction(model, tree, write.node) orelse continue;
         if (conditioned(tree, model, uses, write.file, write.node, function)) return true;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -442,33 +473,6 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Contex
         }
     }
     return false;
-}
-
-/// Whether a write's receiver is a record a loop walks: the loop's element capture, an element
-/// indexed by a loop's capture, or a local made from one (`const s = &slots[at];`).
-fn walked(tree: *const Ast, model: *const Model, receiver: Ast.Node.Index) bool {
-    switch (tree.nodeTag(receiver)) {
-        .array_access => return loopCapture(tree, model, tree.nodeData(receiver).node_and_node[1]),
-        .address_of => return walked(tree, model, tree.nodeData(receiver).node),
-        .grouped_expression => return walked(tree, model, tree.nodeData(receiver).node_and_token[0]),
-        .identifier => {},
-        else => return false,
-    }
-    if (loopCapture(tree, model, receiver)) return true;
-    const reference = model.reference(receiver) orelse return false;
-    const d = reference.declaration orelse return false;
-    if (model.declarations[d].kind != .variable) return false;
-    const local = tree.fullVarDecl(model.declarations[d].node) orelse return false;
-    return walked(tree, model, local.ast.init_node.unwrap() orelse return false);
-}
-
-/// Whether `node` names a capture of a `for` or `while` loop.
-fn loopCapture(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const reference = model.reference(node) orelse return false;
-    const d = reference.declaration orelse return false;
-    const owner = model.declarations[d].node;
-    return model.declarations[d].kind == .capture and (tree.fullFor(owner) != null or tree.fullWhile(owner) != null);
 }
 
 /// Whether `node` sits in a branch a switch or an `if`/`while` on one of `uses` selects, within
@@ -642,8 +646,10 @@ fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index)
 /// path to the read writes it. A write is an assignment to it or into it, its address taken or
 /// a part of it sliced (what a call fills through the pointer it is given is that call's
 /// contract), a method called on it, or an `asm` output bound to it (`"={eax}" (eax)`), written
-/// once the `asm` has read its inputs; a path through a loop or a branch that writes it on some
-/// paths only ends the walk, never a guess.
+/// once the `asm` has read its inputs. A branch that writes it on some paths only, and a loop
+/// that may run no pass, leave it unwritten for what follows; a branch that leaves (`return`,
+/// `break`, `continue`, `unreachable`) reaches nothing after it, and a `for` over a range of
+/// literals runs at least once.
 pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
@@ -665,7 +671,9 @@ pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-const State = enum { unwritten, written, done };
+/// Where the walk stands: the local unwritten, written, a read found (`done`), or the path left
+/// before what follows (`left`).
+const State = enum { unwritten, written, done, left };
 
 const Walk = struct {
     c: *Context,
@@ -708,6 +716,14 @@ const Walk = struct {
     /// The state past `node`, reading it in the order Zig evaluates it.
     fn statement(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!State {
         const tree = w.tree;
+        // A path that leaves reads what it leaves with first.
+        switch (tree.nodeTag(node)) {
+            .@"return", .@"break", .@"continue", .unreachable_literal => {
+                const past = if (w.mentioned(node)) try w.simple(node) else state;
+                return if (past == .done) .done else .left;
+            },
+            else => {},
+        }
         if (!w.mentioned(node)) return state;
         switch (tree.nodeTag(node)) {
             .@"defer", .@"errdefer" => return state,
@@ -738,14 +754,20 @@ const Walk = struct {
         if (tree.fullWhile(node)) |loop| {
             const after = try w.statement(loop.ast.cond_expr, state);
             if (after != .unwritten) return after;
-            // The body runs first with the local unwritten; what it leaves holds on some paths only.
+            // The body runs first with the local unwritten; a loop may run no pass, so what it
+            // writes holds on some paths only.
             const body = try w.statement(loop.ast.then_expr, after);
-            return if (body == .unwritten) after else .done;
+            return if (body == .done) .done else after;
         }
         if (tree.fullFor(node)) |loop| {
-            for (loop.ast.inputs) |input| if (try w.statement(input, state) != .unwritten) return .done;
+            for (loop.ast.inputs) |input| {
+                const past = try w.statement(input, state);
+                if (past != .unwritten) return past;
+            }
             const body = try w.statement(loop.ast.then_expr, state);
-            return if (body == .unwritten) state else .done;
+            if (body == .done) return .done;
+            // A range of literals with passes in it runs the body, and its first pass is as read.
+            return if (body == .written and passes(tree, loop.ast.inputs[0])) .written else state;
         }
         return w.simple(node);
     }
@@ -862,10 +884,29 @@ const Walk = struct {
 
 fn merge(a: State, b: State) State {
     if (a == .done or b == .done) return .done;
+    // A path that left reaches nothing after the branch.
+    if (a == .left) return b;
+    if (b == .left) return a;
     if (a == .written and b == .written) return .written;
-    if (a == .unwritten and b == .unwritten) return .unwritten;
-    // Written on some paths only: what follows is not read with a guess.
-    return .done;
+    // Written on some paths only: a read that follows may read it undefined.
+    return .unwritten;
+}
+
+/// Whether a `for` input is a range of literals with a pass in it (`0..2`).
+fn passes(tree: *const Ast, input: Ast.Node.Index) bool {
+    if (tree.nodeTag(input) != .for_range) return false;
+    const start, const end = tree.nodeData(input).node_and_opt_node;
+    const from = literalValue(tree, start) orelse return false;
+    const to = literalValue(tree, end.unwrap() orelse return false) orelse return false;
+    return to > from;
+}
+
+fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
+    if (tree.nodeTag(node) != .number_literal) return null;
+    return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+        .int => |value| value,
+        else => null,
+    };
 }
 
 /// The containers std's `paths` name (a namespace's file, a type), each resolved once.

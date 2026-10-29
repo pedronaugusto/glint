@@ -2465,7 +2465,7 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     // The parts come from the outside in; the eight nearest the declaration are kept.
-    var ring: [8][]const u8 = undefined;
+    var ring: [8][]const u8 = @splat("");
     var count: usize = 0;
     var exposed = false;
     // Whether a pointer is followed past the declaration's own step.

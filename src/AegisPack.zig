@@ -2299,7 +2299,7 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
     // The declaration's node is its prototype, or the whole declaration; its body is the latter's.
     const whole = if (written.nodeTag(record.node) == .fn_decl) record.node else c.project.models[function.file.raw()].node_parents[@backingInt(record.node)] orelse return false; // safe: an AST node index reads its own parent table
     if (written.nodeTag(whole) != .fn_decl) return false;
-    var params: [32]Ast.TokenIndex = undefined;
+    var params: [32]Ast.TokenIndex = @splat(0);
     var count: usize = 0;
     var it = proto.iterate(written);
     while (it.next()) |param| {

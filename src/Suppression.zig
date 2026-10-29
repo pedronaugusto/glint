@@ -68,7 +68,8 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
     const raw = std.mem.trim(u8, file.source[comment.start + 2 .. comment.end], " \t\r");
     var rule: ?rules.Rule = null;
     var escape: ?Reason = null;
-    var covers: [max_covered]rules.Rule = undefined;
+    // Copied whole into what is found, past what it names too: every entry holds a rule.
+    var covers: [max_covered]rules.Rule = @splat(.Z001);
     var covers_len: u8 = 0;
     var unnamed = false;
     var reason: []const u8 = undefined;

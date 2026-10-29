@@ -2565,7 +2565,7 @@ fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Nod
     const model = &self.project.models[decl.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&fn_buffer, model.declarations[decl.index].node) orelse return null;
-    var params: [64]Ast.TokenIndex = undefined;
+    var params: [64]Ast.TokenIndex = @splat(0);
     var count: usize = 0;
     var it = proto.iterate(tree);
     while (it.next()) |param| {
