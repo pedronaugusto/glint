@@ -2118,7 +2118,7 @@ const Flow = struct {
         var heard: Heard = .{ .outer = f.c.sink };
         var probe = f.c.*;
         probe.file = function.file;
-        probe.sink = heard.sink();
+        probe.sink = &heard.sink;
         const body = written.nodeData(whole_fn).node_and_node[1];
         var seen: Exits = .{};
         const walker: Flow = .{ .c = &probe, .tree = written, .model = model, .token = token orelse return null, .kind = f.kind, .scope = body, .known = known, .depth = f.depth + 1, .pointer = true, .exits = &seen };
@@ -2237,21 +2237,19 @@ const Flow = struct {
 const Heard = struct {
     any: bool = false,
     /// The run's own sink, which knows each file's configuration.
-    outer: Context.Sink,
+    outer: *Context.Sink,
+    sink: Context.Sink = .{ .diagnostic = diagnostic, .coverage = coverage, .config = config },
 
-    fn sink(heard: *Heard) Context.Sink {
-        return .{ .data = heard, .diagnostic = diagnostic, .coverage = coverage, .config = config };
+    fn config(sink: *Context.Sink, file: @import("Project.zig").FileId) @import("Rule.zig").Config {
+        const heard: *Heard = @fieldParentPtr("sink", sink);
+        return heard.outer.config(heard.outer, file);
     }
-    fn config(data: *anyopaque, file: @import("Project.zig").FileId) @import("Rule.zig").Config {
-        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal(A019): `sink` gives this callback a Heard.
-        return heard.outer.config(heard.outer.data, file);
-    }
-    fn diagnostic(data: *anyopaque, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {
-        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal(A019): `sink` gives this callback a Heard.
+    fn diagnostic(sink: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {
+        const heard: *Heard = @fieldParentPtr("sink", sink);
         heard.any = true;
     }
-    fn coverage(data: *anyopaque, _: Report.Coverage) Context.Error!void {
-        const heard: *Heard = @ptrCast(@alignCast(data)); // aegis: internal(A019): `sink` gives this callback a Heard.
+    fn coverage(sink: *Context.Sink, _: Report.Coverage) Context.Error!void {
+        const heard: *Heard = @fieldParentPtr("sink", sink);
         heard.any = true;
     }
 };

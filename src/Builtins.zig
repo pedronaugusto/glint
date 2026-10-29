@@ -506,7 +506,7 @@ fn unknownCoverage(self: *Context) RunError!void {
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
         const value = try self.facts.resolve(self.file, node);
-        if (value == .unknown) try self.sink.coverage(self.sink.data, .{ .file = self.file, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = .unresolved, .detail = @tagName(value.unknown) });
+        if (value == .unknown) try self.sink.coverage(self.sink, .{ .file = self.file, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = .unresolved, .detail = @tagName(value.unknown) });
     }
 }
 

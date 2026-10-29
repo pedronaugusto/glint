@@ -31,8 +31,8 @@
       }
     ],
     "escapes": {
-      "no-danger": 8,
-      "internal": 6
+      "no-danger": 7,
+      "internal": 1
     }
   },
   "fuzz": {

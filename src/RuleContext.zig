@@ -13,15 +13,16 @@ file: Project.FileId,
 config: rules.Config,
 facts: *Facts,
 definitions: []const rules.Definition,
-sink: Sink,
+sink: *Sink,
 
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
+/// Where a rule's findings go. Its owner embeds it in its own state and gets that back from
+/// the sink a callback is given with `@fieldParentPtr`.
 pub const Sink = struct {
-    data: *anyopaque,
-    diagnostic: *const fn (*anyopaque, rules.Rule, u32, u32, []const u8, []const Report.Span, []const Report.Edit) Error!void,
-    coverage: *const fn (*anyopaque, Report.Coverage) Error!void,
+    diagnostic: *const fn (*Sink, rules.Rule, u32, u32, []const u8, []const Report.Span, []const Report.Edit) Error!void,
+    coverage: *const fn (*Sink, Report.Coverage) Error!void,
     /// The configuration another selected file is checked with.
-    config: *const fn (*anyopaque, Project.FileId) rules.Config,
+    config: *const fn (*Sink, Project.FileId) rules.Config,
 };
 /// Compiled rule. Metadata and callback are validated once before execution.
 pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void };
@@ -156,14 +157,14 @@ pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, mes
     }
     for (fix) |e| if (e.start > e.end or e.end > bytes.len) return error.InvalidHandle;
     // Rules may retain no temporary message storage in the report: the sink copies it.
-    return self.sink.diagnostic(self.sink.data, rule, start, end, message, related, fix);
+    return self.sink.diagnostic(self.sink, rule, start, end, message, related, fix);
 }
 /// Required uncertainty cannot be suppressed into a completed gating run.
 pub fn undecided(self: *RuleContext, rule: rules.Rule, start: u32, reason: Report.Coverage.Reason, detail: []const u8) Error!void {
     if (!self.config.has(rule)) return;
     if (rules.definition(rule, self.definitions) == null) return error.InvalidSelection;
     if (start > (try self.project.source(try self.source())).len) return error.InvalidHandle;
-    return self.sink.coverage(self.sink.data, .{ .file = self.file, .rule = rule, .start = start, .reason = reason, .detail = detail });
+    return self.sink.coverage(self.sink, .{ .file = self.file, .rule = rule, .start = start, .reason = reason, .detail = detail });
 }
 /// A site at `token` with its deterministic fix.
 pub fn fixedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, fix: []const Report.Edit) Error!void {
@@ -186,7 +187,7 @@ pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Inde
 /// The configuration `file` is checked with: a fact computed for the whole program reads
 /// only the files whose rules ask for it.
 pub fn configOf(self: *const RuleContext, file: Project.FileId) rules.Config {
-    return self.sink.config(self.sink.data, file);
+    return self.sink.config(self.sink, file);
 }
 /// Whether a token is test code: a test input, or inside a `test` block.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {

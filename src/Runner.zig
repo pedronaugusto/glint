@@ -22,6 +22,8 @@ coverage: std.ArrayList(Report.Coverage) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
 stale: std.ArrayList(Report.Stale) = .empty,
+/// Where the rules' findings come in; each callback gets the runner back from it.
+sink: Context.Sink = .{ .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig },
 escapes: std.ArrayList(Report.Escape) = .empty,
 malformed: std.ArrayList(Report.Malformed) = .empty,
 /// What each of the current file's aegis escapes covered, by its index in `suppressions`.
@@ -102,7 +104,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
-        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = .{ .data = &runner, .diagnostic = sinkDiagnostic, .coverage = sinkCoverage, .config = sinkConfig } };
+        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink };
         try Builtins.check(&context);
         if (config.metrics) {
             const counts = try Metrics.count(&context);
@@ -191,17 +193,17 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     }, .level = self.config.level(rule), .severity = if (rule == .Z003) .@"error" else .warning, .span = span, .message = try self.a.dupe(u8, message), .related = try self.a.dupe(Report.Span, related), .bug_class = metadata.purpose, .fix = if (fix.len != 0) try Fix.copy(self.a, fix) else &.{} });
 }
 
-fn sinkDiagnostic(data: *anyopaque, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal(A019): this sink is created only from an aligned live Runner.
+fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
     try runner.emitRelated(rule, start, end, message, related, fix);
 }
-fn sinkConfig(data: *anyopaque, file: Project.FileId) rules.Config {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: no-danger(A019): this sink is created only from an aligned live Runner.
+fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
     for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
     return runner.base;
 }
-fn sinkCoverage(data: *anyopaque, coverage: Report.Coverage) Context.Error!void {
-    const runner: *Runner = @ptrCast(@alignCast(data)); // aegis: internal(A019): this sink is created only from an aligned live Runner.
+fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {
+    const runner: *Runner = @fieldParentPtr("sink", sink);
     var owned = coverage;
     owned.detail = try runner.a.dupe(u8, coverage.detail);
     if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;
