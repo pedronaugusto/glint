@@ -1634,6 +1634,118 @@ test "A009 clears a pointer moved within its memory only where it is read at its
     try std.testing.expectEqualSlices(u32, &.{ 4, 9, 14 }, result.lines[0..result.findings]);
 }
 
+test "A009 ends a comparison's fact at a store through another name for its memory: a pointer taken, a method or call given it, a pointer parameter of its type, a value holding it" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct {
+        \\    buf: []u8,
+        \\    count: usize = 0,
+        \\    other: Inner = .{},
+        \\    fn shrink(s: *S) void {
+        \\        s.buf = s.buf[16..];
+        \\    }
+        \\};
+        \\const Inner = struct {
+        \\    n: usize = 0,
+        \\    fn bump(i: *Inner) void {
+        \\        i.n += 1;
+        \\    }
+        \\};
+        \\fn cut(s: *S) void {
+        \\    s.buf = s.buf[16..];
+        \\}
+        \\fn look(s: *const S, b: []u8) usize {
+        \\    return s.count + b.len;
+        \\}
+        \\pub fn alias(r: *std.Io.Reader, s0: S) !u8 {
+        \\    var s = s0;
+        \\    const p = &s;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        p.buf = s.buf[16..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn method(r: *std.Io.Reader, s: *S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        s.shrink();
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn call(r: *std.Io.Reader, s: *S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        cut(s);
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn viaptr(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const pin = &in;
+        \\    const ip: usize = try r.takeInt(u32, .little);
+        \\    if (ip < in.len) {
+        \\        pin.* = in[16..];
+        \\        return in[ip];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn deref(r: *std.Io.Reader, s: *S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        s.* = .{ .buf = s.buf[0..1] };
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn twin(r: *std.Io.Reader, s: *S, t: *S) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len) {
+        \\        t.buf = t.buf[1..];
+        \\        return s.buf[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn held(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const h: struct { p: *[]u8 } = .{ .p = &in };
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < in.len) {
+        \\        h.p.* = in[0..1];
+        \\        return in[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn apart(r: *std.Io.Reader, s: *S, k: *const S) !u8 {
+        \\    const in: []u8 = s.buf;
+        \\    const p = &s.count;
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i < s.buf.len and i < in.len) {
+        \\        p.* += 1;
+        \\        s.count = look(k, s.buf) + look(k, in);
+        \\        s.other.bump();
+        \\        in[0] = 1;
+        \\        return s.buf[i] ^ in[i];
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn after(r: *std.Io.Reader, start: []u8) !u8 {
+        \\    var in: []u8 = start;
+        \\    const pin = &in;
+        \\    const ip: usize = try r.takeInt(u32, .little);
+        \\    if (ip < in.len) return in[ip];
+        \\    pin.* = in[1..];
+        \\    return 0;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // Each store through another name, never one to a part the comparison doesn't read.
+    try std.testing.expectEqualSlices(u32, &.{ 28, 36, 44, 54, 62, 70, 80 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
