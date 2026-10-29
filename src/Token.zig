@@ -17,17 +17,17 @@ pub const Error = data.Error;
 /// precedes its direct member edge. Tests are disjoint inclusive byte-offset ranges.
 /// This is conservative lexical liveness, not declaration or type resolution.
 /// The observer, if any, sees each token as the one pass over the source reaches it.
-pub fn scan(arena: std.mem.Allocator, source: []const u8, seen: ?Observer) Error!Facts {
+pub fn scan(arena: std.mem.Allocator, source: []const u8, seen: ?*Observer) Error!Facts {
     if (source.len > std.math.maxInt(u29)) return error.SourceTooLarge;
     return scanSentinel(arena, try arena.dupeSentinel(u8, source, 0), seen);
 }
 /// Avoids copying bytes when the source provider already owns a zero sentinel.
 /// The caller keeps source alive as long as the returned token and spelling slices.
-pub fn scanSentinel(arena: std.mem.Allocator, source: [:0]const u8, seen: ?Observer) Error!Facts {
+pub fn scanSentinel(arena: std.mem.Allocator, source: [:0]const u8, seen: ?*Observer) Error!Facts {
     if (source.len > std.math.maxInt(u29)) return error.SourceTooLarge;
     return if (source.len <= 1024) scanBuilt(true, arena, source, seen) else scanBuilt(false, arena, source, seen);
 }
-fn scanBuilt(comptime small: bool, arena: std.mem.Allocator, source: [:0]const u8, seen: ?Observer) Error!Facts {
+fn scanBuilt(comptime small: bool, arena: std.mem.Allocator, source: [:0]const u8, seen: ?*Observer) Error!Facts {
     var builder: liveness.Builder(small) = .{};
     var buffer: [if (small) 2048 else 0]u8 = undefined;
     var storage: std.heap.BufferFirstAllocator = .init(&buffer, arena);
@@ -37,7 +37,7 @@ fn scanBuilt(comptime small: bool, arena: std.mem.Allocator, source: [:0]const u
 
 /// The stored stream keeps whole operators; the observer, when it wants
 /// punctuation, receives every byte of one, and decoded escaped names.
-fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]const u8, seen: ?Observer, builder: anytype) Error![]StoredToken {
+fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]const u8, seen: ?*Observer, builder: anytype) Error![]StoredToken {
     var lexer = std.zig.Tokenizer.init(source);
     var out: std.ArrayList(StoredToken) = .empty;
     try out.ensureTotalCapacityPrecise(storage, if (source.len < 1024) @min(source.len / 2 + 4, 32) else @min(source.len / 4 + 4, 512));
@@ -48,32 +48,32 @@ fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]co
             .eof => break,
             .doc_comment, .container_doc_comment => {},
             .char_literal, .multiline_string_literal_line, .invalid => {
-                if (seen) |observer| if (observer.boundary) |boundary| boundary(observer.context);
+                if (seen) |observer| if (observer.boundary) |boundary| boundary(observer);
             },
             .string_literal => {
                 const text = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
                 try emit(storage, &out, StoredToken.init(.string_literal, text, token.loc.start, token.loc.end), source.len);
-                if (seen) |observer| try observer.token(observer.context, unit(.string, text, token.loc.start, token.loc.end));
+                if (seen) |observer| try observer.token(observer, unit(.string, text, token.loc.start, token.loc.end));
             },
             .identifier, .number_literal => {
                 const escaped = std.mem.startsWith(u8, raw, "@\"");
                 const text = if (escaped) try std.zig.string_literal.parseAlloc(arena, raw[1..]) else raw;
                 const stored = if (escaped) StoredToken.initEscaped(text, token.loc.start, token.loc.end) else StoredToken.init(token.tag, text, token.loc.start, token.loc.end);
                 try emit(storage, &out, stored, source.len);
-                if (seen) |observer| try observer.token(observer.context, unit(if (token.tag == .number_literal) .literal else .word, text, token.loc.start, token.loc.end));
+                if (seen) |observer| try observer.token(observer, unit(if (token.tag == .number_literal) .literal else .word, text, token.loc.start, token.loc.end));
             },
             .builtin => {
                 try emit(storage, &out, StoredToken.init(.builtin, raw[0..1], token.loc.start, token.loc.start + 1), source.len);
                 try emit(storage, &out, StoredToken.init(.identifier, raw[1..], token.loc.start + 1, token.loc.end), source.len);
                 if (seen) |observer| {
-                    if (observer.punctuation) try observer.token(observer.context, unit(.punctuation, raw[0..1], token.loc.start, token.loc.start + 1));
-                    try observer.token(observer.context, unit(.word, raw[1..], token.loc.start + 1, token.loc.end));
+                    if (observer.punctuation) try observer.token(observer, unit(.punctuation, raw[0..1], token.loc.start, token.loc.start + 1));
+                    try observer.token(observer, unit(.word, raw[1..], token.loc.start + 1, token.loc.end));
                 }
             },
             else => {
                 if (@backingInt(token.tag) >= @backingInt(std.zig.Token.Tag.keyword_addrspace)) { // safe: standard keyword tags form the final contiguous enum group.
                     try emit(storage, &out, StoredToken.init(token.tag, raw, token.loc.start, token.loc.end), source.len);
-                    if (seen) |observer| try observer.token(observer.context, unit(.keyword, raw, token.loc.start, token.loc.end));
+                    if (seen) |observer| try observer.token(observer, unit(.keyword, raw, token.loc.start, token.loc.end));
                 } else {
                     // Ranges retain distinct dots; other operators stay whole in the stored stream.
                     if (raw.len != 0 and raw[0] != '.') {
@@ -82,7 +82,7 @@ fn tokenize(arena: std.mem.Allocator, storage: std.mem.Allocator, source: [:0]co
                         try emit(storage, &out, StoredToken.init(if (raw[i] == '.') .period else .asterisk, raw[i .. i + 1], token.loc.start + i, token.loc.start + i + 1), source.len);
                     }
                     if (seen) |observer| if (observer.punctuation) for (raw, 0..) |_, i| {
-                        try observer.token(observer.context, unit(.punctuation, raw[i .. i + 1], token.loc.start + i, token.loc.start + i + 1));
+                        try observer.token(observer, unit(.punctuation, raw[i .. i + 1], token.loc.start + i, token.loc.start + i + 1));
                     };
                 }
             },

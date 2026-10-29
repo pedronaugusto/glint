@@ -15,11 +15,12 @@ pub const Token = struct {
         return (t.kind() == .word or t.kind() == .keyword or t.kind() == .punctuation) and std.mem.eql(u8, t.text, spelling);
     }
 };
+/// What a scan tells its caller as it goes. The caller embeds it in its own state and gets
+/// that back from the observer it is given with `@fieldParentPtr`.
 pub const Observer = struct {
-    context: *anyopaque,
     punctuation: bool = false,
-    boundary: ?*const fn (*anyopaque) void = null,
-    token: *const fn (*anyopaque, Token) error{OutOfMemory}!void,
+    boundary: ?*const fn (*Observer) void = null,
+    token: *const fn (*Observer, Token) error{OutOfMemory}!void,
 };
 pub const Import = struct {
     name: []const u8,

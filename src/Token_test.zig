@@ -51,12 +51,13 @@ test "token observer sees exact escaped spans and range punctuation as the pass 
         dots: usize = 0,
         escaped: bool = false,
         bytes: []const u8,
-        fn boundary(raw: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
+        observer: token.Observer,
+        fn boundary(observer: *token.Observer) void {
+            const self: *Self = @fieldParentPtr("observer", observer);
             self.boundaries += 1;
         }
-        fn see(raw: *anyopaque, t: token.Token) error{OutOfMemory}!void {
-            const self: *Self = @ptrCast(@alignCast(raw)); // safe: observer context is this caller-owned Capture.
+        fn see(observer: *token.Observer, t: token.Token) error{OutOfMemory}!void {
+            const self: *Self = @fieldParentPtr("observer", observer);
             self.calls += 1;
             if (t.is(".")) self.dots += 1;
             std.debug.assert(t.offset < t.end());
@@ -70,14 +71,14 @@ test "token observer sees exact escaped spans and range punctuation as the pass 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const bytes = "const @\"escaped\\x20name\" = @import(\"dep\"); pub fn f() void { _ = 0..4; _ = 'x'; _ = a == b; }";
-    var capture: Capture = .{ .bytes = bytes };
-    const observed = try token.scan(arena.allocator(), bytes, .{ .context = &capture, .punctuation = true, .boundary = Capture.boundary, .token = Capture.see });
+    var capture: Capture = .{ .bytes = bytes, .observer = .{ .punctuation = true, .boundary = Capture.boundary, .token = Capture.see } };
+    const observed = try token.scan(arena.allocator(), bytes, &capture.observer);
     try std.testing.expectEqual(@as(usize, 2), capture.dots); // safe: the range consists of two dot tokens.
     try std.testing.expectEqual(@as(usize, 1), capture.boundaries); // safe: one character literal interrupts policy observation.
     try std.testing.expect(capture.escaped);
     // Every punctuation byte of `==` arrives, and without punctuation none does.
-    var plain: Capture = .{ .bytes = bytes };
-    const quiet = try token.scan(arena.allocator(), bytes, .{ .context = &plain, .boundary = Capture.boundary, .token = Capture.see });
+    var plain: Capture = .{ .bytes = bytes, .observer = .{ .boundary = Capture.boundary, .token = Capture.see } };
+    const quiet = try token.scan(arena.allocator(), bytes, &plain.observer);
     try std.testing.expectEqual(@as(usize, 0), plain.dots); // safe: punctuation is not observed.
     try std.testing.expect(plain.calls < capture.calls);
     // Observing changes no fact.

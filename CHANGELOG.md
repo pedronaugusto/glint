@@ -7,6 +7,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 ### Breaking
 
 - An aegis escape names the pack rules it covers, `// aegis: <reason>(<rule>, ...): <why>` (`// aegis: boundary(A019): zlib's C contract`), and covers only their findings on its line: one escape silenced every pack rule there, findings added later too. An escape in the older form, naming none, still covers its line's pack findings but makes the run incomplete; `zig build fix` writes into it the rules it covers then, for its author to check.
+- `token.Observer` has no `context`: its callbacks take the observer itself (`token: *const fn (*Observer, Token) error{OutOfMemory}!void`, `boundary: ?*const fn (*Observer) void`), and `scan`/`scanSentinel` take a `?*Observer`. A caller embeds its observer and gets its own state back with `@fieldParentPtr`, where an `*anyopaque` made it cast the pointer back and carry an escape for the cast.
 - `Fix.escapeOf` is gone, and no fix writes an escape a site did not already have: it turned a `// safe:` or `// unreachable:` comment into an escape that passed, its reason (`no-danger` for most) chosen by the tool. A reason is the author's to state. The pack's old `// glint-ignore: A0NN -- <category>: <why>` still becomes the escape, naming that rule.
 
 ### Fixed
