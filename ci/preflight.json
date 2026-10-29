@@ -29,7 +29,11 @@
         "id": "A003",
         "level": "gate"
       }
-    ]
+    ],
+    "escapes": {
+      "no-danger": 9,
+      "internal": 6
+    }
   },
   "fuzz": {
     "trusted": {

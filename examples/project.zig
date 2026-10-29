@@ -1,4 +1,8 @@
 //! Standalone compiled project rules use glint's model and CLI completion contract.
+//! A project's file states an exception to its own rule as to any other:
+//!
+//!     // glint-ignore: LOCAL_EXPORT -- sample intentionally exposes a constant to demonstrate a reasoned project exception
+//!     pub const requires_contract = 1;
 const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;

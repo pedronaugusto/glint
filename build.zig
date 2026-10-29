@@ -109,9 +109,10 @@ pub fn dev(b: *std.Build, tools: type) void {
     b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
     helper_check.dependOn(&project_smoke.step);
+    // The project linter on each test platform, over its own source, which its rule passes.
     const portable_smoke = b.addRunArtifact(project_linter);
-    portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/input.zig" });
-    portable_smoke.addFileInput(p.path("examples/input.zig"));
+    portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/project.zig" });
+    portable_smoke.addFileInput(p.path("examples/project.zig"));
     test_step.dependOn(&portable_smoke.step);
     const check = b.step("check", "Compile CLI and tests");
     check.dependOn(&tests.step);
