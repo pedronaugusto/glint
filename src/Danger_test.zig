@@ -78,7 +78,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -99,6 +99,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
+    \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
     .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
@@ -456,6 +457,30 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
         \\}
     , 0);
+    // Only std's own stdio and a std handle's literal: a method of the program's that is named
+    // `stdout` but returns what it opened (and its callers, and the open itself), and a literal
+    // of the program's type with a `handle` field, are owners handed over.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const Proc = struct {
+        \\    dir: std.Io.Dir,
+        \\    fn opened(p: *Proc) std.Io.File {
+        \\        _ = p;
+        \\        return undefined;
+        \\    }
+        \\    pub fn stdout(p: *Proc) std.Io.File {
+        \\        return p.opened();
+        \\    }
+        \\};
+        \\const Wrapped = struct { handle: std.Io.File };
+        \\pub fn take(p: *Proc) std.Io.File {
+        \\    return p.stdout();
+        \\}
+        \\pub fn unwrap(f: *Proc) std.Io.File {
+        \\    const w: Wrapped = .{ .handle = f.opened() };
+        \\    return w.handle;
+        \\}
+    , 4);
     // A field moved out through a variable, a field of what was just opened, and an open are
     // owners handed over.
     try expect(pack.ownership,
@@ -2286,6 +2311,15 @@ test "A012 reads a take, peek or discard on a fixed reader as no work a peer siz
         \\    var r: std.Io.Reader = .fixed(body);
         \\    const size = try in.takeInt(u32, 0);
         \\    return r.readAlloc(gpa, size);
+        \\}
+    , 1);
+    // An allocating read is one by the type it takes, whatever its parameter is named.
+    try expect(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(in: *std.Io.Reader, body: []const u8, gpa: std.mem.Allocator) ![]u8 {
+        \\    var r: std.Io.Reader = .fixed(body);
+        \\    const size = try in.takeInt(u32, 0);
+        \\    return r.readArena(gpa, size);
         \\}
     , 1);
 }

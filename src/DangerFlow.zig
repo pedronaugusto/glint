@@ -185,9 +185,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const names = try parameters(c, decl);
         // A fixed reader's take, peek or discard views or skips bytes the program already
         // holds and fails past them: no work a peer sizes, unless the read allocates.
-        var allocates = false;
-        for (names) |each| allocates = allocates or std.mem.eql(u8, each, "gpa") or std.mem.eql(u8, each, "allocator");
-        if (own and !allocates) continue;
+        if (own and !try allocates(c, decl)) continue;
         for (reached.args, 0..) |arg, position| {
             if (position >= names.len) break;
             var sized = false;
@@ -572,6 +570,32 @@ fn comparison(tag: Ast.Node.Tag) bool {
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => true,
         else => false,
     };
+}
+
+/// Whether a read may allocate: it takes a `std.mem.Allocator`, by value or pointer, or a
+/// parameter whose type the reading cannot tell is none (`anytype`, a type that does not
+/// resolve). Decided by the parameter's type, never its name.
+fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    const tree = &c.project.files[decl.file.raw()].tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return true;
+    const allocators = (try Governed.declarations(c, "std", "mem.Allocator")) orelse &.{};
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        const declared = param.type_expr orelse return true;
+        var value = try c.facts.resolve(decl.file, declared);
+        if (value == .pointer) value = value.pointer.*;
+        const k = switch (value) {
+            .container, .instance => |k| k,
+            .unknown, .alternatives => return true,
+            else => continue,
+        };
+        for (allocators) |each| {
+            const allocator_type = try c.facts.declaration((try c.facts.origin(each)) orelse each);
+            if (allocator_type == .container and allocator_type.container.file.eql(k.file) and allocator_type.container.scope == k.scope) return true;
+        }
+    }
+    return false;
 }
 
 /// A function's parameter names in order, the receiver first.

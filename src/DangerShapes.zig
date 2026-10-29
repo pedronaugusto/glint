@@ -38,7 +38,7 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         const which = find(resources, held) orelse continue;
         if (decl.kind == .field and !released(tree, decl.name)) continue;
-        if (decl.kind == .function and views(tree, model, decl)) continue;
+        if (decl.kind == .function and try views(c, resources, decl)) continue;
         if (decl.kind == .function) {
             if (vtable == null) vtable = (try containersOf(c, rule, &.{"Io.VTable"}))[0];
             if (try implements(c, @intCast(index), vtable.?)) continue;
@@ -54,7 +54,9 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
 /// judged) of something itself held, a declared constant, std's process-wide `stdin`, `stdout` or
 /// `stderr`, which nobody closes, or a literal naming a handle it was given (`.{ .handle = handle
 /// }`). A variable (a field moved out first) or what a call made is an owner handed over.
-fn views(tree: *const Ast, model: *const Model, decl: Model.Declaration) bool {
+fn views(c: *Context, resources: []const Facts.Container, decl: Model.Declaration) Context.Error!bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
     const body = body: {
         const parent = model.node_parents[@backingInt(decl.node)] orelse return false; // safe: a node index indexes its own tree's parent table.
         if (tree.nodeTag(parent) != .fn_decl) return false;
@@ -69,7 +71,7 @@ fn views(tree: *const Ast, model: *const Model, decl: Model.Declaration) bool {
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
         const value = tree.nodeData(node).opt_node.unwrap() orelse return false;
-        if (!viewed(tree, model, value, 0)) return false;
+        if (!try viewed(c, resources, value, 0)) return false;
         returns += 1;
     }
     return returns != 0;
@@ -112,16 +114,18 @@ fn implements(c: *Context, index: u32, vtable: Facts.Container) Context.Error!bo
     return false;
 }
 
-fn viewed(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8) bool {
+fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    const tree = &c.project.files[c.file.raw()].tree;
+    const model = &c.project.models[c.file.raw()];
     if (depth == 16) return false;
     const next = depth + 1;
     switch (tree.nodeTag(node)) {
-        .grouped_expression => return viewed(tree, model, tree.nodeData(node).node_and_token[0], next),
-        .unwrap_optional => return viewed(tree, model, tree.nodeData(node).node_and_token[0], next),
-        .array_access => return viewed(tree, model, tree.nodeData(node).node_and_node[0], next),
+        .grouped_expression => return viewed(c, resources, tree.nodeData(node).node_and_token[0], next),
+        .unwrap_optional => return viewed(c, resources, tree.nodeData(node).node_and_token[0], next),
+        .array_access => return viewed(c, resources, tree.nodeData(node).node_and_node[0], next),
         .@"orelse" => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return viewed(tree, model, lhs, next) and viewed(tree, model, rhs, next);
+            return try viewed(c, resources, lhs, next) and try viewed(c, resources, rhs, next);
         },
         .field_access => {
             var root = node;
@@ -129,7 +133,7 @@ fn viewed(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8
                 .array_access => tree.nodeData(root).node_and_node[0],
                 else => tree.nodeData(root).node_and_token[0],
             };
-            return tree.nodeTag(root) == .identifier and viewed(tree, model, root, next);
+            return tree.nodeTag(root) == .identifier and try viewed(c, resources, root, next);
         },
         .identifier => {
             if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
@@ -143,31 +147,41 @@ fn viewed(tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: u8
             // A declared constant, or a local one made from what is already held.
             return switch (model.scopes[record.scope].kind) {
                 .file, .container => true,
-                else => viewed(tree, model, variable.ast.init_node.unwrap() orelse return false, next),
+                else => try viewed(c, resources, variable.ast.init_node.unwrap() orelse return false, next),
             };
         },
         .@"switch", .switch_comma => {
             const full = tree.fullSwitch(node).?;
-            for (full.ast.cases) |case| if (!viewed(tree, model, tree.fullSwitchCase(case).?.ast.target_expr, next)) return false;
+            for (full.ast.cases) |case| if (!try viewed(c, resources, tree.fullSwitchCase(case).?.ast.target_expr, next)) return false;
             return true;
         },
         else => {
             if (tree.fullIf(node)) |branch| {
                 const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-                return viewed(tree, model, branch.ast.then_expr, next) and viewed(tree, model, otherwise, next);
+                return try viewed(c, resources, branch.ast.then_expr, next) and try viewed(c, resources, otherwise, next);
             }
             var buffer: [1]Ast.Node.Index = undefined;
             if (tree.fullCall(&buffer, node)) |call| {
-                if (call.ast.params.len != 0 or tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-                const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
-                for ([_][]const u8{ "stdin", "stdout", "stderr" }) |standard| if (std.mem.eql(u8, name, standard)) return true;
+                if (call.ast.params.len != 0) return false;
+                const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
+                    .function => |decl| (try c.facts.origin(decl)) orelse decl,
+                    else => return false,
+                };
+                for ([_][]const u8{ "Io.File.stdin", "Io.File.stdout", "Io.File.stderr" }) |standard| {
+                    for ((try Governed.declarations(c, "std", standard)) orelse &.{}) |decl| {
+                        if (std.meta.eql((try c.facts.origin(decl)) orelse decl, callee)) return true;
+                    }
+                }
                 return false;
             }
             var init_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullStructInit(&init_buffer, node)) |literal| {
+                // A std handle made from one it is given: the literal of a std resource type.
+                const made = byValue(try c.facts.literalType(c.file, node)) orelse return false;
+                if (find(resources, made) == null) return false;
                 for (literal.ast.fields) |value| {
                     if (tree.firstToken(value) < 2 or !std.mem.eql(u8, tree.tokenSlice(tree.firstToken(value) - 2), "handle")) continue;
-                    return viewed(tree, model, value, next);
+                    return viewed(c, resources, value, next);
                 }
                 return false;
             }
