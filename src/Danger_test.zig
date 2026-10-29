@@ -1416,6 +1416,46 @@ test "A009 reads a field through a value whose type is one of several by each on
     try std.testing.expectEqualSlices(u32, &.{ 15, 18 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a parse's result as refined only where its parser shows the value's range: a check, a narrower source; a whole-width read stays input" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const Parsed = struct { count: u32 };
+        \\fn unchecked(_: void, b: []const u8) error{Short}!Parsed {
+        \\    if (b.len < 4) return error.Short;
+        \\    return .{ .count = std.mem.readInt(u32, b[0..4], .little) };
+        \\}
+        \\fn bare(_: void, b: []const u8) error{Short}!u32 {
+        \\    if (b.len < 4) return error.Short;
+        \\    return std.mem.readInt(u32, b[0..4], .little);
+        \\}
+        \\fn checked(_: void, b: []const u8) error{ Short, Big }!u32 {
+        \\    if (b.len < 4) return error.Short;
+        \\    const n = std.mem.readInt(u32, b[0..4], .little);
+        \\    if (n > 4096) return error.Big;
+        \\    return n;
+        \\}
+        \\fn narrow(_: void, b: []const u8) error{Short}!u32 {
+        \\    if (b.len < 1) return error.Short;
+        \\    return b[0];
+        \\}
+        \\pub fn f(bytes: []const u8) !void {
+        \\    const field = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, unchecked);
+        \\    var a: usize = field.count;
+        \\    while (a > 0) : (a -= 1) {}
+        \\    var b: usize = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, bare);
+        \\    while (b > 0) : (b -= 1) {}
+        \\    var c: usize = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, checked);
+        \\    while (c > 0) : (c -= 1) {}
+        \\    var d: usize = try aegis.input.Untrusted([]const u8).init(bytes).parse({}, narrow);
+        \\    while (d > 0) : (d -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The unchecked field's loop and the bare read's; never the checked or the narrow one's.
+    try std.testing.expectEqualSlices(u32, &.{ 25, 27 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

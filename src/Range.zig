@@ -146,6 +146,27 @@ pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand
     return true;
 }
 
+/// Whether a value is shown narrower than the integer type `declared` (in `declared_file`)
+/// gives it, at every pointer width: a comparison, an operation or a narrower source puts its
+/// greatest below the type's own (`return first` of a `u8` into a `u17`, a count checked below
+/// its limit). A `bool` holds no number; a value of the type's whole range, or a type the
+/// reading does not know, shows none.
+pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_file: Project.FileId, declared: Ast.Node.Index) Context.Error!bool {
+    const types = &c.project.files[declared_file.raw()].tree;
+    if (types.nodeTag(declared) == .identifier and std.mem.eql(u8, types.tokenSlice(types.nodeMainToken(declared)), "bool")) return true;
+    for (widths(c)) |pointer| {
+        const into = (try named(c, declared_file, declared, pointer)) orelse return false;
+        const most = (try bound(c, file, value, pointer, 0)) orelse return false;
+        if (most >= into.reach()) return false;
+    }
+    return true;
+}
+
+/// Whether a type expression names an integer type.
+pub fn integral(c: *Context, file: Project.FileId, type_node: Ast.Node.Index) Context.Error!bool {
+    return (try named(c, file, type_node, widths(c)[0])) != null;
+}
+
 /// Whether a value is held to 16 bits at every pointer width: what it can be is a short's
 /// count, never a peer's past it.
 pub fn small(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {

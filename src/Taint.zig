@@ -38,6 +38,7 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
+const Range = @import("Range.zig");
 const Project = @import("Project.zig");
 const Governed = @import("Governed.zig");
 const Contract = @import("AegisContract.zig");
@@ -110,8 +111,12 @@ const Function = struct {
     fills: u64 = 0,
     /// Its comptime parameters: fixed when the program is compiled, so no input reaches them.
     fixed: u64 = 0,
-    /// It is handed to aegis's `Untrusted.parse`: what it returns reaches the program refined.
+    /// It is handed to aegis's `Untrusted.parse`: what it returns reaches the program refined
+    /// where it shows the value's range.
     parser: bool = false,
+    /// What a parse given it gives: the level of the values it returns without showing their
+    /// range, which the parse refines nothing of.
+    unrefined: Level = .clean,
 };
 
 pub const Flow = struct {
@@ -353,6 +358,7 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
                     flow.functions.items[function].ret = now;
                     flow.changed = true;
                 }
+                if (f.parser) try unrefined(c, flow, function, value);
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
@@ -363,7 +369,7 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
                     // refines them, a direct call gives them as they were read.
                     const refined = f.parser and returned(tree, model, node);
                     for (literal.ast.fields, fields) |value, field| {
-                        if (refined and valueField(c, field)) continue;
+                        if (refined and try shownField(c, f.file, value, field)) continue;
                         try raiseGlobal(c, flow, field, concrete(flow, function, try dep(c, flow, function, value)));
                     }
                 };
@@ -921,7 +927,7 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
         if (try literalFields(c, f.file, node, literal)) |fields| {
             if (!f.parser or !returned(tree, model, node)) return .{};
             var out: Dep = .{};
-            for (literal.ast.fields, fields) |value, field| if (valueField(c, field)) {
+            for (literal.ast.fields, fields) |value, field| if (try shownField(c, f.file, value, field)) {
                 out = out.join(try dep(c, flow, function, value));
             };
             return out;
@@ -1007,13 +1013,48 @@ fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     return false;
 }
 
-/// Whether a field's declared type is a number or a `bool`: a value, no memory a peer's bytes
-/// could stand behind.
-fn valueField(c: *Context, decl: Facts.Decl) bool {
+/// Whether a parser's result field holds a value it showed the range of: a number or a `bool`
+/// by its declared type, no memory a peer's bytes could stand behind, given a value narrower
+/// than that type (`Range.shown`).
+fn shownField(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
     const tree = &c.project.files[decl.file.raw()].tree;
     const field = tree.fullContainerField(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
     const declared = field.ast.type_expr.unwrap() orelse return false;
-    return tree.nodeTag(declared) == .identifier and Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)));
+    if (tree.nodeTag(declared) != .identifier or !Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)))) return false;
+    return Range.shown(c, file, value, decl.file, declared);
+}
+
+/// A parser's return of a number it shows no range of, other than in a literal of its result
+/// type (whose fields are read one by one): what a parse given it gives is that number's
+/// input.
+fn unrefined(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Context.Error!void {
+    const f = flow.functions.items[function];
+    const tree = &c.project.files[f.file.raw()].tree;
+    // Each arm a branch returns is read as returned.
+    if (tree.fullIf(value)) |branch| {
+        try unrefined(c, flow, function, branch.ast.then_expr);
+        if (branch.ast.else_expr.unwrap()) |otherwise| try unrefined(c, flow, function, otherwise);
+        return;
+    }
+    if (tree.fullSwitch(value)) |choice| {
+        for (choice.ast.cases) |case| try unrefined(c, flow, function, tree.fullSwitchCase(case).?.ast.target_expr);
+        return;
+    }
+    if (tree.nodeTag(value) == .grouped_expression) return unrefined(c, flow, function, tree.nodeData(value).node_and_token[0]);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, value)) |literal| if (try literalFields(c, f.file, value, literal) != null) return;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, tree.nodeData(f.node).node_and_node[0]) orelse return;
+    var payload = proto.ast.return_type.unwrap() orelse return;
+    if (tree.nodeTag(payload) == .error_union) payload = tree.nodeData(payload).node_and_node[1];
+    // A result that is no number (a checked path, a name, a list) is the parser's refinement.
+    if (!try Range.integral(c, f.file, payload) or try Range.shown(c, f.file, value, f.file, payload)) return;
+    const level = concrete(flow, function, try dep(c, flow, function, value));
+    const now = flow.functions.items[function].unrefined.join(level);
+    if (now != flow.functions.items[function].unrefined) {
+        flow.functions.items[function].unrefined = now;
+        flow.changed = true;
+    }
 }
 
 /// A labeled block's value: what its `break`s give it.
@@ -1046,7 +1087,12 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
     const f = flow.functions.items[function];
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
-        .aegis => return .{},
+        // A parse gives what its parser returns refined, but for the values it showed no range
+        // of; aegis's other functions give the program's own.
+        .aegis => {
+            const target = (try parserOf(c, flow, f.file, call, callee.decl.?)) orelse return .{};
+            return .{ .level = flow.functions.items[target].unrefined };
+        },
         // What it holds: `init`'s value, the receiver of `lend`, `get`, `borrow` and `move`.
         .holder => {
             var out: Dep = .{};
