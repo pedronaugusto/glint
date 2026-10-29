@@ -330,8 +330,10 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
 }
 
 /// Whether a call passes on the `error.Canceled` it returns: under a `try`, returned, or caught
-/// by a handler that returns it (`catch |e| return e`, `return r.fail(e)`) or re-arms it
-/// (`io.recancel()`), in the prong `error.Canceled` takes where the handler switches on it. In
+/// (`catch`, or an `if`'s `else |err|`) by a handler that returns it, gives it as the value of
+/// a whole that is returned, or re-arms it (`catch |e| return e`, `return r.fail(e)`, `return
+/// f() catch |e| switch (e) { error.Canceled => error.Canceled, ... }`, `io.recancel()`), in
+/// the prong `error.Canceled` takes where the handler switches on it. In
 /// the loop judged (`loop`, the loop's body) a handler that leaves the loop ends it, which is all
 /// a cancel asks there (`catch return`, `catch break`). A handler that drops it (`catch {}`,
 /// `error.Canceled => continue`), or a function that turns it into a value (`catch return
@@ -347,23 +349,59 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index, loop: ?Ast.
             const caught, const handler = tree.nodeData(parent).node_and_node;
             if (caught != at) return false;
             const catch_token = tree.nodeMainToken(parent);
-            const capture: ?Ast.TokenIndex = if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null;
-            const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
-                const name = capture orelse break :taken .{ handler, null };
-                const chosen = tree.fullSwitch(handler) orelse break :taken .{ handler, null };
-                if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) break :taken .{ handler, null };
-                // The prong `error.Canceled` takes: the one naming it, or `else`.
-                var otherwise: ?Ast.full.SwitchCase = null;
-                for (chosen.ast.cases) |case_node| {
-                    const case = tree.fullSwitchCase(case_node).?;
-                    if (case.ast.values.len == 0) otherwise = case;
-                    for (case.ast.values) |value| if (namesCanceled(tree, value)) break :taken .{ case.ast.target_expr, case.payload_token };
-                }
-                const chosen_prong = otherwise orelse return false;
-                break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
-            };
-            return handles(c, file, prong, &.{ capture, payload }, loop);
+            return handled(c, file, parent, handler, if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null, loop);
         },
+        // `if (call) |v| ... else |err| ...`: the else branch is its handler.
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(parent).?;
+            if (branch.ast.cond_expr != at) return false;
+            const capture = branch.error_token orelse return false;
+            return handled(c, file, parent, branch.ast.else_expr.unwrap() orelse return false, capture, loop);
+        },
+        else => return false,
+    };
+    return false;
+}
+
+/// Whether the handler of a call's error passes `error.Canceled` on: in the prong it takes,
+/// where the handler switches on it (the one naming it, or `else`), a return or re-arming of
+/// it, or, where the whole (`whole`, the `catch` or `if`) is returned or tried, the error
+/// itself as the prong's value (`return f() catch |e| switch (e) { error.Canceled =>
+/// error.Canceled, ... }`).
+fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex, loop: ?Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
+        const name = capture orelse break :taken .{ handler, null };
+        const chosen = tree.fullSwitch(handler) orelse break :taken .{ handler, null };
+        if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) break :taken .{ handler, null };
+        var otherwise: ?Ast.full.SwitchCase = null;
+        for (chosen.ast.cases) |case_node| {
+            const case = tree.fullSwitchCase(case_node).?;
+            if (case.ast.values.len == 0) otherwise = case;
+            for (case.ast.values) |value| if (namesCanceled(tree, value)) break :taken .{ case.ast.target_expr, case.payload_token };
+        }
+        const chosen_prong = otherwise orelse return false;
+        break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
+    };
+    const names = [_]?Ast.TokenIndex{ capture, payload };
+    if (handles(c, file, prong, &names, loop)) return true;
+    // The prong's value is the error, and the whole is returned or tried.
+    var value = prong;
+    while (tree.nodeTag(value) == .grouped_expression) value = tree.nodeData(value).node_and_token[0];
+    const yields = switch (tree.nodeTag(value)) {
+        .error_value => namesCanceled(tree, value),
+        .identifier => for (names) |name| {
+            const n = name orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), tree.tokenSlice(n))) break true;
+        } else false,
+        else => false,
+    };
+    if (!yields) return false;
+    var at = whole;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .grouped_expression => {},
+        .@"try", .@"return" => return true,
         else => return false,
     };
     return false;
