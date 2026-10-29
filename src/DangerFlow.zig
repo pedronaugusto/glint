@@ -272,19 +272,20 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             }
             if (!unbounded and !by_input) continue;
             if (try cancels(c, c.file, loop.ast.then_expr, 0)) continue;
-            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls can return error.Canceled, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
+            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
         }
     }
 }
 
-/// Whether a body reaches a cancellation point: a call whose callee can return
-/// `error.Canceled` by its declared error set (`checkCancel`, an `Io` operation's
-/// `Cancelable`), in the body or in a function of the project it calls, to a depth of four. A
-/// call is none for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name. A
-/// callee chosen per target (`const wait = if (windows) waitWindows else waitPosix`, or a method
-/// of a type so chosen) is one where every choice is.
+/// Whether a body reaches a cancellation point: a call that can return `error.Canceled` and
+/// passes it on. A function of the project can where its body reaches one; another (std's
+/// `checkCancel`, an `Io` operation's `Cancelable`) by its declared error set. A call is none
+/// for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name, nor where what
+/// it returns is caught and its `Canceled` dropped. A callee chosen per target (`const wait =
+/// if (windows) waitWindows else waitPosix`, or a method of a type so chosen) is one where
+/// every choice is.
 fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) Context.Error!bool {
-    if (depth > 4) return false;
+    if (depth > 16) return false;
     const tree = &c.project.files[file.raw()].tree;
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
@@ -294,6 +295,7 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
+        if (!passedOn(c, file, node, if (depth == 0) body else null)) continue;
         const callee = try c.facts.resolve(file, call.ast.fn_expr);
         const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
         const every = for (choices) |choice| {
@@ -304,19 +306,112 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
     return false;
 }
 
-/// Whether a call of `callee` is a cancellation point: its declared error set holds
-/// `error.Canceled`, or, a function of the project, its body reaches one.
+const Cancels = struct { map: std.AutoHashMapUnmanaged(Facts.Decl, bool) = .empty };
+
+/// Whether a call of `callee` is a cancellation point: a function of the project where its body
+/// reaches one, whatever its error set declares (`error{Canceled}!void {}` cancels nothing);
+/// another where its declared error set holds `error.Canceled`.
 fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
     const callee_tree = &c.project.files[callee.file.raw()].tree;
     const callee_model = &c.project.models[callee.file.raw()];
-    var proto_buffer: [1]Ast.Node.Index = undefined;
-    if (callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[callee.index].node)) |proto| if (proto.ast.return_type.unwrap()) |result| {
-        if (try canceling(c, callee.file, result, 0)) return true;
+    if (c.project.inputs[callee.file.raw()].selected) if (callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)]) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) { // safe: a node index indexes its own tree's parent table.
+        const memo = try c.facts.memo(Cancels);
+        if (memo.map.get(callee)) |known| return known;
+        // A function that reaches itself is no cancellation point while it is being read.
+        try memo.map.put(c.allocator, callee, false);
+        const out = try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1);
+        try memo.map.put(c.allocator, callee, out);
+        return out;
     };
-    if (!c.project.inputs[callee.file.raw()].selected) return false;
-    const parent = callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)] orelse return false; // safe: a node index indexes its own tree's parent table.
-    if (callee_tree.nodeTag(parent) != .fn_decl) return false;
-    return cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1);
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[callee.index].node) orelse return false;
+    return canceling(c, callee.file, proto.ast.return_type.unwrap() orelse return false, 0);
+}
+
+/// Whether a call passes on the `error.Canceled` it returns: under a `try`, returned, or caught
+/// by a handler that returns it (`catch |e| return e`, `return r.fail(e)`) or re-arms it
+/// (`io.recancel()`), in the prong `error.Canceled` takes where the handler switches on it. In
+/// the loop judged (`loop`, the loop's body) a handler that leaves the loop ends it, which is all
+/// a cancel asks there (`catch return`, `catch break`). A handler that drops it (`catch {}`,
+/// `error.Canceled => continue`), or a function that turns it into a value (`catch return
+/// false`), lets the loop run on.
+fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index, loop: ?Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = call;
+    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .grouped_expression => {},
+        .@"try", .@"return" => return true,
+        .@"catch" => {
+            const caught, const handler = tree.nodeData(parent).node_and_node;
+            if (caught != at) return false;
+            const catch_token = tree.nodeMainToken(parent);
+            const capture: ?Ast.TokenIndex = if (tree.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null;
+            const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
+                const name = capture orelse break :taken .{ handler, null };
+                const chosen = tree.fullSwitch(handler) orelse break :taken .{ handler, null };
+                if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) break :taken .{ handler, null };
+                // The prong `error.Canceled` takes: the one naming it, or `else`.
+                var otherwise: ?Ast.full.SwitchCase = null;
+                for (chosen.ast.cases) |case_node| {
+                    const case = tree.fullSwitchCase(case_node).?;
+                    if (case.ast.values.len == 0) otherwise = case;
+                    for (case.ast.values) |value| if (namesCanceled(tree, value)) break :taken .{ case.ast.target_expr, case.payload_token };
+                }
+                const chosen_prong = otherwise orelse return false;
+                break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
+            };
+            return handles(c, file, prong, &.{ capture, payload }, loop);
+        },
+        else => return false,
+    };
+    return false;
+}
+
+fn namesCanceled(tree: *const Ast, node: Ast.Node.Index) bool {
+    for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| {
+        if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Canceled")) return true;
+    }
+    return false;
+}
+
+/// Whether a handler passes on what it caught (named by `names`, the capture and the prong's):
+/// a `return` of it or of `error.Canceled`, a call of `recancel`, or, in the judged loop's
+/// body, a `return` or a `break` of that loop.
+fn handles(c: *Context, file: Project.FileId, handler: Ast.Node.Index, names: []const ?Ast.TokenIndex, loop: ?Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    const first = tree.firstToken(handler);
+    const last = tree.lastToken(handler);
+    for (first..last + 1) |token| {
+        if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "recancel") and tree.tokenTag(@intCast(token + 1)) == .l_paren) return true;
+    }
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return" and tag != .@"break") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        if (tag == .@"break") {
+            // An unlabeled `break` whose innermost loop is the one judged.
+            const body = loop orelse continue;
+            if (tree.nodeData(node).opt_token_and_opt_node[0] != .none) continue;
+            var at = node;
+            const inner = while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) {
+                if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) break parent;
+            } else continue;
+            const then = if (tree.fullWhile(inner)) |w| w.ast.then_expr else tree.fullFor(inner).?.ast.then_expr;
+            if (then == body) return true;
+            continue;
+        }
+        if (loop != null) return true;
+        const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
+        if (namesCanceled(tree, value)) return true;
+        for (tree.firstToken(value)..tree.lastToken(value) + 1) |t| for (names) |name| {
+            const n = name orelse continue;
+            if (tree.tokenTag(@intCast(t)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(t)), tree.tokenSlice(n))) return true;
+        };
+    }
+    return false;
 }
 
 /// Whether a result type's error set holds `error.Canceled`: a set literal naming it, a merge

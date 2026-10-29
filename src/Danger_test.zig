@@ -31,6 +31,7 @@ const std_files = [_]sources.Extra{
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
     \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
+    \\pub fn recancel(io: @This()) void { _ = io; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Handle = @import("root").Handle;
@@ -2347,7 +2348,7 @@ test "A020 reads a call of a function or method chosen per target as a cancellat
         \\    fn waitEmpty(g: *const LinuxCgroup, io: std.Io) std.Io.Cancelable!bool { _ = g; try io.checkCancel(); return true; }
         \\};
         \\const NoCgroup = struct {
-        \\    fn waitEmpty(g: *const NoCgroup, io: std.Io) std.Io.Cancelable!bool { _ = g; _ = io; return true; }
+        \\    fn waitEmpty(g: *const NoCgroup, io: std.Io) std.Io.Cancelable!bool { _ = g; try io.checkCancel(); return true; }
         \\};
         \\const StubCgroup = struct {
         \\    fn waitEmpty(g: *const StubCgroup, io: std.Io) bool { _ = g; _ = io; return true; }
@@ -2371,6 +2372,72 @@ test "A020 reads a call of a function or method chosen per target as a cancellat
         "const wait = if (windows) spinWindows else waitPosix;\npub fn read(io: std.Io) !void {\n    while (true) if (try wait(io) == 0) return;\n}\n",
         "const Cgroup = if (windows) StubCgroup else LinuxCgroup;\npub fn reap(io: std.Io, group: *const Cgroup) !void {\n    while (true) if (try group.waitEmpty(io)) return;\n}\n",
     }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A020 reads a project function's body, not its declared error set, and no call whose error.Canceled is caught and dropped" {
+    const head =
+        \\const std = @import("std");
+        \\const windows = @import("builtin").os.tag == .windows;
+        \\const Error = error{Bad} || std.Io.Cancelable;
+        \\fn step(x: u32) Error!u64 {
+        \\    if (x == 0xffff_ffff) return error.Bad;
+        \\    return x;
+        \\}
+        \\fn tick() error{Canceled}!void {}
+        \\fn waitPosix(io: std.Io) std.Io.Cancelable!u8 {
+        \\    try io.checkCancel();
+        \\    return 1;
+        \\}
+        \\fn waitWindows(io: std.Io) std.Io.Cancelable!u8 {
+        \\    _ = io;
+        \\    return 1;
+        \\}
+        \\fn ready(io: std.Io) bool {
+        \\    io.checkCancel() catch return false;
+        \\    return true;
+        \\}
+        \\fn passed(io: std.Io) std.Io.Cancelable!void {
+        \\    io.checkCancel() catch |err| switch (err) {
+        \\        error.Canceled => return err,
+        \\    };
+        \\}
+        \\fn rearmed(io: std.Io) error{Failed}!void {
+        \\    io.checkCancel() catch {
+        \\        io.recancel();
+        \\        return error.Failed;
+        \\    };
+        \\}
+        \\fn renamed(io: std.Io) error{Failed}!void {
+        \\    io.checkCancel() catch return error.Failed;
+        \\}
+        \\
+    ;
+    // Each loop runs on through a cancel, or loses it: one dropped, a set that only declares it,
+    // a choice per target whose body never cancels, a function that turns it into a value or
+    // another error.
+    inline for (.{
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        io.checkCancel() catch {};\n        total +%= i;\n    }\n    return total;\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    _ = &io;\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) total +%= try step(i);\n    return total;\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    _ = &io;\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        try tick();\n        total +%= i;\n    }\n    return total;\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        io.checkCancel() catch |e| switch (e) {\n            error.Canceled => continue,\n        };\n        total +%= i;\n    }\n    return total;\n}\n",
+        "const wait = if (windows) waitWindows else waitPosix;\npub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) total +%= try wait(io);\n    return total;\n}\n",
+        "pub fn f(io: std.Io) void {\n    while (true) if (!ready(io)) return;\n}\n",
+        "pub fn f(io: std.Io) !void {\n    while (true) try renamed(io);\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // Each passes it on or ends the loop for it.
+    inline for (.{
+        "pub fn f(io: std.Io) !void {\n    while (true) try passed(io);\n}\n",
+        "pub fn f(io: std.Io) !void {\n    while (true) try rearmed(io);\n}\n",
+        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch return;\n}\n",
+        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch break;\n}\n",
+        "pub fn f(io: std.Io) !void {\n    while (true) io.checkCancel() catch |e| return e;\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 0) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
@@ -2510,17 +2577,17 @@ test "A020 reads a cancellation point the loop reaches through the project's fun
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\const Socket = struct { io: std.Io, file: std.Io.File, reader: std.Io.File.Reader };
-        \\fn awaitRequest(s: *Socket) bool {
-        \\    s.io.checkCancel() catch return false;
+        \\fn awaitRequest(s: *Socket) std.Io.Cancelable!bool {
+        \\    try s.io.checkCancel();
         \\    return true;
         \\}
         \\fn readPacket(s: *Socket) !u8 {
         \\    return s.reader.interface.takeByte();
         \\}
         \\fn send(io: std.Io, s: *Socket) void { _ = io; _ = s; }
-        \\pub fn serve(io: std.Io, s: *Socket) void {
+        \\pub fn serve(io: std.Io, s: *Socket) !void {
         \\    _ = io;
-        \\    while (true) if (!awaitRequest(s)) return;
+        \\    while (true) if (!try awaitRequest(s)) return;
         \\}
         \\pub fn fetch(io: std.Io, s: *Socket) !void {
         \\    _ = io;
