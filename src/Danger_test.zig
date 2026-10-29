@@ -2539,6 +2539,7 @@ test "A020 reads a project function's body, not its declared error set, and no c
         "const wait = if (windows) waitWindows else waitPosix;\npub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) total +%= try wait(io);\n    return total;\n}\n",
         "pub fn f(io: std.Io) void {\n    while (true) if (!ready(io)) return;\n}\n",
         "pub fn f(io: std.Io) !void {\n    while (true) try renamed(io);\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        if (i == 0) try io.checkCancel();\n        total +%= i;\n    }\n    return total;\n}\n",
     }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
@@ -2550,6 +2551,8 @@ test "A020 reads a project function's body, not its declared error set, and no c
         "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch return;\n}\n",
         "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch break;\n}\n",
         "pub fn f(io: std.Io) !void {\n    while (true) io.checkCancel() catch |e| return e;\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        if (i % 1024 == 0) try io.checkCancel();\n        total +%= i;\n    }\n    return total;\n}\n",
+        "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    var left: u32 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        if (left == 0) {\n            try io.checkCancel();\n            left = 1024;\n        }\n        left -= 1;\n        total +%= i;\n    }\n    return total;\n}\n",
     }) |body| expect(pack.cancellation, head ++ body, 0) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;

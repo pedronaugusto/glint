@@ -296,6 +296,7 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (!passedOn(c, file, node, if (depth == 0) body else null)) continue;
+        if (depth == 0 and once(c, file, node, body)) continue;
         const callee = try c.facts.resolve(file, call.ast.fn_expr);
         const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
         const every = for (choices) |choice| {
@@ -365,6 +366,49 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index, loop: ?Ast.
         },
         else => return false,
     };
+    return false;
+}
+
+/// Whether a call in a loop's body runs on one pass only: under an `if` that compares a
+/// variable with a constant (`if (i == 0)`) and sets it nowhere in what it guards. A check
+/// every so many passes (`i % 1024 == 0`, a countdown set again where it reaches zero) is one
+/// every pass reaches in turn.
+fn once(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const model = &c.project.models[file.raw()];
+    var at = call;
+    while (at != body) {
+        const parent = model.node_parents[@backingInt(at)] orelse return false;
+        defer at = parent;
+        const branch = tree.fullIf(parent) orelse continue;
+        if (at == branch.ast.cond_expr) continue;
+        const condition = branch.ast.cond_expr;
+        switch (tree.nodeTag(condition)) {
+            .equal_equal, .less_than, .less_or_equal, .greater_than, .greater_or_equal => {},
+            else => continue,
+        }
+        const lhs, const rhs = tree.nodeData(condition).node_and_node;
+        const counter = if (tree.nodeTag(rhs) == .number_literal) lhs else if (tree.nodeTag(lhs) == .number_literal) rhs else continue;
+        switch (tree.nodeTag(counter)) {
+            .identifier, .field_access => {},
+            else => continue,
+        }
+        // Set again where it guards: a countdown, so a check every so many passes.
+        const name = tree.getNodeSource(counter);
+        const first = tree.firstToken(at);
+        const last = tree.lastToken(at);
+        const reset = for (tree.nodes.items(.tag), 0..) |tag, i| {
+            switch (tag) {
+                .assign, .assign_add, .assign_sub => {},
+                else => continue,
+            }
+            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(assignment);
+            if (token < first or token > last) continue;
+            if (std.mem.eql(u8, tree.getNodeSource(tree.nodeData(assignment).node_and_node[0]), name)) break true;
+        } else false;
+        if (!reset) return true;
+    }
     return false;
 }
 
