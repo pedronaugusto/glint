@@ -101,7 +101,9 @@ const Loader = struct {
                 if (literal.tag != .string_literal) continue;
                 const spelling = try std.zig.string_literal.parseAlloc(self.a, sentinel[literal.loc.start..literal.loc.end]);
                 if (lexer.next().tag != .r_paren) continue;
-                const target_path = try self.importPath(cursor, spelling) orelse continue;
+                // The spelling is the source's: a path it names is parsed into one inside the
+                // roots before anything opens it.
+                const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
                 const target = try self.load(target_path, false);
                 var duplicate = false;
                 for (self.mappings.items) |m| if (m.from.eql(from) and std.mem.eql(u8, m.spelling, spelling)) {
@@ -113,16 +115,22 @@ const Loader = struct {
         }
     }
 
-    fn importPath(self: *Loader, from: usize, spelling: []const u8) !?[]const u8 {
-        if (std.mem.eql(u8, spelling, "std")) {
+    /// An `@import` a loaded file spells, and the file it is written in.
+    const Spelling = struct { from: usize, text: []const u8 };
+
+    /// The file an import names: std's or a module's root by its name, or a relative path,
+    /// resolved against the importing file's directory, inside the roots as Zig requires of a
+    /// module's imports; null for a name that is no file of the run.
+    fn importPath(self: *Loader, spelling: Spelling) error{ OutOfMemory, ImportOutsideRoots }!?[]const u8 {
+        if (std.mem.eql(u8, spelling.text, "std")) {
             const lib = self.options.zig_lib_path orelse return null;
-            const path = try std.Io.Dir.path.join(self.a, &.{ lib, "std", "std.zig" });
-            return path;
+            return try std.Io.Dir.path.join(self.a, &.{ lib, "std", "std.zig" });
         }
-        for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling, module.name)) return module.path;
-        if (!std.mem.endsWith(u8, spelling, ".zig")) return null;
-        const path = try std.Io.Dir.path.join(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[from]) orelse ".", spelling });
-        return path;
+        for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling.text, module.name)) return module.path;
+        if (!std.mem.endsWith(u8, spelling.text, ".zig")) return null;
+        const path = try std.Io.Dir.path.resolveAlloc(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[spelling.from]) orelse ".", spelling.text });
+        for (self.roots.items) |root| if (within(root, path)) return path;
+        return error.ImportOutsideRoots;
     }
 };
 
