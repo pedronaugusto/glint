@@ -1193,15 +1193,16 @@ fn untyped(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     return variable.ast.init_node.unwrap();
 }
 
-/// A C integer type across the family's targets at one pointer width: `char` 8 bits of
-/// either sign, `short` 16, `int` 32, `long` 32 on Windows and 32-bit targets and the
-/// pointer's width elsewhere, `long long` 64.
+/// A C integer type across the targets of one pointer width, as Zig's C ABI gives them:
+/// `char` 8 bits of either sign, `short` 16, `int` 16 on 16-bit targets (AVR, MSP430) and 32
+/// elsewhere, `long` 32 on Windows and on 16- and 32-bit targets and the pointer's width
+/// elsewhere, `long long` 64.
 fn cType(name: []const u8, pointer: u16) Typed {
     const unsigned = name.len > 1 and name[0] == 'u';
     const base = if (unsigned) name[1..] else name;
     if (std.mem.eql(u8, name, "char")) return .{ .int = .{ .bits = 8, .signed = true, .either = true } };
     if (std.mem.eql(u8, base, "short")) return .{ .int = .{ .bits = 16, .signed = !unsigned } };
-    if (std.mem.eql(u8, base, "int")) return .{ .int = .{ .bits = 32, .signed = !unsigned } };
+    if (std.mem.eql(u8, base, "int")) return .{ .int = .{ .bits = if (pointer == 16) 16 else 32, .signed = !unsigned } };
     if (std.mem.eql(u8, base, "long")) return .{ .int = .{ .bits = 32, .signed = !unsigned, .wide = @max(pointer, 32) } };
     if (std.mem.eql(u8, base, "longlong")) return .{ .int = .{ .bits = 64, .signed = !unsigned } };
     return .unknown;

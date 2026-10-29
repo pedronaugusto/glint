@@ -1661,6 +1661,18 @@ test "A010 reads a range at the pointer widths of the package's targets: a u32 c
     try std.testing.expectError(error.InvalidSelection, (glint.Config{ .pointer_widths = &.{48} }).validate());
 }
 
+test "A010 reads a C int at a 16-bit pointer width as 16 bits: a value past it fits elsewhere and not there" {
+    const program =
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !c_int {
+        \\    const v = try r.takeInt(u32, 0);
+        \\    return @intCast(v & 0xffff);
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try runWidths(pack.integers, program, &.{ 32, 64 })).findings);
+    try std.testing.expectEqual(@as(usize, 1), (try runWidths(pack.integers, program, &.{16})).findings);
+}
+
 test "A010 leaves what a file or directory handle answers of itself, though input made the handle" {
     try expect(pack.integers,
         \\const std = @import("std");
