@@ -23,7 +23,9 @@ pub fn copy(a: std.mem.Allocator, fix: []const Report.Edit) std.mem.Allocator.Er
 /// An escape a run before this one reported, with the rules it covered then: a line of the
 /// report's text, `escape: src/a.zig:12:30: no-danger: why (A010 at 12:5, A013 at 12:9)`, or
 /// preflight's record of it, `glint: escape: src/a.zig:12:30: no-danger: why (A010, A013)`.
-pub const Escaped = struct { path: []const u8, line: u32, rules: []const []const u8 };
+/// It is the escape at that place with that reason and why, and no other: one moved or
+/// reworded since is not it.
+pub const Escaped = struct { path: []const u8, line: u32, column: u32, reason: []const u8, why: []const u8, rules: []const []const u8 };
 
 pub const Options = struct {
     /// The escapes of a run before, by which an escape in the older form is named: a migration
@@ -31,34 +33,72 @@ pub const Options = struct {
     escapes_before: []const Escaped = &.{},
 };
 
-/// The escapes a report's text lists, each line holding `escape: ` (a caller's prefix before it
-/// aside); other lines are left. A line that holds it and is no escape's is
+/// The escapes a report's text lists: each line that starts `escape: ` or `glint: escape: `;
+/// every other line is left. A line that starts so and is not an escape's in that exact form,
+/// `path:line:column: reason: why (rules)`, each rule alone or followed by ` at line:column`, is
 /// `error.InvalidEscapeRecord`.
 pub fn escapeRecord(a: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory, InvalidEscapeRecord }![]const Escaped {
     var out: std.ArrayList(Escaped) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
-        const at = std.mem.find(u8, line, "escape: ") orelse continue;
-        const rest = line[at + "escape: ".len ..];
-        // `path:line:column: `, then the reason and why, then the rules covered in parentheses.
-        const path_end = std.mem.findScalar(u8, rest, ':') orelse return error.InvalidEscapeRecord;
-        const line_end = std.mem.findScalarPos(u8, rest, path_end + 1, ':') orelse return error.InvalidEscapeRecord;
-        const number = std.fmt.parseInt(u32, rest[path_end + 1 .. line_end], 10) catch return error.InvalidEscapeRecord;
-        if (rest.len == 0 or rest[rest.len - 1] != ')') return error.InvalidEscapeRecord;
-        const open = std.mem.findScalarLast(u8, rest, '(') orelse return error.InvalidEscapeRecord;
-        if (open <= line_end) return error.InvalidEscapeRecord;
-        var rules: std.ArrayList([]const u8) = .empty;
-        // Each entry's rule, its place after it where glint's own report gives one (`A010 at 4:18`).
-        var entries = std.mem.tokenizeScalar(u8, rest[open + 1 .. rest.len - 1], ',');
-        while (entries.next()) |entry| {
-            var words = std.mem.tokenizeScalar(u8, entry, ' ');
-            try rules.append(a, words.next() orelse return error.InvalidEscapeRecord);
-        }
-        if (path_end == 0) return error.InvalidEscapeRecord;
-        try out.append(a, .{ .path = rest[0..path_end], .line = number, .rules = rules.items });
+        const rest = if (std.mem.startsWith(u8, line, "escape: "))
+            line["escape: ".len..]
+        else if (std.mem.startsWith(u8, line, "glint: escape: "))
+            line["glint: escape: ".len..]
+        else
+            continue;
+        try out.append(a, try escapeLine(a, rest));
     }
     return out.items;
+}
+
+/// One record line after its `escape: `: `path:line:column: reason: why (rules)`.
+fn escapeLine(a: std.mem.Allocator, rest: []const u8) error{ OutOfMemory, InvalidEscapeRecord }!Escaped {
+    const path_end = std.mem.findScalar(u8, rest, ':') orelse return error.InvalidEscapeRecord;
+    if (path_end == 0) return error.InvalidEscapeRecord;
+    const line_end = std.mem.findScalarPos(u8, rest, path_end + 1, ':') orelse return error.InvalidEscapeRecord;
+    const column_end = std.mem.findScalarPos(u8, rest, line_end + 1, ':') orelse return error.InvalidEscapeRecord;
+    const line = position(rest[path_end + 1 .. line_end]) orelse return error.InvalidEscapeRecord;
+    const column = position(rest[line_end + 1 .. column_end]) orelse return error.InvalidEscapeRecord;
+    if (!std.mem.startsWith(u8, rest[column_end..], ": ")) return error.InvalidEscapeRecord;
+    const text = rest[column_end + 2 ..];
+    const reason_end = std.mem.find(u8, text, ": ") orelse return error.InvalidEscapeRecord;
+    const reason = text[0..reason_end];
+    if (reason.len == 0 or std.mem.findAny(u8, reason, " ()") != null) return error.InvalidEscapeRecord;
+    if (text.len == 0 or text[text.len - 1] != ')') return error.InvalidEscapeRecord;
+    const open = std.mem.findLast(u8, text, " (") orelse return error.InvalidEscapeRecord;
+    if (open < reason_end + 2) return error.InvalidEscapeRecord;
+    var rules: std.ArrayList([]const u8) = .empty;
+    var entries = std.mem.splitSequence(u8, text[open + 2 .. text.len - 1], ", ");
+    while (entries.next()) |entry| {
+        // A rule's name, its place after it where glint's own report gives one (`A010 at 4:18`).
+        const name_end = std.mem.findScalar(u8, entry, ' ') orelse entry.len;
+        const name = entry[0..name_end];
+        if (name.len == 0 or !ruleName(name)) return error.InvalidEscapeRecord;
+        if (name_end != entry.len) {
+            const place = entry[name_end..];
+            if (!std.mem.startsWith(u8, place, " at ")) return error.InvalidEscapeRecord;
+            const colon = std.mem.findScalar(u8, place, ':') orelse return error.InvalidEscapeRecord;
+            _ = position(place[" at ".len..colon]) orelse return error.InvalidEscapeRecord;
+            _ = position(place[colon + 1 ..]) orelse return error.InvalidEscapeRecord;
+        }
+        try rules.append(a, name);
+    }
+    return .{ .path = rest[0..path_end], .line = line, .column = column, .reason = reason, .why = text[reason_end + 2 .. open], .rules = rules.items };
+}
+
+/// A line or column number: decimal digits alone.
+fn position(digits: []const u8) ?u32 {
+    if (digits.len == 0) return null;
+    for (digits) |d| if (!std.ascii.isDigit(d)) return null;
+    return std.fmt.parseInt(u32, digits, 10) catch null;
+}
+
+/// A rule's name as a report spells it: letters and digits.
+fn ruleName(name: []const u8) bool {
+    for (name) |ch| if (!std.ascii.isAlphanumeric(ch)) return false;
+    return true;
 }
 
 /// Each file a run's fixes change, with its bytes after them: every finding's fix and the
@@ -137,11 +177,14 @@ fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const R
     const file = &project.files[span.file.raw()];
     const text = file.source[span.start..span.end];
     if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
-    const recorded = for (before) |escaped| {
-        if (escaped.line == span.line and std.mem.eql(u8, escaped.path, project.inputs[span.file.raw()].name)) break escaped;
-    } else return null;
     for (report.escapes) |escape| {
         if (!escape.span.file.eql(span.file) or escape.span.start != span.start) continue;
+        // The record's escape is this one: its place and its words.
+        const recorded = for (before) |escaped| {
+            if (escaped.line != span.line or escaped.column != span.column) continue;
+            if (!std.mem.eql(u8, escaped.path, project.inputs[span.file.raw()].name)) continue;
+            if (std.mem.eql(u8, escaped.reason, escape.reason) and std.mem.eql(u8, escaped.why, escape.why)) break escaped;
+        } else return null;
         var names: std.ArrayList(u8) = .empty;
         var seen: std.ArrayList([]const u8) = .empty;
         for (escape.covered) |covered| {

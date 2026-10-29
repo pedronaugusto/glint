@@ -204,7 +204,7 @@ pub const Arguments = struct {
             .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
             .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
             .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
-            .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form with only the rules listed for it there that find something now, and leaves one not listed to its owner" },
+            .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
             .root = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "A directory imports may read files from, repeated" },
@@ -212,7 +212,8 @@ pub const Arguments = struct {
             .files_from = .{ .value_name = "FILE", .hint = .file, .section = "Inputs", .help = "A file naming files to check under this directory, one a line, repeated" },
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
         },
-        .conflicts = &.{&.{ .only, .reviewed, .family, .config }},
+        // A run of some rules sees only what they cover: it never names an older escape.
+        .conflicts = &.{ &.{ .only, .reviewed, .family, .config }, &.{ .only, .escapes_before } },
     };
 };
 
@@ -415,6 +416,8 @@ test "CLI invalid selections and unknown formats fail" {
     defer arena.deinit();
     try std.testing.expectError(error.UnknownRule, options(arena.allocator(), std.testing.io, .{ .only = &.{"Z008"} }, &.{}));
     try std.testing.expectError(error.InvalidValue, ensign.parse(Arguments, arena.allocator(), &.{ "--format", "other" }, .{}));
+    // A run of some rules never names an older escape from a record.
+    try std.testing.expectError(error.Conflict, ensign.parse(Arguments, arena.allocator(), &.{ "--only", "A009", "--escapes-before", "escapes.txt", "--fix" }, .{}));
     try std.testing.expect(within("/root", "/root/src/x.zig"));
     try std.testing.expect(!within("/root", "/root-copy/x.zig"));
 }

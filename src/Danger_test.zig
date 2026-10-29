@@ -1056,7 +1056,7 @@ fn fixedBy(rules: []const glint.Rule, program: []const u8, record: []const u8) !
     return .{ .bytes = try std.testing.allocator.dupe(u8, bytes), .stale = report.stale.len };
 }
 
-test "the fix names an escape in the older form only with rules a run before shows it covered and that find something now, and keeps an escape whose rules did not run" {
+test "the fix names an escape in the older form only where a run before recorded it at that place with those words, with the rules it covered then that find something now, and keeps an escape whose rules did not run" {
     const older =
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
@@ -1078,13 +1078,33 @@ test "the fix names an escape in the older form only with rules a run before sho
         defer std.testing.allocator.free(out.bytes);
         try std.testing.expect(std.mem.find(u8, out.bytes, "// aegis: no-danger(A009, A010): probe") != null);
     }
-    // No record of the escape, or one of another line or rules that find nothing now: nothing
-    // is written, and the escape stays for its owner to name.
-    inline for (.{ "", "glint: escape: consumer:9:32: no-danger: probe (A010)\n", "glint: escape: consumer:4:32: no-danger: probe (A013)\n" }) |record| {
+    // No record of the escape, or one of another line, column or words (moved or reworded
+    // since), or of rules that find nothing now, or a line in another form that names it:
+    // nothing is written, and the escape stays for its owner to name.
+    inline for (.{
+        "",
+        "glint: escape: consumer:9:32: no-danger: probe (A010)\n",
+        "glint: escape: consumer:4:30: no-danger: probe (A010)\n",
+        "glint: escape: consumer:4:32: design: probe (A010)\n",
+        "glint: escape: consumer:4:32: no-danger: probe two (A010)\n",
+        "glint: escape: consumer:4:32: no-danger: probe (A013)\n",
+        "note: escape: consumer:4:32: no-danger: probe (A010)\n",
+        "glint: A010: consumer:4:18: see escape: consumer:4:32: no-danger: probe (A010)\n",
+    }) |record| {
         const out = try fixedBy(both, older, record);
         defer std.testing.allocator.free(out.bytes);
         try std.testing.expectEqualStrings(older, out.bytes);
     }
+    // A line in the record's form that is no escape's whole record is refused, not guessed at.
+    var records = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer records.deinit();
+    inline for (.{
+        "escape: consumer:4: no-danger: probe (A010)\n",
+        "escape: consumer:4:32: no-danger probe (A010)\n",
+        "glint: escape: consumer:4:32: no-danger: probe (A010\n",
+        "escape: consumer:4:32: no-danger: probe (A010 near 4:18)\n",
+        "escape: consumer:x:32: no-danger: probe (A010)\n",
+    }) |record| try std.testing.expectError(error.InvalidEscapeRecord, glint.Fix.escapeRecord(records.allocator(), record));
     // An escape is stale only where every rule it names ran: a run of A009 alone keeps an
     // escape naming A010, and one naming A009 and A010.
     inline for (.{ "no-danger(A010)", "no-danger(A009, A013)" }) |escape| {
