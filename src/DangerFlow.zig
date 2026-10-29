@@ -298,7 +298,7 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (!passedOn(c, file, node)) continue;
+        if (!try passedOn(c, file, node)) continue;
         if (!always(c, file, node, body, depth == 0)) continue;
         const callee = try c.facts.resolve(file, call.ast.fn_expr);
         const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
@@ -338,7 +338,7 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
 /// (`catch break`, `catch return`), turns it into a value or another error (`catch return
 /// false`, `return isFatal(e)`) or re-arms it for a later point (`io.recancel()`) lets the
 /// task run on.
-fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
+fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     var at = call;
@@ -369,7 +369,7 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
 /// statement with nothing before it that may leave) from a function whose result is an error
 /// union, or is it as its value where the whole (`whole`, the `catch` or `if`) is returned or
 /// tried (`return f() catch |e| switch (e) { error.Canceled => error.Canceled, ... }`).
-fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex) bool {
+fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
@@ -386,14 +386,14 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
         break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
     };
     const names = [_]?Ast.TokenIndex{ capture, payload };
-    if (returnsIt(c, file, prong, &names)) return true;
+    if (try returnsIt(c, file, prong, &names)) return true;
     // The prong's value is the error, and the whole is returned or tried.
     if (!isIt(tree, prong, &names)) return false;
     var at = whole;
     while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
         .grouped_expression => {},
         .@"try" => return true,
-        .@"return" => return errorResult(c, file, parent),
+        .@"return" => return try errorResult(c, file, parent),
         else => return false,
     };
     return false;
@@ -402,21 +402,21 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
 /// Whether a handler's path returns what it caught itself: `return x` with `x` the error
 /// (`isIt`), alone or as a block's last statement with nothing before it that may leave, from
 /// a function whose result is an error union, where the error goes on as one.
-fn returnsIt(c: *Context, file: Project.FileId, path: Ast.Node.Index, names: []const ?Ast.TokenIndex) bool {
+fn returnsIt(c: *Context, file: Project.FileId, path: Ast.Node.Index, names: []const ?Ast.TokenIndex) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     var at = path;
     while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
     switch (tree.nodeTag(at)) {
         .@"return" => {
             const value = tree.nodeData(at).opt_node.unwrap() orelse return false;
-            return isIt(tree, value, names) and errorResult(c, file, at);
+            return isIt(tree, value, names) and try errorResult(c, file, at);
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, at).?;
             if (statements.len == 0) return false;
             for (statements[0 .. statements.len - 1]) |statement| if (leavesIn(tree, statement)) return false;
-            return returnsIt(c, file, statements[statements.len - 1], names);
+            return try returnsIt(c, file, statements[statements.len - 1], names);
         },
         else => return false,
     }
@@ -436,9 +436,10 @@ fn isIt(tree: *const Ast, node: Ast.Node.Index, names: []const ?Ast.TokenIndex) 
     };
 }
 
-/// Whether the function holding `node` returns an error union (`!T`, `E!T`): what it returns
-/// of an error type goes on as an error, not as a value.
-fn errorResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
+/// Whether the function holding `node` returns an error union (`!T`, `E!T`) whose payload holds
+/// no error (`anyerror`, an error set, or one behind an optional or pointer could take it as a
+/// value): what it returns of an error type goes on as an error.
+fn errorResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
     var at = node;
@@ -448,18 +449,33 @@ fn errorResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return false;
     const result = proto.ast.return_type.unwrap() orelse return false;
-    if (tree.nodeTag(result) == .error_union) return true;
+    if (tree.nodeTag(result) == .error_union) return holdsNoError(try c.facts.resolve(file, tree.nodeData(result).node_and_node[1]));
     const before = tree.firstToken(result);
-    return before > 0 and tree.tokenTag(before - 1) == .bang;
+    if (before == 0 or tree.tokenTag(before - 1) != .bang) return false;
+    return holdsNoError(try c.facts.resolve(file, result));
+}
+
+/// Whether a type is known to hold no error value: a primitive other than `anyerror`, a
+/// struct, enum or union, or memory or an optional of one.
+fn holdsNoError(t: Facts.Value) bool {
+    return switch (t) {
+        .primitive => |name| !std.mem.eql(u8, name, "anyerror"),
+        .container => true,
+        .pointer, .array, .optional => |inner| holdsNoError(inner.*),
+        else => false,
+    };
 }
 
 /// Whether `node` runs on every pass of the body `body` (a loop's, or a function's): on no
 /// branch, prong, inner loop or right side of an `and`, `or`, `orelse` or `catch`, and after no
-/// statement that may leave the pass (a `continue`, `break` or `return` in it). Where `periodic`,
-/// a branch in one of the two periodic forms (`periodic`) runs on a pass in turn.
+/// statement that may end the pass while what runs it goes on: in a function's body any that may
+/// leave it (`leavesIn`), in a loop's one that may skip to the next pass (`skipsIn`), as a
+/// `return` or `try` there ends the loop too. Where `periodic`, a branch in one of the two
+/// periodic forms (`periodic`) runs on a pass in turn.
 fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.Index, every_so_often: bool) bool {
     const tree = &c.project.files[file.raw()].tree;
     const model = &c.project.models[file.raw()];
+    const function = if (model.node_parents[@backingInt(body)]) |holder| tree.nodeTag(holder) == .fn_decl else true; // safe: a node index indexes its own tree's parent table.
     var at = node;
     while (at != body) {
         const parent = model.node_parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
@@ -471,7 +487,7 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Nod
                 var buffer: [2]Ast.Node.Index = undefined;
                 for (tree.blockStatements(&buffer, parent).?) |statement| {
                     if (statement == at) break;
-                    if (leavesIn(tree, statement)) return false;
+                    if (if (function) leavesIn(tree, statement) else skipsIn(tree, statement)) return false;
                 }
             },
             else => if (tree.fullIf(parent)) |branch| {
@@ -764,17 +780,30 @@ fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!
         const whole = std.mem.eql(u8, name, "takeByte") or std.mem.eql(u8, name, "takeByteSigned") or std.mem.eql(u8, name, "takeInt") or std.mem.eql(u8, name, "takeVarInt") or std.mem.eql(u8, name, "takeLeb128") or std.mem.eql(u8, name, "takeEnum");
         const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Range.nonzero(c, c.file, call.ast.params[0]) else false;
         if (taken and try Taint.isRead(c, flow, c.file, call) and always(c, c.file, node, body, false)) return true;
-        if (std.mem.eql(u8, name, "checkCancel") and passedOn(c, c.file, node) and always(c, c.file, node, body, false)) return true;
+        if (std.mem.eql(u8, name, "checkCancel") and try passedOn(c, c.file, node) and always(c, c.file, node, body, false)) return true;
     }
     return false;
 }
 
-/// Whether a statement holds a `continue`, `break` or `return`.
+/// Whether a statement may leave the path it is on: a `continue`, `break`, `return` or `try`.
 fn leavesIn(tree: *const Ast, statement: Ast.Node.Index) bool {
     const first = tree.firstToken(statement);
     const last = tree.lastToken(statement);
     for (first..last + 1) |token| switch (tree.tokenTag(@intCast(token))) {
-        .keyword_continue, .keyword_break, .keyword_return => return true,
+        .keyword_continue, .keyword_break, .keyword_return, .keyword_try => return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether a statement may end a loop's pass while the loop goes on: a `continue`, or a `break`
+/// that may be a labeled block's. A `return` or `try` ends the loop with the pass, which bounds
+/// it no less.
+fn skipsIn(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (first..last + 1) |token| switch (tree.tokenTag(@intCast(token))) {
+        .keyword_continue, .keyword_break => return true,
         else => {},
     };
     return false;
@@ -791,8 +820,8 @@ fn clears(c: *Context, condition: Ast.Node.Index, body: Ast.Node.Index) bool {
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, body) orelse return false;
     for (statements) |statement| {
-        // A statement before that may leave the pass leaves the bit set.
-        if (leavesIn(tree, statement)) return false;
+        // A statement before that may end the pass leaves the bit set.
+        if (skipsIn(tree, statement)) return false;
         const target, const operand = switch (tree.nodeTag(statement)) {
             .assign_bit_and, .assign_shr => tree.nodeData(statement).node_and_node,
             else => continue,

@@ -246,8 +246,15 @@ fn upper(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.I
     const tree = &c.project.files[file.raw()].tree;
     if (tree.nodeTag(node) != .identifier and tree.nodeTag(node) != .field_access) return null;
     var out: ?u128 = null;
-    // A position the function indexes or slices memory with is below a length.
+    // A position the function indexes or slices memory with is below a length, and so is one
+    // read below a length where it is used (a std search's in what it searched).
     if (try position(c, file, node)) out = length(pointer);
+    const named_value = alias(c, file, node);
+    for (try gather(c, file, at)) |fact| {
+        if (!fact.read) continue;
+        const base, const k = offset(tree, fact.small);
+        if (same(tree, base, node) or (named_value != null and same(tree, base, named_value.?))) out = narrower(out, length(pointer) -| k);
+    }
     for (try facts(c, file, at)) |fact| {
         // `node + k` at most a value puts `node` at most that value less `k`.
         const base, const k = offset(tree, fact.small);
@@ -568,7 +575,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node) orelse return null;
             return switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse returned(c, decl, pointer, next),
+                .function => |decl| (try extreme(c, file, decl, call, pointer)) orelse (try readCount(c, file, decl, call)) orelse returned(c, decl, pointer, next),
                 else => null,
             };
         },
@@ -588,8 +595,22 @@ fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.C
     return null;
 }
 
-/// What a function returns at most, read once per function and pointer width: the widest of
-/// its `return`s, each read in its body.
+/// The count std's `Io.Reader.readSliceShort` returns: at most its buffer's length, where the
+/// buffer is an array of a length the program fixes (`&buf`, or a pointer to one).
+fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call) Context.Error!?u128 {
+    if (call.ast.params.len == 0) return null;
+    for ((try Governed.declarations(c, "std", "Io.Reader.readSliceShort")) orelse return null) |each| {
+        if (!each.file.eql(decl.file) or each.index != decl.index) continue;
+        const tree = &c.project.files[file.raw()].tree;
+        var buffer = bare(tree, call.ast.params[call.ast.params.len - 1]);
+        if (tree.nodeTag(buffer) == .address_of) buffer = bare(tree, tree.nodeData(buffer).node);
+        return fixedLength(c, file, buffer);
+    }
+    return null;
+}
+
+/// What a function of the program returns at most, read once per function and pointer width:
+/// the widest of its `return`s, each read in its body.
 const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty };
 
 fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
@@ -598,9 +619,12 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     if (memo.map.get(key)) |known| return known;
     // A function that reaches itself is read as unbounded while it is being read.
     try memo.map.put(c.allocator, key, null);
+    // Only the program's own functions are read: a dependency's body is its to change.
+    if (!c.project.inputs[decl.file.raw()].selected) return null;
     const tree = &c.project.files[decl.file.raw()].tree;
     const model = &c.project.models[decl.file.raw()];
-    const function = model.declarations[decl.index].node;
+    // A function is declared at its prototype; its body is the declaration around it.
+    const function = model.node_parents[@backingInt(model.declarations[decl.index].node)] orelse return null; // safe: a node index indexes its own tree's parent table.
     if (tree.nodeTag(function) != .fn_decl) return null;
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
@@ -1131,7 +1155,9 @@ fn prong(c: *Context, decl: Facts.Decl) ?Reach {
 }
 
 /// Whether a divisor cannot be zero: a literal other than zero, `@max(k, x)` with `k` at least
-/// one, an inline prong's capture whose items are all above zero, a constant naming one, or a
+/// one, an inline prong's capture whose items are all above zero, a constant naming one, a sum
+/// (`+`, which stops where it overflows) of parts at zero or above one of which is not zero, an
+/// odd literal shifted left (`1 << k`: the amount's type keeps the bit within the width), or a
 /// value a comparison holding where it is read puts above zero (`if (n == 0) return`, `if (x >=
 /// 1)`, or above another value that cannot be negative: the `else` of `if (a >= len)`).
 pub fn nonzero(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
@@ -1156,6 +1182,15 @@ fn nonzeroAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.No
             if (constantOf(c, file, value)) |local| if (local.ast.init_node.unwrap()) |init| {
                 if (try nonzeroAt(c, file, init, at, depth + 1)) return true;
             };
+        },
+        // A shift keeps a set lowest bit within the width (the amount's type is below it).
+        .shl => if ((literal(tree, bare(tree, tree.nodeData(value).node_and_node[0])) orelse 0) & 1 == 1) return true,
+        .add => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            const parts = for (widths(c)) |pointer| {
+                if (!try nonnegativeAt(c, file, lhs, at, pointer, depth + 1) or !try nonnegativeAt(c, file, rhs, at, pointer, depth + 1)) break false;
+            } else true;
+            if (parts and (try nonzeroAt(c, file, lhs, at, depth + 1) or try nonzeroAt(c, file, rhs, at, depth + 1))) return true;
         },
         else => {},
     }
@@ -2728,6 +2763,8 @@ fn ordered(c: *Context, file: Project.FileId, node: Ast.Node.Index, lhs: Ast.Nod
         }
     };
     const taken = literal(tree, rhs);
+    // One taken from what is above zero (`(@as(u128, 1) << k) - 1`).
+    if (taken == 1 and try nonnegative(c, file, lhs, pointer) and try nonzero(c, file, lhs)) return true;
     for (try facts(c, file, node)) |fact| {
         if (!same(tree, fact.large, lhs)) {
             // At most what is left of `lhs` once something is taken from it (`if (size > end -
@@ -2886,6 +2923,26 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     // so is a `for` counter over its length or beside it.
     if (try remainderOf(c, file, index, memory)) return true;
     if (try counted(c, file, index, memory)) return true;
+    // A least of several (`@min(x, m.len - 1)`) is at most each: one within is enough; and the
+    // length less what cannot be zero is below it (where it would go under zero it stops).
+    const tree = &c.project.files[file.raw()].tree;
+    const at = bare(tree, index);
+    switch (tree.nodeTag(at)) {
+        .sub => {
+            const whole, const taken = tree.nodeData(at).node_and_node;
+            if (lengthOf(c, file, whole, memory) and !try varies(c, file, memory) and (end or try nonzero(c, file, taken))) {
+                const kept_above = for (widths(c)) |pointer| {
+                    if (!try nonnegative(c, file, taken, pointer)) break false;
+                } else true;
+                if (kept_above) return true;
+            }
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@min")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (Facts.builtinArgs(tree, at, &buffer)) |arg| if (try within(c, file, arg, memory, end)) return true;
+        },
+        else => {},
+    }
     const held_here = try gather(c, file, index);
     for (widths(c)) |pointer| {
         if (try fixedLength(c, file, memory)) |n| {
@@ -3360,7 +3417,8 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
             break :blk array_type;
         },
         .field => (decl_tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap(),
-        .parameter => null,
+        // A parameter holds what its type says: the compiler checks every call gives that.
+        .parameter => c.facts.parameterTypeNode(decl),
         else => null,
     };
     var t = type_node orelse return null;

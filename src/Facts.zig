@@ -2733,6 +2733,22 @@ fn settledByCalls(self: *Facts, decl: Decl) ResolveError!?usize {
     return null;
 }
 
+/// The type expression a function's parameter is declared with (in its own file), or null for
+/// `anytype` or a parameter of no function the file declares.
+pub fn parameterTypeNode(self: *const Facts, parameter: Decl) ?Ast.Node.Index {
+    const model = &self.project.models[parameter.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.files[parameter.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
+    const function = self.functionOf(parameter) orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[function.index].node) orelse return null;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        if (param.name_token != model.declarations[parameter.index].token) continue;
+        return param.type_expr;
+    }
+    return null;
+}
+
 fn functionOf(self: *const Facts, parameter: Decl) ?Decl {
     const model = &self.project.models[parameter.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
     const scope = model.scopes[model.declarations[parameter.index].scope];

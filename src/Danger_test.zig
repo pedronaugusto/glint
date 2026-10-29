@@ -720,8 +720,10 @@ const input_program =
     \\}
 ;
 
-test "A009 finds input that indexes or slices input, names a path, and a number that picks a table entry or bounds a loop; it leaves clean, fixed and refined values and a byte picking a table entry" {
-    try expect(pack.untrusted_input, input_program, 6);
+test "A009 finds input that indexes or slices input, names a path, a byte or number that picks an entry of a table of unknown length, and a number that bounds a loop; it leaves clean, fixed and refined values" {
+    // The bytes `table[n]`, `table[0..len]` and `table[pick(n)]` choose: `table`'s length is
+    // the caller's, which nothing here shows holds a byte.
+    try expect(pack.untrusted_input, input_program, 9);
 }
 
 test "A009's input is a child's output and a file's contents, aegis's whole-file read's too, never the path or allocator a read is given; an escape on a read's line makes it no less input" {
@@ -784,7 +786,7 @@ test "every flow rule reads what an escaped read gives as input in each function
     try std.testing.expectEqualSlices(u32, &.{13}, allocated.lines[0..allocated.findings]);
 }
 
-test "positions std finds in input, a read's count and a value under a clean bound are clean; a number assembled by hand is a number, and a 16-bit decode is data" {
+test "positions std finds in input, a read's count and a value under a length stay within their memory; a number assembled by hand is a number, and a 16-bit decode is data" {
     const program =
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader, table: []const u8) !usize {
@@ -806,8 +808,9 @@ test "positions std finds in input, a read's count and a value under a clean bou
     try expect(pack.integers, program, 3);
 }
 
-test "A010 finds arithmetic on a number from input, not on its bytes" {
-    try expect(pack.integers, input_program, 1);
+test "A010 finds arithmetic on input that may overflow its type: a byte's sum and product as a number's" {
+    // `n + 1` and `len * 2` on a byte stop at 255 and 128; `count + 1` at the u32's top.
+    try expect(pack.integers, input_program, 3);
 }
 
 test "A010 leaves what a number's range holds: arithmetic that cannot overflow its type and a conversion its destination holds, from a decode's width, a typed local, @as and a constant" {
@@ -1000,14 +1003,16 @@ test "A018 reads the peer writers a package declares" {
     }
 }
 
-test "A020 finds a loop on input or without bound that gives its Io to nothing" {
+test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
+    // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\pub fn serve(io: std.Io, r: *std.Io.Reader) void { _ = io; while (true) { _ = r.takeByte() catch return; } }
-        \\pub fn polite(io: std.Io, r: *std.Io.Reader) void { while (true) { io.checkCancel() catch return; _ = r.takeByte() catch return; } }
+        \\pub fn polite(io: std.Io, r: *std.Io.Reader) !void { while (true) { try io.checkCancel(); _ = r.takeByte() catch return; } }
+        \\pub fn quiet(io: std.Io, r: *std.Io.Reader) void { while (true) { io.checkCancel() catch return; _ = r.takeByte() catch return; } }
         \\pub fn counted(io: std.Io, r: *std.Io.Reader) void { const n = r.takeInt(u32, 0) catch return; var i: u32 = 0; while (i < n) : (i += 1) {} _ = io; }
         \\pub fn plain(io: std.Io) void { var i: u8 = 0; while (i < 10) : (i += 1) {} _ = io; }
-    , 2);
+    , 3);
 }
 
 /// `program` after the fixes of `rule`'s findings and its stale escapes.
@@ -1416,9 +1421,10 @@ test "A009 reads a parser's returned literal as the parse refines it: its number
         \\}
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    // The loops the parsed memory's bytes and the direct call's count bound; never the parsed
-    // count's, through the header it is stored in.
-    try std.testing.expectEqualSlices(u32, &.{ 21, 26 }, result.lines[0..result.findings]);
+    // The parsed count (at most 16 bits) picking an entry of a table of unknown length, and
+    // the loops the parsed memory's bytes and the direct call's count bound; never the loop the
+    // parsed count bounds, through the header it is stored in.
+    try std.testing.expectEqualSlices(u32, &.{ 16, 21, 26 }, result.lines[0..result.findings]);
 }
 
 test "A009 judges a pointer moved by input: no length checks the address it reaches, unless the offset is within the memory it came from" {
@@ -2456,7 +2462,8 @@ test "A010 reads a clamp among the block's other assignments before a difference
         \\    return short;
         \\}
     , 0);
-    // A block that may change the clamped value again keeps nothing.
+    // A block that may change the clamped value again keeps nothing: the difference, and the
+    // sum on a value that may be the byte read or `at.*`'s whole range.
     try expect(pack.integers,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader, at: *usize, more: bool) !void {
@@ -2467,7 +2474,7 @@ test "A010 reads a clamp among the block's other assignments before a difference
         \\    }
         \\    at.* -= n;
         \\}
-    , 1);
+    , 2);
 }
 
 test "A010 takes no input into a comptime parameter, which the program fixes when it is compiled" {
@@ -2841,7 +2848,8 @@ test "A020 reads a project function's body, not its declared error set, and no c
     ;
     // Each loop runs on through a cancel, or loses it: one dropped, a set that only declares it,
     // a choice per target whose body never cancels, a function that turns it into a value or
-    // another error.
+    // another error, one that re-arms it and returns another error, and a plain return or break
+    // that ends the loop but hands the caller no error.Canceled.
     inline for (.{
         "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        io.checkCancel() catch {};\n        total +%= i;\n    }\n    return total;\n}\n",
         "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    _ = &io;\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) total +%= try step(i);\n    return total;\n}\n",
@@ -2852,16 +2860,16 @@ test "A020 reads a project function's body, not its declared error set, and no c
         "pub fn f(io: std.Io) !void {\n    while (true) try renamed(io);\n}\n",
         "pub fn f(io: std.Io) void {\n    while (true) if (!found(io)) return;\n}\n",
         "pub fn f(io: std.Io, r: *std.Io.Reader) !u64 {\n    var total: u64 = 0;\n    const n = try r.takeInt(u32, .little);\n    var i: u32 = 0;\n    while (i < n) : (i += 1) {\n        if (i == 0) try io.checkCancel();\n        total +%= i;\n    }\n    return total;\n}\n",
+        "pub fn f(io: std.Io) !void {\n    while (true) try rearmed(io);\n}\n",
+        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch return;\n}\n",
+        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch break;\n}\n",
     }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
-    // Each passes it on or ends the loop for it.
+    // Each passes error.Canceled itself on.
     inline for (.{
         "pub fn f(io: std.Io) !void {\n    while (true) try passed(io);\n}\n",
-        "pub fn f(io: std.Io) !void {\n    while (true) try rearmed(io);\n}\n",
-        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch return;\n}\n",
-        "pub fn f(io: std.Io) void {\n    while (true) io.checkCancel() catch break;\n}\n",
         "pub fn f(io: std.Io) !void {\n    while (true) io.checkCancel() catch |e| return e;\n}\n",
         "pub fn f(io: std.Io) !void {\n    while (true) try mapped(io);\n}\n",
         "pub fn f(io: std.Io) !void {\n    while (true) try captured(io);\n}\n",
@@ -3442,7 +3450,9 @@ test "A009 reads the length a union field's capture or an allocator's create poi
 
 test "A010 reads a negation's operand by every value its variable is given, a saturating sum of digits, a remainder, and a widened value" {
     // relic's date parsers: a sign applied to digits read with `*|` and `+|`, a zone's
-    // minutes negated in place, git's `tz` integer, an offset widened before it is negated.
+    // minutes negated in place, git's `tz` integer, an offset widened before it is negated. The
+    // negations are clean; `tz`'s product and sum are not: its parameter's range is its caller's,
+    // and at the i32's whole range `@divTrunc(abs, 60) * 100` passes the top.
     try expect(pack.integers,
         \\const std = @import("std");
         \\fn digits(s: []const u8, neg: bool) i64 {
@@ -3475,7 +3485,7 @@ test "A010 reads a negation's operand by every value its variable is given, a sa
         \\    _ = widened(o, n);
         \\    return digits(s, s[0] == '-') +| zone(s[2..], s[1]) +| tz(@intCast(o & 0xffff));
         \\}
-    , 0);
+    , 2);
     // A variable given a negative value elsewhere or through its address, a product that may be
     // the minimum, and a full-width value stay findings.
     const head =
@@ -3590,4 +3600,650 @@ test "A010 reads a field by its stores only while nothing writes its struct's by
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
+}
+test "A009 reads a parse's number at the bound its parser compared it with a constant on every path to its return, and judges it against the memory it indexes" {
+    // The second probe review's caps (N2): a bound past the table, one against another number
+    // the peer sent, a return the check does not dominate, a check on another branch, a value
+    // read again after it, a bound that leaves nearly the whole range, a lower bound alone.
+    const head =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const E = error{Short};
+        \\
+    ;
+    try expect(pack.untrusted_input, head ++ "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n >= 16) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: *const [16]u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n", 0);
+    inline for (.{
+        "const Cap = struct { count: u32 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n >= 1_000_000) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: *const [16]u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 8) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    const m = std.mem.readInt(u32, b[4..8], .little);\n    if (n >= m) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(8)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 5) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (b[4] == 1) return .{ .count = n };\n    if (n >= 16) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(5)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 5) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n < 16) return .{ .count = n };\n    if (b[4] == 1) return .{ .count = n };\n    return error.Short;\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(5)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    var small = false;\n    if (n < 16) small = true;\n    std.mem.doNotOptimizeAway(small);\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n < 16) {\n        std.mem.doNotOptimizeAway(n);\n    } else {\n        return .{ .count = n };\n    }\n    return .{ .count = 0 };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 8) return error.Short;\n    var n: u32 = std.mem.readInt(u32, b[0..4], .little);\n    if (n >= 16) return error.Short;\n    n = std.mem.readInt(u32, b[4..8], .little);\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(8)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n == 0xffff_ffff) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: usize };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 8) return error.Short;\n    const n = std.mem.readInt(u64, b[0..8], .little);\n    if (n > std.math.maxInt(u64) - 1) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(8)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+        "const Cap = struct { count: u64 };\nfn parseCap(_: void, b: []const u8) E!Cap {\n    if (b.len < 4) return error.Short;\n    const n = std.mem.readInt(u32, b[0..4], .little);\n    if (n < 16) return error.Short;\n    return .{ .count = n };\n}\npub fn capped(r: *std.Io.Reader, table: []const u8) !u8 {\n    const parsed = try aegis.input.Untrusted([]const u8).init(try r.take(4)).parse({}, parseCap);\n    return table[parsed.count];\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A009 judges a byte or a short picking an entry of a table shorter than its type's range, through a parse too; a byte picks one of 256" {
+    // The second probe review's tables (M-N7): a short's range is past a 256-entry table and a
+    // byte's past a 16-entry one; a slice's length is the caller's.
+    try expect(pack.untrusted_input, "const std = @import(\"std\");\npub fn look(r: *std.Io.Reader, table: *const [256]u8) !u8 {\n    const i: u32 = try r.takeInt(u8, .little);\n    return table[i];\n}\n", 0);
+    inline for (.{
+        "const std = @import(\"std\");\npub fn look(r: *std.Io.Reader, table: *const [16]u8) !u8 {\n    const i: u8 = try r.takeByte();\n    return table[i];\n}\n",
+        "const std = @import(\"std\");\npub fn look(r: *std.Io.Reader, table: *const [256]u8) !u8 {\n    const i: u32 = try r.takeInt(u16, .little);\n    return table[i];\n}\n",
+        "const std = @import(\"std\");\npub fn look(r: *std.Io.Reader, table: *const [256]u8) !u8 {\n    const i: u32 = try r.takeInt(u32, .little);\n    return table[i];\n}\n",
+        "const std = @import(\"std\");\npub fn look(r: *std.Io.Reader, table: []const u8) !u8 {\n    const i: u32 = try r.takeInt(u16, .little);\n    return table[i];\n}\n",
+        "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst E = error{Short};\nconst Hdr = struct { index: u32 };\nfn parseHdr(_: void, b: []const u8) E!Hdr {\n    if (b.len < 1) return error.Short;\n    return .{ .index = b[0] };\n}\npub fn look(r: *std.Io.Reader, table: *const [16]u8) !u8 {\n    const h = try aegis.input.Untrusted([]const u8).init(try r.take(1)).parse({}, parseHdr);\n    return table[h.index];\n}\n",
+        "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst E = error{Short};\nconst Hdr = struct { index: u32 };\nfn parseHdr(_: void, b: []const u8) E!Hdr {\n    if (b.len < 2) return error.Short;\n    return .{ .index = std.mem.readInt(u16, b[0..2], .little) };\n}\npub fn look(r: *std.Io.Reader, table: *const [256]u8) !u8 {\n    const h = try aegis.input.Untrusted([]const u8).init(try r.take(2)).parse({}, parseHdr);\n    return table[h.index];\n}\n",
+        "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst E = error{Short};\nconst Hdr = struct { index: u32 };\nfn parseHdr(_: void, b: []const u8) E!Hdr {\n    if (b.len < 2) return error.Short;\n    return .{ .index = std.mem.readInt(u16, b[0..2], .little) };\n}\npub fn look(r: *std.Io.Reader, table: []const u8) !u8 {\n    const h = try aegis.input.Untrusted([]const u8).init(try r.take(2)).parse({}, parseHdr);\n    return table[h.index];\n}\n",
+    }) |body| expect(pack.untrusted_input, body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
+test "A020 counts a cancellation point only where the path error.Canceled takes returns it, and a conditioned check only in the two periodic forms" {
+    // The second probe review's loops (N5): a handler return Canceled never takes or never reaches,
+    // a swallowing else, a helper or catch-all that maps it to another error, a capture of another
+    // call, a check once by a flag, a continue, a no-op reset or a compound condition, a function
+    // pointer, a per-target choice one of which never cancels, a method declared Cancelable that
+    // never cancels, a vtable entry, a check after a continue, a prong that drops it beside one
+    // that returns another, a whole assigned, an else that returns another error.
+    const result = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\// 1. a return in the handler that Canceled never takes
+        \\pub fn condReturn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        io.checkCancel() catch |e| {
+        \\            if (e != error.Canceled) return e;
+        \\        };
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 2. the Canceled prong holds a return it never reaches
+        \\pub fn deadReturn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        io.checkCancel() catch |e| switch (e) {
+        \\            error.Canceled => if (total == 0xffff_ffff_ffff) return e,
+        \\        };
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 3. if/else capture that swallows
+        \\pub fn elseSwallow(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        if (io.checkCancel()) |_| {} else |err| switch (err) {
+        \\            error.Canceled => {},
+        \\        }
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 4. a helper that maps Canceled to another error, returned
+        \\const Bad = error{Bad};
+        \\fn fail(_: anyerror) Bad {
+        \\    return error.Bad;
+        \\}
+        \\fn step(io: std.Io) Bad!void {
+        \\    io.checkCancel() catch |e| return fail(e);
+        \\}
+        \\pub fn mappedHelper(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        step(io) catch {};
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 5. a callee whose catch-all maps Canceled away, returned as a whole
+        \\fn step2(io: std.Io) error{Timeout}!void {
+        \\    return io.checkCancel() catch |e| switch (e) {
+        \\        else => error.Timeout,
+        \\    };
+        \\}
+        \\pub fn catchAll(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try step2(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 6. a callee that returns the capture's value, but the capture was from another call
+        \\fn step3(io: std.Io, r: *std.Io.Reader) !void {
+        \\    io.checkCancel() catch {};
+        \\    _ = r.takeByte() catch |e| return e;
+        \\}
+        \\pub fn otherCapture(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try step3(io, r);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 7. once, by a flag
+        \\pub fn onceFlag(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    var first = true;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        if (first) {
+        \\            first = false;
+        \\            try io.checkCancel();
+        \\        }
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 8. once, by continue before the call
+        \\pub fn onceContinue(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        total +%= i;
+        \\        if (i != 0) continue;
+        \\        try io.checkCancel();
+        \\    }
+        \\    return total;
+        \\}
+        \\// 9. once, with a no-op reset
+        \\pub fn onceNoopReset(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        if (i == 0) {
+        \\            i += 0;
+        \\            try io.checkCancel();
+        \\        }
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 10. once, compound condition
+        \\pub fn onceAnd(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        if (i == 0 and n > 0) try io.checkCancel();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 11. a function pointer to a project function that never cancels
+        \\fn tick(_: std.Io) std.Io.Cancelable!void {}
+        \\const tickPtr: *const fn (std.Io) std.Io.Cancelable!void = &tick;
+        \\pub fn fnPtr(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try tickPtr(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 12. a switch-chosen callee per target, one choice never cancels
+        \\fn waitPosix(io: std.Io) std.Io.Cancelable!void {
+        \\    try io.checkCancel();
+        \\}
+        \\fn waitOther(_: std.Io) std.Io.Cancelable!void {}
+        \\const wait = switch (builtin.os.tag) {
+        \\    .linux, .macos => waitPosix,
+        \\    else => waitOther,
+        \\};
+        \\pub fn switchChosen(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try wait(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 13. a method that never cancels, declared Cancelable
+        \\const T = struct {
+        \\    io: std.Io,
+        \\    fn poll(_: *T) std.Io.Cancelable!void {}
+        \\};
+        \\pub fn method(io: std.Io, t: *T, r: *std.Io.Reader) !u64 {
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try t.poll();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 14. a vtable entry
+        \\const VT = struct { poll: *const fn () std.Io.Cancelable!void };
+        \\pub fn vtable(io: std.Io, vt: *const VT, r: *std.Io.Reader) !u64 {
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try vt.poll();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 15. the cancel point after a break that always runs first
+        \\pub fn afterBreak(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        total +%= i;
+        \\        if (total != 0xffff_ffff_ffff) continue;
+        \\        try io.checkCancel();
+        \\    }
+        \\    return total;
+        \\}
+        \\// 16. a catch whose prong names Canceled with another, returns the other only
+        \\pub fn multiValue(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = io.sleep(.fromMilliseconds(0), .awake) catch |e| switch (e) {
+        \\            error.Canceled => {},
+        \\            else => return e,
+        \\        };
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 17. returned-whole form where the prong is the capture but the whole is assigned
+        \\fn step4(io: std.Io) !void {
+        \\    const res = io.checkCancel() catch |e| switch (e) {
+        \\        error.Canceled => e,
+        \\    };
+        \\    _ = res;
+        \\}
+        \\pub fn assignedWhole(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try step4(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// 18. the if/else form where else returns a different error
+        \\fn step5(io: std.Io) error{Bad}!void {
+        \\    if (io.checkCancel()) |_| {} else |err| switch (err) {
+        \\        error.Canceled => return error.Bad,
+        \\    }
+        \\}
+        \\pub fn elseOther(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        step5(io) catch {};
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 8, 21, 34, 54, 70, 85, 97, 111, 123, 137, 150, 169, 185, 198, 209, 221, 241, 257 }, result.lines[0..result.findings]);
+}
+
+test "A020 reads an error returned as a value as no cancellation point: a dropped arm, a swallowing else, a value from the error, a payload that can hold it" {
+    // The second probe review's helpers (N5): `case_e` returns the capture from a function whose
+    // payload (`?anyerror`) can take it as a value; `case_g`'s helpers pass it on.
+    const result = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\// a) whole returned, the Canceled arm drops it
+        \\fn armDrops(io: std.Io) !void {
+        \\    return io.checkCancel() catch |e| switch (e) {
+        \\        error.Canceled => {},
+        \\    };
+        \\}
+        \\pub fn case_a(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try armDrops(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// b) if/else capture whose else swallows
+        \\fn elseSwallows(io: std.Io) !void {
+        \\    if (io.checkCancel()) |_| {} else |err| switch (err) {
+        \\        error.Canceled => {},
+        \\    }
+        \\}
+        \\pub fn case_b(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try elseSwallows(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// c) whole returned, catch-all maps Canceled to a value
+        \\fn catchAllValue(io: std.Io) !bool {
+        \\    return if (io.checkCancel()) |_| true else |err| switch (err) {
+        \\        else => false,
+        \\    };
+        \\}
+        \\pub fn case_c(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = try catchAllValue(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// d) the handler returns a value computed from the error: false on cancel
+        \\fn isFatal(e: anyerror) bool {
+        \\    return e == error.Unexpected;
+        \\}
+        \\fn toValue(io: std.Io) !bool {
+        \\    io.checkCancel() catch |e| return isFatal(e);
+        \\    return true;
+        \\}
+        \\pub fn case_d(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = try toValue(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// e) the if/else form, the else returns a value naming the capture
+        \\fn elseValue(io: std.Io) !?anyerror {
+        \\    if (io.checkCancel()) |_| {} else |err| return err;
+        \\    return null;
+        \\}
+        \\pub fn case_e(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = try elseValue(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// f) whole returned, prong value is the error, but the function's type makes it a value
+        \\fn asValue(io: std.Io) anyerror {
+        \\    return io.checkCancel() catch |err| switch (err) {
+        \\        error.Canceled => error.Canceled,
+        \\    };
+        \\}
+        \\pub fn case_f(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = asValue(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\// g) the safe twins
+        \\fn passes(io: std.Io) !void {
+        \\    return io.checkCancel() catch |err| switch (err) {
+        \\        error.Canceled => error.Canceled,
+        \\    };
+        \\}
+        \\fn elsePasses(io: std.Io) !void {
+        \\    if (io.checkCancel()) |_| {} else |err| return err;
+        \\}
+        \\pub fn case_g(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try passes(io);
+        \\        try elsePasses(io);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 12, 28, 44, 62, 77, 93 }, result.lines[0..result.findings]);
+}
+
+test "A020 reads a method by its body, not its declared error set, however it is called" {
+    // The second probe review's methods: declared Cancelable through a pointer, by value and called
+    // through its type, never cancels; a plain method gives the loop nothing.
+    const result = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\const T = struct {
+        \\    io: std.Io,
+        \\    // declares Cancelable, never cancels
+        \\    fn poll(_: *T) std.Io.Cancelable!void {}
+        \\    fn plain(_: *T) void {}
+        \\};
+        \\pub fn declared(io: std.Io, t: *T, r: *std.Io.Reader) !u64 {
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try t.poll();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn plainBase(io: std.Io, t: *T, r: *std.Io.Reader) !u64 {
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        t.plain();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn valueRecv(io: std.Io, t: T, r: *std.Io.Reader) !u64 {
+        \\    var tt = t;
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try tt.poll();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn direct(io: std.Io, t: *T, r: *std.Io.Reader) !u64 {
+        \\    _ = &io;
+        \\    var total: u64 = 0;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        try T.poll(t);
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 13, 24, 36, 47 }, result.lines[0..result.findings]);
+}
+
+test "A009 reads an array parameter's length from its declared type: a checked byte, a byte into 256 entries" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: [16]u8) !u8 {
+        \\    const b = try r.takeByte();
+        \\    if (b >= 16) return 0;
+        \\    return table[b];
+        \\}
+        \\pub fn g(r: *std.Io.Reader, table: *const [256]u8) !u8 {
+        \\    return table[try r.takeByte()];
+        \\}
+    , 0);
+    // An unchecked byte past a 16-entry array, a check past its length.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: *const [16]u8) !u8 {
+        \\    return table[try r.takeByte()];
+        \\}
+        \\pub fn g(r: *std.Io.Reader, table: [16]u8) !u8 {
+        \\    const b = try r.takeByte();
+        \\    if (b > 16) return 0;
+        \\    return table[b];
+        \\}
+    , 2);
+}
+
+test "A009 reads a short read's count as at most its buffer's length, and a least of several as at most each" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var buf: [8]u8 = undefined;
+        \\    const got = try r.readSliceShort(&buf);
+        \\    _ = buf[0..got];
+        \\    const b = try r.takeByte();
+        \\    _ = table[0 .. table.len - @min(b, table.len)];
+        \\    return table[@min(b, table.len - 1)];
+        \\}
+    , 0);
+    // A count read into a larger buffer than the one sliced, a least still at the length, and a
+    // length less what may be zero.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var big: [8]u8 = undefined;
+        \\    var small: [4]u8 = undefined;
+        \\    const many = try r.readSliceShort(&big);
+        \\    _ = small[0..many];
+        \\    const b = try r.takeByte();
+        \\    _ = table[@min(b, table.len)];
+        \\    return table[table.len - b];
+        \\}
+    , 3);
+}
+
+test "A010 reads a position a std search found as below a length, a call by what the program's function returns, and one less a value above zero" {
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn twenty() usize {
+        \\    return 20;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u128 {
+        \\    const line = try r.take(16);
+        \\    const space = std.mem.findScalar(u8, line, ' ') orelse return 0;
+        \\    const b: usize = try r.takeByte();
+        \\    _ = b + twenty();
+        \\    const k = try r.takeInt(u8, 0);
+        \\    if (k >= 128) return 0;
+        \\    return (@as(u128, 1) << @intCast(k)) - 1 + space + 1;
+        \\}
+    , 0);
+    // A function that returns what it is given, a shifted even value that may leave zero, and
+    // a number from input plus one.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\fn same(v: usize) usize {
+        \\    return v;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, x: usize) !u128 {
+        \\    const b: usize = try r.takeByte();
+        \\    _ = b + same(x);
+        \\    const k = try r.takeInt(u8, 0);
+        \\    if (k >= 128) return 0;
+        \\    _ = (@as(u128, 2) << @intCast(k)) - 1;
+        \\    return try r.takeInt(u64, 0) + 1;
+        \\}
+    , 3);
+}
+
+test "A009 leaves a loop that consumes on every pass a return or try may end, and finds one a continue may skip" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !void {
+        \\    var cp: []const u8 = bytes;
+        \\    var n = try r.takeInt(u32, 0);
+        \\    while (n > 0) : (n -= 1) {
+        \\        if (cp.len == 0) return;
+        \\        const slash = std.mem.findScalar(u8, cp, '/') orelse return error.Short;
+        \\        cp = cp[slash + 1 ..];
+        \\    }
+        \\}
+    , 0);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, bytes: []const u8) !void {
+        \\    var cp: []const u8 = bytes;
+        \\    var n = try r.takeInt(u32, 0);
+        \\    while (n > 0) : (n -= 1) {
+        \\        if (cp.len == 0) continue;
+        \\        const slash = std.mem.findScalar(u8, cp, '/') orelse return error.Short;
+        \\        cp = cp[slash + 1 ..];
+        \\    }
+        \\}
+    , 1);
+}
+
+test "A020 reads a check a function body may return before as no cancellation point of a call, and one a loop's pass may return before as one" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn f(io: std.Io, r: *std.Io.Reader) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        if (i == 7) return;
+        \\        try io.checkCancel();
+        \\    }
+        \\}
+    , 0);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\fn step(io: std.Io, i: u32) !void {
+        \\    if (i != 7) return;
+        \\    try io.checkCancel();
+        \\}
+        \\pub fn f(io: std.Io, r: *std.Io.Reader) !void {
+        \\    const n = try r.takeInt(u32, 0);
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) try step(io, i);
+        \\}
+    , 1);
 }
