@@ -252,15 +252,10 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         if (value == .container) container = value.container;
     }
     const io_type = container orelse return;
-    var reader_type: ?Facts.Container = null;
-    if (try Governed.declarations(c, "std", "Io.Reader")) |found| for (found) |decl| {
-        const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
-        if (value == .container) reader_type = value.container;
-    };
     const flow = try Taint.get(c, .input);
     const tree = &c.project.files[c.file.raw()].tree;
     const model = &c.project.models[c.file.raw()];
-    for (model.declarations, 0..) |decl, d| {
+    for (model.declarations) |decl| {
         if (decl.kind != .parameter or c.inTest(decl.token)) continue;
         const value = try c.facts.resolve(c.file, decl.node);
         const held = switch (value) {
@@ -280,39 +275,17 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 by_input = (try ranged(c, flow, lhs)).join(try ranged(c, flow, rhs)).reaches(.number);
             }
             if (!unbounded and !by_input) continue;
-            if (gives(c, loop.ast.then_expr, @intCast(d)) or refills(c, loop.ast.then_expr, @intCast(d))) continue;
-            if (try cancels(c, c.file, loop.ast.then_expr, io_type, reader_type, 0)) continue;
-            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} that gives '{s}' to nothing: no cancellation point, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it", .{ if (unbounded) "with no bound" else "bound by input", decl.name, decl.name }));
+            if (try cancels(c, c.file, loop.ast.then_expr, 0)) continue;
+            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls can return error.Canceled, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
         }
     }
 }
 
-/// Whether a loop's body calls a method of a reader or writer made from the `Io` `d`
-/// (`file.reader(io, &buffer)`, called as itself or through `&reader.interface`): its refill or
-/// drain goes through that `Io`, a cancellation point.
-fn refills(c: *Context, body: Ast.Node.Index, d: u32) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
-        if (token < first or token > last) continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
-        if (madeFrom(c, tree.nodeData(call.ast.fn_expr).node_and_token[0], d)) return true;
-    }
-    return false;
-}
-
-/// Whether a body reaches a cancellation point through what it calls: `checkCancel`, a call
-/// given an `Io` (the function's own or one a value holds, `c.socket.io`), or a consuming read
-/// (`take*`, `read*`, `discard*`, `stream*`, `fillMore`) on the interface of a std reader made
-/// from an `Io` (`File.Reader`, `net.Stream.Reader`), whose refill goes through it; in the body
-/// or in a function of the project it calls, to a depth of four. A bare `std.Io.Reader` may be
-/// a fixed one over the program's bytes, which no `Io` refills: never one.
-fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, io: Facts.Container, reader: ?Facts.Container, depth: u8) Context.Error!bool {
+/// Whether a body reaches a cancellation point: a call whose callee can return
+/// `error.Canceled` by its declared error set (`checkCancel`, an `Io` operation's
+/// `Cancelable`), in the body or in a function of the project it calls, to a depth of four. A
+/// call is none for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name.
+fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 4) return false;
     const tree = &c.project.files[file.raw()].tree;
     const first = tree.firstToken(body);
@@ -323,98 +296,50 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, io: Facts.Co
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        for (call.ast.params) |arg| if (try holds(c, file, arg, io)) return true;
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-            const receiver, const name_token = tree.nodeData(call.ast.fn_expr).node_and_token;
-            const name = tree.tokenSlice(name_token);
-            if (std.mem.eql(u8, name, "checkCancel") and try holds(c, file, receiver, io)) return true;
-            var consuming = std.mem.eql(u8, name, "fillMore");
-            for ([_][]const u8{ "take", "read", "discard", "stream" }) |prefix| consuming = consuming or std.mem.startsWith(u8, name, prefix);
-            if (consuming and reader != null and try streamed(c, file, receiver, reader.?)) return true;
-        }
         const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
             .function => |decl| decl,
             else => continue,
         };
-        if (!c.project.inputs[callee.file.raw()].selected) continue;
-        const callee_model = &c.project.models[callee.file.raw()];
-        const parent = callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)] orelse continue; // safe: a node index indexes its own tree's parent table.
         const callee_tree = &c.project.files[callee.file.raw()].tree;
+        const callee_model = &c.project.models[callee.file.raw()];
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        if (callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[callee.index].node)) |proto| if (proto.ast.return_type.unwrap()) |result| {
+            if (try canceling(c, callee.file, result, 0)) return true;
+        };
+        if (!c.project.inputs[callee.file.raw()].selected) continue;
+        const parent = callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)] orelse continue; // safe: a node index indexes its own tree's parent table.
         if (callee_tree.nodeTag(parent) != .fn_decl) continue;
-        if (try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], io, reader, depth + 1)) return true;
+        if (try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1)) return true;
     }
     return false;
 }
 
-/// Whether a value is an `Io`, or a pointer to one.
-fn holds(c: *Context, file: Project.FileId, node: Ast.Node.Index, io: Facts.Container) Context.Error!bool {
-    var held = try c.facts.resolve(file, node);
-    if (held == .pointer) held = held.pointer.*;
-    return switch (held) {
-        .instance => |k| k.file.eql(io.file) and k.scope == io.scope,
-        else => false,
-    };
-}
-
-/// Whether a reader is the `interface` of a std reader other than `Io.Reader` itself, which
-/// holds the `Io` its refill goes through (`file_reader.interface`, `&stream_reader.interface`).
-fn streamed(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, reader: Facts.Container) Context.Error!bool {
+/// Whether a result type's error set holds `error.Canceled`: a set literal naming it, a merge
+/// with one that does, or a declaration whose value is such a set (`Io.Cancelable`).
+fn canceling(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 8) return false;
     const tree = &c.project.files[file.raw()].tree;
-    var at = receiver;
-    while (tree.nodeTag(at) == .address_of or tree.nodeTag(at) == .grouped_expression) at = switch (tree.nodeTag(at)) {
-        .address_of => tree.nodeData(at).node,
-        else => tree.nodeData(at).node_and_token[0],
-    };
-    if (tree.nodeTag(at) != .field_access) return false;
-    const holder, const name = tree.nodeData(at).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(name), "interface")) return false;
-    var held = try c.facts.resolve(file, holder);
-    if (held == .pointer) held = held.pointer.*;
-    const k = switch (held) {
-        .instance => |k| k,
+    switch (tree.nodeTag(node)) {
+        .error_union => return canceling(c, file, tree.nodeData(node).node_and_node[0], depth + 1),
+        .merge_error_sets => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return try canceling(c, file, lhs, depth + 1) or try canceling(c, file, rhs, depth + 1);
+        },
+        .grouped_expression => return canceling(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .error_set_decl => {
+            for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| {
+                if (tree.tokenTag(@intCast(token)) == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Canceled")) return true;
+            }
+            return false;
+        },
+        .identifier, .field_access => {
+            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.models[file.raw()].reference(node) orelse return false).declaration orelse return false) } else (try c.facts.definition(file, node)) orelse return false;
+            const declared = &c.project.files[decl.file.raw()].tree;
+            const variable = declared.fullVarDecl(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
+            return canceling(c, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
+        },
         else => return false,
-    };
-    if (k.file.eql(reader.file) and k.scope == reader.scope) return false;
-    const model = &c.project.models[k.file.raw()];
-    if (!c.project.inputs[k.file.raw()].selected and model.scopes[k.scope].kind == .container) {
-        const declared = model.scopes[k.scope].node;
-        const parent = model.node_parents[@backingInt(declared)] orelse return false; // safe: a node index indexes its own tree's parent table.
-        const k_tree = &c.project.files[k.file.raw()].tree;
-        const variable = k_tree.fullVarDecl(parent) orelse return false;
-        return std.mem.eql(u8, k_tree.tokenSlice(variable.ast.mut_token + 1), "Reader") and c.facts.member(k, "io") != null;
     }
-    return false;
-}
-
-/// Whether a receiver is a local made by a call given the declaration `d`, followed through
-/// fields, addresses and the locals that name it.
-fn madeFrom(c: *Context, receiver: Ast.Node.Index, d: u32) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    var at = receiver;
-    var steps: u8 = 0;
-    while (steps < 8) : (steps += 1) {
-        switch (tree.nodeTag(at)) {
-            .address_of => at = tree.nodeData(at).node,
-            .field_access => at = tree.nodeData(at).node_and_token[0],
-            .identifier => {
-                const ref = model.reference(at) orelse return false;
-                const local = ref.declaration orelse return false;
-                const variable = tree.fullVarDecl(model.declarations[local].node) orelse return false;
-                const init = variable.ast.init_node.unwrap() orelse return false;
-                var buffer: [1]Ast.Node.Index = undefined;
-                if (tree.fullCall(&buffer, init)) |made| {
-                    for (made.ast.params) |arg| if (tree.nodeTag(arg) == .identifier) {
-                        if ((model.reference(arg) orelse continue).declaration == d) return true;
-                    };
-                    return false;
-                }
-                at = init;
-            },
-            else => return false,
-        }
-    }
-    return false;
 }
 
 /// The `fn_decl` holding `node`.
@@ -433,23 +358,6 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
     const a = functionOf(c, node) orelse return false;
     const b = functionOf(c, param) orelse return false;
     return a == b;
-}
-
-/// Whether `body` names the declaration `d` anywhere: a call given it, a method called on it.
-fn gives(c: *Context, body: Ast.Node.Index, d: u32) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    const first = tree.firstToken(body);
-    const last = tree.lastToken(body);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
-        if (token < first or token > last) continue;
-        const ref = model.reference(node) orelse continue;
-        if (ref.declaration == d) return true;
-    }
-    return false;
 }
 
 /// A sink in the checked file: a finding where the value is input, undecided where the fact

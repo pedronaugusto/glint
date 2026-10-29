@@ -2016,7 +2016,7 @@ test "A010 reads a plain struct's field by every value the program stores in it,
     , 4);
 }
 
-test "A020 counts a refill through a reader made from the function's Io as a cancellation point, never one passed in or over the program's own bytes" {
+test "A020 counts no read as a cancellation point whose error set holds no error.Canceled: a file reader's refill reports a cancel as ReadFailed" {
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\pub fn drain(io: std.Io, file: std.Io.File, buffer: []u8) void {
@@ -2029,7 +2029,7 @@ test "A020 counts a refill through a reader made from the function's Io as a can
         \\    var fixed: std.Io.Reader = .fixed(bytes);
         \\    while (true) _ = fixed.takeByte() catch return;
         \\}
-    , 1);
+    , 2);
 }
 
 test "A010 reads a type made from its backing integer as holding the operand where each value it can have is one of the type's" {
@@ -2159,9 +2159,10 @@ test "A014 reads a local list nothing grows or frees once its items are stored a
     };
 }
 
-test "A020 reads a cancellation point the loop reaches through the project's functions: a call given an Io a value holds, checkCancel, a read on a std stream reader's interface" {
-    // uplink's connection loop (its socket holds the Io), relic's fetch-pack packets (read
-    // from the transport's stream reader).
+test "A020 reads a cancellation point the loop reaches through the project's functions: a call whose error set holds error.Canceled, never one only given an Io" {
+    // uplink's connection loop (its socket holds the Io); relic's fetch-pack packets read from
+    // a stream reader, which reports a cancel as ReadFailed, and a call only given the Io, are
+    // no cancellation point.
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\const Socket = struct { io: std.Io, file: std.Io.File, reader: std.Io.File.Reader };
@@ -2185,7 +2186,15 @@ test "A020 reads a cancellation point the loop reaches through the project's fun
         \\    _ = io;
         \\    while (true) send(s.io, s);
         \\}
-    , 0);
+        \\fn now(io: std.Io) u64 {
+        \\    _ = io;
+        \\    return 0;
+        \\}
+        \\pub fn clock(io: std.Io) void {
+        \\    var total: u64 = 0;
+        \\    while (true) total +%= now(io);
+        \\}
+    , 3);
     // A reader passed in may be a fixed one over the program's bytes, a toss never refills, and
     // a function that reaches no Io is no cancellation point.
     const head =
