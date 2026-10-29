@@ -29,6 +29,7 @@ const std_files = [_]sources.Extra{
     \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
+    \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
@@ -2119,6 +2120,48 @@ test "A020 counts no read as a cancellation point whose error set holds no error
         \\    while (true) _ = fixed.takeByte() catch return;
         \\}
     , 2);
+}
+
+test "A020 reads a call of a function or method chosen per target as a cancellation point where every choice is one" {
+    // visor's input wait (`wait = if (is_windows) waitWindows else waitPosix`) and conduit's
+    // reaper, which waits through a `Cgroup` chosen per target.
+    const head =
+        \\const std = @import("std");
+        \\const windows = @import("builtin").os.tag == .windows;
+        \\fn waitWindows(io: std.Io) std.Io.Cancelable!u8 { try io.checkCancel(); return 0; }
+        \\fn waitPosix(io: std.Io) (error{EndOfStream} || std.Io.Cancelable)!u8 { try io.checkCancel(); return 1; }
+        \\fn spinWindows(io: std.Io) u8 { _ = io; return 0; }
+        \\const LinuxCgroup = struct {
+        \\    fn waitEmpty(g: *const LinuxCgroup, io: std.Io) std.Io.Cancelable!bool { _ = g; try io.checkCancel(); return true; }
+        \\};
+        \\const NoCgroup = struct {
+        \\    fn waitEmpty(g: *const NoCgroup, io: std.Io) std.Io.Cancelable!bool { _ = g; _ = io; return true; }
+        \\};
+        \\const StubCgroup = struct {
+        \\    fn waitEmpty(g: *const StubCgroup, io: std.Io) bool { _ = g; _ = io; return true; }
+        \\};
+        \\
+    ;
+    try expect(pack.cancellation, head ++
+        \\const wait = if (windows) waitWindows else waitPosix;
+        \\pub fn read(io: std.Io) !void {
+        \\    while (true) if (try wait(io) == 0) return;
+        \\}
+    , 0);
+    try expect(pack.cancellation, head ++
+        \\const Cgroup = if (windows) NoCgroup else LinuxCgroup;
+        \\pub fn reap(io: std.Io, group: *const Cgroup) !void {
+        \\    while (true) if (try group.waitEmpty(io)) return;
+        \\}
+    , 0);
+    // A choice that cannot return error.Canceled leaves the call no cancellation point.
+    inline for (.{
+        "const wait = if (windows) spinWindows else waitPosix;\npub fn read(io: std.Io) !void {\n    while (true) if (try wait(io) == 0) return;\n}\n",
+        "const Cgroup = if (windows) StubCgroup else LinuxCgroup;\npub fn reap(io: std.Io, group: *const Cgroup) !void {\n    while (true) if (try group.waitEmpty(io)) return;\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
 }
 
 test "A010 reads a type made from its backing integer as holding the operand where each value it can have is one of the type's" {

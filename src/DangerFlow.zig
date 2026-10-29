@@ -282,7 +282,9 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
 /// Whether a body reaches a cancellation point: a call whose callee can return
 /// `error.Canceled` by its declared error set (`checkCancel`, an `Io` operation's
 /// `Cancelable`), in the body or in a function of the project it calls, to a depth of four. A
-/// call is none for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name.
+/// call is none for being given an `Io` (`Clock.now(io)` cannot cancel), nor for its name. A
+/// callee chosen per target (`const wait = if (windows) waitWindows else waitPosix`, or a method
+/// of a type so chosen) is one where every choice is.
 fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) Context.Error!bool {
     if (depth > 4) return false;
     const tree = &c.project.files[file.raw()].tree;
@@ -294,22 +296,29 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-            .function => |decl| decl,
-            else => continue,
-        };
-        const callee_tree = &c.project.files[callee.file.raw()].tree;
-        const callee_model = &c.project.models[callee.file.raw()];
-        var proto_buffer: [1]Ast.Node.Index = undefined;
-        if (callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[callee.index].node)) |proto| if (proto.ast.return_type.unwrap()) |result| {
-            if (try canceling(c, callee.file, result, 0)) return true;
-        };
-        if (!c.project.inputs[callee.file.raw()].selected) continue;
-        const parent = callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)] orelse continue; // safe: a node index indexes its own tree's parent table.
-        if (callee_tree.nodeTag(parent) != .fn_decl) continue;
-        if (try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1)) return true;
+        const callee = try c.facts.resolve(file, call.ast.fn_expr);
+        const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
+        const every = for (choices) |choice| {
+            if (choice != .function or !try callCancels(c, choice.function, depth)) break false;
+        } else true;
+        if (every) return true;
     }
     return false;
+}
+
+/// Whether a call of `callee` is a cancellation point: its declared error set holds
+/// `error.Canceled`, or, a function of the project, its body reaches one.
+fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
+    const callee_tree = &c.project.files[callee.file.raw()].tree;
+    const callee_model = &c.project.models[callee.file.raw()];
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    if (callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[callee.index].node)) |proto| if (proto.ast.return_type.unwrap()) |result| {
+        if (try canceling(c, callee.file, result, 0)) return true;
+    };
+    if (!c.project.inputs[callee.file.raw()].selected) return false;
+    const parent = callee_model.node_parents[@backingInt(callee_model.declarations[callee.index].node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    if (callee_tree.nodeTag(parent) != .fn_decl) return false;
+    return cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1);
 }
 
 /// Whether a result type's error set holds `error.Canceled`: a set literal naming it, a merge
