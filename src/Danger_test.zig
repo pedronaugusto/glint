@@ -1600,6 +1600,40 @@ test "A009 reads a parse's number as refined only where its parser compares it o
     };
 }
 
+test "A009 clears a pointer moved within its memory only where it is read at its first element: what is left past the offset is all the comparison shows" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn plus5(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o < out.len) return (out.ptr + o)[5];
+        \\    return 0;
+        \\}
+        \\pub fn copy16(r: *std.Io.Reader, out: []u8, dst: *[16]u8) !void {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o < out.len) @memcpy(dst, (out.ptr + o)[0..16]);
+        \\}
+        \\pub fn kept(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o >= out.len) return 0;
+        \\    const p = out.ptr + o;
+        \\    return p[1];
+        \\}
+        \\pub fn first(r: *std.Io.Reader, out: []u8) !u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o < out.len) return (out.ptr + o)[0];
+        \\    return 0;
+        \\}
+        \\pub fn one(r: *std.Io.Reader, out: []u8) ![]u8 {
+        \\    const o: usize = try r.takeInt(u32, .little);
+        \\    if (o >= out.len) return error.Short;
+        \\    return (out.ptr + o)[0..1];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The read five past, the sixteen bytes, the pointer kept; never a first element's read.
+    try std.testing.expectEqualSlices(u32, &.{ 4, 9, 14 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");

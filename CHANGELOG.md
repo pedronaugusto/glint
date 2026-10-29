@@ -14,6 +14,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- A009 clears a pointer moved within its memory (`x.ptr + o`, `o < x.len`) only where it is read at its first element (`[0]`, `[0..1]`): the comparison leaves `x.len - o` bytes, at least one. A read further on, a longer slice, or the moved pointer kept or given on is judged, where the comparison cleared every read through it.
 - A parse's number is refined only where its parser holds it to 16 bits or a comparison in it bounds it below its type: a wider type than its source (a `u32` read returned as `u64` or `usize`, or put in a `u64` field) is no bound, as a peer fills the `u32`. A tuple's numbers are read one by one, each against its field's type, where a tuple read as no number at all. A field read through a parse whose result's type is one of several no longer comes back clean where one choice has no such field (an optional beside a struct): the choices that hold it are read.
 - A009 judges a pointer moved by input (`out.ptr + o`, `m - offset`, `p += n`): no length checks the address it reaches, unless the offset is shown below the length of the memory the pointer came from. It was left to A009 and A009 never judged it, so a package may see findings it had not.
 - A010 reads `@enumFromInt` and `@fromBackingInt` into a type that fills its backing integer as safe only for an operand shown within that integer: a wider operand or a signed one is a finding. Any operand was cleared.

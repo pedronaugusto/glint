@@ -379,8 +379,10 @@ pub fn addresses(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
     return pointerValue(c, file, tree.nodeData(node).node_and_node[0], 0);
 }
 
-/// Whether pointer arithmetic stays within the memory its pointer came from: an offset below
-/// the length of `x` for `x.ptr + o`.
+/// Whether pointer arithmetic stays within the memory its pointer came from, and so does what
+/// is read through it: `x.ptr + o` with `o` below the length of `x` leaves `x.len - o` bytes, at
+/// least one, so a read of its first element (`(x.ptr + o)[0]`, `[0..1]`) is within. Any other
+/// read, or the moved pointer kept or given on, reaches past what the comparison shows.
 pub fn movedWithin(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.files[file.raw()].tree;
     const base, const moved = tree.nodeData(node).node_and_node;
@@ -388,7 +390,28 @@ pub fn movedWithin(c: *Context, file: Project.FileId, node: Ast.Node.Index) Cont
     if (tree.nodeTag(at) != .field_access) return false;
     const memory, const name = tree.nodeData(at).node_and_token;
     if (!std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return false;
+    if (!firstRead(c, file, node)) return false;
     return within(c, file, moved, memory, false);
+}
+
+/// Whether a moved pointer is read only at its first element, where it is computed.
+fn firstRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &c.project.files[file.raw()].tree;
+    const parents = c.project.models[file.raw()].node_parents;
+    var at = node;
+    var parent = parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    while (tree.nodeTag(parent) == .grouped_expression) {
+        at = parent;
+        parent = parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    }
+    if (tree.nodeTag(parent) == .array_access) {
+        const reached, const index = tree.nodeData(parent).node_and_node;
+        return reached == at and literal(tree, index) == 0;
+    }
+    const slice = tree.fullSlice(parent) orelse return false;
+    if (slice.ast.sliced != at or literal(tree, slice.ast.start) != 0) return false;
+    const end = slice.ast.end.unwrap() orelse return false;
+    return (literal(tree, end) orelse return false) <= 1;
 }
 
 /// Whether a value is a pointer: one it resolves to, an address moved from one (`p + i`,
