@@ -1089,13 +1089,41 @@ fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 
 /// Whether a parser's result field holds a value it showed the range of: a number or a `bool`
 /// by its declared type, no memory a peer's bytes could stand behind, given a value narrower
-/// than that type (`Range.shown`).
+/// than that type (`Range.shown`); or an optional or array of one, given `null`, such a
+/// value, or an array literal each element of which is one; each arm of a branch so.
 fn shownField(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
     const tree = &c.project.files[decl.file.raw()].tree;
     const field = tree.fullContainerField(c.project.models[decl.file.raw()].declarations[decl.index].node) orelse return false;
-    const declared = field.ast.type_expr.unwrap() orelse return false;
-    if (tree.nodeTag(declared) != .identifier or !Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)))) return false;
-    return Range.shown(c, file, value, decl.file, declared);
+    return shownAs(c, file, value, decl.file, field.ast.type_expr.unwrap() orelse return false);
+}
+
+fn shownAs(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_file: Project.FileId, declared: Ast.Node.Index) Context.Error!bool {
+    const types = &c.project.files[declared_file.raw()].tree;
+    const tree = &c.project.files[file.raw()].tree;
+    // Each arm a branch gives is a value given.
+    if (tree.fullIf(value)) |branch| {
+        const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+        return try shownAs(c, file, branch.ast.then_expr, declared_file, declared) and try shownAs(c, file, otherwise, declared_file, declared);
+    }
+    if (tree.nodeTag(value) == .grouped_expression) return shownAs(c, file, tree.nodeData(value).node_and_token[0], declared_file, declared);
+    switch (types.nodeTag(declared)) {
+        .identifier => {
+            if (!Model.primitive(types.tokenSlice(types.nodeMainToken(declared)))) return false;
+            return Range.shown(c, file, value, declared_file, declared);
+        },
+        .optional_type => {
+            if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) return true;
+            return shownAs(c, file, value, declared_file, types.nodeData(declared).node);
+        },
+        .array_type, .array_type_sentinel => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullArrayInit(&buffer, value) orelse return false;
+            const element = types.fullArrayType(declared).?.ast.elem_type;
+            for (literal.ast.elements) |each| if (!try shownAs(c, file, each, declared_file, element)) return false;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// A parser's return of a number it shows no range of, other than in a literal of its result

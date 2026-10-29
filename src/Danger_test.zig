@@ -1577,6 +1577,48 @@ test "A009 reads a field of a constant the compiler evaluates as the constant's,
     try std.testing.expectEqualSlices(u32, &.{ 27, 31, 33 }, result.lines[0..result.findings]);
 }
 
+test "A009 reads a parser's returned optionals and array literals of numbers as refined where it shows each number's range" {
+    // A parsed table's optional size and its literal pairs: each number narrower than its type.
+    const result = try run(pack.untrusted_input,
+        \\const aegis = @import("aegis");
+        \\const Table = struct { pair: [2]u32, compressed: ?u32, norm: [2]u16 };
+        \\fn readTable(_: void, in: []const u8) error{Short}!Table {
+        \\    if (in.len < 8) return error.Short;
+        \\    return .{
+        \\        .pair = .{ in[3], @as(u32, in[4]) << 8 | in[5] },
+        \\        .compressed = if (in[0] == 0) null else @as(u32, in[1]) << 8 | in[2],
+        \\        .norm = .{ in[6], @as(u16, in[6]) << 8 | in[7] },
+        \\    };
+        \\}
+        \\const Wide = struct { both: [2]u32, size: ?u32 };
+        \\fn readWide(_: void, in: []const u8) error{Short}!Wide {
+        \\    if (in.len < 8) return error.Short;
+        \\    const w = @as(u32, in[0]) << 24 | @as(u32, in[1]) << 16 | @as(u32, in[2]) << 8 | in[3];
+        \\    return .{ .both = .{ in[3], w }, .size = if (in[0] == 0) null else w };
+        \\}
+        \\pub fn parsed(in: []const u8) !void {
+        \\    const t = try aegis.input.Untrusted([]const u8).init(in).parse({}, readTable);
+        \\    var n: usize = t.pair[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var m: usize = t.compressed orelse 0;
+        \\    while (m > 0) : (m -= 1) {}
+        \\    var k: usize = t.norm[1];
+        \\    while (k > 0) : (k -= 1) {}
+        \\}
+        \\pub fn wide(in: []const u8) !void {
+        \\    const t = try aegis.input.Untrusted([]const u8).init(in).parse({}, readWide);
+        \\    var n: usize = t.both[1];
+        \\    while (n > 0) : (n -= 1) {}
+        \\    var m: usize = t.size orelse 0;
+        \\    while (m > 0) : (m -= 1) {}
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    // The pair element that fills its u16, and the pair and size a full word fills; never the
+    // pair and size the parser held to two bytes.
+    try std.testing.expectEqualSlices(u32, &.{ 24, 29, 31 }, result.lines[0..result.findings]);
+}
+
 test "A010 leaves float arithmetic, which gives an infinity where an integer's stops: a division by a sample, a sum of them" {
     const result = try run(pack.integers,
         \\const std = @import("std");
