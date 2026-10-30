@@ -705,6 +705,17 @@ test "A002 reads a copy from any place an owner is read through, an assignment's
     try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { const v = s.expose(); return v; }", pack.copies, true, 1);
     try expectJudged(head ++ "const R = struct { v: *const u32 };\npub fn f(s: *S(u32)) R { return .{ .v = s.expose() }; }", pack.copies, true, 1);
     try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { var v: *const u32 = undefined; v = s.expose(); return v; }", pack.copies, true, 1);
+    // A local put back in itself is followed once (each hop of `head = head orelse x` doubled
+    // the walk); a borrow in any of its values is still returned.
+    try expectJudged(head ++ "pub fn f(s: *S(u32), xs: []const u32) ?*const u32 { var head: ?*const u32 = null; for (xs) |x| { if (x == 1) head = head orelse null; if (x == 2) head = head orelse null; if (x == 3) head = head orelse null; } _ = s; return head orelse null; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(s: *S(u32), xs: []const u32) ?*const u32 { var head: ?*const u32 = null; for (xs) |x| { if (x == 1) head = head orelse null; if (x == 2) head = head orelse null; if (x == 3) head = head orelse s.expose(); } return head orelse null; }", pack.copies, true, 1);
+    // A chain of locals past the depth the walk follows leaves the return undecided.
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(std.testing.allocator);
+    try chain.appendSlice(std.testing.allocator, head ++ "pub fn f(s: *S(u32)) *const u32 { const v0 = s.expose();");
+    for (1..300) |i| try chain.print(std.testing.allocator, " const v{d} = v{d};", .{ i, i - 1 });
+    try chain.appendSlice(std.testing.allocator, " return v299; }");
+    try expectJudged(chain.items, pack.copies, false, 0);
     // A reservation moved out of a local nothing reads again is moved; one whose address was
     // taken first is still reached through that address.
     const budget = "const bounded = @import(\"aegis\").bounded;\n";
