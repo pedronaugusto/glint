@@ -22,6 +22,8 @@ const std_files = [_]sources.Extra{
     \\pub const zig = @import("zig.zig");
     \\pub const fmt = @import("fmt.zig");
     \\pub const DoublyLinkedList = @import("DoublyLinkedList.zig");
+    \\pub const ascii = @import("ascii.zig");
+    \\pub const base64 = @import("base64.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -72,6 +74,7 @@ const std_files = [_]sources.Extra{
     \\pub const sign = struct { pub const Ed25519 = @import("crypto/ed25519.zig").Ed25519; };
     \\pub fn secureZero(comptime T: type, s: []volatile T) void { for (s) |*b| b.* = 0; }
     \\pub const hash = struct { pub const sha2 = @import("crypto/sha2.zig"); };
+    \\pub const auth = struct { pub const hmac = @import("crypto/hmac.zig"); };
     },
     .{ .name = "std/crypto/timing_safe.zig", .bytes =
     \\pub fn eql(comptime T: type, a: T, b: T) bool { return a == b; }
@@ -152,7 +155,7 @@ const std_files = [_]sources.Extra{
     \\fn Sha2x32(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     \\fn Sha2x64(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     },
-    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }\npub fn hexToBytes(out: []u8, input: []const u8) ![]u8 { if (input.len & 1 != 0) return error.InvalidLength; if (out.len * 2 < input.len) return error.NoSpaceLeft; return out[0 .. input.len / 2]; }" },
+    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }\npub fn hexToBytes(out: []u8, input: []const u8) ![]u8 { if (input.len & 1 != 0) return error.InvalidLength; if (out.len * 2 < input.len) return error.NoSpaceLeft; return out[0 .. input.len / 2]; }\npub fn printInt(buffer: []u8, value: anytype, base: u8, case: u1, options: struct {}) usize { _ = value; _ = base; _ = case; _ = options; return buffer.len; }" },
     .{ .name = "std/DoublyLinkedList.zig", .bytes =
     \\const DoublyLinkedList = @This();
     \\first: ?*Node = null,
@@ -161,6 +164,20 @@ const std_files = [_]sources.Extra{
     \\pub fn append(list: *DoublyLinkedList, new_node: *Node) void { list.last = new_node; }
     \\pub fn prepend(list: *DoublyLinkedList, new_node: *Node) void { list.first = new_node; }
     \\pub fn popFirst(list: *DoublyLinkedList) ?*Node { return list.first; }
+    },
+    .{ .name = "std/ascii.zig", .bytes =
+    \\pub fn lowerString(output: []u8, ascii_string: []const u8) []u8 { for (ascii_string, 0..) |c, i| output[i] = c; return output[0..ascii_string.len]; }
+    \\pub fn upperString(output: []u8, ascii_string: []const u8) []u8 { for (ascii_string, 0..) |c, i| output[i] = c; return output[0..ascii_string.len]; }
+    },
+    .{ .name = "std/base64.zig", .bytes =
+    \\pub const Base64Encoder = struct { pad: u8, pub fn encode(encoder: *const Base64Encoder, dest: []u8, source: []const u8) []const u8 { _ = encoder; return dest[0..source.len]; } };
+    \\pub const Base64Decoder = struct { pad: u8, pub fn decode(decoder: *const Base64Decoder, dest: []u8, source: []const u8) !void { _ = decoder; _ = dest; _ = source; } };
+    \\pub const Codecs = struct { Encoder: Base64Encoder, Decoder: Base64Decoder };
+    \\pub const standard: Codecs = .{ .Encoder = .{ .pad = 0 }, .Decoder = .{ .pad = 0 } };
+    },
+    .{ .name = "std/crypto/hmac.zig", .bytes =
+    \\pub const sha2 = struct { pub const HmacSha256 = Hmac(32); };
+    \\fn Hmac(comptime len: comptime_int) type { return struct { const Self = @This(); pub const mac_length = len; pub fn init(key: []const u8) Self { _ = key; return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[mac_length]u8) void { _ = d; _ = out; } pub fn create(out: *[mac_length]u8, msg: []const u8, key: []const u8) void { _ = out; _ = msg; _ = key; } }; }
     },
 };
 const std_imports = [_]sources.ExtraImport{
@@ -184,6 +201,9 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 3, .spelling = "crypto/sha2.zig", .target = 17 },
     .{ .from = 0, .spelling = "fmt.zig", .target = 18 },
     .{ .from = 0, .spelling = "DoublyLinkedList.zig", .target = 19 },
+    .{ .from = 0, .spelling = "ascii.zig", .target = 20 },
+    .{ .from = 0, .spelling = "base64.zig", .target = 21 },
+    .{ .from = 3, .spelling = "crypto/hmac.zig", .target = 22 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -1101,6 +1121,87 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
     const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
+}
+
+test "A019 reads a local a function outside the program writes only where its result shows it did" {
+    // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
+    // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size
+    // returned (17), a BOOL's out never read and read past `== .FALSE` (19, 20), a status's
+    // `.SUCCESS` prong (22). Findings: the externs themselves (3-8), status read unchecked (11),
+    // past a test whose two sides both go on (14), past a count (16), a size other than the one
+    // given (18), read after `and` a failure (21), another prong (23), a test of `and` with the
+    // failure on one side (24), a size test that is not the size given (26). Clean too: a size
+    // test in a statement of its own, the type read through `@TypeOf` (25); an array of no
+    // elements (27); a per-build choice of two symbols alike (32). Findings: their externs (28,
+    // 29), read past a test that goes on either way (33).
+    const found = try run(pack.unsafe_set,
+        \\const Status = enum(u32) { SUCCESS = 0, OTHER = 1, _ };
+        \\const BOOL = enum(i32) { FALSE = 0, TRUE = 1 };
+        \\extern "c" fn waitpid(pid: i32, status: *c_int, options: c_int) i32;
+        \\extern "c" fn getrlimit(resource: c_int, rlim: *[2]u64) c_int;
+        \\extern "c" fn read(fd: i32, buf: [*]u8, n: usize) isize;
+        \\extern "c" fn proc_pidinfo(pid: i32, flavor: c_int, arg: u64, buffer: *anyopaque, size: c_int) c_int;
+        \\extern "kernel32" fn GetConsoleMode(h: usize, mode: *u32) BOOL;
+        \\extern "ntdll" fn NtOpenFile(h: *usize, access: u32, attributes: usize, io: *u64) Status;
+        \\fn use(x: anytype) void { _ = x; }
+        \\pub fn w1(pid: i32) ?c_int { var s: c_int = undefined; const rc = waitpid(pid, &s, 1); if (rc == 0) return null; if (rc > 0) return s; return null; }
+        \\pub fn w2(pid: i32) c_int { var s: c_int = undefined; _ = waitpid(pid, &s, 1); return s; }
+        \\pub fn r1() u64 { var l: [2]u64 = undefined; return if (getrlimit(7, &l) == 0) l[0] else 0; }
+        \\pub fn r2() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) != 0) return 0; return l[0]; }
+        \\pub fn r3() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) == 0) {} return l[0]; }
+        \\pub fn n1(fd: i32) void { var b: [8]u8 = undefined; const n = read(fd, &b, b.len); if (n <= 0) return; use(b[0..@intCast(n)]); }
+        \\pub fn n2(fd: i32) void { var b: [8]u8 = undefined; _ = read(fd, &b, b.len); use(b[0..4]); }
+        \\pub fn p1(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == @sizeOf([4]u64)) info[0] else 0; }
+        \\pub fn p2(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == 8) info[0] else 0; }
+        \\pub fn g1(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) != .FALSE; }
+        \\pub fn g2(h: usize) u32 { var m: u32 = undefined; if (GetConsoleMode(h, &m) == .FALSE) return 0; return m; }
+        \\pub fn g3(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) == .FALSE and m == 0; }
+        \\pub fn t1() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .SUCCESS => return h, else => return 0 } }
+        \\pub fn t2() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .OTHER => return h, else => return 0 } }
+        \\pub fn e1(pid: i32) u64 { var l: [2]u64 = undefined; const rc = getrlimit(pid, &l); if (rc != 0 and pid > 0) return 0; return l[0]; }
+        \\pub fn s1(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got != @sizeOf(@TypeOf(info))) return 0; return info[0]; }
+        \\pub fn s2(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got == 0) return 0; return info[0]; }
+        \\pub fn z1(fd: i32) void { var none: [0]u8 = undefined; _ = read(fd, &none, 0); use(&none); }
+        \\extern "c" fn fstat(fd: i32, buf: *[18]u64) c_int;
+        \\extern "c" fn @"fstat$INODE64"(fd: i32, buf: *[18]u64) c_int;
+        \\const stat = if (@import("builtin").cpu.arch == .x86_64) @"fstat$INODE64" else fstat;
+        \\const either = if (@import("builtin").cpu.arch == .x86_64) fstat else waitpid;
+        \\pub fn c1(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) != 0) return 0; return st[0]; }
+        \\pub fn c2(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) == 0) {} return st[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8, 11, 14, 16, 18, 21, 23, 24, 26, 28, 29, 33 }, found.lines[0..found.findings]);
+}
+
+test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
+    // Clean: the program's writers of a part returned as written (9, 10, 11), std's keeps
+    // returning what they fill (15, 17), an HMAC's final and create (18, 19), a count a call
+    // returns read in place (20). Findings: past the part written (12), a bound assigned
+    // between (13), a part written on one path (14), a keep's buffer read (16), past the
+    // count (21).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\fn four(v4: [4]u8, buf: *[16]u8) []const u8 { buf[0..4].* = v4; return buf[0..4]; }
+        \\fn whole(v: [16]u8, buf: *[16]u8) []const u8 { buf.* = v; return buf[0..8]; }
+        \\fn copied(name: []const u8, out: *[64]u8) []const u8 { if (name.len > out.len) return name; @memcpy(out[0..name.len], name); return out[0..name.len]; }
+        \\fn past(v4: [4]u8, buf: *[16]u8) []const u8 { buf[0..4].* = v4; return buf[0..8]; }
+        \\fn moved(src: []const u8, out: *[64]u8) []const u8 { var k = src.len; @memcpy(out[0..k], src); k += 1; return out[0..k]; }
+        \\fn sometimes(v4: [4]u8, buf: *[16]u8, ok: bool) []const u8 { if (ok) buf[0..4].* = v4; return buf[0..4]; }
+        \\pub fn p1(v4: [4]u8) void { var b: [16]u8 = undefined; use(four(v4, &b)); }
+        \\pub fn p2(v: [16]u8) void { var b: [16]u8 = undefined; use(whole(v, &b)); }
+        \\pub fn p3(s: []const u8) void { var b: [64]u8 = undefined; use(copied(s, &b)); }
+        \\pub fn p4(v4: [4]u8) void { var b: [16]u8 = undefined; use(past(v4, &b)); }
+        \\pub fn p5(s: []const u8) void { var b: [64]u8 = undefined; use(moved(s, &b)); }
+        \\pub fn p6(v4: [4]u8, ok: bool) void { var b: [16]u8 = undefined; use(sometimes(v4, &b, ok)); }
+        \\pub fn s1(s: []const u8) void { var b: [64]u8 = undefined; use(std.ascii.lowerString(&b, s)); }
+        \\pub fn s2(s: []const u8) u8 { var b: [64]u8 = undefined; _ = std.ascii.lowerString(&b, s); return b[0]; }
+        \\pub fn s3(s: []const u8) void { var b: [64]u8 = undefined; use(std.base64.standard.Encoder.encode(&b, s)); }
+        \\pub fn h1(m: []const u8) [32]u8 { var out: [32]u8 = undefined; var h = std.crypto.auth.hmac.sha2.HmacSha256.init(m); h.final(&out); return out; }
+        \\pub fn h2(m: []const u8) [32]u8 { var out: [32]u8 = undefined; std.crypto.auth.hmac.sha2.HmacSha256.create(&out, m, m); return out; }
+        \\pub fn n1() void { var b: [20]u8 = undefined; use(b[0..std.fmt.printInt(&b, 7, 10, 0, .{})]); }
+        \\pub fn n2() void { var b: [20]u8 = undefined; use(b[0 .. std.fmt.printInt(&b, 7, 10, 0, .{}) + 1]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 12, 13, 14, 16, 21 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads all of a local through asBytes, a for setting each element after what neither reads it nor leaves, a vector's one buffer, and a prefix read by the count that wrote it" {
