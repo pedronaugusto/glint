@@ -825,6 +825,28 @@ test "A019 reads std's hashers as filling their output by declaration, and keeps
     try std.testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15, 17 }, found.lines[0..found.findings]);
 }
 
+test "A019 keeps nothing it read past its depth: a keeper first reached at the end of a long chain is still one where it is called directly" {
+    // k0 hands the buffer through nine of the program's keepers, past how deep they are read
+    // (line 13: handed on); a call of the last of them reads it as a keeper (14).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn k8(buf: []u8) std.Io.Writer { return .fixed(buf); }
+        \\fn k7(buf: []u8) std.Io.Writer { return k8(buf); }
+        \\fn k6(buf: []u8) std.Io.Writer { return k7(buf); }
+        \\fn k5(buf: []u8) std.Io.Writer { return k6(buf); }
+        \\fn k4(buf: []u8) std.Io.Writer { return k5(buf); }
+        \\fn k3(buf: []u8) std.Io.Writer { return k4(buf); }
+        \\fn k2(buf: []u8) std.Io.Writer { return k3(buf); }
+        \\fn k1(buf: []u8) std.Io.Writer { return k2(buf); }
+        \\fn k0(buf: []u8) std.Io.Writer { return k1(buf); }
+        \\fn use(w: anytype) void { _ = w; }
+        \\
+        \\pub fn deep() void { var b: [8]u8 = undefined; use(k0(&b)); }
+        \\pub fn direct() void { var b: [8]u8 = undefined; use(k8(&b)); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{13}, found.lines[0..found.findings]);
+}
+
 test "A014 finds a borrow of a std container's storage stored in a field" {
     try expect(pack.lifetimes,
         \\const std = @import("std");

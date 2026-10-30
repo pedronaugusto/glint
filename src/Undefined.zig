@@ -552,11 +552,10 @@ fn names(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
 /// each mention of the parameter hands all of it to one of std's keeps or to another such
 /// function, or reads its length. It writes none of it and reads none of it itself.
 fn keepsOnly(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
-    const memo = try c.facts.memo(Keeps);
-    const key: Writes.Key = .{ .decl = decl, .index = index };
-    if (memo.map.get(key)) |known| return known;
-    try memo.map.put(c.allocator, key, false);
-    if (depth > depth_limit) return false;
+    return remembered(c, .{ .decl = decl, .index = index, .question = .keeps }, depth, keepsOnlyRead);
+}
+
+fn keepsOnlyRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
     const found = (try parameter(c, decl, index)) orelse return false;
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
@@ -569,11 +568,8 @@ fn keepsOnly(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, mention) orelse return false;
         if (try walk.handedTo(parent, call, position, false, true, tree.nodeMainToken(mention)) != null) return false;
     }
-    try memo.map.put(c.allocator, key, true);
     return true;
 }
-
-const Keeps = struct { map: std.AutoHashMapUnmanaged(Writes.Key, bool) = .empty };
 
 /// A function's parameter at `index`: its declaration, where its type is a pointer the
 /// function may write through, and the function's body.
@@ -604,27 +600,44 @@ fn parameter(c: *Context, decl: Facts.Decl, index: usize) Context.Error!?struct 
 /// at before any read of it, on every path that returns, read once per function and parameter.
 /// A parameter that is not a mutable pointer, or a function without a body, writes nothing.
 fn writesWhole(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
-    const memo = try c.facts.memo(Writes);
-    const key: Writes.Key = .{ .decl = decl, .index = index };
-    if (memo.map.get(key)) |known| return known;
-    // A cycle back to a function being read shows nothing.
-    try memo.map.put(c.allocator, key, false);
-    if (depth > depth_limit) return false;
+    return remembered(c, .{ .decl = decl, .index = index, .question = .writes }, depth, writesWholeRead);
+}
+
+fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
     const found = (try parameter(c, decl, index)) orelse return false;
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = c.project.at(decl.file).file.tree.blockStatements(&buffer, found.body) orelse return false;
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
     const end = try walk.sequence(statements, .unwritten);
-    const shown = walk.read == null and !walk.exit_unwritten and (end == .written or end == .left);
-    try memo.map.put(c.allocator, key, shown);
-    return shown;
+    return walk.read == null and !walk.exit_unwritten and (end == .written or end == .left);
 }
 
-const Writes = struct {
-    const Key = struct { decl: Facts.Decl, index: usize };
-    map: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+/// What the program's functions were found to do with a parameter, kept once per function,
+/// parameter and question. A reading cut short (a cycle back to a function being read, or one
+/// past the depth) shows nothing, and what was read while one was is not kept: it depends on
+/// where the reading began, and another reading may show more.
+const Calls = struct {
+    const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps } };
+    found: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+    active: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    cuts: usize = 0,
 };
+
+fn remembered(c: *Context, key: Calls.Key, depth: u8, comptime read: fn (*Context, Facts.Decl, usize, u8) Context.Error!bool) Context.Error!bool {
+    const memo = try c.facts.memo(Calls);
+    if (memo.found.get(key)) |known| return known;
+    if (depth > depth_limit or memo.active.contains(key)) {
+        memo.cuts += 1;
+        return false;
+    }
+    try memo.active.put(c.allocator, key, {});
+    defer _ = memo.active.remove(key);
+    const cuts = memo.cuts;
+    const shown = try read(c, key.decl, key.index, depth);
+    if (memo.cuts == cuts) try memo.found.put(c.allocator, key, shown);
+    return shown;
+}
 
 /// Whether `decl` is one of std's calls `list` names, at its parameter `index`.
 fn named(c: *Context, list: []const Named, decl: Facts.Decl, index: usize) Context.Error!bool {
