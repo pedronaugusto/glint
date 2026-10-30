@@ -3591,6 +3591,9 @@ fn oneValue(c: *Context, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.In
 fn lengthOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, node);
+    // The length an array's type spells (`out: *[width]u8`, `var r: [width]u8`), which the
+    // compiler fixes: the same names read the same comptime values wherever they are visible.
+    if (declaredLength(c, file, memory)) |declared| if (same(tree, declared, at)) return true;
     if (tree.nodeTag(at) == .sub) {
         const sliced = bare(tree, memory);
         if (tree.nodeTag(sliced) != .slice_open) return false;
@@ -3605,6 +3608,70 @@ fn lengthOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: Ast
     if (tree.nodeTag(at) != .field_access) return false;
     const receiver, const name = tree.nodeData(at).node_and_token;
     return std.mem.eql(u8, tree.tokenSlice(name), "len") and same(tree, receiver, memory);
+}
+
+/// The length expression of the array `memory` names, as its declaration's type spells it, in
+/// this file: a local's or a parameter's `[n]T` or `*[n]T`, or a `for` capture's over a literal
+/// whose elements are all addresses of such arrays of one spelled length (`inline for (.{ &r,
+/// &s }) |out|`). Only names and their fields: what an array type's length names is comptime.
+fn declaredLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const at = bare(tree, memory);
+    if (tree.nodeTag(at) != .identifier) return null;
+    const d = (model.reference(at) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(d)];
+    const type_node: Ast.Node.Index = switch (record.kind) {
+        .variable => (tree.fullVarDecl(record.node) orelse return null).ast.type_node.unwrap() orelse return null,
+        .parameter => c.facts.parameterTypeNode(.{ .file = file, .index = d }) orelse return null,
+        .capture => {
+            const loop = tree.fullFor(record.node) orelse return null;
+            // The input the capture walks: captures name the inputs in order.
+            var token = loop.payload_token;
+            var input: usize = 0;
+            while (token < record.token) : (token += 1) {
+                if (tree.tokenTag(token) == .comma) input += 1;
+            }
+            if (input >= loop.ast.inputs.len) return null;
+            return commonLength(c, file, loop.ast.inputs[input]);
+        },
+        else => return null,
+    };
+    return arrayLength(tree, type_node);
+}
+
+/// The length every element of a tuple or array literal of array addresses spells alike.
+fn commonLength(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const elements: []const Ast.Node.Index = if (tree.fullArrayInit(&buffer, literal_node)) |each| each.ast.elements else return null;
+    var found: ?Ast.Node.Index = null;
+    for (elements) |item| {
+        if (tree.nodeTag(item) != .address_of) return null;
+        const spelled = declaredLength(c, file, tree.nodeData(item).node) orelse return null;
+        if (found) |first| {
+            if (!same(tree, first, spelled)) return null;
+        } else found = spelled;
+    }
+    return found;
+}
+
+/// The length an array type spells, through one single-item pointer to it: `n` of `[n]T`,
+/// `*[n]T` and their sentinel forms, where `n` is names and fields alone.
+fn arrayLength(tree: *const Ast, type_node: Ast.Node.Index) ?Ast.Node.Index {
+    var t = type_node;
+    if (tree.fullPtrType(t)) |pointer| {
+        if (pointer.size != .one) return null;
+        t = pointer.ast.child_type;
+    }
+    const spelled = switch (tree.nodeTag(t)) {
+        .array_type => tree.nodeData(t).node_and_node[0],
+        .array_type_sentinel => tree.nodeData(t).node_and_extra[0],
+        else => return null,
+    };
+    var part = spelled;
+    while (tree.nodeTag(part) == .field_access) part = tree.nodeData(part).node_and_token[0];
+    return if (tree.nodeTag(part) == .identifier) spelled else null;
 }
 
 /// Which way a bound holds a value: at most it, or at least it.

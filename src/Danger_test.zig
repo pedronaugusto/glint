@@ -3168,6 +3168,48 @@ test "A009 reads what a method of the file checked of its receiver, where the ca
     , 1);
 }
 
+test "A009 reads an array's length as its type spells it: a comptime width, a constant naming it, and a capture over addresses of arrays of one length" {
+    const program =
+        \\const std = @import("std");
+        \\const Curve = struct {
+        \\    pub const scalar_length = 32;
+        \\};
+        \\fn rightAligned(comptime width: usize, value: []const u8, out: *[width]u8) error{Long}!void {
+        \\    if (value.len > width) return error.Long;
+        \\    @memcpy(out[width - value.len ..], value);
+        \\}
+        \\fn rightAlignedType(comptime curve: type, value: []const u8, out: *[curve.scalar_length]u8) error{Long}!void {
+        \\    const width = curve.scalar_length;
+        \\    if (value.len > width) return error.Long;
+        \\    @memcpy(out[width - value.len ..], value);
+        \\}
+        \\fn pair(comptime curve: type, input: []const u8) error{Long}![2][curve.scalar_length]u8 {
+        \\    const width = curve.scalar_length;
+        \\    var r: [width]u8 = @splat(0);
+        \\    var s: [width]u8 = @splat(0);
+        \\    inline for (.{ &r, &s }, 0..) |out, i| {
+        \\        const value = input[i * 4 ..][0..4];
+        \\        if (value.len > width) return error.Long;
+        \\        @memcpy(out[width - value.len ..], value);
+        \\    }
+        \\    return .{ r, s };
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const v = try r.take(8);
+        \\    var out: [32]u8 = @splat(0);
+        \\    try rightAligned(32, v, &out);
+        \\    try rightAlignedType(Curve, v, &out);
+        \\    _ = try pair(Curve, try r.take(8));
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // Another width than the array's, and a capture over arrays of two lengths.
+    try expect(pack.untrusted_input, comptime edited(program, "fn rightAligned(comptime width: usize, value: []const u8, out: *[width]u8)", "fn rightAligned(comptime width: usize, value: []const u8, out: *[width - 1]u8)"), 1);
+    try expect(pack.untrusted_input, comptime edited(edited(program, "    var s: [width]u8 = @splat(0);", "    var s: [width + 1]u8 = @splat(0);"), "    return .{ r, s };", "    return .{ r, s[0..width].* };"), 1);
+    // Without the check, the start goes under zero: A010's.
+    try expect(pack.integers, comptime edited(program, "    if (value.len > width) return error.Long;\n    @memcpy(out[width - value.len ..], value);\n}\nfn rightAlignedType", "    @memcpy(out[width - value.len ..], value);\n}\nfn rightAlignedType"), 1);
+}
+
 test "A009 reads a callee's check of its receiver only while the rest of the callee leaves the receiver as checked" {
     const program =
         \\const std = @import("std");
