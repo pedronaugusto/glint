@@ -35,12 +35,12 @@ pub const Int = struct {
 
     /// The greatest magnitude the type holds on every target: what a conversion into it or
     /// arithmetic in it must stay within.
-    fn room(self: Int) Magnitude {
+    pub fn room(self: Int) Magnitude {
         return filled(if (self.signed) self.bits -| 1 else self.bits);
     }
 
     /// The greatest magnitude a value of the type can have on some target.
-    fn reach(self: Int) Magnitude {
+    pub fn reach(self: Int) Magnitude {
         const bits = self.wide orelse self.bits;
         return filled(if (self.signed and !self.either) bits -| 1 else bits);
     }
@@ -75,7 +75,7 @@ const Typed = union(enum) {
 /// The integer a magnitude is read in: wide enough for a type of 255 bits and a sum or product
 /// past one, so a `u136` sum of two `u128` values is exact. A bound saturates at its greatest,
 /// past every type's room (`atMost`).
-const Magnitude = u256;
+pub const Magnitude = u256;
 
 /// The pointer widths a range is read at: those of the targets the package builds for
 /// (`Config.pointer_widths`), both 32 and 64 bits where it names none.
@@ -3969,4 +3969,32 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
     if (decl_tree.nodeTag(t) != .array_type and decl_tree.nodeTag(t) != .array_type_sentinel) return null;
     const length_node = if (decl_tree.nodeTag(t) == .array_type) decl_tree.nodeData(t).node_and_node[0] else decl_tree.nodeData(t).node_and_extra[0];
     return (try valueOf(c, decl.file, length_node, 0)) orelse null;
+}
+
+/// The integer type an expression computes in at a pointer width, where it is one (Bounds).
+pub fn intOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+    return switch (try typeOf(c, file, node, pointer, 0)) {
+        .int => |int| int,
+        else => null,
+    };
+}
+
+/// The integer type a type expression names at a pointer width (Bounds).
+pub fn intNamed(c: *Context, file: Project.FileId, type_node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+    return named(c, file, type_node, pointer);
+}
+
+/// The length an array's type fixes for memory, where it is one (Bounds).
+pub fn memoryLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?Magnitude {
+    return fixedLength(c, file, memory);
+}
+
+/// The greatest length of memory at a pointer width (Bounds).
+pub fn longest(pointer: u16) Magnitude {
+    return length(pointer);
+}
+
+/// The pointer widths a range is read at (Bounds).
+pub fn pointerWidths(c: *const Context) []const u16 {
+    return widths(c);
 }
