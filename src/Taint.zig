@@ -192,7 +192,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
 fn reads(config: @import("Rule.zig").Config, fact: Fact) bool {
     const pack = @import("AegisRules.zig");
     return switch (fact) {
-        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation) or config.has(pack.contracts),
+        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation) or config.has(pack.contracts) or config.has(pack.recursion),
         .peer => config.has(pack.diagnostics),
     };
 }

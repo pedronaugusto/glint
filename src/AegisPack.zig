@@ -2684,21 +2684,126 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "raw")) return false;
     return try requiredOwner(c, data[0], scalar, data[1]) == .scalar;
 }
+/// Whether `node` may give what a scalar's `raw()` returned: the call itself, or that value
+/// carried unchanged through a grouping, `try`, `comptime`, `@as`, a branch of an `if`, an
+/// `orelse`, a `catch`, a `switch` or a labeled block's `break`, or a local: a constant it
+/// initializes, a variable it initializes or is assigned (`=` or a compound assignment) anywhere.
+/// What an operator makes of it is reported at the operator, not carried further. `seen` holds
+/// the locals the value is already being followed through.
+fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.Id) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    switch (tree.nodeTag(node)) {
+        .call_one, .call_one_comma, .call, .call_comma => return raw(c, node),
+        .@"try", .@"comptime" => return rawValue(c, tree.nodeData(node).node, seen),
+        .grouped_expression => return rawValue(c, tree.nodeData(node).node_and_token[0], seen),
+        .@"orelse", .@"catch" => {
+            const sides = tree.nodeData(node).node_and_node;
+            return try rawValue(c, sides[0], seen) or try rawValue(c, sides[1], seen);
+        },
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(node).?; // unreachable: the tag is an if's
+            if (try rawValue(c, branch.ast.then_expr, seen)) return true;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return rawValue(c, otherwise, seen);
+        },
+        .@"switch", .switch_comma => {
+            const choice = tree.fullSwitch(node).?; // unreachable: the tag is a switch's
+            for (choice.ast.cases) |case| if (try rawValue(c, tree.fullSwitchCase(case).?.ast.target_expr, seen)) return true; // unreachable: a switch's cases are cases
+            return false;
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return rawBreaks(c, node, seen),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            return args.len == 2 and try rawValue(c, args[1], seen);
+        },
+        .identifier => {
+            const index = Contract.local(c, node) orelse return false;
+            for (seen) |s| if (s == index) return false;
+            const decl = c.project.at(c.file).model.declarations[@backingInt(index)];
+            if (decl.kind != .variable) return false;
+            const v = tree.fullVarDecl(decl.node) orelse return false;
+            const followed = try std.mem.concat(c.allocator, Model.Declaration.Id, &.{ seen, &.{index} });
+            if (v.ast.init_node.unwrap()) |init| if (try rawValue(c, init, followed)) return true;
+            if (tree.tokenTag(v.ast.mut_token) != .keyword_var) return false;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (!assigning(tag)) continue;
+                const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                if (tree.nodeTag(sides[0]) != .identifier or Contract.local(c, sides[0]) != index) continue;
+                if (try rawValue(c, sides[1], followed)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Whether a `break` out of the labeled block `node` may give a raw value.
+fn rawBreaks(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.Id) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const lbrace = tree.nodeMainToken(node);
+    if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon or tree.tokenTag(lbrace - 2) != .identifier) return false;
+    const label = tree.tokenSlice(lbrace - 2);
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = tree.nodeMainToken(brk);
+        if (at < first or at > last) continue;
+        const data = tree.nodeData(brk).opt_token_and_opt_node;
+        const target = data[0].unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(target), label)) continue;
+        if (try rawValue(c, data[1].unwrap() orelse continue, seen)) return true;
+    }
+    return false;
+}
+
+/// An assignment, plain or compound: each writes its left side from its right.
+fn assigning(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => true,
+        else => false,
+    };
+}
+
+/// The builtins that convert or reinterpret an integer: each can discard what a scalar checks.
+const scalar_casts = [_][]const u8{ "@intCast", "@truncate", "@enumFromInt", "@bitCast", "@floatFromInt", "@ptrFromInt", "@byteSwap", "@bitReverse" };
+/// The builtins that compute with integers, outside the scalar's own checked operations.
+const scalar_arithmetic = [_][]const u8{ "@divTrunc", "@divFloor", "@divExact", "@mod", "@rem", "@shlExact", "@shrExact", "@addWithOverflow", "@subWithOverflow", "@mulWithOverflow", "@shlWithOverflow", "@min", "@max", "@abs" };
+
+fn listed(name: []const u8, names: []const []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
 fn checkScalar(c: *Context) Context.Error!void {
     if (!try begin(c, scalar)) return;
     const tree = try c.project.syntax(try c.source());
+    const operation = "raw aegis scalar operation bypasses domain/unit or checked arithmetic; explicit boundary semantics required";
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tag) {
-            .add, .sub, .mul, .div, .mod, .shl, .add_wrap, .sub_wrap, .mul_wrap, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
+            .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const operands = tree.nodeData(node).node_and_node;
-                if (try raw(c, operands[0]) or try raw(c, operands[1])) try c.at(scalar, tree.nodeMainToken(node), "raw aegis scalar operation bypasses domain/unit or checked arithmetic; explicit boundary semantics required");
+                if (try rawValue(c, operands[0], &.{}) or try rawValue(c, operands[1], &.{})) try c.at(scalar, tree.nodeMainToken(node), operation);
             },
+            // A compound assignment is the operator's: `n += s.raw()` computes as `n + s.raw()`.
+            .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {
+                const operands = tree.nodeData(node).node_and_node;
+                if (try rawValue(c, operands[0], &.{}) or try rawValue(c, operands[1], &.{})) try c.at(scalar, tree.nodeMainToken(node), operation);
+            },
+            .negation, .negation_wrap, .bit_not => if (try rawValue(c, tree.nodeData(node).node, &.{})) try c.at(scalar, tree.nodeMainToken(node), operation),
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
-                if (!std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@truncate") and !std.mem.eql(u8, name, "@enumFromInt")) continue;
+                const cast = listed(name, &scalar_casts);
+                if (!cast and !listed(name, &scalar_arithmetic)) continue;
                 var buffer: [2]Ast.Node.Index = undefined;
-                for (Facts.builtinArgs(tree, node, &buffer)) |arg| if (try raw(c, arg)) try c.at(scalar, tree.nodeMainToken(node), "raw aegis scalar cast can discard domain/range/all-build failure checks; use checked conversion or justify boundary");
+                for (Facts.builtinArgs(tree, node, &buffer)) |arg| if (try rawValue(c, arg, &.{})) {
+                    try c.at(scalar, tree.nodeMainToken(node), if (cast) "raw aegis scalar cast can discard domain/range/all-build failure checks; use checked conversion or justify boundary" else operation);
+                    break;
+                };
             },
             else => {},
         }

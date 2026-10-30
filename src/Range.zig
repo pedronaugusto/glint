@@ -1680,6 +1680,7 @@ fn gather(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
                     try succeeded(c, file, &out, statement, node);
                     if (tree.fullVarDecl(statement)) |local| if (local.ast.init_node.unwrap()) |init| {
                         try searchFacts(c, file, &out, init, node);
+                        try readFacts(c, file, &out, init, node);
                         try succeeded(c, file, &out, init, node);
                     };
                     const branch = tree.fullIf(statement) orelse continue;
@@ -1803,12 +1804,15 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, root: Ast.Nod
 }
 
 /// What a method call that succeeded checked: `try r.f(…)` where `f`, in this file, fails
-/// unless a condition on its receiver holds, by `return if (c) … else error.X;` or by leading
-/// `if (c) return error.X;` guards (`fn byte(self) !u8 { return if (self.at <
-/// self.input.len) self.input[self.at] else error.SyntaxError; }`). The condition is read with
-/// the receiver for the first parameter, so only where the call spells its receiver as `f`
-/// names it and the condition names no other parameter; it holds from the call while nothing
-/// after it assigns what it compares.
+/// unless a condition on its receiver holds, by `return if (c) … else error.X;` or by
+/// `if (c) return error.X;` guards among its statements (`fn byte(self) !u8 { return if
+/// (self.at < self.input.len) self.input[self.at] else error.SyntaxError; }`, `fn enter(self)
+/// !void { self.depth += 1; if (self.depth > max) return error.TooDeep; }`). A guard counts
+/// where no statement before it returns without failing, so a call that succeeded passed it, and
+/// none after it may change the receiver (`touches`), so what it saw still holds. The condition
+/// is read with the receiver for the first parameter, so only where the call spells its receiver
+/// as `f` names it and the condition names no other parameter; it holds from the call while
+/// nothing after it assigns what it compares.
 fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -1832,20 +1836,82 @@ fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
     if (tree.nodeTag(function) != .fn_decl) return;
     var statement_buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&statement_buffer, tree.nodeData(function).node_and_node[1]) orelse return;
-    for (statements) |statement| {
+    for (statements, 0..) |statement, at| {
         if (tree.nodeTag(statement) == .@"return") {
             const result = tree.nodeData(statement).opt_node.unwrap() orelse return;
             const branch = tree.fullIf(bare(tree, result)) orelse return;
             const otherwise = branch.ast.else_expr.unwrap() orelse return;
             if (!receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
-            if (tree.nodeTag(bare(tree, otherwise)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
-            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
+            if (tree.nodeTag(bare(tree, otherwise)) == .error_value and !touches(tree, model, &.{branch.ast.then_expr}, self_name)) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
+            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value and !touches(tree, model, &.{otherwise}, self_name)) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
             return;
         }
-        const branch = tree.fullIf(statement) orelse return;
-        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
+        if (returnsQuietly(tree, statement)) return;
+        const branch = tree.fullIf(statement) orelse continue;
+        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, self_name)) continue;
+        if (touches(tree, model, statements[at + 1 ..], self_name)) continue;
         try holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
     }
+}
+
+/// Whether `statement` may return without failing: a `return` in it that gives no error value.
+fn returnsQuietly(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const result = tree.nodeData(node).opt_node.unwrap() orelse return true;
+        if (tree.nodeTag(bare(tree, result)) != .error_value) return true;
+    }
+    return false;
+}
+
+/// Whether `nodes`, in order, may change what the receiver `self_name` holds: an assignment to
+/// it or a part of it, its address or a part's taken, or it or a part handed to a call or a
+/// method of it called, any of which may write it.
+fn touches(tree: *const Ast, model: anytype, nodes: []const Ast.Node.Index, self_name: []const u8) bool {
+    for (nodes) |whole| {
+        const first = tree.firstToken(whole);
+        const last = tree.lastToken(whole);
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(node);
+            if (token < first or token > last) continue;
+            switch (tag) {
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (receiverRooted(tree, model, tree.nodeData(node).node_and_node[0], self_name)) return true,
+                .address_of => if (receiverRooted(tree, model, tree.nodeData(node).node, self_name)) return true,
+                .call_one, .call_one_comma, .call, .call_comma => {
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+                    if (tree.nodeTag(call.ast.fn_expr) == .field_access and receiverRooted(tree, model, tree.nodeData(call.ast.fn_expr).node_and_token[0], self_name)) return true;
+                    for (call.ast.params) |param| if (receiverRooted(tree, model, param, self_name)) return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether `node` names the receiver `self_name` or a part of it, past fields, indexes, slices,
+/// unwraps, dereferences and addresses.
+fn receiverRooted(tree: *const Ast, model: anytype, node: Ast.Node.Index, self_name: []const u8) bool {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .identifier => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), self_name)) return false;
+            const d = (model.reference(at) orelse return false).declaration orelse return false;
+            return model.declarations[@backingInt(d)].kind == .parameter;
+        },
+        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .deref, .address_of => at = tree.nodeData(at).node,
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return false).ast.sliced,
+        else => return false,
+    };
 }
 
 /// Whether a callee's condition names no parameter but its first: what it says of the receiver
@@ -1918,6 +1984,142 @@ fn searchFacts(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), val
     // The search's value is the position its capture or constant names: below `h.len`.
     try out.append(c.allocator, .{ .small = search, .large = haystack, .strict = scalar, .read = true });
     if (from and try kept(c, file, call.ast.params[2], value, use)) try out.append(c.allocator, .{ .small = call.ast.params[2], .large = search, .strict = false });
+}
+
+/// std's reads, which return how many bytes they put in the buffers they are given: at most
+/// those buffers' total length, std's promise by declaration. `param` names the buffers, one
+/// slice or a vector of them (a method's receiver is parameter 0).
+const std_reads = [_]struct { path: []const u8, param: usize }{
+    .{ .path = "posix.read", .param = 1 },
+    .{ .path = "Io.File.readStreaming", .param = 2 },
+    .{ .path = "Io.File.readPositional", .param = 2 },
+    .{ .path = "Io.net.Stream.read", .param = 2 },
+    .{ .path = "Io.Reader.readVec", .param = 1 },
+    .{ .path = "Io.Reader.readSliceShort", .param = 1 },
+};
+
+/// What a read's count holds where a constant takes it (`const n = try f.readStreaming(io,
+/// &.{chunk[0..m]})`): at most the length of the one buffer it filled. A slice `x[s..e]` is
+/// at most `e` long; another buffer is named whole, its length a read position's bound. A
+/// vector of several buffers, or one not spelled, says nothing.
+fn readFacts(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.at(file).file.tree;
+    const call = givenCall(tree, value) orelse return;
+    const buffers = (try readBuffers(c, file, call, 0)) orelse return;
+    var one = bare(tree, buffers);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.nodeTag(one) == .address_of and tree.fullArrayInit(&buffer, tree.nodeData(one).node) != null) {
+        const vector = tree.fullArrayInit(&buffer, tree.nodeData(one).node).?; // unreachable: just read
+        if (vector.ast.elements.len != 1) return;
+        one = bare(tree, vector.ast.elements[0]);
+    } else {
+        // One buffer of bytes, a slice or an array's address, not a vector held elsewhere.
+        const bytes = switch (try c.facts.resolve(file, one)) {
+            .pointer => |item| item.* == .primitive or (item.* == .array and item.array.* == .primitive),
+            else => false,
+        };
+        if (!bytes) return;
+        if (tree.nodeTag(one) == .address_of) one = bare(tree, tree.nodeData(one).node);
+    }
+    if (tree.fullSlice(one)) |slice| {
+        const end = slice.ast.end.unwrap() orelse return;
+        if (!try kept(c, file, end, value, use)) return;
+        try out.append(c.allocator, .{ .small = call, .large = end, .strict = false });
+        return;
+    }
+    if (!try kept(c, file, one, value, use)) return;
+    try out.append(c.allocator, .{ .small = call, .large = one, .strict = false, .read = true });
+}
+
+/// The call `value` gives: itself, past `try`, and past a `catch` or `orelse` whose other side
+/// leaves (every prong of a `switch` on the error leaving too).
+fn givenCall(tree: *const Ast, value: Ast.Node.Index) ?Ast.Node.Index {
+    var at = bare(tree, value);
+    while (true) switch (tree.nodeTag(at)) {
+        .@"try" => at = bare(tree, tree.nodeData(at).node),
+        .@"catch", .@"orelse" => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            if (!leavesAll(tree, rhs)) return null;
+            at = bare(tree, lhs);
+        },
+        .call_one, .call_one_comma, .call, .call_comma => return at,
+        else => return null,
+    };
+}
+
+/// Whether `node` leaves on every way through it: `leaves`, or a `switch` each prong of which does.
+fn leavesAll(tree: *const Ast, node: Ast.Node.Index) bool {
+    if (leaves(tree, node)) return true;
+    const choice = tree.fullSwitch(node) orelse return false;
+    for (choice.ast.cases) |case| if (!leavesAll(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are cases
+    return true;
+}
+
+/// The argument naming the buffers a read call fills: the call reaches one of `std_reads`, or a
+/// function of the program each value of which it returns is such a read of one parameter, the
+/// same one (a read retried until it makes progress).
+fn readBuffers(c: *Context, file: Project.FileId, call_node: Ast.Node.Index, depth: u8) Context.Error!?Ast.Node.Index {
+    if (depth == 4) return null;
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return null;
+    const callee = try c.facts.resolve(file, call.ast.fn_expr);
+    if (callee != .function) return null;
+    const decl = (try c.facts.origin(callee.function)) orelse callee.function;
+    const param = (try readParam(c, decl, depth)) orelse return null;
+    // A method call hands its receiver first.
+    var skip: usize = 0;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+        .instance, .pointer, .optional => skip = 1,
+        else => {},
+    };
+    if (param < skip or param - skip >= call.ast.params.len) return null;
+    return call.ast.params[param - skip];
+}
+
+/// The parameter of `decl` naming the buffers whose total length bounds what it returns: a
+/// `std_reads` entry's, or, for a function of the program, the one every value it returns
+/// reads into, directly or through a constant (`const n = try f.readStreaming(io, buffers);
+/// if (n != 0) return n;`). An error it returns gives no count.
+fn readParam(c: *Context, decl: Facts.Decl, depth: u8) Context.Error!?usize {
+    for (std_reads) |each| for ((try Governed.declarations(c, "std", each.path)) orelse &.{}) |found| {
+        if (std.meta.eql((try c.facts.origin(found)) orelse found, decl)) return each.param;
+    };
+    if (!c.project.at(decl.file).input.selected) return null;
+    const tree = &c.project.at(decl.file).file.tree;
+    const model = &c.project.at(decl.file).model;
+    const function = model.parentOf(model.declarations[@backingInt(decl.index)].node) orelse return null;
+    if (tree.nodeTag(function) != .fn_decl) return null;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[@backingInt(decl.index)].node) orelse return null;
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    var found: ?usize = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const result = tree.nodeData(node).opt_node.unwrap() orelse return null;
+        if (tree.nodeTag(bare(tree, result)) == .error_value) continue;
+        var reading = givenCall(tree, result);
+        if (reading == null) if (constantOf(c, decl.file, bare(tree, result))) |local| {
+            reading = givenCall(tree, local.ast.init_node.unwrap() orelse return null);
+        };
+        const buffers = (try readBuffers(c, decl.file, reading orelse return null, depth + 1)) orelse return null;
+        const spelled = bare(tree, buffers);
+        if (tree.nodeTag(spelled) != .identifier) return null;
+        const d = (model.reference(spelled) orelse return null).declaration orelse return null;
+        if (model.declarations[@backingInt(d)].kind != .parameter) return null;
+        var it = proto.iterate(tree);
+        var place: usize = 0;
+        const at = while (it.next()) |p| : (place += 1) {
+            if (p.name_token == model.declarations[@backingInt(d)].token) break place;
+        } else return null;
+        if (found) |other| if (other != at) return null;
+        found = at;
+    }
+    return found;
 }
 
 /// The std search call `value` is, alone or before an `orelse` that leaves: a call spelled
@@ -2207,7 +2409,7 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
     }
     const region: Region = .{ .tree = tree, .from = from, .to = to, .skipped = skipped, .loops = around.constItems() };
     // What the compared value reads, for the stores that reach it through other names.
-    var places: Places = .{};
+    var places: Places = .{ .rename = try calleeReceiver(c, file, compared, condition) };
     try places.gather(c, file, compared, 0);
     const exposed = places.exposed();
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -2337,7 +2539,7 @@ fn varies(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
 }
 
 /// Whether a call cannot write the program's memory: a function of std's `mem`, `math`,
-/// `ascii` or `unicode` namespaces, which hold no pointer of the program's, whose parameters
+/// `ascii` or `unicode` namespaces, aegis's `assert` or std's `debug.assert` (`Pure`), which hold no pointer of the program's, whose parameters
 /// can carry none it could write through: a type, a value of a primitive type, or a `const`
 /// pointer or slice of one (a type parameter's where the call gives it a primitive type). A
 /// function parameter, `anytype`, a struct by value or a mutable pointer may reach anything.
@@ -2349,7 +2551,7 @@ fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!
         .function => |d| d,
         else => return false,
     };
-    if (!try pure(c, decl.file)) return false;
+    if (!try pure(c, decl)) return false;
     const callee = &c.project.at(decl.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = callee.fullFnProto(&proto_buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
@@ -2397,17 +2599,20 @@ fn typeParameter(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?u
     return null;
 }
 
-/// The files of std's `mem`, `math`, `ascii` and `unicode` namespaces, and the files they reach
-/// by their relative imports, found once for the run.
-const Pure = struct { built: bool = false, files: std.AutoHashMapUnmanaged(u32, void) = .empty };
+/// The files of std's `mem`, `math`, `ascii` and `unicode` namespaces and of aegis's `assert`,
+/// and the files they reach by their relative imports; and std's `debug.assert`, a function of
+/// a truth value alone in a file that holds others. Found once for the run.
+const Pure = struct { built: bool = false, files: std.AutoHashMapUnmanaged(u32, void) = .empty, checks: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty };
 
-fn pure(c: *Context, file: Project.FileId) Context.Error!bool {
+/// Whether `decl` is a function `inert` may read by its parameters: one of `Pure`'s.
+fn pure(c: *Context, decl: Facts.Decl) Context.Error!bool {
     const memo = try c.facts.memo(Pure);
     if (!memo.built) {
         memo.built = true;
-        for ([_][]const u8{ "mem", "math", "ascii", "unicode" }) |namespace| {
-            for ((try Governed.declarations(c, "std", namespace)) orelse &.{}) |decl| {
-                const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        const namespaces = [_][2][]const u8{ .{ "std", "mem" }, .{ "std", "math" }, .{ "std", "ascii" }, .{ "std", "unicode" }, .{ "aegis", "assert" } };
+        for (namespaces) |namespace| {
+            for ((try Governed.declarations(c, namespace[0], namespace[1])) orelse &.{}) |found| {
+                const value = try c.facts.declaration((try c.facts.origin(found)) orelse found);
                 if (value != .container) continue;
                 var next: std.ArrayList(Project.FileId) = .empty;
                 if (!(try memo.files.getOrPut(c.allocator, @backingInt(value.container.file))).found_existing) try next.append(c.allocator, value.container.file);
@@ -2418,8 +2623,9 @@ fn pure(c: *Context, file: Project.FileId) Context.Error!bool {
                 };
             }
         }
+        for ((try Governed.declarations(c, "std", "debug.assert")) orelse &.{}) |found| try memo.checks.put(c.allocator, (try c.facts.origin(found)) orelse found, {});
     }
-    return memo.files.contains(@backingInt(file));
+    return memo.files.contains(@backingInt(decl.file)) or memo.checks.contains(decl);
 }
 
 /// Whether a compared value reads what a store writes: the store's target spelled as a whole
@@ -2621,14 +2827,50 @@ fn rootOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.De
     };
 }
 
+/// A declaration read as another: a callee's receiver parameter as the receiver its call names.
+const Rename = struct { from: Model.Declaration.Id, to: Model.Declaration.Id };
+
+/// Where `compared` is a callee's condition read at its call `since` (`succeeded`): the callee's
+/// first parameter, which it is rooted at, as the local or parameter the call names as its
+/// receiver, spelled the same. Null for anything else.
+fn calleeReceiver(c: *Context, file: Project.FileId, compared: Ast.Node.Index, since: Ast.Node.Index) Context.Error!?Rename {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, since) orelse return null;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+    if (tree.nodeTag(receiver) != .identifier) return null;
+    const to = (model.reference(receiver) orelse return null).declaration orelse return null;
+    const from = rootOf(tree, model, bare(tree, compared)) orelse return null;
+    if (from == to) return null;
+    const record = model.declarations[@backingInt(from)];
+    if (record.kind != .parameter or !std.mem.eql(u8, record.name, model.declarations[@backingInt(to)].name)) return null;
+    // The parameter is the first of the function the call reaches.
+    const callee = try c.facts.resolve(file, call.ast.fn_expr);
+    if (callee != .function or callee.function.file != file) return null;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[@backingInt(callee.function.index)].node) orelse return null;
+    var parameters = proto.iterate(tree);
+    const first = parameters.next() orelse return null;
+    if (first.name_token != record.token) return null;
+    return .{ .from = from, .to = to };
+}
+
 /// The places a compared value reads: each named in it, and those of the constants it names.
 const Places = struct {
     items: [8]Place = undefined,
     len: u8 = 0,
     /// More places than are kept: read as exposed.
     over: bool = false,
+    /// A callee's receiver read as its call's (`calleeReceiver`).
+    rename: ?Rename = null,
 
-    fn add(self: *Places, place: Place) void {
+    fn add(self: *Places, given: Place) void {
+        var place = given;
+        if (self.rename) |r| if (place.decl == r.from) {
+            place.decl = r.to;
+        };
         if (self.len == self.items.len) {
             self.over = true;
             return;
@@ -2938,6 +3180,18 @@ fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
 /// array's declared length. Such a position the program has checked, and no peer's choice
 /// of it reaches past the memory.
 pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
+    // A bound read through another bound reads that one's facts in turn: so deep and no deeper.
+    const nesting = try c.facts.memo(Nesting);
+    if (nesting.level >= 16) return false;
+    nesting.level += 1;
+    defer nesting.level -= 1;
+    return withinOnce(c, file, index, memory, end);
+}
+
+/// How deep `within` is in reading itself.
+const Nesting = struct { level: u8 = 0 };
+
+fn withinOnce(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
     if (try ownId(c, file, index, memory)) return true;
     // A remainder by the memory's length is below it (a zero length stops the remainder), and
     // so is a `for` counter over its length or beside it.
@@ -2947,15 +3201,24 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     // length less what cannot be zero is below it (where it would go under zero it stops).
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, index);
+    // A slice's end at the memory's own length.
+    if (end and lengthOf(c, file, at, memory) and !try varies(c, file, memory)) return true;
     switch (tree.nodeTag(at)) {
         .sub => {
             const whole, const taken = tree.nodeData(at).node_and_node;
+            const kept_above = for (widths(c)) |pointer| {
+                if (!try nonnegative(c, file, taken, pointer)) break false;
+            } else true;
             if (lengthOf(c, file, whole, memory) and !try varies(c, file, memory) and (end or try nonzero(c, file, taken))) {
-                const kept_above = for (widths(c)) |pointer| {
-                    if (!try nonnegative(c, file, taken, pointer)) break false;
-                } else true;
                 if (kept_above) return true;
             }
+            // Less what is not below zero is at most what it is taken from: within where that is
+            // (where it would go under zero it stops, A010's).
+            if (kept_above and try within(c, file, whole, memory, end)) return true;
+        },
+        // A constant local is its value, while the memory stays as it was where it was given.
+        .identifier => if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
+            if (try within(c, file, init, memory, end) and try kept(c, file, memory, init, index)) return true;
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@min")) {
             var buffer: [2]Ast.Node.Index = undefined;
@@ -3200,6 +3463,9 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
     for (held_here) |fact| {
         if (fact.differs) continue;
         if (try covered(c, file, fact, index, memory, end)) return true;
+        // One step through a bound that is itself within the memory: `n <= e` and `e` at most
+        // its length (a read's count and the end of the one buffer it filled).
+        if (!fact.read and oneValue(c, file, fact.small, index) and try within(c, file, fact.large, memory, end or fact.strict) and try kept(c, file, memory, fact.large, index)) return true;
         if (fact.read) {
             if (!same(tree, fact.large, memory)) continue;
             const base, const k = shift(tree, fact.small);
@@ -3476,12 +3742,17 @@ fn offset(tree: *const Ast, node: Ast.Node.Index) struct { Ast.Node.Index, u64 }
     return .{ at, 0 };
 }
 
-/// Whether `a` and `b` are one value: spelled alike, or one a constant local naming the other.
+/// Whether `a` and `b` are one value: spelled alike, or one a constant local naming the other, or
+/// holding the call the other is (only a read fact names an impure call: one that varies is never
+/// kept).
 fn oneValue(c: *Context, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     if (same(tree, a, b)) return true;
     if (alias(c, file, a)) |x| if (same(tree, x, b)) return true;
     if (alias(c, file, b)) |y| if (same(tree, a, y)) return true;
+    // A constant holding a call's value is that call where a fact names it (a read's count).
+    if (constantOf(c, file, bare(tree, a))) |local| if (givenCall(tree, local.ast.init_node.unwrap() orelse return false)) |x| if (same(tree, x, b)) return true;
+    if (constantOf(c, file, bare(tree, b))) |local| if (givenCall(tree, local.ast.init_node.unwrap() orelse return false)) |y| if (same(tree, a, y)) return true;
     return false;
 }
 
@@ -3490,6 +3761,9 @@ fn oneValue(c: *Context, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.In
 fn lengthOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, node);
+    // The length an array's type spells (`out: *[width]u8`, `var r: [width]u8`), which the
+    // compiler fixes: the same names read the same comptime values wherever they are visible.
+    if (declaredLength(c, file, memory)) |declared| if (same(tree, declared, at)) return true;
     if (tree.nodeTag(at) == .sub) {
         const sliced = bare(tree, memory);
         if (tree.nodeTag(sliced) != .slice_open) return false;
@@ -3504,6 +3778,85 @@ fn lengthOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: Ast
     if (tree.nodeTag(at) != .field_access) return false;
     const receiver, const name = tree.nodeData(at).node_and_token;
     return std.mem.eql(u8, tree.tokenSlice(name), "len") and same(tree, receiver, memory);
+}
+
+/// The length expression of the array `memory` names, as its declaration's type spells it, in
+/// this file: a local's or a parameter's `[n]T` or `*[n]T`, or a `for` capture's over a literal
+/// whose elements are all addresses of such arrays of one spelled length (`inline for (.{ &r,
+/// &s }) |out|`). Only names and their fields: what an array type's length names is comptime.
+fn declaredLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const at = bare(tree, memory);
+    if (tree.nodeTag(at) != .identifier) return null;
+    const d = (model.reference(at) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(d)];
+    const type_node: Ast.Node.Index = switch (record.kind) {
+        .variable => (tree.fullVarDecl(record.node) orelse return null).ast.type_node.unwrap() orelse return null,
+        .parameter => c.facts.parameterTypeNode(.{ .file = file, .index = d }) orelse return null,
+        .capture => {
+            const loop = tree.fullFor(record.node) orelse return null;
+            // The input the capture walks: captures name the inputs in order.
+            var token = loop.payload_token;
+            var input: usize = 0;
+            while (token < record.token) : (token += 1) {
+                if (tree.tokenTag(token) == .comma) input += 1;
+            }
+            if (input >= loop.ast.inputs.len) return null;
+            return commonLength(c, file, loop.ast.inputs[input]);
+        },
+        else => return null,
+    };
+    return arrayLength(tree, type_node);
+}
+
+/// The length every element of a tuple or array literal of array addresses spells alike.
+fn commonLength(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const elements: []const Ast.Node.Index = if (tree.fullArrayInit(&buffer, literal_node)) |each| each.ast.elements else return null;
+    var found: ?Ast.Node.Index = null;
+    for (elements) |item| {
+        if (tree.nodeTag(item) != .address_of) return null;
+        const spelled = declaredLength(c, file, tree.nodeData(item).node) orelse return null;
+        if (found) |first| {
+            if (!same(tree, first, spelled)) return null;
+        } else found = spelled;
+    }
+    return found;
+}
+
+/// The length an array type spells, through one single-item pointer to it: `n` of `[n]T`,
+/// `*[n]T` and their sentinel forms, where `n` is names and fields alone.
+fn arrayLength(tree: *const Ast, type_node: Ast.Node.Index) ?Ast.Node.Index {
+    var t = type_node;
+    if (tree.fullPtrType(t)) |pointer| {
+        if (pointer.size != .one) return null;
+        t = pointer.ast.child_type;
+    }
+    const spelled = switch (tree.nodeTag(t)) {
+        .array_type => tree.nodeData(t).node_and_node[0],
+        .array_type_sentinel => tree.nodeData(t).node_and_extra[0],
+        else => return null,
+    };
+    var part = spelled;
+    while (tree.nodeTag(part) == .field_access) part = tree.nodeData(part).node_and_token[0];
+    return if (tree.nodeTag(part) == .identifier) spelled else null;
+}
+
+/// Which way a bound holds a value: at most it, or at least it.
+pub const Side = enum { ceiling, floor };
+
+/// What the comparisons holding where `at` is evaluated put `value` at most (`.ceiling`: the
+/// larger sides) or at least (`.floor`: the smaller sides), `value` spelled as they spell it.
+pub fn boundsAt(c: *Context, file: Project.FileId, at: Ast.Node.Index, value: Ast.Node.Index, side: Side) Context.Error![]const Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    var out: std.ArrayList(Ast.Node.Index) = .empty;
+    for (try facts(c, file, at)) |fact| switch (side) {
+        .ceiling => if (same(tree, fact.small, value)) try out.append(c.allocator, fact.large),
+        .floor => if (same(tree, fact.large, value)) try out.append(c.allocator, fact.small),
+    };
+    return out.items;
 }
 
 /// What the comparisons holding where `node` is read put it at most: the larger sides, for a
