@@ -5262,3 +5262,34 @@ test "A021 holds a guard until a release of its own block runs, and one bound by
     };
     try expect(pack.lock_order, head ++ "pub fn f(a: *A, b: *A) void {\n    var g = a.acquire();\n    g.deinit();\n    var h = b.acquire();\n    h.deinit();\n}\n", 0);
 }
+
+test "A010 reads a slice's length as its bounds set it, apart from what it holds: through a local, a parameter, a field, a return and a reassignment" {
+    const program =
+        \\const std = @import("std");
+        \\const Holder = struct { part: []const u8 };
+        \\fn take(s: []const u8) usize {
+        \\    return s.len - 86;
+        \\}
+        \\fn prefix(out: *[512]u8, n: usize) []u8 {
+        \\    return out[0..n];
+        \\}
+        \\const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        \\var holder: Holder = .{ .part = "" };
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    var memory: [512]u8 = @splat(0);
+        \\    const out = &memory;
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    const bytes = out[0..n];
+        \\    const rest = out[n..];
+        \\    var moved: []u8 = out[0..0];
+        \\    moved = out[0..n];
+        \\    holder.part = out[0..n];
+        \\    var total: u64 = 0;
+        \\    for (days[0..@min(n, days.len)]) |d| total += d;
+        \\    const sum = (bytes.len - 86) +% (rest.len - 86) +% take(out[0..n]) +% (moved.len - 86) +% (holder.part.len - 86) +% (prefix(out, n).len - 86);
+        \\    return total +% sum;
+        \\}
+    ;
+    // Each difference, and no sum of the table's own days, sliced as far as the peer chose.
+    try expect(pack.integers, program, 6);
+}
