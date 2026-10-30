@@ -28,7 +28,7 @@ test "compatibility Z011 finds deprecated calls at every expression position" {
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = source },
         .{ .name = "dep", .selected = false, .bytes = "/// Deprecated: use modern.\npub fn old() u8 { return 1; } pub fn modern(x: u8) u8 { return x; }" },
-    }, &.{.{ .from = glint.Project.FileId.fromRaw(0), .spelling = "dep", .target = glint.Project.FileId.fromRaw(1) }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
+    }, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z011, true);
@@ -57,7 +57,7 @@ test "compatibility Z016 splits only conjunction of the mapped standard assertio
     var project = try glint.Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = root },
         .{ .name = "standard", .bytes = "pub const debug = struct { pub fn assert(ok: bool) void { _ = ok; } };", .selected = false },
-    }, &.{.{ .from = glint.Project.FileId.fromRaw(0), .target = glint.Project.FileId.fromRaw(1), .spelling = "std" }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
+    }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{}); // safe: fixture constants and bounded output lengths fit the asserted integer widths.
     defer project.deinit();
     var config = glint.Config.none();
     config.set(.Z016, true);
@@ -348,9 +348,9 @@ fn ownershipRunIn(program: []const u8, package: []const u8, disallowed: []const 
         , .selected = false },
     };
     const imports = [_]P.Import{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "lib", .target = P.FileId.fromRaw(1) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "posix.zig", .target = P.FileId.fromRaw(2) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "c.zig", .target = P.FileId.fromRaw(3) },
+        .{ .from = 0, .spelling = "lib", .target = 1 },
+        .{ .from = 1, .spelling = "posix.zig", .target = 2 },
+        .{ .from = 1, .spelling = "c.zig", .target = 3 },
     };
     var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
     defer project.deinit();
@@ -513,10 +513,10 @@ test "metrics count assertion calls by the declaration their callee resolves to"
         .{ .name = "assert.zig", .bytes = "pub fn pre(ok: bool, comptime m: []const u8) void { if (!ok) @panic(m); }\npub inline fn never(comptime m: []const u8) noreturn { @panic(m); }", .selected = false },
     };
     const imports = [_]P.Import{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "std", .target = P.FileId.fromRaw(1) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "debug.zig", .target = P.FileId.fromRaw(2) },
-        .{ .from = P.FileId.fromRaw(0), .spelling = "aegis", .target = P.FileId.fromRaw(3) },
-        .{ .from = P.FileId.fromRaw(3), .spelling = "assert.zig", .target = P.FileId.fromRaw(4) },
+        .{ .from = 0, .spelling = "std", .target = 1 },
+        .{ .from = 1, .spelling = "debug.zig", .target = 2 },
+        .{ .from = 0, .spelling = "aegis", .target = 3 },
+        .{ .from = 3, .spelling = "assert.zig", .target = 4 },
     };
     var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
     defer project.deinit();
@@ -561,7 +561,7 @@ test "review Z006 accepts a name a generic reads on its type parameter that an o
     const own = "const dep = @import(\"dep\");\npub const Point = struct { pub const basePoint: Point = .{}; pub const otherName: Point = .{}; };\nfn table(comptime P: type) P { return P.basePoint; }\npub fn f() void { _ = table(Point); _ = table(dep.Edwards); }";
     for ([_]bool{ true, false }) |generic| {
         const source = if (generic) own else "const dep = @import(\"dep\");\npub const Point = struct { pub const basePoint: Point = .{}; pub const otherName: Point = .{}; };\npub fn f() void { _ = dep; }";
-        var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "fixture", .stem = "Fixture", .bytes = source }, .{ .name = "dep", .stem = "Dep", .bytes = outside, .selected = false } }, &.{.{ .from = .fromRaw(0), .spelling = "dep", .target = .fromRaw(1) }}, .{});
+        var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "fixture", .stem = "Fixture", .bytes = source }, .{ .name = "dep", .stem = "Dep", .bytes = outside, .selected = false } }, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{});
         defer project.deinit();
         var config = glint.Config.none();
         config.set(.Z006, true);

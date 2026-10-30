@@ -26,7 +26,7 @@ const Ast = std.zig.Ast;
 pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "atomic.Value", "atomic.Mutex" };
     const held = try governedHeld(c, rule, &sync, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const name = builtinName(tree, node) orelse continue;
@@ -34,10 +34,10 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
             if (!c.inTest(tree.nodeMainToken(node)) and atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
         };
     }
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .variable) continue;
-        const scope = model.scopes[decl.scope].kind;
+        const scope = model.scopes[@backingInt(decl.scope)].kind;
         if (scope != .file and scope != .container) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
         if (tree.tokenTag(variable.ast.mut_token) != .keyword_var or variable.threadlocal_token != null) continue;
@@ -79,8 +79,8 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     try governed(c, rule, &calls, true, "{s}: secret material handled by hand; aegis Secret and SecretBytes wipe it, Choice compares in constant time");
     const keys = try secretKeys(c);
     if (keys.len == 0) return;
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const site = switch (tag) {
@@ -95,10 +95,10 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         const origin = (try c.facts.origin(decl)) orelse decl;
         var secret = false;
         for (keys) |key| secret = secret or std.meta.eql(key, decl) or std.meta.eql(key, origin);
-        if (!secret or (!std.meta.eql(decl, origin) and c.project.inputs[decl.file.raw()].selected)) continue;
+        if (!secret or (!std.meta.eql(decl, origin) and c.project.at(decl.file).input.selected)) continue;
         if (try borrowedOrSealed(c, node)) continue;
         // A secret type compared with another is named, not held.
-        if (model.node_parents[@backingInt(node)]) |parent| switch (tree.nodeTag(parent)) { // safe: a node index indexes its own tree's parent table
+        if (model.parentOf(node)) |parent| switch (tree.nodeTag(parent)) {
             .equal_equal, .bang_equal => continue,
             else => {},
         };
@@ -112,12 +112,12 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) {
         for (roots.items) |seen| {
-            if (seen.eql(mapping.target)) break;
+            if (seen == mapping.target) break;
         } else try roots.append(c.allocator, mapping.target);
     };
     var files: std.ArrayList(Project.FileId) = .empty;
     for (roots.items) |root| {
-        const crypto = c.facts.member(.{ .file = root, .scope = 0 }, "crypto") orelse continue;
+        const crypto = c.facts.member(c.facts.rootOf(root), "crypto") orelse continue;
         const value = try c.facts.declaration((try c.facts.origin(crypto)) orelse crypto);
         if (value != .container) continue;
         try files.append(c.allocator, value.container.file);
@@ -126,17 +126,17 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
     while (next < files.items.len) : (next += 1) {
         const file = files.items[next];
         for (c.project.imports) |mapping| {
-            if (!mapping.from.eql(file) or !std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
+            if (mapping.from != file or !std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
             for (files.items) |seen| {
-                if (seen.eql(mapping.target)) break;
+                if (seen == mapping.target) break;
             } else try files.append(c.allocator, mapping.target);
         }
     }
     var keys: std.ArrayList(Facts.Decl) = .empty;
-    for (files.items) |file| for (c.project.models[file.raw()].declarations, 0..) |decl, d| {
+    for (files.items) |file| for (c.project.at(file).model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or !decl.public) continue;
         if (!std.mem.eql(u8, decl.name, "SecretKey") and !std.mem.eql(u8, decl.name, "KeyPair")) continue;
-        try keys.append(c.allocator, .{ .file = file, .index = @intCast(d) });
+        try keys.append(c.allocator, .{ .file = file, .index = @fromBackingInt(@intCast(d)) });
     };
     return keys.items;
 }
@@ -144,10 +144,10 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
 /// Whether a reference to a secret-key type stands behind a pointer (a borrow) or inside an
 /// aegis `Secret` or `SecretBytes` instantiation (sealed), up to the declaration it is part of.
 fn borrowedOrSealed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+    while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return true,
             .fn_decl, .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
@@ -209,8 +209,8 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     const found = try Governed.resolve(c, rule, targets, indexes);
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
         if (sameUnit(tree, model, site.node)) continue;
@@ -222,12 +222,12 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
 /// difference.
 fn sameUnit(tree: *const Ast, model: anytype, node: Ast.Node.Index) bool {
     if (!nanoseconds(tree, node)) return false;
-    var parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table
+    var parent = model.parentOf(node) orelse return false;
     var at = node;
     // A difference of raw counts is one too: what it meets is what the read meets.
     while ((tree.nodeTag(parent) == .sub or tree.nodeTag(parent) == .sub_sat or tree.nodeTag(parent) == .grouped_expression) and nanoseconds(tree, parent)) {
         at = parent;
-        parent = model.node_parents[@backingInt(parent)] orelse return false; // safe: a node index indexes its own tree's parent table
+        parent = model.parentOf(parent) orelse return false;
     }
     switch (tree.nodeTag(parent)) {
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .sub, .sub_sat => {},
@@ -258,7 +258,7 @@ fn nanoseconds(tree: *const Ast, node: Ast.Node.Index) bool {
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, .input);
     try asserts(c, rule, flow);
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .unreachable_literal) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -277,11 +277,11 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
 /// answer of, through the call before it (what the call reads and is given), up to its
 /// function.
 fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var out: Taint.Level = .clean;
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+    while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .fn_decl => break,
             .@"catch", .@"orelse" => {
@@ -295,7 +295,7 @@ fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!
         } else if (tree.fullWhile(parent)) |loop| {
             if (loop.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr));
         } else if (tree.fullSwitchCase(parent) != null) {
-            const choice = model.node_parents[@backingInt(parent)] orelse continue; // safe: a node index indexes its own tree's parent table
+            const choice = model.parentOf(parent) orelse continue;
             const whole = tree.fullSwitch(choice) orelse continue;
             out = out.join(try Taint.levelAt(c, flow, c.file, whole.ast.condition));
         }
@@ -306,7 +306,7 @@ fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!
 /// How far input can make `expression` fail: what it holds, and what a call it makes reads
 /// and is given.
 fn failedBy(c: *Context, flow: *Taint.Flow, expression: Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     var out = try Taint.levelAt(c, flow, c.file, expression);
     var inner = expression;
     while (tree.nodeTag(inner) == .@"try" or tree.nodeTag(inner) == .grouped_expression) inner = if (tree.nodeTag(inner) == .@"try") tree.nodeData(inner).node else tree.nodeData(inner).node_and_token[0];
@@ -328,14 +328,14 @@ fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
     const found = try Governed.resolve(c, rule, &target, &index);
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var calls: std.ArrayList(Ast.Node.Index) = .empty;
     // A call through an alias the program declares is read by what its callee reaches.
     try aliasCalls(c, found[0].decls, &calls);
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
-        const parent = model.node_parents[@backingInt(site.node)] orelse continue; // safe: a node index indexes its own tree's parent table
+        const parent = model.parentOf(site.node) orelse continue;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == site.node) {
             try calls.append(c.allocator, parent);
@@ -367,7 +367,7 @@ fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
 /// std.debug.assert;`), public or private, in any of its files, and an alias of one: each call
 /// whose callee is a declaration other than std's that reaches one of `assert_decls`.
 fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
@@ -385,7 +385,7 @@ fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayLi
 /// The edits that make the call at `node` (`f(c)`) `aegis.assert.invariant(c, "c")`, the
 /// file's aegis import among them; false where the call is not that shape.
 fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edit)) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
     if (call.ast.params.len != 1) return false;
@@ -410,12 +410,12 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
 /// The name the file imports aegis by, an edit adding the import (after std's) when it has
 /// none; null where `aegis` names something else.
 fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    const file = &c.project.files[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const file = &c.project.at(c.file).file;
     var after_std: u32 = 0;
     for (model.declarations) |decl| {
-        if (decl.kind != .variable or model.scopes[decl.scope].kind != .file) continue;
+        if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .file) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
         const init = variable.ast.init_node.unwrap() orelse continue;
         const spelled = tree.getNodeSource(init);
@@ -439,7 +439,7 @@ fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]c
 
 /// A019: the operations Zig leaves unchecked.
 pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
@@ -463,7 +463,7 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             }
             // A condition on the build mode: off in the modes whose checks it turns off. A mode
             // that builds without them (fast, small) loses nothing to it.
-            const on = (try Model.modes(c.allocator, tree, &c.project.models[c.file.raw()], args[0], 0)) orelse {
+            const on = (try Model.modes(c.allocator, tree, &c.project.at(c.file).model, args[0], 0)) orelse {
                 try c.unknown(rule, node, .comptime_dependent);
                 continue;
             };
@@ -484,7 +484,7 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };
     }
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .variable and decl.kind != .function) continue;
         const token: ?Ast.TokenIndex = if (decl.kind == .function) blk: {
@@ -530,9 +530,9 @@ fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime mes
 /// std.Io.Mutex`, a comptime check that refuses the type): none holds one. A member that is a
 /// value (`std.Io.Mutex.init`) is one held.
 fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    if (model.node_parents[@backingInt(node)]) |parent| { // safe: a node index indexes its own tree's parent table
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    if (model.parentOf(node)) |parent| {
         if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return switch (try c.facts.resolve(c.file, parent)) {
             .function, .container, .error_set, .primitive, .fn_type => true,
             else => false,
@@ -541,12 +541,12 @@ fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
         var compared = parent;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |made| if (made.ast.fn_expr == node) {
-            compared = model.node_parents[@backingInt(parent)] orelse parent; // safe: a node index indexes its own tree's parent table
+            compared = model.parentOf(parent) orelse parent;
         };
         if (tree.nodeTag(compared) == .equal_equal or tree.nodeTag(compared) == .bang_equal) return true;
     }
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+    while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return true,
             .fn_decl, .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
@@ -591,12 +591,12 @@ fn governed(c: *Context, rule: Rule, paths: []const []const u8, operation: bool,
 
 /// Whether a reference is the whole value of a constant a file or container declares.
 fn declaredAs(c: *const Context, node: Ast.Node.Index) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
-    const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const parent = model.parentOf(node) orelse return false;
     const variable = tree.fullVarDecl(parent) orelse return false;
     if (variable.ast.init_node.unwrap() != node) return false;
-    const holder = model.node_parents[@backingInt(parent)] orelse return true; // safe: a node index indexes its own tree's parent table
+    const holder = model.parentOf(parent) orelse return true;
     var buffer: [2]Ast.Node.Index = undefined;
     return tree.fullContainerDecl(&buffer, holder) != null or tree.nodeTag(holder) == .root;
 }
@@ -605,10 +605,10 @@ fn declaredAs(c: *const Context, node: Ast.Node.Index) bool {
 /// not return `type`, outside any `comptime` block and any container's declarations nested
 /// there. A container-level value or a field's default is evaluated as the program compiles.
 pub fn atRuntime(c: *const Context, node: Ast.Node.Index) bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table
+    while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .@"comptime" => return false,
             .test_decl => return true,

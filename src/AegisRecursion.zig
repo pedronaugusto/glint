@@ -45,12 +45,12 @@ const Walk = struct {
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()]; // safe: the checked handle indexes this frozen file.
+    const model = &c.project.at(c.file).model;
     var walk: Walk = .{ .c = c, .rule = rule };
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .function) continue;
         if (!try takesUntrusted(c, tree, decl.node)) continue;
-        try entry(&walk, .{ .file = c.file, .index = @intCast(d) }, decl.token);
+        try entry(&walk, .{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }, decl.token);
     }
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -67,7 +67,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
 }
 
 fn selected(c: *Context, file: @import("Project.zig").FileId) bool {
-    return c.project.inputs[file.raw()].selected; // safe: resolved declarations name frozen project files.
+    return c.project.at(file).input.selected;
 }
 
 /// Whether a function declares a parameter of an untrusted type.
@@ -91,12 +91,12 @@ fn entry(self: *Walk, start: Facts.Decl, token: Ast.TokenIndex) Context.Error!vo
         // Each by its place and spelling: an unresolved call is settled by giving it a type.
         var names: std.Io.Writer.Allocating = .init(self.c.allocator);
         for (self.unresolved.items, 0..) |one, i| {
-            const file = &self.c.project.files[one.file.raw()]; // safe: resolved declarations name frozen project files.
+            const file = &self.c.project.at(one.file).file;
             const at = file.line(file.tree.tokenStart(file.tree.firstToken(one.call))) + 1;
             var buffer: [1]Ast.Node.Index = undefined;
             const callee = file.tree.getNodeSource(file.tree.fullCall(&buffer, one.call).?.ast.fn_expr);
             // An allocating writer fails only when its allocation does.
-            names.writer.print("{s}{s}:{d} `{s}`", .{ if (i == 0) "" else ", ", self.c.project.inputs[one.file.raw()].name, at, callee }) catch return error.OutOfMemory;
+            names.writer.print("{s}{s}:{d} `{s}`", .{ if (i == 0) "" else ", ", self.c.project.at(one.file).input.name, at, callee }) catch return error.OutOfMemory;
         }
         try self.c.undecided(self.rule, tree.tokenStart(token), .unresolved, try self.c.allocator.print("{d} calls reachable from untrusted input do not resolve ({s}); recursion through them is undecided", .{ self.unresolved.items.len, names.written() }));
     }
@@ -106,7 +106,7 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
     if (self.done.contains(function)) return;
     try self.stack.append(self.c.allocator, function);
     defer _ = self.stack.pop();
-    const tree = &self.c.project.files[function.file.raw()].tree; // safe: resolved declarations name frozen project files.
+    const tree = &self.c.project.at(function.file).file.tree;
     for (try callsOf(self, function)) |call_node| {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, call_node).?;
@@ -131,9 +131,9 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
 /// `comptime seen: []const type`), so no value read at run time reaches it and its depth is the
 /// types' it is given (strand's descriptors).
 fn compileTime(self: *Walk, f: Facts.Decl) bool {
-    const tree = &self.c.project.files[f.file.raw()].tree; // safe: resolved declarations name frozen project files.
+    const tree = &self.c.project.at(f.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, self.c.project.models[f.file.raw()].declarations[f.index].node) orelse return false; // safe: resolved declarations name frozen project tables.
+    const proto = tree.fullFnProto(&buffer, self.c.project.at(f.file).model.declarations[@backingInt(f.index)].node) orelse return false;
     if (proto.ast.return_type.unwrap()) |result| if (typeKeyword(tree, result)) return true;
     var parameters = proto.iterate(tree);
     var any = false;
@@ -173,11 +173,11 @@ fn cycle(self: *Walk, from: usize, token: Ast.TokenIndex) Context.Error!void {
 }
 
 fn name(self: *Walk, f: Facts.Decl) []const u8 {
-    return self.c.project.models[f.file.raw()].declarations[f.index].name; // safe: resolved declarations name frozen project tables.
+    return self.c.project.at(f.file).model.declarations[@backingInt(f.index)].name;
 }
 
 fn span(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!Report.Span {
-    const source = &self.c.project.files[file.raw()]; // safe: resolved declarations name frozen project files.
+    const source = &self.c.project.at(file).file;
     const start = source.tree.tokenStart(source.tree.nodeMainToken(node));
     const line = source.line(start);
     return .{ .file = file, .start = start, .end = start + 1, .line = line + 1, .column = start - source.lines[line] + 1 };
@@ -186,8 +186,8 @@ fn span(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Index) 
 /// Whether the function making `edge`'s call changes a depth it compares: a parameter passed
 /// on as `p + k` or `p - k`, or a field moved by `+=`/`-=`, itself or in a function it calls.
 fn bounds(self: *Walk, edge: Walk.Edge) Context.Error!bool {
-    const tree = &self.c.project.files[edge.at.file.raw()].tree; // safe: resolved declarations name frozen project files.
-    const model = &self.c.project.models[edge.at.file.raw()]; // safe: resolved declarations name frozen project files.
+    const tree = &self.c.project.at(edge.at.file).file.tree;
+    const model = &self.c.project.at(edge.at.file).model;
     const whole = body(tree, model, edge.at) orelse return false;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, edge.call).?;
@@ -199,8 +199,8 @@ fn bounds(self: *Walk, edge: Walk.Edge) Context.Error!bool {
         const inner = tree.fullCall(&buffer, other).?;
         const callee = try self.c.facts.resolve(edge.at.file, inner.ast.fn_expr);
         if (callee != .function or !selected(self.c, callee.function.file)) continue;
-        const callee_tree = &self.c.project.files[callee.function.file.raw()].tree; // safe: resolved declarations name frozen project files.
-        const callee_model = &self.c.project.models[callee.function.file.raw()]; // safe: resolved declarations name frozen project files.
+        const callee_tree = &self.c.project.at(callee.function.file).file.tree;
+        const callee_model = &self.c.project.at(callee.function.file).model;
         const callee_body = body(callee_tree, callee_model, callee.function) orelse continue;
         if (movedField(callee_tree, callee_model, callee_body)) return true;
     }
@@ -208,14 +208,14 @@ fn bounds(self: *Walk, edge: Walk.Edge) Context.Error!bool {
 }
 
 fn body(tree: *const Ast, model: *const Model, f: Facts.Decl) ?Ast.Node.Index {
-    const proto = model.declarations[f.index].node;
-    const parent = model.node_parents[@backingInt(proto)] orelse return null; // safe: the checked AST indexes its own parent table.
+    const proto = model.declarations[@backingInt(f.index)].node;
+    const parent = model.parentOf(proto) orelse return null;
     return if (tree.nodeTag(parent) == .fn_decl) parent else null;
 }
 
 /// The parameter `argument` passes on one step away: `p + k`, `p - k` and their wrapping and
 /// saturating forms, where `p` is a parameter.
-fn stepped(tree: *const Ast, model: *const Model, argument: Ast.Node.Index) ?u32 {
+fn stepped(tree: *const Ast, model: *const Model, argument: Ast.Node.Index) ?Model.Declaration.Id {
     switch (tree.nodeTag(argument)) {
         .add, .sub, .add_wrap, .sub_wrap, .add_sat, .sub_sat => {},
         else => return null,
@@ -225,14 +225,14 @@ fn stepped(tree: *const Ast, model: *const Model, argument: Ast.Node.Index) ?u32
     return null;
 }
 
-fn parameterOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?u32 {
+fn parameterOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
     if (tree.nodeTag(node) != .identifier) return null;
     const reference = model.reference(node) orelse return null;
     const d = reference.declaration orelse return null;
-    return if (model.declarations[d].kind == .parameter) d else null;
+    return if (model.declarations[@backingInt(d)].kind == .parameter) d else null;
 }
 
-const Depth = union(enum) { parameter: u32, field: []const u8 };
+const Depth = union(enum) { parameter: Model.Declaration.Id, field: []const u8 };
 
 /// Whether a comparison inside `whole` has the depth as an operand.
 fn compared(tree: *const Ast, model: *const Model, whole: Ast.Node.Index, depth: Depth) bool {
@@ -284,10 +284,10 @@ fn movedField(tree: *const Ast, model: *const Model, whole: Ast.Node.Index) bool
 
 /// The calls whose nearest enclosing function is `f`, indexed once per file.
 fn callsOf(self: *Walk, f: Facts.Decl) Context.Error![]const Ast.Node.Index {
-    const tree = &self.c.project.files[f.file.raw()].tree; // safe: resolved declarations name frozen project files.
-    const model = &self.c.project.models[f.file.raw()]; // safe: resolved declarations name frozen project files.
+    const tree = &self.c.project.at(f.file).file.tree;
+    const model = &self.c.project.at(f.file).model;
     const whole = body(tree, model, f) orelse return &.{};
-    const entry_ = try self.calls.getOrPut(self.c.allocator, f.file.raw());
+    const entry_ = try self.calls.getOrPut(self.c.allocator, @backingInt(f.file));
     if (!entry_.found_existing) {
         entry_.value_ptr.* = .empty;
         for (tree.nodes.items(.tag), 0..) |_, i| {
@@ -295,7 +295,7 @@ fn callsOf(self: *Walk, f: Facts.Decl) Context.Error![]const Ast.Node.Index {
             var buffer: [1]Ast.Node.Index = undefined;
             _ = tree.fullCall(&buffer, node) orelse continue;
             var at = model.node_parents[i];
-            while (at) |parent| : (at = model.node_parents[@backingInt(parent)]) { // safe: the checked AST indexes its own parent table.
+            while (at) |parent| : (at = model.parentOf(parent)) {
                 if (tree.nodeTag(parent) != .fn_decl) continue;
                 const list = try entry_.value_ptr.getOrPut(self.c.allocator, @backingInt(parent)); // safe: AST node indexes key their own table.
                 if (!list.found_existing) list.value_ptr.* = .empty;

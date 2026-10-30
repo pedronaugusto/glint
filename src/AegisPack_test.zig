@@ -108,7 +108,7 @@ test "aegis pack report acceptance never completes invalid input even with file 
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expect(!report.complete);
-    var gated = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules, .files = &.{.{ .file = P.FileId.fromRaw(0), .config = .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} } }} });
+    var gated = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules, .files = &.{.{ .file = project.sources[0].id, .config = .{ .selections = &.{.{ .rule = pack.access, .level = .gate }} } }} });
     defer gated.deinit();
     try std.testing.expect(!gated.complete);
 }
@@ -284,8 +284,8 @@ test "adopted aegis gates preserve escaped operation spellings" {
     defer plain_project.deinit();
     var escaped_project = try fixture(escaped);
     defer escaped_project.deinit();
-    try std.testing.expectEqual(.parsed, plain_project.files[0].status);
-    try std.testing.expectEqual(.parsed, escaped_project.files[0].status);
+    try std.testing.expectEqual(.parsed, plain_project.sources[0].file.status);
+    try std.testing.expectEqual(.parsed, escaped_project.sources[0].file.status);
     var plain = try glint.runConfigured(std.testing.allocator, &plain_project, adopted, .{ .project_rules = &pack.rules });
     defer plain.deinit();
     var quoted = try glint.runConfigured(std.testing.allocator, &escaped_project, adopted, .{ .project_rules = &pack.rules });
@@ -304,7 +304,7 @@ test "escaped acquisition cleanup and guard type keep direct gate witnesses" {
     inline for (cases) |case| {
         var project = try fixture(case[1]);
         defer project.deinit();
-        try std.testing.expectEqual(.parsed, project.files[0].status);
+        try std.testing.expectEqual(.parsed, project.sources[0].file.status);
         var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
         try std.testing.expect(report.complete);
@@ -389,14 +389,14 @@ fn flatFixture(bytes: []const u8, options: Flat) !P {
         .{ .name = "vault.zig", .bytes = options.vault, .selected = false },
     };
     const imports = [_]P.Import{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "aegis", .target = P.FileId.fromRaw(1) },
-        .{ .from = P.FileId.fromRaw(0), .spelling = "vault", .target = P.FileId.fromRaw(8) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "Secret.zig", .target = P.FileId.fromRaw(2) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "Guarded.zig", .target = P.FileId.fromRaw(3) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "SecretBytes.zig", .target = P.FileId.fromRaw(4) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "int.zig", .target = P.FileId.fromRaw(5) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "id.zig", .target = P.FileId.fromRaw(6) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "units.zig", .target = P.FileId.fromRaw(7) },
+        .{ .from = 0, .spelling = "aegis", .target = 1 },
+        .{ .from = 0, .spelling = "vault", .target = 8 },
+        .{ .from = 1, .spelling = "Secret.zig", .target = 2 },
+        .{ .from = 1, .spelling = "Guarded.zig", .target = 3 },
+        .{ .from = 1, .spelling = "SecretBytes.zig", .target = 4 },
+        .{ .from = 1, .spelling = "int.zig", .target = 5 },
+        .{ .from = 1, .spelling = "id.zig", .target = 6 },
+        .{ .from = 1, .spelling = "units.zig", .target = 7 },
     };
     return P.init(std.testing.allocator, &inputs, &imports, .{});
 }
@@ -547,7 +547,7 @@ test "a scalar receiver is known through an unwrapped optional" {
 fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findings: usize } {
     var project = try fixture(source);
     defer project.deinit();
-    try std.testing.expectEqual(.parsed, project.files[0].status);
+    try std.testing.expectEqual(.parsed, project.sources[0].file.status);
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     return .{ .complete = report.complete, .findings = count(report, rule) };

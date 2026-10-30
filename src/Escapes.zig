@@ -22,9 +22,8 @@ const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
-    const index = c.file.raw();
-    const tree = &c.project.files[index].tree;
-    const model = &c.project.models[index];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     const self: Walk = .{ .c = c, .tree = tree, .model = model };
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -38,7 +37,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (stored) |target| if (!self.outlives(target)) continue;
         const local = (try self.escaping(operand, function, 0)) orelse continue;
         if (stored) |target| if (self.restored(function, target)) continue;
-        const name = model.declarations[local].name;
+        const name = model.declarations[@backingInt(local)].name;
         const message = if (stored == null)
             try c.allocator.print("returns a pointer into local '{s}', which the return frees", .{name})
         else
@@ -56,7 +55,7 @@ const Walk = struct {
     /// function returning `type`: all comptime frames.
     fn enclosing(self: Walk, node: Ast.Node.Index) ?Ast.Node.Index {
         var at = node;
-        while (self.model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: the checked AST indexes its own parent table.
+        while (self.model.parentOf(at)) |parent| : (at = parent) {
             switch (self.tree.nodeTag(parent)) {
                 .@"comptime" => return null,
                 .fn_decl => {
@@ -74,17 +73,17 @@ const Walk = struct {
 
     /// The declaration an identifier names, when it is one of `function`'s own: declared in its
     /// body, outside any nested function or `comptime`.
-    fn own(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?u32 {
+    fn own(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
         const reference = self.model.reference(identifier) orelse return null;
         const d = reference.declaration orelse return null;
-        const decl = self.model.declarations[d];
+        const decl = self.model.declarations[@backingInt(d)];
         if (decl.kind != .variable) return null;
         if (self.enclosing(decl.node) != function) return null;
         return d;
     }
 
     /// The local a pointer value reaches into, or null: through `depth` aliases so far.
-    fn escaping(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!?u32 {
+    fn escaping(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!?Model.Declaration.Id {
         const tree = self.tree;
         if (depth > 8) return null;
         switch (tree.nodeTag(node)) {
@@ -105,7 +104,7 @@ const Walk = struct {
             // A name for a pointer: what its `const` holds, or each value its `var` is given.
             .identifier => {
                 const d = self.own(node, function) orelse return null;
-                const decl = self.tree.fullVarDecl(self.model.declarations[d].node) orelse return null;
+                const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
                 if (decl.ast.init_node.unwrap()) |init| if (try self.escaping(init, function, depth + 1)) |reached| return reached;
                 if (tree.tokenTag(decl.ast.mut_token) == .keyword_const) return null;
                 for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -128,9 +127,9 @@ const Walk = struct {
 
     /// A local of `function`'s own in its frame: a `var` not comptime, or a `const` whose value
     /// is no literal the program compiles in.
-    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?u32 {
+    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
         const d = self.own(identifier, function) orelse return null;
-        const decl = self.tree.fullVarDecl(self.model.declarations[d].node) orelse return null;
+        const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
         if (decl.comptime_token != null) return null;
         if (self.tree.tokenTag(decl.ast.mut_token) == .keyword_const) {
             const init = decl.ast.init_node.unwrap() orelse return null;
@@ -153,7 +152,7 @@ const Walk = struct {
 
     /// Whether a local's fields and elements live in it: its type, written or of its value, is
     /// no pointer Zig would dereference. A type the reading does not know may be a value.
-    fn value(self: Walk, d: u32) Context.Error!bool {
+    fn value(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
         return switch (try self.typeOf(d)) {
             .pointer => false,
             else => true,
@@ -162,8 +161,8 @@ const Walk = struct {
 
     /// Whether a local is an array a slice of which is its frame's memory: its type, written
     /// or of its value, is an array, or one the reading does not know.
-    fn array(self: Walk, d: u32) Context.Error!bool {
-        const decl = self.tree.fullVarDecl(self.model.declarations[d].node) orelse return false;
+    fn array(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
+        const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return false;
         if (decl.ast.type_node.unwrap()) |kind| switch (self.tree.nodeTag(kind)) {
             .array_type, .array_type_sentinel => return true,
             else => {},
@@ -175,8 +174,8 @@ const Walk = struct {
     }
 
     /// What a local's type resolves to: the type it is written with, or its value's.
-    fn typeOf(self: Walk, d: u32) Context.Error!@import("Facts.zig").Value {
-        const decl = self.tree.fullVarDecl(self.model.declarations[d].node) orelse return .{ .unknown = .unsupported };
+    fn typeOf(self: Walk, d: Model.Declaration.Id) Context.Error!@import("Facts.zig").Value {
+        const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return .{ .unknown = .unsupported };
         if (decl.ast.type_node.unwrap()) |kind| return self.c.facts.resolve(self.c.file, kind);
         const init = decl.ast.init_node.unwrap() orelse return .{ .unknown = .unsupported };
         return self.c.facts.resolve(self.c.file, init);
@@ -197,15 +196,15 @@ const Walk = struct {
         };
         const reference = self.model.reference(at) orelse return false;
         const d = reference.declaration orelse return false;
-        return self.model.declarations[d].kind == .parameter or self.global(at);
+        return self.model.declarations[@backingInt(d)].kind == .parameter or self.global(at);
     }
 
     fn global(self: Walk, identifier: Ast.Node.Index) bool {
         const reference = self.model.reference(identifier) orelse return false;
         const d = reference.declaration orelse return false;
-        const decl = self.model.declarations[d];
+        const decl = self.model.declarations[@backingInt(d)];
         if (decl.kind != .variable) return false;
-        return switch (self.model.scopes[decl.scope].kind) {
+        return switch (self.model.scopes[@backingInt(decl.scope)].kind) {
             .file, .container => true,
             else => false,
         };

@@ -89,10 +89,10 @@ test "G2 compiled rules reject missing definitions collisions and invalid spans"
 test "G2 caller selects per-file rule levels without importing a path dialect" {
     var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "chosen", .bytes = "pub const x = 1;" }, .{ .name = "excluded", .bytes = "pub const y = 2;" } }, &.{}, .{});
     defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.off), .{ .project_rules = &.{rule}, .files = &.{.{ .file = glint.Project.FileId.fromRaw(0), .config = configuration(.report) }} });
+    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.off), .{ .project_rules = &.{rule}, .files = &.{.{ .file = project.sources[0].id, .config = configuration(.report) }} });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: only selected source reports.
-    try std.testing.expect(report.diagnostics[0].span.file.eql(glint.Project.FileId.fromRaw(0)));
+    try std.testing.expect(report.diagnostics[0].span.file == project.sources[0].id);
 }
 
 /// Reports each call `x.read(...)` that `Lib.read` cannot be, by `RuleContext.accepts`.
@@ -101,7 +101,7 @@ fn refusedCalls(context: *glint.RuleContext) glint.RuleContext.Error!void {
     const tree = try context.project.syntax(h);
     const declarations = try context.project.declarations(h);
     const read: glint.Symbol = for (declarations, 0..) |decl, i| {
-        if (decl.kind == .function and std.mem.eql(u8, decl.name, "read")) break .{ .file = context.file, .index = @intCast(i) }; // safe: declaration indexes are bounded by the frozen model.
+        if (decl.kind == .function and std.mem.eql(u8, decl.name, "read")) break .{ .file = context.file, .index = @fromBackingInt(@intCast(i)) }; // safe: declaration indexes are bounded by the frozen model.
     } else return;
     for (0..tree.nodes.len) |i| {
         const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i)); // safe: AST node table supplies bounded indexes.

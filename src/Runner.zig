@@ -31,7 +31,8 @@ covered: std.array_hash_map.Auto(usize, std.ArrayList(Report.Covered)) = .empty,
 complete: bool = true,
 definitions: []const rules.Definition = &.{},
 files: []const FileConfig = &.{},
-file: Project.FileId = Project.FileId.fromRaw(0), // safe: validated file identities and budgeted std source indexes fit u32.
+/// The file whose rules run; set before each file's run, and read only during it.
+file: Project.FileId = undefined,
 
 pub const RunError = Suppression.ParseError || Context.Error || std.Io.Cancelable;
 pub const Options = struct {
@@ -54,9 +55,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     errdefer arena.deinit();
     const a = arena.allocator();
     for (options.files, 0..) |setting, i| {
-        // aegis: no-danger(A004): an identity checked against the length of the table it indexes; the comparison is the bound
-        if (setting.file.raw() >= project.count()) return error.InvalidHandle;
-        for (options.files[0..i]) |earlier| if (setting.file.eql(earlier.file)) return error.InvalidSelection;
+        // An id of another project.
+        if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
+        for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
     const definitions = try a.alloc(rules.Definition, options.project_rules.len);
     for (options.project_rules, 0..) |rule, i| {
@@ -69,17 +70,17 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
-    for (project.inputs, 0..) |input, index| {
-        if (!input.selected) continue;
+    for (project.sources) |*source| {
+        if (!source.input.selected) continue;
         if (options.io) |io| try io.checkCancel();
-        runner.file = Project.FileId.fromRaw(@intCast(index));
+        runner.file = source.id;
         runner.config = config;
-        for (options.files) |setting| if (setting.file.eql(runner.file)) {
+        for (options.files) |setting| if (setting.file == runner.file) {
             runner.config = setting.config;
         };
         try runner.config.validate();
         try validateRules(runner.config, definitions);
-        const file = &project.files[index];
+        const file = &source.file;
         var malformed: std.ArrayList(Suppression.Malformed) = .empty;
         runner.suppressions = try Suppression.parseConfigured(a, file, definitions, &malformed);
         for (malformed.items) |entry| {
@@ -100,7 +101,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         } });
         if (file.status == .parsed) {
             if (file.zir == null) runner.complete = false;
-            const lowered_coverage = project.models[index].lowered_coverage;
+            const lowered_coverage = source.model.lowered_coverage;
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
@@ -165,7 +166,7 @@ fn escapeRan(self: *const Runner, escape: Suppression, project_rules: []const Co
 }
 
 fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.Diagnostic) bool {
-    const order = std.mem.order(u8, project.inputs[lhs.span.file.raw()].name, project.inputs[rhs.span.file.raw()].name); // safe: enum identities index their owning frozen tables without narrowing.
+    const order = std.mem.order(u8, project.at(lhs.span.file).input.name, project.at(rhs.span.file).input.name);
     if (order != .eq) return order == .lt;
     if (lhs.span.start != rhs.span.start) return lhs.span.start < rhs.span.start;
     return @backingInt(lhs.rule) < @backingInt(rhs.rule); // safe: enum identities index their owning frozen tables without narrowing.
@@ -173,7 +174,7 @@ fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.D
 
 fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
     if (!self.config.has(rule)) return;
-    const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const file = &self.project.at(self.file).file;
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 };
@@ -207,7 +208,7 @@ fn sinkDiagnostic(sink: *Context.Sink, rule: rules.Rule, start: u32, end: u32, m
 }
 fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
     const runner: *Runner = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Runner's own sink field.
-    for (runner.files) |setting| if (setting.file.eql(file)) return setting.config;
+    for (runner.files) |setting| if (setting.file == file) return setting.config;
     return runner.base;
 }
 fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {

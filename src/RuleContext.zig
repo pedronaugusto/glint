@@ -3,6 +3,7 @@ const std = @import("std");
 const Project = @import("Project.zig");
 const Ast = std.zig.Ast;
 const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
 const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
 const RuleContext = @This();
@@ -43,9 +44,8 @@ pub fn role(self: *RuleContext, library: anytype, value: Facts.Value) Error!?@Ty
 }
 /// Whether `file` is one of the library's own files, reached from its module roots.
 pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Error!bool {
-    _ = try self.project.handle(file);
     const found = try self.facts.publication(library);
-    for (found.files) |own| if (own.eql(file)) return true;
+    for (found.files) |own| if (own == file) return true;
     return false;
 }
 /// Whether `decl`'s parameters, past the first `skip` (a method's receiver), can take the
@@ -53,10 +53,10 @@ pub fn inLibrary(self: *RuleContext, library: anytype, file: Project.FileId) Err
 /// literal where a struct is taken, and none a type where a value of a struct, a pointer or a
 /// number is taken (a type goes only to a `type` or `anytype` parameter).
 pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: usize) Error!bool {
-    const target = &self.project.files[decl.file.raw()].tree;
-    const tree = &self.project.files[self.file.raw()].tree;
+    const target = &self.project.at(decl.file).file.tree;
+    const tree = &self.project.at(self.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const function = target.fullFnProto(&buffer, self.project.models[decl.file.raw()].declarations[decl.index].node) orelse return true;
+    const function = target.fullFnProto(&buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return true;
     var it = function.iterate(target);
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
@@ -78,8 +78,8 @@ pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: 
             else => {},
         };
         if (literal and kind == .container) {
-            const scope_node = self.project.models[kind.container.file.raw()].scopes[kind.container.scope].node;
-            const owner = &self.project.files[kind.container.file.raw()].tree;
+            const scope_node = self.project.at(kind.container.file).model.scopes[@backingInt(kind.container.scope)].node;
+            const owner = &self.project.at(kind.container.file).file.tree;
             if (scope_node == .root or owner.tokenTag(owner.nodeMainToken(scope_node)) == .keyword_struct) return false;
         }
     }
@@ -89,7 +89,7 @@ pub fn accepts(self: *RuleContext, decl: Facts.Decl, call: Ast.full.Call, skip: 
 /// error union type, a container), naming one, made by a call to a function that returns
 /// `type`, or given by a builtin that makes types.
 fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
-    const tree = &self.project.files[self.file.raw()].tree;
+    const tree = &self.project.at(self.file).file.tree;
     if (tree.fullPtrType(node) != null or tree.fullArrayType(node) != null) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) return true;
@@ -97,9 +97,9 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
     if (tree.fullCall(&call_buffer, node)) |call| {
         const decl = (try self.facts.definition(self.file, call.ast.fn_expr)) orelse return false;
         const function = (try self.facts.origin(decl)) orelse return false;
-        const record = self.project.models[function.file.raw()].declarations[function.index];
+        const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
         if (record.kind != .function) return false;
-        const written = &self.project.files[function.file.raw()].tree;
+        const written = &self.project.at(function.file).file.tree;
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
         const result = proto.ast.return_type.unwrap() orelse return false;
@@ -126,7 +126,7 @@ pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unkn
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     const found = try self.facts.publication(library);
     const tree = try self.project.syntax(try self.source());
-    const model = &self.project.models[self.file.raw()]; // safe: the checked handle indexes this frozen file.
+    const model = &self.project.at(self.file).model;
     for (found.gaps) |gap| for (model.import_nodes) |node| {
         var buffer: [2]std.zig.Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
@@ -152,7 +152,7 @@ pub fn emitFixed(self: *RuleContext, rule: rules.Rule, start: u32, end: u32, mes
     const bytes = try self.project.source(try self.source());
     if (start > end or end > bytes.len) return error.InvalidHandle;
     for (related) |span| {
-        const target = try self.project.handle(span.file);
+        const target = self.project.handle(span.file);
         if (span.start > span.end or span.end > (try self.project.source(target)).len) return error.InvalidHandle;
     }
     for (fix) |e| if (e.start > e.end or e.end > bytes.len) return error.InvalidHandle;
@@ -191,12 +191,13 @@ pub fn configOf(self: *const RuleContext, file: Project.FileId) rules.Config {
 }
 /// Whether a token is test code: a test input, or inside a `test` block.
 pub fn inTest(self: *const RuleContext, token: std.zig.Ast.TokenIndex) bool {
-    if (self.project.inputs[self.file.raw()].classification == .@"test") return true;
-    const model = &self.project.models[self.file.raw()]; // safe: the checked file indexes its frozen model.
-    var scope: ?u32 = model.token_scopes[token];
-    while (scope) |index| {
-        if (model.scopes[index].kind == .@"test") return true;
-        scope = model.scopes[index].parent;
+    if (self.project.at(self.file).input.classification == .@"test") return true;
+    const model = &self.project.at(self.file).model;
+    var scope: ?Model.Scope.Id = model.scopeOf(token);
+    while (scope) |id| {
+        const each = &model.scopes[@backingInt(id)];
+        if (each.kind == .@"test") return true;
+        scope = each.parent;
     }
     return false;
 }
@@ -205,14 +206,13 @@ pub fn selected(self: *const RuleContext, selection: []const rules.Rule) bool {
     return false;
 }
 pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl) Error!void {
-    const h = try self.project.handle(definition.file);
+    const h = self.project.handle(definition.file);
     const tree = try self.project.syntax(h);
     const declarations = try self.project.declarations(h);
-    if (definition.index >= declarations.len) return error.InvalidHandle;
-    const start = tree.tokenStart(declarations[definition.index].token);
-    const file = &self.project.files[definition.file.raw()];
+    const start = tree.tokenStart(declarations[@backingInt(definition.index)].token);
+    const file = &self.project.at(definition.file).file;
     const line = file.line(start);
-    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[definition.index].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }};
+    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[@backingInt(definition.index)].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }};
     const site_tree = try self.project.syntax(try self.source());
     const site = site_tree.tokenStart(token);
     try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related);

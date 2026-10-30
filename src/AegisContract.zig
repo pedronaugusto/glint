@@ -169,14 +169,14 @@ const root_members = [_]Lib.Member{
 /// Generic argument equality, alias effects and control flow are deliberately not inferred.
 pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!?Kind {
     if (depth == 64) return null;
-    const tree = &c.project.files[file.raw()].tree;
-    const model = &c.project.models[file.raw()];
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     if (tree.fullPtrType(node)) |ptr| return kind(c, file, ptr.ast.child_type, depth + 1);
     switch (tree.nodeTag(node)) {
         .identifier => {
             const ref = model.reference(node) orelse return null;
             const index = ref.declaration orelse return null;
-            const decl = model.declarations[index];
+            const decl = model.declarations[@backingInt(index)];
             if (decl.kind == .parameter) return kind(c, file, decl.node, depth + 1);
             if (decl.kind == .capture) return captured(c, file, decl.node, decl.token, depth + 1);
             if (decl.kind == .field) {
@@ -200,8 +200,8 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             // declaration: its type expression is read where it is written, which a value
             // resolved through a type function's call cannot always be.
             const decl = (try c.facts.definition(file, node)) orelse return null;
-            const record = c.project.models[decl.file.raw()].declarations[decl.index];
-            const written = &c.project.files[decl.file.raw()].tree;
+            const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+            const written = &c.project.at(decl.file).file.tree;
             if (record.kind == .field) {
                 const field = written.fullContainerField(record.node).?;
                 if (field.ast.type_expr.unwrap()) |t| return kind(c, decl.file, t, depth + 1);
@@ -228,9 +228,9 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             if (try c.role(library, .{ .function = origin })) |k| return k;
             // A function of the program's own is what its declared result says, whether it is
             // an ordinary function or a method of a type a type function returns.
-            const record = c.project.models[origin.file.raw()].declarations[origin.index];
+            const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
             if (record.kind != .function) return null;
-            const written = &c.project.files[origin.file.raw()].tree;
+            const written = &c.project.at(origin.file).file.tree;
             var proto_buffer: [1]Ast.Node.Index = undefined;
             const proto = written.fullFnProto(&proto_buffer, record.node) orelse return null;
             const result = proto.ast.return_type.unwrap() orelse return null;
@@ -256,7 +256,7 @@ pub fn acquisition(name: []const u8) bool {
 /// What a name bound by `if (x) |name|` or `while (x) |name|` holds: the payload of `x`, which
 /// is `x`'s own kind seen through its optional or error union. Other captures stay unknown.
 fn captured(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: Ast.TokenIndex, depth: usize) Context.Error!?Kind {
-    const tree = &c.project.files[file.raw()].tree;
+    const tree = &c.project.at(file).file.tree;
     if (tree.fullIf(node)) |branch| {
         const payload = branch.payload_token orelse return null;
         if (payload != name and payload + 1 != name) return null;
@@ -277,8 +277,8 @@ pub fn owner(c: *Context, node: Ast.Node.Index) Context.Error!?Kind {
     return kind(c, c.file, node, 0);
 }
 /// Lexical root identity; member paths are not collapsed to their enclosing owner.
-pub fn local(c: *Context, node: Ast.Node.Index) ?u32 {
-    const model = &c.project.models[c.file.raw()];
+pub fn local(c: *Context, node: Ast.Node.Index) ?Model.Declaration.Id {
+    const model = &c.project.at(c.file).model;
     const ref = model.reference(node) orelse return null;
     return ref.declaration;
 }

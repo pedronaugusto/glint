@@ -96,72 +96,69 @@ const assert_file = 42;
 /// Imports as aegis's own build wires them, then the ways the consumer (source 0) imports aegis.
 fn imports() [62]Project.Import {
     return .{
-        .{ .from = file(root), .spelling = "secret.zig", .target = file(secret) },
-        .{ .from = file(root), .spelling = "sync.zig", .target = file(sync) },
-        .{ .from = file(root), .spelling = "int.zig", .target = file(int) },
-        .{ .from = file(root), .spelling = "id.zig", .target = file(id) },
-        .{ .from = file(root), .spelling = "units.zig", .target = file(units) },
-        .{ .from = file(secret), .spelling = "secret/inline.zig", .target = file(secret_inline) },
-        .{ .from = file(secret), .spelling = "secret/SecretBytes.zig", .target = file(secret_bytes) },
-        .{ .from = file(sync), .spelling = "Guarded.zig", .target = file(guarded) },
-        .{ .from = file(sync), .spelling = "BlockingGuarded.zig", .target = file(blocking_guarded) },
-        .{ .from = file(sync), .spelling = "RwGuarded.zig", .target = file(rw_guarded) },
-        .{ .from = file(sync), .spelling = "SpinRwGuarded.zig", .target = file(spin_rw_guarded) },
-        .{ .from = file(sync), .spelling = "Condition.zig", .target = file(condition) },
-        .{ .from = file(sync), .spelling = "Once.zig", .target = file(once) },
-        .{ .from = file(sync), .spelling = "Lazy.zig", .target = file(lazy) },
-        .{ .from = file(sync), .spelling = "Confined.zig", .target = file(confined) },
-        .{ .from = file(once), .spelling = "Condition.zig", .target = file(condition) },
-        .{ .from = file(int), .spelling = "scalar.zig", .target = file(scalar) },
-        .{ .from = file(id), .spelling = "scalar.zig", .target = file(scalar) },
-        .{ .from = file(id), .spelling = "units.zig", .target = file(units) },
-        .{ .from = file(units), .spelling = "scalar.zig", .target = file(scalar) },
-        .{ .from = file(units), .spelling = "int.zig", .target = file(int) },
-        .{ .from = file(root), .spelling = "bounded.zig", .target = file(bounded) },
-        .{ .from = file(root), .spelling = "own.zig", .target = file(own) },
-        .{ .from = file(root), .spelling = "input.zig", .target = file(input) },
-        .{ .from = file(root), .spelling = "state.zig", .target = file(state) },
-        .{ .from = file(root), .spelling = "scope.zig", .target = file(scope) },
-        .{ .from = file(root), .spelling = "handle.zig", .target = file(handle) },
-        .{ .from = file(sync), .spelling = "Shared.zig", .target = file(shared) },
-        .{ .from = file(secret), .spelling = "secret/value.zig", .target = file(secret_value) },
-        .{ .from = file(state), .spelling = "state/edge.zig", .target = file(state_edge) },
-        .{ .from = file(state), .spelling = "state/machine.zig", .target = file(state_machine) },
-        .{ .from = file(state_machine), .spelling = "edge.zig", .target = file(state_edge) },
-        .{ .from = file(state_machine), .spelling = "runtime.zig", .target = file(state_runtime) },
-        .{ .from = file(state_machine), .spelling = "stage.zig", .target = file(state_stage) },
-        .{ .from = file(scope), .spelling = "scope/ref.zig", .target = file(scope_ref) },
-        .{ .from = file(scope), .spelling = "scope/slot.zig", .target = file(scope_slot) },
-        .{ .from = file(scope), .spelling = "scope/table.zig", .target = file(scope_table) },
-        .{ .from = file(scope_table), .spelling = "ref.zig", .target = file(scope_ref) },
-        .{ .from = file(scope_table), .spelling = "slot.zig", .target = file(scope_slot) },
-        .{ .from = file(scope_ref), .spelling = "slot.zig", .target = file(scope_slot) },
-        .{ .from = file(handle), .spelling = "handle/dense.zig", .target = file(handle_dense) },
-        .{ .from = file(handle), .spelling = "handle/Domain.zig", .target = file(handle_domain) },
-        .{ .from = file(handle), .spelling = "handle/index.zig", .target = file(handle_index) },
-        .{ .from = file(handle), .spelling = "handle/pool.zig", .target = file(handle_pool) },
-        .{ .from = file(handle), .spelling = "handle/secondary.zig", .target = file(handle_secondary) },
-        .{ .from = file(handle), .spelling = "handle/slot_map.zig", .target = file(handle_slot_map) },
-        .{ .from = file(handle_slot_map), .spelling = "Domain.zig", .target = file(handle_domain) },
-        .{ .from = file(handle_slot_map), .spelling = "pool.zig", .target = file(handle_pool) },
-        .{ .from = file(handle_dense), .spelling = "Domain.zig", .target = file(handle_domain) },
-        .{ .from = file(handle_dense), .spelling = "slot_map.zig", .target = file(handle_slot_map) },
-        .{ .from = file(handle_pool), .spelling = "Domain.zig", .target = file(handle_domain) },
-        .{ .from = file(sync), .spelling = "Atomic.zig", .target = file(atomic) },
-        .{ .from = file(sync), .spelling = "Order.zig", .target = file(order) },
-        .{ .from = file(order), .spelling = "Condition.zig", .target = file(condition) },
-        .{ .from = file(root), .spelling = "err.zig", .target = file(err) },
-        .{ .from = file(root), .spelling = "assert.zig", .target = file(assert_file) },
-        .{ .from = file(0), .spelling = "aegis", .target = file(root) },
-        .{ .from = file(0), .spelling = "aegis.secret", .target = file(secret) },
-        .{ .from = file(0), .spelling = "aegis.sync", .target = file(sync) },
-        .{ .from = file(0), .spelling = "aegis.int", .target = file(int) },
-        .{ .from = file(0), .spelling = "aegis.id", .target = file(id) },
-        .{ .from = file(0), .spelling = "aegis.units", .target = file(units) },
+        .{ .from = root, .spelling = "secret.zig", .target = secret },
+        .{ .from = root, .spelling = "sync.zig", .target = sync },
+        .{ .from = root, .spelling = "int.zig", .target = int },
+        .{ .from = root, .spelling = "id.zig", .target = id },
+        .{ .from = root, .spelling = "units.zig", .target = units },
+        .{ .from = secret, .spelling = "secret/inline.zig", .target = secret_inline },
+        .{ .from = secret, .spelling = "secret/SecretBytes.zig", .target = secret_bytes },
+        .{ .from = sync, .spelling = "Guarded.zig", .target = guarded },
+        .{ .from = sync, .spelling = "BlockingGuarded.zig", .target = blocking_guarded },
+        .{ .from = sync, .spelling = "RwGuarded.zig", .target = rw_guarded },
+        .{ .from = sync, .spelling = "SpinRwGuarded.zig", .target = spin_rw_guarded },
+        .{ .from = sync, .spelling = "Condition.zig", .target = condition },
+        .{ .from = sync, .spelling = "Once.zig", .target = once },
+        .{ .from = sync, .spelling = "Lazy.zig", .target = lazy },
+        .{ .from = sync, .spelling = "Confined.zig", .target = confined },
+        .{ .from = once, .spelling = "Condition.zig", .target = condition },
+        .{ .from = int, .spelling = "scalar.zig", .target = scalar },
+        .{ .from = id, .spelling = "scalar.zig", .target = scalar },
+        .{ .from = id, .spelling = "units.zig", .target = units },
+        .{ .from = units, .spelling = "scalar.zig", .target = scalar },
+        .{ .from = units, .spelling = "int.zig", .target = int },
+        .{ .from = root, .spelling = "bounded.zig", .target = bounded },
+        .{ .from = root, .spelling = "own.zig", .target = own },
+        .{ .from = root, .spelling = "input.zig", .target = input },
+        .{ .from = root, .spelling = "state.zig", .target = state },
+        .{ .from = root, .spelling = "scope.zig", .target = scope },
+        .{ .from = root, .spelling = "handle.zig", .target = handle },
+        .{ .from = sync, .spelling = "Shared.zig", .target = shared },
+        .{ .from = secret, .spelling = "secret/value.zig", .target = secret_value },
+        .{ .from = state, .spelling = "state/edge.zig", .target = state_edge },
+        .{ .from = state, .spelling = "state/machine.zig", .target = state_machine },
+        .{ .from = state_machine, .spelling = "edge.zig", .target = state_edge },
+        .{ .from = state_machine, .spelling = "runtime.zig", .target = state_runtime },
+        .{ .from = state_machine, .spelling = "stage.zig", .target = state_stage },
+        .{ .from = scope, .spelling = "scope/ref.zig", .target = scope_ref },
+        .{ .from = scope, .spelling = "scope/slot.zig", .target = scope_slot },
+        .{ .from = scope, .spelling = "scope/table.zig", .target = scope_table },
+        .{ .from = scope_table, .spelling = "ref.zig", .target = scope_ref },
+        .{ .from = scope_table, .spelling = "slot.zig", .target = scope_slot },
+        .{ .from = scope_ref, .spelling = "slot.zig", .target = scope_slot },
+        .{ .from = handle, .spelling = "handle/dense.zig", .target = handle_dense },
+        .{ .from = handle, .spelling = "handle/Domain.zig", .target = handle_domain },
+        .{ .from = handle, .spelling = "handle/index.zig", .target = handle_index },
+        .{ .from = handle, .spelling = "handle/pool.zig", .target = handle_pool },
+        .{ .from = handle, .spelling = "handle/secondary.zig", .target = handle_secondary },
+        .{ .from = handle, .spelling = "handle/slot_map.zig", .target = handle_slot_map },
+        .{ .from = handle_slot_map, .spelling = "Domain.zig", .target = handle_domain },
+        .{ .from = handle_slot_map, .spelling = "pool.zig", .target = handle_pool },
+        .{ .from = handle_dense, .spelling = "Domain.zig", .target = handle_domain },
+        .{ .from = handle_dense, .spelling = "slot_map.zig", .target = handle_slot_map },
+        .{ .from = handle_pool, .spelling = "Domain.zig", .target = handle_domain },
+        .{ .from = sync, .spelling = "Atomic.zig", .target = atomic },
+        .{ .from = sync, .spelling = "Order.zig", .target = order },
+        .{ .from = order, .spelling = "Condition.zig", .target = condition },
+        .{ .from = root, .spelling = "err.zig", .target = err },
+        .{ .from = root, .spelling = "assert.zig", .target = assert_file },
+        .{ .from = 0, .spelling = "aegis", .target = root },
+        .{ .from = 0, .spelling = "aegis.secret", .target = secret },
+        .{ .from = 0, .spelling = "aegis.sync", .target = sync },
+        .{ .from = 0, .spelling = "aegis.int", .target = int },
+        .{ .from = 0, .spelling = "aegis.id", .target = id },
+        .{ .from = 0, .spelling = "aegis.units", .target = units },
     };
-}
-fn file(index: u32) Project.FileId {
-    return Project.FileId.fromRaw(index);
 }
 
 /// A project whose first source is `consumer`, followed by the aegis files, none of them selected.
@@ -188,12 +185,12 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
     for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
     inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib, .selected = selected };
-    const lib_file = file(sources.len + 1);
+    const lib_file = sources.len + 1;
     const mapped = imports();
     var all: [mapped.len + 2]Project.Import = undefined;
     @memcpy(all[0..mapped.len], &mapped);
-    all[mapped.len] = .{ .from = file(0), .spelling = "lib", .target = lib_file };
-    all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = file(root) };
+    all[mapped.len] = .{ .from = 0, .spelling = "lib", .target = lib_file };
+    all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = root };
     return Project.init(gpa, &inputs, &all, .{});
 }
 
@@ -215,6 +212,6 @@ pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: [
     defer gpa.free(all);
     @memcpy(all[0..mapped.len], &mapped);
     const first: u32 = sources.len + 1;
-    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| file(first + from) else file(0), .spelling = entry.spelling, .target = file(first + entry.target) };
+    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = first + entry.target };
     return Project.init(gpa, inputs, all, .{});
 }

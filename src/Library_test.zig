@@ -40,11 +40,11 @@ fn project(bytes: []const u8, layout: []const Layout) !P {
     for (layout, 1..) |entry, i| inputs[i] = .{ .name = entry.name, .bytes = entry.bytes, .selected = false };
     // Layout entry 0 is the module root. Files reach each other by their relative names.
     var imports: [16]P.Import = undefined;
-    imports[0] = .{ .from = P.FileId.fromRaw(0), .spelling = "gadgets", .target = P.FileId.fromRaw(1) };
+    imports[0] = .{ .from = 0, .spelling = "gadgets", .target = 1 };
     var count: usize = 1;
     for (layout, 1..) |_, from| for (layout[1..], 2..) |target, to| {
         if (from == to) continue;
-        imports[count] = .{ .from = P.FileId.fromRaw(@intCast(from)), .spelling = target.name, .target = P.FileId.fromRaw(@intCast(to)) }; // safe: the fixture has a handful of files.
+        imports[count] = .{ .from = from, .spelling = target.name, .target = to }; // safe: the fixture has a handful of files.
         count += 1;
     };
     return P.init(std.testing.allocator, inputs[0 .. layout.len + 1], imports[0..count], .{});
@@ -95,8 +95,8 @@ test "a lookalike declaration under another module is not the library's" {
         .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
         .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;", .selected = false },
     }, &.{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "lookalike", .target = P.FileId.fromRaw(2) },
-        .{ .from = P.FileId.fromRaw(2), .spelling = "widget.zig", .target = P.FileId.fromRaw(1) },
+        .{ .from = 0, .spelling = "lookalike", .target = 2 },
+        .{ .from = 2, .spelling = "widget.zig", .target = 1 },
     }, .{});
     defer built.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
@@ -131,8 +131,8 @@ test "an unmapped namespace is drift with its reason" {
         .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");", .selected = false },
         .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
     }, &.{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "gadgets", .target = P.FileId.fromRaw(1) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "widget.zig", .target = P.FileId.fromRaw(2) },
+        .{ .from = 0, .spelling = "gadgets", .target = 1 },
+        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
     }, .{});
     defer built.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
@@ -155,12 +155,12 @@ test "the library's own files are not checked and two roots are both recognized"
         .{ .name = "w2.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { other: T }; }" },
         .{ .name = "k2.zig", .bytes = "pub fn Gauge(comptime T: type) type { return struct { other: T }; }" },
     }, &.{
-        .{ .from = P.FileId.fromRaw(0), .spelling = "gadgets", .target = P.FileId.fromRaw(2) },
-        .{ .from = P.FileId.fromRaw(1), .spelling = "gadgets", .target = P.FileId.fromRaw(5) },
-        .{ .from = P.FileId.fromRaw(2), .spelling = "w1.zig", .target = P.FileId.fromRaw(3) },
-        .{ .from = P.FileId.fromRaw(2), .spelling = "k1.zig", .target = P.FileId.fromRaw(4) },
-        .{ .from = P.FileId.fromRaw(5), .spelling = "w2.zig", .target = P.FileId.fromRaw(6) },
-        .{ .from = P.FileId.fromRaw(5), .spelling = "k2.zig", .target = P.FileId.fromRaw(7) },
+        .{ .from = 0, .spelling = "gadgets", .target = 2 },
+        .{ .from = 1, .spelling = "gadgets", .target = 5 },
+        .{ .from = 2, .spelling = "w1.zig", .target = 3 },
+        .{ .from = 2, .spelling = "k1.zig", .target = 4 },
+        .{ .from = 5, .spelling = "w2.zig", .target = 6 },
+        .{ .from = 5, .spelling = "k2.zig", .target = 7 },
     }, .{});
     defer built.deinit();
     // Every source is selected, the library's own files too: they are internals, so the probe skips them.
@@ -178,9 +178,9 @@ test "library resolution releases allocation failures" {
                 .{ .name = flat[1].name, .bytes = flat[1].bytes, .selected = false },
                 .{ .name = flat[2].name, .bytes = flat[2].bytes, .selected = false },
             }, &.{
-                .{ .from = P.FileId.fromRaw(0), .spelling = "gadgets", .target = P.FileId.fromRaw(1) },
-                .{ .from = P.FileId.fromRaw(1), .spelling = flat[1].name, .target = P.FileId.fromRaw(2) },
-                .{ .from = P.FileId.fromRaw(1), .spelling = flat[2].name, .target = P.FileId.fromRaw(3) },
+                .{ .from = 0, .spelling = "gadgets", .target = 1 },
+                .{ .from = 1, .spelling = flat[1].name, .target = 2 },
+                .{ .from = 1, .spelling = flat[2].name, .target = 3 },
             }, .{});
             defer built.deinit();
             var report = try glint.runConfigured(a, &built, config, .{ .project_rules = &.{rule} });

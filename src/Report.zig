@@ -134,17 +134,17 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
     switch (format) {
         .text => {
             for (self.diagnostics) |diagnostic| try writer.print("{s}: {s}:{d}:{d}: {s}\n", .{
-                diagnostic.name,      project.inputs[diagnostic.span.file.raw()].name, // safe: enum identities index their owning frozen tables without narrowing.
+                diagnostic.name,      project.at(diagnostic.span.file).input.name,
                 diagnostic.span.line, diagnostic.span.column,
                 diagnostic.message,
             });
             for (self.coverage) |coverage| if (coverage.reason != .parsed) {
-                try writer.print("coverage: {s}: {s}: {s}\n", .{ project.inputs[coverage.file.raw()].name, @tagName(coverage.reason), coverage.detail }); // safe: enum identities index their owning frozen tables without narrowing.
+                try writer.print("coverage: {s}: {s}: {s}\n", .{ project.at(coverage.file).input.name, @tagName(coverage.reason), coverage.detail });
             };
-            for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.inputs[stale.span.file.raw()].name, stale.span.line, stale.span.column, stale.name }); // safe: enum identities index their owning frozen tables without narrowing.
-            for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.inputs[entry.span.file.raw()].name, entry.span.line, entry.span.column, entry.why }); // safe: enum identities index their owning frozen tables without narrowing.
+            for (self.stale) |stale| try writer.print("suppression: {s}:{d}:{d}: {s} suppresses nothing\n", .{ project.at(stale.span.file).input.name, stale.span.line, stale.span.column, stale.name });
+            for (self.malformed) |entry| try writer.print("suppression: {s}:{d}:{d}: malformed: {s}\n", .{ project.at(entry.span.file).input.name, entry.span.line, entry.span.column, entry.why });
             for (self.escapes) |escape| {
-                try writer.print("escape: {s}:{d}:{d}: {s}: {s} (", .{ project.inputs[escape.span.file.raw()].name, escape.span.line, escape.span.column, escape.reason, escape.why }); // safe: enum identities index their owning frozen tables without narrowing.
+                try writer.print("escape: {s}:{d}:{d}: {s}: {s} (", .{ project.at(escape.span.file).input.name, escape.span.line, escape.span.column, escape.reason, escape.why });
                 for (escape.covered, 0..) |covered, i| try writer.print("{s}{s} at {d}:{d}", .{ if (i == 0) "" else ", ", covered.name, covered.span.line, covered.span.column });
                 try writer.writeAll(")\n");
             }
@@ -154,12 +154,12 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.print("{{\"version\":1,\"analysis_complete\":{s},\"suppressed\":{d},\"stale_suppressions\":{d},\"stale\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale.len });
             for (self.stale, 0..) |stale, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .source = project.inputs[stale.span.file.raw()].name, .rule = stale.name, .line = stale.span.line, .column = stale.span.column }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                try std.json.Stringify.value(.{ .source = project.at(stale.span.file).input.name, .rule = stale.name, .line = stale.span.line, .column = stale.span.column }, .{}, writer);
             }
             try writer.writeAll("],\"malformed\":[");
             for (self.malformed, 0..) |entry, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .source = project.inputs[entry.span.file.raw()].name, .line = entry.span.line, .column = entry.span.column, .why = entry.why }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                try std.json.Stringify.value(.{ .source = project.at(entry.span.file).input.name, .line = entry.span.line, .column = entry.span.column, .why = entry.why }, .{}, writer);
             }
             try writer.writeAll("],\"escapes\":[");
             for (self.escapes, 0..) |escape, i| {
@@ -174,7 +174,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.writeAll("],\"coverage\":[");
             for (self.coverage, 0..) |c, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .source = project.inputs[c.file.raw()].name, .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                try std.json.Stringify.value(.{ .source = project.at(c.file).input.name, .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer);
             }
             try writer.writeByte(']');
             if (self.metrics) |metrics| {
@@ -184,7 +184,7 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
                 for (metrics.files, 0..) |entry, i| {
                     if (i != 0) try writer.writeByte(',');
                     try writer.writeAll("{\"source\":");
-                    try std.json.Stringify.value(project.inputs[entry.file.raw()].name, .{}, writer); // safe: enum identities index their owning frozen tables without narrowing.
+                    try std.json.Stringify.value(project.at(entry.file).input.name, .{}, writer);
                     try writer.writeByte(',');
                     try jsonCounts(writer, entry.counts);
                     try writer.writeByte('}');
@@ -202,13 +202,13 @@ pub fn write(self: *const Report, writer: *std.Io.Writer, project: *const Projec
             try writer.print("],\"properties\":{{\"analysisComplete\":{s},\"suppressed\":{d},\"staleSuppressions\":{d},\"stale\":[", .{ if (self.complete) "true" else "false", self.suppressed, self.stale.len });
             for (self.stale, 0..) |stale, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .file = stale.span.file.raw(), .rule = stale.name, .start = stale.span.start, .line = stale.span.line, .column = stale.span.column }, .{}, writer);
+                try std.json.Stringify.value(.{ .file = @backingInt(stale.span.file), .rule = stale.name, .start = stale.span.start, .line = stale.span.line, .column = stale.span.column }, .{}, writer);
             }
             try writer.writeAll("],\"coverage\":");
             try writer.writeByte('[');
             for (self.coverage, 0..) |c, i| {
                 if (i != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(.{ .file = c.file.raw(), .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: explicit nullable metadata representation, without narrowing.
+                try std.json.Stringify.value(.{ .file = @backingInt(c.file), .rule = if (c.rule == null) @as(?[]const u8, null) else c.rule_name, .start = c.start, .reason = c.reason, .detail = c.detail }, .{}, writer); // safe: explicit nullable metadata representation, without narrowing.
             }
             try writer.writeByte(']');
             try writer.writeAll("}}]}\n");
@@ -239,7 +239,7 @@ fn jsonEscape(writer: *std.Io.Writer, project: *const Project, escape: Escape) s
     var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
     try stream.beginObject();
     try stream.objectField("source");
-    try stream.write(project.inputs[escape.span.file.raw()].name); // safe: the span belongs to this report's verified project.
+    try stream.write(project.at(escape.span.file).input.name);
     try stream.objectField("span");
     try stream.write(wireSpan(escape.span));
     try stream.objectField("reason");
@@ -255,7 +255,7 @@ fn jsonEscape(writer: *std.Io.Writer, project: *const Project, escape: Escape) s
 
 fn jsonDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnostic) std.Io.Writer.Error!void {
     var stream: std.json.Stringify = .{ .writer = writer, .options = .{} };
-    const record = .{ .rule = d.name, .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.inputs[d.span.file.raw()].name, .span = wireSpan(d.span), .level = d.level, .message = d.message, .bug_class = d.bug_class }; // safe: the span belongs to this report's verified project.
+    const record = .{ .rule = d.name, .rule_version = d.rule_version, .class = d.class, .severity = d.severity, .source = project.at(d.span.file).input.name, .span = wireSpan(d.span), .level = d.level, .message = d.message, .bug_class = d.bug_class };
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(record)).@"struct".field_names) |name| {
         try stream.objectField(name);
@@ -279,7 +279,7 @@ fn physicalLocation(stream: *std.json.Stringify, project: *const Project, span: 
     try stream.objectField("artifactLocation");
     try stream.beginObject();
     try stream.objectField("uri");
-    try writeUri(stream, project.inputs[span.file.raw()].name); // safe: the span belongs to this report's verified project.
+    try writeUri(stream, project.at(span.file).input.name);
     try stream.endObject();
     try stream.objectField("region");
     // Byte offsets stay precise for non-ASCII and invalid UTF-8 source. A byte
@@ -298,7 +298,7 @@ fn relatedLocations(stream: *std.json.Stringify, project: *const Project, spans:
             try stream.objectField("physicalLocation");
             try physicalLocation(stream, project, span);
             try stream.endObject();
-        } else try stream.write(.{ .source = project.inputs[span.file.raw()].name, .span = wireSpan(span) }); // safe: related spans index this report's verified project.
+        } else try stream.write(.{ .source = project.at(span.file).input.name, .span = wireSpan(span) });
     }
     try stream.endArray();
 }
@@ -327,7 +327,7 @@ fn sarifDiagnostic(writer: *std.Io.Writer, project: *const Project, d: Diagnosti
 }
 
 fn wireSpan(span: Span) struct { file: u32, start: u32, end: u32, line: u32, column: u32 } {
-    return .{ .file = span.file.raw(), .start = span.start, .end = span.end, .line = span.line, .column = span.column };
+    return .{ .file = @backingInt(span.file), .start = span.start, .end = span.end, .line = span.line, .column = span.column };
 }
 /// Findings selected to gate. Completion is checked independently, before acceptance.
 pub fn gateFindings(self: *const Report) usize {

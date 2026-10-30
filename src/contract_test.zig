@@ -89,7 +89,7 @@ test "contract a report cannot silently render against another project snapshot"
 test "contract public lowered references disclose partial std ZIR coverage" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = "const x = 1; pub fn f() u32 { return x; }" }}, &.{}, .{});
     defer project.deinit();
-    const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: source zero exists in this fixture.
+    const handle = project.handle(project.sources[0].id);
     try std.testing.expectEqual(.partial, try project.loweredCoverage(handle));
     try std.testing.expect((try project.loweredReferences(handle)).len != 0);
 }
@@ -142,14 +142,14 @@ test "contract G2 allocation failures release dead-private owners" {
 test "contract invalid lowering never indexes partial ZIR declaration payloads" {
     var invalid = try glint.Project.init(std.testing.allocator, &.{.{ .name = "invalid", .bytes = "pub fn make() Unknown { return .{}; }" }}, &.{}, .{});
     defer invalid.deinit();
-    try std.testing.expectEqual(.invalid_lowering, invalid.files[0].status);
-    try std.testing.expectEqual(@as(usize, 0), invalid.models[0].zir_declarations.len); // safe: rejected lowering has no admitted declaration payloads.
+    try std.testing.expectEqual(.invalid_lowering, invalid.sources[0].file.status);
+    try std.testing.expectEqual(@as(usize, 0), invalid.sources[0].model.zir_declarations.len); // safe: rejected lowering has no admitted declaration payloads.
     var report = try glint.run(std.testing.allocator, &invalid, .{});
     defer report.deinit();
     try std.testing.expect(!report.complete);
     var valid = try glint.Project.init(std.testing.allocator, &.{.{ .name = "valid", .bytes = "pub fn make() u8 { return 1; }" }}, &.{}, .{});
     defer valid.deinit();
-    try std.testing.expect(valid.models[0].zir_declarations.len != 0);
+    try std.testing.expect(valid.sources[0].model.zir_declarations.len != 0);
 }
 
 test "project allocation failures release partially initialized files" {

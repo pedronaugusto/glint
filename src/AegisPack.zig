@@ -169,12 +169,12 @@ fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []
 /// Whether a literal could be a value of `container`: every field it names is one of the
 /// container's, and it names every field that has no default.
 fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, container: Facts.Container) Context.Error!bool {
-    const model = &c.project.models[container.file.raw()];
-    const own = &c.project.files[container.file.raw()].tree;
+    const model = &c.project.at(container.file).model;
+    const own = &c.project.at(container.file).file.tree;
     for (literal.ast.fields) |value| {
         const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2));
         const field = c.facts.member(container, name) orelse return false;
-        if (model.declarations[field.index].kind != .field) return false;
+        if (model.declarations[@backingInt(field.index)].kind != .field) return false;
     }
     for (model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != container.scope) continue;
@@ -192,7 +192,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
 fn noLibraryHolder(c: *Context, name: []const u8, others: []const []const u8) Context.Error!bool {
     const found = try c.facts.publication(Contract.library);
     for (found.files) |file| {
-        const model = &c.project.models[file.raw()];
+        const model = &c.project.at(file).model;
         for (model.declarations) |decl| {
             if (decl.kind != .field or !std.mem.eql(u8, decl.name, name)) continue;
             const holder: Facts.Container = .{ .file = file, .scope = decl.scope };
@@ -266,9 +266,9 @@ fn typeValue(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     if (try c.facts.resolve(c.file, node) == .container) return true;
     const tree = try c.project.syntax(try c.source());
     if (tree.nodeTag(node) != .identifier) return false;
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     const index = (model.reference(node) orelse return false).declaration orelse return false;
-    const decl = model.declarations[index];
+    const decl = model.declarations[@backingInt(index)];
     const declared = if (decl.kind == .parameter) decl.node else if (tree.fullVarDecl(decl.node)) |v| v.ast.type_node.unwrap() orelse return false else return false;
     return tree.nodeTag(declared) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(declared)), "type");
 }
@@ -283,14 +283,14 @@ fn typeValue(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 /// when any such type is not refuted.
 fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     // What the program reads of `x.name`.
     var member: ?[]const u8 = null;
     // Whether the program uses `x.name` as a truth value, a number or an operand of a comparison.
     var operand = false;
     // Whether the program calls `x.name(...)`: a method, or a field that holds a function.
     var called = false;
-    if (model.node_parents[@backingInt(field)]) |parent| { // safe: an AST node index reads its own parent table
+    if (model.parentOf(field)) |parent| {
         if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == field)
             member = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
         operand = scalarOperand(tree, parent, field);
@@ -302,7 +302,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     var literal: ?Ast.full.StructInit = null;
     const receiver = tree.nodeData(field).node_and_token[0];
     if (tree.nodeTag(receiver) == .identifier) if (model.reference(receiver)) |ref| if (ref.declaration) |index| {
-        if (tree.fullVarDecl(model.declarations[index].node)) |v| if (v.ast.init_node.unwrap()) |init| {
+        if (tree.fullVarDecl(model.declarations[@backingInt(index)].node)) |v| if (v.ast.init_node.unwrap()) |init| {
             if (tree.fullStructInit(&literal_buffer, init)) |value| if (value.ast.type_expr == .none) {
                 literal = value;
             };
@@ -319,18 +319,18 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
         const container = (try publishedContainer(c, entry.target)) orelse return false;
         // A published type of this kind without such a field is no candidate.
         const decl = c.facts.member(container, name) orelse continue;
-        const record = c.project.models[decl.file.raw()].declarations[decl.index];
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind != .field) continue;
         any = true;
         if (literal) |value| {
             const lacks = for (value.ast.fields) |init| {
                 const label = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(init) - 2));
                 const named = c.facts.member(container, label) orelse break true;
-                if (c.project.models[named.file.raw()].declarations[named.index].kind != .field) break true;
+                if (c.project.at(named.file).model.declarations[@backingInt(named.index)].kind != .field) break true;
             } else false;
             if (lacks) continue;
         }
-        const written = &c.project.files[decl.file.raw()].tree;
+        const written = &c.project.at(decl.file).file.tree;
         const type_expr = written.fullContainerField(record.node).?.ast.type_expr.unwrap() orelse return false;
         // A call needs a function: no backing field of this type holds one.
         if (called) {
@@ -411,9 +411,9 @@ fn scalarOperand(tree: *const Ast, parent: Ast.Node.Index, field: Ast.Node.Index
 /// Whether a container is a struct with no packed layout (or an opaque): a type no
 /// comparison, arithmetic or condition accepts.
 fn plainStruct(c: *Context, container: Facts.Container) bool {
-    const model = &c.project.models[container.file.raw()];
-    const tree = &c.project.files[container.file.raw()].tree;
-    const node = model.scopes[container.scope].node;
+    const model = &c.project.at(container.file).model;
+    const tree = &c.project.at(container.file).file.tree;
+    const node = model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     const full = tree.fullContainerDecl(&buffer, node) orelse return false;
@@ -434,17 +434,17 @@ fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Co
                 .container, .instance => |container| return container,
                 else => {},
             };
-            const model = &c.project.models[function.file.raw()];
-            const tree = &c.project.files[function.file.raw()].tree;
-            const record = model.declarations[function.index];
-            const whole = if (tree.nodeTag(record.node) == .fn_decl) record.node else model.node_parents[@backingInt(record.node)] orelse return null; // safe: an AST node index reads its own parent table
+            const model = &c.project.at(function.file).model;
+            const tree = &c.project.at(function.file).file.tree;
+            const record = model.declarations[@backingInt(function.index)];
+            const whole = if (tree.nodeTag(record.node) == .fn_decl) record.node else model.parentOf(record.node) orelse return null;
             for (model.scopes, 0..) |scope, i| {
                 if (scope.kind != .container) continue;
                 var at = scope.parent;
-                while (at) |p| : (at = model.scopes[p].parent) {
-                    if (model.scopes[p].kind == .container) break;
-                    if (model.scopes[p].kind == .function) {
-                        if (model.scopes[p].node == whole or model.scopes[p].node == record.node) return .{ .file = function.file, .scope = @intCast(i) };
+                while (at) |p| : (at = model.scopes[@backingInt(p)].parent) {
+                    if (model.scopes[@backingInt(p)].kind == .container) break;
+                    if (model.scopes[@backingInt(p)].kind == .function) {
+                        if (model.scopes[@backingInt(p)].node == whole or model.scopes[@backingInt(p)].node == record.node) return .{ .file = function.file, .scope = @fromBackingInt(@intCast(i)) };
                         break;
                     }
                 }
@@ -583,10 +583,10 @@ fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     const value = try c.facts.runtime(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
     const found = try c.facts.publication(Contract.library);
     for (found.files) |file| {
-        const model = &c.project.models[file.raw()];
+        const model = &c.project.at(file).model;
         for (model.declarations, 0..) |decl, i| {
-            if (!std.mem.eql(u8, decl.name, name) or model.scopes[decl.scope].kind != .container) continue;
-            const candidate: Facts.Decl = .{ .file = file, .index = @intCast(i) };
+            if (!std.mem.eql(u8, decl.name, name) or model.scopes[@backingInt(decl.scope)].kind != .container) continue;
+            const candidate: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
             // A constant or a field of no function's type is no callee; one that may hold a
             // function (a pointer, or a type not known) may be.
             switch (try c.facts.declaration(candidate)) {
@@ -654,20 +654,20 @@ fn copied(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
 /// guard is: its own operations belong to that type's contract.
 fn enclosingPublished(c: *Context, container: Facts.Container) Context.Error!?Contract.Kind {
     const found = try c.facts.publication(Contract.library);
-    const scopes = c.project.models[container.file.raw()].scopes; // safe: a resolved container's file indexes the frozen model table.
-    var scope = scopes[container.scope].parent;
-    while (scope) |s| : (scope = scopes[s].parent) {
-        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file.eql(container.file) and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role));
+    const scopes = c.project.at(container.file).model.scopes;
+    var scope = scopes[@backingInt(container.scope)].parent;
+    while (scope) |s| : (scope = scopes[@backingInt(s)].parent) {
+        for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == container.file and entry.target.container.scope == s) return @fromBackingInt(@intCast(entry.role));
     }
     return null;
 }
 /// The name a container is declared under (`pub const Guard = struct { ... }`), if any.
 fn containerName(c: *Context, container: Facts.Container) ?[]const u8 {
-    const model = &c.project.models[container.file.raw()];
-    const tree = &c.project.files[container.file.raw()].tree;
-    const node = model.scopes[container.scope].node;
+    const model = &c.project.at(container.file).model;
+    const tree = &c.project.at(container.file).file.tree;
+    const node = model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return null;
-    const parent = model.node_parents[@backingInt(node)] orelse return null; // safe: an AST node index reads its own parent table
+    const parent = model.parentOf(node) orelse return null;
     const declared = tree.fullVarDecl(parent) orelse return null;
     return tree.tokenSlice(declared.ast.mut_token + 1);
 }
@@ -743,9 +743,9 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
     const function = (try c.facts.origin(decl)) orelse return;
     const made = try c.facts.parameterCopies(function);
     if (made.len == 0) return;
-    const written = &c.project.files[function.file.raw()].tree;
+    const written = &c.project.at(function.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = written.fullFnProto(&proto_buffer, c.project.models[function.file.raw()].declarations[function.index].node) orelse return;
+    const proto = written.fullFnProto(&proto_buffer, c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return;
     // Which parameters take a type: a binding of one is a type the call writes.
     var types: [64]bool = @splat(false);
     var values: [64]bool = @splat(false);
@@ -784,10 +784,10 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             else => value,
         };
         if (copy.kind == .made) {
-            const site = &c.project.files[copy.site.file.raw()];
+            const site = &c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
             switch (try perBuild(c, bound)) {
-                .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.inputs[copy.site.file.raw()].name, line })),
+                .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
                 .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
             }
@@ -795,8 +795,8 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         }
         switch (try copied(c, bound, 0)) {
             .owner => |k| if (copiedOwner(k)) {
-                const site = &c.project.files[copy.site.file.raw()];
-                const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.inputs[copy.site.file.raw()].name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
+                const site = &c.project.at(copy.site.file).file;
+                const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.at(copy.site.file).input.name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
                 try c.at(copies, tree.nodeMainToken(node), detail);
                 return;
             },
@@ -816,7 +816,7 @@ fn checkCopies(c: *Context) Context.Error!void {
             const init = v.ast.init_node.unwrap() orelse continue;
             if (tree.nodeTag(init) != .identifier) continue;
             // `undefined`, `true`, `false` and `null` are values, not references to an owner.
-            if (c.project.models[c.file.raw()].reference(init) == null) continue; // safe: the checked source handle indexes this frozen model.
+            if (c.project.at(c.file).model.reference(init) == null) continue;
             // A value of a generic's parameter: each binding's copy, checked at the binding.
             if (c.facts.parameterValue(c.file, init)) continue;
             // A `comptime` parameter's value, known as the program compiles: it holds nothing at
@@ -858,11 +858,11 @@ fn movable(k: Contract.Kind) bool {
 /// runs the copy again without declaring the source again.
 fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     const index = Contract.local(c, source) orelse return false;
-    const decl = model.declarations[index];
+    const decl = model.declarations[@backingInt(index)];
     if (decl.kind != .variable and decl.kind != .capture) return false;
-    if (decl.kind == .variable and model.scopes[decl.scope].kind != .block) return false;
+    if (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .block) return false;
     const at = tree.lastToken(copy);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
@@ -872,7 +872,7 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
         if (ref.declaration != index) continue;
         if (tree.nodeMainToken(candidate) > at) return false;
         var up = model.node_parents[i];
-        while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+        while (up) |parent| : (up = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
                 .@"defer", .@"errdefer" => return false,
                 else => {},
@@ -880,8 +880,8 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
         }
     }
     // A loop between the source's declaration and the copy runs the copy again.
-    var up = model.node_parents[@backingInt(copy)]; // safe: an AST node index reads its own parent table
-    while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+    var up = model.parentOf(copy);
+    while (up) |parent| : (up = model.parentOf(parent)) {
         if (tree.firstToken(parent) <= decl.token and decl.token <= tree.lastToken(parent)) break;
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return false;
     }
@@ -892,7 +892,7 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
 /// slice, pointer, optional or error union of plain data. No aegis owner or capability is such a value.
 fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
-    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
+    const tree = &c.project.at(file).file.tree;
     if (tree.fullPtrType(node)) |ptr| return plainType(c, file, ptr.ast.child_type, depth + 1);
     if (tree.fullArrayType(node)) |array| return plainType(c, file, array.ast.elem_type, depth + 1);
     return switch (tree.nodeTag(node)) {
@@ -928,8 +928,8 @@ fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usi
 /// or the result of a function declared to return plain data.
 fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
     if (depth == 64) return false;
-    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
-    const model = &c.project.models[file.raw()]; // safe: the file handle indexes the frozen project table.
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     switch (tree.nodeTag(node)) {
         .number_literal, .char_literal, .string_literal => return true,
         // Zig has no operator overloading: an operator gives a number, a truth value, a vector or
@@ -975,7 +975,7 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
         .identifier => {
             const ref = model.reference(node) orelse return false;
             const index = ref.declaration orelse return false;
-            const decl = model.declarations[index];
+            const decl = model.declarations[@backingInt(index)];
             if (decl.kind == .parameter) return plainType(c, file, decl.node, depth + 1);
             // A `for` capture over plain inputs: an element of plain data, or a number.
             if (decl.kind == .capture) {
@@ -996,9 +996,9 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             const call = tree.fullCall(&buffer, node).?;
             const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
             const origin = (try c.facts.origin(decl)) orelse return false;
-            const record = c.project.models[origin.file.raw()].declarations[origin.index]; // safe: the origin indexes its own frozen model.
+            const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
             if (record.kind != .function) return false;
-            const written = &c.project.files[origin.file.raw()].tree; // safe: the origin indexes the frozen project table.
+            const written = &c.project.at(origin.file).file.tree;
             var proto_buffer: [1]Ast.Node.Index = undefined;
             const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
             const result = proto.ast.return_type.unwrap() orelse return false;
@@ -1011,7 +1011,7 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
 /// Whether every `break` out of the labeled block `node` gives plain data; false for a block
 /// with no label, which gives no value.
 fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usize) Context.Error!bool {
-    const tree = &c.project.files[file.raw()].tree; // safe: the file handle indexes the frozen project table.
+    const tree = &c.project.at(file).file.tree;
     const lbrace = tree.nodeMainToken(node);
     if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon or tree.tokenTag(lbrace - 2) != .identifier) return false;
     const label = tree.tokenSlice(lbrace - 2);
@@ -1044,7 +1044,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     if (depth == 64) return false;
     const tree = try c.project.syntax(try c.source());
     const index = Contract.local(c, node) orelse return false;
-    const decl = c.project.models[c.file.raw()].declarations[index];
+    const decl = c.project.at(c.file).model.declarations[@backingInt(index)];
     if (decl.kind == .parameter) return tree.fullPtrType(decl.node) == null and try Contract.owner(c, decl.node) != null;
     const v = tree.fullVarDecl(decl.node) orelse return false;
     if (v.ast.type_node.unwrap()) |t| {
@@ -1076,10 +1076,10 @@ fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 fn checkCleanup(c: *Context) Context.Error!void {
     if (!try begin(c, cleanup)) return;
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup);
     for (model.declarations) |decl| {
-        if (decl.kind != .variable or model.scopes[decl.scope].kind != .block) continue;
+        if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .block) continue;
         const v = tree.fullVarDecl(decl.node) orelse continue;
         const init = v.ast.init_node.unwrap() orelse continue;
         // Only actual acquisition expressions, never an owner alias or type alias: an owner's
@@ -1103,11 +1103,11 @@ fn checkCleanup(c: *Context) Context.Error!void {
         const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
         if (releases(k) == null) continue;
         var buffer: [2]Ast.Node.Index = undefined;
-        const statements = tree.blockStatements(&buffer, model.scopes[decl.scope].node) orelse continue;
+        const statements = tree.blockStatements(&buffer, model.scopes[@backingInt(decl.scope)].node) orelse continue;
         const at = for (statements, 0..) |stmt, i| {
             if (stmt == decl.node) break i + 1;
         } else continue;
-        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = model.scopes[decl.scope].node };
+        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = model.scopes[@backingInt(decl.scope)].node };
         switch (try flow.walk(statements[at..], .live)) {
             .paths => |paths| if (paths.falls == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
             .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
@@ -1118,7 +1118,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
 /// Whether the local declared at `site` is initialised by an acquisition: an owner's
 /// constructor or an operation that gives one by its name.
 fn acquiring(c: *Context, site: Facts.Key) Context.Error!bool {
-    const tree = &c.project.files[site.file.raw()].tree;
+    const tree = &c.project.at(site.file).file.tree;
     const v = tree.fullVarDecl(site.node) orelse return false;
     const init = v.ast.init_node.unwrap() orelse return false;
     const value = switch (tree.nodeTag(init)) {
@@ -1157,7 +1157,7 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
 fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context.Error!bool {
     const decl = (try c.facts.definition(c.file, callee)) orelse return false;
     const function = (try c.facts.origin(decl)) orelse return false;
-    if (c.project.models[function.file.raw()].declarations[function.index].kind != .function) return false;
+    if (c.project.at(function.file).model.declarations[@backingInt(function.index)].kind != .function) return false;
     const result = switch (try c.facts.resolve(c.file, call)) {
         .error_union => |payload| payload.*,
         else => |value| value,
@@ -1234,11 +1234,11 @@ const Flow = struct {
         /// The ways out of the `if` itself; its end is in `when`.
         paths: Paths,
         /// The flag's declaration.
-        flag: u32,
+        flag: Model.Declaration.Id,
         /// The state past the `if` while the flag is false, and while it is true.
         when: [2]State,
     };
-    const Known = struct { flag: u32, value: bool };
+    const Known = struct { flag: Model.Declaration.Id, value: bool };
     /// Whether some error exit of a function walked for a call leaves the owner held, and
     /// whether some releases it (an `errdefer` that does counts).
     const Exits = struct { held: bool = false, released: bool = false };
@@ -1450,7 +1450,7 @@ const Flow = struct {
     /// same pass of any loop as `stmt`, set to a literal only by statements of the branches
     /// themselves and to different values past each (a branch that does not set it leaves it as
     /// declared), its address never taken.
-    fn correlated(f: Flow, stmt: Ast.Node.Index, branch: Ast.full.If) Context.Error!?struct { declaration: u32, then: bool } {
+    fn correlated(f: Flow, stmt: Ast.Node.Index, branch: Ast.full.If) Context.Error!?struct { declaration: Model.Declaration.Id, then: bool } {
         const branches = [2]?Ast.Node.Index{ branch.ast.then_expr, branch.ast.else_expr.unwrap() };
         for (branches) |side| {
             const node = side orelse continue;
@@ -1460,7 +1460,7 @@ const Flow = struct {
                 const set = f.setsFlag(candidate) orelse continue;
                 const declared = f.flagDeclared(set.declaration) orelse continue;
                 if (!try f.flagWritesIn(set.declaration, branches)) continue;
-                if (loopOf(f.model, f.tree, f.model.declarations[set.declaration].node) != loopOf(f.model, f.tree, stmt)) continue;
+                if (loopOf(f.model, f.tree, f.model.declarations[@backingInt(set.declaration)].node) != loopOf(f.model, f.tree, stmt)) continue;
                 const then_value = f.flagPast(branch.ast.then_expr, set.declaration) orelse declared;
                 const else_value = if (branches[1]) |other| f.flagPast(other, set.declaration) orelse declared else declared;
                 if (then_value != else_value) return .{ .declaration = set.declaration, .then = then_value };
@@ -1470,27 +1470,27 @@ const Flow = struct {
     }
 
     /// `flag = true` or `flag = false` of a local: the flag's declaration and the value.
-    fn setsFlag(f: Flow, stmt: Ast.Node.Index) ?struct { declaration: u32, value: bool } {
+    fn setsFlag(f: Flow, stmt: Ast.Node.Index) ?struct { declaration: Model.Declaration.Id, value: bool } {
         if (f.tree.nodeTag(stmt) != .assign) return null;
         const data = f.tree.nodeData(stmt).node_and_node;
         if (f.tree.nodeTag(data[0]) != .identifier) return null;
         const value = literalBool(f.tree, data[1]) orelse return null;
         const ref = f.model.reference(data[0]) orelse return null;
         const declaration = ref.declaration orelse return null;
-        const record = f.model.declarations[declaration];
-        if (record.kind != .variable or f.model.scopes[record.scope].kind != .block) return null;
+        const record = f.model.declarations[@backingInt(declaration)];
+        if (record.kind != .variable or f.model.scopes[@backingInt(record.scope)].kind != .block) return null;
         return .{ .declaration = declaration, .value = value };
     }
 
     /// The literal a `var` is declared with, if it is one.
-    fn flagDeclared(f: Flow, declaration: u32) ?bool {
-        const variable = f.tree.fullVarDecl(f.model.declarations[declaration].node) orelse return null;
+    fn flagDeclared(f: Flow, declaration: Model.Declaration.Id) ?bool {
+        const variable = f.tree.fullVarDecl(f.model.declarations[@backingInt(declaration)].node) orelse return null;
         if (f.tree.tokenTag(variable.ast.mut_token) != .keyword_var) return null;
         return literalBool(f.tree, variable.ast.init_node.unwrap() orelse return null);
     }
 
     /// The value a branch leaves the flag at when it falls through: its last top-level setting.
-    fn flagPast(f: Flow, node: Ast.Node.Index, declaration: u32) ?bool {
+    fn flagPast(f: Flow, node: Ast.Node.Index, declaration: Model.Declaration.Id) ?bool {
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = f.tree.blockStatements(&buffer, node) orelse &[_]Ast.Node.Index{node};
         var value: ?bool = null;
@@ -1502,7 +1502,7 @@ const Flow = struct {
 
     /// Whether every write of the flag is a top-level literal setting in one of `branches`, and
     /// nothing takes its address.
-    fn flagWritesIn(f: Flow, declaration: u32, branches: [2]?Ast.Node.Index) Context.Error!bool {
+    fn flagWritesIn(f: Flow, declaration: Model.Declaration.Id, branches: [2]?Ast.Node.Index) Context.Error!bool {
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .identifier) continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -1512,7 +1512,7 @@ const Flow = struct {
             switch (f.tree.nodeTag(parent)) {
                 .address_of => return false,
                 .assign => if (f.tree.nodeData(parent).node_and_node[0] == node) {
-                    const place = f.model.node_parents[@backingInt(parent)] orelse return false; // safe: an AST node index reads its own parent table
+                    const place = f.model.parentOf(parent) orelse return false;
                     for (branches) |side| {
                         const branch = side orelse continue;
                         if (place == branch or parent == branch) break;
@@ -1777,15 +1777,15 @@ const Flow = struct {
         const capture = payload orelse return f.mine(data[0]);
         if (f.tree.nodeTag(data[0]) != .identifier) return false;
         const ref = f.model.reference(data[0]) orelse return false;
-        const token = f.model.declarations[ref.declaration orelse return false].token;
+        const token = f.model.declarations[@backingInt(ref.declaration orelse return false)].token;
         return token == capture or token == capture + 1;
     }
 
     /// The move (`moves`) `node`, a name of the owner, is the receiver or the optional of.
     fn moveOf(f: Flow, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
-        const parent = f.model.node_parents[@backingInt(node)] orelse return null; // safe: an AST node index reads its own parent table
+        const parent = f.model.parentOf(node) orelse return null;
         if (f.tree.nodeTag(parent) == .field_access) {
-            const call = f.model.node_parents[@backingInt(parent)] orelse return null; // safe: an AST node index reads its own parent table
+            const call = f.model.parentOf(parent) orelse return null;
             return if (try f.moves(call)) call else null;
         }
         return if (try f.moves(parent)) parent else null;
@@ -1823,7 +1823,7 @@ const Flow = struct {
         }
         var child = move;
         while (child != value) {
-            const parent = f.model.node_parents[@backingInt(child)] orelse return null; // safe: an AST node index reads its own parent table
+            const parent = f.model.parentOf(child) orelse return null;
             var buffer: [2]Ast.Node.Index = undefined;
             const held = if (f.tree.fullStructInit(&buffer, parent)) |literal|
                 std.mem.findScalar(Ast.Node.Index, literal.ast.fields, child) != null
@@ -1846,10 +1846,10 @@ const Flow = struct {
         const again = f.tree.nodeTag(jumping) == .@"continue";
         var passed = jumping == root;
         var child = jumping;
-        var at = f.model.node_parents[@backingInt(jumping)]; // safe: an AST node index reads its own parent table
+        var at = f.model.parentOf(jumping);
         while (at) |parent| : ({
             child = parent;
-            at = f.model.node_parents[@backingInt(parent)]; // safe: an AST node index reads its own parent table
+            at = f.model.parentOf(parent);
         }) {
             if (f.targets(parent, child, label, again)) {
                 if (!passed) return .inside;
@@ -1887,8 +1887,8 @@ const Flow = struct {
 
     /// Whether `node` is inside the block the owner is declared in.
     fn within(f: Flow, node: Ast.Node.Index) bool {
-        var at = f.model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
-        while (at) |parent| : (at = f.model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+        var at = f.model.parentOf(node);
+        while (at) |parent| : (at = f.model.parentOf(parent)) {
             if (parent == f.scope) return true;
         }
         return false;
@@ -1930,7 +1930,7 @@ const Flow = struct {
     /// whose initializer is a struct literal that holds the owner as a field's value, nowhere
     /// else, with the owner named nowhere after it. Its obligation is then that local's.
     fn movedInto(f: Flow, stmt: Ast.Node.Index) Context.Error!?Ast.TokenIndex {
-        if (f.model.node_parents[@backingInt(stmt)] != f.scope) return null; // safe: an AST node index reads its own parent table
+        if (f.model.parentOf(stmt) != f.scope) return null;
         const variable = f.tree.fullVarDecl(stmt) orelse return null;
         const init = variable.ast.init_node.unwrap() orelse return null;
         var buffer: [2]Ast.Node.Index = undefined;
@@ -1962,7 +1962,7 @@ const Flow = struct {
         if (f.tree.nodeTag(node) != .identifier) return false;
         const ref = f.model.reference(node) orelse return false;
         const index = ref.declaration orelse return false;
-        return f.model.declarations[index].token == f.token;
+        return f.model.declarations[@backingInt(index)].token == f.token;
     }
 
     const Use = enum { none, members, other };
@@ -1979,7 +1979,7 @@ const Flow = struct {
             if (main < first or main > last) continue;
             const ref = f.model.reference(candidate) orelse continue;
             const index = ref.declaration orelse continue;
-            if (f.model.declarations[index].token != f.token) continue;
+            if (f.model.declarations[@backingInt(index)].token != f.token) continue;
             const parent = f.model.node_parents[i] orelse return .other;
             // Lent to a call that holds it again on every return: a borrow.
             if (f.tree.nodeTag(parent) == .address_of and try lent(f.c, f.c.file, parent, 0)) {
@@ -2004,7 +2004,7 @@ const Flow = struct {
         if (f.tree.nodeTag(stmt) != .assign) return false;
         const data = f.tree.nodeData(stmt).node_and_node;
         const index = Contract.local(f.c, data[0]) orelse return false;
-        if (f.model.declarations[index].token != f.token) return false;
+        if (f.model.declarations[@backingInt(index)].token != f.token) return false;
         var call_buffer: [1]Ast.Node.Index = undefined;
         const value = if (f.tree.nodeTag(data[1]) == .@"try") f.tree.nodeData(data[1]).node else data[1];
         const call = f.tree.fullCall(&call_buffer, value) orelse return false;
@@ -2027,7 +2027,7 @@ const Flow = struct {
         if (f.tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 0) return false;
         const data = f.tree.nodeData(call.ast.fn_expr).node_and_token;
         const index = Contract.local(f.c, data[0]) orelse return false;
-        return f.model.declarations[index].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
+        return f.model.declarations[@backingInt(index)].token == f.token and std.mem.eql(u8, try Model.identifier(f.c.allocator, f.tree.tokenSlice(data[1])), "handOff");
     }
 
     /// A statement that is a call, or keeps or tries its result, with the owner itself among
@@ -2046,7 +2046,7 @@ const Flow = struct {
         }
         if (given != 1) return false;
         const callee = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return false;
-        if (f.c.project.inputs[callee.file.raw()].selected) return false;
+        if (f.c.project.at(callee.file).input.selected) return false;
         const first = f.tree.firstToken(stmt);
         const last = f.tree.lastToken(stmt);
         var named: usize = 0;
@@ -2088,14 +2088,14 @@ const Flow = struct {
         if (named != 1) return null;
         const decl = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return null;
         const function = (try f.c.facts.origin(decl)) orelse return null;
-        if (!f.c.project.inputs[function.file.raw()].selected or try f.c.inLibrary(Contract.library, function.file)) return null;
-        const model = &f.c.project.models[function.file.raw()];
-        const record = model.declarations[function.index];
+        if (!f.c.project.at(function.file).input.selected or try f.c.inLibrary(Contract.library, function.file)) return null;
+        const model = &f.c.project.at(function.file).model;
+        const record = model.declarations[@backingInt(function.index)];
         if (record.kind != .function) return null;
-        const written = &f.c.project.files[function.file.raw()].tree;
+        const written = &f.c.project.at(function.file).file.tree;
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = written.fullFnProto(&proto_buffer, record.node) orelse return null;
-        const whole_fn = if (written.nodeTag(record.node) == .fn_decl) record.node else model.node_parents[@backingInt(record.node)] orelse return null; // safe: an AST node index reads its own parent table
+        const whole_fn = if (written.nodeTag(record.node) == .fn_decl) record.node else model.parentOf(record.node) orelse return null;
         if (written.nodeTag(whole_fn) != .fn_decl) return null;
         var count: usize = 0;
         var counting = proto.iterate(written);
@@ -2112,7 +2112,7 @@ const Flow = struct {
             const truth = literalBool(f.tree, call.ast.params[at - skip]) orelse continue;
             const name = param.name_token orelse continue;
             for (model.declarations, 0..) |d, i| if (d.kind == .parameter and d.token == name) {
-                known = .{ .flag = @intCast(i), .value = truth };
+                known = .{ .flag = @fromBackingInt(@intCast(i)), .value = truth };
             };
         }
         var heard: Heard = .{ .outer = f.c.sink };
@@ -2164,10 +2164,10 @@ const Flow = struct {
             },
             .identifier => {
                 const ref = f.model.reference(place) orelse return false;
-                const declaration = f.model.declarations[ref.declaration orelse return false];
+                const declaration = f.model.declarations[@backingInt(ref.declaration orelse return false)];
                 return switch (declaration.kind) {
                     .parameter => true,
-                    .variable => switch (f.model.scopes[declaration.scope].kind) {
+                    .variable => switch (f.model.scopes[@backingInt(declaration.scope)].kind) {
                         .file, .container => true,
                         else => false,
                     },
@@ -2228,7 +2228,7 @@ const Flow = struct {
         const data = f.tree.nodeData(stmt).node_and_node;
         if (f.tree.nodeTag(data[0]) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(data[0])), "_") or f.tree.nodeTag(data[1]) != .address_of) return false;
         const index = Contract.local(f.c, f.tree.nodeData(data[1]).node) orelse return false;
-        return f.model.declarations[index].token == f.token;
+        return f.model.declarations[@backingInt(index)].token == f.token;
     }
 };
 
@@ -2266,9 +2266,9 @@ fn fieldOf(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool 
 /// while they wait and hold it again on every return, or to a function of the program's own
 /// that hands it back held on every path (`Loan`).
 fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) Context.Error!bool {
-    const tree = &c.project.files[file.raw()].tree;
-    const model = &c.project.models[file.raw()];
-    const call_node = model.node_parents[@backingInt(argument)] orelse return false; // safe: an AST node index reads its own parent table
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const call_node = model.parentOf(argument) orelse return false;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, call_node) orelse return false;
     const position = for (call.ast.params, 0..) |param, i| {
@@ -2291,13 +2291,13 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
     const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
     const function = (try c.facts.origin(decl)) orelse return false;
     if (try c.inLibrary(Contract.library, function.file)) return false;
-    const record = c.project.models[function.file.raw()].declarations[function.index];
+    const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
     if (record.kind != .function) return false;
-    const written = &c.project.files[function.file.raw()].tree;
+    const written = &c.project.at(function.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
     // The declaration's node is its prototype, or the whole declaration; its body is the latter's.
-    const whole = if (written.nodeTag(record.node) == .fn_decl) record.node else c.project.models[function.file.raw()].node_parents[@backingInt(record.node)] orelse return false; // safe: an AST node index reads its own parent table
+    const whole = if (written.nodeTag(record.node) == .fn_decl) record.node else c.project.at(function.file).model.parentOf(record.node) orelse return false;
     if (written.nodeTag(whole) != .fn_decl) return false;
     var params: [32]Ast.TokenIndex = @splat(0);
     var count: usize = 0;
@@ -2309,7 +2309,7 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
     }
     // A method called on a value takes the value as its first parameter.
     const skip: usize = if (count == call.ast.params.len + 1) 1 else if (count == call.ast.params.len) 0 else return false;
-    const loan: Loan = .{ .c = c, .file = function.file, .tree = written, .model = &c.project.models[function.file.raw()], .token = params[position + skip], .depth = depth + 1 };
+    const loan: Loan = .{ .c = c, .file = function.file, .tree = written, .model = &c.project.at(function.file).model, .token = params[position + skip], .depth = depth + 1 };
     const body = written.nodeData(whole).node_and_node[1];
     var block_buffer: [2]Ast.Node.Index = undefined;
     const statements = written.blockStatements(&block_buffer, body) orelse return false;
@@ -2417,7 +2417,7 @@ const Loan = struct {
         if (l.tree.nodeTag(node) != .identifier) return false;
         const ref = l.model.reference(node) orelse return false;
         const index = ref.declaration orelse return false;
-        return l.model.declarations[index].token == l.token;
+        return l.model.declarations[@backingInt(index)].token == l.token;
     }
 
     /// `p.deinit(...)`.
@@ -2493,7 +2493,7 @@ fn insideLoop(tree: *const Ast, model: *const Model, token: Ast.TokenIndex, root
         if (tag != .@"break" and tag != .@"continue") continue;
         if (tree.nodeMainToken(@fromBackingInt(@intCast(i))) != token) continue;
         var at = model.node_parents[i];
-        while (at) |parent| : (at = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+        while (at) |parent| : (at = model.parentOf(parent)) {
             if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return true;
             if (parent == root) return false;
         }
@@ -2524,10 +2524,10 @@ fn literalBool(tree: *const Ast, node: Ast.Node.Index) ?bool {
 /// The innermost `while` or `for` around `node` within its function, whose passes it runs in.
 fn loopOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     var child = node;
-    var at = model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
+    var at = model.parentOf(node);
     while (at) |parent| : ({
         child = parent;
-        at = model.node_parents[@backingInt(parent)]; // safe: an AST node index reads its own parent table
+        at = model.parentOf(parent);
     }) {
         if (tree.nodeTag(parent) == .fn_decl) return null;
         if (tree.fullWhile(parent)) |loop| {
@@ -2555,7 +2555,7 @@ fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.E
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
     const data = tree.nodeData(call.ast.fn_expr).node_and_token;
     const index = Contract.local(c, data[0]) orelse return null;
-    if (c.project.models[c.file.raw()].declarations[index].token != token) return null;
+    if (c.project.at(c.file).model.declarations[@backingInt(index)].token != token) return null;
     return try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
 }
 fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
@@ -2621,7 +2621,7 @@ fn wholeAllocation(c: *Context, adoption: Ast.Node.Index, allocation: Ast.Node.I
 }
 
 /// A value named as a path: a declaration of the checked file, then members of it (`s.gpa`).
-const Path = struct { root: u32, chain: []const []const u8 };
+const Path = struct { root: Model.Declaration.Id, chain: []const []const u8 };
 
 fn pathOf(c: *Context, node: Ast.Node.Index) Context.Error!?Path {
     const tree = try c.project.syntax(try c.source());
@@ -2644,7 +2644,7 @@ fn samePaths(a: Path, b: Path) bool {
 }
 
 /// A call a value is read through: into `function`, called by `call`.
-const Frame = struct { function: u32, call: Ast.Node.Index };
+const Frame = struct { function: Model.Declaration.Id, call: Ast.Node.Index };
 
 /// `path`, read inside the function the innermost of `frames` calls, as the function the
 /// outermost call is in reads it: a parameter is the call's argument there; a declaration
@@ -2665,37 +2665,37 @@ fn outward(c: *Context, path: Path, frames: []const Frame) Context.Error!?Path {
 }
 
 /// The position of `decl` among the parameters of `function`, if it is one.
-fn parameterPosition(c: *Context, function: u32, decl: u32) ?usize {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
-    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
-    if (model.declarations[decl].kind != .parameter) return null;
+fn parameterPosition(c: *Context, function: Model.Declaration.Id, decl: Model.Declaration.Id) ?usize {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    if (model.declarations[@backingInt(decl)].kind != .parameter) return null;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, model.declarations[function].node) orelse return null;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function)].node) orelse return null;
     var it = proto.iterate(tree);
     var position: usize = 0;
-    while (it.next()) |param| : (position += 1) if (param.name_token == model.declarations[decl].token) return position;
+    while (it.next()) |param| : (position += 1) if (param.name_token == model.declarations[@backingInt(decl)].token) return position;
     return null;
 }
 
 /// Whether `decl` is declared inside `function`'s body or among its parameters.
-fn within(c: *Context, decl: u32, function: u32) bool {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
-    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
-    const node = model.declarations[function].node;
-    const whole_fn = model.node_parents[@backingInt(node)] orelse node; // safe: an AST node index reads its own parent table
-    const token = model.declarations[decl].token;
+fn within(c: *Context, decl: Model.Declaration.Id, function: Model.Declaration.Id) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const node = model.declarations[@backingInt(function)].node;
+    const whole_fn = model.parentOf(node) orelse node;
+    const token = model.declarations[@backingInt(decl)].token;
     return tree.firstToken(whole_fn) <= token and token <= tree.lastToken(whole_fn);
 }
 
 /// The argument `call` passes at `function`'s parameter `position`: a method called on a value
 /// takes the value first.
-fn argumentAt(c: *Context, function: u32, call_node: Ast.Node.Index, position: usize) ?Ast.Node.Index {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
-    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
+fn argumentAt(c: *Context, function: Model.Declaration.Id, call_node: Ast.Node.Index, position: usize) ?Ast.Node.Index {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, call_node) orelse return null;
     var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&proto_buffer, model.declarations[function].node) orelse return null;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[@backingInt(function)].node) orelse return null;
     var count: usize = 0;
     var it = proto.iterate(tree);
     while (it.next()) |_| count += 1;
@@ -2711,7 +2711,7 @@ fn argumentAt(c: *Context, function: u32, call_node: Ast.Node.Index, position: u
 fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Frame, until: Ast.TokenIndex, depth: usize) Context.Error!bool {
     if (depth == 16) return false;
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
+    const model = &c.project.at(c.file).model;
     switch (tree.nodeTag(node)) {
         .grouped_expression => return wholeBytes(c, tree.nodeData(node).node_and_token[0], want, frames, until, depth + 1),
         .@"try" => return wholeBytes(c, tree.nodeData(node).node, want, frames, until, depth + 1),
@@ -2723,10 +2723,10 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
         },
         .identifier => {
             const index = Contract.local(c, node) orelse return false;
-            const decl = model.declarations[index];
+            const decl = model.declarations[@backingInt(index)];
             switch (decl.kind) {
                 .variable => {
-                    if (model.scopes[decl.scope].kind != .block) return false;
+                    if (model.scopes[@backingInt(decl.scope)].kind != .block) return false;
                     const v = tree.fullVarDecl(decl.node) orelse return false;
                     const init = v.ast.init_node.unwrap() orelse return false;
                     if (!heldAlone(c, index, node, until)) return false;
@@ -2773,8 +2773,8 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
     // A function of this file: what it returns on every path that gives a value.
     const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return false;
     const function = (try c.facts.origin(callee)) orelse return false;
-    if (!function.file.eql(c.file) or model.declarations[function.index].kind != .function) return false;
-    const body_fn = model.node_parents[@backingInt(model.declarations[function.index].node)] orelse return false; // safe: an AST node index reads its own parent table
+    if (function.file != c.file or model.declarations[@backingInt(function.index)].kind != .function) return false;
+    const body_fn = model.parentOf(model.declarations[@backingInt(function.index)].node) orelse return false;
     if (tree.nodeTag(body_fn) != .fn_decl) return false;
     const inner = try std.mem.concat(c.allocator, Frame, &.{ frames, &.{.{ .function = function.index, .call = node }} });
     var gives = false;
@@ -2801,16 +2801,16 @@ fn completesNot(tree: *const Ast, node: Ast.Node.Index) bool {
 }
 
 fn isByte(c: *Context, node: Ast.Node.Index) bool {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
+    const tree = &c.project.at(c.file).file.tree;
     if (tree.nodeTag(node) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "u8")) return false;
-    const ref = c.project.models[c.file.raw()].reference(node) orelse return true;
+    const ref = c.project.at(c.file).model.reference(node) orelse return true;
     return ref.declaration == null;
 }
 
 /// The `fn_decl` whose body holds `node`, nearest first.
 fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
-    var up = model.node_parents[@backingInt(node)]; // safe: an AST node index reads its own parent table
-    while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) {
         if (tree.nodeTag(parent) == .fn_decl) return parent;
     }
     return null;
@@ -2818,9 +2818,9 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
 
 /// Whether the local `index` is named, apart from at `read`, only before `until` and never in
 /// deferred code: what it holds is the reader's alone from there.
-fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenIndex) bool {
-    const tree = &c.project.files[c.file.raw()].tree; // safe: the checked source handle indexes the frozen file table.
-    const model = &c.project.models[c.file.raw()]; // safe: the checked source handle indexes the frozen model table.
+fn heldAlone(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
         const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -2829,7 +2829,7 @@ fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenInde
         if (ref.declaration != index) continue;
         if (tree.nodeMainToken(candidate) > until) return false;
         var up = model.node_parents[i];
-        while (up) |parent| : (up = model.node_parents[@backingInt(parent)]) { // safe: an AST node index reads its own parent table
+        while (up) |parent| : (up = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
                 .@"defer", .@"errdefer" => return false,
                 else => {},
@@ -2842,13 +2842,13 @@ fn heldAlone(c: *Context, index: u32, read: Ast.Node.Index, until: Ast.TokenInde
 /// Whether every call of the function whose parameter `index` is passes a whole allocation
 /// there, of the allocator `want` names in the function, read at the call: the function is
 /// private to this file and named only as the callee of calls.
-fn passedWhole(c: *Context, index: u32, want: ?Path, depth: usize) Context.Error!bool {
+fn passedWhole(c: *Context, index: Model.Declaration.Id, want: ?Path, depth: usize) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.models[c.file.raw()];
-    const function: u32 = for (model.declarations, 0..) |d, i| {
-        if (d.kind == .function and parameterPosition(c, @intCast(i), index) != null) break @intCast(i);
+    const model = &c.project.at(c.file).model;
+    const function: Model.Declaration.Id = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .function and parameterPosition(c, @fromBackingInt(@intCast(i)), index) != null) break @fromBackingInt(@intCast(i));
     } else return false;
-    const record = model.declarations[function];
+    const record = model.declarations[@backingInt(function)];
     if (record.public or record.exported) return false;
     // A method's calls name it as a member, which a declaration's references do not show.
     for (tree.nodes.items(.tag), 0..) |tag, i| {

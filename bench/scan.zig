@@ -98,7 +98,7 @@ fn semanticRows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, roun
     const root = "const dep = @import(\"dep\"); const Alias = dep.S; pub fn f(v: Alias) Alias { _ = dep.old(); return v; }";
     const dependency = "/// Deprecated: use the replacement.\npub fn old() u8 { return 1; } pub const S = struct { value: u8 };";
     const inputs: []const glint.Project.Input = &.{ .{ .name = "root", .stem = "Root", .bytes = root }, .{ .name = "dependency", .stem = "Dependency", .bytes = dependency, .selected = false } };
-    const imports: []const glint.Project.Import = &.{.{ .from = glint.Project.FileId.fromRaw(0), .spelling = "dep", .target = glint.Project.FileId.fromRaw(1) }}; // safe: the two frozen fixture sources have indexes zero and one.
+    const imports: []const glint.Project.Import = &.{.{ .from = 0, .spelling = "dep", .target = 1 }};
     var config = glint.Config.none();
     for ([_]glint.Rule{.Z011}) |rule| config.set(rule, true);
     try writer.print("case=cross_module bytes={d} files=2 rounds={d}\n", .{ root.len + dependency.len, rounds });

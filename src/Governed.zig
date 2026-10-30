@@ -66,11 +66,11 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
         var roots: std.ArrayList(Project.FileId) = .empty;
         if (module) for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
             for (roots.items) |seen| {
-                if (seen.eql(mapping.target)) break;
+                if (seen == mapping.target) break;
             } else try roots.append(self.allocator, mapping.target);
         };
-        if (!module) for (self.project.inputs, 0..) |input, i| if (std.mem.eql(u8, input.name, source)) {
-            try roots.append(self.allocator, Project.FileId.fromRaw(@intCast(i)));
+        if (!module) for (self.project.sources) |*each| if (std.mem.eql(u8, each.input.name, source)) {
+            try roots.append(self.allocator, each.id);
         };
         if (roots.items.len == 0) {
             if (!module) try self.undecided(rule, 0, .unresolved, "governed declaration source is not a project input");
@@ -94,7 +94,7 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
         for (roots.items) |seen| {
-            if (seen.eql(mapping.target)) break;
+            if (seen == mapping.target) break;
         } else try roots.append(self.allocator, mapping.target);
     };
     if (roots.items.len == 0) return null;
@@ -105,8 +105,8 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
 /// declaration, where none of its files imports the package by name.
 pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
     var roots: std.ArrayList(Project.FileId) = .empty;
-    for (self.project.inputs, 0..) |input, f| {
-        if (input.selected and std.mem.eql(u8, input.package, package)) try roots.append(self.allocator, Project.FileId.fromRaw(@intCast(f)));
+    for (self.project.sources) |*source| {
+        if (source.input.selected and std.mem.eql(u8, source.input.package, package)) try roots.append(self.allocator, source.id);
     }
     if (roots.items.len == 0) return null;
     return walk(self, roots.items, path, true);
@@ -116,7 +116,7 @@ pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const 
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {
     if (governed.len == 0) return;
-    const tree = &self.project.files[self.file.raw()].tree;
+    const tree = &self.project.at(self.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const site: Ast.TokenIndex, const spelled: []const u8 = switch (tag) {
@@ -165,8 +165,8 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
             if (!std.mem.eql(u8, g.name, spelled) or (testing and g.target.production) or !matches(self, g, decl)) continue;
             // `reach` gives a definition first and its origin second: a match on the origin of
             // a different declaration came through the program's alias.
-            const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.inputs[decls[d - 1].file.raw()].selected;
-            const declared = alias and switch (self.project.models[decls[d - 1].file.raw()].scopes[self.project.models[decls[d - 1].file.raw()].declarations[decls[d - 1].index].scope].kind) {
+            const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.at(decls[d - 1].file).input.selected;
+            const declared = alias and switch (self.project.at(decls[d - 1].file).model.scopes[@backingInt(self.project.at(decls[d - 1].file).model.declarations[@backingInt(decls[d - 1].index)].scope)].kind) {
                 .file, .container => true,
                 else => false,
             };
@@ -182,9 +182,9 @@ fn free(self: *Context, governed: []const Governed, name: []const u8) bool {
     for (governed) |g| {
         if (!std.mem.eql(u8, g.name, name)) continue;
         for (g.decls) |decl| {
-            const model = &self.project.models[decl.file.raw()];
-            const scope = model.declarations[decl.index].scope;
-            if (model.declarations[decl.index].kind != .function) return false;
+            const model = &self.project.at(decl.file).model;
+            const scope = model.declarations[@backingInt(decl.index)].scope;
+            if (model.declarations[@backingInt(decl.index)].kind != .function) return false;
             for (model.declarations) |other| if (other.kind == .field and other.scope == scope) return false;
         }
     }
@@ -193,8 +193,8 @@ fn free(self: *Context, governed: []const Governed, name: []const u8) bool {
 
 /// Whether a member access is the callee of a call.
 fn methodCall(self: *Context, member: Ast.Node.Index) bool {
-    const tree = &self.project.files[self.file.raw()].tree;
-    const parent = self.project.models[self.file.raw()].node_parents[@backingInt(member)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    const tree = &self.project.at(self.file).file.tree;
+    const parent = self.project.at(self.file).model.parentOf(member) orelse return false;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, parent) orelse return false;
     return call.ast.fn_expr == member;
@@ -212,7 +212,7 @@ fn matches(self: *Context, g: Governed, decl: Facts.Decl) bool {
 /// no alternative has it.
 fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_only: bool) Context.Error!?[]const Facts.Decl {
     var current: std.ArrayList(Facts.Container) = .empty;
-    for (roots) |root| try current.append(self.allocator, .{ .file = root, .scope = 0 });
+    for (roots) |root| try current.append(self.allocator, self.facts.rootOf(root));
     var found: std.ArrayList(Facts.Decl) = .empty;
     var names = std.mem.splitScalar(u8, path, '.');
     while (names.next()) |name| {
@@ -220,7 +220,7 @@ fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_
         for (current.items) |container| {
             const decl = self.facts.member(container, name) orelse continue;
             // A field has no `pub`: every field of a container a program reaches is its to name.
-            const record = self.project.models[decl.file.raw()].declarations[decl.index];
+            const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             if (public_only and !record.public and record.kind != .field) continue;
             try found.append(self.allocator, (try self.facts.origin(decl)) orelse decl);
         }
@@ -259,7 +259,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
         const value = try self.facts.resolve(self.file, node);
         return if (value == .unknown) .{ .unknown = value.unknown } else .{ .decls = &.{} };
     }
-    const tree = &self.project.files[self.file.raw()].tree;
+    const tree = &self.project.at(self.file).file.tree;
     const receiver_node = if (tag == .field_access) tree.nodeData(node).node_and_token[0] else blk: {
         var buffer: [2]Ast.Node.Index = undefined;
         break :blk Facts.builtinArgs(tree, node, &buffer)[0];
@@ -279,9 +279,9 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
 
 /// The symbol an `extern` function binds: its name.
 fn externSymbol(project: *const Project, decl: Facts.Decl) ?[]const u8 {
-    const record = project.models[decl.file.raw()].declarations[decl.index];
+    const record = project.at(decl.file).model.declarations[@backingInt(decl.index)];
     if (record.kind != .function) return null;
-    const tree = &project.files[decl.file.raw()].tree;
+    const tree = &project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const token = (tree.fullFnProto(&buffer, record.node) orelse return null).extern_export_inline_token orelse return null;
     if (tree.tokenTag(token) != .keyword_extern) return null;
@@ -291,12 +291,12 @@ fn externSymbol(project: *const Project, decl: Facts.Decl) ?[]const u8 {
 /// Whether an identifier is the name of an enum's or union's member written alone
 /// (`enum { sync, close }`): the parser gives it as a field's type, but it names the member.
 fn memberName(self: *const Context, node: Ast.Node.Index) bool {
-    const model = &self.project.models[self.file.raw()];
-    const tree = &self.project.files[self.file.raw()].tree;
-    const field_node = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    const model = &self.project.at(self.file).model;
+    const tree = &self.project.at(self.file).file.tree;
+    const field_node = model.parentOf(node) orelse return false;
     const field = tree.fullContainerField(field_node) orelse return false;
     if (!field.ast.tuple_like or field.ast.type_expr.unwrap() != node) return false;
-    const container = model.node_parents[@backingInt(field_node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    const container = model.parentOf(field_node) orelse return false;
     return switch (tree.tokenTag(tree.nodeMainToken(container))) {
         .keyword_enum, .keyword_union => true,
         else => false,
@@ -311,9 +311,9 @@ fn memberName(self: *const Context, node: Ast.Node.Index) bool {
 /// external symbol is a function whose parameters are unknown.
 fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!bool {
     if (tag != .field_access) return false;
-    const model = &self.project.models[self.file.raw()];
-    const tree = &self.project.files[self.file.raw()].tree;
-    const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    const model = &self.project.at(self.file).model;
+    const tree = &self.project.at(self.file).file.tree;
+    const parent = model.parentOf(node) orelse return false;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const called: ?Ast.full.Call = if (tree.fullCall(&call_buffer, parent)) |call| (if (call.ast.fn_expr == node) call else null) else null;
     if (called == null and !try usedAsReceiver(self, parent, node)) return false;
@@ -336,8 +336,8 @@ fn refuted(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []c
 
 /// Whether `node` is the value of a declaration that the file uses as a receiver of a member.
 fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
-    const model = &self.project.models[self.file.raw()];
-    const tree = &self.project.files[self.file.raw()].tree;
+    const model = &self.project.at(self.file).model;
+    const tree = &self.project.at(self.file).file.tree;
     const variable = tree.fullVarDecl(parent) orelse return false;
     if (variable.ast.init_node.unwrap() != node) return false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -347,7 +347,7 @@ fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) 
         if (tree.nodeTag(receiver) != .identifier) continue;
         const ref = model.reference(receiver) orelse continue;
         const index = ref.declaration orelse continue;
-        if (model.declarations[index].node == parent) return true;
+        if (model.declarations[@backingInt(index)].node == parent) return true;
     }
     return false;
 }

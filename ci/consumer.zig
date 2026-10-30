@@ -9,7 +9,7 @@ pub fn main() !void {
     if (facts.imports.len != 2 or !std.mem.eql(u8, facts.imports[0].name, "unmapped")) return error.MissingTokenFact;
     var project = try glint.Project.init(std.heap.page_allocator, &.{.{ .name = "consumer", .bytes = "const dependency = @import(\"dependency\");" }}, &.{}, .{});
     defer project.deinit();
-    const handle = try project.handle(glint.Project.FileId.fromRaw(0)); // safe: the fixture creates source zero.
+    const handle = project.handle(try project.fileAt(0));
     if ((try project.declarations(handle)).len != 1) return error.MissingDeclaration;
     var report = try glint.run(std.heap.page_allocator, &project, .{});
     defer report.deinit();

@@ -18,13 +18,13 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 
-const Candidate = struct { decl: u32, first: Ast.TokenIndex, last: Ast.TokenIndex, used: bool = false };
+const Candidate = struct { decl: Model.Declaration.Id, first: Ast.TokenIndex, last: Ast.TokenIndex, used: bool = false };
 
 pub fn check(context: *Context) Context.Error!void {
     if (!context.config.has(.D001)) return;
-    const index = context.file.raw();
-    const model = &context.project.models[index];
-    const tree = &context.project.files[index].tree;
+    const source = context.project.at(context.file);
+    const model = &source.model;
+    const tree = &source.file.tree;
     const a = context.allocator;
     var candidates: std.ArrayList(Candidate) = .empty;
     var by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
@@ -33,31 +33,31 @@ pub fn check(context: *Context) Context.Error!void {
     for (model.declarations, 0..) |decl, d| {
         declared[decl.token] = true;
         if (decl.public or decl.exported or (decl.kind != .function and decl.kind != .variable)) continue;
-        if (model.scopes[decl.scope].kind != .file and model.scopes[decl.scope].kind != .container) continue;
+        if (model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container) continue;
         var whole = decl.node;
         if (decl.kind == .variable) {
             const init = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap();
             // Z013 is the import case, one predicate owner.
             if (init) |node| if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
-        } else if (model.node_parents[@backingInt(decl.node)]) |parent| { // safe: the checked AST indexes its own parent table.
+        } else if (model.parentOf(decl.node)) |parent| {
             if (tree.nodeTag(parent) == .fn_decl) whole = parent;
         }
         const entry = try by_name.getOrPut(a, decl.name);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.append(a, @intCast(candidates.items.len));
-        try candidates.append(a, .{ .decl = @intCast(d), .first = tree.firstToken(whole), .last = tree.lastToken(whole) });
+        try candidates.append(a, .{ .decl = @fromBackingInt(@intCast(d)), .first = tree.firstToken(whole), .last = tree.lastToken(whole) });
     }
     if (candidates.items.len == 0) return;
-    const resolved = try a.alloc(?u32, tree.tokens.len);
+    const resolved = try a.alloc(?Model.Declaration.Id, tree.tokens.len);
     @memset(resolved, null);
     for (model.references) |reference| if (reference.declaration) |d| {
-        if (model.declarations[d].kind != .field) resolved[reference.token] = d;
+        if (model.declarations[@backingInt(d)].kind != .field) resolved[reference.token] = d;
     };
     for (0..tree.tokens.len) |t| {
         const token: Ast.TokenIndex = @intCast(t);
         if (tree.tokenTag(token) != .identifier or declared[token] or fieldName(tree, token)) continue;
         if (resolved[token]) |d| {
-            if (find(candidates.items, by_name, model.declarations[d].name, d)) |c| {
+            if (find(candidates.items, by_name, model.declarations[@backingInt(d)].name, d)) |c| {
                 use(&candidates.items[c], token);
                 continue;
             }
@@ -95,7 +95,7 @@ pub fn check(context: *Context) Context.Error!void {
     if (undecided) return;
     for (candidates.items) |candidate| {
         if (candidate.used or within(candidates.items, model, tree, candidate)) continue;
-        const decl = model.declarations[candidate.decl];
+        const decl = model.declarations[@backingInt(candidate.decl)];
         try context.at(.D001, decl.token, try a.print("private declaration '{s}' is named nowhere in its file, the only place Zig lets it be used", .{decl.name}));
     }
 }
@@ -110,7 +110,7 @@ fn fieldName(tree: *const Ast, token: Ast.TokenIndex) bool {
     };
 }
 
-fn find(candidates: []const Candidate, by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)), name: []const u8, decl: u32) ?u32 {
+fn find(candidates: []const Candidate, by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)), name: []const u8, decl: Model.Declaration.Id) ?u32 {
     const list = by_name.get(name) orelse return null;
     for (list.items) |c| if (candidates[c].decl == decl) return c;
     return null;
@@ -131,8 +131,8 @@ fn computed(context: *Context, candidates: []Candidate, model: *const Model, val
     switch (value) {
         .container, .instance => |container| {
             if (container.symbolic) return false;
-            if (!container.file.eql(context.file)) return true; // Another file's container shows this one nothing private.
-            for (candidates) |*candidate| if (model.declarations[candidate.decl].scope == container.scope) use(candidate, token);
+            if (container.file != context.file) return true; // Another file's container shows this one nothing private.
+            for (candidates) |*candidate| if (model.declarations[@backingInt(candidate.decl)].scope == container.scope) use(candidate, token);
             return true;
         },
         .pointer, .optional, .error_union => |child| return computed(context, candidates, model, child.*, token),
@@ -147,10 +147,10 @@ fn computed(context: *Context, candidates: []Candidate, model: *const Model, val
 
 /// A declaration inside a container that is itself reported: the container is the finding.
 fn within(candidates: []const Candidate, model: *const Model, tree: *const Ast, candidate: Candidate) bool {
-    const decl = model.declarations[candidate.decl];
+    const decl = model.declarations[@backingInt(candidate.decl)];
     for (candidates) |outer| {
         if (outer.used or outer.decl == candidate.decl) continue;
-        if (model.declarations[outer.decl].kind != .variable) continue;
+        if (model.declarations[@backingInt(outer.decl)].kind != .variable) continue;
         if (outer.first <= candidate.first and candidate.last <= outer.last and tree.firstToken(decl.node) > outer.first) return true;
     }
     return false;

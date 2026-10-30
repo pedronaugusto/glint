@@ -22,9 +22,10 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     const paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
     const resources = try containersOf(c, rule, &paths);
     if (resources.len == 0) return;
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var vtable: ?Facts.Container = null;
+    var looked = false;
     for (model.declarations, 0..) |decl, index| {
         if (c.inTest(decl.token)) continue;
         const written: Ast.Node.Index = switch (decl.kind) {
@@ -40,8 +41,11 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         if (decl.kind == .field and !releasedAnywhere(c, decl.name)) continue;
         if (decl.kind == .function and try views(c, resources, decl)) continue;
         if (decl.kind == .function) {
-            if (vtable == null) vtable = (try containersOf(c, rule, &.{"Io.VTable"}))[0];
-            if (try implements(c, @intCast(index), vtable.?)) continue;
+            if (!looked) {
+                vtable = (try containersOf(c, rule, &.{"Io.VTable"}))[0];
+                looked = true;
+            }
+            if (try implements(c, @fromBackingInt(@intCast(index)), vtable)) continue;
         }
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
@@ -54,11 +58,11 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
 /// judged) of something itself held, a declared constant, std's process-wide `stdin`, `stdout` or
 /// `stderr`, which nobody closes, or a literal naming a handle it was given (`.{ .handle = handle
 /// }`). A variable (a field moved out first) or what a call made is an owner handed over.
-fn views(c: *Context, resources: []const Facts.Container, decl: Model.Declaration) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+fn views(c: *Context, resources: []const ?Facts.Container, decl: Model.Declaration) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     const body = body: {
-        const parent = model.node_parents[@backingInt(decl.node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        const parent = model.parentOf(decl.node) orelse return false;
         if (tree.nodeTag(parent) != .fn_decl) return false;
         break :body tree.nodeData(parent).node_and_node[1];
     };
@@ -81,19 +85,19 @@ fn views(c: *Context, resources: []const Facts.Container, decl: Model.Declaratio
 /// userdata first and is named, not called, as a literal's value for a field `Io.VTable`
 /// declares (`.processSpawn = seam.routedSpawn`). The vtable fixes its signature, and the
 /// caller of the `Io` operation owns what it returns, as with std's own implementations.
-fn implements(c: *Context, index: u32, vtable: Facts.Container) Context.Error!bool {
-    if (vtable.scope == std.math.maxInt(u32)) return false;
-    const decl = c.project.models[c.file.raw()].declarations[index];
-    const own = &c.project.files[c.file.raw()].tree;
+fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Container) Context.Error!bool {
+    const vtable = maybe_vtable orelse return false;
+    const decl = c.project.at(c.file).model.declarations[@backingInt(index)];
+    const own = &c.project.at(c.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = own.fullFnProto(&proto_buffer, decl.node) orelse return false;
     var params = proto.iterate(own);
     const first = params.next() orelse return false;
     if (!std.mem.eql(u8, own.getNodeSource(first.type_expr orelse return false), "?*anyopaque")) return false;
-    for (c.project.inputs, 0..) |input, f| {
-        if (!input.selected) continue;
-        const file = Project.FileId.fromRaw(@intCast(f));
-        const tree = &c.project.files[f].tree;
+    for (c.project.sources) |*source| {
+        if (!source.input.selected) continue;
+        const file = source.id;
+        const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             var buffer: [2]Ast.Node.Index = undefined;
             const literal = tree.fullStructInit(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
@@ -103,9 +107,9 @@ fn implements(c: *Context, index: u32, vtable: Facts.Container) Context.Error!bo
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(named)), decl.name)) continue;
                 if (tree.firstToken(value) < 2) continue;
                 const slot = c.facts.member(vtable, tree.tokenSlice(tree.firstToken(value) - 2)) orelse continue;
-                if (c.project.models[slot.file.raw()].declarations[slot.index].kind != .field) continue;
+                if (c.project.at(slot.file).model.declarations[@backingInt(slot.index)].kind != .field) continue;
                 switch (try c.facts.resolve(file, named)) {
-                    .function => |d| if (d.file.eql(c.file) and d.index == index) return true,
+                    .function => |d| if (d.file == c.file and d.index == index) return true,
                     else => {},
                 }
             }
@@ -114,9 +118,9 @@ fn implements(c: *Context, index: u32, vtable: Facts.Container) Context.Error!bo
     return false;
 }
 
-fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index, depth: u8) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+fn viewed(c: *Context, resources: []const ?Facts.Container, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     if (depth == 16) return false;
     const next = depth + 1;
     switch (tree.nodeTag(node)) {
@@ -139,7 +143,7 @@ fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index,
             if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
             const reference = model.reference(node) orelse return false;
             const d = reference.declaration orelse return false;
-            const record = model.declarations[d];
+            const record = model.declarations[@backingInt(d)];
             if (record.kind == .parameter) return true;
             // A capture holds what it binds: a view where that is one (an owner a call made,
             // unwrapped, is handed over).
@@ -151,7 +155,7 @@ fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index,
             const variable = tree.fullVarDecl(record.node) orelse return false;
             if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
             // A declared constant, or a local one made from what is already held.
-            return switch (model.scopes[record.scope].kind) {
+            return switch (model.scopes[@backingInt(record.scope)].kind) {
                 .file, .container => true,
                 else => try viewed(c, resources, variable.ast.init_node.unwrap() orelse return false, next),
             };
@@ -199,8 +203,8 @@ fn viewed(c: *Context, resources: []const Facts.Container, node: Ast.Node.Index,
 /// Whether any of the program's files releases a field named `name`: wherever the owner is
 /// released, the field holds one.
 fn releasedAnywhere(c: *Context, name: []const u8) bool {
-    for (c.project.inputs, 0..) |input, f| {
-        if (input.selected and released(&c.project.files[f].tree, name)) return true;
+    for (c.project.sources) |*source| {
+        if (source.input.selected and released(&source.file.tree, name)) return true;
     }
     return false;
 }
@@ -243,8 +247,8 @@ fn release(method: []const u8) bool {
 /// on a receiver that does not resolve is undecided in a function that takes a guard. One
 /// function's own acquisitions only: a call made while holding a guard is not followed.
 pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     const Held = struct { first: Ast.TokenIndex, last: Ast.TokenIndex, ranked: bool };
     var held: std.ArrayList(Held) = .empty;
     var acquisitions: std.ArrayList(struct { node: Ast.Node.Index, ranked: bool }) = .empty;
@@ -268,9 +272,9 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
         const ranked = std.mem.find(u8, method, "Ordered") != null;
         try acquisitions.append(c.allocator, .{ .node = node, .ranked = ranked });
         // The guard's local, and how long it is held.
-        const parent = model.node_parents[@backingInt(node)] orelse continue; // safe: a node index indexes its own tree's parent table.
+        const parent = model.parentOf(node) orelse continue;
         var at = parent;
-        while (tree.nodeTag(at) == .@"try" or tree.nodeTag(at) == .@"catch" or tree.nodeTag(at) == .grouped_expression) at = model.node_parents[@backingInt(at)] orelse break; // safe: a node index indexes its own tree's parent table.
+        while (tree.nodeTag(at) == .@"try" or tree.nodeTag(at) == .@"catch" or tree.nodeTag(at) == .grouped_expression) at = model.parentOf(at) orelse break;
         const block = enclosingBlock(tree, model, at) orelse continue;
         const variable = tree.fullVarDecl(at) orelse {
             try held.append(c.allocator, .{ .first = tree.lastToken(node), .last = tree.lastToken(block), .ranked = ranked });
@@ -300,7 +304,7 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
 /// The block a statement stands in.
 fn enclosingBlock(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+    while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .block, .block_semicolon, .block_two, .block_two_semicolon => return parent,
             .fn_decl => return null,
@@ -332,8 +336,8 @@ fn releaseOf(tree: *const Ast, block: Ast.Node.Index, declared: Ast.Node.Index, 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
 /// public struct, where nothing keeps one from standing for the other.
 pub fn identity(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .function or !decl.public or c.inTest(decl.token)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -350,13 +354,13 @@ pub fn identity(c: *Context, rule: Rule) Context.Error!void {
         }
         if (try meet(c, tree, names.items, types.items)) |pair| try c.at(rule, decl.token, try c.allocator.print("'{s}' and '{s}' are both {s} that identify: one may be passed for the other; aegis id.Id or a handle gives each its own type", .{ tree.tokenSlice(pair[0]), tree.tokenSlice(pair[1]), pair[2] }));
     }
-    for (model.scopes, 0..) |scope, s| {
+    for (model.scopes) |scope| {
         if (scope.kind != .container and scope.kind != .file) continue;
         if (scope.kind == .container and !publicContainer(tree, model, scope.node)) continue;
         var names: std.ArrayList(Ast.TokenIndex) = .empty;
         var types: std.ArrayList([]const u8) = .empty;
         for (model.declarations) |decl| {
-            if (decl.kind != .field or decl.scope != s or c.inTest(decl.token) or !identifies(decl.name)) continue;
+            if (decl.kind != .field or decl.scope != scope.id or c.inTest(decl.token) or !identifies(decl.name)) continue;
             const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
             const kind = integer(try c.facts.resolve(c.file, written)) orelse continue;
             try names.append(c.allocator, decl.token);
@@ -405,7 +409,7 @@ fn integer(value: Facts.Value) ?[]const u8 {
 
 /// Whether a container is declared `pub` (`pub const S = struct { ... }`).
 fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    const parent = model.node_parents[@backingInt(node)] orelse return true; // safe: a node index indexes its own tree's parent table.
+    const parent = model.parentOf(node) orelse return true;
     const variable = tree.fullVarDecl(parent) orelse return false;
     return variable.visib_token != null;
 }
@@ -417,8 +421,8 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// value is built or read (a table's layout, a date's kind) is data. A field moved on the records
 /// a loop walks is moved on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
         const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
@@ -430,18 +434,18 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         var writers: std.ArrayList(Facts.Key) = .empty;
         var switched = false;
         for (try c.facts.memberUses(decl.name)) |use| {
-            const use_tree = &c.project.files[use.file.raw()].tree;
-            const use_model = &c.project.models[use.file.raw()];
+            const use_tree = &c.project.at(use.file).file.tree;
+            const use_model = &c.project.at(use.file).model;
             const receiver = try c.facts.resolve(use.file, use_tree.nodeData(use.node).node_and_token[0]);
             const owner = byPointer(receiver) orelse continue;
-            if (!owner.file.eql(holder.file) or owner.scope != holder.scope) continue;
+            if (owner.file != holder.file or owner.scope != holder.scope) continue;
             try uses.append(c.allocator, use);
-            const parent = use_model.node_parents[@backingInt(use.node)] orelse continue; // safe: a node index indexes its own tree's parent table.
+            const parent = use_model.parentOf(use.node) orelse continue;
             if (use_tree.nodeTag(parent) == .assign and use_tree.nodeData(parent).node_and_node[0] == use.node) {
                 try writes.append(c.allocator, .{ .file = use.file, .node = parent });
                 const function = enclosingFunction(use_model, use_tree, parent) orelse continue;
                 for (writers.items) |seen| {
-                    if (seen.file.eql(use.file) and seen.node == function) break;
+                    if (seen.file == use.file and seen.node == function) break;
                 } else try writers.append(c.allocator, .{ .file = use.file, .node = function });
             }
             if (use_tree.fullSwitch(parent)) |s| switched = switched or s.ast.condition == use.node;
@@ -455,8 +459,8 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
 /// or in a function a call under one makes.
 fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Context.Error!bool {
     for (writes) |write| {
-        const tree = &c.project.files[write.file.raw()].tree;
-        const model = &c.project.models[write.file.raw()];
+        const tree = &c.project.at(write.file).file.tree;
+        const model = &c.project.at(write.file).model;
         const function = enclosingFunction(model, tree, write.node) orelse continue;
         if (conditioned(tree, model, uses, write.file, write.node, function)) return true;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -464,10 +468,10 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Contex
         const name = tree.tokenSlice(proto.name_token orelse continue);
         for (try c.facts.memberUses(name)) |call| {
             const callee = try c.facts.resolve(call.file, call.node);
-            if (callee != .function or !callee.function.file.eql(write.file)) continue;
-            if (model.declarations[callee.function.index].node != tree.nodeData(function).node_and_node[0]) continue;
-            const call_tree = &c.project.files[call.file.raw()].tree;
-            const call_model = &c.project.models[call.file.raw()];
+            if (callee != .function or callee.function.file != write.file) continue;
+            if (model.declarations[@backingInt(callee.function.index)].node != tree.nodeData(function).node_and_node[0]) continue;
+            const call_tree = &c.project.at(call.file).file.tree;
+            const call_model = &c.project.at(call.file).model;
             const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
             if (conditioned(call_tree, call_model, uses, call.file, call.node, caller)) return true;
         }
@@ -477,9 +481,9 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Contex
 
 /// Whether `node` sits in a branch a switch or an `if`/`while` on one of `uses` selects, within
 /// `function`.
-fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, file: @import("Project.zig").FileId, node: Ast.Node.Index, function: Ast.Node.Index) bool {
+fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, file: Project.FileId, node: Ast.Node.Index, function: Ast.Node.Index) bool {
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+    while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == function) return false;
         const condition = if (tree.fullSwitch(parent)) |s|
             s.ast.condition
@@ -493,7 +497,7 @@ fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, f
         const first = tree.firstToken(condition);
         const last = tree.lastToken(condition);
         for (uses) |use| {
-            if (!use.file.eql(file)) continue;
+            if (use.file != file) continue;
             const token = tree.nodeMainToken(use.node);
             if (token >= first and token <= last) return true;
         }
@@ -502,15 +506,15 @@ fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, f
 }
 
 fn isEnum(c: *Context, value: Facts.Container) bool {
-    const tree = &c.project.files[value.file.raw()].tree;
-    const node = c.project.models[value.file.raw()].scopes[value.scope].node;
+    const tree = &c.project.at(value.file).file.tree;
+    const node = c.project.at(value.file).model.scopes[@backingInt(value.scope)].node;
     if (node == .root) return false;
     return tree.tokenTag(tree.nodeMainToken(node)) == .keyword_enum;
 }
 
 fn enclosingFunction(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     var at = node;
-    while (model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+    while (model.parentOf(at)) |parent| : (at = parent) {
         if (tree.nodeTag(parent) == .fn_decl) return parent;
     }
     return null;
@@ -523,7 +527,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
     const paths = [_][]const u8{ "array_list", "hash_map", "array_hash_map" };
     const namespaces = try containersOf(c, rule, &paths);
     if (namespaces.len == 0) return;
-    const tree = &c.project.files[c.file.raw()].tree;
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .assign) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -536,7 +540,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
 }
 
 /// What borrow of std container storage `node` is, if it is one.
-fn borrow(c: *Context, tree: *const Ast, namespaces: []const Facts.Container, node: Ast.Node.Index) Context.Error!?[]const u8 {
+fn borrow(c: *Context, tree: *const Ast, namespaces: []const ?Facts.Container, node: Ast.Node.Index) Context.Error!?[]const u8 {
     switch (tree.nodeTag(node)) {
         .grouped_expression => return borrow(c, tree, namespaces, tree.nodeData(node).node_and_token[0]),
         .unwrap_optional => return borrow(c, tree, namespaces, tree.nodeData(node).node_and_token[0]),
@@ -572,8 +576,8 @@ fn borrow(c: *Context, tree: *const Ast, namespaces: []const Facts.Container, no
 /// pass could grow it in. Once the function returns the list is gone, and with it every way to
 /// move its storage (parley's agreed task ids, collected into an arena list).
 fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var at = value;
     while (true) at = switch (tree.nodeTag(at)) {
         .grouped_expression, .unwrap_optional => tree.nodeData(at).node_and_token[0],
@@ -592,17 +596,17 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
     const receiver = tree.nodeData(at).node_and_token[0];
     if (tree.nodeTag(receiver) != .identifier) return false;
     const local = (model.reference(receiver) orelse return false).declaration orelse return false;
-    const record = model.declarations[local];
+    const record = model.declarations[@backingInt(local)];
     if (record.kind != .variable) return false;
-    switch (model.scopes[record.scope].kind) {
+    switch (model.scopes[@backingInt(record.scope)].kind) {
         .file, .container => return false,
         else => {},
     }
     if ((try c.facts.resolve(c.file, receiver)) != .instance) return false;
     // A loop between the local's scope and the store runs the store again after a growth.
     var up = store;
-    while (model.node_parents[@backingInt(up)]) |parent| : (up = parent) { // safe: a node index indexes its own tree's parent table.
-        if (parent == model.scopes[record.scope].node) break;
+    while (model.parentOf(up)) |parent| : (up = parent) {
+        if (parent == model.scopes[@backingInt(record.scope)].node) break;
         switch (tree.nodeTag(parent)) {
             .while_simple, .while_cont, .@"while", .for_simple, .@"for" => return false,
             else => {},
@@ -615,7 +619,7 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
         const reference = model.reference(node) orelse continue;
         if (reference.declaration != local) continue;
         if (tree.nodeMainToken(node) > end) return false;
-        const parent = model.node_parents[@backingInt(node)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        const parent = model.parentOf(node) orelse return false;
         if (tree.nodeTag(parent) != .field_access) return false;
         // A list freed at all, wherever the free is written (a `defer` before the store runs
         // after it), leaves the borrow pointing at freed memory.
@@ -624,7 +628,7 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
             if (std.mem.eql(u8, member, frees)) return false;
         }
         var up_from = node;
-        while (model.node_parents[@backingInt(up_from)]) |outer| : (up_from = outer) { // safe: a node index indexes its own tree's parent table.
+        while (model.parentOf(up_from)) |outer| : (up_from = outer) {
             switch (tree.nodeTag(outer)) {
                 .@"defer", .@"errdefer" => return false,
                 .fn_decl => break,
@@ -636,9 +640,9 @@ fn settled(c: *Context, store: Ast.Node.Index, value: Ast.Node.Index) Context.Er
 }
 
 /// Whether a value is a container declared in one of std's container namespaces.
-fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index) Context.Error!bool {
+fn ofStd(c: *Context, namespaces: []const ?Facts.Container, node: Ast.Node.Index) Context.Error!bool {
     const held = byPointer(try c.facts.resolve(c.file, node)) orelse return false;
-    for (namespaces) |namespace| if (held.file.eql(namespace.file)) return true;
+    for (namespaces) |each| if (each) |namespace| if (held.file == namespace.file) return true;
     return false;
 }
 
@@ -651,8 +655,8 @@ fn ofStd(c: *Context, namespaces: []const Facts.Container, node: Ast.Node.Index)
 /// `break`, `continue`, `unreachable`) reaches nothing after it, and a `for` over a range of
 /// literals runs at least once.
 pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.files[c.file.raw()].tree;
-    const model = &c.project.models[c.file.raw()];
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or c.inTest(decl.token)) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
@@ -660,10 +664,10 @@ pub fn undefinedReads(c: *Context, rule: Rule) Context.Error!void {
         const init = variable.ast.init_node.unwrap() orelse continue;
         if (tree.nodeTag(init) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "undefined")) continue;
         if (!Danger.atRuntime(c, decl.node)) continue;
-        const block = model.node_parents[@backingInt(decl.node)] orelse continue; // safe: a node index indexes its own tree's parent table.
+        const block = model.parentOf(decl.node) orelse continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, block) orelse continue;
-        var walk: Walk = .{ .c = c, .tree = tree, .model = model, .local = @intCast(d) };
+        var walk: Walk = .{ .c = c, .tree = tree, .model = model, .local = @fromBackingInt(@intCast(d)) };
         try walk.collect();
         const start = std.mem.findScalar(Ast.Node.Index, statements, decl.node) orelse continue;
         _ = try walk.sequence(statements[start + 1 ..], .unwritten);
@@ -679,7 +683,7 @@ const Walk = struct {
     c: *Context,
     tree: *const Ast,
     model: *const Model,
-    local: u32,
+    local: Model.Declaration.Id,
     /// The identifiers that name the local, in source order.
     mentions: std.ArrayList(Ast.Node.Index) = .empty,
     /// The `asm` outputs bound to the local, by the token naming it, with the `asm` they are in.
@@ -687,7 +691,7 @@ const Walk = struct {
     read: ?Ast.TokenIndex = null,
 
     fn collect(w: *Walk) Context.Error!void {
-        const name = w.model.declarations[w.local].name;
+        const name = w.model.declarations[@backingInt(w.local)].name;
         for (w.tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (tag == .asm_output) {
@@ -801,23 +805,23 @@ const Walk = struct {
     /// it reads none of its memory: an array's `.len`, known as the program compiles.
     fn classify(w: *Walk, mention: Ast.Node.Index) ?Use {
         const tree = w.tree;
-        if (w.model.node_parents[@backingInt(mention)]) |parent| { // safe: a node index indexes its own tree's parent table.
+        if (w.model.parentOf(mention)) |parent| {
             if (tree.nodeTag(parent) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len") and w.array()) return null;
             // `@field(local, name) = ...` writes the field it names.
             if (builtinField(tree, parent, mention)) {
-                const grand = w.model.node_parents[@backingInt(parent)] orelse return .{ .key = tree.nodeMainToken(mention), .write = false }; // safe: a node index indexes its own tree's parent table.
+                const grand = w.model.parentOf(parent) orelse return .{ .key = tree.nodeMainToken(mention), .write = false };
                 if (tree.nodeTag(grand) == .assign and tree.nodeData(grand).node_and_node[0] == parent) return .{ .key = tree.lastToken(grand), .write = true };
             }
         }
         var at = mention;
-        while (w.model.node_parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+        while (w.model.parentOf(at)) |parent| : (at = parent) {
             switch (tree.nodeTag(parent)) {
                 .field_access, .array_access => {
                     const base = if (tree.nodeTag(parent) == .field_access) tree.nodeData(parent).node_and_token[0] else tree.nodeData(parent).node_and_node[0];
                     if (base != at) break;
                     // A method called on it may write through its receiver.
                     if (tree.nodeTag(parent) == .field_access) {
-                        const grand = w.model.node_parents[@backingInt(parent)] orelse break; // safe: a node index indexes its own tree's parent table.
+                        const grand = w.model.parentOf(parent) orelse break;
                         var buffer: [1]Ast.Node.Index = undefined;
                         if (tree.fullCall(&buffer, grand)) |call| if (call.ast.fn_expr == parent) return .{ .key = tree.nodeMainToken(mention), .write = true };
                     }
@@ -840,7 +844,7 @@ const Walk = struct {
 
     /// Whether the local is declared an array, whose length its type holds.
     fn array(w: *const Walk) bool {
-        const variable = w.tree.fullVarDecl(w.model.declarations[w.local].node) orelse return false;
+        const variable = w.tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return false;
         const kind = variable.ast.type_node.unwrap() orelse return false;
         return switch (w.tree.nodeTag(kind)) {
             .array_type, .array_type_sentinel => true,
@@ -910,28 +914,28 @@ fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
 }
 
 /// The containers std's `paths` name (a namespace's file, a type), each resolved once.
-fn containersOf(c: *Context, rule: Rule, paths: []const []const u8) Context.Error![]const Facts.Container {
+fn containersOf(c: *Context, rule: Rule, paths: []const []const u8) Context.Error![]const ?Facts.Container {
     const targets = try c.allocator.alloc(Governed.Target, paths.len);
     const indexes = try c.allocator.alloc(usize, paths.len);
     for (paths, targets, indexes, 0..) |path, *target, *index, i| {
         target.* = .{ .source = "std", .declaration = path };
         index.* = i;
     }
-    var out: std.ArrayList(Facts.Container) = .empty;
+    var out: std.ArrayList(?Facts.Container) = .empty;
     for (try Governed.resolve(c, rule, targets, indexes)) |found| {
         var container: ?Facts.Container = null;
         for (found.decls) |decl| {
             const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
             if (value == .container) container = value.container;
         }
-        // Kept in the order of `paths`, an unresolved one as a container no value has.
-        try out.append(c.allocator, container orelse .{ .file = c.file, .scope = std.math.maxInt(u32) });
+        // Kept in the order of `paths`, an unresolved one as null.
+        try out.append(c.allocator, container);
     }
     return out.items;
 }
 
-fn find(containers: []const Facts.Container, held: Facts.Container) ?usize {
-    for (containers, 0..) |k, i| if (k.file.eql(held.file) and k.scope == held.scope) return i;
+fn find(containers: []const ?Facts.Container, held: Facts.Container) ?usize {
+    for (containers, 0..) |each, i| if (each) |k| if (k.file == held.file and k.scope == held.scope) return i;
     return null;
 }
 

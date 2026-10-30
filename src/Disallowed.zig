@@ -12,7 +12,7 @@ const Disallowed = @import("Rule.zig").Config.Disallowed;
 
 pub fn check(self: *Context) Context.Error!void {
     if (!self.config.has(.P006) or self.config.disallowed.len == 0) return;
-    const package = self.project.inputs[self.file.raw()].package;
+    const package = self.project.at(self.file).input.package;
     var targets: std.ArrayList(Governed.Target) = .empty;
     var indexes: std.ArrayList(usize) = .empty;
     for (self.config.disallowed, 0..) |entry, i| {

@@ -35,9 +35,9 @@ const assert_members = [_]Lib.Member{
 
 /// Counts the context's file.
 pub fn count(context: *Context) Context.Error!Counts {
-    const index = context.file.raw();
-    const tree = &context.project.files[index].tree;
-    const parents = context.project.models[index].node_parents;
+    const source = context.project.at(context.file);
+    const tree = &source.file.tree;
+    const parents = source.model.node_parents;
     var counts: Counts = .{};
     if (tree.errors.len != 0) return counts;
     const asserted = try context.allocator.alloc(bool, tree.nodes.len);

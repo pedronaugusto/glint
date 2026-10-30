@@ -30,7 +30,7 @@ pub fn check(context: *Context) RunError!void {
 
 fn parser(self: *Context) RunError!void {
     if (!self.config.has(.Z003)) return;
-    const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const file = &self.project.at(self.file).file;
     for (file.tree.errors) |err| {
         if (err.is_note) continue;
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -102,9 +102,9 @@ fn ordered(outer: Operators, inner: Operators) bool {
 /// parenthesizes the operand as 0.17 groups it, which keeps what the expression means.
 fn precedence(self: *Context) RunError!void {
     if (!self.config.has(.Z034)) return;
-    const index = self.file.raw(); // safe: selected identity indexes this frozen project.
-    const tree = &self.project.files[index].tree;
-    const parents = self.project.models[index].node_parents;
+    const source = self.project.at(self.file);
+    const tree = &source.file.tree;
+    const parents = source.model.node_parents;
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         const inner = operators(tag) orelse continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
@@ -125,9 +125,9 @@ fn precedence(self: *Context) RunError!void {
 
 fn unusedImports(self: *Context) RunError!void {
     if (!self.config.has(.Z013)) return;
-    const file_index = self.file.raw(); // safe: selected identity indexes this frozen project.
-    const tree = &self.project.files[file_index].tree;
-    const declarations = self.project.models[file_index].declarations;
+    const source = self.project.at(self.file);
+    const tree = &source.file.tree;
+    const declarations = source.model.declarations;
     var candidates: std.StringHashMapUnmanaged(void) = .empty;
     defer candidates.deinit(self.allocator);
     var indexes: std.ArrayList(u32) = .empty;
@@ -156,7 +156,7 @@ fn unusedImports(self: *Context) RunError!void {
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
         if (!candidates.contains(name)) continue;
         if (try self.facts.definition(self.file, node)) |definition| {
-            if (definition.file.eql(self.file)) used[definition.index] = true;
+            if (definition.file == self.file) used[@backingInt(definition.index)] = true;
         } else {
             const receiver = try self.facts.resolve(self.file, pair[0]);
             try unknown(self, .Z013, node, if (receiver == .unknown) receiver.unknown else .unsupported);
@@ -170,7 +170,7 @@ fn unusedImports(self: *Context) RunError!void {
 }
 
 fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringHashMapUnmanaged(void), indexes: []const u32, used: []bool, undecided: *std.StringHashMapUnmanaged(void)) RunError!void {
-    const tree = &self.project.files[self.file.raw()].tree;
+    const tree = &self.project.at(self.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return;
@@ -184,7 +184,7 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
         };
         if (!candidates.contains(name.?)) return;
         if (try self.facts.reflected(self.file, node)) |definition| {
-            if (definition.file.eql(self.file)) used[definition.index] = true;
+            if (definition.file == self.file) used[@backingInt(definition.index)] = true;
             return;
         }
     }
@@ -195,13 +195,13 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
     };
     if (container) |known| if (!known.symbolic) {
         // A literal missing member, or a foreign namespace, cannot use this file's import.
-        if (name != null or !known.file.eql(self.file)) return;
+        if (name != null or known.file != self.file) return;
     };
     var affected = false;
     for (indexes) |index| {
-        const decl = self.project.models[self.file.raw()].declarations[index];
+        const decl = self.project.at(self.file).model.declarations[index];
         if (name) |literal| if (!std.mem.eql(u8, literal, decl.name)) continue;
-        if (container) |known| if (!known.symbolic and (!known.file.eql(self.file) or known.scope != decl.scope)) continue;
+        if (container) |known| if (!known.symbolic and (known.file != self.file or known.scope != decl.scope)) continue;
         try undecided.put(self.allocator, decl.name, {});
         affected = true;
     }
@@ -217,7 +217,7 @@ fn unknown(self: *Context, rule: rules.Rule, node: Ast.Node.Index, reason: Facts
 
 fn priorityRules(self: *Context) RunError!void {
     if (!self.config.has(.Z011)) return;
-    const tree = &self.project.files[self.file.raw()].tree; // safe: selected identity belongs to the frozen project.
+    const tree = &self.project.at(self.file).file.tree;
     // Node-table enumeration covers every expression position exactly once.
     for (tree.nodes.items(.tag), 0..) |_, n| {
         const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n));
@@ -239,11 +239,11 @@ fn priorityRules(self: *Context) RunError!void {
 
 fn amendedPolicies(self: *Context) RunError!void {
     if (!selected(self, &.{ .Z012, .Z026 })) return;
-    const index = self.file.raw(); // safe: validated file identity indexes its frozen project.
-    const tree = &self.project.files[index].tree;
-    if (self.config.has(.Z012)) for (self.project.models[index].declarations) |decl| {
+    const source = self.project.at(self.file);
+    const tree = &source.file.tree;
+    if (self.config.has(.Z012)) for (source.model.declarations) |decl| {
         if (decl.kind != .function or !decl.public) continue;
-        if (!reachable(&self.project.models[index], decl.scope)) continue;
+        if (!reachable(&source.model, decl.scope)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const function = tree.fullFnProto(&buffer, decl.node).?;
         if (function.ast.return_type.unwrap()) |t| try privateType(self, t, decl.token, 0);
@@ -264,11 +264,11 @@ fn amendedPolicies(self: *Context) RunError!void {
 /// it held by a public or exported declaration, up to the file. A container a private declaration
 /// holds is named by nobody outside, so its `pub` methods are no public signature (reactor's
 /// backend sinks, called through `anytype`; a test's harness).
-fn reachable(model: *const Model, scope: u32) bool {
-    var at: ?u32 = scope;
-    while (at) |s| : (at = model.scopes[s].parent) {
-        if (model.scopes[s].kind != .container) continue;
-        const node = @backingInt(model.scopes[s].node);
+fn reachable(model: *const Model, scope: Model.Scope.Id) bool {
+    var at: ?Model.Scope.Id = scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind != .container) continue;
+        const node = @backingInt(model.scopes[@backingInt(s)].node);
         if (node >= model.node_parents.len) continue;
         const holder = model.node_parents[node] orelse continue;
         for (model.declarations) |d| if (d.kind == .variable and d.node == holder) {
@@ -280,7 +280,7 @@ fn reachable(model: *const Model, scope: u32) bool {
 }
 
 fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth: usize) RunError!void {
-    const tree = &self.project.files[self.file.raw()].tree; // safe: validated source identity.
+    const tree = &self.project.at(self.file).file.tree;
     if (depth >= 128) return unknown(self, .Z012, node, .budget);
     if (tree.fullPtrType(node)) |pointer| return privateType(self, pointer.ast.child_type, site, depth + 1);
     switch (tree.nodeTag(node)) {
@@ -290,7 +290,7 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
                 if (value == .unknown) try unknown(self, .Z012, node, value.unknown);
                 return;
             };
-            const decl = self.project.models[definition.file.raw()].declarations[definition.index]; // safe: resolved declaration belongs to frozen model.
+            const decl = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
             if (decl.kind == .parameter or decl.public or decl.exported) return;
             const value = try self.facts.resolve(self.file, node);
             if (value == .unknown) return unknown(self, .Z012, node, value.unknown);
@@ -298,14 +298,14 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
             if (value != .container) return;
             if (value.container.scope == decl.scope) return; // An enclosing @This receiver is nameable through its public owner.
             if (try self.facts.origin(definition)) |origin| {
-                const original = self.project.models[origin.file.raw()].declarations[origin.index]; // safe: resolved alias provenance.
+                const original = self.project.at(origin.file).model.declarations[@backingInt(origin.index)]; // safe: resolved alias provenance.
                 if (original.public or original.exported) return;
             }
             // A public alias to this same concrete container makes the type nameable.
-            for (self.project.models[definition.file.raw()].declarations, 0..) |alias, i| {
+            for (self.project.at(definition.file).model.declarations, 0..) |alias, i| {
                 if (!alias.public or alias.kind != .variable) continue;
-                const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @intCast(i) });
-                if (exposed == .container and exposed.container.file.eql(value.container.file) and exposed.container.scope == value.container.scope and exposed.container.symbolic == value.container.symbolic) return;
+                const exposed = try self.facts.declaration(.{ .file = definition.file, .index = @fromBackingInt(@intCast(i)) });
+                if (exposed == .container and exposed.container.file == value.container.file and exposed.container.scope == value.container.scope and exposed.container.symbolic == value.container.symbolic) return;
             }
             try self.atDefinition(.Z012, site, try self.allocator.print("public signature exposes private type '{s}'", .{decl.name}), definition);
         },
@@ -318,8 +318,8 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
 }
 
 fn deprecated(self: *const Context, definition: Facts.Decl) bool {
-    const tree = &self.project.files[definition.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    const decl = self.project.models[definition.file.raw()].declarations[definition.index]; // safe: enum identities index their owning frozen tables without narrowing.
+    const tree = &self.project.at(definition.file).file.tree;
+    const decl = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
     var token = tree.firstToken(decl.node);
     while (token > 0) {
         token -= 1;
@@ -344,7 +344,7 @@ fn standardContainer(self: *Context, root: Facts.Container, path_parts: []const 
 }
 
 fn lineLength(self: *Context) RunError!void {
-    const file = &self.project.files[self.file.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+    const file = &self.project.at(self.file).file;
     if (self.config.has(.Z024)) for (file.lines, 0..) |start, l| {
         var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len);
         if (end > start and file.source[end - 1] == '\r') end -= 1;
@@ -354,11 +354,11 @@ fn lineLength(self: *Context) RunError!void {
 
 fn syntaxRules(self: *Context) RunError!void {
     if (!selected(self, &.{ .Z001, .Z005, .Z006, .Z009, .Z014, .Z031, .Z032 })) return;
-    const index = self.file.raw(); // safe: selected identity indexes this frozen project.
-    const tree = &self.project.files[index].tree;
-    const model = &self.project.models[index];
-    for (model.declarations) |decl| if (decl.kind == .field and decl.scope == 0) {
-        if (!names.isPascalCase(self.project.inputs[index].stem)) try self.emit(.Z009, 0, 0, "file struct label should use TitleCase; caller owns file naming");
+    const source = self.project.at(self.file);
+    const tree = &source.file.tree;
+    const model = &source.model;
+    for (model.declarations) |decl| if (decl.kind == .field and decl.scope == model.root()) {
+        if (!names.isPascalCase(source.input.stem)) try self.emit(.Z009, 0, 0, "file struct label should use TitleCase; caller owns file naming");
         break;
     };
     for (model.declarations) |decl| {
@@ -414,8 +414,8 @@ fn syntaxRules(self: *Context) RunError!void {
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in type names as ordinary words, for example XmlParser");
                     } else if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case"),
                     .function => |definition| {
-                        const target = &self.project.files[definition.file.raw()].tree; // safe: resolved declaration belongs to its frozen file.
-                        const record = self.project.models[definition.file.raw()].declarations[definition.index];
+                        const target = &self.project.at(definition.file).file.tree;
+                        const record = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
                         var buffer: [1]Ast.Node.Index = undefined;
                         const function = target.fullFnProto(&buffer, record.node).?;
                         if (std.mem.eql(u8, name, record.name)) {
@@ -440,14 +440,17 @@ fn syntaxRules(self: *Context) RunError!void {
 /// selected sources (std's, a dependency's) also declares in public: the generic takes both,
 /// so the outside type fixes the spelling.
 fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunError!bool {
-    const model = &self.project.models[self.file.raw()]; // safe: the checked file indexes its frozen model.
-    if (model.scopes[decl.scope].kind != .container and model.scopes[decl.scope].kind != .file) return false;
+    const model = &self.project.at(self.file).model;
+    if (model.scopes[@backingInt(decl.scope)].kind != .container and model.scopes[@backingInt(decl.scope)].kind != .file) return false;
     if (!try genericReads(self, name)) return false;
-    for (self.project.files, self.project.models, self.project.inputs) |*file, *other, input| {
+    for (self.project.sources) |*each| {
+        const file = &each.file;
+        const other = &each.model;
+        const input = each.input;
         if (input.selected or file.status != .parsed) continue;
         for (other.declarations) |d| {
             if (!d.public or !std.mem.eql(u8, d.name, name)) continue;
-            if (other.scopes[d.scope].kind == .container or other.scopes[d.scope].kind == .file) return true;
+            if (other.scopes[@backingInt(d.scope)].kind == .container or other.scopes[@backingInt(d.scope)].kind == .file) return true;
         }
     }
     return false;
@@ -456,7 +459,10 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
 /// Whether a selected file reads `T.name` where `T` is a parameter that takes a type: declared
 /// `type` (comptime by necessity) or `anytype`.
 fn genericReads(self: *Context, name: []const u8) RunError!bool {
-    for (self.project.files, self.project.models, self.project.inputs) |*file, *model, input| {
+    for (self.project.sources) |*each| {
+        const file = &each.file;
+        const model = &each.model;
+        const input = each.input;
         if (!input.selected or file.status != .parsed) continue;
         const tree = &file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -465,7 +471,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
             if (!std.mem.eql(u8, tree.tokenSlice(data[1]), name)) continue;
             if (tree.nodeTag(data[0]) != .identifier) continue;
             const index = (model.reference(data[0]) orelse continue).declaration orelse continue;
-            const parameter = model.declarations[index];
+            const parameter = model.declarations[@backingInt(index)];
             if (parameter.kind != .parameter) continue;
             // `anytype` has no type expression of its own: the parameter's node is the keyword.
             const typed = tree.nodeTag(parameter.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parameter.node)), "type");
@@ -477,7 +483,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
 
 fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
-    const tree = &self.project.files[self.file.raw()].tree; // safe: selected file identity belongs to the project.
+    const tree = &self.project.at(self.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         var cb: [1]Ast.Node.Index = undefined;
@@ -487,7 +493,7 @@ fn contextRules(self: *Context) RunError!void {
                 if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
                 if (value == .function) for (self.project.imports) |mapping| {
                     if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
-                    const debug = (try standardContainer(self, .{ .file = mapping.target, .scope = 0 }, &.{"debug"})) orelse continue;
+                    const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
                     const assertion = self.facts.member(debug, "assert") orelse continue;
                     if (std.meta.eql(assertion, value.function)) {
                         try self.at(.Z016, tree.nodeMainToken(node), "consider separate assertions only when evaluation and short circuit effects are preserved");
@@ -500,8 +506,8 @@ fn contextRules(self: *Context) RunError!void {
 }
 
 fn unknownCoverage(self: *Context) RunError!void {
-    const tree = &self.project.files[self.file.raw()].tree; // safe: enum identities index their owning frozen tables without narrowing.
-    for (self.project.models[self.file.raw()].import_nodes) |node| { // safe: the selected file indexes its frozen project model.
+    const tree = &self.project.at(self.file).file.tree;
+    for (self.project.at(self.file).model.import_nodes) |node| {
         var b: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
@@ -512,7 +518,7 @@ fn unknownCoverage(self: *Context) RunError!void {
 
 fn sourcePolicies(self: *Context) RunError!void {
     if (!self.config.has(.P005)) return;
-    const tree = &self.project.files[self.file.raw()].tree;
+    const tree = &self.project.at(self.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
@@ -522,8 +528,8 @@ fn sourcePolicies(self: *Context) RunError!void {
         const value = try self.facts.resolve(self.file, call.ast.fn_expr);
         if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
         if (value == .function) for (self.project.imports) |mapping| {
-            if (!mapping.from.eql(self.file) or !std.mem.eql(u8, mapping.spelling, "std")) continue;
-            const debug = (try standardContainer(self, .{ .file = mapping.target, .scope = 0 }, &.{"debug"})) orelse continue;
+            if (mapping.from != self.file or !std.mem.eql(u8, mapping.spelling, "std")) continue;
+            const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
             const print = self.facts.member(debug, "print") orelse continue;
             if (std.meta.eql(print, value.function)) {
                 try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
@@ -534,7 +540,7 @@ fn sourcePolicies(self: *Context) RunError!void {
 }
 fn functionLengths(self: *Context) RunError!void {
     if (!self.config.has(.P003)) return;
-    const file = &self.project.files[self.file.raw()];
+    const file = &self.project.at(self.file).file;
     const tree = &file.tree;
     const used = try self.allocator.alloc(bool, self.config.function_exceptions.len);
     @memset(used, false);

@@ -34,18 +34,19 @@ const Loader = struct {
     options: *const Options,
     inputs: std.ArrayList(Project.Input) = .empty,
     mappings: std.ArrayList(Project.Import) = .empty,
-    paths: std.StringHashMapUnmanaged(Project.FileId) = .empty,
+    /// Each loaded file's position in `inputs`, by its canonical path.
+    paths: std.StringHashMapUnmanaged(usize) = .empty,
     canonical_paths: std.ArrayList([]const u8) = .empty,
     roots: std.ArrayList([]const u8) = .empty,
     /// Package directories, canonical.
     packages: std.ArrayList(Module) = .empty,
     bytes: usize = 0,
 
-    fn load(self: *Loader, path: []const u8, selected: bool) !Project.FileId {
+    fn load(self: *Loader, path: []const u8, selected: bool) !usize {
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.a);
-        if (self.paths.get(canonical)) |id| {
-            if (selected) self.inputs.items[id.raw()].selected = true; // safe: enum identities index their owning frozen tables without narrowing.
-            return id;
+        if (self.paths.get(canonical)) |position| {
+            if (selected) self.inputs.items[position].selected = true;
+            return position;
         }
         if (self.inputs.items.len >= 4096) return error.FileBudgetExceeded;
         if (!selected) {
@@ -60,13 +61,13 @@ const Loader = struct {
         // A file's bytes are input until the project's budget has taken them.
         const source = try aegis.input.Untrusted([:0]const u8).init(read).parse(self, Loader.take);
         const bytes = source.bytes;
-        const id: Project.FileId = Project.FileId.fromRaw(@intCast(self.inputs.items.len));
+        const position = self.inputs.items.len;
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = self.packageOf(canonical) });
         try self.canonical_paths.append(self.a, canonical);
-        try self.paths.put(self.a, canonical, id);
-        return id;
+        try self.paths.put(self.a, canonical, position);
+        return position;
     }
 
     /// A file's bytes, counted against the project's source budget.
@@ -89,7 +90,7 @@ const Loader = struct {
     fn imports(self: *Loader) !void {
         var cursor: usize = 0;
         while (cursor < self.inputs.items.len) : (cursor += 1) {
-            const from: Project.FileId = Project.FileId.fromRaw(@intCast(cursor));
+            const from = cursor;
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
             var lexer: std.zig.Tokenizer = .init(sentinel);
@@ -108,7 +109,7 @@ const Loader = struct {
                 const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;
                 const target = try self.load(target_path, false);
                 var duplicate = false;
-                for (self.mappings.items) |m| if (m.from.eql(from) and std.mem.eql(u8, m.spelling, spelling)) {
+                for (self.mappings.items) |m| if (m.from == from and std.mem.eql(u8, m.spelling, spelling)) {
                     duplicate = true;
                     break;
                 };
@@ -347,8 +348,8 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     for (configured.packages.items) |package| try loader.packages.append(a, .{ .name = package.name, .path = try std.Io.Dir.cwd().realPathFileAlloc(io, package.path, a) });
     for (configured.roots.items) |root| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, root, a));
     for (configured.files.items) |path| {
-        const id = try loader.load(path, true);
-        const canonical = loader.canonical_paths.items[id.raw()]; // safe: enum identities index their owning frozen tables without narrowing.
+        const position = try loader.load(path, true);
+        const canonical = loader.canonical_paths.items[position];
         try loader.roots.append(a, std.Io.Dir.path.dirname(canonical) orelse canonical);
     }
     if (configured.zig_lib_path) |lib| try loader.roots.append(a, try std.Io.Dir.cwd().realPathFileAlloc(io, lib, a));
@@ -377,7 +378,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
         var made: usize = 0;
         const changed = try Fix.apply(a, &project, &report, .{ .escapes_before = configured.escapes_before });
         for (changed) |file| {
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project.inputs[file.file.raw()].name, .data = file.bytes });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project.at(file.file).input.name, .data = file.bytes });
             made += file.edits;
         }
         try problems.print("glint: fixed {d} sites in {d} files\n", .{ made, changed.len });

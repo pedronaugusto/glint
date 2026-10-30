@@ -105,30 +105,30 @@ fn ruleName(name: []const u8) bool {
 /// removal of every escape that covered nothing. Overlapping edits keep the first; an edit two
 /// findings share is made once.
 pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) std.mem.Allocator.Error![]const Changed {
-    var by_file: std.array_hash_map.Auto(u32, std.ArrayList(Report.Edit)) = .empty;
+    var by_file: std.array_hash_map.Auto(Project.FileId, std.ArrayList(Report.Edit)) = .empty;
     for (report.diagnostics) |d| {
         if (d.fix.len == 0) continue;
-        const entry = try by_file.getOrPut(a, d.span.file.raw());
+        const entry = try by_file.getOrPut(a, d.span.file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.appendSlice(a, d.fix);
     }
     for (report.stale) |stale| {
         if (!std.mem.eql(u8, stale.name, "aegis")) continue;
-        const file = &project.files[stale.span.file.raw()];
-        const entry = try by_file.getOrPut(a, stale.span.file.raw());
+        const file = &project.at(stale.span.file).file;
+        const entry = try by_file.getOrPut(a, stale.span.file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end));
     }
     for (report.malformed) |entry| {
-        const file = &project.files[entry.span.file.raw()];
+        const file = &project.at(entry.span.file).file;
         const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
-        const slot = try by_file.getOrPut(a, entry.span.file.raw());
+        const slot = try by_file.getOrPut(a, entry.span.file);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, edit);
     }
     var out: std.ArrayList(Changed) = .empty;
-    for (by_file.keys(), by_file.values()) |raw, *edits| {
-        const source = project.files[raw].source;
+    for (by_file.keys(), by_file.values()) |file, *edits| {
+        const source = project.at(file).file.source;
         std.mem.sort(Report.Edit, edits.items, {}, earlier);
         var bytes: std.ArrayList(u8) = .empty;
         var at: u32 = 0;
@@ -144,7 +144,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
             made += 1;
         }
         try bytes.appendSlice(a, source[at..]);
-        try out.append(a, .{ .file = Project.FileId.fromRaw(raw), .bytes = bytes.items, .edits = made });
+        try out.append(a, .{ .file = file, .bytes = bytes.items, .edits = made });
     }
     return out.items;
 }
@@ -174,15 +174,15 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
 /// with none of today's rules, is left for its owner to name. One that covers nothing goes as a
 /// stale escape instead.
 fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
-    const file = &project.files[span.file.raw()];
+    const file = &project.at(span.file).file;
     const text = file.source[span.start..span.end];
     if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
     for (report.escapes) |escape| {
-        if (!escape.span.file.eql(span.file) or escape.span.start != span.start) continue;
+        if (escape.span.file != span.file or escape.span.start != span.start) continue;
         // The record's escape is this one: its place and its words.
         const recorded = for (before) |escaped| {
             if (escaped.line != span.line or escaped.column != span.column) continue;
-            if (!std.mem.eql(u8, escaped.path, project.inputs[span.file.raw()].name)) continue;
+            if (!std.mem.eql(u8, escaped.path, project.at(span.file).input.name)) continue;
             if (std.mem.eql(u8, escaped.reason, escape.reason) and std.mem.eql(u8, escaped.why, escape.why)) break escaped;
         } else return null;
         var names: std.ArrayList(u8) = .empty;
