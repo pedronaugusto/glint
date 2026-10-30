@@ -3168,6 +3168,57 @@ test "A009 reads what a method of the file checked of its receiver, where the ca
     , 1);
 }
 
+test "A009 reads a std read's count as at most the one buffer it filled, through a function of the program that retries it" {
+    const program =
+        \\const std = @import("std");
+        \\fn readSome(io: std.Io, from: std.Io.File, buffers: []const []u8) !usize {
+        \\    while (true) {
+        \\        const n = try from.readStreaming(io, buffers);
+        \\        if (n != 0) return n;
+        \\    }
+        \\}
+        \\pub fn f(r: *std.Io.Reader, file: std.Io.File, io: std.Io) !u8 {
+        \\    var chunk: [512]u8 = undefined;
+        \\    const room: usize = try r.takeInt(u32, .little);
+        \\    const n = readSome(io, file, &.{chunk[0..@min(room, chunk.len)]}) catch |err| switch (err) {
+        \\        error.Canceled => return error.Canceled,
+        \\        else => return 0,
+        \\    };
+        \\    var buf: [64]u8 = undefined;
+        \\    const m = try r.readSliceShort(&buf);
+        \\    return chunk[0..n][0] +% buf[0..m][0];
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // A count the wrapper does not return as read, two buffers, and an end past the array.
+    try expect(pack.untrusted_input, comptime edited(program, "if (n != 0) return n;", "if (n != 0) return n + 1;"), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "&.{chunk[0..@min(room, chunk.len)]}", "&.{ chunk[0..@min(room, chunk.len)], chunk[0..1] }"), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "@min(room, chunk.len)", "@max(room, chunk.len)"), 2);
+}
+
+test "A009 reads what aegis asserted across another assertion, and a difference or a constant within where what it is made of is" {
+    const program =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const S = struct { buf: []u8, filled: usize, consumed: usize };
+        \\fn touch(s: *S) void {
+        \\    s.filled += 1;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, s: *S) !void {
+        \\    s.filled = try r.takeInt(u32, .little);
+        \\    s.consumed = try r.takeInt(u32, .little);
+        \\    aegis.assert.invariant(s.consumed <= s.filled, "consumed <= filled");
+        \\    aegis.assert.invariant(s.filled <= s.buf.len, "filled <= buf.len");
+        \\    const rest = s.filled - s.consumed;
+        \\    @memmove(s.buf[0..rest], s.buf[s.consumed..s.filled]);
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    try expect(pack.untrusted_input, comptime edited(program, "    const rest = s.filled - s.consumed;\n", "    touch(s);\n    const rest = s.filled - s.consumed;\n"), 2);
+    try expect(pack.untrusted_input, comptime edited(program, "    aegis.assert.invariant(s.filled <= s.buf.len, \"filled <= buf.len\");\n", ""), 2);
+    try expect(pack.untrusted_input, comptime edited(program, "@memmove(s.buf[0..rest]", "s.buf = s.buf[1..];\n    @memmove(s.buf[0..rest]"), 2);
+}
+
 test "A009 reads an array's length as its type spells it: a comptime width, a constant naming it, and a capture over addresses of arrays of one length" {
     const program =
         \\const std = @import("std");
