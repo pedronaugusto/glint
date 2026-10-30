@@ -1273,6 +1273,23 @@ test "A019 reads the prefix a cursor writer counts, where its type steps the cou
     try std.testing.expectEqualSlices(u32, &.{ 16, 17, 18, 24, 25 }, found.lines[0..found.findings]);
 }
 
+test "A019 reads a local a range's passes wrote a stride at a time, all of it" {
+    // Clean: four eight-byte strides over 32 bytes, counting up (3) and down (4). Findings: 32
+    // of 40 bytes (5), strides of 4 that leave the tail (6), a pass that may skip its write
+    // (7), a pass that reads the local it writes (8).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn s1(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s2(words: [4]u64) void { var out: [32]u8 = undefined; inline for (0..4) |i| std.mem.writeInt(u64, out[8 * (4 - 1 - i) ..][0..8], words[i], .big); use(&out); }
+        \\pub fn s3(words: [4]u64) void { var out: [40]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s4(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[4 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s5(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| { if (words[i] == 0) continue; std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); } use(&out); }
+        \\pub fn s6() void { var out: [32]u8 = undefined; for (0..4) |i| @memcpy(out[8 * i ..][0..8], out[0..8]); use(&out); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 7, 8 }, found.lines[0..found.findings]);
+}
+
 test "A019 reads a local a function outside the program writes only where its result shows it did" {
     // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
     // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size

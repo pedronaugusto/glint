@@ -478,6 +478,7 @@ const Walk = struct {
         }
         if (tree.fullFor(node)) |loop| {
             if (try w.setsEveryField(loop)) return .written;
+            if (try w.stridesWhole(loop)) return .written;
             for (loop.ast.inputs) |input| {
                 const past = try w.statement(input, state);
                 if (past.at != .unwritten) return past;
@@ -503,6 +504,48 @@ const Walk = struct {
             try w.flags.append(w.c.allocator, .{ .decl = decl, .state = try w.whenTrue(value, past) });
         };
         return past;
+    }
+
+    /// Whether a `for` over `0..n`, `n` a number, writes all of the local, an array of `n * k`
+    /// elements, a stride at a time: its body is one statement, mentioning the local once, that
+    /// writes `local[k * i ..][0..k]` (or `local[k * (n - 1 - i) ..][0..k]`) whole, `i` the
+    /// range's capture and `k` a number: `std.mem.writeInt` (whose type is that long),
+    /// `@memcpy`, `@memset` or `.* =`. Each pass writes its own stride; together they are all.
+    fn stridesWhole(w: *Walk, loop: Ast.full.For) Context.Error!bool {
+        const tree = w.tree;
+        if (loop.ast.else_expr != .none) return false;
+        const length = w.arrayLength() orelse return false;
+        const position, const passes_count = for (loop.ast.inputs, 0..) |input, at| {
+            if (tree.nodeTag(input) != .for_range) continue;
+            const from, const to = tree.nodeData(input).node_and_opt_node;
+            if (literalValue(tree, from) != 0) continue;
+            break .{ at, literalValue(tree, to.unwrap() orelse continue) orelse continue };
+        } else return false;
+        const index = capture(tree, loop.payload_token, position, false) orelse return false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, loop.ast.then_expr) orelse (&loop.ast.then_expr)[0..1];
+        if (statements.len != 1) return false;
+        const only = statements[0];
+        if (leavesPass(tree, only)) return false;
+        var mentions: usize = 0;
+        for (w.mentions.items) |mention| {
+            if (tree.firstToken(mention) >= tree.firstToken(only) and tree.lastToken(mention) <= tree.lastToken(only)) mentions += 1;
+        }
+        if (mentions != 1) return false;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const dest = if (tree.fullCall(&call_buffer, only)) |call| dest: {
+            if (call.ast.params.len != 4 or !try w.isStd(only, call, "mem.writeInt")) return false;
+            break :dest call.ast.params[1];
+        } else filled(tree, only) orelse return false;
+        // `local[start..][0..k]`.
+        const span = tree.fullSlice(dest) orelse return false;
+        if (literalValue(tree, span.ast.start) != 0) return false;
+        const stride = literalValue(tree, span.ast.end.unwrap() orelse return false) orelse return false;
+        const rest = tree.fullSlice(span.ast.sliced) orelse return false;
+        if (rest.ast.end != .none or !w.isLocal(rest.ast.sliced)) return false;
+        const total = std.math.mul(u64, passes_count, stride) catch return false;
+        if (stride == 0 or total != length) return false;
+        return strideAt(tree, rest.ast.start, stride, index, passes_count);
     }
 
     /// Whether `input`, a slice no one assigns, is known at `call` to be twice the local's
@@ -2591,6 +2634,20 @@ fn conditional(tree: *const Ast, model: *const Model, inner: Ast.Node.Index, top
 }
 
 /// Whether a `for` input is a range of literals with a pass in it (`0..2`).
+/// Whether `start` is the stride `k` times the pass `i` of `n`: `k * i`, `i * k`, or counting
+/// down, `k * (n - 1 - i)`.
+fn strideAt(tree: *const Ast, start: Ast.Node.Index, stride: u64, index: []const u8, count: u64) bool {
+    if (tree.nodeTag(start) != .mul) return false;
+    const a, const b = tree.nodeData(start).node_and_node;
+    const pass = ungrouped(tree, if (literalValue(tree, a) == stride) b else if (literalValue(tree, b) == stride) a else return false);
+    if (isWord(tree, pass, index)) return true;
+    if (tree.nodeTag(pass) != .sub) return false;
+    const left, const right = tree.nodeData(pass).node_and_node;
+    if (!isWord(tree, right, index) or tree.nodeTag(left) != .sub) return false;
+    const n, const one = tree.nodeData(left).node_and_node;
+    return literalValue(tree, n) == count and literalValue(tree, one) == 1;
+}
+
 fn passes(tree: *const Ast, input: Ast.Node.Index) bool {
     if (tree.nodeTag(input) != .for_range) return false;
     const start, const end = tree.nodeData(input).node_and_opt_node;
