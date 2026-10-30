@@ -959,6 +959,40 @@ test "A009 leaves a position the program checked against the memory's length, an
     , 1);
 }
 
+test "A009 reads a fixed array's length check as a slice's: a position checked against it is within, one checked against another array's or unchecked is not" {
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    const table: [16]u8 = @splat(0);
+        \\    const other: [32]u8 = @splat(0);
+        \\    const i = try r.takeInt(u32, .little);
+        \\    if (i >= table.len) return error.Short;
+        \\    _ = table[i];
+        \\    const j = try r.takeInt(u32, .little);
+        \\    if (j >= other.len) return error.Short;
+        \\    _ = table[j];
+        \\    const k = try r.takeInt(u32, .little);
+        \\    return table[k];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 2), found.findings);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 12 }, found.lines[0..2]);
+}
+
+test "A009 gives no bound where an integer type's width overflows Range's own arithmetic: a `u65535` beside a signed peer is read, not a panic" {
+    // Before the width was added checked, reading `wide + narrow` overflowed a u16 in glint.
+    _ = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var buf: [8]u8 = undefined;
+        \\    _ = try r.readSliceShort(&buf);
+        \\    const wide: u65535 = 1;
+        \\    const narrow: i8 = @bitCast(buf[1]);
+        \\    return buf[wide + narrow];
+        \\}
+    );
+}
+
 test "A009 trusts a table's own id by its type, and reports each id made from an integer that does not count the table's entries" {
     // A table's own id indexes and slices it (lines 8-10); ids counted over it (13) or its
     // length less one after an append (23) are made. Findings: an id made from input (18), a

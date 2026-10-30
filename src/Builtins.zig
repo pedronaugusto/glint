@@ -104,22 +104,21 @@ fn precedence(self: *Context) RunError!void {
     if (!self.config.has(.Z034)) return;
     const source = self.project.at(self.file);
     const tree = &source.file.tree;
-    const parents = source.model.node_parents;
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         const inner = operators(tag) orelse continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-        const parent = parents[n] orelse continue;
+        const parent = source.model.node_parents[n] orelse continue;
         const outer = operators(tree.nodeTag(parent)) orelse continue;
         if (ordered(outer, inner)) continue;
         const operand_start = tree.tokenStart(tree.firstToken(node));
         const last = tree.lastToken(node);
-        const operand_end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len));
+        const operand_end = tree.tokenToSpan(last).end;
         const outer_token = tree.nodeMainToken(parent);
         const inner_token = tree.nodeMainToken(node);
-        const at = tree.tokenStart(inner_token);
+        const at = tree.tokenToSpan(inner_token);
         const message = try self.allocator.print("'{s}' and '{s}' meet without parentheses, which Zig 0.18 refuses as ambiguous; parenthesize the operand", .{ tree.tokenSlice(outer_token), tree.tokenSlice(inner_token) });
         const edits = try self.allocator.dupe(Report.Edit, &.{ .{ .start = operand_start, .end = operand_start, .text = "(", .nests = true }, .{ .start = operand_end, .end = operand_end, .text = ")", .nests = true } });
-        try self.emitFixed(.Z034, at, at + @as(u32, @intCast(tree.tokenSlice(inner_token).len)), message, &.{}, edits);
+        try self.emitFixed(.Z034, at.start, at.end, message, &.{}, edits);
     }
 }
 
@@ -130,7 +129,7 @@ fn unusedImports(self: *Context) RunError!void {
     const declarations = source.model.declarations;
     var candidates: std.StringHashMapUnmanaged(void) = .empty;
     defer candidates.deinit(self.allocator);
-    var indexes: std.ArrayList(u32) = .empty;
+    var indexes: std.ArrayList(Model.Declaration.Id) = .empty;
     for (declarations, 0..) |decl, index| {
         if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
         const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
@@ -138,25 +137,24 @@ fn unusedImports(self: *Context) RunError!void {
         const args = Facts.builtinArgs(tree, value, &buffer);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import")) continue;
         try candidates.put(self.allocator, decl.name, {});
-        try indexes.append(self.allocator, @intCast(index));
+        try indexes.append(self.allocator, @fromBackingInt(@intCast(index)));
     }
     if (indexes.items.len == 0) return;
-    const used = try self.allocator.alloc(bool, declarations.len);
-    @memset(used, false);
+    var used: Used = .empty;
     var undecided: std.StringHashMapUnmanaged(void) = .empty;
     defer undecided.deinit(self.allocator);
     // One pass for all candidates: spelling filters work, declaration identity decides usage.
     for (tree.nodes.items(.tag), 0..) |tag, n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
         if (tag != .field_access) {
-            try reflectedImport(self, node, candidates, indexes.items, used, &undecided);
+            try reflectedImport(self, node, candidates, indexes.items, &used, &undecided);
             continue;
         }
         const pair = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
         if (!candidates.contains(name)) continue;
         if (try self.facts.definition(self.file, node)) |definition| {
-            if (definition.file == self.file) used[@backingInt(definition.index)] = true;
+            if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
         } else {
             const receiver = try self.facts.resolve(self.file, pair[0]);
             try unknown(self, .Z013, node, if (receiver == .unknown) receiver.unknown else .unsupported);
@@ -164,12 +162,15 @@ fn unusedImports(self: *Context) RunError!void {
         }
     }
     for (indexes.items) |index| {
-        const decl = declarations[index];
-        if (!used[index] and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
+        const decl = declarations[@backingInt(index)];
+        if (!used.contains(index) and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
     }
 }
 
-fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringHashMapUnmanaged(void), indexes: []const u32, used: []bool, undecided: *std.StringHashMapUnmanaged(void)) RunError!void {
+/// The candidate imports a selected file names.
+const Used = std.AutoHashMapUnmanaged(Model.Declaration.Id, void);
+
+fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringHashMapUnmanaged(void), indexes: []const Model.Declaration.Id, used: *Used, undecided: *std.StringHashMapUnmanaged(void)) RunError!void {
     const tree = &self.project.at(self.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
@@ -184,7 +185,7 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
         };
         if (!candidates.contains(name.?)) return;
         if (try self.facts.reflected(self.file, node)) |definition| {
-            if (definition.file == self.file) used[@backingInt(definition.index)] = true;
+            if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
             return;
         }
     }
@@ -199,7 +200,7 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
     };
     var affected = false;
     for (indexes) |index| {
-        const decl = self.project.at(self.file).model.declarations[index];
+        const decl = self.project.at(self.file).model.declarations[@backingInt(index)];
         if (name) |literal| if (!std.mem.eql(u8, literal, decl.name)) continue;
         if (container) |known| if (!known.symbolic and (known.file != self.file or known.scope != decl.scope)) continue;
         try undecided.put(self.allocator, decl.name, {});
@@ -345,10 +346,12 @@ fn standardContainer(self: *Context, root: Facts.Container, path_parts: []const 
 
 fn lineLength(self: *Context) RunError!void {
     const file = &self.project.at(self.file).file;
-    if (self.config.has(.Z024)) for (file.lines, 0..) |start, l| {
-        var end: u32 = if (l + 1 < file.lines.len) file.lines[l + 1] - 1 else @intCast(file.source.len);
-        if (end > start and file.source[end - 1] == '\r') end -= 1;
-        if (end - start > self.config.max_line_length) try self.emit(.Z024, start + self.config.max_line_length, end, "line exceeds configured byte length");
+    if (self.config.has(.Z024)) for (file.lines, 0..) |_, l| {
+        const line = file.lineBytes(l);
+        if (line.text.len <= self.config.max_line_length) continue;
+        const over = std.math.add(u32, line.start, self.config.max_line_length) catch continue;
+        const end = std.math.add(u32, line.start, std.math.cast(u32, line.text.len) orelse continue) catch continue;
+        try self.emit(.Z024, over, end, "line exceeds configured byte length");
     };
 }
 

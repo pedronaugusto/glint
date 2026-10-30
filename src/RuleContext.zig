@@ -170,14 +170,14 @@ pub fn undecided(self: *RuleContext, rule: rules.Rule, start: u32, reason: Repor
 pub fn fixedAt(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, fix: []const Report.Edit) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
-    const start = tree.tokenStart(token);
-    try self.emitFixed(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message, &.{}, fix);
+    const span = tree.tokenToSpan(token);
+    try self.emitFixed(rule, span.start, span.end, message, &.{}, fix);
 }
 pub fn at(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8) Error!void {
     const tree = try self.project.syntax(try self.source());
     if (token >= tree.tokens.len) return error.InvalidHandle;
-    const start = tree.tokenStart(token);
-    try self.emit(rule, start, start + @as(u32, @intCast(tree.tokenSlice(token).len)), message);
+    const span = tree.tokenToSpan(token);
+    try self.emit(rule, span.start, span.end, message);
 }
 pub fn unknown(self: *RuleContext, rule: rules.Rule, node: std.zig.Ast.Node.Index, reason: Facts.Unknown) Error!void {
     const tree = try self.project.syntax(try self.source());
@@ -205,15 +205,17 @@ pub fn selected(self: *const RuleContext, selection: []const rules.Rule) bool {
     for (selection) |rule| if (self.config.has(rule)) return true;
     return false;
 }
+/// A token of a file, as a finding's related place.
+pub fn spanOf(self: *const RuleContext, file: Project.FileId, token: std.zig.Ast.TokenIndex) Report.Span {
+    const held = &self.project.at(file).file;
+    const named = held.tree.tokenToSpan(token);
+    const line = held.line(named.start);
+    return .{ .file = file, .start = named.start, .end = named.end, .line = line + 1, .column = held.column(named.start) };
+}
 pub fn atDefinition(self: *RuleContext, rule: rules.Rule, token: std.zig.Ast.TokenIndex, message: []const u8, definition: Facts.Decl) Error!void {
-    const h = self.project.handle(definition.file);
-    const tree = try self.project.syntax(h);
-    const declarations = try self.project.declarations(h);
-    const start = tree.tokenStart(declarations[@backingInt(definition.index)].token);
-    const file = &self.project.at(definition.file).file;
-    const line = file.line(start);
-    const related = [_]Report.Span{.{ .file = definition.file, .start = start, .end = start + @as(u32, @intCast(tree.tokenSlice(declarations[@backingInt(definition.index)].token).len)), .line = line + 1, .column = start - file.lines[line] + 1 }};
+    const named = self.project.at(definition.file).model.declarations[@backingInt(definition.index)].token;
+    const related = [_]Report.Span{self.spanOf(definition.file, named)};
     const site_tree = try self.project.syntax(try self.source());
-    const site = site_tree.tokenStart(token);
-    try self.emitRelated(rule, site, site + @as(u32, @intCast(site_tree.tokenSlice(token).len)), message, &related);
+    const site = site_tree.tokenToSpan(token);
+    try self.emitRelated(rule, site.start, site.end, message, &related);
 }

@@ -75,13 +75,13 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
     var reason: []const u8 = undefined;
     if (std.mem.startsWith(u8, raw, "aegis:")) {
         const rest = std.mem.trim(u8, raw["aegis:".len..], " \t");
-        const colon = std.mem.findScalar(u8, rest, ':') orelse return .{ .malformed = "an aegis escape is `// aegis: <reason>(<rule>, ...): <why>`" };
-        const head = std.mem.trim(u8, rest[0..colon], " \t");
-        const open = std.mem.findScalar(u8, head, '(');
-        escape = std.meta.stringToEnum(Reason, std.mem.trim(u8, head[0 .. open orelse head.len], " \t")) orelse return .{ .malformed = "an aegis escape's reason is no-danger, design, hot-loop, internal or boundary" };
-        if (open) |at| {
-            if (head[head.len - 1] != ')') return .{ .malformed = "an aegis escape names its rules in parentheses: `// aegis: <reason>(<rule>, ...): <why>`" };
-            var names = std.mem.tokenizeAny(u8, head[at + 1 .. head.len - 1], ", \t");
+        const before_colon, const why = std.mem.cutScalar(u8, rest, ':') orelse return .{ .malformed = "an aegis escape is `// aegis: <reason>(<rule>, ...): <why>`" };
+        const head = std.mem.trim(u8, before_colon, " \t");
+        const named_reason, const listed = std.mem.cutScalar(u8, head, '(') orelse .{ head, null };
+        escape = std.meta.stringToEnum(Reason, std.mem.trim(u8, named_reason, " \t")) orelse return .{ .malformed = "an aegis escape's reason is no-danger, design, hot-loop, internal or boundary" };
+        if (listed) |inside| {
+            const names_text = std.mem.cutSuffix(u8, inside, ")") orelse return .{ .malformed = "an aegis escape names its rules in parentheses: `// aegis: <reason>(<rule>, ...): <why>`" };
+            var names = std.mem.tokenizeAny(u8, names_text, ", \t");
             while (names.next()) |id| {
                 const named = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "an aegis escape names a rule glint does not have" };
                 if (rules.definition(named, definitions).?.exception != .aegis) return .{ .malformed = "an aegis escape names only the pack's rules" };
@@ -91,15 +91,15 @@ fn one(file: *const File, comment: File.Comment, definitions: []const rules.Defi
             }
             if (covers_len == 0) return .{ .malformed = "an aegis escape names the rules it covers" };
         } else unnamed = true;
-        reason = std.mem.trim(u8, rest[colon + 1 ..], " \t");
+        reason = std.mem.trim(u8, why, " \t");
     } else if (std.mem.startsWith(u8, raw, "glint-ignore:")) {
         const rest = std.mem.trim(u8, raw[13..], " \t");
-        const separator = std.mem.find(u8, rest, " -- ") orelse return .{ .malformed = "a suppression is `// glint-ignore: <rule> -- <reason>`" };
-        const id = std.mem.trim(u8, rest[0..separator], " \t");
+        const named, const why = std.mem.cut(u8, rest, " -- ") orelse return .{ .malformed = "a suppression is `// glint-ignore: <rule> -- <reason>`" };
+        const id = std.mem.trim(u8, named, " \t");
         rule = rules.parseConfigured(id, definitions) orelse return .{ .malformed = "a suppression names a rule glint does not have" };
         // The pack has one escape, which says why the danger is absent: never a bare reason.
         if (rules.definition(rule.?, definitions).?.exception == .aegis) return .{ .malformed = "an aegis rule takes `// aegis: <reason>(<rule>, ...): <why>`, never glint-ignore" };
-        reason = std.mem.trim(u8, rest[separator + 4 ..], " \t");
+        reason = std.mem.trim(u8, why, " \t");
     } else return .none;
     if (reason.len == 0) return .{ .malformed = "a suppression or escape needs its written reason" };
     const before = std.mem.trim(u8, file.source[file.lines[comment.line]..comment.start], " \t\r");

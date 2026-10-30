@@ -284,7 +284,8 @@ fn physicalLocation(stream: *std.json.Stringify, project: *const Project, span: 
     try stream.objectField("region");
     // Byte offsets stay precise for non-ASCII and invalid UTF-8 source. A byte
     // column is not mislabeled as SARIF's default UTF-16 column.
-    try stream.write(.{ .startLine = span.line, .byteOffset = span.start, .byteLength = span.end - span.start });
+    const length = if (span.end > span.start) span.end - span.start else 0;
+    try stream.write(.{ .startLine = span.line, .byteOffset = span.start, .byteLength = length });
     try stream.endObject();
 }
 

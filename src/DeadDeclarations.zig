@@ -18,7 +18,17 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
 
-const Candidate = struct { decl: Model.Declaration.Id, first: Ast.TokenIndex, last: Ast.TokenIndex, used: bool = false };
+const Candidate = struct {
+    decl: Model.Declaration.Id,
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+    used: bool = false,
+
+    /// A candidate of one check, made only as it is appended.
+    const Id = enum(u32) { _ };
+};
+/// The candidates by their name.
+const ByName = std.StringHashMapUnmanaged(std.ArrayList(Candidate.Id));
 
 pub fn check(context: *Context) Context.Error!void {
     if (!context.config.has(.D001)) return;
@@ -27,7 +37,7 @@ pub fn check(context: *Context) Context.Error!void {
     const tree = &source.file.tree;
     const a = context.allocator;
     var candidates: std.ArrayList(Candidate) = .empty;
-    var by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+    var by_name: ByName = .empty;
     const declared = try a.alloc(bool, tree.tokens.len);
     @memset(declared, false);
     for (model.declarations, 0..) |decl, d| {
@@ -44,8 +54,8 @@ pub fn check(context: *Context) Context.Error!void {
         }
         const entry = try by_name.getOrPut(a, decl.name);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(a, @intCast(candidates.items.len));
         try candidates.append(a, .{ .decl = @fromBackingInt(@intCast(d)), .first = tree.firstToken(whole), .last = tree.lastToken(whole) });
+        try entry.value_ptr.append(a, @fromBackingInt(@intCast(candidates.items.len - 1)));
     }
     if (candidates.items.len == 0) return;
     const resolved = try a.alloc(?Model.Declaration.Id, tree.tokens.len);
@@ -58,7 +68,7 @@ pub fn check(context: *Context) Context.Error!void {
         if (tree.tokenTag(token) != .identifier or declared[token] or fieldName(tree, token)) continue;
         if (resolved[token]) |d| {
             if (find(candidates.items, by_name, model.declarations[@backingInt(d)].name, d)) |c| {
-                use(&candidates.items[c], token);
+                use(&candidates.items[@backingInt(c)], token);
                 continue;
             }
         }
@@ -110,9 +120,9 @@ fn fieldName(tree: *const Ast, token: Ast.TokenIndex) bool {
     };
 }
 
-fn find(candidates: []const Candidate, by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)), name: []const u8, decl: Model.Declaration.Id) ?u32 {
+fn find(candidates: []const Candidate, by_name: ByName, name: []const u8, decl: Model.Declaration.Id) ?Candidate.Id {
     const list = by_name.get(name) orelse return null;
-    for (list.items) |c| if (candidates[c].decl == decl) return c;
+    for (list.items) |c| if (candidates[@backingInt(c)].decl == decl) return c;
     return null;
 }
 
@@ -120,9 +130,9 @@ fn use(candidate: *Candidate, token: Ast.TokenIndex) void {
     if (token < candidate.first or token > candidate.last) candidate.used = true;
 }
 
-fn spelled(candidates: []Candidate, by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)), name: []const u8, token: Ast.TokenIndex) void {
+fn spelled(candidates: []Candidate, by_name: ByName, name: []const u8, token: Ast.TokenIndex) void {
     const list = by_name.get(name) orelse return;
-    for (list.items) |c| use(&candidates[c], token);
+    for (list.items) |c| use(&candidates[@backingInt(c)], token);
 }
 
 /// A computed `@field` name reaches every declaration of its receiver's container. False when

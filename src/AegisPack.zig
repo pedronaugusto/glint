@@ -172,7 +172,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
     const model = &c.project.at(container.file).model;
     const own = &c.project.at(container.file).file.tree;
     for (literal.ast.fields) |value| {
-        const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2));
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, value) orelse continue));
         const field = c.facts.member(container, name) orelse return false;
         if (model.declarations[@backingInt(field.index)].kind != .field) return false;
     }
@@ -180,7 +180,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
         if (decl.kind != .field or decl.scope != container.scope) continue;
         if (own.fullContainerField(decl.node).?.ast.value_expr != .none) continue;
         for (literal.ast.fields) |value| {
-            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2)), decl.name)) break;
+            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, value) orelse continue)), decl.name)) break;
         } else return false;
     }
     return true;
@@ -324,7 +324,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
         any = true;
         if (literal) |value| {
             const lacks = for (value.ast.fields) |init| {
-                const label = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(init) - 2));
+                const label = try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, init) orelse continue));
                 const named = c.facts.member(container, label) orelse break true;
                 if (c.project.at(named.file).model.declarations[@backingInt(named.index)].kind != .field) break true;
             } else false;

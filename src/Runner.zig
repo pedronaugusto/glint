@@ -86,7 +86,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         for (malformed.items) |entry| {
             runner.complete = false;
             const start = entry.comment.start;
-            try runner.malformed.append(a, .{ .why = entry.why, .span = .{ .file = runner.file, .start = start, .end = entry.comment.end, .line = entry.comment.line + 1, .column = start - file.lines[entry.comment.line] + 1 } });
+            try runner.malformed.append(a, .{ .why = entry.why, .span = .{ .file = runner.file, .start = start, .end = entry.comment.end, .line = entry.comment.line + 1, .column = file.column(start) } });
         }
         try runner.coverage.append(a, .{ .file = runner.file, .reason = switch (file.status) {
             .parsed => .parsed,
@@ -121,7 +121,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         // escape in the older form, every pack rule).
         for (runner.suppressions, 0..) |suppression, i| {
             const start = suppression.comment.start;
-            const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = start - file.lines[suppression.comment.line] + 1 };
+            const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
             if (suppression.escape) |reason| {
                 // An escape in the older form covers what any pack rule finds on its line, a
                 // finding added later too: it is read so the fix can name what it covers, and
@@ -177,7 +177,7 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     const file = &self.project.at(self.file).file;
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
-    const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = start - file.lines[line] + 1 };
+    const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = file.column(start) };
     // An escape in the older form names no rule it was judged for: what it covers is recorded
     // for the fix to name, and stays a finding, its fix held back, until its rules are named.
     var held = false;

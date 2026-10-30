@@ -10,12 +10,11 @@ project: *const Project,
 gpa: std.mem.Allocator,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
-/// The sets of comptime `bool` parameters' values that the paths read so far settle, each once:
-/// `settled.items[i]` is set `i + 1`; set 0 is the empty one.
-settled: std.ArrayList([]const Assumption) = .empty,
-/// The set in force: what the path to the node being read settles. A value is read as Zig
-/// analyses the node, in the instantiations where its path is taken.
-assumed: u32 = 0,
+/// The sets of comptime `bool` parameters' values that the paths read so far settle, each once.
+settled: std.ArrayList(Assumptions) = .empty,
+/// The set in force: what the path to the node being read settles; null for none. A value is
+/// read as Zig analyses the node, in the instantiations where its path is taken.
+assumed: ?Assumptions.Id = null,
 /// What each generic function copies of its parameters' values, found once (`parameterCopies`).
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
 /// The names those functions are declared under, for a quick look before a callee is resolved.
@@ -44,7 +43,14 @@ remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
-const Settled = struct { key: Key, assumed: u32 };
+const Settled = struct { key: Key, assumed: ?Assumptions.Id };
+/// A set of settled assumptions, held once in `settled`.
+const Assumptions = struct {
+    held: []const Assumption,
+
+    /// A set of `settled`, made only as it is appended or by counting them.
+    const Id = enum(u32) { _ };
+};
 /// A `comptime` parameter's value on a path: a `bool`'s inside `if (wrapped)`'s branches or
 /// after `if (wrapped) return ...;`, an enum's inside a `switch` prong naming one tag. Zig
 /// analyses a branch of a comptime-known condition only in the instantiations that take it, so
@@ -80,7 +86,7 @@ pub const Made = struct {
     file: Project.FileId,
     call: Ast.Node.Index,
     env: ?*const Env = null,
-    assumed: u32 = 0,
+    assumed: ?Assumptions.Id = null,
     /// For a type function that returns another's call (`Owned(T, f)` returning
     /// `Owner(T, false, f)`): the call that made the outer one, whose bindings this call's
     /// arguments are read with.
@@ -282,7 +288,8 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     if (self.project.at(file).file.status != .parsed) return .{ .unknown = .invalid_front_end };
     const key: Settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed };
     if (self.cache.get(key)) |value| return value;
-    if (self.remaining == 0 or self.active.count() >= 128) return .{ .unknown = .budget };
+    if (self.active.count() >= 128) return .{ .unknown = .budget };
+    if (self.remaining == 0) return .{ .unknown = .budget };
     self.remaining -= 1;
     if (self.active.contains(key)) return .{ .unknown = .cycle };
     try self.active.put(self.gpa, key, {});
@@ -297,41 +304,41 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
 
 /// The set of assumptions in force at `node`: `outer` and what the path to `node` settles. A
 /// path `outer` contradicts is not taken where `outer` holds; it keeps `outer`.
-fn settle(self: *Facts, file: Project.FileId, node: Ast.Node.Index, outer: u32) ResolveError!u32 {
+fn settle(self: *Facts, file: Project.FileId, node: Ast.Node.Index, outer: ?Assumptions.Id) ResolveError!?Assumptions.Id {
     if (!try self.hasConditions(file)) return outer;
     var found: std.ArrayList(Assumption) = .empty;
     try found.appendSlice(self.gpa, self.assumptions(outer));
     const before = found.items.len;
     if (!try self.pathFacts(file, node, &found)) return outer;
     if (found.items.len == before) return outer;
-    return self.intern(found.items);
+    return try self.intern(found.items);
 }
 
 /// Whether the path to `node` contradicts the assumptions in force: code an instantiation
 /// that settles them does not analyse.
 fn dead(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    if (self.assumed == 0 or !try self.hasConditions(file)) return false;
+    if (self.assumed == null or !try self.hasConditions(file)) return false;
     var found: std.ArrayList(Assumption) = .empty;
     try found.appendSlice(self.gpa, self.assumptions(self.assumed));
     return !try self.pathFacts(file, node, &found);
 }
 
-fn assumptions(self: *const Facts, set: u32) []const Assumption {
-    return if (set == 0) &.{} else self.settled.items[set - 1];
+fn assumptions(self: *const Facts, set: ?Assumptions.Id) []const Assumption {
+    return if (set) |id| self.settled.items[@backingInt(id)].held else &.{};
 }
 
-/// The index of the set holding exactly `items`, added if new.
-fn intern(self: *Facts, items: []const Assumption) ResolveError!u32 {
-    for (self.settled.items, 1..) |set, index| {
-        if (set.len != items.len) continue;
+/// The set holding exactly `items`, added if new.
+fn intern(self: *Facts, items: []const Assumption) ResolveError!Assumptions.Id {
+    for (self.settled.items, 0..) |set, index| {
+        if (set.held.len != items.len) continue;
         for (items) |item| {
-            for (set) |held| {
+            for (set.held) |held| {
                 if (held.eql(item)) break;
             } else break;
-        } else return @intCast(index);
+        } else return @fromBackingInt(@intCast(index));
     }
-    try self.settled.append(self.gpa, try self.gpa.dupe(Assumption, items));
-    return @intCast(self.settled.items.len);
+    try self.settled.append(self.gpa, .{ .held = try self.gpa.dupe(Assumption, items) });
+    return @fromBackingInt(@intCast(self.settled.items.len - 1));
 }
 
 /// Adds to `found` what the path from the file's root to `node` settles: the branch of each
@@ -340,19 +347,19 @@ fn intern(self: *Facts, items: []const Assumption) ResolveError!u32 {
 /// the block runs only where `c` is false). False when the path contradicts `found`.
 fn pathFacts(self: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *std.ArrayList(Assumption)) ResolveError!bool {
     const tree = &self.project.at(file).file.tree;
-    const parents = self.project.at(file).model.node_parents;
-    if (parents.len == 0) return true;
+    const model = &self.project.at(file).model;
+    if (model.node_parents.len == 0) return true;
     var child = node;
-    var up = parents[@backingInt(node)]; // safe: a node index indexes its own tree's parent table.
+    var up = model.parentOf(node);
     while (up) |parent| : ({
         child = parent;
-        up = parents[@backingInt(parent)]; // safe: a node index indexes its own tree's parent table.
+        up = model.parentOf(parent);
     }) {
         if (tree.fullIf(parent)) |whole| if (whole.payload_token == null and whole.error_token == null) {
             if (child == whole.ast.then_expr and !try self.holds(file, whole.ast.cond_expr, true, found)) return false;
             if (whole.ast.else_expr.unwrap() == child and !try self.holds(file, whole.ast.cond_expr, false, found)) return false;
         };
-        if (tree.fullSwitchCase(parent)) |case| if (case.ast.target_expr == child) if (parents[@backingInt(parent)]) |at| if (tree.fullSwitch(at)) |whole| { // safe: a node index indexes its own tree's parent table.
+        if (tree.fullSwitchCase(parent)) |case| if (case.ast.target_expr == child) if (model.parentOf(parent)) |at| if (tree.fullSwitch(at)) |whole| {
             if (self.switchParameter(file, whole.ast.condition)) |parameter| if (!try self.prong(tree, whole, case, parameter, found)) return false;
         };
         var buffer: [2]Ast.Node.Index = undefined;
@@ -422,9 +429,9 @@ fn namesTag(tree: *const Ast, item: Ast.Node.Index, tag: []const u8) bool {
 pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     if (!try self.hasConditions(file)) return false;
     const tree = &self.project.at(file).file.tree;
-    const parents = self.project.at(file).model.node_parents;
-    var up = parents[@backingInt(node)]; // safe: a node index indexes its own tree's parent table.
-    const function = while (up) |parent| : (up = parents[@backingInt(parent)]) { // safe: a node index indexes its own tree's parent table.
+    const model = &self.project.at(file).model;
+    var up = model.parentOf(node);
+    const function = while (up) |parent| : (up = model.parentOf(parent)) {
         if (tree.nodeTag(parent) == .fn_decl) break parent;
     } else return false;
     const first = tree.firstToken(function);
@@ -784,7 +791,7 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
         if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
         for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
         const next = try self.gpa.create(Env);
-        next.* = .{ .function = target, .args = inner_args.items, .depth = env.depth + 1 };
+        next.* = .{ .function = target, .args = inner_args.items, .depth = env.depth +| 1 };
         env = next;
     }
     return self.resolveIn(env, source.file, source.node);
@@ -1343,7 +1350,7 @@ fn literalField(self: *Facts, literal: Key, name: []const u8) ResolveError!Value
     var buffer: [2]Ast.Node.Index = undefined;
     const full = tree.fullStructInit(&buffer, literal.node) orelse return .{ .unknown = .unsupported };
     for (full.ast.fields) |field| {
-        const label = try self.memberName(tree.tokenSlice(tree.firstToken(field) - 2));
+        const label = try self.memberName(tree.tokenSlice(Model.initName(tree, field) orelse continue));
         if (std.mem.eql(u8, label, name)) return self.resolve(literal.file, field);
     }
     return .{ .unknown = .unresolved };
@@ -1434,7 +1441,7 @@ fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: D
     const generic: Generic = .{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver };
     const result = (try self.written(generic, result_node, 0)) orelse return null;
     // `!T`: an error union whose error set the body infers.
-    if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(result) };
+    if (Model.inferredErrors(target_tree, result_node)) return .{ .error_union = try self.boxed(result) };
     return result;
 }
 
@@ -1514,7 +1521,7 @@ fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Dec
     var result = try self.substituted(decl.file, result_node, made);
     if (result == .unknown) return null;
     result = try self.madeWithin(result, container, made);
-    if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(try self.instance(result)) };
+    if (Model.inferredErrors(target_tree, result_node)) return .{ .error_union = try self.boxed(try self.instance(result)) };
     return try self.instance(result);
 }
 
@@ -1569,7 +1576,7 @@ fn forwarded(self: *Facts, function: Decl) ResolveError!?struct { function: Decl
     const tree = &self.project.at(function.file).file.tree;
     const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
     if (record.kind != .function) return null;
-    const returned = finalReturn(tree, self.project.at(function.file).model.node_parents, record) orelse return null;
+    const returned = finalReturn(tree, &self.project.at(function.file).model, record) orelse return null;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, returned) orelse return null;
     const callee = (try self.definition(function.file, call.ast.fn_expr)) orelse return null;
@@ -1603,7 +1610,7 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
     const env = try self.gpa.create(Env);
-    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth + 1 else 0, .truths = truths };
+    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths };
     return env;
 }
 
@@ -1629,7 +1636,7 @@ fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
         const function = target_tree.fullFnProto(&fn_buffer, declaration_record.node).?;
         const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
         // `!T`: an error union whose error set the body infers.
-        if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) {
+        if (Model.inferredErrors(target_tree, result_node)) {
             const payload_value = try self.resolve(decl.file, result_node);
             if (payload_value == .unknown) return payload_value;
             return .{ .error_union = try self.boxed(try self.instance(payload_value)) };
@@ -1795,7 +1802,7 @@ fn breaks(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
 /// one encloses it.
 fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.at(file).file.tree;
-    const parents = self.project.at(file).model.node_parents;
+    const model = &self.project.at(file).model;
     const body: Ast.Node.Index, const otherwise: Ast.Node.Index, const label: ?[]const u8 = if (tree.fullFor(node)) |loop|
         .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
     else if (tree.fullWhile(node)) |loop|
@@ -1816,8 +1823,8 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
             if (label == null or !std.mem.eql(u8, tree.tokenSlice(token), label.?)) continue;
         } else {
             // The innermost loop around the break, short of this one, takes it.
-            var up = parents[@backingInt(jump)]; // safe: a node index indexes its own tree's parent table.
-            const inner = while (up) |p| : (up = parents[@backingInt(p)]) { // safe: a node index indexes its own tree's parent table.
+            var up = model.parentOf(jump);
+            const inner = while (up) |p| : (up = model.parentOf(p)) {
                 if (p == node) break false;
                 if (tree.fullFor(p) != null or tree.fullWhile(p) != null) break true;
             } else true;
@@ -2473,7 +2480,7 @@ fn resultOf(self: *Facts, proto: Key) ResolveError!Value {
     const result_node = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
     const result = try self.resolve(proto.file, result_node);
     if (result == .unknown) return result;
-    if (target_tree.tokenTag(target_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(result) };
+    if (Model.inferredErrors(target_tree, result_node)) return .{ .error_union = try self.boxed(result) };
     return result;
 }
 
@@ -2494,7 +2501,7 @@ fn isGeneric(tree: *const Ast, function: Ast.full.FnProto) bool {
 /// written in terms of its parameters. Null when that reading gives nothing known, for the
 /// caller's other means.
 fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
-    const depth = if (env) |e| e.depth + 1 else 0;
+    const depth = if (env) |e| e.depth +| 1 else 0;
     if (depth == 8) return null;
     const target_tree = &self.project.at(decl.file).file.tree;
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
@@ -2528,7 +2535,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     bound.* = .{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items };
     const result_tree = target_tree;
     if (returns_type) {
-        const returned = finalReturn(result_tree, self.project.at(decl.file).model.node_parents, record) orelse return null;
+        const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return null;
         // A container is the template's, which the call makes: read by the existing means.
         var container_buffer: [2]Ast.Node.Index = undefined;
         if (result_tree.fullContainerDecl(&container_buffer, returned) != null) return null;
@@ -2537,7 +2544,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     }
     const value = try self.resolveIn(bound, decl.file, result_node);
     if (value == .unknown) return null;
-    if (result_tree.tokenTag(result_tree.firstToken(result_node) - 1) == .bang) return .{ .error_union = try self.boxed(try self.valueOf(value)) };
+    if (Model.inferredErrors(result_tree, result_node)) return .{ .error_union = try self.boxed(try self.valueOf(value)) };
     return try self.valueOf(value);
 }
 
@@ -2590,9 +2597,9 @@ fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Nod
 }
 
 /// The operand of a function body's one `return`, its final statement.
-fn finalReturn(tree: *const Ast, parents: []const ?Ast.Node.Index, record: Model.Declaration) ?Ast.Node.Index {
+fn finalReturn(tree: *const Ast, model: *const Model, record: Model.Declaration) ?Ast.Node.Index {
     var fn_node = record.node;
-    if (tree.nodeTag(fn_node) != .fn_decl) fn_node = parents[@backingInt(fn_node)] orelse return null; // safe: a node index indexes its own tree's parent table.
+    if (tree.nodeTag(fn_node) != .fn_decl) fn_node = model.parentOf(fn_node) orelse return null;
     if (tree.nodeTag(fn_node) != .fn_decl) return null;
     const body = tree.nodeData(fn_node).node_and_node[1];
     var body_buffer: [2]Ast.Node.Index = undefined;
@@ -3191,7 +3198,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     if (tree.fullStructInit(&parent_buffer, parent) != null) {
         const whole = try self.placeType(file, parent, depth + 1);
         if (whole == .unknown or whole == .scalar) return whole;
-        const name = try self.memberName(tree.tokenSlice(tree.firstToken(node) - 2));
+        const name = try self.memberName(tree.tokenSlice(Model.initName(tree, node) orelse return .{ .unknown = .unsupported }));
         // A literal coerces through an optional or an error union; `&.{}` gives a pointer to one.
         var holder = whole;
         while (true) holder = switch (holder) {
@@ -3283,7 +3290,7 @@ fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, positi
     var it = function.iterate(target_tree);
     var at: usize = 0;
     while (it.next()) |param| : (at += 1) {
-        if (at != position + receiver) continue;
+        if (at < receiver or at - receiver != position) continue;
         const type_expr = param.type_expr orelse return .scalar;
         if (made) |m| return self.substituted(decl.file, type_expr, m);
         // Written in terms of a `comptime T: type` parameter: the call's argument for it.

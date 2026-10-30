@@ -106,7 +106,7 @@ fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Con
                 if (tree.nodeTag(named) == .address_of) named = tree.nodeData(named).node;
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.lastToken(named)), decl.name)) continue;
                 if (tree.firstToken(value) < 2) continue;
-                const slot = c.facts.member(vtable, tree.tokenSlice(tree.firstToken(value) - 2)) orelse continue;
+                const slot = c.facts.member(vtable, tree.tokenSlice(Model.initName(tree, value) orelse continue)) orelse continue;
                 if (c.project.at(slot.file).model.declarations[@backingInt(slot.index)].kind != .field) continue;
                 switch (try c.facts.resolve(file, named)) {
                     .function => |d| if (d.file == c.file and d.index == index) return true,
@@ -190,7 +190,7 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, node: Ast.Node.Index
                 const made = byValue(try c.facts.literalType(c.file, node)) orelse return false;
                 if (find(resources, made) == null) return false;
                 for (literal.ast.fields) |value| {
-                    if (tree.firstToken(value) < 2 or !std.mem.eql(u8, tree.tokenSlice(tree.firstToken(value) - 2), "handle")) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(Model.initName(tree, value) orelse continue), "handle")) continue;
                     return viewed(c, resources, value, next);
                 }
                 return false;
@@ -386,8 +386,10 @@ fn identifies(name: []const u8) bool {
     for ([_][]const u8{ "id", "index", "handle", "idx" }) |word| {
         if (std.ascii.eqlIgnoreCase(name, word)) return true;
         if (name.len <= word.len) continue;
+        const head = name[0 .. name.len - word.len];
         const tail = name[name.len - word.len ..];
-        const before = name[name.len - word.len - 1];
+        if (head.len == 0) continue;
+        const before = head[head.len - 1];
         if (before == '_' and std.mem.eql(u8, tail, word)) return true;
         // camelCase: the word starts upper case after a lower-case letter or digit.
         if (std.ascii.isUpper(tail[0]) and std.ascii.eqlIgnoreCase(tail, word) and std.mem.eql(u8, tail[1..], word[1..]) and (std.ascii.isLower(before) or std.ascii.isDigit(before))) return true;

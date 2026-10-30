@@ -6,6 +6,7 @@
 //! covers nothing goes. No fix writes an escape a site did not already have:
 //! a reason is the author's to state. A site whose answer is a design choice carries no fix.
 const std = @import("std");
+const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const File = @import("File.zig");
 const Report = @import("Report.zig");
@@ -55,37 +56,32 @@ pub fn escapeRecord(a: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory,
 
 /// One record line after its `escape: `: `path:line:column: reason: why (rules)`.
 fn escapeLine(a: std.mem.Allocator, rest: []const u8) error{ OutOfMemory, InvalidEscapeRecord }!Escaped {
-    const path_end = std.mem.findScalar(u8, rest, ':') orelse return error.InvalidEscapeRecord;
-    if (path_end == 0) return error.InvalidEscapeRecord;
-    const line_end = std.mem.findScalarPos(u8, rest, path_end + 1, ':') orelse return error.InvalidEscapeRecord;
-    const column_end = std.mem.findScalarPos(u8, rest, line_end + 1, ':') orelse return error.InvalidEscapeRecord;
-    const line = position(rest[path_end + 1 .. line_end]) orelse return error.InvalidEscapeRecord;
-    const column = position(rest[line_end + 1 .. column_end]) orelse return error.InvalidEscapeRecord;
-    if (!std.mem.startsWith(u8, rest[column_end..], ": ")) return error.InvalidEscapeRecord;
-    const text = rest[column_end + 2 ..];
-    const reason_end = std.mem.find(u8, text, ": ") orelse return error.InvalidEscapeRecord;
-    const reason = text[0..reason_end];
+    const path, const after_path = std.mem.cutScalar(u8, rest, ':') orelse return error.InvalidEscapeRecord;
+    if (path.len == 0) return error.InvalidEscapeRecord;
+    const line_digits, const after_line = std.mem.cutScalar(u8, after_path, ':') orelse return error.InvalidEscapeRecord;
+    const column_digits, const after_column = std.mem.cutScalar(u8, after_line, ':') orelse return error.InvalidEscapeRecord;
+    const line = position(line_digits) orelse return error.InvalidEscapeRecord;
+    const column = position(column_digits) orelse return error.InvalidEscapeRecord;
+    const text = std.mem.cutPrefix(u8, after_column, " ") orelse return error.InvalidEscapeRecord;
+    const reason, const after_reason = std.mem.cut(u8, text, ": ") orelse return error.InvalidEscapeRecord;
     if (reason.len == 0 or std.mem.findAny(u8, reason, " ()") != null) return error.InvalidEscapeRecord;
-    if (text.len == 0 or text[text.len - 1] != ')') return error.InvalidEscapeRecord;
-    const open = std.mem.findLast(u8, text, " (") orelse return error.InvalidEscapeRecord;
-    if (open < reason_end + 2) return error.InvalidEscapeRecord;
+    const listed_whole = std.mem.cutSuffix(u8, after_reason, ")") orelse return error.InvalidEscapeRecord;
+    const why, const listed = std.mem.cutLast(u8, listed_whole, " (") orelse return error.InvalidEscapeRecord;
     var rules: std.ArrayList([]const u8) = .empty;
-    var entries = std.mem.splitSequence(u8, text[open + 2 .. text.len - 1], ", ");
+    var entries = std.mem.splitSequence(u8, listed, ", ");
     while (entries.next()) |entry| {
         // A rule's name, its place after it where glint's own report gives one (`A010 at 4:18`).
-        const name_end = std.mem.findScalar(u8, entry, ' ') orelse entry.len;
-        const name = entry[0..name_end];
+        const name, const place = std.mem.cutScalar(u8, entry, ' ') orelse .{ entry, null };
         if (name.len == 0 or !ruleName(name)) return error.InvalidEscapeRecord;
-        if (name_end != entry.len) {
-            const place = entry[name_end..];
-            if (!std.mem.startsWith(u8, place, " at ")) return error.InvalidEscapeRecord;
-            const colon = std.mem.findScalar(u8, place, ':') orelse return error.InvalidEscapeRecord;
-            _ = position(place[" at ".len..colon]) orelse return error.InvalidEscapeRecord;
-            _ = position(place[colon + 1 ..]) orelse return error.InvalidEscapeRecord;
+        if (place) |words| {
+            const at = std.mem.cutPrefix(u8, words, "at ") orelse return error.InvalidEscapeRecord;
+            const at_line, const at_column = std.mem.cutScalar(u8, at, ':') orelse return error.InvalidEscapeRecord;
+            _ = position(at_line) orelse return error.InvalidEscapeRecord;
+            _ = position(at_column) orelse return error.InvalidEscapeRecord;
         }
         try rules.append(a, name);
     }
-    return .{ .path = rest[0..path_end], .line = line, .column = column, .reason = reason, .why = text[reason_end + 2 .. open], .rules = rules.items };
+    return .{ .path = path, .line = line, .column = column, .reason = reason, .why = why, .rules = rules.items };
 }
 
 /// A line or column number: decimal digits alone.
@@ -104,7 +100,8 @@ fn ruleName(name: []const u8) bool {
 /// Each file a run's fixes change, with its bytes after them: every finding's fix and the
 /// removal of every escape that covered nothing. Overlapping edits keep the first; an edit two
 /// findings share is made once.
-pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) std.mem.Allocator.Error![]const Changed {
+/// An edit outside its file's bytes is no edit glint makes: `InvalidEdit`.
+pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Report, options: Options) error{ OutOfMemory, InvalidEdit }![]const Changed {
     var by_file: std.array_hash_map.Auto(Project.FileId, std.ArrayList(Report.Edit)) = .empty;
     for (report.diagnostics) |d| {
         if (d.fix.len == 0) continue;
@@ -117,7 +114,7 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         const file = &project.at(stale.span.file).file;
         const entry = try by_file.getOrPut(a, stale.span.file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end));
+        try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end) orelse return error.InvalidEdit);
     }
     for (report.malformed) |entry| {
         const file = &project.at(entry.span.file).file;
@@ -137,12 +134,14 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
         for (edits.items) |e| {
             if (last) |l| if (!e.nests and l.start == e.start and l.end == e.end and std.mem.eql(u8, l.text, e.text)) continue;
             if (e.start < at) continue;
+            if (e.start > e.end or e.start > source.len or e.end > source.len) return error.InvalidEdit;
             try bytes.appendSlice(a, source[at..e.start]);
             try bytes.appendSlice(a, e.text);
             at = e.end;
             last = e;
             made += 1;
         }
+        if (at > source.len) return error.InvalidEdit;
         try bytes.appendSlice(a, source[at..]);
         try out.append(a, .{ .file = file, .bytes = bytes.items, .edits = made });
     }
@@ -153,18 +152,23 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
 /// category becomes the escape's reason (`measured-boundary` is `hot-loop`,
 /// `safe-type-internals` `internal`, `c-os-boundary` `boundary`), its words kept.
 fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32) std.mem.Allocator.Error!?Report.Edit {
-    const text = file.source[start..end];
-    const prefix = "// glint-ignore: A0";
-    if (!std.mem.startsWith(u8, text, prefix)) return null;
-    const separator = std.mem.find(u8, text, " -- ") orelse return null;
-    const rest = text[separator + 4 ..];
-    const colon = std.mem.findScalar(u8, rest, ':') orelse return null;
+    const text = spanned(file, start, end) orelse return null;
+    const after = std.mem.cutPrefix(u8, text, "// glint-ignore: ") orelse return null;
+    if (!std.mem.startsWith(u8, after, "A0")) return null;
+    const named, const rest = std.mem.cut(u8, after, " -- ") orelse return null;
+    const category_name, const why = std.mem.cutScalar(u8, rest, ':') orelse return null;
     const categories = [_][2][]const u8{ .{ "no-danger", "no-danger" }, .{ "design", "design" }, .{ "measured-boundary", "hot-loop" }, .{ "safe-type-internals", "internal" }, .{ "c-os-boundary", "boundary" } };
-    const rule = std.mem.trim(u8, text["// glint-ignore: ".len..separator], " ");
-    for (categories) |category| if (std.mem.eql(u8, std.mem.trim(u8, rest[0..colon], " "), category[0])) {
-        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}({s}):{s}", .{ category[1], rule, rest[colon + 1 ..] }) };
+    const rule = std.mem.trim(u8, named, " ");
+    for (categories) |category| if (std.mem.eql(u8, std.mem.trim(u8, category_name, " "), category[0])) {
+        return .{ .start = start, .end = end, .text = try a.print("// aegis: {s}({s}):{s}", .{ category[1], rule, why }) };
     };
     return null;
+}
+
+/// A span's bytes of `file`; null for a span outside them.
+fn spanned(file: *const File, start: u32, end: u32) ?[]const u8 {
+    if (start > end or end > file.source.len) return null;
+    return file.source[start..end];
 }
 
 /// The rules an escape in the older form (`// aegis: <reason>: <why>`) covers, written into it
@@ -175,7 +179,7 @@ fn oldSuppression(a: std.mem.Allocator, file: *const File, start: u32, end: u32)
 /// stale escape instead.
 fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
     const file = &project.at(span.file).file;
-    const text = file.source[span.start..span.end];
+    const text = spanned(file, span.start, span.end) orelse return null;
     if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
     for (report.escapes) |escape| {
         if (escape.span.file != span.file or escape.span.start != span.start) continue;
@@ -218,15 +222,19 @@ fn earlier(_: void, x: Report.Edit, y: Report.Edit) bool {
 
 /// The edit that removes a comment: its whole line when it stands alone, else the comment and
 /// the spaces before it.
-fn removal(file: *const File, start: u32, end: u32) Report.Edit {
+fn removal(file: *const File, start: u32, end: u32) ?Report.Edit {
+    const source = file.source;
+    if (start > end or start > source.len or end > source.len) return null;
     const line = file.line(start);
     const line_start = file.lines[line];
-    const line_end: u32 = if (std.mem.findScalarPos(u8, file.source, end, '\n')) |newline| @intCast(newline + 1) else @intCast(file.source.len);
-    if (std.mem.trim(u8, file.source[line_start..start], " \t").len == 0 and std.mem.trim(u8, file.source[end..line_end], " \t\r\n").len == 0) {
+    const whole = aegis.int.cast(u32, source.len) catch return null;
+    const line_end = if (line + 1 < file.lines.len) file.lines[line + 1] else whole;
+    if (line_start > start or line_end < end or line_end > source.len) return null;
+    if (std.mem.trim(u8, source[line_start..start], " \t").len == 0 and std.mem.trim(u8, source[end..line_end], " \t\r\n").len == 0) {
         return .{ .start = line_start, .end = line_end, .text = "" };
     }
     var from = start;
-    while (from > line_start and (file.source[from - 1] == ' ' or file.source[from - 1] == '\t')) from -= 1;
+    while (from > line_start and from <= source.len and (source[from - 1] == ' ' or source[from - 1] == '\t')) from -= 1;
     return .{ .start = from, .end = end, .text = "" };
 }
 
@@ -236,6 +244,6 @@ test "the pack's old suppression becomes the escape naming its rule, an unused e
     const a = file.arena.allocator();
     const old = (try oldSuppression(a, &file, file.comments[0].start, file.comments[0].end)).?;
     try std.testing.expectEqualStrings("// aegis: design(A010): one byte", old.text);
-    const gone = removal(&file, file.comments[1].start, file.comments[1].end);
+    const gone = removal(&file, file.comments[1].start, file.comments[1].end).?;
     try std.testing.expectEqualStrings(" // aegis: no-danger(A009): stale", file.source[gone.start..gone.end]);
 }

@@ -157,7 +157,9 @@ pub const Config = struct {
     /// Whether a rule was selected.
     pub fn has(self: Config, rule: Rule) bool {
         for (self.selections) |selection| if (selection.rule == rule) return selection.level != .off;
-        return @backingInt(rule) < self.enabled.len and self.enabled[@backingInt(rule)]; // safe: enum identities index their owning frozen tables without narrowing.
+        const index = @backingInt(rule);
+        if (index >= self.enabled.len) return false;
+        return self.enabled[index];
     }
 };
 

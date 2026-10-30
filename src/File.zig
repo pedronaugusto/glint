@@ -10,6 +10,8 @@ zir: ?std.zig.Zir,
 status: Status,
 comments: []const Comment,
 lines: []const u32,
+/// The source's length: every position in it is at most this.
+end: u32,
 
 pub const Status = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted };
 pub const Limits = struct {
@@ -45,12 +47,12 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
         if (zir.?.hasCompileErrors()) status = .invalid_lowering;
         if (zir.?.instructions.len > limits.instructions) status = .budget_exhausted;
     }
-    return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = front.lines, .comments = front.comments };
+    return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = front.lines, .comments = front.comments, .end = front.end };
 }
 
 /// What a file's bytes are once read as Zig, and the input boundary of all glint builds from
 /// them: the tree, each line's start and each comment's span.
-const Front = struct { tree: std.zig.Ast, lines: []const u32, comments: []const Comment };
+const Front = struct { tree: std.zig.Ast, lines: []const u32, comments: []const Comment, end: u32 };
 const Reading = struct { a: std.mem.Allocator, limits: Limits };
 
 /// The check is std's Zig parser, behind the lexical budget that keeps its work bounded: every
@@ -66,7 +68,8 @@ fn parseZig(reading: Reading, source: [:0]const u8) InitError!Front {
         try lines.append(reading.a, @intCast(offset + 1));
     };
     const comments = try scanComments(reading.a, source, lines.items);
-    return .{ .tree = tree, .lines = try lines.toOwnedSlice(reading.a), .comments = comments };
+    const end = aegis.int.cast(u32, source.len) catch return error.SourceTooLarge;
+    return .{ .tree = tree, .lines = try lines.toOwnedSlice(reading.a), .comments = comments, .end = end };
 }
 
 // std's char-literal lowering assumes a complete UTF8 sequence. Check its
@@ -113,6 +116,32 @@ fn sourceComplexity(source: [:0]const u8, limits: Limits) InitError!void {
 pub fn deinit(self: *File) void {
     self.arena.deinit();
     self.* = undefined;
+}
+
+/// Where line `l` ends: the next line's start, past its newline, or the source's end.
+pub fn lineEnd(self: *const File, l: usize) u32 {
+    const next = l +| 1;
+    return if (next < self.lines.len) self.lines[next] else self.end;
+}
+
+/// Line `l`: where it starts, and its bytes, its newline and a carriage return before it left
+/// out. Empty past the last line.
+pub fn lineBytes(self: *const File, l: usize) struct { start: u32, text: []const u8 } {
+    if (l >= self.lines.len) return .{ .start = self.end, .text = "" };
+    const start = self.lines[l];
+    const end = self.lineEnd(l);
+    if (start > end or end > self.source.len) return .{ .start = start, .text = "" };
+    const whole = self.source[start..end];
+    const bare = std.mem.cutSuffix(u8, whole, "\n") orelse whole;
+    return .{ .start = start, .text = std.mem.cutSuffix(u8, bare, "\r") orelse bare };
+}
+
+/// The 1-based column of `offset` on its line.
+pub fn column(self: *const File, offset: u32) u32 {
+    const l = self.line(offset);
+    if (l >= self.lines.len) return 1;
+    const start = self.lines[l];
+    return if (offset < start) 1 else (offset - start) +| 1;
 }
 
 pub fn line(self: *const File, offset: u32) u32 {

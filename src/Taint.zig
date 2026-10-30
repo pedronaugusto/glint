@@ -121,6 +121,9 @@ const Function = struct {
         for (f.params, 0..) |param, i| if (param == d) return i;
         return null;
     }
+
+    /// A function of the flow, made only as it is appended or by counting them.
+    const Id = enum(u32) { _ };
 };
 
 pub const Flow = struct {
@@ -128,8 +131,8 @@ pub const Flow = struct {
     fact: Fact = .input,
     functions: std.ArrayList(Function) = .empty,
     /// Per file, each node's nearest enclosing function, by its index in `functions`.
-    owners: std.AutoHashMapUnmanaged(Project.FileId, []const ?u32) = .empty,
-    by_node: std.AutoHashMapUnmanaged(Facts.Key, u32) = .empty,
+    owners: std.AutoHashMapUnmanaged(Project.FileId, []const ?Function.Id) = .empty,
+    by_node: std.AutoHashMapUnmanaged(Facts.Key, Function.Id) = .empty,
     locals: std.AutoHashMapUnmanaged(Facts.Decl, Dep) = .empty,
     /// Fields and container-level variables, by declaration.
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
@@ -181,7 +184,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         flow.changed = false;
-        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @intCast(i));
+        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @fromBackingInt(@intCast(i)));
         if (!flow.changed) break;
     }
 }
@@ -207,7 +210,7 @@ fn parsers(c: *Context, flow: *Flow) Context.Error!void {
             const call = tree.fullCall(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
             const callee = try resolveCall(c, flow, file, call);
             if (callee.kind != .aegis) continue;
-            if (try parserOf(c, flow, file, call, callee.decl.?)) |target| flow.functions.items[target].parser = true;
+            if (try parserOf(c, flow, file, call, callee.decl.?)) |target| flow.functions.items[@backingInt(target)].parser = true;
         }
     }
 }
@@ -268,7 +271,7 @@ fn reach(c: *Context, set: *std.AutoHashMapUnmanaged(u32, void), root: Project.F
 fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const owners = try c.allocator.alloc(?u32, tree.nodes.len);
+    const owners = try c.allocator.alloc(?Function.Id, tree.nodes.len);
     @memset(owners, null);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .fn_decl) continue;
@@ -295,8 +298,8 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
         }
         const levels = try c.allocator.alloc(Level, params.items.len);
         @memset(levels, .clean);
-        try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @intCast(flow.functions.items.len));
         try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .fixed = fixed });
+        try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @fromBackingInt(@intCast(flow.functions.items.len - 1)));
     }
     for (0..tree.nodes.len) |i| {
         var at: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -313,14 +316,15 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
 }
 
 /// The function whose body holds `node`, if the fact reads it.
-pub fn owner(flow: *const Flow, file: Project.FileId, node: Ast.Node.Index) ?u32 {
+fn owner(flow: *const Flow, file: Project.FileId, node: Ast.Node.Index) ?Function.Id {
     const owners = flow.owners.get(file) orelse return null;
-    return owners[@backingInt(node)]; // safe: a node index indexes its own tree's table.
+    const index = @backingInt(node);
+    return if (index < owners.len) owners[index] else null;
 }
 
 /// One round over a function's bindings: what each local, field, parameter and result takes.
-fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
-    const f = flow.functions.items[function];
+fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     const owners = flow.owners.get(f.file).?;
@@ -364,9 +368,9 @@ fn bindings(c: *Context, flow: *Flow, function: u32) Context.Error!void {
             },
             .@"return" => {
                 const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
-                const now = flow.functions.items[function].ret.join(try dep(c, flow, function, value));
-                if (!now.eql(flow.functions.items[function].ret)) {
-                    flow.functions.items[function].ret = now;
+                const now = flow.functions.items[@backingInt(function)].ret.join(try dep(c, flow, function, value));
+                if (!now.eql(flow.functions.items[@backingInt(function)].ret)) {
+                    flow.functions.items[@backingInt(function)].ret = now;
                     flow.changed = true;
                 }
                 if (f.parser) try unrefined(c, flow, function, value);
@@ -414,8 +418,8 @@ fn isMemcpy(tree: *const Ast, node: Ast.Node.Index) bool {
 /// What a capture binds: an `if`'s or `while`'s payload its condition, a `switch` prong's the
 /// switch's operand, a `for` capture its input (a range's counter is clean), a `catch`'s error
 /// nothing.
-fn captured(c: *Context, flow: *Flow, function: u32, decl: Model.Declaration) Context.Error!Dep {
-    const f = flow.functions.items[function];
+fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declaration) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     const node = decl.node;
@@ -462,8 +466,8 @@ fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level) Context
 /// A store of `value` into `target`: a local, a container-level variable or a field by its
 /// declaration, the local an element or part of it belongs to, or the memory a parameter
 /// points at (the function then fills it).
-fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value: Dep) Context.Error!void {
-    const f = flow.functions.items[function];
+fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index, value: Dep) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     switch (tree.nodeTag(target)) {
@@ -500,8 +504,8 @@ fn store(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index, value:
 
 /// What a parameter's root a store reaches: the parameter's index, when the target is rooted
 /// at one.
-fn rootParam(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index) ?usize {
-    const f = flow.functions.items[function];
+fn rootParam(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index) ?usize {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     var at = target;
@@ -521,19 +525,19 @@ fn rootParam(c: *Context, flow: *Flow, function: u32, target: Ast.Node.Index) ?u
 
 /// A call's effects beyond its result: what it gives the program's own callee's parameters,
 /// what a read fills, what a local receiver takes from what it is given.
-fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!void {
-    const f = flow.functions.items[function];
+fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
         .program => |target| {
-            const g = flow.functions.items[target];
+            const g = flow.functions.items[@backingInt(target)];
             for (callee.args.items, 0..) |arg, position| {
                 const index = position + callee.skip;
                 if (index >= g.levels.len) break;
                 if (g.fixed & bit(index) != 0) continue;
                 const level = concrete(flow, function, try dep(c, flow, function, arg));
                 if (level.join(g.levels[index]) != g.levels[index]) {
-                    flow.functions.items[target].levels[index] = level.join(g.levels[index]);
+                    flow.functions.items[@backingInt(target)].levels[index] = level.join(g.levels[index]);
                     flow.changed = true;
                 }
                 if (g.fills & bit(index) != 0) try fill(c, flow, function, arg);
@@ -565,14 +569,14 @@ fn effects(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context
 /// what it returns, the refined result, is clean.
 fn parsed(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!void {
     const target = (try parserOf(c, flow, file, call, decl)) orelse return;
-    const levels = flow.functions.items[target].levels;
+    const levels = flow.functions.items[@backingInt(target)].levels;
     if (levels.len < 2 or levels[1].join(.data) == levels[1]) return;
     levels[1] = levels[1].join(.data);
     flow.changed = true;
 }
 
 /// The program's function an `Untrusted.parse(context, parser)` call hands its value to.
-fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!?u32 {
+fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!?Function.Id {
     const origin = (try c.facts.origin(decl)) orelse decl;
     const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
     if (!std.mem.eql(u8, record.name, "parse") or call.ast.params.len == 0) return null;
@@ -630,10 +634,10 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!u64 {
 
 /// A read fills `arg`'s memory with the fact: the local it is rooted at, or the parameter's
 /// memory it points into (the function then fills that parameter for its callers).
-fn fill(c: *Context, flow: *Flow, function: u32, arg: Ast.Node.Index) Context.Error!void {
+fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!void {
     if (rootParam(c, flow, function, arg)) |index| {
-        if (flow.functions.items[function].fills & bit(index) == 0) {
-            flow.functions.items[function].fills |= bit(index);
+        if (flow.functions.items[@backingInt(function)].fills & bit(index) == 0) {
+            flow.functions.items[@backingInt(function)].fills |= bit(index);
             flow.changed = true;
         }
         return;
@@ -646,9 +650,9 @@ fn bit(index: usize) u64 {
 }
 
 /// A dependence read as a level, with what callers give the function's parameters.
-pub fn concrete(flow: *const Flow, function: u32, value: Dep) Level {
+fn concrete(flow: *const Flow, function: Function.Id, value: Dep) Level {
     var level = value.level;
-    const f = flow.functions.items[function];
+    const f = flow.functions.items[@backingInt(function)];
     for (f.levels, 0..) |given, index| {
         if (value.params & bit(index) != 0) level = level.join(given);
         if (value.numbers & bit(index) != 0 and given == .data) level = level.join(.number);
@@ -660,7 +664,7 @@ pub fn concrete(flow: *const Flow, function: u32, value: Dep) Level {
 
 const Callee = struct {
     /// `holder`: a method of an aegis owner or loan (`own.Owned`, `own.OwnedIo`, `own.Lent`).
-    kind: union(enum) { program: u32, source, outside, aegis, holder, none },
+    kind: union(enum) { program: Function.Id, source, outside, aegis, holder, none },
     /// The arguments in order, the receiver of a method call first.
     args: std.ArrayList(Ast.Node.Index) = .empty,
     receiver: ?Ast.Node.Index = null,
@@ -764,9 +768,9 @@ fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.
 
 /// Whether a read is from a reader std's `Reader.fixed` made over clean bytes (`fixedBytes`):
 /// such a read carries the bytes' fact, not input's.
-fn fixedClean(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!bool {
+fn fixedClean(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!bool {
     if (flow.fact != .input) return false;
-    const f = flow.functions.items[function];
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
     const bytes = (try fixedBytes(c, flow, f.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) orelse return false;
@@ -859,8 +863,8 @@ fn isLen(tree: *const Ast, node: Ast.Node.Index) bool {
 }
 
 /// What an expression holds, read in `function`.
-pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
-    const f = flow.functions.items[function];
+fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
     switch (tree.nodeTag(node)) {
@@ -976,8 +980,8 @@ pub fn dep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
 
 /// What a builtin's result holds: nothing for one the program fixes as it compiles (a size, a
 /// type, a name), what its operands hold for any other.
-fn builtinDep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
-    const tree = &c.project.at(flow.functions.items[function].file).file.tree;
+fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@errorName", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
     var buffer: [2]Ast.Node.Index = undefined;
@@ -1000,8 +1004,8 @@ fn builtinDep(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Con
 /// What any other expression holds: what its parts hold (`a ** n`, an `asm`'s inputs, a loop's
 /// value), but for one the program fixes as it compiles: a type, a declaration, a `comptime`
 /// block, a literal.
-fn composed(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
-    const f = flow.functions.items[function];
+fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     switch (tree.nodeTag(node)) {
         .@"comptime", .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi, .test_decl, .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .merge_error_sets, .anyframe_type, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => return .{},
@@ -1051,7 +1055,7 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
     const tree = &c.project.at(file).file.tree;
     const fields = try c.allocator.alloc(Facts.Decl, literal.ast.fields.len);
     for (literal.ast.fields, fields) |value, *field| {
-        const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(value) - 2));
+        const name = try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, value) orelse return null));
         const decl = c.facts.member(container, name) orelse return null;
         if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return null;
         field.* = decl;
@@ -1093,8 +1097,8 @@ fn shownField(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Fa
 /// A parser's return of a number it shows no range of, other than in a literal of its result
 /// type (whose fields are read one by one): what a parse given it gives is that number's
 /// input.
-fn unrefined(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Context.Error!void {
-    const f = flow.functions.items[function];
+fn unrefined(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.Index) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     // Each arm a branch returns is read as returned.
     if (tree.fullIf(value)) |branch| {
@@ -1138,19 +1142,19 @@ fn unrefined(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index) Con
 
 /// A parser's result holds `value`'s input as given: a number whose range it shows (`shown`)
 /// as data held to that range.
-fn unrefinedBy(c: *Context, flow: *Flow, function: u32, value: Ast.Node.Index, shown: bool) Context.Error!void {
+fn unrefinedBy(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.Index, shown: bool) Context.Error!void {
     var level = concrete(flow, function, try dep(c, flow, function, value));
     if (shown and level == .number) level = .data;
-    const now = flow.functions.items[function].unrefined.join(level);
-    if (now != flow.functions.items[function].unrefined) {
-        flow.functions.items[function].unrefined = now;
+    const now = flow.functions.items[@backingInt(function)].unrefined.join(level);
+    if (now != flow.functions.items[@backingInt(function)].unrefined) {
+        flow.functions.items[@backingInt(function)].unrefined = now;
         flow.changed = true;
     }
 }
 
 /// A labeled block's value: what its `break`s give it.
-fn labeled(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Context.Error!Dep {
-    const f = flow.functions.items[function];
+fn labeled(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const lbrace = tree.nodeMainToken(node);
     if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon) return .{};
@@ -1174,8 +1178,8 @@ fn labeled(c: *Context, flow: *Flow, function: u32, node: Ast.Node.Index) Contex
 /// A call's result: the program's callee's summary read with these arguments, a read's input,
 /// what a function outside the program makes of what it is given, aegis's answer clean, and
 /// unknown from a callee that does not resolve.
-fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.Error!Dep {
-    const f = flow.functions.items[function];
+fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
         // A parse gives what its parser returns refined, but for the values it showed no range
@@ -1183,7 +1187,7 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
         // checked sum or an id's `raw` holds the peer's choice as much as its operand did,
         // though the checks the conversion makes are aegis's.
         .aegis => {
-            if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| return .{ .level = flow.functions.items[target].unrefined };
+            if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| return .{ .level = flow.functions.items[@backingInt(target)].unrefined };
             var out: Dep = .{};
             for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
             return out;
@@ -1195,7 +1199,7 @@ fn result(c: *Context, flow: *Flow, function: u32, call: Ast.full.Call) Context.
             return out;
         },
         .program => |target| {
-            const g = flow.functions.items[target];
+            const g = flow.functions.items[@backingInt(target)];
             var out: Dep = .{ .level = g.ret.level };
             for (callee.args.items, 0..) |arg, position| {
                 const index = position + callee.skip;
@@ -1381,20 +1385,20 @@ pub fn sourceOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.I
 const Walk = struct {
     c: *Context,
     flow: *Flow,
-    seen: std.AutoHashMapUnmanaged(struct { u32, Ast.Node.Index }, void) = .empty,
+    seen: std.AutoHashMapUnmanaged(struct { Function.Id, Ast.Node.Index }, void) = .empty,
     steps: u32 = 0,
 
     const step_limit = 4000;
 
-    fn carries(w: *Walk, function: u32, node: Ast.Node.Index) Context.Error!bool {
+    fn carries(w: *Walk, function: Function.Id, node: Ast.Node.Index) Context.Error!bool {
         return concrete(w.flow, function, try dep(w.c, w.flow, function, node)) != .clean;
     }
 
-    fn from(w: *Walk, function: u32, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
+    fn from(w: *Walk, function: Function.Id, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
         if (depth > 48 or w.steps >= step_limit) return null;
         w.steps += 1;
         if ((try w.seen.getOrPut(w.c.allocator, .{ function, node })).found_existing) return null;
-        const f = w.flow.functions.items[function];
+        const f = w.flow.functions.items[@backingInt(function)];
         const tree = &w.c.project.at(f.file).file.tree;
         const model = &w.c.project.at(f.file).model;
         var call_buffer: [1]Ast.Node.Index = undefined;
@@ -1419,14 +1423,14 @@ const Walk = struct {
         return null;
     }
 
-    fn throughCall(w: *Walk, function: u32, node: Ast.Node.Index, at: Ast.full.Call, depth: u8) Context.Error!?Origin {
-        const f = w.flow.functions.items[function];
+    fn throughCall(w: *Walk, function: Function.Id, node: Ast.Node.Index, at: Ast.full.Call, depth: u8) Context.Error!?Origin {
+        const f = w.flow.functions.items[@backingInt(function)];
         const callee = try resolveCall(w.c, w.flow, f.file, at);
         switch (callee.kind) {
             .source => return .{ .file = f.file, .node = node },
             .aegis => if (try parserOf(w.c, w.flow, f.file, at, callee.decl.?) != null) return null,
             .program => |target| {
-                const g = w.flow.functions.items[target];
+                const g = w.flow.functions.items[@backingInt(target)];
                 const tree = &w.c.project.at(g.file).file.tree;
                 for (try children(w.c, g.file, g.node)) |part| if (try w.returned(target, tree, part, depth)) |found| {
                     // The innermost call into the function that holds the read names it.
@@ -1445,7 +1449,7 @@ const Walk = struct {
     }
 
     /// The `return`s within `node` of `function`'s own body, walked back.
-    fn returned(w: *Walk, function: u32, tree: *const Ast, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
+    fn returned(w: *Walk, function: Function.Id, tree: *const Ast, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
         if (w.steps >= step_limit) return null;
         w.steps += 1;
         if (tree.nodeTag(node) == .fn_decl or tree.nodeTag(node) == .fn_proto or tree.nodeTag(node) == .fn_proto_one or tree.nodeTag(node) == .fn_proto_simple or tree.nodeTag(node) == .fn_proto_multi) return null;
@@ -1454,14 +1458,14 @@ const Walk = struct {
             if (!try w.carries(function, value)) return null;
             return w.from(function, value, depth + 1);
         }
-        const g = w.flow.functions.items[function];
+        const g = w.flow.functions.items[@backingInt(function)];
         for (try children(w.c, g.file, node)) |part| if (try w.returned(function, tree, part, depth)) |found| return found;
         return null;
     }
 
     /// A local's initializer, what is assigned to it and the reads that fill it.
-    fn local(w: *Walk, function: u32, d: Model.Declaration.Id, depth: u8) Context.Error!?Origin {
-        const f = w.flow.functions.items[function];
+    fn local(w: *Walk, function: Function.Id, d: Model.Declaration.Id, depth: u8) Context.Error!?Origin {
+        const f = w.flow.functions.items[@backingInt(function)];
         const tree = &w.c.project.at(f.file).file.tree;
         const model = &w.c.project.at(f.file).model;
         const decl = model.declarations[@backingInt(d)];
@@ -1493,7 +1497,7 @@ const Walk = struct {
     fn stored(w: *Walk, decl: Facts.Decl, depth: u8) Context.Error!?Origin {
         const stores = try storeSites(w.c, w.flow);
         for ((stores.map.get(decl) orelse return null).items) |site| {
-            const f = w.flow.functions.items[site.function];
+            const f = w.flow.functions.items[@backingInt(site.function)];
             if (site.read) return .{ .file = f.file, .node = site.node };
             if (!try w.carries(site.function, site.node)) continue;
             if (try w.from(site.function, site.node, depth + 1)) |found| return found;
@@ -1502,10 +1506,10 @@ const Walk = struct {
     }
 
     /// What the program's callers of `function` give its parameter `index`.
-    fn callers(w: *Walk, function: u32, index: usize, depth: u8) Context.Error!?Origin {
+    fn callers(w: *Walk, function: Function.Id, index: usize, depth: u8) Context.Error!?Origin {
         const sites = try callSites(w.c, w.flow);
         for ((sites.map.get(function) orelse return null).items) |site| {
-            const f = w.flow.functions.items[site.caller];
+            const f = w.flow.functions.items[@backingInt(site.caller)];
             const tree = &w.c.project.at(f.file).file.tree;
             var buffer: [1]Ast.Node.Index = undefined;
             const made = tree.fullCall(&buffer, site.node) orelse continue;
@@ -1535,27 +1539,28 @@ fn rootDecl(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Model.
 }
 
 /// Each node's children, by file, built once from the parent table.
-const Children = struct { map: std.AutoHashMapUnmanaged(u32, []const []const Ast.Node.Index) = .empty };
+const Children = struct { map: std.AutoHashMapUnmanaged(Project.FileId, []const []const Ast.Node.Index) = .empty };
 
 fn children(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {
     const memo = try c.facts.memo(Children);
-    const all = memo.map.get(@backingInt(file)) orelse blk: {
+    const all = memo.map.get(file) orelse blk: {
         const model = &c.project.at(file).model;
         const lists = try c.allocator.alloc(std.ArrayList(Ast.Node.Index), model.node_parents.len);
         @memset(lists, .empty);
         for (model.node_parents, 0..) |parent, i| if (parent) |p| try lists[@backingInt(p)].append(c.allocator, @fromBackingInt(@intCast(i)));
         const out = try c.allocator.alloc([]const Ast.Node.Index, lists.len);
         for (lists, out) |list, *each| each.* = list.items;
-        try memo.map.put(c.allocator, @backingInt(file), out);
+        try memo.map.put(c.allocator, file, out);
         break :blk out;
     };
-    return all[@backingInt(node)]; // safe: a node index indexes its own tree's parent table.
+    const index = @backingInt(node);
+    return if (index < all.len) all[index] else &.{};
 }
 
 /// The program's calls of each of its functions, by callee, built once per flow.
 const CallSites = struct {
     built: bool = false,
-    map: std.AutoHashMapUnmanaged(u32, std.ArrayList(struct { caller: u32, node: Ast.Node.Index })) = .empty,
+    map: std.AutoHashMapUnmanaged(Function.Id, std.ArrayList(struct { caller: Function.Id, node: Ast.Node.Index })) = .empty,
 };
 
 fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
@@ -1590,7 +1595,7 @@ const StoreSites = struct {
     built: bool = false,
     map: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(StoreSite)) = .empty,
 };
-const StoreSite = struct { function: u32, node: Ast.Node.Index, read: bool };
+const StoreSite = struct { function: Function.Id, node: Ast.Node.Index, read: bool };
 
 fn storeSites(c: *Context, flow: *Flow) Context.Error!*StoreSites {
     const memo = try c.facts.memo(StoreSites);

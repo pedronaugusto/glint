@@ -16,6 +16,7 @@ const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
+const File = @import("File.zig");
 const Contract = @import("AegisContract.zig");
 const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
@@ -64,7 +65,9 @@ const Typed = union(enum) {
         if (x.signed == y.signed) return .{ .int = .{ .bits = @max(x.bits, y.bits), .signed = x.signed, .wide = wide, .either = either } };
         const signed = if (x.signed) x else y;
         const unsigned = if (x.signed) y else x;
-        return .{ .int = .{ .bits = @max(signed.bits, unsigned.bits + 1), .signed = true, .wide = if (wide) |w| @max(w, unsigned.bits + 1) else null, .either = either } };
+        // The unsigned one's values and a sign: one bit more, which a `u65535` has no room for.
+        const room = std.math.add(u16, unsigned.bits, 1) catch return .unknown;
+        return .{ .int = .{ .bits = @max(signed.bits, room), .signed = true, .wide = if (wide) |w| @max(w, room) else null, .either = either } };
     }
 };
 
@@ -75,6 +78,10 @@ fn widths(c: *const Context) []const u16 {
 }
 /// How deep a reading follows constants' initializers.
 const depth_limit = 12;
+/// The most tokens a walk over one expression's tokens or parts takes: a file's default budget
+/// for one expression (`File.Limits.expression_tokens`). A walk that reaches it gives the
+/// answer that clears nothing.
+const expression_tokens = @as(File.Limits, .{}).expression_tokens;
 
 /// Whether arithmetic `node` (`+`, `*`, `-` and their assignments) cannot overflow its type
 /// whatever its operands' ranges hold, at every pointer width, and an unsigned difference
@@ -432,12 +439,12 @@ pub fn movedWithin(c: *Context, file: Project.FileId, node: Ast.Node.Index) Cont
 /// Whether a moved pointer is read only at its first element, where it is computed.
 fn firstRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
     const tree = &c.project.at(file).file.tree;
-    const parents = c.project.at(file).model.node_parents;
+    const model = &c.project.at(file).model;
     var at = node;
-    var parent = parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
+    var parent = model.parentOf(at) orelse return false;
     while (tree.nodeTag(parent) == .grouped_expression) {
         at = parent;
-        parent = parents[@backingInt(at)] orelse return false; // safe: a node index indexes its own tree's parent table.
+        parent = model.parentOf(at) orelse return false;
     }
     if (tree.nodeTag(parent) == .array_access) {
         const reached, const index = tree.nodeData(parent).node_and_node;
@@ -554,7 +561,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
         .bit_or, .bit_xor => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
-            return filled(128 - @clz(most));
+            return filled(std.math.sub(u16, 128, @clz(most)) catch return null);
         },
         .@"if", .if_simple => {
             const branch = tree.fullIf(node).?;
@@ -808,7 +815,7 @@ fn stores(c: *Context) Context.Error!*Stores {
                     const literal_init = tree.fullStructInit(&buffer, node) orelse continue;
                     for (literal_init.ast.fields) |value| {
                         if (tree.firstToken(value) < 2) continue;
-                        try add(c, memo, tree.tokenSlice(tree.firstToken(value) - 2), .{ .file = file, .node = value, .kind = .literal });
+                        try add(c, memo, tree.tokenSlice(Model.initName(tree, value) orelse continue), .{ .file = file, .node = value, .kind = .literal });
                     }
                     continue;
                 },
@@ -1028,7 +1035,7 @@ fn containerName(c: *Context, file: Project.FileId, container_node: Ast.Node.Ind
     const tree = &c.project.at(file).file.tree;
     if (container_node == .root) {
         const base = std.Io.Dir.path.basename(c.project.at(file).input.name);
-        return if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else null;
+        return std.mem.cutSuffix(u8, base, ".zig");
     }
     const parent = c.project.at(file).model.parentOf(container_node) orelse return null;
     const variable = tree.fullVarDecl(parent) orelse return null;
@@ -1548,8 +1555,7 @@ fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value:
         .container, .instance => |k| k,
         else => return null,
     };
-    if (tree.firstToken(value) < 2) return null;
-    const name = tree.tokenSlice(tree.firstToken(value) - 2);
+    const name = tree.tokenSlice(Model.initName(tree, value) orelse return null);
     const decl = c.facts.member(container, name) orelse return null;
     if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return null;
     return decl;
@@ -1618,7 +1624,7 @@ fn filled(bits: u16) u128 {
 
 /// The greatest length of memory at a pointer width: below half the address space.
 fn length(pointer: u16) u128 {
-    return filled(pointer - 1);
+    return filled(std.math.sub(u16, pointer, 1) catch 0);
 }
 
 /// A quotient's bound: the dividend's divided by a literal divisor.
@@ -1739,6 +1745,7 @@ fn subtracted(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), stat
             return span.tree.nodeMainToken(node) < span.first;
         }
     }.before);
+    if (start > all.len) return;
     for (all[start..]) |difference| {
         if (tree.nodeMainToken(difference) > last) break;
         if (!always(c, file, difference, statement)) continue;
@@ -2232,9 +2239,13 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
                     const out_name = tree.nodeData(output).opt_node_and_token[1] - 1;
                     if (tree.tokenTag(out_name) != .identifier) continue;
                     const at = bare(tree, compared);
-                    for (tree.firstToken(at)..tree.lastToken(at) + 1) |k| {
-                        if (std.mem.eql(u8, tree.tokenSlice(@intCast(k)), tree.tokenSlice(out_name))) return false;
-                    }
+                    const last = tree.lastToken(at);
+                    var k = tree.firstToken(at);
+                    for (0..expression_tokens) |_| {
+                        if (k > last) break;
+                        if (std.mem.eql(u8, tree.tokenSlice(k), tree.tokenSlice(out_name))) return false;
+                        k = std.math.add(Ast.TokenIndex, k, 1) catch return false;
+                    } else return false;
                 }
             },
             // Its address handed on (`advance(&i)`) lets what takes it write it.
@@ -2423,24 +2434,32 @@ fn reads(c: *Context, file: Project.FileId, compared: Ast.Node.Index, target: As
     const tree = &c.project.at(file).file.tree;
     const written_to = bare(tree, target);
     const want_first = tree.firstToken(written_to);
-    const want = tree.lastToken(written_to) - want_first + 1;
+    const want_last = tree.lastToken(written_to);
     const at = bare(tree, compared);
-    const first = tree.firstToken(at);
     const last = tree.lastToken(at);
-    var start = first;
-    while (start + want - 1 <= last) : (start += 1) {
+    // Each place a part may start, as long as the whole target fits before `last`.
+    var start = tree.firstToken(at);
+    for (0..expression_tokens) |_| {
+        const span = std.math.sub(Ast.TokenIndex, want_last, want_first) catch return true;
+        const end = std.math.add(Ast.TokenIndex, start, span) catch return true;
+        if (end > last) break;
+        defer start = std.math.add(Ast.TokenIndex, start, 1) catch last;
         // A part begins where no `.` names it a field of something else.
         if (start > 0 and tree.tokenTag(start - 1) == .period) continue;
-        for (0..want) |k| {
-            const a: Ast.TokenIndex = @intCast(start + k);
-            const b: Ast.TokenIndex = @intCast(want_first + k);
-            if (tree.tokenTag(a) != tree.tokenTag(b) or !std.mem.eql(u8, tree.tokenSlice(a), tree.tokenSlice(b))) break;
-        } else {
-            // And ends where nothing continues it but a field, an index or a call on it.
-            const next = start + want;
-            if (next > last or tree.tokenTag(next) != .identifier) return true;
-        }
-    }
+        var a = start;
+        var b = want_first;
+        const alike = for (0..expression_tokens) |_| {
+            if (tree.tokenTag(a) != tree.tokenTag(b) or !std.mem.eql(u8, tree.tokenSlice(a), tree.tokenSlice(b))) break false;
+            if (b == want_last) break true;
+            a = std.math.add(Ast.TokenIndex, a, 1) catch break false;
+            b = std.math.add(Ast.TokenIndex, b, 1) catch break false;
+        } else return true;
+        if (!alike) continue;
+        // And ends where nothing continues it but a field, an index or a call on it.
+        if (end == last) return true;
+        const next = std.math.add(Ast.TokenIndex, end, 1) catch return true;
+        if (tree.tokenTag(next) != .identifier) return true;
+    } else return true;
     if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| return reads(c, file, init, target, depth + 1);
     return false;
 }
@@ -2465,13 +2484,13 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     // The parts come from the outside in; the eight nearest the declaration are kept.
-    var ring: [8][]const u8 = @splat("");
-    var count: usize = 0;
+    var parts: std.ArrayList([]const u8) = .empty;
     var exposed = false;
     // Whether a pointer is followed past the declaration's own step.
     var deep = false;
     var at = bare(tree, node);
-    while (tree.nodeTag(at) != .identifier) {
+    for (0..expression_tokens) |_| {
+        if (tree.nodeTag(at) == .identifier) break;
         const part: ?[]const u8, const inner = switch (tree.nodeTag(at)) {
             .field_access => .{ tree.tokenSlice(tree.nodeData(at).node_and_token[1]), tree.nodeData(at).node_and_token[0] },
             .array_access => .{ "[]", tree.nodeData(at).node_and_node[0] },
@@ -2489,19 +2508,21 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
             exposed = true;
             if (tree.nodeTag(bare(tree, inner)) != .identifier) deep = true;
         }
-        if (part) |name| {
-            ring[count % ring.len] = name;
-            count += 1;
-        }
+        if (part) |name| try parts.append(c.allocator, name);
         at = bare(tree, inner);
-    }
+    } else return null;
     const d = (model.reference(at) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(d)];
     const scope = model.scopes[@backingInt(record.scope)].kind;
     if (record.kind == .variable and (scope == .file or scope == .container)) exposed = true;
     if (!exposed and try addressed(c, file, d)) exposed = true;
     var out: Place = .{ .decl = d, .exposed = exposed };
-    while (out.len < @min(count, ring.len)) : (out.len += 1) out.parts[out.len] = ring[(count - 1 - out.len) % ring.len];
+    std.mem.reverse([]const u8, parts.items);
+    for (parts.items, 0..) |part, i| {
+        if (i >= out.parts.len) break;
+        out.parts[i] = part;
+        out.len += 1;
+    }
     out.flat = !deep and out.len > 0 and !std.mem.eql(u8, out.parts[0], "[]") and try structured(c, file, at);
     return out;
 }
@@ -2820,8 +2841,11 @@ fn position(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 fn indexes(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    var function = node;
-    while (tree.nodeTag(function) != .fn_decl) function = model.parentOf(function) orelse return false;
+    const function = found: {
+        var up: ?Ast.Node.Index = node;
+        while (up) |each| : (up = model.parentOf(each)) if (tree.nodeTag(each) == .fn_decl) break :found each;
+        return false;
+    };
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -2946,10 +2970,11 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     }
     const held_here = try gather(c, file, index);
     for (widths(c)) |pointer| {
-        if (try fixedLength(c, file, memory)) |n| {
-            const most = (try bound(c, file, index, pointer, 0)) orelse return false;
+        // A fixed array's length is known: a bound below it is enough, and otherwise the
+        // comparisons with its length are read as a slice's.
+        if (try fixedLength(c, file, memory)) |n| if (try bound(c, file, index, pointer, 0)) |most| {
             if (if (end) most <= n else most < n) continue;
-        }
+        };
         if (!try keeps(c, file, held_here, index, memory, end)) return false;
     }
     return true;
@@ -3184,13 +3209,19 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
             if (!same(tree, fact.large, memory)) continue;
             const base, const k = shift(tree, fact.small);
             const step: i128 = @intFromBool(fact.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
+            if (oneValue(c, file, base, index_base)) {
+                const reach = std.math.add(i128, k, step) catch return false;
+                most = @max(most orelse reach, reach);
+            }
             continue;
         }
         if (lengthOf(c, file, fact.large, memory)) {
             const base, const k = shift(tree, fact.small);
             const step: i128 = @intFromBool(fact.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
+            if (oneValue(c, file, base, index_base)) {
+                const reach = std.math.add(i128, k, step) catch return false;
+                most = @max(most orelse reach, reach);
+            }
             continue;
         }
         if (remains(c, file, fact, index, memory, end)) return true;
@@ -3199,7 +3230,10 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
             if (next.differs or next.read or !lengthOf(c, file, next.large, memory) or !oneValue(c, file, fact.large, next.small)) continue;
             const base, const k = shift(tree, fact.small);
             const step: i128 = @as(i128, @intFromBool(fact.strict)) + @intFromBool(next.strict);
-            if (oneValue(c, file, base, index_base)) most = @max(most orelse (k + step), k + step);
+            if (oneValue(c, file, base, index_base)) {
+                const reach = std.math.add(i128, k, step) catch return false;
+                most = @max(most orelse reach, reach);
+            }
         }
     }
     var m = most orelse return false;
@@ -3212,7 +3246,7 @@ fn keeps(c: *Context, file: Project.FileId, held_here: []const Fact, index: Ast.
             const spot = if (lengthOf(c, file, fact.large, memory)) fact.small else if (lengthOf(c, file, fact.small, memory)) fact.large else continue;
             const base, const k = shift(tree, spot);
             if (k == m and oneValue(c, file, base, index_base)) {
-                m += 1;
+                m = std.math.add(i128, m, 1) catch return false;
                 moved = true;
             }
         }
@@ -3247,7 +3281,7 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
         const whole_length, const margin = tree.nodeData(large).node_and_node;
         const k = (try valueOf(c, file, bare(tree, margin), 0)) orelse return false;
         if (!lengthOf(c, file, whole_length, base)) return false;
-        whole.constant += k;
+        whole.constant = std.math.add(i128, whole.constant, k) catch return false;
     } else if (!lengthOf(c, file, fact.large, base)) return false;
     if (!try whole.add(c, file, fact.small, 0) or whole.len == 0 or (whole.len < 2 and whole.constant == 0)) return false;
     var used: [Terms.capacity]bool = @splat(false);
@@ -3262,7 +3296,7 @@ fn covered(c: *Context, file: Project.FileId, fact: Fact, index: Ast.Node.Index,
         const typed = try typeOf(c, file, part, 64, 0);
         if (typed != .int or typed.int.signed) return false;
     };
-    const room = whole.constant + @intFromBool(fact.strict) - needed.constant;
+    const room = std.math.sub(i128, std.math.add(i128, whole.constant, @intFromBool(fact.strict)) catch return false, needed.constant) catch return false;
     return if (end) room >= 0 else room >= 1;
 }
 
@@ -3375,7 +3409,7 @@ const Terms = struct {
         const tree = &c.project.at(file).file.tree;
         const at = bare(tree, node);
         if (try valueOf(c, file, at, 0)) |k| {
-            terms.constant += k;
+            terms.constant = std.math.add(i128, terms.constant, k) catch return false;
             return true;
         }
         if (tree.nodeTag(at) == .add) {
@@ -3386,7 +3420,7 @@ const Terms = struct {
         if (tree.nodeTag(at) == .sub) {
             const a, const b = tree.nodeData(at).node_and_node;
             if (try valueOf(c, file, b, 0)) |k| {
-                terms.constant -= k;
+                terms.constant = std.math.sub(i128, terms.constant, k) catch return false;
                 return terms.add(c, file, a, depth);
             }
         }

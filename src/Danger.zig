@@ -403,7 +403,7 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
     }
     const start = tree.tokenStart(tree.firstToken(node));
     const last = tree.lastToken(node);
-    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)), .text = try c.allocator.print("{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
+    try edits.append(c.allocator, .{ .start = start, .end = tree.tokenToSpan(last).end, .text = try c.allocator.print("{s}.assert.invariant({s}, \"{s}\")", .{ aegis, condition, said.written() }) });
     return true;
 }
 
@@ -423,7 +423,7 @@ fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]c
         if (std.mem.eql(u8, decl.name, "aegis")) return null;
         if (std.mem.eql(u8, spelled, "@import(\"std\")")) {
             const line = file.line(tree.tokenStart(decl.token));
-            after_std = if (line + 1 < file.lines.len) file.lines[line + 1] else @intCast(file.source.len);
+            after_std = file.lineEnd(line);
         }
     }
     // With no std import the line goes after the file's doc comment, which stands first.

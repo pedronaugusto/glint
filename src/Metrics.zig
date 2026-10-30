@@ -4,6 +4,7 @@
 //! apart. A report, never a proof or a gate: a count says nothing about what an assertion checks.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
+const Model = @import("Model.zig");
 const Library = @import("Library.zig").Library;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
@@ -37,7 +38,7 @@ const assert_members = [_]Lib.Member{
 pub fn count(context: *Context) Context.Error!Counts {
     const source = context.project.at(context.file);
     const tree = &source.file.tree;
-    const parents = source.model.node_parents;
+    const model = &source.model;
     var counts: Counts = .{};
     if (tree.errors.len != 0) return counts;
     const asserted = try context.allocator.alloc(bool, tree.nodes.len);
@@ -51,7 +52,7 @@ pub fn count(context: *Context) Context.Error!Counts {
         const kind = if (value == .function) try context.role(library, value) else null;
         if (kind) |k| {
             counts.assertions[@backingInt(k)] += 1; // safe: a kind indexes its own count table.
-            if (function(tree, parents, node)) |f| asserted[@backingInt(f)] = true; // safe: the checked AST indexes its own node table.
+            if (function(tree, model, node)) |f| asserted[@backingInt(f)] = true; // safe: the checked AST indexes its own node table.
         } else if (value == .unknown and spelledLike(tree, call.ast.fn_expr)) counts.unresolved += 1;
     }
     for (asserted) |yes| {
@@ -61,9 +62,9 @@ pub fn count(context: *Context) Context.Error!Counts {
 }
 
 /// The function whose own body holds `node`, if any; a test block holds it otherwise.
-fn function(tree: *const Ast, parents: []const ?Ast.Node.Index, node: Ast.Node.Index) ?Ast.Node.Index {
-    var at = parents[@backingInt(node)]; // safe: the checked AST indexes its own parent table.
-    while (at) |parent| : (at = parents[@backingInt(parent)]) { // safe: the checked AST indexes its own parent table.
+fn function(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    var at = model.parentOf(node);
+    while (at) |parent| : (at = model.parentOf(parent)) {
         switch (tree.nodeTag(parent)) {
             .fn_decl => return parent,
             .test_decl => return null,

@@ -583,6 +583,20 @@ fn capture(a: std.mem.Allocator, tree: *const Ast, scopes: []Scope, list: *std.A
     try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = node, .token = name, .scope = scope, .kind = .capture });
 }
 
+/// The name a struct literal's field value is given under (`.name = value`): two tokens before
+/// the value.
+pub fn initName(tree: *const Ast, value: Ast.Node.Index) ?Ast.TokenIndex {
+    const at = tree.firstToken(value);
+    if (at < 2) return null;
+    return at - 2;
+}
+
+/// Whether a function's return type is written after `!`: its error set is inferred.
+pub fn inferredErrors(tree: *const Ast, return_type: Ast.Node.Index) bool {
+    const first = tree.firstToken(return_type);
+    return first > 0 and tree.tokenTag(first - 1) == .bang;
+}
+
 /// The position among a `for` loop's captures of the one named at `token`, a discarded `_`
 /// counted: the input it takes is the loop's input at that position.
 pub fn capturePosition(tree: *const Ast, loop: Ast.full.For, token: Ast.TokenIndex) ?usize {

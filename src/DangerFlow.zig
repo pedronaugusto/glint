@@ -6,6 +6,7 @@
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
+const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Taint = @import("Taint.zig");
 const Range = @import("Range.zig");
@@ -665,7 +666,7 @@ fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = tree.nodeMainToken(node);
             if (token < first or token > last or !std.mem.eql(u8, tree.tokenSlice(token), names[position])) continue;
-            if (grows(tree, model.node_parents, node, body)) break :done false;
+            if (grows(tree, model, node, body)) break :done false;
         }
         break :done true;
     };
@@ -676,9 +677,9 @@ fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
 /// Whether the use `node` of a parameter can size work before the walk up reaches `body`: an
 /// argument of a call (not `assert`'s) or a builtin, a loop's bound, a local's value or what
 /// the function returns.
-fn grows(tree: *const Ast, parents: []const ?Ast.Node.Index, node: Ast.Node.Index, body: Ast.Node.Index) bool {
+fn grows(tree: *const Ast, model: *const Model, node: Ast.Node.Index, body: Ast.Node.Index) bool {
     var at = node;
-    while (parents[@backingInt(at)]) |parent| : (at = parent) { // safe: a node index indexes its own tree's parent table.
+    while (model.parentOf(at)) |parent| : (at = parent) {
         if (at == body) return false;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| {

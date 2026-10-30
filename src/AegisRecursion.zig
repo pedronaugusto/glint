@@ -118,10 +118,12 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
         if (!selected(self.c, callee.function.file) or compileTime(self, callee.function)) continue;
         try self.edges.append(self.c.allocator, .{ .at = function, .call = call_node });
         defer _ = self.edges.pop();
-        const back = for (self.stack.items, 0..) |on, i| {
-            if (std.meta.eql(on, callee.function)) break i;
-        } else null;
-        if (back) |i| try cycle(self, i, token) else try visit(self, callee.function, token);
+        for (self.stack.items, 0..) |on, i| {
+            if (!std.meta.eql(on, callee.function)) continue;
+            // The calls from the stack's functions are the edges, one each.
+            if (i <= self.edges.items.len) try cycle(self, self.stack.items[i..], self.edges.items[i..], token);
+            break;
+        } else try visit(self, callee.function, token);
     }
     try self.done.put(self.c.allocator, function, {});
 }
@@ -151,36 +153,30 @@ fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
-/// The cycle from `stack[from]` back to it through the current edges.
-fn cycle(self: *Walk, from: usize, token: Ast.TokenIndex) Context.Error!void {
-    const head = self.stack.items[from];
+/// The cycle `looped` (the stack from the function called again) makes back to its first
+/// function through `edges`, each one's call.
+fn cycle(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, token: Ast.TokenIndex) Context.Error!void {
+    if (looped.len == 0) return;
+    const head = looped[0];
     if (self.reported.contains(head)) return;
-    const edges = self.edges.items[self.edges.items.len - (self.stack.items.len - from) ..];
     for (edges) |edge| if (try bounds(self, edge)) return;
     try self.reported.put(self.c.allocator, head, {});
     var names: std.ArrayList(u8) = .empty;
-    for (self.stack.items[from..]) |f| {
+    for (looped) |f| {
         try names.appendSlice(self.c.allocator, name(self, f));
         try names.appendSlice(self.c.allocator, " -> ");
     }
     try names.appendSlice(self.c.allocator, name(self, head));
     var related: std.ArrayList(Report.Span) = .empty;
-    for (edges) |edge| try related.append(self.c.allocator, try span(self, edge.at.file, edge.call));
+    for (edges) |edge| try related.append(self.c.allocator, self.c.spanOf(edge.at.file, self.c.project.at(edge.at.file).file.tree.nodeMainToken(edge.call)));
     const message = try self.c.allocator.print("recursion reachable from untrusted input ({s}) has no depth bound: input nested deep enough overflows the stack", .{names.items});
     const tree = try self.c.project.syntax(try self.c.source());
-    const at = tree.tokenStart(token);
-    try self.c.emitRelated(self.rule, at, at + @as(u32, @intCast(tree.tokenSlice(token).len)), message, related.items);
+    const at = tree.tokenToSpan(token);
+    try self.c.emitRelated(self.rule, at.start, at.end, message, related.items);
 }
 
 fn name(self: *Walk, f: Facts.Decl) []const u8 {
     return self.c.project.at(f.file).model.declarations[@backingInt(f.index)].name;
-}
-
-fn span(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!Report.Span {
-    const source = &self.c.project.at(file).file;
-    const start = source.tree.tokenStart(source.tree.nodeMainToken(node));
-    const line = source.line(start);
-    return .{ .file = file, .start = start, .end = start + 1, .line = line + 1, .column = start - source.lines[line] + 1 };
 }
 
 /// Whether the function making `edge`'s call changes a depth it compares: a parameter passed

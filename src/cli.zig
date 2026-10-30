@@ -73,7 +73,7 @@ const Loader = struct {
     /// A file's bytes, counted against the project's source budget.
     const Source = struct { bytes: [:0]const u8 };
     fn take(self: *Loader, bytes: [:0]const u8) error{SourceBudgetExceeded}!Source {
-        self.bytes += bytes.len;
+        self.bytes = std.math.add(usize, self.bytes, bytes.len) catch return error.SourceBudgetExceeded;
         if (self.bytes > 128 * 1024 * 1024) return error.SourceBudgetExceeded;
         return .{ .bytes = bytes };
     }
@@ -131,6 +131,7 @@ const Loader = struct {
         }
         for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling.text, module.name)) return module.path;
         if (!std.mem.endsWith(u8, spelling.text, ".zig")) return null;
+        if (spelling.from >= self.canonical_paths.items.len) return null;
         const path = try std.Io.Dir.path.resolveAlloc(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[spelling.from]) orelse ".", spelling.text });
         for (self.roots.items) |root| if (within(root, path)) return path;
         return error.ImportOutsideRoots;
