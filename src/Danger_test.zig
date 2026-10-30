@@ -1101,6 +1101,32 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
 }
 
+test "A019 reads a prefix a counter stepped past each element after setting it, and what a per-build choice of std's hashers fills" {
+    // Clean: elements set then counted (7), a hasher a switch of types picks filling the part
+    // returned (10, 11). Findings: a count stepped where the set may not run (8), a counter set
+    // otherwise (9), past the part the chosen hasher filled (12), a part under its own name
+    // returned unwritten (16). Clean too: a part under its own name, filled, returned (15).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u32) void { _ = b; }
+        \\fn useBytes(b: []const u8) void { _ = b; }
+        \\fn Hasher(comptime wide: bool) type { return switch (wide) { false => std.crypto.hash.sha2.Sha256, true => std.crypto.hash.sha2.Sha512 }; }
+        \\fn digest(comptime wide: bool, m: []const u8, out: *[64]u8) []const u8 { const H = Hasher(wide); H.hash(m, out[0..H.digest_length]); return out[0..H.digest_length]; }
+        \\fn past(comptime wide: bool, m: []const u8, out: *[64]u8) []const u8 { const H = Hasher(wide); H.hash(m, out[0..H.digest_length]); return out[0..64]; }
+        \\pub fn a1(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { a[n] = x; n += 1; } use(a[0..n]); }
+        \\pub fn a2(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { if (x > 0) a[n] = x; n += 1; } use(a[0..n]); }
+        \\pub fn a3(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { a[n] = x; n += 1; } n = 8; use(a[0..n]); }
+        \\pub fn d1(m: []const u8, wide: bool) void { var b: [64]u8 = undefined; useBytes(if (wide) digest(true, m, &b) else digest(false, m, &b)); }
+        \\pub fn d2(m: []const u8) void { var b: [64]u8 = undefined; useBytes(digest(false, m, &b)); }
+        \\pub fn d3(m: []const u8) void { var b: [64]u8 = undefined; useBytes(past(false, m, &b)); }
+        \\fn named(out: *[16]u8, v: u32) struct { bytes: []const u8 } { const part = out[0..4]; std.mem.writeInt(u32, part, v, 0); return .{ .bytes = part }; }
+        \\fn unnamed(out: *[16]u8) struct { bytes: []const u8 } { const part = out[0..4]; return .{ .bytes = part }; }
+        \\pub fn n1(v: u32) void { var b: [16]u8 = undefined; useBytes(named(&b, v).bytes); }
+        \\pub fn n2() void { var b: [16]u8 = undefined; useBytes(unnamed(&b).bytes); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9, 12, 16 }, found.lines[0..found.findings]);
+}
+
 test "A019 reads a local a function outside the program writes only where its result shows it did" {
     // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
     // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size

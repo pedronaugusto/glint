@@ -179,6 +179,10 @@ const State = struct {
     }
 };
 
+/// What every alternative of a per-build choice of functions does with what it is given: a fill
+/// (one of them, for how its failure leaves), a keep or a count, or a contract.
+const Choice = union(enum) { fill: Facts.Decl, keep, contract: *const CContract.Entry };
+
 /// A call that writes the local when its result checks, and the constant holding that result,
 /// where one does (`const rc = f(&x);`).
 const Guard = struct { call: Ast.Node.Index, entry: *const CContract.Entry, binding: ?Model.Declaration.Id };
@@ -893,9 +897,11 @@ const Walk = struct {
         const handed: Use = .{ .key = key, .effect = .handed };
         const decl = (try w.callee(node, call)) orelse {
             if (receiver) return handed;
-            const entry = (try w.choiceContract(call, position)) orelse return handed;
-            if (entry.success == .count or !whole) return null;
-            return .{ .key = tree.lastToken(node), .effect = .{ .guarded = .{ .call = node, .entry = entry, .binding = w.resultConstant(node) } } };
+            return switch ((try w.chosen(call, position)) orelse return handed) {
+                .keep => null,
+                .fill => |origin| if (whole and w.failureLeaves(node, origin)) .{ .key = tree.lastToken(node), .effect = .write } else null,
+                .contract => |entry| if (entry.success == .count or !whole) null else .{ .key = tree.lastToken(node), .effect = .{ .guarded = .{ .call = node, .entry = entry, .binding = w.resultConstant(node) } } },
+            };
         };
         const origin = (try w.c.facts.origin(decl)) orelse decl;
         var index = position;
@@ -931,22 +937,39 @@ const Walk = struct {
         return .{ .key = key, .effect = .{ .needs = found.mask } };
     }
 
-    /// The contract of a call to a choice of functions made per build (std's `c.fstatat`, a
-    /// program's `if (x86_64) statfs64 else statfs`): each alternative a function with a
-    /// contract for parameter `index`, all alike in when they write.
-    fn choiceContract(w: *Walk, call: Ast.full.Call, index: usize) Context.Error!?*const CContract.Entry {
+    /// What a call to a choice of functions made per build does with what it is given at
+    /// `position` (std's `c.fstatat`, a program's `if (x86_64) statfs64 else statfs`, a hasher
+    /// a type function picks by a `switch`): every alternative one of std's fills, every one a
+    /// keep or a count, or every one a function outside the program whose contract writes it,
+    /// all alike in when; null where they differ or one is none of these.
+    fn chosen(w: *Walk, call: Ast.full.Call, position: usize) Context.Error!?Choice {
+        const tree = w.tree;
         const value = try w.c.facts.resolve(w.file, call.ast.fn_expr);
         if (value != .alternatives) return null;
-        var found: ?*const CContract.Entry = null;
+        var index = position;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try w.c.facts.resolve(w.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+            .instance, .pointer, .optional => index += 1,
+            else => {},
+        };
+        var found: ?Choice = null;
         for (value.alternatives) |each| {
             const decl = switch (each) {
                 .function => |function| function,
                 else => return null,
             };
             const origin = (try w.c.facts.origin(decl)) orelse decl;
-            const entry = (try CContract.find(w.c, origin, index)) orelse return null;
-            if (found) |sofar| if (!std.meta.eql(sofar.success, entry.success)) return null;
-            found = entry;
+            const this: Choice = if (try named(w.c, &std_fills, origin, index))
+                .{ .fill = origin }
+            else if (try named(w.c, &std_keeps, origin, index) or try named(w.c, &std_counts, origin, index))
+                .keep
+            else if (try CContract.find(w.c, origin, index)) |entry|
+                .{ .contract = entry }
+            else
+                return null;
+            if (found) |sofar| {
+                if (std.meta.activeTag(sofar) != std.meta.activeTag(this)) return null;
+                if (sofar == .contract and !std.meta.eql(sofar.contract.success, this.contract.success)) return null;
+            } else found = this;
         }
         return found;
     }
@@ -1051,7 +1074,7 @@ const Walk = struct {
             const count = w.model.declarations[@backingInt(index)];
             if (count.kind != .variable) return false;
             const variable = tree.fullVarDecl(count.node) orelse return false;
-            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return w.appended(index);
             source = variable.ast.init_node.unwrap() orelse return false;
         }
         switch (tree.nodeTag(source)) {
@@ -1082,6 +1105,53 @@ const Walk = struct {
             if (w.namesAlone(arg)) return true;
         }
         return false;
+    }
+
+    /// Whether `count`, a `var` the slice ends at, counts the elements of the local written from
+    /// its start: it begins at 0, and every change to it is `count += 1` right after the
+    /// statement before it in its block sets `local[count]`, so each step past an element
+    /// follows that element's write. Its address is never taken.
+    fn appended(w: *const Walk, count: Model.Declaration.Id) bool {
+        const tree = w.tree;
+        const variable = tree.fullVarDecl(w.model.declarations[@backingInt(count)].node) orelse return false;
+        if (literalValue(tree, variable.ast.init_node.unwrap() orelse return false) != 0) return false;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const ref = w.model.reference(node) orelse continue;
+            if (ref.declaration != count) continue;
+            const parent = w.model.parentOf(node) orelse return false;
+            switch (tree.nodeTag(parent)) {
+                .address_of => return false,
+                .assign, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => if (tree.nodeData(parent).node_and_node[0] == node) return false,
+                .assign_add => {
+                    const target, const step = tree.nodeData(parent).node_and_node;
+                    if (target != node) continue;
+                    if (literalValue(tree, step) != 1 or !w.followsSet(parent, count)) return false;
+                },
+                else => {},
+            }
+        }
+        return true;
+    }
+
+    /// Whether the statement before `step` in its block is `local[count] = …`.
+    fn followsSet(w: *const Walk, step: Ast.Node.Index, count: Model.Declaration.Id) bool {
+        const tree = w.tree;
+        const block = w.model.parentOf(step) orelse return false;
+        if (!isBlock(tree, block)) return false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, block) orelse return false;
+        const at = std.mem.findScalar(Ast.Node.Index, statements, step) orelse return false;
+        if (at == 0) return false;
+        const set = statements[at - 1];
+        if (tree.nodeTag(set) != .assign) return false;
+        const target = tree.nodeData(set).node_and_node[0];
+        if (tree.nodeTag(target) != .array_access) return false;
+        const memory, const index = tree.nodeData(target).node_and_node;
+        if (!w.isLocal(memory) or tree.nodeTag(index) != .identifier) return false;
+        const ref = w.model.reference(index) orelse return false;
+        return ref.declaration == count;
     }
 
     /// Whether `arg` is the local's address (`&buf`), all of it sliced, or a vector of it
@@ -1466,6 +1536,26 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
                     try written.append(c.allocator, .{ .part = parent, .statement = statementOf(model, tree, above) orelse return false });
                     continue;
                 }
+                // `const part = p[a..b];`: the part under another name, each mention of which
+                // is the part's.
+                if (tree.fullVarDecl(above)) |variable| if (variable.ast.init_node.unwrap() == parent and tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+                    const alias = for (model.declarations, 0..) |each, d| {
+                        if (each.kind == .variable and each.node == above) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(d)));
+                    } else return false;
+                    var aliased: Walk = .init(c, decl.file, alias, true, depth);
+                    try aliased.collect();
+                    for (aliased.mentions.items) |each| {
+                        const up = model.parentOf(each) orelse return false;
+                        if (tree.nodeTag(up) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(up).node_and_token[1]), "len")) continue;
+                        const use = (try aliased.given(each, true, tree.nodeMainToken(each))) orelse continue;
+                        if (use.effect == .write) {
+                            try written.append(c.allocator, .{ .part = parent, .statement = statementOf(model, tree, each) orelse return false });
+                            continue;
+                        }
+                        if (!coveredBefore(model, tree, written.items, parent, each)) return false;
+                    }
+                    continue;
+                };
             },
             .address_of => return false,
             else => {},
