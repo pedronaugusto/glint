@@ -28,7 +28,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
-    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } };
+    \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } pub fn readLink(dir: Dir, io: anytype, sub_path: []const u8, buffer: []u8) !usize { _ = dir; _ = io; _ = sub_path; _ = buffer; return 0; } };
     \\pub const Writer = struct { end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
     \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
@@ -84,7 +84,7 @@ const std_files = [_]sources.Extra{
     \\    pub const KeyPair = struct { secret_key: SecretKey, public_key: PublicKey, pub fn generate() KeyPair { return undefined; } };
     \\};
     },
-    .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
+    .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
@@ -973,6 +973,39 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
     const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
+}
+
+test "A019 reads all of a local through asBytes, a for setting each element after what neither reads it nor leaves, a vector's one buffer, and a prefix read by the count that wrote it" {
+    // Clean: asBytes(&h) filled under `catch return` (6), each element set after a statement
+    // that does not read it, a member's name like the capture's (8, 9), a buffer kept by a
+    // vectored read and read to its count, also with `catch 0` (12, 13), kept and not read
+    // (14), std's lockStderr keeping one (16), readLink's count (18). Findings: asBytes(&h)
+    // whose failure goes on (7), a pass that may leave first (10), an element read before it
+    // is set (11), a count a failure makes 16 (15), past the count (19), lockStderr's buffer
+    // read (17), two buffers in the vector (20).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const Header = extern struct { runs: u64, pcs: u64 };
+        \\const Definition = struct { id: u32 };
+        \\const Rule = struct { definition: Definition };
+        \\fn use(bytes: []const u8) void { _ = bytes; }
+        \\pub fn a1(r: *std.Io.Reader) u64 { var h: Header = undefined; r.readSliceAll(std.mem.asBytes(&h)) catch return 0; return h.runs; }
+        \\pub fn a2(r: *std.Io.Reader) u64 { var h: Header = undefined; r.readSliceAll(std.mem.asBytes(&h)) catch {}; return h.runs; }
+        \\pub fn f1(src: [4]Rule) [4]Definition { var out: [4]Definition = undefined; for (src, &out) |rule, *definition| definition.* = rule.definition; return out; }
+        \\pub fn f2(src: [4]Rule) [4]Definition { var out: [4]Definition = undefined; for (src, &out) |rule, *slot| { const d = rule.definition; slot.* = d; } return out; }
+        \\pub fn f3(src: [4]Rule) [4]Definition { var out: [4]Definition = undefined; for (src, &out) |rule, *slot| { if (rule.definition.id == 0) continue; slot.* = rule.definition; } return out; }
+        \\pub fn f4(src: [4]u32) [4]u32 { var out: [4]u32 = undefined; for (src, &out) |v, *slot| { const old = slot.*; slot.* = v + old; } return out; }
+        \\pub fn v1(f: std.Io.File, io: std.Io) !void { var buf: [8]u8 = undefined; const n = try f.readStreaming(io, &.{&buf}); use(buf[0..n]); }
+        \\pub fn v2(f: std.Io.File, io: std.Io) void { var buf: [8]u8 = undefined; const n = f.readStreaming(io, &.{&buf}) catch 0; use(buf[0..n]); }
+        \\pub fn v3(f: std.Io.File, io: std.Io) void { var buf: [8]u8 = undefined; _ = f.readStreaming(io, &.{&buf}) catch {}; }
+        \\pub fn v4(f: std.Io.File, io: std.Io) void { var buf: [8]u8 = undefined; const n = f.readStreaming(io, &.{&buf}) catch 16; use(buf[0..n]); }
+        \\pub fn k1() void { var buf: [8]u8 = undefined; std.debug.lockStderr(&buf); }
+        \\pub fn k2() u8 { var buf: [8]u8 = undefined; std.debug.lockStderr(&buf); return buf[0]; }
+        \\pub fn l1(d: std.Io.Dir, io: std.Io) !void { var t: [8]u8 = undefined; const len = try d.readLink(io, "x", &t); use(t[0..len]); }
+        \\pub fn l2(d: std.Io.Dir, io: std.Io) !void { var t: [8]u8 = undefined; const len = try d.readLink(io, "x", &t); use(t[0 .. len + 1]); }
+        \\pub fn w2(f: std.Io.File, io: std.Io) void { var a: [8]u8 = undefined; var b: [8]u8 = undefined; const n = f.readStreaming(io, &.{ &a, &b }) catch 0; use(a[0..n]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 7, 10, 11, 15, 17, 19, 20 }, found.lines[0..found.findings]);
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {

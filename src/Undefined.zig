@@ -50,6 +50,20 @@ const std_fills = [_]Named{
     .{ .path = "crypto.hash.sha3.Sha3_256.final", .param = 1 },
     .{ .path = "mem.writeInt", .param = 1 },
     .{ .path = "crypto.secureZero", .param = 1 },
+    // Each operation of the batch, then the last one's link.
+    .{ .path = "Io.Batch.init", .param = 0 },
+    // `mr.* = .{ … }`, after the streams' contexts.
+    .{ .path = "Io.File.MultiReader.init", .param = 0 },
+};
+
+/// std's calls that write a prefix of the memory they are given at a parameter and return its
+/// length: they keep it, and `buf[0..n]` with that count reads what they wrote. A vector names
+/// each buffer it holds.
+const std_counts = [_]Named{
+    .{ .path = "Io.File.readStreaming", .param = 2 },
+    .{ .path = "Io.File.readPositional", .param = 2 },
+    .{ .path = "Io.Dir.readLink", .param = 3 },
+    .{ .path = "Io.Reader.readSliceShort", .param = 1 },
 };
 
 /// std's calls that keep the memory they are given at a parameter as storage, or write a part
@@ -62,7 +76,6 @@ const std_keeps = [_]Named{
     .{ .path = "Io.File.writerStreaming", .param = 2 },
     .{ .path = "Io.net.Stream.reader", .param = 2 },
     .{ .path = "Io.net.Stream.writer", .param = 2 },
-    .{ .path = "Io.Reader.readSliceShort", .param = 1 },
     .{ .path = "heap.FixedBufferAllocator.init", .param = 0 },
     .{ .path = "heap.BufferFirstAllocator.init", .param = 0 },
     .{ .path = "fmt.bufPrint", .param = 0 },
@@ -76,6 +89,16 @@ const std_keeps = [_]Named{
     .{ .path = "zig.Ast.fullCall", .param = 1 },
     .{ .path = "zig.Ast.builtinCallParams", .param = 1 },
     .{ .path = "zig.Ast.blockStatements", .param = 1 },
+    // A queue's ring: a get takes only what a put wrote.
+    .{ .path = "Io.Queue.init", .param = 0 },
+    .{ .path = "Io.Select.init", .param = 1 },
+    // A writer's or a reader's buffer, its end and seek at 0.
+    .{ .path = "debug.lockStderr", .param = 0 },
+    .{ .path = "compress.flate.Decompress.init", .param = 2 },
+    // The file's bytes into a prefix, returned as the slice they fill.
+    .{ .path = "Io.Dir.readFile", .param = 3 },
+    // The streams' length set, their contexts and storage for MultiReader.init to write.
+    .{ .path = "Io.File.MultiReader.Buffer.toStreams", .param = 0 },
 };
 
 const Named = struct { path: []const u8, param: usize };
@@ -305,6 +328,8 @@ const Walk = struct {
             .address_of => return if (w.param) read else try w.given(parent, true, key),
             .slice_open, .slice, .slice_sentinel => {
                 if ((tree.fullSlice(parent) orelse return read).ast.sliced != mention) return read;
+                // `buf[0..n]` with n the count a call that wrote that prefix returned.
+                if (try w.countedPrefix(parent)) return null;
                 return try w.given(parent, w.allOf(parent), key);
             },
             else => {
@@ -348,10 +373,21 @@ const Walk = struct {
         }
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| {
+            // `std.mem.asBytes(&x)`: all of x's bytes, handed on as the view is.
+            if (whole and call.ast.params.len == 1 and try w.isStd(parent, call, "mem.asBytes")) return w.given(parent, true, key);
             for (call.ast.params, 0..) |arg, position| if (arg == memory) return w.handedTo(parent, call, position, false, whole, key);
             return handed;
         }
         if (tree.fullFor(parent)) |loop| return w.forSets(parent, loop, memory, whole, key);
+        // `&.{&buf}`: a vector of buffers a call is given, each of which it is given.
+        var elements: [2]Ast.Node.Index = undefined;
+        if (tree.fullArrayInit(&elements, parent)) |literal| if (literal.ast.type_expr == .none) {
+            const address = w.model.parentOf(parent) orelse return handed;
+            if (tree.nodeTag(address) != .address_of) return handed;
+            const outer = w.model.parentOf(address) orelse return handed;
+            const call = tree.fullCall(&buffer, outer) orelse return handed;
+            for (call.ast.params, 0..) |arg, position| if (arg == address) return w.handedTo(outer, call, position, false, false, key);
+        };
         return handed;
     }
 
@@ -375,11 +411,22 @@ const Walk = struct {
         const written: Use = .{ .key = tree.lastToken(node), .effect = .write };
         const leaves = w.failureLeaves(node, origin);
         if (try named(w.c, &std_fills, origin, index)) return if (whole and leaves) written else null;
-        if (try named(w.c, &std_keeps, origin, index)) return null;
+        if (try named(w.c, &std_keeps, origin, index) or try named(w.c, &std_counts, origin, index)) return null;
         if (!w.c.project.at(origin.file).input.selected) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) return null;
         return handed;
+    }
+
+    /// Whether a call reaches std's declaration at `path`.
+    fn isStd(w: *Walk, node: Ast.Node.Index, call: Ast.full.Call, path: []const u8) Context.Error!bool {
+        const decl = (try w.callee(node, call)) orelse return false;
+        const origin = (try w.c.facts.origin(decl)) orelse decl;
+        for ((try Governed.declarations(w.c, "std", path)) orelse &.{}) |found| {
+            const target = (try w.c.facts.origin(found)) orelse found;
+            if (std.meta.eql(target, origin)) return true;
+        }
+        return false;
     }
 
     /// The function a call reaches: by its name, or a declaration literal (`.fixed(&buf)`) by
@@ -433,17 +480,92 @@ const Walk = struct {
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, loop.ast.then_expr) orelse (&loop.ast.then_expr)[0..1];
         for (statements) |each| {
-            // Only other elements set before it: nothing that reads it, branches or leaves.
-            if (tree.nodeTag(each) != .assign) return handed;
-            const target, const value = tree.nodeData(each).node_and_node;
-            if (names(tree, value, name)) return handed;
-            if (tree.nodeTag(target) != .deref) return handed;
-            const pointer = tree.nodeData(target).node;
-            if (tree.nodeTag(pointer) != .identifier) return handed;
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(pointer)), name)) continue;
-            return if (whole) .{ .key = tree.lastToken(node), .effect = .write } else null;
+            // Before it, only what neither reads the element nor leaves the pass.
+            if (names(tree, each, name) or leavesPass(tree, each)) {
+                if (tree.nodeTag(each) != .assign) return handed;
+                const target, const value = tree.nodeData(each).node_and_node;
+                if (names(tree, value, name) or leavesPass(tree, value)) return handed;
+                if (tree.nodeTag(target) != .deref) return handed;
+                const pointer = tree.nodeData(target).node;
+                if (tree.nodeTag(pointer) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(pointer)), name)) return handed;
+                return if (whole) .{ .key = tree.lastToken(node), .effect = .write } else null;
+            }
         }
         return handed;
+    }
+
+    /// Whether `slice` is the local from zero to a count one of std's calls returned of what
+    /// it wrote there (`const n = try file.readStreaming(io, &.{&buf}); buf[0..n]`): the count
+    /// a constant, its call given the local itself, alone, at the position the call writes; a
+    /// failure that gives a count gives 0.
+    fn countedPrefix(w: *Walk, slice: Ast.Node.Index) Context.Error!bool {
+        const tree = w.tree;
+        if (tree.nodeTag(slice) == .slice_sentinel) return false;
+        const full = tree.fullSlice(slice) orelse return false;
+        if (literalValue(tree, full.ast.start) != 0) return false;
+        var end = full.ast.end.unwrap() orelse return false;
+        // `@intCast(n)`: the same count, or a checked stop.
+        if (isBuiltin(tree, end, "@intCast")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, end, &buffer);
+            if (args.len != 1) return false;
+            end = args[0];
+        }
+        if (tree.nodeTag(end) != .identifier) return false;
+        const index = (w.model.reference(end) orelse return false).declaration orelse return false;
+        const count = w.model.declarations[@backingInt(index)];
+        if (count.kind != .variable) return false;
+        const variable = tree.fullVarDecl(count.node) orelse return false;
+        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+        var source = variable.ast.init_node.unwrap() orelse return false;
+        switch (tree.nodeTag(source)) {
+            .@"try" => source = tree.nodeData(source).node,
+            .@"catch" => {
+                const lhs, const rhs = tree.nodeData(source).node_and_node;
+                switch (tree.nodeTag(rhs)) {
+                    .@"return", .unreachable_literal => {},
+                    else => if (literalValue(tree, rhs) != 0) return false,
+                }
+                source = lhs;
+            },
+            else => {},
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, source) orelse return false;
+        const decl = (try w.callee(source, call)) orelse return false;
+        const origin = (try w.c.facts.origin(decl)) orelse decl;
+        var offset: usize = 0;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try w.c.facts.resolve(w.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+            .instance, .pointer, .optional => offset = 1,
+            else => {},
+        };
+        for (call.ast.params, 0..) |arg, position| {
+            if (!try named(w.c, &std_counts, origin, position + offset)) continue;
+            if (w.namesAlone(arg)) return true;
+        }
+        return false;
+    }
+
+    /// Whether `arg` is the local's address (`&buf`), all of it sliced, or a vector of it
+    /// alone (`&.{&buf}`).
+    fn namesAlone(w: *const Walk, arg: Ast.Node.Index) bool {
+        const tree = w.tree;
+        var at = arg;
+        if (tree.nodeTag(at) == .address_of) {
+            const inner = tree.nodeData(at).node;
+            var elements: [2]Ast.Node.Index = undefined;
+            if (tree.fullArrayInit(&elements, inner)) |literal| {
+                if (literal.ast.elements.len != 1) return false;
+                at = literal.ast.elements[0];
+            }
+        }
+        if (tree.nodeTag(at) == .address_of) at = tree.nodeData(at).node else if (tree.fullSlice(at) != null) {
+            if (!w.allOf(at)) return false;
+            at = tree.fullSlice(at).?.ast.sliced;
+        }
+        if (tree.nodeTag(at) != .identifier) return false;
+        const ref = w.model.reference(at) orelse return false;
+        return ref.declaration == w.local;
     }
 
     /// Whether a slice of the local is all of it: from zero, to its end or its length.
@@ -540,11 +662,31 @@ fn capture(tree: *const Ast, payload: Ast.TokenIndex, position: usize) ?[]const 
 }
 
 /// Whether an identifier spelled `name` appears in `node`.
+fn isBuiltin(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name),
+        else => false,
+    };
+}
+
 fn names(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
     var token = tree.firstToken(node);
     while (token <= tree.lastToken(node)) : (token += 1) {
+        // A member's name (`rule.definition`, `.definition = …`) names no local.
+        if (token > 0 and tree.tokenTag(token - 1) == .period) continue;
         if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
     }
+    return false;
+}
+
+/// Whether `node` holds a way out of a `for` pass that skips what follows in it: `break`,
+/// `continue` or `return`. An error `try` returns leaves the function, past every read.
+fn leavesPass(tree: *const Ast, node: Ast.Node.Index) bool {
+    var token = tree.firstToken(node);
+    while (token <= tree.lastToken(node)) : (token += 1) switch (tree.tokenTag(token)) {
+        .keyword_break, .keyword_continue, .keyword_return => return true,
+        else => {},
+    };
     return false;
 }
 
