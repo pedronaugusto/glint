@@ -81,7 +81,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -959,29 +959,75 @@ test "A009 leaves a position the program checked against the memory's length, an
     , 1);
 }
 
-test "A009 reads a fixed array's length check as a slice's: a position checked against it is within, one checked against another array's or unchecked is not" {
+test "A009 reads a fixed array's length check where the position has no numeric bound: an enum's backing integer checked against the array is within; unchecked, or checked against another array, it is not" {
+    // `@backingInt` of a non-exhaustive enum gives Range no bound; the check on line 8 is
+    // what keeps line 9. Findings: unchecked (12) and checked against `wide` (17).
     const found = try run(pack.untrusted_input,
         \\const std = @import("std");
-        \\pub fn f(r: *std.Io.Reader) !u8 {
-        \\    const table: [16]u8 = @splat(0);
-        \\    const other: [32]u8 = @splat(0);
-        \\    const i = try r.takeInt(u32, .little);
-        \\    if (i >= table.len) return error.Short;
-        \\    _ = table[i];
-        \\    const j = try r.takeInt(u32, .little);
-        \\    if (j >= other.len) return error.Short;
-        \\    _ = table[j];
-        \\    const k = try r.takeInt(u32, .little);
-        \\    return table[k];
+        \\const Rule = enum(u16) { a, b, _ };
+        \\const Config = struct {
+        \\    enabled: [64]bool = @splat(false),
+        \\    wide: [128]bool = @splat(false),
+        \\    fn has(self: Config, rule: Rule) bool {
+        \\        const index = @backingInt(rule);
+        \\        if (index >= self.enabled.len) return false;
+        \\        return self.enabled[index];
+        \\    }
+        \\    fn raw(self: Config, rule: Rule) bool {
+        \\        return self.enabled[@backingInt(rule)];
+        \\    }
+        \\    fn other(self: Config, rule: Rule) bool {
+        \\        const index = @backingInt(rule);
+        \\        if (index >= self.wide.len) return false;
+        \\        return self.enabled[index];
+        \\    }
+        \\};
+        \\pub fn f(r: *std.Io.Reader) !bool {
+        \\    const c: Config = .{};
+        \\    const rule: Rule = @enumFromInt(try r.takeInt(u16, .little));
+        \\    return c.has(rule) and c.raw(rule) and c.other(rule);
         \\}
     );
     try std.testing.expectEqual(@as(usize, 2), found.findings);
-    try std.testing.expectEqualSlices(u32, &.{ 10, 12 }, found.lines[0..2]);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 17 }, found.lines[0..2]);
+}
+
+test "A009 reads a vectored read's buffers as input: each one the vector names, given in place, held in a local, or a parameter the caller fills" {
+    // Input reaches buf (line 5), more through a named part in a local vector (10) and the
+    // caller's own (21); clean (13) is never read into, and a value printed in a tuple (12) is
+    // a copy the call does not write.
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(io: std.Io, file: std.Io.File, w: *std.Io.Writer) !u8 {
+        \\    var buf: [8]u8 = undefined;
+        \\    _ = try file.readStreaming(io, &.{&buf});
+        \\    var sum = buf[buf[0]];
+        \\    var more: [8]u8 = undefined;
+        \\    const part: []u8 = more[0..];
+        \\    var vec = [_][]u8{part};
+        \\    _ = try file.readPositional(io, &vec, 0);
+        \\    sum +%= more[more[1]];
+        \\    const clean: [8]u8 = @splat(0);
+        \\    try w.print("{d}{d}", .{ clean[0], buf[1] });
+        \\    return sum +% clean[clean[0]];
+        \\}
+        \\fn into(io: std.Io, file: std.Io.File, out: []u8) !void {
+        \\    _ = try file.readStreaming(io, &.{ out[0..1], out[1..] });
+        \\}
+        \\pub fn g(io: std.Io, file: std.Io.File) !u8 {
+        \\    var own: [8]u8 = undefined;
+        \\    try into(io, file, &own);
+        \\    return own[own[0]];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), found.findings);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 10, 21 }, found.lines[0..3]);
 }
 
 test "A009 gives no bound where an integer type's width overflows Range's own arithmetic: a `u65535` beside a signed peer is read, not a panic" {
     // Before the width was added checked, reading `wide + narrow` overflowed a u16 in glint.
-    _ = try run(pack.untrusted_input,
+    // The type is then unknown, so the position is not shown within: a finding (line 7).
+    const found = try run(pack.untrusted_input,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !u8 {
         \\    var buf: [8]u8 = undefined;
@@ -991,6 +1037,8 @@ test "A009 gives no bound where an integer type's width overflows Range's own ar
         \\    return buf[wide + narrow];
         \\}
     );
+    try std.testing.expectEqual(@as(usize, 1), found.findings);
+    try std.testing.expectEqual(@as(u32, 7), found.lines[0]);
 }
 
 test "A009 trusts a table's own id by its type, and reports each id made from an integer that does not count the table's entries" {

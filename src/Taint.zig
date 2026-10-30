@@ -464,8 +464,9 @@ fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level) Context
 }
 
 /// A store of `value` into `target`: a local, a container-level variable or a field by its
-/// declaration, the local an element or part of it belongs to, or the memory a parameter
-/// points at (the function then fills it).
+/// declaration, the local an element or part of it belongs to, each memory a literal names
+/// by address or part (`&.{ &buf, rest[0..] }`; a value in it, as a `print`'s `.{name}`, is
+/// a copy no callee writes), or the memory a parameter points at (the function then fills it).
 fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index, value: Dep) Context.Error!void {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
@@ -478,10 +479,14 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
             if (decl.kind == .parameter) return;
             const scope = model.scopes[@backingInt(decl.scope)].kind;
             if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value));
-            // A store through a local holding another's address (`const p = &x; p.* = v`)
-            // writes that other.
+            // A store through a local holding another's memory (`const p = &x; p.* = v`, a part
+            // of it `x[0..n]`, or a vector of them `[_][]u8{&x}`) writes that other.
             if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
-                if (tree.nodeTag(init) == .address_of) try store(c, flow, function, tree.nodeData(init).node, value);
+                var buffer: [2]Ast.Node.Index = undefined;
+                switch (tree.nodeTag(init)) {
+                    .address_of, .slice_open, .slice, .slice_sentinel => try store(c, flow, function, init, value),
+                    else => if (tree.fullArrayInit(&buffer, init) != null) try store(c, flow, function, init, value),
+                }
             };
             return raiseLocal(c, flow, .{ .file = f.file, .index = d }, value);
         },
@@ -498,7 +503,14 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
         .deref, .address_of => return store(c, flow, function, tree.nodeData(target).node, value),
         .grouped_expression, .unwrap_optional => return store(c, flow, function, tree.nodeData(target).node_and_token[0], value),
         .slice_open, .slice, .slice_sentinel => return store(c, flow, function, (tree.fullSlice(target) orelse return).ast.sliced, value),
-        else => {},
+        else => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const vector = tree.fullArrayInit(&buffer, target) orelse return;
+            for (vector.ast.elements) |element| switch (tree.nodeTag(element)) {
+                .address_of, .slice_open, .slice, .slice_sentinel => try store(c, flow, function, element, value),
+                else => {},
+            };
+        },
     }
 }
 
@@ -635,6 +647,11 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!u64 {
 /// A read fills `arg`'s memory with the fact: the local it is rooted at, or the parameter's
 /// memory it points into (the function then fills that parameter for its callers).
 fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!void {
+    // A read's vector is a list of buffers: it fills each one it names, values among them.
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (vectorOf(c, flow.functions.items[@backingInt(function)].file, &buffer, arg)) |elements| {
+        for (elements) |element| try fill(c, flow, function, element);
+    }
     if (rootParam(c, flow, function, arg)) |index| {
         if (flow.functions.items[@backingInt(function)].fills & bit(index) == 0) {
             flow.functions.items[@backingInt(function)].fills |= bit(index);
@@ -643,6 +660,29 @@ fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Co
         return;
     }
     try store(c, flow, function, arg, .{ .level = .data });
+}
+
+/// The buffers a vector given to a read names: a literal (`&.{ &buf, rest }`), or the literal
+/// a local vector was made with (`var vec = [_][]u8{ &buf, rest }; read(&vec)`).
+fn vectorOf(c: *Context, file: Project.FileId, buffer: *[2]Ast.Node.Index, arg: Ast.Node.Index) ?[]const Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = arg;
+    var named = false;
+    while (true) switch (tree.nodeTag(at)) {
+        .address_of => at = tree.nodeData(at).node,
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .identifier => {
+            if (named) return null;
+            named = true;
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const decl = model.declarations[@backingInt(d)];
+            if (decl.kind != .variable) return null;
+            const variable = tree.fullVarDecl(decl.node) orelse return null;
+            at = variable.ast.init_node.unwrap() orelse return null;
+        },
+        else => return (tree.fullArrayInit(buffer, at) orelse return null).ast.elements,
+    };
 }
 
 fn bit(index: usize) u64 {
@@ -1623,7 +1663,12 @@ fn storeSites(c: *Context, flow: *Flow) Context.Error!*StoreSites {
             var call_buffer: [1]Ast.Node.Index = undefined;
             const made = tree.fullCall(&call_buffer, node) orelse continue;
             if ((try resolveCall(c, flow, file, made)).kind != .source) continue;
-            for (made.ast.params) |arg| if (try storedDecl(c, file, arg)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
+            for (made.ast.params) |arg| {
+                var vector_buffer: [2]Ast.Node.Index = undefined;
+                const elements = vectorOf(c, file, &vector_buffer, arg) orelse &.{};
+                for (elements) |element| if (try storedDecl(c, file, element)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
+                if (try storedDecl(c, file, arg)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
+            }
         }
     }
     return memo;
