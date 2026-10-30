@@ -20,6 +20,7 @@ const std_files = [_]sources.Extra{
     \\pub const array_hash_map = @import("array_hash_map.zig");
     \\pub const math = @import("math.zig");
     \\pub const zig = @import("zig.zig");
+    \\pub const fmt = @import("fmt.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -69,6 +70,7 @@ const std_files = [_]sources.Extra{
     \\pub const timing_safe = @import("crypto/timing_safe.zig");
     \\pub const sign = struct { pub const Ed25519 = @import("crypto/ed25519.zig").Ed25519; };
     \\pub fn secureZero(comptime T: type, s: []volatile T) void { for (s) |*b| b.* = 0; }
+    \\pub const hash = struct { pub const sha2 = @import("crypto/sha2.zig"); };
     },
     .{ .name = "std/crypto/timing_safe.zig", .bytes =
     \\pub fn eql(comptime T: type, a: T, b: T) bool { return a == b; }
@@ -142,6 +144,14 @@ const std_files = [_]sources.Extra{
     \\    pub fn tokenSlice(tree: Ast, token: u32) []const u8 { return tree.source[token..]; }
     \\};
     },
+    .{ .name = "std/crypto/sha2.zig", .bytes =
+    \\pub const Sha256 = Sha2x32(256);
+    \\pub const Sha384 = Sha2x64(384);
+    \\pub const Sha512 = Sha2x64(512);
+    \\fn Sha2x32(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
+    \\fn Sha2x64(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
+    },
+    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }" },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .spelling = "std", .target = 0 },
@@ -161,6 +171,8 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "array_hash_map.zig", .target = 11 },
     .{ .from = 0, .spelling = "math.zig", .target = 15 },
     .{ .from = 0, .spelling = "zig.zig", .target = 16 },
+    .{ .from = 3, .spelling = "crypto/sha2.zig", .target = 17 },
+    .{ .from = 0, .spelling = "fmt.zig", .target = 18 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -783,6 +795,34 @@ test "A019 reads the program's function that only hands a buffer to std's keeps 
         \\pub fn f2(src: [4]u8) u8 { var dst: [4]u8 = undefined; for (src, &dst) |v, *d| { if (v == 0) continue; d.* = v; } return dst[0]; }
     );
     try std.testing.expectEqualSlices(u32, &.{ 14, 16 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads std's hashers as filling their output by declaration, and keeps as neither a fill nor a read: a buffer kept is still undefined to a direct read" {
+    // Filled (no finding): Sha512's init/update/final (line 9), Sha384's one-shot hash (10),
+    // Sha256's final (11), and a read through what bufPrint returns (16). Findings: a fixed
+    // writer's buffer read directly (12), a wrapper that keeps the buffer and also reads it (13),
+    // a same-named `fixed` that is not std's (14), a read past what bufPrint printed (15), and a
+    // program hasher's same-named `final` (17).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const W = struct { n: usize = 0 };
+        \\var stash: []u8 = &.{};
+        \\fn fixed(buffer: []u8) W { stash = buffer; return .{}; }
+        \\fn keepsAndReads(buf: []u8) std.Io.Writer { const w: std.Io.Writer = .fixed(buf); _ = buf[0]; return w; }
+        \\fn use(x: anytype) void { _ = x; }
+        \\const Sha = struct { pub fn init() Sha { return .{}; } pub fn final(d: *Sha, out: *[32]u8) void { _ = d; _ = out; } };
+        \\
+        \\pub fn h1() u8 { var out: [64]u8 = undefined; var d = std.crypto.hash.sha2.Sha512.init(); d.update("x"); d.final(&out); return out[0]; }
+        \\pub fn h2() u8 { var out: [48]u8 = undefined; std.crypto.hash.sha2.Sha384.hash("x", &out); return out[0]; }
+        \\pub fn h3() u8 { var out: [32]u8 = undefined; var d = std.crypto.hash.sha2.Sha256.init(); d.final(&out); return out[0]; }
+        \\pub fn p1() u8 { var buf: [8]u8 = undefined; const w: std.Io.Writer = .fixed(&buf); use(w); return buf[0]; }
+        \\pub fn p2() void { var buf: [8]u8 = undefined; use(keepsAndReads(&buf)); }
+        \\pub fn p3() void { var buf: [8]u8 = undefined; use(fixed(&buf)); }
+        \\pub fn p4(n: u8) !u8 { var buf: [8]u8 = undefined; const s = try std.fmt.bufPrint(&buf, "{d}", .{n}); return buf[s.len]; }
+        \\pub fn p5(n: u8) !u8 { var buf: [8]u8 = undefined; const s = try std.fmt.bufPrint(&buf, "{d}", .{n}); return s[0]; }
+        \\pub fn p6() u8 { var out: [32]u8 = undefined; var d = Sha.init(); d.final(&out); return out[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15, 17 }, found.lines[0..found.findings]);
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {

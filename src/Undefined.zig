@@ -32,7 +32,22 @@ const Ast = std.zig.Ast;
 const std_fills = [_]Named{
     .{ .path = "Io.Reader.readSliceAll", .param = 1 },
     .{ .path = "Io.random", .param = 1 },
+    // A hash's one-shot form and its `final` write the whole `*[digest_length]u8` out; each
+    // name stands for the generic it is made by (Sha256 for every Sha2x32, Sha512 for Sha2x64).
     .{ .path = "crypto.hash.sha2.Sha256.hash", .param = 1 },
+    .{ .path = "crypto.hash.sha2.Sha256.final", .param = 1 },
+    .{ .path = "crypto.hash.sha2.Sha512.hash", .param = 1 },
+    .{ .path = "crypto.hash.sha2.Sha512.final", .param = 1 },
+    .{ .path = "crypto.hash.Sha1.hash", .param = 1 },
+    .{ .path = "crypto.hash.Sha1.final", .param = 1 },
+    .{ .path = "crypto.hash.Md5.hash", .param = 1 },
+    .{ .path = "crypto.hash.Md5.final", .param = 1 },
+    .{ .path = "crypto.hash.blake2.Blake2s256.hash", .param = 1 },
+    .{ .path = "crypto.hash.blake2.Blake2s256.final", .param = 1 },
+    .{ .path = "crypto.hash.blake2.Blake2b512.hash", .param = 1 },
+    .{ .path = "crypto.hash.blake2.Blake2b512.final", .param = 1 },
+    .{ .path = "crypto.hash.sha3.Sha3_256.hash", .param = 1 },
+    .{ .path = "crypto.hash.sha3.Sha3_256.final", .param = 1 },
     .{ .path = "mem.writeInt", .param = 1 },
     .{ .path = "crypto.secureZero", .param = 1 },
 };
