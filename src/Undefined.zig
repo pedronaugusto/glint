@@ -1749,7 +1749,7 @@ const Walk = struct {
             const inner = Facts.builtinArgs(tree, of, &buffer);
             return inner.len == 1 and w.isLocal(ungrouped(tree, inner[0]));
         }
-        return sameText(tree, of, kind);
+        return sameText(w.model, tree, of, kind);
     }
 
     /// What `cond` being true says of the guarding call: true where it shows the call wrote
@@ -1817,7 +1817,7 @@ const Walk = struct {
                 // The size given, a constant that is the local's own: what the call filled is
                 // all of it.
                 const size = call.ast.params[param];
-                if (!w.sizeOfLocal(size) or !sameText(tree, rhs, size)) return null;
+                if (!w.sizeOfLocal(size) or !sameText(w.model, tree, rhs, size)) return null;
                 return equal;
             },
             .length => {
@@ -2034,7 +2034,7 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
             .array_access => {
                 if (tree.nodeData(parent).node_and_node[0] != mention) return false;
                 if (assigned(model, tree, parent)) continue;
-                if (coveredBefore(model, tree, written.items, null, parent)) continue;
+                if (try coveredBefore(c, decl.file, written.items, null, parent)) continue;
                 return false;
             },
             .deref => {
@@ -2071,7 +2071,7 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
                             try written.append(c.allocator, .{ .part = parent, .statement = statementOf(model, tree, each) orelse return false });
                             continue;
                         }
-                        if (!coveredBefore(model, tree, written.items, parent, each)) return false;
+                        if (!try coveredBefore(c, decl.file, written.items, parent, each)) return false;
                     }
                     continue;
                 };
@@ -2084,7 +2084,7 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
             try written.append(c.allocator, .{ .part = if (memory == mention) null else memory, .statement = statementOf(model, tree, memory) orelse return false });
             continue;
         }
-        if (coveredBefore(model, tree, written.items, if (memory == mention) null else memory, memory)) continue;
+        if (try coveredBefore(c, decl.file, written.items, if (memory == mention) null else memory, memory)) continue;
         return false;
     }
     return true;
@@ -2135,6 +2135,8 @@ fn cursorCountRead(c: *Context, container: Facts.Container, memory: Facts.Decl) 
     }
     const counted = count orelse return null;
     const held = model.declarations[@backingInt(memory.index)].name;
+    // The selected files' uses are all that touch a writer this clears: one reaches only
+    // functions of the selected files (`keepsWriter`), never one outside them.
     for (try c.facts.memberUses(counted)) |use| {
         const holder = try holderOf(c, use, container);
         if (holder == .other) continue;
@@ -2189,12 +2191,12 @@ fn stepsCount(c: *Context, use: Facts.Key, memory: []const u8) bool {
             // `x.bytes[x.pos..][0..k]`, the same `x`, `pos` and `k` as the step's.
             const part = tree.fullSlice(span) orelse return false;
             if (literalValue(tree, part.ast.start) != 0) return false;
-            if (!plain(tree, step) or !sameText(tree, part.ast.end.unwrap() orelse return false, step)) return false;
+            if (!plain(tree, step) or !sameText(model, tree, part.ast.end.unwrap() orelse return false, step)) return false;
             const rest = tree.fullSlice(part.ast.sliced) orelse return false;
-            if (rest.ast.end != .none or !sameText(tree, rest.ast.start, use.node)) return false;
+            if (rest.ast.end != .none or !sameText(model, tree, rest.ast.start, use.node)) return false;
             const held = rest.ast.sliced;
             if (tree.nodeTag(held) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(held).node_and_token[1]), memory)) return false;
-            if (!sameText(tree, tree.nodeData(held).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return false;
+            if (!sameText(model, tree, tree.nodeData(held).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return false;
             return true;
         },
         .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => return tree.nodeData(parent).node_and_node[0] != use.node,
@@ -2247,7 +2249,7 @@ fn keepsBelow(c: *Context, use: Facts.Key, count: []const u8) bool {
             if (literalValue(tree, slice.ast.start) == 0) if (slice.ast.end.unwrap()) |end| {
                 if (tree.nodeTag(end) == .field_access and
                     std.mem.eql(u8, tree.tokenSlice(tree.nodeData(end).node_and_token[1]), count) and
-                    sameText(tree, tree.nodeData(end).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return true;
+                    sameText(model, tree, tree.nodeData(end).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return true;
             };
             // A part, or a part of it, written whole.
             var part = parent;
@@ -2415,11 +2417,13 @@ fn statementOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast
 /// Whether `use`, all of a parameter's memory (`part` null) or the part `part` of it, was
 /// written by one of `written`'s statements before it in a block that holds it: the same part,
 /// spelled alike, or all of it; with nothing between assigning a name the part's bounds spell.
-fn coveredBefore(model: *const Model, tree: *const Ast, written: anytype, part: ?Ast.Node.Index, use: Ast.Node.Index) bool {
+fn coveredBefore(c: *Context, file: Project.FileId, written: anytype, part: ?Ast.Node.Index, use: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     for (written) |each| {
         if (each.part) |done| {
             const wanted = part orelse continue;
-            if (!sameText(tree, done, wanted)) continue;
+            if (!sameText(model, tree, done, wanted)) continue;
         }
         const block = model.parentOf(each.statement) orelse continue;
         var at = use;
@@ -2427,63 +2431,122 @@ fn coveredBefore(model: *const Model, tree: *const Ast, written: anytype, part: 
             if (parent == block) break at;
         } else continue;
         if (statement == each.statement or tree.firstToken(statement) <= tree.lastToken(each.statement)) continue;
-        if (each.part) |done| if (boundsAssigned(tree, done, tree.lastToken(each.statement), tree.firstToken(use))) continue;
+        // Through the end of the use's statement: what runs in it before the use, in any order.
+        if (each.part) |done| if (try boundsChanged(c, file, done, tree.lastToken(each.statement), tree.lastToken(statement))) continue;
         return true;
     }
     return false;
 }
 
-/// Whether two nodes are spelled with the same tokens.
-fn sameText(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+/// Whether two nodes are spelled with the same tokens, each name naming the same declaration.
+fn sameText(model: *const Model, tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
     const a_first = tree.firstToken(a);
     const b_first = tree.firstToken(b);
     const len = tree.lastToken(a) - a_first;
     if (tree.lastToken(b) - b_first != len) return false;
     for (0..len + 1) |i| {
         const at: Ast.TokenIndex = @intCast(i);
-        if (!std.mem.eql(u8, tree.tokenSlice(a_first + at), tree.tokenSlice(b_first + at))) return false;
+        const x = a_first + at;
+        const y = b_first + at;
+        if (!std.mem.eql(u8, tree.tokenSlice(x), tree.tokenSlice(y))) return false;
+        if (tree.tokenTag(x) != .identifier or (x > 0 and tree.tokenTag(x - 1) == .period)) continue;
+        const name = tree.tokenSlice(x);
+        if (model.lookup(model.scopeOf(x), name, x) != model.lookup(model.scopeOf(y), name, y)) return false;
     }
     return true;
 }
 
-/// Whether the bounds of `slice` may differ between tokens `from` and `to`: they spell more
-/// than names, numbers, a name's `.len` and arithmetic (a field, a dereference, a call, which
-/// what runs between may change), or a name they spell is assigned between, or has its address
-/// taken anywhere in the file, through which anything may change it.
-fn boundsAssigned(tree: *const Ast, slice: Ast.Node.Index, from: Ast.TokenIndex, to: Ast.TokenIndex) bool {
-    // The sliced memory's own name is the parameter, which nothing in Zig reassigns here.
-    var token = tree.firstToken(slice) + 1;
-    while (token <= tree.lastToken(slice)) : (token += 1) {
-        switch (tree.tokenTag(token)) {
-            .identifier => {},
-            .period => {
-                if (!std.mem.eql(u8, tree.tokenSlice(token + 1), "len") or tree.tokenTag(token - 1) != .identifier) return true;
-                token += 1;
-                continue;
-            },
-            .number_literal, .l_bracket, .r_bracket, .ellipsis2, .plus, .minus, .asterisk, .r_paren => continue,
-            .l_paren => {
-                if (tree.tokenTag(token - 1) == .identifier or tree.tokenTag(token - 1) == .builtin) return true;
-                continue;
-            },
-            else => return true,
-        }
-        const name = tree.tokenSlice(token);
-        for (0..tree.tokens.len - 1) |i| {
-            const address: Ast.TokenIndex = @intCast(i);
-            if (tree.tokenTag(address) == .ampersand and std.mem.eql(u8, tree.tokenSlice(address + 1), name)) return true;
-        }
-        var at = from;
-        while (at < to) : (at += 1) {
-            if (tree.tokenTag(at) != .identifier or !std.mem.eql(u8, tree.tokenSlice(at), name)) continue;
-            if (at > 0 and tree.tokenTag(at - 1) == .period) continue;
-            switch (tree.tokenTag(at + 1)) {
-                .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal, .plus_percent_equal, .minus_percent_equal, .asterisk_percent_equal, .plus_pipe_equal, .minus_pipe_equal, .asterisk_pipe_equal, .ampersand_equal, .pipe_equal, .caret_equal, .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_left_pipe_equal, .angle_bracket_angle_bracket_right_equal => return true,
+/// Whether the bounds of `slice` may differ between tokens `from` and `to`, by what each name
+/// in them declares. Numbers, arithmetic, and names that cannot change there keep their value:
+/// a constant, a parameter, a capture, a local `var` nothing assigns between and whose address
+/// nothing takes; a container's constant (of each type a choice may give); the length of an
+/// array, or of a slice such a name holds. Anything else (a field of a value, a dereference, a
+/// call) may change.
+fn boundsChanged(c: *Context, file: Project.FileId, slice: Ast.Node.Index, from: Ast.TokenIndex, to: Ast.TokenIndex) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const full = tree.fullSlice(slice) orelse return true;
+    switch (tree.nodeTag(full.ast.sliced)) {
+        .identifier => {},
+        .slice_open, .slice, .slice_sentinel => if (try boundsChanged(c, file, full.ast.sliced, from, to)) return true,
+        else => return true,
+    }
+    if (!try fixedBetween(c, file, full.ast.start, from, to, 0)) return true;
+    if (full.ast.end.unwrap()) |end| if (!try fixedBetween(c, file, end, from, to, 0)) return true;
+    if (full.ast.sentinel.unwrap()) |sentinel| if (!try fixedBetween(c, file, sentinel, from, to, 0)) return true;
+    return false;
+}
+
+fn fixedBetween(c: *Context, file: Project.FileId, node: Ast.Node.Index, from: Ast.TokenIndex, to: Ast.TokenIndex, depth: u8) Context.Error!bool {
+    if (depth == 16) return false;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    switch (tree.nodeTag(node)) {
+        .number_literal => return true,
+        .grouped_expression => return fixedBetween(c, file, tree.nodeData(node).node_and_token[0], from, to, depth + 1),
+        .add, .sub, .mul, .div, .mod, .shl, .shr, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return try fixedBetween(c, file, lhs, from, to, depth + 1) and try fixedBetween(c, file, rhs, from, to, depth + 1);
+        },
+        .identifier => {
+            const decl = (model.reference(node) orelse return false).declaration orelse return false;
+            const record = model.declarations[@backingInt(decl)];
+            switch (record.kind) {
+                .parameter, .capture => return true,
+                .function, .field => return false,
+                .variable => {},
+            }
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) return true;
+            // A container's `var` is anyone's to change; a local's changes only where named.
+            switch (model.scopes[@backingInt(record.scope)].kind) {
+                .file, .container => return false,
                 else => {},
             }
-        }
+            for (model.references) |ref| {
+                if (ref.declaration != decl) continue;
+                const parent = model.parentOf(ref.node) orelse continue;
+                switch (tree.nodeTag(parent)) {
+                    .address_of, .assign_destructure => return false,
+                    else => {},
+                }
+                if (ref.token < from or ref.token > to) continue;
+                if (std.mem.startsWith(u8, @tagName(tree.nodeTag(parent)), "assign") and tree.nodeData(parent).node_and_node[0] == ref.node) return false;
+            }
+            return true;
+        },
+        .field_access => {
+            const held, const name = tree.nodeData(node).node_and_token;
+            const value = try c.facts.resolve(file, held);
+            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) switch (value) {
+                .array => return true,
+                .pointer => |inner| switch (inner.*) {
+                    .array => return true,
+                    .container, .instance, .unknown => return false,
+                    else => return fixedBetween(c, file, held, from, to, depth + 1),
+                },
+                else => {},
+            };
+            const member = try Model.identifier(c.allocator, tree.tokenSlice(name));
+            return switch (value) {
+                .container => |container| constantMember(c, container, member),
+                .alternatives => |each| for (each) |one| {
+                    if (one != .container or !constantMember(c, one.container, member)) break false;
+                } else true,
+                else => false,
+            };
+        },
+        else => return false,
     }
-    return false;
+}
+
+/// Whether `container` declares `name` a constant.
+fn constantMember(c: *Context, container: Facts.Container, name: []const u8) bool {
+    const decl = c.facts.member(container, name) orelse return false;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return false;
+    const tree = &c.project.at(decl.file).file.tree;
+    const variable = tree.fullVarDecl(record.node) orelse return false;
+    return tree.tokenTag(variable.ast.mut_token) == .keyword_const;
 }
 
 /// A function's parameter at `index`: its declaration, where its type is a pointer (one the
