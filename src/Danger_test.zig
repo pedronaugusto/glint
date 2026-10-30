@@ -975,6 +975,15 @@ test "A019 reads hexToBytes as writing all of its output where it succeeds on an
     try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9, 10, 11 }, found.lines[0..found.findings]);
 }
 
+test "A019 takes no input as twice as long as an output whose doubled length a u64 cannot count" {
+    // Twice 2^63 is no 0: the output stays unwritten past a test of an empty input (2).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\pub fn j(text: []const u8) u8 { var big: [9223372036854775808]u8 = undefined; const hex = text.len == 0 and if (std.fmt.hexToBytes(&big, text)) |_| true else |_| false; if (!hex) return 0; return big[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{2}, found.lines[0..found.findings]);
+}
+
 test "A019 reads a field used in place as written once it is set, unless something converts a pointer to that field of that struct back to its parent" {
     // Safe: a field set, then a method called on it (5), where the only conversion of a field
     // so named gives another struct (2). Unsafe: the same where a conversion gives this struct
