@@ -66,34 +66,64 @@ pub const Level = enum(u2) {
 /// parameters it depends on: fully; made a number (a parameter's data shifted or multiplied);
 /// kept to a range the program chose (a parameter's number masked or truncated: data); or,
 /// through a call that did not resolve, at most as unknown.
+///
+/// Memory also has a length, which is not what it holds: `out[0..n]` holds the program's
+/// bytes in a length the peer chose. `length` and `lengths` are that length's level and the
+/// slots it depends on (`lengthSlot`): a parameter's value as a bound, or a parameter's own
+/// length. What the memory holds stays the program's; its `.len` is the peer's.
 pub const Dep = struct {
     level: Level = .clean,
     params: u64 = 0,
     numbers: u64 = 0,
     ranged: u64 = 0,
     maybe: u64 = 0,
+    length: Level = .clean,
+    lengths: u64 = 0,
 
     pub fn join(a: Dep, b: Dep) Dep {
-        return .{ .level = a.level.join(b.level), .params = a.params | b.params, .numbers = a.numbers | b.numbers, .ranged = a.ranged | b.ranged, .maybe = a.maybe | b.maybe };
+        return .{ .level = a.level.join(b.level), .params = a.params | b.params, .numbers = a.numbers | b.numbers, .ranged = a.ranged | b.ranged, .maybe = a.maybe | b.maybe, .length = a.length.join(b.length), .lengths = a.lengths | b.lengths };
     }
     fn lowered(a: Dep) Dep {
-        return .{ .level = if (a.level == .clean) .clean else .unknown, .maybe = a.params | a.numbers | a.ranged | a.maybe };
+        return .{ .level = if (a.level == .clean) .clean else .unknown, .maybe = a.params | a.numbers | a.ranged | a.maybe, .length = a.length, .lengths = a.lengths };
     }
     /// Data made a number: a shift or a product of it, or what std decodes from it.
     fn widened(a: Dep) Dep {
-        return .{ .level = if (a.level == .data) .number else a.level, .params = a.params, .numbers = a.numbers | a.params | a.ranged, .maybe = a.maybe };
+        return .{ .level = if (a.level == .data) .number else a.level, .params = a.params, .numbers = a.numbers | a.params | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths };
     }
     /// A value kept to a range the program chose: a number is data there.
     fn narrowed(a: Dep) Dep {
-        return .{ .level = if (a.level == .number) .data else a.level, .ranged = a.params | a.numbers | a.ranged, .maybe = a.maybe };
+        return .{ .level = if (a.level == .number) .data else a.level, .ranged = a.params | a.numbers | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths };
+    }
+    /// Its length read as a value (`.len`): within the memory, so data at most.
+    fn measured(a: Dep) Dep {
+        return .{ .level = if (a.length == .number) .data else a.length, .ranged = a.lengths };
+    }
+    /// Memory whose length is this value (a slice's bound): data at most.
+    fn sizing(a: Dep) Dep {
+        return .{ .length = if (a.level == .number) .data else a.level, .lengths = a.params | a.numbers | a.ranged | a.maybe };
+    }
+    /// What it holds, with no length.
+    fn held(a: Dep) Dep {
+        return .{ .level = a.level, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe };
     }
     fn clean(a: Dep) bool {
-        return a.level == .clean and a.params == 0 and a.numbers == 0 and a.ranged == 0 and a.maybe == 0;
+        return a.level == .clean and a.params == 0 and a.numbers == 0 and a.ranged == 0 and a.maybe == 0 and a.length == .clean and a.lengths == 0;
     }
     fn eql(a: Dep, b: Dep) bool {
-        return a.level == b.level and a.params == b.params and a.numbers == b.numbers and a.ranged == b.ranged and a.maybe == b.maybe;
+        return a.level == b.level and a.params == b.params and a.numbers == b.numbers and a.ranged == b.ranged and a.maybe == b.maybe and a.length == b.length and a.lengths == b.lengths;
     }
 };
+
+/// The slot of a parameter's length among a function's levels: past the 32 values' slots. A
+/// function of more parameters shares a slot between a value and a length, each read as both.
+fn lengthSlot(index: usize) usize {
+    return if (index < 32) index + 32 else index;
+}
+
+/// How many levels a function of `n` parameters keeps: a value's and a length's for each.
+fn slots(n: usize) usize {
+    return if (n == 0) 0 else @max(n, 32 + @min(n, 32));
+}
 
 pub const Fact = enum { input, peer };
 
@@ -102,9 +132,13 @@ const Function = struct {
     node: Ast.Node.Index,
     /// Its parameters' declarations in order, the receiver first; null for an unnamed one.
     params: []const ?Model.Declaration.Id,
-    /// What its callers give each parameter.
+    /// What its callers give each parameter, and the length of each (`lengthSlot`).
     levels: []Level,
     ret: Dep = .{},
+    /// What it stores through each parameter, by position (`out.* = v`, `list.append(gpa, v)`,
+    /// `self.part = buf[0..n]` of a field outside the program): a summary as `ret` is, which
+    /// each call stores into its argument.
+    writes: []Dep,
     /// The parameters whose memory it fills with the fact (a buffer it reads into).
     fills: u64 = 0,
     /// Its comptime parameters: fixed when the program is compiled, so no input reaches them.
@@ -136,6 +170,8 @@ pub const Flow = struct {
     locals: std.AutoHashMapUnmanaged(Facts.Decl, Dep) = .empty,
     /// Fields and container-level variables, by declaration.
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
+    /// The lengths of the memory they hold, by declaration (`Dep.length`).
+    lengths: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
     std_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
     data_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -296,9 +332,11 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
             };
             try params.append(c.allocator, found);
         }
-        const levels = try c.allocator.alloc(Level, params.items.len);
+        const levels = try c.allocator.alloc(Level, slots(params.items.len));
         @memset(levels, .clean);
-        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .fixed = fixed });
+        const writes = try c.allocator.alloc(Dep, params.items.len);
+        @memset(writes, .{});
+        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .writes = writes, .fixed = fixed });
         try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @fromBackingInt(@intCast(flow.functions.items.len - 1)));
     }
     for (0..tree.nodes.len) |i| {
@@ -386,9 +424,10 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                     for (literal.ast.fields, fields) |value, field| {
                         // A number the parser shows the range of reaches the program as data
                         // held to that range, which a sink judges as it judges any value's.
-                        var level = concrete(flow, function, try dep(c, flow, function, value));
+                        const given = try dep(c, flow, function, value);
+                        var level = concrete(flow, function, given);
                         if (refined and level == .number and try shownField(c, f.file, value, field)) level = .data;
-                        try raiseGlobal(c, flow, field, level);
+                        try raiseGlobal(c, flow, field, level, concreteLength(flow, function, given));
                     }
                 };
                 if (isMemcpy(tree, node)) {
@@ -455,12 +494,16 @@ fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Er
     if (!now.eql(before)) flow.changed = true;
 }
 
-fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level) Context.Error!void {
-    if (level == .clean) return;
-    const entry = try flow.globals.getOrPut(c.allocator, decl);
-    const before: Level = if (entry.found_existing) entry.value_ptr.* else .clean;
-    entry.value_ptr.* = before.join(level);
-    if (entry.value_ptr.* != before) flow.changed = true;
+/// A field or a container-level variable given a value of `level` in memory of `length`.
+fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level, length: Level) Context.Error!void {
+    for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Level), Level }{ .{ &flow.globals, level }, .{ &flow.lengths, length } }) |each| {
+        const map, const raised = each;
+        if (raised == .clean) continue;
+        const entry = try map.getOrPut(c.allocator, decl);
+        const before: Level = if (entry.found_existing) entry.value_ptr.* else .clean;
+        entry.value_ptr.* = before.join(raised);
+        if (entry.value_ptr.* != before) flow.changed = true;
+    }
 }
 
 /// A store of `value` into `target`: a local, a container-level variable or a field by its
@@ -476,9 +519,19 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
             const ref = model.reference(target) orelse return;
             const d = ref.declaration orelse return;
             const decl = model.declarations[@backingInt(d)];
-            if (decl.kind == .parameter) return;
+            // A parameter is never assigned: a store reaching one goes through it, into its
+            // callers' memory.
+            if (decl.kind == .parameter) {
+                const index = f.position(d) orelse return;
+                const now = f.writes[index].join(value);
+                if (!now.eql(f.writes[index])) {
+                    f.writes[index] = now;
+                    flow.changed = true;
+                }
+                return;
+            }
             const scope = model.scopes[@backingInt(decl.scope)].kind;
-            if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value));
+            if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value), concreteLength(flow, function, value));
             // A store through a local holding another's memory (`const p = &x; p.* = v`, a part
             // of it `x[0..n]`, or a vector of them `[_][]u8{&x}`) writes that other.
             if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
@@ -495,7 +548,7 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
             // the store reaches only the value it belongs to.
             if (try c.facts.definition(f.file, target)) |decl| {
-                if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and c.project.at(decl.file).input.selected) return raiseGlobal(c, flow, decl, concrete(flow, function, value));
+                if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and c.project.at(decl.file).input.selected) return raiseGlobal(c, flow, decl, concrete(flow, function, value), concreteLength(flow, function, value));
             }
             return store(c, flow, function, tree.nodeData(target).node_and_token[0], value);
         },
@@ -545,14 +598,19 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call)
             const g = flow.functions.items[@backingInt(target)];
             for (callee.args.items, 0..) |arg, position| {
                 const index = position + callee.skip;
-                if (index >= g.levels.len) break;
+                if (index >= g.params.len) break;
                 if (g.fixed & bit(index) != 0) continue;
-                const level = concrete(flow, function, try dep(c, flow, function, arg));
-                if (level.join(g.levels[index]) != g.levels[index]) {
-                    flow.functions.items[@backingInt(target)].levels[index] = level.join(g.levels[index]);
-                    flow.changed = true;
+                const given = try dep(c, flow, function, arg);
+                for ([_]struct { usize, Level }{ .{ index, concrete(flow, function, given) }, .{ lengthSlot(index), concreteLength(flow, function, given) } }) |each| {
+                    const slot, const level = each;
+                    if (slot >= g.levels.len) continue;
+                    if (level.join(g.levels[slot]) != g.levels[slot]) {
+                        flow.functions.items[@backingInt(target)].levels[slot] = level.join(g.levels[slot]);
+                        flow.changed = true;
+                    }
                 }
                 if (g.fills & bit(index) != 0) try fill(c, flow, function, arg);
+                if (!g.writes[index].clean()) try store(c, flow, function, arg, try summarized(c, flow, function, callee, g.writes[index]));
             }
         },
         .source => {
@@ -700,6 +758,11 @@ fn concrete(flow: *const Flow, function: Function.Id, value: Dep) Level {
         if (value.maybe & bit(index) != 0 and given != .clean) level = level.join(.unknown);
     }
     return level;
+}
+
+/// The level of a dependence's length, with what callers give the function's parameters.
+fn concreteLength(flow: *const Flow, function: Function.Id, value: Dep) Level {
+    return concrete(flow, function, value.measured());
 }
 
 const Callee = struct {
@@ -911,11 +974,11 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
         .identifier => {
             const ref = model.reference(node) orelse return .{};
             const d = ref.declaration orelse return .{};
-            if (f.position(d)) |index| return .{ .params = bit(index) };
+            if (f.position(d)) |index| return .{ .params = bit(index), .lengths = bit(lengthSlot(index)) };
             const decl = model.declarations[@backingInt(d)];
             if (decl.kind == .variable or decl.kind == .capture) {
                 const scope = model.scopes[@backingInt(decl.scope)].kind;
-                if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean };
+                if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .length = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
                 return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
             }
             return .{};
@@ -925,10 +988,14 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             // An address is no number a peer chooses; a length is one within the memory the
             // program holds: data, which a sink judges against what it reaches.
             if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
-            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) return (try dep(c, flow, function, receiver)).narrowed();
+            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) {
+                const memory = try dep(c, flow, function, receiver);
+                return memory.held().narrowed().join(memory.measured());
+            }
             var out = try dep(c, flow, function, receiver);
             if (try c.facts.definition(f.file, node)) |decl| {
                 if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
+                if (flow.lengths.get(decl)) |length| out = out.join(.{ .length = length });
                 if (try stdIs(c, decl, &zig_text)) out = out.join(.{ .level = .data });
                 // A function or a type named through a value is no part of its data.
                 const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
@@ -937,7 +1004,17 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             return out;
         },
         .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
-        .slice_open, .slice, .slice_sentinel => return dep(c, flow, function, (tree.fullSlice(node) orelse return .{}).ast.sliced),
+        // A slice holds what it slices, in a length its bounds set: past its start to its end,
+        // or to the end of what it slices.
+        .slice_open, .slice, .slice_sentinel => {
+            const slice = tree.fullSlice(node) orelse return .{};
+            const memory = try dep(c, flow, function, slice.ast.sliced);
+            var out = memory.held().join((try dep(c, flow, function, slice.ast.start)).sizing());
+            if (slice.ast.end.unwrap()) |end| {
+                out = out.join((try dep(c, flow, function, end)).sizing());
+            } else out = out.join(.{ .length = memory.length, .lengths = memory.lengths });
+            return out;
+        },
         .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
         .deref, .address_of, .@"try", .negation, .negation_wrap, .bit_not => return dep(c, flow, function, tree.nodeData(node).node),
         // What is left of a length (`buf.len - at`) is bounded by it; a mask or a remainder by
@@ -1215,6 +1292,35 @@ fn labeled(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
     return out;
 }
 
+/// A summary of the program's callee (what it returns, or what it stores through a parameter),
+/// read at a call with its arguments: an argument's value in its slot, and its length in the
+/// length's, each as the summary holds it, as a value or as a length. Past 32 parameters the
+/// two slots are one, which holds both.
+fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, summary: Dep) Context.Error!Dep {
+    var out: Dep = .{ .level = summary.level, .length = summary.length };
+    for (callee.args.items, 0..) |arg, position| {
+        const index = position + callee.skip;
+        const given = try dep(c, flow, function, arg);
+        for ([_]struct { usize, Dep }{ .{ index, given }, .{ lengthSlot(index), given.measured() } }) |each| {
+            const slot, const held_there = each;
+            const there = bit(slot);
+            if (summary.params & there != 0) out = out.join(held_there);
+            if (summary.numbers & there != 0) out = out.join(held_there.widened());
+            if (summary.ranged & there != 0) out = out.join(held_there.narrowed());
+            if (summary.maybe & there != 0) out = out.join(held_there.lowered());
+            if (summary.lengths & there != 0) out = out.join(held_there.sizing());
+        }
+    }
+    return out;
+}
+
+/// What a function outside the program may make of an argument: what it holds, and its length,
+/// which a search's position or a count is within (`std.mem.indexOfScalar(u8, buf[0..n], 0)`).
+fn outsideArg(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!Dep {
+    const value = try dep(c, flow, function, arg);
+    return value.join(value.measured());
+}
+
 /// A call's result: the program's callee's summary read with these arguments, a read's input,
 /// what a function outside the program makes of what it is given, aegis's answer clean, and
 /// unknown from a callee that does not resolve.
@@ -1229,7 +1335,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
         .aegis => {
             if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| return .{ .level = flow.functions.items[@backingInt(target)].unrefined };
             var out: Dep = .{};
-            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            for (callee.args.items) |arg| out = out.join(try outsideArg(c, flow, function, arg));
             return out;
         },
         // What it holds: `init`'s value, the receiver of `lend`, `get`, `borrow` and `move`.
@@ -1239,16 +1345,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             return out;
         },
         .program => |target| {
-            const g = flow.functions.items[@backingInt(target)];
-            var out: Dep = .{ .level = g.ret.level };
-            for (callee.args.items, 0..) |arg, position| {
-                const index = position + callee.skip;
-                if (g.ret.params & bit(index) != 0) out = out.join(try dep(c, flow, function, arg));
-                if (g.ret.numbers & bit(index) != 0) out = out.join((try dep(c, flow, function, arg)).widened());
-                if (g.ret.ranged & bit(index) != 0) out = out.join((try dep(c, flow, function, arg)).narrowed());
-                if (g.ret.maybe & bit(index) != 0) out = out.join((try dep(c, flow, function, arg)).lowered());
-            }
-            return out;
+            return summarized(c, flow, function, callee, flow.functions.items[@backingInt(target)].ret);
         },
         .source => {
             if (try fixedClean(c, flow, function, call)) return .{};
@@ -1274,7 +1371,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             }
             // A function outside the program gives what it is given, its receiver among it.
             var out: Dep = .{};
-            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            for (callee.args.items) |arg| out = out.join(try outsideArg(c, flow, function, arg));
             const decl = callee.decl orelse return out;
             if (!flow.std_files.contains(@backingInt(decl.file))) return out;
             // A std function that answers a `usize` (a container's `count`, a position it finds
@@ -1293,7 +1390,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
         },
         .none => {
             var out: Dep = .{};
-            for (callee.args.items) |arg| out = out.join(try dep(c, flow, function, arg));
+            for (callee.args.items) |arg| out = out.join(try outsideArg(c, flow, function, arg));
             return out.lowered();
         },
     }
