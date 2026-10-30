@@ -1389,8 +1389,9 @@ test "positions std finds in input, a read's count and a value under a length st
 }
 
 test "A010 finds arithmetic on input that may overflow its type: a byte's sum and product as a number's" {
-    // `n + 1` and `len * 2` on a byte stop at 255 and 128; `count + 1` at the u32's top.
-    try expect(pack.integers, input_program, 3);
+    // `n + 1` and `len * 2` on a byte stop at 255 and 128; `count + 1` at the u32's top; the
+    // return adds `part.len`, a length the peer's byte chose, to a sum past the table's length.
+    try expect(pack.integers, input_program, 4);
 }
 
 test "A010 leaves what a number's range holds: arithmetic that cannot overflow its type and a conversion its destination holds, from a decode's width, a typed local, @as and a constant" {
@@ -5292,4 +5293,33 @@ test "A010 reads a slice's length as its bounds set it, apart from what it holds
     ;
     // Each difference, and no sum of the table's own days, sliced as far as the peer chose.
     try expect(pack.integers, program, 6);
+}
+
+test "A010 reads what a function stores through a parameter in its callers' memory: a value through a pointer, a slice through a pointer to it, and on through a caller that passes its own parameter" {
+    const program =
+        \\const std = @import("std");
+        \\fn setValue(out: *usize, r: *std.Io.Reader) !void {
+        \\    out.* = try r.takeInt(u16, .little);
+        \\}
+        \\fn setSlice(out: *[]u8, memory: *[512]u8, n: usize) void {
+        \\    out.* = memory[0..n];
+        \\}
+        \\fn relay(out: *usize, r: *std.Io.Reader) !void {
+        \\    try setValue(out, r);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    var x: usize = 0;
+        \\    try setValue(&x, r);
+        \\    var y: usize = 0;
+        \\    try relay(&y, r);
+        \\    var memory: [512]u8 = @splat(0);
+        \\    var s: []u8 = memory[0..0];
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    setSlice(&s, &memory, n);
+        \\    var z: usize = 0;
+        \\    z = 7;
+        \\    return (x - 1) +% (y - 1) +% (s.len - 1) +% (z - 1);
+        \\}
+    ;
+    try expect(pack.integers, program, 3);
 }

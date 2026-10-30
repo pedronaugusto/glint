@@ -135,6 +135,10 @@ const Function = struct {
     /// What its callers give each parameter, and the length of each (`lengthSlot`).
     levels: []Level,
     ret: Dep = .{},
+    /// What it stores through each parameter, by position (`out.* = v`, `list.append(gpa, v)`,
+    /// `self.part = buf[0..n]` of a field outside the program): a summary as `ret` is, which
+    /// each call stores into its argument.
+    writes: []Dep,
     /// The parameters whose memory it fills with the fact (a buffer it reads into).
     fills: u64 = 0,
     /// Its comptime parameters: fixed when the program is compiled, so no input reaches them.
@@ -330,7 +334,9 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
         }
         const levels = try c.allocator.alloc(Level, slots(params.items.len));
         @memset(levels, .clean);
-        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .fixed = fixed });
+        const writes = try c.allocator.alloc(Dep, params.items.len);
+        @memset(writes, .{});
+        try flow.functions.append(c.allocator, .{ .file = file, .node = node, .params = params.items, .levels = levels, .writes = writes, .fixed = fixed });
         try flow.by_node.put(c.allocator, .{ .file = file, .node = node }, @fromBackingInt(@intCast(flow.functions.items.len - 1)));
     }
     for (0..tree.nodes.len) |i| {
@@ -513,7 +519,17 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
             const ref = model.reference(target) orelse return;
             const d = ref.declaration orelse return;
             const decl = model.declarations[@backingInt(d)];
-            if (decl.kind == .parameter) return;
+            // A parameter is never assigned: a store reaching one goes through it, into its
+            // callers' memory.
+            if (decl.kind == .parameter) {
+                const index = f.position(d) orelse return;
+                const now = f.writes[index].join(value);
+                if (!now.eql(f.writes[index])) {
+                    f.writes[index] = now;
+                    flow.changed = true;
+                }
+                return;
+            }
             const scope = model.scopes[@backingInt(decl.scope)].kind;
             if (scope == .file or scope == .container) return raiseGlobal(c, flow, .{ .file = f.file, .index = d }, concrete(flow, function, value), concreteLength(flow, function, value));
             // A store through a local holding another's memory (`const p = &x; p.* = v`, a part
@@ -594,6 +610,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call)
                     }
                 }
                 if (g.fills & bit(index) != 0) try fill(c, flow, function, arg);
+                if (!g.writes[index].clean()) try store(c, flow, function, arg, try summarized(c, flow, function, callee, g.writes[index]));
             }
         },
         .source => {
@@ -1275,6 +1292,28 @@ fn labeled(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
     return out;
 }
 
+/// A summary of the program's callee (what it returns, or what it stores through a parameter),
+/// read at a call with its arguments: an argument's value in its slot, and its length in the
+/// length's, each as the summary holds it, as a value or as a length. Past 32 parameters the
+/// two slots are one, which holds both.
+fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, summary: Dep) Context.Error!Dep {
+    var out: Dep = .{ .level = summary.level, .length = summary.length };
+    for (callee.args.items, 0..) |arg, position| {
+        const index = position + callee.skip;
+        const given = try dep(c, flow, function, arg);
+        for ([_]struct { usize, Dep }{ .{ index, given }, .{ lengthSlot(index), given.measured() } }) |each| {
+            const slot, const held_there = each;
+            const there = bit(slot);
+            if (summary.params & there != 0) out = out.join(held_there);
+            if (summary.numbers & there != 0) out = out.join(held_there.widened());
+            if (summary.ranged & there != 0) out = out.join(held_there.narrowed());
+            if (summary.maybe & there != 0) out = out.join(held_there.lowered());
+            if (summary.lengths & there != 0) out = out.join(held_there.sizing());
+        }
+    }
+    return out;
+}
+
 /// What a function outside the program may make of an argument: what it holds, and its length,
 /// which a search's position or a count is within (`std.mem.indexOfScalar(u8, buf[0..n], 0)`).
 fn outsideArg(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!Dep {
@@ -1306,25 +1345,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             return out;
         },
         .program => |target| {
-            const g = flow.functions.items[@backingInt(target)];
-            var out: Dep = .{ .level = g.ret.level, .length = g.ret.length };
-            for (callee.args.items, 0..) |arg, position| {
-                const index = position + callee.skip;
-                const given = try dep(c, flow, function, arg);
-                // An argument's value in its slot, and its length in the length's: what the
-                // summary holds of each, as a value or as a length. Past 32 parameters the two
-                // slots are one, which holds both.
-                for ([_]struct { usize, Dep }{ .{ index, given }, .{ lengthSlot(index), given.measured() } }) |each| {
-                    const slot, const held_there = each;
-                    const there = bit(slot);
-                    if (g.ret.params & there != 0) out = out.join(held_there);
-                    if (g.ret.numbers & there != 0) out = out.join(held_there.widened());
-                    if (g.ret.ranged & there != 0) out = out.join(held_there.narrowed());
-                    if (g.ret.maybe & there != 0) out = out.join(held_there.lowered());
-                    if (g.ret.lengths & there != 0) out = out.join(held_there.sizing());
-                }
-            }
-            return out;
+            return summarized(c, flow, function, callee, flow.functions.items[@backingInt(target)].ret);
         },
         .source => {
             if (try fixedClean(c, flow, function, call)) return .{};
