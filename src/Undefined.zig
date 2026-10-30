@@ -25,6 +25,7 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Danger = @import("Danger.zig");
+const CContract = @import("CContract.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -128,6 +129,8 @@ pub fn reads(c: *Context, rule: Rule) Context.Error!void {
         const init = variable.ast.init_node.unwrap() orelse continue;
         if (tree.nodeTag(init) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "undefined")) continue;
         if (!Danger.atRuntime(c, decl.node)) continue;
+        // An array of no elements has no memory to leave undefined.
+        if (variable.ast.type_node.unwrap()) |kind| if (tree.nodeTag(kind) == .array_type and literalValue(tree, tree.nodeData(kind).node_and_node[0]) == 0) continue;
         const block = model.parentOf(decl.node) orelse continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, block) orelse continue;
@@ -149,6 +152,9 @@ pub fn reads(c: *Context, rule: Rule) Context.Error!void {
 const State = struct {
     at: enum { unwritten, written, done, left },
     parts: u64 = 0,
+    /// A call outside the program given all of it, which writes it when its result checks
+    /// (`CContract`): the walk takes it written where a test of that result shows it did.
+    guard: ?Guard = null,
 
     const unwritten: State = .{ .at = .unwritten };
     const written: State = .{ .at = .written };
@@ -161,8 +167,12 @@ const State = struct {
     }
 };
 
-const Effect = enum { read, handed, write };
-const Use = struct { key: Ast.TokenIndex, effect: Effect };
+/// A call that writes the local when its result checks, and the constant holding that result,
+/// where one does (`const rc = f(&x);`).
+const Guard = struct { call: Ast.Node.Index, entry: *const CContract.Entry, binding: ?Model.Declaration.Id };
+
+const Effect = enum { read, handed, write, guarded };
+const Use = struct { key: Ast.TokenIndex, effect: Effect, guard: ?Guard = null };
 
 /// One local's walk, or one parameter's (`param`): the memory a function's pointer parameter
 /// points at, which the walk shows written whole on every path that returns.
@@ -241,7 +251,7 @@ const Walk = struct {
             },
             else => {},
         }
-        if (!w.mentioned(node) and !w.returnsIn(node)) {
+        if (!w.mentioned(node) and !w.returnsIn(node) and !w.tests(node, state)) {
             // It leaves the local as it is, for what follows and for where a jump in it goes.
             w.jumpsIn(node, state);
             return state;
@@ -265,8 +275,14 @@ const Walk = struct {
         if (tree.fullIf(node)) |branch| {
             const after = try w.statement(branch.ast.cond_expr, state);
             if (after.at != .unwritten) return after;
-            const then = try w.statement(branch.ast.then_expr, after);
-            const otherwise = if (branch.ast.else_expr.unwrap()) |e| try w.statement(e, after) else after;
+            // A test of a guarding call's result writes the local on the side where it checks.
+            var then_start = after;
+            var else_start = after;
+            if (after.guard) |guard| if (w.checks(branch.ast.cond_expr, guard)) |holds| {
+                if (holds) then_start = .written else else_start = .written;
+            };
+            const then = try w.arm(branch.ast.then_expr, then_start);
+            const otherwise = if (branch.ast.else_expr.unwrap()) |e| try w.arm(e, else_start) else else_start;
             return merge(then, otherwise);
         }
         if (tree.fullSwitch(node)) |choice| {
@@ -279,7 +295,9 @@ const Walk = struct {
                     all = .done;
                     break;
                 };
-                const past = try w.statement(prong.ast.target_expr, after);
+                // `switch (errno(rc))` or a status: its `.SUCCESS` prong is where it checks.
+                const start: State = if (after.guard) |guard| (if (w.successProng(choice.ast.condition, prong, guard)) .written else after) else after;
+                const past = try w.arm(prong.ast.target_expr, start);
                 all = if (all) |sofar| merge(sofar, past) else past;
             }
             return w.leave(all orelse after);
@@ -316,6 +334,23 @@ const Walk = struct {
             return if (passes(tree, loop.ast.inputs[0])) body else state;
         }
         return w.simple(node, state);
+    }
+
+    /// Whether `node` is an `if` or a `switch` whose condition tests the result of the call
+    /// guarding the local, which writes it on one side.
+    fn tests(w: *const Walk, node: Ast.Node.Index, state: State) bool {
+        const guard = state.guard orelse return false;
+        if (w.tree.fullIf(node)) |branch| return w.checks(branch.ast.cond_expr, guard) != null;
+        if (w.tree.fullSwitch(node)) |choice| return w.isErrno(choice.ast.condition, guard) or w.isResult(choice.ast.condition, guard);
+        return false;
+    }
+
+    /// A branch walked from `start`: one a guarding call's check starts written reads nothing
+    /// unwritten, and its jumps take it written.
+    fn arm(w: *Walk, node: Ast.Node.Index, start: State) Context.Error!State {
+        if (start.at != .written) return w.statement(node, start);
+        w.jumpsIn(node, start);
+        return start;
     }
 
     /// Opens a construct a `break` may leave for its end.
@@ -386,7 +421,7 @@ const Walk = struct {
             const token = w.tree.nodeMainToken(mention);
             if (token < first or token > last) continue;
             const use = (try w.classify(mention)) orelse continue;
-            if (use.effect == .write and conditional(w.tree, w.model, mention, node)) continue;
+            if ((use.effect == .write or use.effect == .guarded) and conditional(w.tree, w.model, mention, node)) continue;
             if (earliest == null or use.key < earliest.?.use.key) earliest = .{ .use = use, .token = token };
         }
         for (w.outputs.items) |output| {
@@ -397,6 +432,20 @@ const Walk = struct {
         }
         const found = earliest orelse return state;
         if (found.use.effect == .write) return .written;
+        if (found.use.guard) |guard| {
+            // What follows it in the statement reads it only where its result checks.
+            for (w.mentions.items) |mention| {
+                const token = w.tree.nodeMainToken(mention);
+                if (token < first or token > last) continue;
+                const use = (try w.classify(mention)) orelse continue;
+                if (use.key <= found.use.key or use.effect == .write or use.effect == .guarded) continue;
+                if (w.behind(mention, guard, node)) continue;
+                w.read = token;
+                w.handed = use.effect == .handed;
+                return .done;
+            }
+            return .{ .at = .unwritten, .parts = state.parts, .guard = guard };
+        }
         w.read = found.token;
         w.handed = found.use.effect == .handed;
         return .done;
@@ -410,6 +459,8 @@ const Walk = struct {
         const key = tree.nodeMainToken(mention);
         const read: Use = .{ .key = key, .effect = .read };
         const parent = w.model.parentOf(mention) orelse return read;
+        // `@TypeOf(local)` is its type, known as the program compiles.
+        if (isBuiltin(tree, parent, "@TypeOf")) return null;
         switch (tree.nodeTag(parent)) {
             .field_access => {
                 // A parameter's slice or array pointer carries its own length.
@@ -522,6 +573,12 @@ const Walk = struct {
         const leaves = w.failureLeaves(node, origin);
         if (try named(w.c, &std_fills, origin, index)) return if (whole and leaves) written else null;
         if (try named(w.c, &std_keeps, origin, index) or try named(w.c, &std_counts, origin, index)) return null;
+        // A call outside the program writes what its contract names, on the results it names:
+        // a count's prefix, or a part, is kept; all of the local is written where it checks.
+        if (try CContract.find(w.c, origin, index)) |entry| {
+            if (entry.success == .count or !whole) return null;
+            return .{ .key = tree.lastToken(node), .effect = .guarded, .guard = .{ .call = node, .entry = entry, .binding = w.resultConstant(node) } };
+        }
         if (!w.c.project.at(origin.file).input.selected) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) return null;
@@ -654,7 +711,9 @@ const Walk = struct {
             else => {},
         };
         for (call.ast.params, 0..) |arg, position| {
-            if (!try named(w.c, &std_counts, origin, position + offset)) continue;
+            const counts = try named(w.c, &std_counts, origin, position + offset) or
+                if (try CContract.find(w.c, origin, position + offset)) |entry| entry.success == .count else false;
+            if (!counts) continue;
             if (w.namesAlone(arg)) return true;
         }
         return false;
@@ -734,6 +793,144 @@ const Walk = struct {
             if (found == null or w.tree.firstToken(node) > w.tree.firstToken(found.?)) found = node;
         }
         return found;
+    }
+
+    /// The constant a call's result is declared as (`const rc = f(&x);`), where it is one.
+    fn resultConstant(w: *const Walk, call: Ast.Node.Index) ?Model.Declaration.Id {
+        const parent = w.model.parentOf(call) orelse return null;
+        const variable = w.tree.fullVarDecl(parent) orelse return null;
+        if (w.tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.init_node.unwrap() != call) return null;
+        for (w.model.declarations, 0..) |each, d| {
+            if (each.kind == .variable and each.node == parent) return @fromBackingInt(@intCast(d));
+        }
+        return null;
+    }
+
+    /// Whether `node` is the guarding call's result: the call, or the constant it is held in.
+    fn isResult(w: *const Walk, node: Ast.Node.Index, guard: Guard) bool {
+        const at = ungrouped(w.tree, node);
+        if (at == guard.call) return true;
+        if (w.tree.nodeTag(at) != .identifier) return false;
+        const binding = guard.binding orelse return false;
+        const ref = w.model.reference(at) orelse return false;
+        return ref.declaration == binding;
+    }
+
+    /// Whether `node` is `errno(result)`: std's `posix.errno`, `c.errno` or `linux.errno` of
+    /// the guarding call's result, read as a call named `errno` of it alone.
+    fn isErrno(w: *const Walk, node: Ast.Node.Index, guard: Guard) bool {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = w.tree.fullCall(&buffer, ungrouped(w.tree, node)) orelse return false;
+        if (call.ast.params.len != 1 or !w.isResult(call.ast.params[0], guard)) return false;
+        const name = w.tree.tokenSlice(w.tree.lastToken(call.ast.fn_expr));
+        return std.mem.eql(u8, name, "errno");
+    }
+
+    /// What `cond` being true says of the guarding call: true where it shows the call wrote
+    /// (`rc == 0` for a call whose success is 0), false where its being false does (`rc != 0`),
+    /// null where it shows neither. `a and b` is true when either shows it true; `a or b` false
+    /// when either shows it false.
+    fn checks(w: *const Walk, cond: Ast.Node.Index, guard: Guard) ?bool {
+        const tree = w.tree;
+        const node = ungrouped(tree, cond);
+        switch (tree.nodeTag(node)) {
+            .bool_and => {
+                const a, const b = tree.nodeData(node).node_and_node;
+                return if (w.checks(a, guard) == true or w.checks(b, guard) == true) true else null;
+            },
+            .bool_or => {
+                const a, const b = tree.nodeData(node).node_and_node;
+                return if (w.checks(a, guard) == false or w.checks(b, guard) == false) false else null;
+            },
+            .equal_equal, .bang_equal, .greater_than, .greater_or_equal, .less_than, .less_or_equal => {},
+            else => return null,
+        }
+        var lhs, var rhs = tree.nodeData(node).node_and_node;
+        var op = tree.nodeTag(node);
+        // The result on the left: `0 != rc` is `rc != 0`.
+        if (!w.isResult(lhs, guard) and !w.isErrno(lhs, guard)) {
+            std.mem.swap(Ast.Node.Index, &lhs, &rhs);
+            op = switch (op) {
+                .greater_than => .less_than,
+                .less_than => .greater_than,
+                .greater_or_equal => .less_or_equal,
+                .less_or_equal => .greater_or_equal,
+                else => op,
+            };
+        }
+        const equal: ?bool = switch (op) {
+            .equal_equal => true,
+            .bang_equal => false,
+            else => null,
+        };
+        if (w.isErrno(lhs, guard)) {
+            // errno is SUCCESS exactly where a call answering -1 on failure did not fail.
+            switch (guard.entry.success) {
+                .zero, .errno => {},
+                else => return null,
+            }
+            return if (isMember(tree, rhs, "SUCCESS")) equal else null;
+        }
+        if (!w.isResult(lhs, guard)) return null;
+        switch (guard.entry.success) {
+            .zero => return if (literalValue(tree, rhs) == 0 or isMember(tree, rhs, "SUCCESS")) equal else null,
+            .nonzero => {
+                const is = equal orelse return null;
+                return if (literalValue(tree, rhs) == 0 or isMember(tree, rhs, "FALSE")) !is else null;
+            },
+            .positive => {
+                if (literalValue(tree, rhs) != 0) return null;
+                return switch (op) {
+                    .greater_than => true,
+                    .less_or_equal => false,
+                    else => null,
+                };
+            },
+            .size => |param| {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, guard.call) orelse return null;
+                if (param >= call.ast.params.len or !sameText(tree, rhs, call.ast.params[param])) return null;
+                return equal;
+            },
+            .count, .errno => return null,
+        }
+    }
+
+    /// Whether `prong` of a `switch` on `condition` runs only where the guarding call wrote:
+    /// its one item `.SUCCESS`, and the condition the call's errno or its status.
+    fn successProng(w: *const Walk, condition: Ast.Node.Index, prong: Ast.full.SwitchCase, guard: Guard) bool {
+        if (prong.ast.values.len != 1 or !isMember(w.tree, prong.ast.values[0], "SUCCESS")) return false;
+        if (w.isErrno(condition, guard)) return guard.entry.success == .zero or guard.entry.success == .errno;
+        return w.isResult(condition, guard) and guard.entry.success == .zero;
+    }
+
+    /// Whether `mention`, in statement `top`, runs only where the guarding call wrote: in the
+    /// branch of an `if` its condition shows the call wrote on, or after `and` or `or` a test
+    /// that shows it.
+    fn behind(w: *const Walk, mention: Ast.Node.Index, guard: Guard, top: Ast.Node.Index) bool {
+        const tree = w.tree;
+        var at = mention;
+        while (at != top) {
+            const up = w.model.parentOf(at) orelse return false;
+            switch (tree.nodeTag(up)) {
+                .bool_and => {
+                    const a, const b = tree.nodeData(up).node_and_node;
+                    if (b == at and w.checks(a, guard) == true) return true;
+                },
+                .bool_or => {
+                    const a, const b = tree.nodeData(up).node_and_node;
+                    if (b == at and w.checks(a, guard) == false) return true;
+                },
+                else => if (tree.fullIf(up)) |branch| {
+                    if (w.checks(branch.ast.cond_expr, guard)) |holds| {
+                        if (holds and branch.ast.then_expr == at) return true;
+                        if (!holds and branch.ast.else_expr.unwrap() == at) return true;
+                    }
+                },
+            }
+            at = up;
+        }
+        return false;
     }
 
     fn mentioned(w: *const Walk, node: Ast.Node.Index) bool {
@@ -1067,7 +1264,7 @@ fn merge(a: State, b: State) State {
     if (a.at == .written and b.at == .written) return .written;
     // Written on some paths only: a read that follows may read it undefined, past the parts
     // every path wrote.
-    return .{ .at = .unwritten, .parts = a.have() & b.have() };
+    return .{ .at = .unwritten, .parts = a.have() & b.have(), .guard = if (a.guard != null and b.guard != null and a.guard.?.call == b.guard.?.call) a.guard else null };
 }
 
 /// The label a block carries (`blk: { … }`), by its token.
@@ -1145,6 +1342,23 @@ fn passes(tree: *const Ast, input: Ast.Node.Index) bool {
     const from = literalValue(tree, start) orelse return false;
     const to = literalValue(tree, end.unwrap() orelse return false) orelse return false;
     return to > from;
+}
+
+/// `node` without the parentheses around it.
+fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    return at;
+}
+
+/// Whether `node` names a member `name`: `.SUCCESS`, or `E.SUCCESS` of some enum.
+fn isMember(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    const at = ungrouped(tree, node);
+    return switch (tree.nodeTag(at)) {
+        .enum_literal => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), name),
+        .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), name),
+        else => false,
+    };
 }
 
 fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {

@@ -1021,6 +1021,48 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
 }
 
+test "A019 reads a local a function outside the program writes only where its result shows it did" {
+    // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
+    // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size
+    // returned (17), a BOOL's out never read and read past `== .FALSE` (19, 20), a status's
+    // `.SUCCESS` prong (22). Findings: the externs themselves (3-8), status read unchecked (11),
+    // past a test whose two sides both go on (14), past a count (16), a size other than the one
+    // given (18), read after `and` a failure (21), another prong (23), a test of `and` with the
+    // failure on one side (24), a size test that is not the size given (26). Clean too: a size
+    // test in a statement of its own, the type read through `@TypeOf` (25); an array of no
+    // elements (27).
+    const found = try run(pack.unsafe_set,
+        \\const Status = enum(u32) { SUCCESS = 0, OTHER = 1, _ };
+        \\const BOOL = enum(i32) { FALSE = 0, TRUE = 1 };
+        \\extern "c" fn waitpid(pid: i32, status: *c_int, options: c_int) i32;
+        \\extern "c" fn getrlimit(resource: c_int, rlim: *[2]u64) c_int;
+        \\extern "c" fn read(fd: i32, buf: [*]u8, n: usize) isize;
+        \\extern "c" fn proc_pidinfo(pid: i32, flavor: c_int, arg: u64, buffer: *anyopaque, size: c_int) c_int;
+        \\extern "kernel32" fn GetConsoleMode(h: usize, mode: *u32) BOOL;
+        \\extern "ntdll" fn NtOpenFile(h: *usize, access: u32, attributes: usize, io: *u64) Status;
+        \\fn use(x: anytype) void { _ = x; }
+        \\pub fn w1(pid: i32) ?c_int { var s: c_int = undefined; const rc = waitpid(pid, &s, 1); if (rc == 0) return null; if (rc > 0) return s; return null; }
+        \\pub fn w2(pid: i32) c_int { var s: c_int = undefined; _ = waitpid(pid, &s, 1); return s; }
+        \\pub fn r1() u64 { var l: [2]u64 = undefined; return if (getrlimit(7, &l) == 0) l[0] else 0; }
+        \\pub fn r2() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) != 0) return 0; return l[0]; }
+        \\pub fn r3() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) == 0) {} return l[0]; }
+        \\pub fn n1(fd: i32) void { var b: [8]u8 = undefined; const n = read(fd, &b, b.len); if (n <= 0) return; use(b[0..@intCast(n)]); }
+        \\pub fn n2(fd: i32) void { var b: [8]u8 = undefined; _ = read(fd, &b, b.len); use(b[0..4]); }
+        \\pub fn p1(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == @sizeOf([4]u64)) info[0] else 0; }
+        \\pub fn p2(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == 8) info[0] else 0; }
+        \\pub fn g1(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) != .FALSE; }
+        \\pub fn g2(h: usize) u32 { var m: u32 = undefined; if (GetConsoleMode(h, &m) == .FALSE) return 0; return m; }
+        \\pub fn g3(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) == .FALSE and m == 0; }
+        \\pub fn t1() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .SUCCESS => return h, else => return 0 } }
+        \\pub fn t2() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .OTHER => return h, else => return 0 } }
+        \\pub fn e1(pid: i32) u64 { var l: [2]u64 = undefined; const rc = getrlimit(pid, &l); if (rc != 0 and pid > 0) return 0; return l[0]; }
+        \\pub fn s1(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got != @sizeOf(@TypeOf(info))) return 0; return info[0]; }
+        \\pub fn s2(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got == 0) return 0; return info[0]; }
+        \\pub fn z1(fd: i32) void { var none: [0]u8 = undefined; _ = read(fd, &none, 0); use(&none); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8, 11, 14, 16, 18, 21, 23, 24, 26 }, found.lines[0..found.findings]);
+}
+
 test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
     // Clean: the program's writers of a part returned as written (9, 10, 11), std's keeps
     // returning what they fill (15, 17), an HMAC's final and create (18, 19), a count a call
