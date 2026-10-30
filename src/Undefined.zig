@@ -891,7 +891,12 @@ const Walk = struct {
     fn handedTo(w: *Walk, node: Ast.Node.Index, call: Ast.full.Call, position: usize, receiver: bool, whole: bool, key: Ast.TokenIndex) Context.Error!?Use {
         const tree = w.tree;
         const handed: Use = .{ .key = key, .effect = .handed };
-        const decl = (try w.callee(node, call)) orelse return handed;
+        const decl = (try w.callee(node, call)) orelse {
+            if (receiver) return handed;
+            const entry = (try w.choiceContract(call, position)) orelse return handed;
+            if (entry.success == .count or !whole) return null;
+            return .{ .key = tree.lastToken(node), .effect = .{ .guarded = .{ .call = node, .entry = entry, .binding = w.resultConstant(node) } } };
+        };
         const origin = (try w.c.facts.origin(decl)) orelse decl;
         var index = position;
         if (receiver) {
@@ -924,6 +929,26 @@ const Walk = struct {
         const found = (try needs(w.c, origin, index, w.depth + 1)) orelse return handed;
         if (!std.meta.eql(owner, found.owner)) return handed;
         return .{ .key = key, .effect = .{ .needs = found.mask } };
+    }
+
+    /// The contract of a call to a choice of functions made per build (std's `c.fstatat`, a
+    /// program's `if (x86_64) statfs64 else statfs`): each alternative a function with a
+    /// contract for parameter `index`, all alike in when they write.
+    fn choiceContract(w: *Walk, call: Ast.full.Call, index: usize) Context.Error!?*const CContract.Entry {
+        const value = try w.c.facts.resolve(w.file, call.ast.fn_expr);
+        if (value != .alternatives) return null;
+        var found: ?*const CContract.Entry = null;
+        for (value.alternatives) |each| {
+            const decl = switch (each) {
+                .function => |function| function,
+                else => return null,
+            };
+            const origin = (try w.c.facts.origin(decl)) orelse decl;
+            const entry = (try CContract.find(w.c, origin, index)) orelse return null;
+            if (found) |sofar| if (!std.meta.eql(sofar.success, entry.success)) return null;
+            found = entry;
+        }
+        return found;
     }
 
     /// Whether a call reaches std's declaration at `path`.

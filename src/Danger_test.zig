@@ -1110,7 +1110,8 @@ test "A019 reads a local a function outside the program writes only where its re
     // given (18), read after `and` a failure (21), another prong (23), a test of `and` with the
     // failure on one side (24), a size test that is not the size given (26). Clean too: a size
     // test in a statement of its own, the type read through `@TypeOf` (25); an array of no
-    // elements (27).
+    // elements (27); a per-build choice of two symbols alike (32). Findings: their externs (28,
+    // 29), read past a test that goes on either way (33).
     const found = try run(pack.unsafe_set,
         \\const Status = enum(u32) { SUCCESS = 0, OTHER = 1, _ };
         \\const BOOL = enum(i32) { FALSE = 0, TRUE = 1 };
@@ -1139,8 +1140,14 @@ test "A019 reads a local a function outside the program writes only where its re
         \\pub fn s1(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got != @sizeOf(@TypeOf(info))) return 0; return info[0]; }
         \\pub fn s2(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got == 0) return 0; return info[0]; }
         \\pub fn z1(fd: i32) void { var none: [0]u8 = undefined; _ = read(fd, &none, 0); use(&none); }
+        \\extern "c" fn fstat(fd: i32, buf: *[18]u64) c_int;
+        \\extern "c" fn @"fstat$INODE64"(fd: i32, buf: *[18]u64) c_int;
+        \\const stat = if (@import("builtin").cpu.arch == .x86_64) @"fstat$INODE64" else fstat;
+        \\const either = if (@import("builtin").cpu.arch == .x86_64) fstat else waitpid;
+        \\pub fn c1(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) != 0) return 0; return st[0]; }
+        \\pub fn c2(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) == 0) {} return st[0]; }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8, 11, 14, 16, 18, 21, 23, 24, 26 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8, 11, 14, 16, 18, 21, 23, 24, 26, 28, 29, 33 }, found.lines[0..found.findings]);
 }
 
 test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
