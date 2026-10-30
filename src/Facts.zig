@@ -555,6 +555,32 @@ fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError
     return known.reached.?.contains(file);
 }
 const Standard = struct { reached: ?Files = null };
+
+/// Whether a scan of "every use in the program" reads `file`: a file selected, or any file a
+/// path import (`@import("other.zig")`) joins to one, either way: a use in a file of the package
+/// left out of the selection is still a use. A module imported by name (std, a dependency) is
+/// another package's, which names none of this one's declarations.
+pub fn program(self: *Facts, file: Project.FileId) ResolveError!bool {
+    if (self.project.at(file).input.selected) return true;
+    const known = try self.memo(Program);
+    if (known.files == null) {
+        var files: Files = .empty;
+        for (self.project.sources) |*source| if (source.input.selected) try files.put(self.gpa, source.id, {});
+        var growing = true;
+        while (growing) {
+            growing = false;
+            for (self.project.imports) |mapping| {
+                if (!std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
+                if (files.contains(mapping.from) == files.contains(mapping.target)) continue;
+                try files.put(self.gpa, if (files.contains(mapping.from)) mapping.target else mapping.from, {});
+                growing = true;
+            }
+        }
+        known.files = files;
+    }
+    return known.files.?.contains(file);
+}
+const Program = struct { files: ?Files = null };
 const Files = std.AutoHashMapUnmanaged(Project.FileId, void);
 
 /// The files std's module reaches: its own generics are std's, not the program's.
@@ -2240,7 +2266,7 @@ pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
     if (self.member_uses == null) {
         var index: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty;
         for (self.project.sources) |*source| {
-            if (!source.input.selected) continue;
+            if (!try self.program(source.id)) continue;
             const file = source.id;
             const tree = &source.file.tree;
             for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -2910,7 +2936,7 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         const id = source.id;
         const own = id == function.file;
         if (!record.public and !own) continue;
-        if (!source.input.selected) continue;
+        if (!try self.program(source.id)) continue;
         const tree = &file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));

@@ -217,7 +217,10 @@ const std_imports = [_]sources.ExtraImport{
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
 const Run = struct { findings: usize, undecided: usize, lines: [32]u32 = @splat(0) };
 fn run(rule: glint.Rule, program: []const u8) !Run {
-    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    return runWith(rule, program, &std_files, &std_imports);
+}
+fn runWith(rule: glint.Rule, program: []const u8, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
+    var project = try sources.projectWithSources(std.testing.allocator, program, extra, imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
@@ -1074,6 +1077,39 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     // A field named as the program compiles may be the interface's.
     const computed = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    inline for (.{\"interface\"}) |name| try @field(s, name).writeAll(\"y\");\n    return s.count + s.interface.end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, computed.lines[0..computed.findings]);
+}
+
+test "A019 follows each pointer to an interface field to every place it goes: a copy of what it points at, a place of another type, or its functions read out leave the conversion a finding" {
+    // Findings (11, the conversion and its alignment).
+    const use = "    return s.count + s.interface.end;";
+    const deref = try runEdited(pack.unsafe_set, interface_program, use, "    const copy = (&s.interface).*;\n    return s.count + copy.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, deref.lines[0..deref.findings]);
+    const local = try runEdited(pack.unsafe_set, interface_program, use, "    const p = &s.interface;\n    const copy = p.*;\n    return s.count + copy.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, local.lines[0..local.findings]);
+    const helper = try runEdited(pack.unsafe_set, interface_program, "pub fn use() !usize {", "fn dup(w: *std.Io.Writer) std.Io.Writer { return w.*; }\npub fn use() !usize {\n    var t: Sink = .init();\n    _ = dup(&t.interface);");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, helper.lines[0..helper.findings]);
+    const bytes = try runEdited(pack.unsafe_set, interface_program, use, "    _ = std.mem.asBytes(&s.interface);\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, bytes.lines[0..bytes.findings]);
+    const array = try runEdited(pack.unsafe_set, interface_program, use, "    const many: *[1]std.Io.Writer = &s.interface;\n    return s.count + many[0].end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, array.lines[0..array.findings]);
+    const table = try runEdited(pack.unsafe_set, interface_program, use, "    s.other.vtable = s.interface.vtable;\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, table.lines[0..table.findings]);
+    const named = try runEdited(pack.unsafe_set, interface_program, use, "    const vt: std.Io.Writer.VTable = .{ .drain = @field(Sink, \"drain\") };\n    _ = vt;\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, named.lines[0..named.findings]);
+    const held = try runEdited(pack.unsafe_set, interface_program, use, "    const vt = &@field(Sink, \"vtable\");\n    _ = vt;\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, held.lines[0..held.findings]);
+    // Kept a pointer through a local, a field of its own type and a function that returns it.
+    const kept = try runEdited(pack.unsafe_set, interface_program, "pub fn use() !usize {", "const Holder = struct { w: *std.Io.Writer };\nfn writer(s: *Sink) *std.Io.Writer { return &s.interface; }\npub fn use() !usize {\n    var t: Sink = .init();\n    const p = writer(&t);\n    const h: Holder = .{ .w = p };\n    try h.w.writeAll(\"z\");");
+    try std.testing.expectEqual(@as(usize, 0), kept.findings);
+}
+
+test "A019 reads every file a path import joins to the program, selected or not: a copy of an interface field there leaves the conversion a finding" {
+    // `other.zig`, outside the selection, copies the field it is handed: 11, the conversion
+    // and its alignment.
+    const program = comptime edited(interface_program, "pub fn use() !usize {", "const other = @import(\"other.zig\");\npub fn use() !usize {\n    var t: Sink = .init();\n    other.keep(&t);");
+    const other: sources.Extra = .{ .name = "other.zig", .bytes = "pub fn keep(s: anytype) void { const copy = s.interface; _ = copy; }" };
+    const found = try runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{other}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
 }
 
 const observer_program =
