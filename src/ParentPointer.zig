@@ -75,13 +75,133 @@ fn interfaceField(c: *Context, node: Ast.Node.Index, pointer: Ast.Node.Index, fi
     const param_type = tree.fullPtrType(param.node) orelse return false;
     const interface = held(try c.facts.resolve(c.file, param_type.ast.child_type)) orelse return false;
     if (!same(interface, kind)) return false;
-    // The function is not `pub`, and named only where C's own code installs it into C.F.
+    if (!try reachedOnlyInstalled(c, function, param.token, field, kind, 0)) return false;
+    if (!try calledOnlyOnItself(c, kind)) return false;
+    return addressedOnly(c, field);
+}
+
+/// Whether every read in the package of a function an interface of type `kind` holds (a
+/// function pointer field of it, or of the vtable it points at) calls it there and then on the
+/// interface it was read from (`h.f(h)`, `x.F.f(&x.F)`, `w.vtable.drain(w, …)`): a function
+/// read out and called on another pointer converts that pointer as though it were C.F's. A
+/// read whose receiver does not resolve may be one.
+fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
+    const source = c.project.at(kind.file);
+    const tree = &source.file.tree;
+    for (source.model.declarations) |decl| {
+        if (decl.kind != .field or decl.scope != kind.scope) continue;
+        const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+        if (functionPointer(tree, declared)) {
+            if (!try readsCalledOnSelf(c, decl.name, kind, false)) return false;
+            continue;
+        }
+        // A vtable: each of its functions, read through this field.
+        const pointer = tree.fullPtrType(declared) orelse continue;
+        const table = held(try c.facts.resolve(kind.file, pointer.ast.child_type)) orelse continue;
+        const inner = c.project.at(table.file);
+        for (inner.model.declarations) |entry| {
+            if (entry.kind != .field or entry.scope != table.scope) continue;
+            const entry_type = (inner.file.tree.fullContainerField(entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+            if (!functionPointer(&inner.file.tree, entry_type)) continue;
+            if (!try readsCalledOnSelf(c, entry.name, table, true)) return false;
+        }
+    }
+    return true;
+}
+
+/// Whether each read of the function field `name` of a `holder` (directly, or of a vtable a
+/// `through` field points at) is called at once with the interface as its first argument.
+fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, through: bool) Context.Error!bool {
+    for (try c.facts.memberUses(name)) |use| {
+        const tree = &c.project.at(use.file).file.tree;
+        const model = &c.project.at(use.file).model;
+        const receiver = tree.nodeData(use.node).node_and_token[0];
+        const value = try c.facts.resolve(use.file, receiver);
+        if (value == .unknown) return false;
+        if (!isParent(value, holder)) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, model.parentOf(use.node) orelse return false) orelse return false;
+        if (call.ast.fn_expr != use.node or call.ast.params.len == 0) return false;
+        // The interface: the receiver, or what the vtable was read from.
+        var interface = receiver;
+        if (through) {
+            if (tree.nodeTag(receiver) != .field_access) return false;
+            interface = tree.nodeData(receiver).node_and_token[0];
+        }
+        var given = strip(tree, call.ast.params[0]);
+        if (tree.nodeTag(given) == .address_of) given = strip(tree, tree.nodeData(given).node);
+        if (!sameTokens(tree, given, interface)) return false;
+    }
+    return true;
+}
+
+/// Whether a type is a pointer to a function, or an optional one.
+fn functionPointer(tree: *const Ast, kind: Ast.Node.Index) bool {
+    var at = kind;
+    if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
+    const pointer = tree.fullPtrType(at) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    return tree.fullFnProto(&buffer, pointer.ast.child_type) != null;
+}
+
+/// Whether two expressions are spelled the same, token by token.
+fn sameTokens(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const first_a = tree.firstToken(a);
+    const first_b = tree.firstToken(b);
+    const count = tree.lastToken(a) - first_a;
+    if (tree.lastToken(b) - first_b != count) return false;
+    for (0..count + 1) |i| {
+        if (!std.mem.eql(u8, tree.tokenSlice(first_a + @as(Ast.TokenIndex, @intCast(i))), tree.tokenSlice(first_b + @as(Ast.TokenIndex, @intCast(i))))) return false;
+    }
+    return true;
+}
+
+/// Whether the parameter at `token` of `function` is only ever given a pointer to C.F: the
+/// function is not `pub`, and named only where C's own code installs it into C.F's value; or
+/// only called directly, that parameter given the same parameter of a function that is so, a
+/// pointer to F's type (a helper the installed functions share, at most four calls deep).
+fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenIndex, field: Field, kind: Facts.Container, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&proto_buffer, function) orelse return false;
     if (proto.visib_token != null) return false;
     const decl = functionDecl(model, function) orelse return false;
-    if (!try namedOnlyInstalling(c, decl, field, true)) return false;
-    return addressedOnly(c, field);
+    if (try namedOnlyInstalling(c, decl, field, true)) return true;
+    if (depth >= 4) return false;
+    var position: usize = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| : (position += 1) {
+        if (param.name_token == token) break;
+    } else return false;
+    var called = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .identifier => if ((model.reference(node) orelse continue).declaration != decl) continue,
+            .field_access => {
+                const found = (try c.facts.definition(c.file, node)) orelse continue;
+                if (found.file != c.file or found.index != decl) continue;
+                // Called on a value, it is handed that value first: no helper's call.
+                if (try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]) != .container) return false;
+            },
+            else => continue,
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, model.parentOf(node) orelse return false) orelse return false;
+        if (call.ast.fn_expr != node or position >= call.ast.params.len) return false;
+        const arg = strip(tree, call.ast.params[position]);
+        if (tree.nodeTag(arg) != .identifier) return false;
+        const given = model.declarations[@backingInt((model.reference(arg) orelse return false).declaration orelse return false)];
+        if (given.kind != .parameter) return false;
+        const caller = enclosingFunction(tree, model, node) orelse return false;
+        if (!parameterOf(tree, caller, given.token)) return false;
+        const given_type = tree.fullPtrType(given.node) orelse return false;
+        if (!same(held(try c.facts.resolve(c.file, given_type.ast.child_type)) orelse return false, kind)) return false;
+        if (!try reachedOnlyInstalled(c, caller, given.token, field, kind, depth + 1)) return false;
+        called = true;
+    }
+    return called;
 }
 
 /// Whether every reference to `decl` in the checked file installs it into C.F's value, from
@@ -126,6 +246,12 @@ fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: bool)
                 return inside(c, parent, field.parent);
             },
             else => {},
+        }
+        // `if (c) f else null`: what is installed is it or the other branch's value.
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr == at or branch.payload_token != null or branch.error_token != null) return false;
+            at = parent;
+            continue;
         }
         // C.F's own default value, declared in C.
         if (tree.fullContainerField(parent)) |declared| {
@@ -185,6 +311,8 @@ fn addressedOnly(c: *Context, field: Field) Context.Error!bool {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, outer) orelse continue;
                 if (call.ast.fn_expr != parent) continue;
+                // A function pointer field of it called (`x.F.f(&x.F)`) is a part read.
+                if (try fieldOfInterface(c, use.file, parent)) continue;
                 if (!try takesPointer(c, use.file, parent)) return false;
             },
             else => return false,
@@ -213,6 +341,12 @@ fn addressedOnly(c: *Context, field: Field) Context.Error!bool {
         }
     }
     return true;
+}
+
+/// Whether the member access `callee` names a field, not a method: what it reads is that part.
+fn fieldOfInterface(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Context.Error!bool {
+    const decl = (try c.facts.definition(file, callee)) orelse return false;
+    return c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field;
 }
 
 /// Whether the method `callee` (a member access called) takes its receiver by pointer.
