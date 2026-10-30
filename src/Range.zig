@@ -1832,20 +1832,78 @@ fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
     if (tree.nodeTag(function) != .fn_decl) return;
     var statement_buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&statement_buffer, tree.nodeData(function).node_and_node[1]) orelse return;
-    for (statements) |statement| {
+    // What the guards compared holds after the call only while the rest of the callee leaves the
+    // receiver as they saw it.
+    const guarded = out.items.len;
+    for (statements, 0..) |statement, at| {
         if (tree.nodeTag(statement) == .@"return") {
             const result = tree.nodeData(statement).opt_node.unwrap() orelse return;
-            const branch = tree.fullIf(bare(tree, result)) orelse return;
+            const branch = tree.fullIf(bare(tree, result)) orelse {
+                if (touches(tree, model, &.{result}, self_name)) out.shrinkRetainingCapacity(guarded);
+                return;
+            };
             const otherwise = branch.ast.else_expr.unwrap() orelse return;
+            if (touches(tree, model, &.{ branch.ast.then_expr, otherwise }, self_name)) {
+                out.shrinkRetainingCapacity(guarded);
+                return;
+            }
             if (!receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
             if (tree.nodeTag(bare(tree, otherwise)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
             if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
             return;
         }
-        const branch = tree.fullIf(statement) orelse return;
-        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
-        try holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
+        const branch = tree.fullIf(statement);
+        if (branch == null or branch.?.ast.else_expr != .none or !failing(tree, branch.?.ast.then_expr) or !receiverOnly(tree, model, branch.?.ast.cond_expr, self_name)) {
+            if (touches(tree, model, statements[at..], self_name)) out.shrinkRetainingCapacity(guarded);
+            return;
+        }
+        try holds(c, file, out, branch.?.ast.cond_expr, false, use, call_node);
     }
+}
+
+/// Whether `nodes`, in order, may change what the receiver `self_name` holds: an assignment to
+/// it or a part of it, its address or a part's taken, or it or a part handed to a call or a
+/// method of it called, any of which may write it.
+fn touches(tree: *const Ast, model: anytype, nodes: []const Ast.Node.Index, self_name: []const u8) bool {
+    for (nodes) |whole| {
+        const first = tree.firstToken(whole);
+        const last = tree.lastToken(whole);
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(node);
+            if (token < first or token > last) continue;
+            switch (tag) {
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (receiverRooted(tree, model, tree.nodeData(node).node_and_node[0], self_name)) return true,
+                .address_of => if (receiverRooted(tree, model, tree.nodeData(node).node, self_name)) return true,
+                .call_one, .call_one_comma, .call, .call_comma => {
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+                    if (tree.nodeTag(call.ast.fn_expr) == .field_access and receiverRooted(tree, model, tree.nodeData(call.ast.fn_expr).node_and_token[0], self_name)) return true;
+                    for (call.ast.params) |param| if (receiverRooted(tree, model, param, self_name)) return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether `node` names the receiver `self_name` or a part of it, past fields, indexes, slices,
+/// unwraps, dereferences and addresses.
+fn receiverRooted(tree: *const Ast, model: anytype, node: Ast.Node.Index, self_name: []const u8) bool {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .identifier => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), self_name)) return false;
+            const d = (model.reference(at) orelse return false).declaration orelse return false;
+            return model.declarations[@backingInt(d)].kind == .parameter;
+        },
+        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .deref, .address_of => at = tree.nodeData(at).node,
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return false).ast.sliced,
+        else => return false,
+    };
 }
 
 /// Whether a callee's condition names no parameter but its first: what it says of the receiver

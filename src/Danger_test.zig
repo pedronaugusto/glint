@@ -860,8 +860,13 @@ test "A019 keeps nothing it read past its depth: a keeper first reached at the e
 
 /// The findings of `rule` on `program` with `edit` applied: each (old, new) replaced once.
 fn runEdited(rule: glint.Rule, comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) !Run {
-    const at = comptime std.mem.find(u8, program, old).?;
-    return run(rule, program[0..at] ++ new ++ program[at + old.len ..]);
+    return run(rule, comptime edited(program, old, new));
+}
+
+/// `program` with its first `old` replaced by `new`.
+fn edited(comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) []const u8 {
+    const at = std.mem.find(u8, program, old).?;
+    return program[0..at] ++ new ++ program[at + old.len ..];
 }
 
 const interface_program =
@@ -3160,6 +3165,50 @@ test "A009 reads what a method of the file checked of its receiver, where the ca
         \\    try p.step(&q);
         \\}
     , 1);
+}
+
+test "A009 reads a callee's check of its receiver only while the rest of the callee leaves the receiver as checked" {
+    const program =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    fn check(self: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        self.at += 1;
+        \\    }
+        \\    fn peek(self: *P) !u8 {
+        \\        return if (self.at < self.table.len) self.table[self.at] else error.Range;
+        \\    }
+        \\    fn skip(self: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        return self.advance();
+        \\    }
+        \\    fn advance(self: *P) !void {
+        \\        self.at += 1;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.check();
+        \\        return self.table[self.at];
+        \\    }
+        \\    pub fn next(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.skip();
+        \\        return self.table[self.at];
+        \\    }
+        \\    pub fn look(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        const first = try self.peek();
+        \\        return first +% self.table[self.at];
+        \\    }
+        \\};
+    ;
+    // `check` and `skip` move the position past what they checked; `peek` only reads it.
+    try expect(pack.untrusted_input, program, 2);
+    // The checks with what follows them leaving the position where they saw it.
+    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        std.log.debug(\"checked\", .{});\n    }\n    fn peek"), "return self.advance();", "return std.log.debug(\"skipped\", .{});");
+    try expect(pack.untrusted_input, kept, 0);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
