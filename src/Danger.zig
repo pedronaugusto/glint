@@ -14,6 +14,7 @@ const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
+const ParentPointer = @import("ParentPointer.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
@@ -480,6 +481,10 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         // pattern) is that parent only where the pointer is that field's, which no build checks,
         // and so is the alignment `@alignCast` asserts of it: a consumer may build the package
         // ReleaseFast, where nothing checks either.
+        // Where the program shows the pointer is that field's (an interface's own field, a
+        // node of an intrusive list), the parent is shown and its alignment with it.
+        if (std.mem.eql(u8, name, "@fieldParentPtr") and try ParentPointer.cleared(c, node)) continue;
+        if (std.mem.eql(u8, name, "@alignCast") and try ParentPointer.clearedAlignment(c, node)) continue;
         for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };

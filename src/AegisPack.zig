@@ -2358,15 +2358,15 @@ const Heard = struct {
     sink: Context.Sink = .{ .diagnostic = diagnostic, .coverage = coverage, .config = config },
 
     fn config(sink: *Context.Sink, file: @import("Project.zig").FileId) @import("Rule.zig").Config {
-        const heard: *Heard = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Heard's own sink field.
+        const heard: *Heard = @fieldParentPtr("sink", sink);
         return heard.outer.config(heard.outer, file);
     }
     fn diagnostic(sink: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {
-        const heard: *Heard = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Heard's own sink field.
+        const heard: *Heard = @fieldParentPtr("sink", sink);
         heard.any = true;
     }
     fn coverage(sink: *Context.Sink, _: Report.Coverage) Context.Error!void {
-        const heard: *Heard = @fieldParentPtr("sink", sink); // aegis: internal(A019): this function is reached only through a Heard's own sink field.
+        const heard: *Heard = @fieldParentPtr("sink", sink);
         heard.any = true;
     }
 };

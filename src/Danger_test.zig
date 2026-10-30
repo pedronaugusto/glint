@@ -21,6 +21,7 @@ const std_files = [_]sources.Extra{
     \\pub const math = @import("math.zig");
     \\pub const zig = @import("zig.zig");
     \\pub const fmt = @import("fmt.zig");
+    \\pub const DoublyLinkedList = @import("DoublyLinkedList.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -28,7 +29,7 @@ const std_files = [_]sources.Extra{
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } };
-    \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
+    \\pub const Writer = struct { end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
     \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
@@ -152,6 +153,15 @@ const std_files = [_]sources.Extra{
     \\fn Sha2x64(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     },
     .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }" },
+    .{ .name = "std/DoublyLinkedList.zig", .bytes =
+    \\const DoublyLinkedList = @This();
+    \\first: ?*Node = null,
+    \\last: ?*Node = null,
+    \\pub const Node = struct { prev: ?*Node = null, next: ?*Node = null };
+    \\pub fn append(list: *DoublyLinkedList, new_node: *Node) void { list.last = new_node; }
+    \\pub fn prepend(list: *DoublyLinkedList, new_node: *Node) void { list.first = new_node; }
+    \\pub fn popFirst(list: *DoublyLinkedList) ?*Node { return list.first; }
+    },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .spelling = "std", .target = 0 },
@@ -173,6 +183,7 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "zig.zig", .target = 16 },
     .{ .from = 3, .spelling = "crypto/sha2.zig", .target = 17 },
     .{ .from = 0, .spelling = "fmt.zig", .target = 18 },
+    .{ .from = 0, .spelling = "DoublyLinkedList.zig", .target = 19 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -845,6 +856,123 @@ test "A019 keeps nothing it read past its depth: a keeper first reached at the e
         \\pub fn direct() void { var b: [8]u8 = undefined; use(k8(&b)); }
     );
     try std.testing.expectEqualSlices(u32, &.{13}, found.lines[0..found.findings]);
+}
+
+/// The findings of `rule` on `program` with `edit` applied: each (old, new) replaced once.
+fn runEdited(rule: glint.Rule, comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) !Run {
+    const at = comptime std.mem.find(u8, program, old).?;
+    return run(rule, program[0..at] ++ new ++ program[at + old.len ..]);
+}
+
+const interface_program =
+    \\const std = @import("std");
+    \\const Sink = struct {
+    \\    count: usize = 0,
+    \\    interface: std.Io.Writer,
+    \\    other: std.Io.Writer = .{},
+    \\    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+    \\    pub fn init() Sink {
+    \\        return .{ .interface = .{ .vtable = &vtable } };
+    \\    }
+    \\    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) anyerror!usize {
+    \\        const self: *Sink = @alignCast(@fieldParentPtr("interface", w));
+    \\        self.count += splat;
+    \\        return data.len;
+    \\    }
+    \\};
+    \\pub fn use() !usize {
+    \\    var s: Sink = .init();
+    \\    try s.interface.writeAll("x");
+    \\    return s.count + s.interface.end;
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer an interface's own field shows, and its alignment, where nothing copies the field or installs the function anywhere else" {
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, interface_program)).findings);
+    // A copy of the field carries the function to a pointer that is no Sink's field.
+    const copied = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    const w = s.interface;\n    return s.count + w.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, copied.lines[0..copied.findings]);
+    // A vtable others can name, installed into another field, or a field of another type.
+    const public = try runEdited(pack.unsafe_set, interface_program, "    const vtable:", "    pub const vtable:");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, public.lines[0..public.findings]);
+    const other = try runEdited(pack.unsafe_set, interface_program, ".{ .interface = .{ .vtable = &vtable } }", ".{ .interface = .{}, .other = .{ .vtable = &vtable } }");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, other.lines[0..other.findings]);
+    const typed = try runEdited(pack.unsafe_set, interface_program, "    interface: std.Io.Writer,", "    interface: std.Io.Reader,");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, typed.lines[0..typed.findings]);
+    // A field named as the program compiles may be the interface's.
+    const computed = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    inline for (.{\"interface\"}) |name| try @field(s, name).writeAll(\"y\");\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, computed.lines[0..computed.findings]);
+}
+
+const observer_program =
+    \\const Observer = struct {
+    \\    vtable: *const VTable,
+    \\    pub const VTable = struct { see: *const fn (*Observer, u32) void };
+    \\    pub fn see(o: *Observer, n: u32) void { o.vtable.see(o, n); }
+    \\};
+    \\const Counter = struct {
+    \\    total: u32 = 0,
+    \\    observer: Observer = .{ .vtable = &vtable },
+    \\    const vtable: Observer.VTable = .{ .see = see };
+    \\    fn see(o: *Observer, n: u32) void {
+    \\        const self: *Counter = @alignCast(@fieldParentPtr("observer", o));
+    \\        self.total += n;
+    \\    }
+    \\};
+    \\pub fn run() u32 {
+    \\    var c: Counter = .{};
+    \\    c.observer.see(3);
+    \\    return c.total;
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer the program's own interface field shows, installed by the field's default, until a copy of the field" {
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, observer_program)).findings);
+    const copied = try runEdited(pack.unsafe_set, observer_program, "    c.observer.see(3);", "    c.total = 1;\n    var copy = c.observer;\n    copy.see(3);");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, copied.lines[0..copied.findings]);
+}
+
+const list_program =
+    \\const std = @import("std");
+    \\const Conn = struct { id: u32, node: std.DoublyLinkedList.Node = .{} };
+    \\const Other = struct { tag: u32, node: std.DoublyLinkedList.Node = .{} };
+    \\const Pool = struct {
+    \\    free: std.DoublyLinkedList = .{},
+    \\    fn put(p: *Pool, c: *Conn) void { p.free.append(&c.node); }
+    \\    fn take(p: *Pool) ?*Conn {
+    \\        const n = p.free.popFirst() orelse return null;
+    \\        return @fieldParentPtr("node", n);
+    \\    }
+    \\    fn sum(p: *Pool) u32 {
+    \\        var total: u32 = 0;
+    \\        var it = p.free.first;
+    \\        while (it) |n| : (it = n.next) {
+    \\            const c: *Conn = @fieldParentPtr("node", n);
+    \\            total += c.id;
+    \\        }
+    \\        return total;
+    \\    }
+    \\};
+    \\pub fn run(p: *Pool, c: *Conn, o: *Other) u32 {
+    \\    p.put(c);
+    \\    o.tag = 1;
+    \\    _ = p.take();
+    \\    return p.sum();
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer an intrusive list's node shows, where every insertion into the list puts that parent's node and nothing copies it" {
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, list_program)).findings);
+    // Another type's node put into the list; a copied node; the list's nodes read as another type.
+    const other = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    p.free.append(&o.node);");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, other.lines[0..other.findings]);
+    const copied = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    o.tag = 1;\n    const node = c.node;\n    _ = node;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
+    const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
+    try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {
