@@ -788,34 +788,149 @@ fn checkCopies(c: *Context) Context.Error!void {
         try checkBinding(c, tree, node, copies);
         if (tree.fullVarDecl(node)) |v| {
             const init = v.ast.init_node.unwrap() orelse continue;
-            if (tree.nodeTag(init) != .identifier) continue;
-            // `undefined`, `true`, `false` and `null` are values, not references to an owner.
-            if (c.project.at(c.file).model.reference(init) == null) continue;
-            // A value of a generic's parameter: each binding's copy, checked at the binding.
-            if (c.facts.parameterValue(c.file, init)) continue;
-            // A `comptime` parameter's value, known as the program compiles: it holds nothing at
-            // run time.
-            if (c.facts.comptimeParameter(c.file, init)) continue;
-            // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
-            if (v.ast.type_node.unwrap()) |t| if (try plainType(c, c.file, t, 0)) continue;
-            if (try plainValue(c, c.file, init, 0)) continue;
-            // A copied pointer is an alias, which this rule leaves out, whatever it points at.
-            if (pointerShaped(try c.facts.resolve(c.file, init))) continue;
-            const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse continue;
-            if (copiedOwner(k)) {
-                // An owner itself, resolved so or written so where it comes from.
-                if (try c.facts.resolve(c.file, init) != .instance and !try ownedValue(c, init, 0)) continue;
-                // A local nothing reads after the copy, deferred code included, is moved, not
-                // duplicated: `var guard = free;` out of an `if` capture.
-                if (movable(k) and try moved(c, node, init)) continue;
-                try c.at(copies, tree.nodeMainToken(node), "copy of a recognized live owner/capability requires explicit transfer; lifetime and publication are undecided");
-            }
+            // A container's `const` is known as the program compiles and never changes: no
+            // release or consume (each takes `*Self`) reaches it or what it names, so it
+            // duplicates no live owner.
+            if (tree.tokenTag(v.ast.mut_token) == .keyword_const and containerLevel(c, tree, node)) continue;
+            try checkCopy(c, tree, node, init, v.ast.type_node.unwrap());
+        }
+        if (tag == .assign) {
+            const sides = tree.nodeData(node).node_and_node;
+            // `_ = x` discards the value: no second holder.
+            if (tree.nodeTag(sides[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(sides[0])), "_")) continue;
+            try checkCopy(c, tree, node, sides[1], null);
         }
         if (tag == .@"return") {
             const expr = tree.nodeData(node).opt_node.unwrap() orelse continue;
-            if (try exposure(c, expr)) try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
+            if (try carriesExposure(c, expr, 0)) try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
         }
     }
+}
+
+/// A copy made by `copy`, a declaration or an assignment, of the value `init` reads from a
+/// place: a name, a field, what a pointer points at, an element or an optional's payload.
+fn checkCopy(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.Node.Index, type_node: ?Ast.Node.Index) Context.Error!void {
+    const root = placeRoot(tree, init) orelse return;
+    // `undefined`, `true`, `false` and `null` are values, not references to an owner.
+    if (root == init and c.project.at(c.file).model.reference(init) == null) return;
+    // A value of a generic's parameter: each binding's copy, checked at the binding.
+    if (root == init and c.facts.parameterValue(c.file, init)) return;
+    // A `comptime` parameter's value, or a part of it, known as the program compiles: it
+    // holds nothing at run time.
+    if (c.facts.comptimeParameter(c.file, root)) return;
+    // Plain data, as the copy or its source is declared, holds no owner: the copy is decided.
+    if (type_node) |t| if (try plainType(c, c.file, t, 0)) return;
+    if (try plainValue(c, c.file, init, 0)) return;
+    // A copied pointer is an alias, which this rule leaves out, whatever it points at.
+    const value = try c.facts.resolve(c.file, init);
+    if (pointerShaped(value)) return;
+    const k = (try requiredOwner(c, init, copies, tree.nodeMainToken(init))) orelse return;
+    if (!copiedOwner(k)) return;
+    switch (heldAs(value)) {
+        .value => {},
+        // A type, a function or a namespace names no owner's value: `const S = Secret(u32);`.
+        .type => return,
+        // An owner as written where it comes from; else what it is stays undecided.
+        .unknown => if (!try ownedValue(c, init, 0)) {
+            try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(init)), .unresolved, "a copy of what may be a recognized owner does not resolve to a value or a type");
+            return;
+        },
+    }
+    // A local nothing reads after the copy, deferred code included, is moved, not
+    // duplicated: `var guard = free;` out of an `if` capture.
+    if (movable(k) and tree.nodeTag(init) == .identifier and try moved(c, copy, init)) return;
+    try c.at(copies, tree.nodeMainToken(copy), "copy of a recognized live owner/capability requires explicit transfer; lifetime and publication are undecided");
+}
+
+/// Whether a declaration is a container's member: a file's or a struct's, not a body's.
+fn containerLevel(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const parent = c.project.at(c.file).model.parentOf(node) orelse return true;
+    if (tree.nodeTag(parent) == .root) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.fullContainerDecl(&buffer, parent) != null;
+}
+
+/// The name a place is read through (`s` of `s`, `h.s`, `p.*`, `a[0]`, `o.?`), or null for
+/// a value made in place (a call, a literal, an operator), which no other holder shares.
+fn placeRoot(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var current = node;
+    while (true) current = switch (tree.nodeTag(current)) {
+        .identifier => return current,
+        .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(current).node_and_token[0],
+        .deref => tree.nodeData(current).node,
+        .array_access => tree.nodeData(current).node_and_node[0],
+        else => return null,
+    };
+}
+
+const Held = enum { value, type, unknown };
+
+/// Whether a resolved value is a value a copy duplicates, or a type, function or namespace,
+/// which holds none.
+fn heldAs(value: Facts.Value) Held {
+    return switch (value) {
+        .instance, .array, .optional, .error_union => .value,
+        .reified => |built| if (built.value) .value else .type,
+        .container, .function, .primitive, .fn_type, .error_set => .type,
+        .alternatives => |each| blk: {
+            var found: ?Held = null;
+            for (each) |one| {
+                const next = heldAs(one);
+                if (found != null and found.? != next) break :blk .unknown;
+                found = next;
+            }
+            break :blk found orelse .unknown;
+        },
+        else => .unknown,
+    };
+}
+
+/// Whether what a `return` gives carries a borrow of a secret or a guard's value: the borrow
+/// itself, a local it was put in, or a branch, field or element of what is returned.
+fn carriesExposure(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+    if (depth == 64) return false;
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.at(c.file).model;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return carriesExposure(c, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"try" => return carriesExposure(c, tree.nodeData(node).node, depth + 1),
+        .@"orelse", .@"catch" => {
+            const sides = tree.nodeData(node).node_and_node;
+            return try carriesExposure(c, sides[0], depth + 1) or try carriesExposure(c, sides[1], depth + 1);
+        },
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(node).?; // unreachable: the tag is an `if`'s
+            if (try carriesExposure(c, branch.ast.then_expr, depth + 1)) return true;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return carriesExposure(c, otherwise, depth + 1);
+        },
+        .identifier => {
+            const index = Contract.local(c, node) orelse return false;
+            const decl = model.declarations[@backingInt(index)];
+            if (decl.kind != .variable) return false;
+            const v = tree.fullVarDecl(decl.node) orelse return false;
+            if (v.ast.init_node.unwrap()) |init| if (try carriesExposure(c, init, depth + 1)) return true;
+            // Anything put in it later.
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .assign) continue;
+                const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                if (tree.nodeTag(sides[0]) != .identifier or Contract.local(c, sides[0]) != index) continue;
+                if (try carriesExposure(c, sides[1], depth + 1)) return true;
+            }
+            return false;
+        },
+        else => {},
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |literal| {
+        for (literal.ast.fields) |field| if (try carriesExposure(c, field, depth + 1)) return true;
+        return false;
+    }
+    if (tree.fullArrayInit(&buffer, node)) |literal| {
+        for (literal.ast.elements) |element| if (try carriesExposure(c, element, depth + 1)) return true;
+        return false;
+    }
+    return exposure(c, node);
 }
 /// Whether an owner of kind `k` may move by assignment: no erasure owed to the bytes left
 /// behind (secrets), no address an owner or its borrowers keep (guarded values, a budget its
@@ -845,6 +960,9 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
         const ref = model.reference(candidate) orelse continue;
         if (ref.declaration != index) continue;
         if (tree.nodeMainToken(candidate) > at) return false;
+        // An address taken before the copy (`&src`, or a method that takes `*Self`) may be
+        // kept, and reach the source after it.
+        if (try addressed(c, candidate)) return false;
         var up = model.node_parents[i];
         while (up) |parent| : (up = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
@@ -860,6 +978,31 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index) Context.Erro
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return false;
     }
     return true;
+}
+
+/// Whether a reference hands on its local's address: `&x`, or the receiver of a method whose
+/// first parameter is a pointer, or one that does not resolve.
+fn addressed(c: *Context, reference: Ast.Node.Index) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.at(c.file).model;
+    const parent = model.parentOf(reference) orelse return false;
+    if (tree.nodeTag(parent) == .address_of) return true;
+    if (tree.nodeTag(parent) != .field_access) return false;
+    const call_node = model.parentOf(parent) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return false;
+    if (call.ast.fn_expr != parent) return false;
+    const decl = (try c.facts.definition(c.file, parent)) orelse return true;
+    const origin = (try c.facts.origin(decl)) orelse return true;
+    const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
+    if (record.kind != .function) return true;
+    const written = &c.project.at(origin.file).file.tree;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = written.fullFnProto(&proto_buffer, record.node) orelse return true;
+    var it = proto.iterate(written);
+    const first = it.next() orelse return true;
+    const kind = first.type_expr orelse return true;
+    return written.fullPtrType(kind) != null or (written.nodeTag(kind) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(kind)), "anytype"));
 }
 
 /// Whether a type expression is plain data: a primitive type (`usize`, `bool`, `type`), or an array,

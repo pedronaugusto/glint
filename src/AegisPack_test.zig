@@ -642,6 +642,33 @@ test "a copied pointer is an alias, an owner copy is still found" {
     try expectJudged(head ++ "pub fn f() void { var s = S(u32).init(1); defer s.deinit(); const copy = s; _ = copy; }", pack.copies, true, 1);
 }
 
+test "A002 reads a copy from any place an owner is read through, an assignment's among them, and an address taken before a move or a borrow put in a local" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst H = struct { s: S(u32) };\n";
+    // A field, what a pointer points at, an element and an optional's payload each copy the
+    // owner they read; so does an assignment of one into storage.
+    try expectJudged(head ++ "pub fn f(h: *H) void { const copy = h.s; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *S(u32)) void { const copy = p.*; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(a: *[2]S(u32)) void { const copy = a[0]; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(o: *?S(u32)) void { const copy = o.*.?; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(h: *H) void { var s = S(u32).init(1); defer s.deinit(); h.s = s; }", pack.copies, true, 1);
+    // A type named again holds no owner.
+    try expectJudged(head ++ "pub fn f() void { const T = S(u32); const U = T; _ = U; }", pack.copies, true, 0);
+    // A container's `const` is known as the program compiles and never changes: nothing can
+    // release it or a copy of it. A container's `var` can be.
+    try expectJudged(head ++ "const a = S(u32).init(1);\npub const b = a;", pack.copies, true, 0);
+    try expectJudged(head ++ "var a = S(u32).init(1);\npub var b = a;", pack.copies, true, 1);
+    // A borrow returned through a local, or in a literal's field, outlives its owner as one
+    // returned in place does.
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { const v = s.expose(); return v; }", pack.copies, true, 1);
+    try expectJudged(head ++ "const R = struct { v: *const u32 };\npub fn f(s: *S(u32)) R { return .{ .v = s.expose() }; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { var v: *const u32 = undefined; v = s.expose(); return v; }", pack.copies, true, 1);
+    // A reservation moved out of a local nothing reads again is moved; one whose address was
+    // taken first is still reached through that address.
+    const budget = "const bounded = @import(\"aegis\").bounded;\n";
+    try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { const r = try b.reserve(1); var kept = r; defer kept.release(); }", pack.copies, true, 0);
+    try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { var r = try b.reserve(1); const p = &r; var kept = r; defer kept.release(); _ = p; }", pack.copies, true, 1);
+}
+
 test "cleanup paths through branches, deferred releases and loops are decided" {
     const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn hand(_: anytype) void {}\n";
     // Released in a branch that returns, and at the end of the fallthrough.
