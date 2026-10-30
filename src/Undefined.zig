@@ -49,6 +49,10 @@ const std_fills = [_]Named{
     .{ .path = "crypto.hash.blake2.Blake2b512.final", .param = 1 },
     .{ .path = "crypto.hash.sha3.Sha3_256.hash", .param = 1 },
     .{ .path = "crypto.hash.sha3.Sha3_256.final", .param = 1 },
+    // An HMAC's `final` and its one-shot `create` write the whole `*[mac_length]u8` out; the
+    // name stands for the `Hmac` generic every hash's is made by.
+    .{ .path = "crypto.auth.hmac.sha2.HmacSha256.final", .param = 1 },
+    .{ .path = "crypto.auth.hmac.sha2.HmacSha256.create", .param = 0 },
     .{ .path = "mem.writeInt", .param = 1 },
     .{ .path = "crypto.secureZero", .param = 1 },
     // Each operation of the batch, then the last one's link.
@@ -65,6 +69,7 @@ const std_counts = [_]Named{
     .{ .path = "Io.File.readPositional", .param = 2 },
     .{ .path = "Io.Dir.readLink", .param = 3 },
     .{ .path = "Io.Reader.readSliceShort", .param = 1 },
+    .{ .path = "fmt.printInt", .param = 0 },
 };
 
 /// std's calls that keep the memory they are given at a parameter as storage, or write a part
@@ -98,6 +103,12 @@ const std_keeps = [_]Named{
     .{ .path = "compress.flate.Decompress.init", .param = 2 },
     // The file's bytes into a prefix, returned as the slice they fill.
     .{ .path = "Io.Dir.readFile", .param = 3 },
+    // A prefix as long as the input, returned as the slice it fills.
+    .{ .path = "ascii.lowerString", .param = 0 },
+    .{ .path = "ascii.upperString", .param = 0 },
+    .{ .path = "base64.Base64Encoder.encode", .param = 1 },
+    // As many bytes as the source decodes to, which the caller sized `dest` by.
+    .{ .path = "base64.Base64Decoder.decode", .param = 1 },
     // The streams' length set, their contexts and storage for MultiReader.init to write.
     .{ .path = "Io.File.MultiReader.Buffer.toStreams", .param = 0 },
 };
@@ -514,6 +525,7 @@ const Walk = struct {
         if (!w.c.project.at(origin.file).input.selected) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) return null;
+        if (try writesParts(w.c, origin, index, w.depth + 1)) return null;
         return handed;
     }
 
@@ -595,8 +607,8 @@ const Walk = struct {
 
     /// Whether `slice` is the local from zero to a count one of std's calls returned of what
     /// it wrote there (`const n = try file.readStreaming(io, &.{&buf}); buf[0..n]`): the count
-    /// a constant, its call given the local itself, alone, at the position the call writes; a
-    /// failure that gives a count gives 0.
+    /// a constant or the call itself, its call given the local itself, alone, at the position
+    /// the call writes; a failure that gives a count gives 0.
     fn countedPrefix(w: *Walk, slice: Ast.Node.Index) Context.Error!bool {
         const tree = w.tree;
         if (tree.nodeTag(slice) == .slice_sentinel) return false;
@@ -610,13 +622,16 @@ const Walk = struct {
             if (args.len != 1) return false;
             end = args[0];
         }
-        if (tree.nodeTag(end) != .identifier) return false;
-        const index = (w.model.reference(end) orelse return false).declaration orelse return false;
-        const count = w.model.declarations[@backingInt(index)];
-        if (count.kind != .variable) return false;
-        const variable = tree.fullVarDecl(count.node) orelse return false;
-        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-        var source = variable.ast.init_node.unwrap() orelse return false;
+        // `buf[0..std.fmt.printInt(&buf, …)]`: the count the call returns, read where it returns.
+        var source = end;
+        if (tree.nodeTag(end) == .identifier) {
+            const index = (w.model.reference(end) orelse return false).declaration orelse return false;
+            const count = w.model.declarations[@backingInt(index)];
+            if (count.kind != .variable) return false;
+            const variable = tree.fullVarDecl(count.node) orelse return false;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+            source = variable.ast.init_node.unwrap() orelse return false;
+        }
         switch (tree.nodeTag(source)) {
             .@"try" => source = tree.nodeData(source).node,
             .@"catch" => {
@@ -812,6 +827,151 @@ fn keepsOnlyRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context
     return true;
 }
 
+/// Whether the program's function `decl` writes parts of what its parameter `index` points at
+/// and reads, returns or hands on only what it wrote (`buf[0..4].* = v; return buf[0..4];`):
+/// each mention of the parameter reads its length; writes a part, or all of it (`p[i] = v`,
+/// `p[a..b].* = v`, `p.* = v`, `@memcpy(p[a..b], …)`, a `for` setting each element of `p[a..b]`,
+/// one of std's fills given it); hands it to one of std's keeps or such a function; or is
+/// that part, or any part once all of it is, written by a statement before it in a block that
+/// holds it, with nothing between assigning a name the part's bounds spell. It writes none of
+/// it for its caller, and reads none of what it has not written.
+fn writesParts(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
+    return remembered(c, .{ .decl = decl, .index = index, .question = .parts }, depth, writesPartsRead);
+}
+
+fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
+    const found = (try parameter(c, decl, index)) orelse return false;
+    var walk: Walk = .init(c, decl.file, found.id, true, depth);
+    try walk.collect();
+    const tree = walk.tree;
+    const model = walk.model;
+    // What a statement wrote: the part (null: all of it), and the statement.
+    var written: std.ArrayList(struct { part: ?Ast.Node.Index, statement: Ast.Node.Index }) = .empty;
+    for (walk.mentions.items) |mention| {
+        const key = tree.nodeMainToken(mention);
+        const parent = model.parentOf(mention) orelse return false;
+        var memory = mention;
+        switch (tree.nodeTag(parent)) {
+            .field_access => {
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len")) continue;
+                return false;
+            },
+            .array_access => {
+                if (tree.nodeData(parent).node_and_node[0] != mention) return false;
+                if (assigned(model, tree, parent)) continue;
+                if (coveredBefore(model, tree, written.items, null, parent)) continue;
+                return false;
+            },
+            .deref => {
+                if (assigned(model, tree, parent)) {
+                    try written.append(c.allocator, .{ .part = null, .statement = statementOf(model, tree, parent) orelse return false });
+                    continue;
+                }
+                return false;
+            },
+            .slice_open, .slice, .slice_sentinel => {
+                if ((tree.fullSlice(parent) orelse return false).ast.sliced != mention) return false;
+                memory = parent;
+                // `p[a..b].* = v`.
+                const above = model.parentOf(parent) orelse return false;
+                if (tree.nodeTag(above) == .deref and assigned(model, tree, above)) {
+                    try written.append(c.allocator, .{ .part = parent, .statement = statementOf(model, tree, above) orelse return false });
+                    continue;
+                }
+            },
+            .address_of => return false,
+            else => {},
+        }
+        const use = (try walk.given(memory, true, key)) orelse continue;
+        if (use.effect == .write) {
+            try written.append(c.allocator, .{ .part = if (memory == mention) null else memory, .statement = statementOf(model, tree, memory) orelse return false });
+            continue;
+        }
+        if (coveredBefore(model, tree, written.items, if (memory == mention) null else memory, memory)) continue;
+        return false;
+    }
+    return true;
+}
+
+/// Whether `node` is the target of an assignment.
+fn assigned(model: *const Model, tree: *const Ast, node: Ast.Node.Index) bool {
+    const parent = model.parentOf(node) orelse return false;
+    return tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == node;
+}
+
+/// The statement of a block that `node` is in and runs whenever the statement does: nothing
+/// between them chooses (`if`, `switch`, `orelse`, `catch`, `and`, `or`, a loop's body), so
+/// a write there holds past the statement.
+fn statementOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return at,
+        .@"orelse", .@"catch", .bool_and, .bool_or => return null,
+        else => {
+            if (tree.fullIf(parent) != null or tree.fullSwitch(parent) != null or tree.fullWhile(parent) != null) return null;
+            // A `for` that writes the memory it is given sets each element, so the memory is
+            // all written once it ends; a `for` around the write runs it on some paths only.
+            if (tree.fullFor(parent)) |loop| if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return null;
+        },
+    };
+    return null;
+}
+
+/// Whether `use`, all of a parameter's memory (`part` null) or the part `part` of it, was
+/// written by one of `written`'s statements before it in a block that holds it: the same part,
+/// spelled alike, or all of it; with nothing between assigning a name the part's bounds spell.
+fn coveredBefore(model: *const Model, tree: *const Ast, written: anytype, part: ?Ast.Node.Index, use: Ast.Node.Index) bool {
+    for (written) |each| {
+        if (each.part) |done| {
+            const wanted = part orelse continue;
+            if (!sameText(tree, done, wanted)) continue;
+        }
+        const block = model.parentOf(each.statement) orelse continue;
+        var at = use;
+        const statement = while (model.parentOf(at)) |parent| : (at = parent) {
+            if (parent == block) break at;
+        } else continue;
+        if (statement == each.statement or tree.firstToken(statement) <= tree.lastToken(each.statement)) continue;
+        if (each.part) |done| if (boundsAssigned(tree, done, tree.lastToken(each.statement), tree.firstToken(use))) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Whether two nodes are spelled with the same tokens.
+fn sameText(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const a_first = tree.firstToken(a);
+    const b_first = tree.firstToken(b);
+    const len = tree.lastToken(a) - a_first;
+    if (tree.lastToken(b) - b_first != len) return false;
+    for (0..len + 1) |i| {
+        const at: Ast.TokenIndex = @intCast(i);
+        if (!std.mem.eql(u8, tree.tokenSlice(a_first + at), tree.tokenSlice(b_first + at))) return false;
+    }
+    return true;
+}
+
+/// Whether a name the bounds of `slice` spell is assigned between tokens `from` and `to`.
+fn boundsAssigned(tree: *const Ast, slice: Ast.Node.Index, from: Ast.TokenIndex, to: Ast.TokenIndex) bool {
+    // The sliced memory's own name is the parameter, which nothing in Zig reassigns here.
+    var token = tree.firstToken(slice) + 1;
+    while (token <= tree.lastToken(slice)) : (token += 1) {
+        if (tree.tokenTag(token) != .identifier) continue;
+        if (token > 0 and tree.tokenTag(token - 1) == .period) continue;
+        const name = tree.tokenSlice(token);
+        var at = from;
+        while (at < to) : (at += 1) {
+            if (tree.tokenTag(at) != .identifier or !std.mem.eql(u8, tree.tokenSlice(at), name)) continue;
+            if (at > 0 and tree.tokenTag(at - 1) == .period) continue;
+            switch (tree.tokenTag(at + 1)) {
+                .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal, .plus_percent_equal, .minus_percent_equal, .asterisk_percent_equal, .plus_pipe_equal, .minus_pipe_equal, .asterisk_pipe_equal, .ampersand_equal, .pipe_equal, .caret_equal, .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_left_pipe_equal, .angle_bracket_angle_bracket_right_equal => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
 /// A function's parameter at `index`: its declaration, where its type is a pointer the
 /// function may write through, and the function's body.
 fn parameter(c: *Context, decl: Facts.Decl, index: usize) Context.Error!?struct { id: Model.Declaration.Id, body: Ast.Node.Index } {
@@ -859,7 +1019,7 @@ fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
 /// past the depth) shows nothing, and what was read while one was is not kept: it depends on
 /// where the reading began, and another reading may show more.
 const Calls = struct {
-    const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps } };
+    const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps, parts } };
     found: std.AutoHashMapUnmanaged(Key, bool) = .empty,
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,

@@ -22,6 +22,8 @@ const std_files = [_]sources.Extra{
     \\pub const zig = @import("zig.zig");
     \\pub const fmt = @import("fmt.zig");
     \\pub const DoublyLinkedList = @import("DoublyLinkedList.zig");
+    \\pub const ascii = @import("ascii.zig");
+    \\pub const base64 = @import("base64.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -72,6 +74,7 @@ const std_files = [_]sources.Extra{
     \\pub const sign = struct { pub const Ed25519 = @import("crypto/ed25519.zig").Ed25519; };
     \\pub fn secureZero(comptime T: type, s: []volatile T) void { for (s) |*b| b.* = 0; }
     \\pub const hash = struct { pub const sha2 = @import("crypto/sha2.zig"); };
+    \\pub const auth = struct { pub const hmac = @import("crypto/hmac.zig"); };
     },
     .{ .name = "std/crypto/timing_safe.zig", .bytes =
     \\pub fn eql(comptime T: type, a: T, b: T) bool { return a == b; }
@@ -152,7 +155,7 @@ const std_files = [_]sources.Extra{
     \\fn Sha2x32(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     \\fn Sha2x64(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     },
-    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }" },
+    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }\npub fn printInt(buffer: []u8, value: anytype, base: u8, case: u1, options: struct {}) usize { _ = value; _ = base; _ = case; _ = options; return buffer.len; }" },
     .{ .name = "std/DoublyLinkedList.zig", .bytes =
     \\const DoublyLinkedList = @This();
     \\first: ?*Node = null,
@@ -161,6 +164,20 @@ const std_files = [_]sources.Extra{
     \\pub fn append(list: *DoublyLinkedList, new_node: *Node) void { list.last = new_node; }
     \\pub fn prepend(list: *DoublyLinkedList, new_node: *Node) void { list.first = new_node; }
     \\pub fn popFirst(list: *DoublyLinkedList) ?*Node { return list.first; }
+    },
+    .{ .name = "std/ascii.zig", .bytes =
+    \\pub fn lowerString(output: []u8, ascii_string: []const u8) []u8 { for (ascii_string, 0..) |c, i| output[i] = c; return output[0..ascii_string.len]; }
+    \\pub fn upperString(output: []u8, ascii_string: []const u8) []u8 { for (ascii_string, 0..) |c, i| output[i] = c; return output[0..ascii_string.len]; }
+    },
+    .{ .name = "std/base64.zig", .bytes =
+    \\pub const Base64Encoder = struct { pad: u8, pub fn encode(encoder: *const Base64Encoder, dest: []u8, source: []const u8) []const u8 { _ = encoder; return dest[0..source.len]; } };
+    \\pub const Base64Decoder = struct { pad: u8, pub fn decode(decoder: *const Base64Decoder, dest: []u8, source: []const u8) !void { _ = decoder; _ = dest; _ = source; } };
+    \\pub const Codecs = struct { Encoder: Base64Encoder, Decoder: Base64Decoder };
+    \\pub const standard: Codecs = .{ .Encoder = .{ .pad = 0 }, .Decoder = .{ .pad = 0 } };
+    },
+    .{ .name = "std/crypto/hmac.zig", .bytes =
+    \\pub const sha2 = struct { pub const HmacSha256 = Hmac(32); };
+    \\fn Hmac(comptime len: comptime_int) type { return struct { const Self = @This(); pub const mac_length = len; pub fn init(key: []const u8) Self { _ = key; return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[mac_length]u8) void { _ = d; _ = out; } pub fn create(out: *[mac_length]u8, msg: []const u8, key: []const u8) void { _ = out; _ = msg; _ = key; } }; }
     },
 };
 const std_imports = [_]sources.ExtraImport{
@@ -184,6 +201,9 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 3, .spelling = "crypto/sha2.zig", .target = 17 },
     .{ .from = 0, .spelling = "fmt.zig", .target = 18 },
     .{ .from = 0, .spelling = "DoublyLinkedList.zig", .target = 19 },
+    .{ .from = 0, .spelling = "ascii.zig", .target = 20 },
+    .{ .from = 0, .spelling = "base64.zig", .target = 21 },
+    .{ .from = 3, .spelling = "crypto/hmac.zig", .target = 22 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -999,6 +1019,38 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
     const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
+}
+
+test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
+    // Clean: the program's writers of a part returned as written (9, 10, 11), std's keeps
+    // returning what they fill (15, 17), an HMAC's final and create (18, 19), a count a call
+    // returns read in place (20). Findings: past the part written (12), a bound assigned
+    // between (13), a part written on one path (14), a keep's buffer read (16), past the
+    // count (21).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\fn four(v4: [4]u8, buf: *[16]u8) []const u8 { buf[0..4].* = v4; return buf[0..4]; }
+        \\fn whole(v: [16]u8, buf: *[16]u8) []const u8 { buf.* = v; return buf[0..8]; }
+        \\fn copied(name: []const u8, out: *[64]u8) []const u8 { if (name.len > out.len) return name; @memcpy(out[0..name.len], name); return out[0..name.len]; }
+        \\fn past(v4: [4]u8, buf: *[16]u8) []const u8 { buf[0..4].* = v4; return buf[0..8]; }
+        \\fn moved(src: []const u8, out: *[64]u8) []const u8 { var k = src.len; @memcpy(out[0..k], src); k += 1; return out[0..k]; }
+        \\fn sometimes(v4: [4]u8, buf: *[16]u8, ok: bool) []const u8 { if (ok) buf[0..4].* = v4; return buf[0..4]; }
+        \\pub fn p1(v4: [4]u8) void { var b: [16]u8 = undefined; use(four(v4, &b)); }
+        \\pub fn p2(v: [16]u8) void { var b: [16]u8 = undefined; use(whole(v, &b)); }
+        \\pub fn p3(s: []const u8) void { var b: [64]u8 = undefined; use(copied(s, &b)); }
+        \\pub fn p4(v4: [4]u8) void { var b: [16]u8 = undefined; use(past(v4, &b)); }
+        \\pub fn p5(s: []const u8) void { var b: [64]u8 = undefined; use(moved(s, &b)); }
+        \\pub fn p6(v4: [4]u8, ok: bool) void { var b: [16]u8 = undefined; use(sometimes(v4, &b, ok)); }
+        \\pub fn s1(s: []const u8) void { var b: [64]u8 = undefined; use(std.ascii.lowerString(&b, s)); }
+        \\pub fn s2(s: []const u8) u8 { var b: [64]u8 = undefined; _ = std.ascii.lowerString(&b, s); return b[0]; }
+        \\pub fn s3(s: []const u8) void { var b: [64]u8 = undefined; use(std.base64.standard.Encoder.encode(&b, s)); }
+        \\pub fn h1(m: []const u8) [32]u8 { var out: [32]u8 = undefined; var h = std.crypto.auth.hmac.sha2.HmacSha256.init(m); h.final(&out); return out; }
+        \\pub fn h2(m: []const u8) [32]u8 { var out: [32]u8 = undefined; std.crypto.auth.hmac.sha2.HmacSha256.create(&out, m, m); return out; }
+        \\pub fn n1() void { var b: [20]u8 = undefined; use(b[0..std.fmt.printInt(&b, 7, 10, 0, .{})]); }
+        \\pub fn n2() void { var b: [20]u8 = undefined; use(b[0 .. std.fmt.printInt(&b, 7, 10, 0, .{}) + 1]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 12, 13, 14, 16, 21 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads all of a local through asBytes, a for setting each element after what neither reads it nor leaves, a vector's one buffer, and a prefix read by the count that wrote it" {
