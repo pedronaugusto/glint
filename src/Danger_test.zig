@@ -5379,3 +5379,26 @@ test "A010 reads what a function stores through a parameter in its callers' memo
     ;
     try expect(pack.integers, program, 3);
 }
+
+test "A010 reads a bound past a u128 as past it: a sum or a conversion into a type of 128 bits or more, exact up to 255 bits" {
+    const program =
+        \\const std = @import("std");
+        \\fn grows(r: u128) u128 {
+        \\    return r + 1;
+        \\}
+        \\fn narrows(r: u128) u128 {
+        \\    const wide: u136 = r;
+        \\    return @intCast(wide + 1);
+        \\}
+        \\fn widens(r: u128) u136 {
+        \\    const wide: u136 = r;
+        \\    return wide + std.math.maxInt(u128);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u136 {
+        \\    const value = try r.takeInt(u128, .little);
+        \\    return grows(value) +% narrows(value) +% widens(value);
+        \\}
+    ;
+    // `r + 1` and the conversion each pass the type's greatest; a u136 holds the sum of two u128s.
+    try expect(pack.integers, program, 2);
+}

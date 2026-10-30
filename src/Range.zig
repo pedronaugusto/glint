@@ -35,12 +35,12 @@ pub const Int = struct {
 
     /// The greatest magnitude the type holds on every target: what a conversion into it or
     /// arithmetic in it must stay within.
-    fn room(self: Int) u128 {
+    fn room(self: Int) Magnitude {
         return filled(if (self.signed) self.bits -| 1 else self.bits);
     }
 
     /// The greatest magnitude a value of the type can have on some target.
-    fn reach(self: Int) u128 {
+    fn reach(self: Int) Magnitude {
         const bits = self.wide orelse self.bits;
         return filled(if (self.signed and !self.either) bits -| 1 else bits);
     }
@@ -71,6 +71,11 @@ const Typed = union(enum) {
         return .{ .int = .{ .bits = @max(signed.bits, room), .signed = true, .wide = if (wide) |w| @max(w, room) else null, .either = either } };
     }
 };
+
+/// The integer a magnitude is read in: wide enough for a type of 255 bits and a sum or product
+/// past one, so a `u136` sum of two `u128` values is exact. A bound saturates at its greatest,
+/// past every type's room (`atMost`).
+const Magnitude = u256;
 
 /// The pointer widths a range is read at: those of the targets the package builds for
 /// (`Config.pointer_widths`), both 32 and 64 bits where it names none.
@@ -121,7 +126,7 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
             const k = literal(tree, rhs).?;
             if (subtracts and try ordered(c, file, node, lhs, rhs, pointer)) continue;
             if (!subtracts and tag != .mul and tag != .assign_mul) {
-                if (try upper(c, file, lhs, node, pointer, 0)) |most| if (most +| k <= int.room()) continue;
+                if (try upper(c, file, lhs, node, pointer, 0)) |most| if (atMost(most +| k, int.room())) continue;
             }
         }
         const left = (try bound(c, file, lhs, pointer, 0)) orelse return false;
@@ -130,7 +135,7 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
             .mul, .assign_mul => left *| right,
             else => left +| right,
         };
-        if (needed > int.room()) return false;
+        if (!atMost(needed, int.room())) return false;
     }
     return true;
 }
@@ -149,7 +154,7 @@ pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand
         // where it is read keeps it at zero or above.
         if (from.signed and (!into.signed or into.either) and !try nonnegative(c, file, operand, pointer)) return false;
         const magnitude = (try bound(c, file, operand, pointer, 0)) orelse return false;
-        if (magnitude > into.room()) return false;
+        if (!atMost(magnitude, into.room())) return false;
     }
     return true;
 }
@@ -179,15 +184,15 @@ pub fn shown(c: *Context, file: Project.FileId, value: Ast.Node.Index, declared_
 /// constant the program chose: a literal, a constant naming one, or `std.math.maxInt` of a
 /// type. A comparison with another value (another number a peer sent) shows no limit of the
 /// program's.
-fn upperByConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16) Context.Error!?u128 {
+fn upperByConstant(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
     if (tree.nodeTag(node) != .identifier and tree.nodeTag(node) != .field_access) return null;
-    var out: ?u128 = null;
+    var out: ?Magnitude = null;
     for (try facts(c, file, at)) |fact| {
         const base, const k = offset(tree, fact.small);
         if (!same(tree, base, node)) continue;
         const large = bare(tree, fact.large);
-        const most: u128 = if (try valueOf(c, file, large, 0)) |value| value else most: {
+        const most: Magnitude = if (try valueOf(c, file, large, 0)) |value| value else most: {
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, large) orelse continue;
             const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
@@ -235,10 +240,10 @@ pub fn small(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
 }
 
 /// The greatest magnitude a value can have, or null where the reading does not know.
-fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?u128 {
+fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     if (depth > depth_limit) return null;
     const own = try operation(c, file, node, pointer, depth);
-    const typed: ?u128 = switch (try typeOf(c, file, node, pointer, depth)) {
+    const typed: ?Magnitude = switch (try typeOf(c, file, node, pointer, depth)) {
         .int => |int| int.reach(),
         else => null,
     };
@@ -250,10 +255,10 @@ fn bound(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, 
 
 /// What the comparisons holding at `at` (and a position's memory) put `node` at most, read
 /// as a value, not a magnitude.
-fn upper(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?u128 {
+fn upper(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
     if (tree.nodeTag(node) != .identifier and tree.nodeTag(node) != .field_access) return null;
-    var out: ?u128 = null;
+    var out: ?Magnitude = null;
     // A position the function indexes or slices memory with is below a length, and so is one
     // read below a length where it is used (a std search's in what it searched).
     if (try position(c, file, node)) out = length(pointer);
@@ -480,7 +485,7 @@ fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: 
 }
 
 /// What an expression's own operation bounds, before its type does.
-fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?u128 {
+fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
     const next = depth + 1;
     switch (tree.nodeTag(node)) {
@@ -541,15 +546,17 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             return quotient(try bound(c, file, lhs, pointer, next), literal(tree, rhs));
         },
         .mod => return ((try bound(c, file, tree.nodeData(node).node_and_node[1], pointer, next)) orelse return null) -| 1,
+        // A shift by at most `k` moves at most as far as one by `k`.
         .shl => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return shifted(try bound(c, file, lhs, pointer, next), literal(tree, rhs) orelse return null);
+            const by = literal(tree, rhs) orelse std.math.cast(u64, (try bound(c, file, rhs, pointer, next)) orelse return null) orelse return null;
+            return shifted(try bound(c, file, lhs, pointer, next), by);
         },
         .shr => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const left = (try bound(c, file, lhs, pointer, next)) orelse return null;
             const by = literal(tree, rhs) orelse return left;
-            return if (by >= 128) 0 else left >> @intCast(by);
+            return if (by >= @bitSizeOf(Magnitude)) 0 else left >> @intCast(by);
         },
         .bit_and => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -562,7 +569,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
         .bit_or, .bit_xor => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const most = wider(try bound(c, file, lhs, pointer, next), try bound(c, file, rhs, pointer, next)) orelse return null;
-            return filled(std.math.sub(u16, 128, @clz(most)) catch return null);
+            return filled(std.math.sub(u16, @bitSizeOf(Magnitude), @clz(most)) catch return null);
         },
         .@"if", .if_simple => {
             const branch = tree.fullIf(node).?;
@@ -571,7 +578,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             return wider(then, try bound(c, file, otherwise, pointer, next));
         },
         .@"switch", .switch_comma => {
-            var out: ?u128 = 0;
+            var out: ?Magnitude = 0;
             for (tree.fullSwitch(node).?.ast.cases) |case| {
                 const full = tree.fullSwitchCase(case) orelse return null;
                 out = wider(out, try bound(c, file, full.ast.target_expr, pointer, next));
@@ -592,7 +599,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
 
 /// `std.math.maxInt(T)` of an integer type `T`: its greatest value, so a guard `x <=
 /// std.math.maxInt(u32)` bounds `x` as a literal would.
-fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call, pointer: u16) Context.Error!?u128 {
+fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call, pointer: u16) Context.Error!?Magnitude {
     if (call.ast.params.len != 1) return null;
     for ((try Governed.declarations(c, "std", "math.maxInt")) orelse return null) |each| {
         if (each.file != decl.file or each.index != decl.index) continue;
@@ -605,7 +612,7 @@ fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.C
 
 /// The count std's `Io.Reader.readSliceShort` returns: at most its buffer's length, where the
 /// buffer is an array of a length the program fixes (`&buf`, or a pointer to one).
-fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call) Context.Error!?u128 {
+fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call) Context.Error!?Magnitude {
     if (call.ast.params.len == 0) return null;
     for ((try Governed.declarations(c, "std", "Io.Reader.readSliceShort")) orelse return null) |each| {
         if (each.file != decl.file or each.index != decl.index) continue;
@@ -619,9 +626,9 @@ fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full
 
 /// What a function of the program returns at most, read once per function and pointer width:
 /// the widest of its `return`s, each read in its body.
-const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty };
+const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const memo = try c.facts.memo(Returns);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -636,7 +643,7 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     if (tree.nodeTag(function) != .fn_decl) return null;
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
-    var out: ?u128 = 0;
+    var out: ?Magnitude = 0;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"return") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -660,7 +667,7 @@ fn enclosing(tree: *const Ast, model: anytype, node: Ast.Node.Index) ?Ast.Node.I
 }
 
 /// What a builtin's operation bounds.
-fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?u128 {
+fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const tree = &c.project.at(file).file.tree;
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     var buffer: [2]Ast.Node.Index = undefined;
@@ -699,7 +706,7 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
     if (is(name, &.{"@shlExact"})) return shifted(left, literal(tree, args[1]) orelse return null);
     if (is(name, &.{"@shrExact"})) {
         const by = literal(tree, args[1]) orelse return left;
-        return if (by >= 128) 0 else (left orelse return null) >> @intCast(by);
+        return if (by >= @bitSizeOf(Magnitude)) 0 else (left orelse return null) >> @intCast(by);
     }
     return null;
 }
@@ -707,7 +714,7 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
 /// What a declaration's value is bounded by: a constant's by its initializer (and its type,
 /// where it spells one); a function's local variable by every value it is given; a
 /// parameter, a field or a capture by its type alone.
-fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
@@ -723,9 +730,9 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
 /// the widest of its initializer and of each value assigned to it, every one read where it is
 /// given (`null` and `undefined` give none). One added to, multiplied or shifted in place, or
 /// whose address is taken, is unknown.
-const Assigned = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty };
+const Assigned = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const memo = try c.facts.memo(Assigned);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -736,7 +743,7 @@ fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: 
     const function = enclosing(tree, model, model.declarations[@backingInt(decl.index)].node) orelse return null;
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
-    var out: ?u128 = 0;
+    var out: ?Magnitude = 0;
     if (variable.ast.init_node.unwrap()) |init| if (!empty(tree, init)) {
         out = try bound(c, decl.file, init, pointer, depth);
     };
@@ -945,9 +952,9 @@ fn add(c: *Context, memo: *Stores, name: []const u8, site: Stores.Site) Context.
 /// assignment or a struct literal, each read where it is stored. One changed in place or whose
 /// address is taken is unknown, and so is a field of an `extern` or `packed` struct, whose bytes
 /// a reinterpretation (`@bitCast`, a reader's `takeStruct`) sets with no store to read.
-const Stored = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?u128) = .empty };
+const Stored = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?u128 {
+fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const memo = try c.facts.memo(Stored);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -968,7 +975,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     const type_name = containerName(c, decl.file, container_node) orelse return null;
     if (found.arguments.contains(type_name)) return null;
     if (found.exposed.contains(.{ decl.file, record.scope })) return null;
-    var out: ?u128 = 0;
+    var out: ?Magnitude = 0;
     if (field_decl.ast.value_expr.unwrap()) |default| if (!empty(tree, default)) {
         out = try bound(c, decl.file, default, pointer, depth);
     };
@@ -1144,7 +1151,7 @@ fn element(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Typed {
 
 /// The least and greatest value an inline prong's capture takes: its prong's items, each a
 /// literal or a range of literals (`inline 1...7 => |period|`). Null for any other capture.
-const Reach = struct { least: u128, most: u128 };
+const Reach = struct { least: Magnitude, most: Magnitude };
 fn prong(c: *Context, decl: Facts.Decl) ?Reach {
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
@@ -1152,7 +1159,7 @@ fn prong(c: *Context, decl: Facts.Decl) ?Reach {
     if (record.kind != .capture) return null;
     const case = tree.fullSwitchCase(record.node) orelse return null;
     if (case.inline_token == null or case.payload_token != record.token or case.ast.values.len == 0) return null;
-    var out: Reach = .{ .least = std.math.maxInt(u128), .most = 0 };
+    var out: Reach = .{ .least = std.math.maxInt(Magnitude), .most = 0 };
     for (case.ast.values) |item| {
         const low, const high = if (tree.nodeTag(item) == .switch_range) tree.nodeData(item).node_and_node else .{ item, item };
         const a = literal(tree, low) orelse return null;
@@ -1447,7 +1454,7 @@ fn destination(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer:
 /// one of its values; an exhaustive enum's are the tags it names.
 const Backing = struct {
     tag: Int,
-    filled: u128,
+    filled: Magnitude,
 };
 
 fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16) Context.Error!?Backing {
@@ -1495,9 +1502,9 @@ fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16)
     std.mem.sortUnstable(u64, values.items, {}, std.sort.asc(u64));
     // The values from zero each tag names, without a gap, are what any operand below them
     // makes.
-    var filled_to: ?u128 = null;
+    var filled_to: ?Magnitude = null;
     for (values.items) |value| {
-        const expected: u128 = if (filled_to) |f| f + 1 else 0;
+        const expected: Magnitude = if (filled_to) |f| f + 1 else 0;
         if (value == expected) filled_to = expected else if (value > expected) break;
     }
     return .{ .tag = tag, .filled = filled_to orelse return null };
@@ -1512,7 +1519,7 @@ pub fn fills(c: *Context, file: Project.FileId, call: Ast.Node.Index, operand: A
         // signed operand converts only where it is shown within it.
         if (!try nonnegative(c, file, operand, pointer)) return false;
         const magnitude = (try bound(c, file, operand, pointer, 0)) orelse return false;
-        if (magnitude > backing.filled) return false;
+        if (!atMost(magnitude, backing.filled)) return false;
     }
     return true;
 }
@@ -1597,39 +1604,46 @@ fn literal(tree: *const Ast, node: Ast.Node.Index) ?u64 {
     }
 }
 
-fn narrower(a: ?u128, b: ?u128) ?u128 {
+fn narrower(a: ?Magnitude, b: ?Magnitude) ?Magnitude {
     const x = a orelse return b;
     const y = b orelse return a;
     return @min(x, y);
 }
 
-fn wider(a: ?u128, b: ?u128) ?u128 {
+fn wider(a: ?Magnitude, b: ?Magnitude) ?Magnitude {
     return @max(a orelse return null, b orelse return null);
 }
 
-fn sum(a: ?u128, b: ?u128) ?u128 {
+fn sum(a: ?Magnitude, b: ?Magnitude) ?Magnitude {
     return (a orelse return null) +| (b orelse return null);
 }
 
-fn shifted(a: ?u128, by: u64) ?u128 {
+fn shifted(a: ?Magnitude, by: u64) ?Magnitude {
     const left = a orelse return null;
     if (left == 0) return 0;
-    if (by >= 128 or left > @as(u128, std.math.maxInt(u128)) >> @intCast(by)) return std.math.maxInt(u128);
+    if (by >= @bitSizeOf(Magnitude) or left > @as(Magnitude, std.math.maxInt(Magnitude)) >> @intCast(by)) return std.math.maxInt(Magnitude);
     return left << @intCast(by);
 }
 
+/// Whether a magnitude is shown at most `limit`. The bounds saturate at the greatest `Magnitude` (a sum
+/// past it, `filled` of a type of 128 bits or more), so one there may be past any limit: a sum
+/// past a `u128` read as fitting it.
+fn atMost(magnitude: Magnitude, limit: Magnitude) bool {
+    return magnitude < std.math.maxInt(Magnitude) and magnitude <= limit;
+}
+
 /// The greatest value of `bits` bits.
-fn filled(bits: u16) u128 {
-    return if (bits >= 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(bits)) - 1;
+fn filled(bits: u16) Magnitude {
+    return if (bits >= @bitSizeOf(Magnitude)) std.math.maxInt(Magnitude) else (@as(Magnitude, 1) << @intCast(bits)) - 1;
 }
 
 /// The greatest length of memory at a pointer width: below half the address space.
-fn length(pointer: u16) u128 {
+fn length(pointer: u16) Magnitude {
     return filled(std.math.sub(u16, pointer, 1) catch 0);
 }
 
 /// A quotient's bound: the dividend's divided by a literal divisor.
-fn quotient(dividend: ?u128, divisor: ?u64) ?u128 {
+fn quotient(dividend: ?Magnitude, divisor: ?u64) ?Magnitude {
     const left = dividend orelse return null;
     const by = divisor orelse return left;
     if (by == 0) return left;
@@ -2981,7 +2995,7 @@ fn apart(c: *Context, file: Project.FileId, assignment: Ast.Node.Index, use: Ast
 
 /// The bound a fact gives its smaller side: the larger side's, one less where it is strictly
 /// under it.
-fn below(c: *Context, file: Project.FileId, fact: Fact, pointer: u16, depth: u8) Context.Error!?u128 {
+fn below(c: *Context, file: Project.FileId, fact: Fact, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const most = (try bound(c, file, fact.large, pointer, depth)) orelse return null;
     return if (fact.strict) most -| 1 else most;
 }
@@ -3909,7 +3923,7 @@ fn prongField(c: *Context, capture: Facts.Decl) Context.Error!?Facts.Decl {
 
 /// The declared length of the fixed array a name holds, or points to (`var buf: [256]u8`,
 /// `const t = [_]u8{ ... }`, a field `table: *const [256][4]u8`), its length a constant.
-fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?u128 {
+fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?Magnitude {
     var decl = (try c.facts.definition(file, memory)) orelse return null;
     var record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     // A prong's capture of a union's field (`.set => |s|`) has that field's type.
