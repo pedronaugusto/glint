@@ -4899,6 +4899,76 @@ test "A020 counts a cancellation point only where the path error.Canceled takes 
     try std.testing.expectEqualSlices(u32, &.{ 8, 21, 34, 54, 70, 85, 97, 111, 123, 137, 150, 169, 185, 198, 209, 221, 241, 257 }, result.lines[0..result.findings]);
 }
 
+test "A020 goes where a break or continue goes, by its label or its loop, not by its spelling, and lets a callee leave before its point only by an error that ends the loop" {
+    const head =
+        \\const std = @import("std");
+        \\fn quick(io: std.Io, n: *const usize) std.Io.Cancelable!usize {
+        \\    if (n.* == 0) return 0;
+        \\    try io.checkCancel();
+        \\    return n.*;
+        \\}
+        \\fn readSome(io: std.Io, n: *const usize) (std.Io.Cancelable || error{Empty})!usize {
+        \\    if (n.* == 0) return error.Empty;
+        \\    while (true) {
+        \\        try io.checkCancel();
+        \\        if (n.* != 0) return n.*;
+        \\    }
+        \\}
+        \\fn whileCounted(io: std.Io, n: *usize) std.Io.Cancelable!usize {
+        \\    while (n.* < 10) {
+        \\        try io.checkCancel();
+        \\        n.* += 1;
+        \\    }
+        \\    return n.*;
+        \\}
+        \\fn breaksFirst(io: std.Io, n: *const usize) std.Io.Cancelable!usize {
+        \\    while (true) {
+        \\        if (n.* == 0) break;
+        \\        try io.checkCancel();
+        \\        return 1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    ;
+    // Each has a pass that goes on without the point: a continue of the loop, a break of a block
+    // around the point, the point in a loop that may not run, a callee that returns a value before
+    // it, and a handler that goes on with the loop after an error.
+    inline for (.{
+        "pub fn f(io: std.Io, skip: *const bool) !void {\n    while (true) {\n        if (skip.*) continue;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, skip: *const bool) !void {\n    outer: while (true) {\n        if (skip.*) continue :outer;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, skip: *const bool) !void {\n    while (true) {\n        blk: {\n            if (skip.*) break :blk;\n            try io.checkCancel();\n        }\n    }\n}\n",
+        "pub fn f(io: std.Io, skip: *const bool) !void {\n    while (true) body: {\n        if (skip.*) break :body;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, xs: []const u8) !void {\n    while (true) {\n        for (xs) |x| {\n            if (x == 0) break;\n            try io.checkCancel();\n        }\n    }\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) _ = try quick(io, n);\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) {\n        _ = readSome(io, n) catch |err| switch (err) {\n            error.Canceled => return error.Canceled,\n            error.Empty => continue,\n        };\n    }\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) {\n        _ = readSome(io, n) catch |err| switch (err) {\n            error.Canceled => return error.Canceled,\n            error.Empty => {},\n        };\n    }\n}\n",
+        "pub fn f(io: std.Io, n: *usize) !void {\n    while (true) _ = try whileCounted(io, n);\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) _ = try breaksFirst(io, n);\n}\n",
+        "pub fn f(io: std.Io, done: *const bool) !void {\n    while (true) {\n        while (true) {\n            if (done.*) break;\n            try io.checkCancel();\n        }\n    }\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // Each reaches the point on every pass that goes on: a break of the loop ends it, a jump
+    // inside a statement ends only what it names, a callee leaves before its point only by an
+    // error the loop ends on, and a `while (true)` runs its first pass.
+    inline for (.{
+        "pub fn f(io: std.Io, done: *const bool) !void {\n    while (true) {\n        if (done.*) break;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, done: *const bool) !void {\n    outer: while (true) {\n        if (done.*) break :outer;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, done: *const bool) !void {\n    outer: while (true) {\n        try io.checkCancel();\n        while (true) {\n            if (done.*) continue :outer;\n            try io.checkCancel();\n        }\n    }\n}\n",
+        "pub fn f(io: std.Io, xs: []const u8) !void {\n    while (true) {\n        for (xs) |x| {\n            if (x == 0) break;\n            if (x == 1) continue;\n        }\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, xs: []const u8) !void {\n    while (true) {\n        const first = blk: {\n            if (xs.len == 0) break :blk 0;\n            break :blk xs[0];\n        };\n        _ = first;\n        try io.checkCancel();\n    }\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) _ = try readSome(io, n);\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) {\n        _ = readSome(io, n) catch |err| switch (err) {\n            error.Canceled => return error.Canceled,\n            error.Empty => return,\n        };\n    }\n}\n",
+        "pub fn f(io: std.Io, n: *const usize) !void {\n    while (true) {\n        _ = readSome(io, n) catch |err| switch (err) {\n            error.Canceled => return error.Canceled,\n            else => break,\n        };\n    }\n}\n",
+        "pub fn f(io: std.Io, done: *const bool) !void {\n    while (true) {\n        while (true) {\n            try io.checkCancel();\n            if (done.*) break;\n        }\n    }\n}\n",
+    }) |body| expect(pack.cancellation, head ++ body, 0) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+}
+
 test "A020 reads an error returned as a value as no cancellation point: a dropped arm, a swallowing else, a value from the error, a payload that can hold it" {
     // The second probe review's helpers (N5): `case_e` returns the capture from a function whose
     // payload (`?anyerror`) can take it as a value; `case_g`'s helpers pass it on.
