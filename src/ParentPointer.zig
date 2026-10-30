@@ -707,6 +707,7 @@ fn listNode(c: *Context, pointer: Ast.Node.Index, field: Field, kind: Facts.Cont
     const source = (try nodeSource(c, c.file, pointer, field, list, null, 0)) orelse return false;
     if (source == .same) return false;
     if (!try insertsOnlyParents(c, field, list, source)) return false;
+    if (!try listsInPlace(c, list)) return false;
     return addressedOnly(c, field, kind);
 }
 
@@ -829,24 +830,33 @@ fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: Lis
 
 /// Whether every way the package puts a node into a list that may be `source`'s puts `&c.F`
 /// of a C: std's insertions (`append`, `prepend`, `insertAfter`, `insertBefore`, a node's
-/// `insertAfter`) and a store to a list's or node's links. A list moved into another
-/// (`concatByMoving`) is shown nothing of.
+/// `insertAfter`), each reached by its declaration and called there on a list or a node, and
+/// a store to a list's or node's links. A list moved into another (`concatByMoving`) is shown
+/// nothing of. An insertion named any other way (`@call`, `const add = L.append`, a type's
+/// member read out), a link's address, or a `@field` that may name either, shows nothing.
 fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Context.Error!bool {
     const inserts: []const []const u8 = switch (list) {
         .doubly => &.{ "append", "prepend", "insertAfter", "insertBefore", "concatByMoving" },
         .singly => &.{ "prepend", "insertAfter" },
     };
+    const links = [_][]const u8{ "first", "last", "next", "prev" };
     for (inserts) |method| for (try c.facts.memberUses(method)) |use| {
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
-        const outer = model.parentOf(use.node) orelse continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, outer) orelse continue;
-        if (call.ast.fn_expr != use.node) continue;
         // Which it is, by its receiver's type: std's list or its node; a receiver that does
         // not resolve may be either.
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const of = (try receiverKind(c, use.file, receiver, list)) orelse continue;
+        // Named on the type (`std.DoublyLinkedList.append`): a function value that may insert
+        // anything, wherever it is called.
+        switch (try c.facts.resolve(use.file, receiver)) {
+            .container => return false,
+            else => {},
+        }
+        const outer = model.parentOf(use.node) orelse return false;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, outer) orelse return false;
+        if (call.ast.fn_expr != use.node) return false;
         if (std.mem.eql(u8, method, "concatByMoving")) {
             if (of != .node and try mayBe(c, use.file, receiver, source)) return false;
             continue;
@@ -857,17 +867,125 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
         const inserted = (try nodeSource(c, use.file, call.ast.params[call.ast.params.len - 1], field, list, null, 0)) orelse return false;
         if (inserted != .any) return false;
     };
-    for ([_][]const u8{ "first", "last", "next", "prev" }) |link| for (try c.facts.memberUses(link)) |use| {
+    for (links) |link| for (try c.facts.memberUses(link)) |use| {
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
-        const parent = model.parentOf(use.node) orelse continue;
-        if (tree.nodeTag(parent) != .assign or tree.nodeData(parent).node_and_node[0] != use.node) continue;
         if ((try receiverKind(c, use.file, tree.nodeData(use.node).node_and_token[0], list)) == null) continue;
+        const parent = model.parentOf(use.node) orelse continue;
+        // A link's address writes it wherever that goes.
+        if (tree.nodeTag(parent) == .address_of) return false;
+        if (tree.nodeTag(parent) != .assign or tree.nodeData(parent).node_and_node[0] != use.node) continue;
         const value = strip(tree, tree.nodeData(parent).node_and_node[1]);
         if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
         const stored = (try nodeSource(c, use.file, value, field, list, null, 0)) orelse return false;
         if (stored == .same) return false;
     };
+    // `@field(l, "first")`, `@field(L, "append")`: named so, a link or an insertion.
+    for (c.project.sources) |*each| {
+        if (!try c.facts.program(each.id)) continue;
+        const tree = &each.file.tree;
+        for (tree.nodes.items(.tag), 0..) |_, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!isBuiltin(tree, node, "@field")) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 2) continue;
+            if ((try receiverKind(c, each.id, args[0], list)) == null) continue;
+            for (links ++ [_][]const u8{ "append", "prepend", "insertAfter", "insertBefore", "concatByMoving" }) |name| {
+                if (try namedBy(c, tree, args[1], name)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Whether no list or node of `list`'s kind is made or copied whole in the package except
+/// empty: a literal of either gives each link `null`, a whole one assigned is such a literal,
+/// and none is read out by value (`p.free = b.items`, `var l = p.free`, `p.*` of either), which
+/// carries its links to another place that may insert anything after them. A literal or a
+/// place whose type does not resolve may be one.
+fn listsInPlace(c: *Context, list: List) Context.Error!bool {
+    for (c.project.sources) |*each| {
+        if (!try c.facts.program(each.id)) continue;
+        const file = each.id;
+        const tree = &each.file.tree;
+        const model = &each.model;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullStructInit(&buffer, node)) |literal| {
+                var linked = false;
+                for (literal.ast.fields) |value| {
+                    const first = tree.firstToken(value);
+                    if (first < 2 or tree.tokenTag(first - 2) != .identifier) continue;
+                    const name = try Model.identifier(c.allocator, tree.tokenSlice(first - 2));
+                    const is_link = for ([_][]const u8{ "first", "last", "next", "prev" }) |link| {
+                        if (std.mem.eql(u8, name, link)) break true;
+                    } else false;
+                    const plain = strip(tree, value);
+                    if (is_link and !(tree.nodeTag(plain) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(plain)), "null"))) linked = true;
+                }
+                if (!linked) continue;
+                const container = if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, node);
+                const made = container orelse return false;
+                if (try stdList(c, made, "") == list or try stdList(c, made, "Node") == list) return false;
+                continue;
+            }
+            switch (tag) {
+                .identifier, .field_access, .deref, .array_access, .unwrap_optional => {},
+                else => continue,
+            }
+            const value = try c.facts.resolve(file, node);
+            const container = switch (value) {
+                .instance => |container| container,
+                else => continue,
+            };
+            if (try stdList(c, container, "") != list and try stdList(c, container, "Node") != list) continue;
+            // In place: its address, a member of it, a whole write to it.
+            const parent = model.parentOf(node) orelse return false;
+            switch (tree.nodeTag(parent)) {
+                .address_of, .field_access => continue,
+                .assign => {
+                    const target, const assigned = tree.nodeData(parent).node_and_node;
+                    if (target != node) return false;
+                    var literal_buffer: [2]Ast.Node.Index = undefined;
+                    if (tree.fullStructInit(&literal_buffer, strip(tree, assigned)) == null) return false;
+                },
+                else => {
+                    // Its declaration names it, as its type, not as a value.
+                    if (tree.nodeTag(node) == .identifier) {
+                        const ref = model.reference(node) orelse return false;
+                        const index = ref.declaration orelse return false;
+                        if (model.declarations[@backingInt(index)].node == parent) continue;
+                    }
+                    return false;
+                },
+            }
+        }
+        // A parameter of either by value is a copy of what its caller gives.
+        for (model.declarations) |decl| {
+            if (decl.kind != .parameter) continue;
+            const declared = decl.node;
+            const container = switch (try c.facts.resolve(file, declared)) {
+                .container, .instance => |container| container,
+                else => continue,
+            };
+            if (try stdList(c, container, "") == list or try stdList(c, container, "Node") == list) return false;
+        }
+        // A local of either initialised from a place, not a literal.
+        for (model.declarations) |decl| {
+            if (decl.kind != .variable) continue;
+            const variable = tree.fullVarDecl(decl.node) orelse continue;
+            const init = strip(tree, variable.ast.init_node.unwrap() orelse continue);
+            var literal_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullStructInit(&literal_buffer, init) != null) continue;
+            const container = switch (try c.facts.resolve(file, init)) {
+                .instance => |container| container,
+                else => continue,
+            };
+            if (try stdList(c, container, "") == list or try stdList(c, container, "Node") == list) return false;
+        }
+    }
     return true;
 }
 
