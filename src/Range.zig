@@ -2272,7 +2272,7 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
     }
     const region: Region = .{ .tree = tree, .from = from, .to = to, .skipped = skipped, .loops = around.constItems() };
     // What the compared value reads, for the stores that reach it through other names.
-    var places: Places = .{};
+    var places: Places = .{ .rename = try calleeReceiver(c, file, compared, condition) };
     try places.gather(c, file, compared, 0);
     const exposed = places.exposed();
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -2686,14 +2686,50 @@ fn rootOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.De
     };
 }
 
+/// A declaration read as another: a callee's receiver parameter as the receiver its call names.
+const Rename = struct { from: Model.Declaration.Id, to: Model.Declaration.Id };
+
+/// Where `compared` is a callee's condition read at its call `since` (`succeeded`): the callee's
+/// first parameter, which it is rooted at, as the local or parameter the call names as its
+/// receiver, spelled the same. Null for anything else.
+fn calleeReceiver(c: *Context, file: Project.FileId, compared: Ast.Node.Index, since: Ast.Node.Index) Context.Error!?Rename {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, since) orelse return null;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+    if (tree.nodeTag(receiver) != .identifier) return null;
+    const to = (model.reference(receiver) orelse return null).declaration orelse return null;
+    const from = rootOf(tree, model, bare(tree, compared)) orelse return null;
+    if (from == to) return null;
+    const record = model.declarations[@backingInt(from)];
+    if (record.kind != .parameter or !std.mem.eql(u8, record.name, model.declarations[@backingInt(to)].name)) return null;
+    // The parameter is the first of the function the call reaches.
+    const callee = try c.facts.resolve(file, call.ast.fn_expr);
+    if (callee != .function or callee.function.file != file) return null;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[@backingInt(callee.function.index)].node) orelse return null;
+    var parameters = proto.iterate(tree);
+    const first = parameters.next() orelse return null;
+    if (first.name_token != record.token) return null;
+    return .{ .from = from, .to = to };
+}
+
 /// The places a compared value reads: each named in it, and those of the constants it names.
 const Places = struct {
     items: [8]Place = undefined,
     len: u8 = 0,
     /// More places than are kept: read as exposed.
     over: bool = false,
+    /// A callee's receiver read as its call's (`calleeReceiver`).
+    rename: ?Rename = null,
 
-    fn add(self: *Places, place: Place) void {
+    fn add(self: *Places, given: Place) void {
+        var place = given;
+        if (self.rename) |r| if (place.decl == r.from) {
+            place.decl = r.to;
+        };
         if (self.len == self.items.len) {
             self.over = true;
             return;
@@ -3569,6 +3605,21 @@ fn lengthOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, memory: Ast
     if (tree.nodeTag(at) != .field_access) return false;
     const receiver, const name = tree.nodeData(at).node_and_token;
     return std.mem.eql(u8, tree.tokenSlice(name), "len") and same(tree, receiver, memory);
+}
+
+/// Which way a bound holds a value: at most it, or at least it.
+pub const Side = enum { ceiling, floor };
+
+/// What the comparisons holding where `at` is evaluated put `value` at most (`.ceiling`: the
+/// larger sides) or at least (`.floor`: the smaller sides), `value` spelled as they spell it.
+pub fn boundsAt(c: *Context, file: Project.FileId, at: Ast.Node.Index, value: Ast.Node.Index, side: Side) Context.Error![]const Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    var out: std.ArrayList(Ast.Node.Index) = .empty;
+    for (try facts(c, file, at)) |fact| switch (side) {
+        .ceiling => if (same(tree, fact.small, value)) try out.append(c.allocator, fact.large),
+        .floor => if (same(tree, fact.large, value)) try out.append(c.allocator, fact.small),
+    };
+    return out.items;
 }
 
 /// What the comparisons holding where `node` is read put it at most: the larger sides, for a
