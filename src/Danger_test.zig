@@ -1088,6 +1088,62 @@ test "A019 clears a parent pointer the program's own interface field shows, inst
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, copied.lines[0..copied.findings]);
 }
 
+const helper_program =
+    \\const Host = struct { issue_fn: *const fn (*Host) u32, check_fn: ?*const fn (*Host) bool = null };
+    \\const enabled = true;
+    \\const W = struct {
+    \\    n: u32 = 0,
+    \\    host: Host = Hooks.answers,
+    \\    const Hooks = struct {
+    \\        const answers: Host = .{ .issue_fn = Hooks.issue, .check_fn = if (enabled) Hooks.check else null };
+    \\        fn of(h: *Host) *W {
+    \\            return @alignCast(@fieldParentPtr("host", h));
+    \\        }
+    \\        fn issue(h: *Host) u32 { return of(h).n; }
+    \\        fn check(h: *Host) bool { return twice(h).n == 0; }
+    \\        fn twice(h: *Host) *W { return of(h); }
+    \\    };
+    \\};
+    \\pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }
+    \\
+;
+
+test "A019 clears a parent pointer a helper converts for the installed functions, each handing it its own interface parameter, and one installed by a choice of it or null" {
+    // Clear: `of`, called from `issue` and from `twice`, itself called from `check`, which an
+    // `if` installs. Findings (9, the conversion and its alignment): `of` given another
+    // pointer, `of` public, a helper called on a value, a choice whose value goes elsewhere.
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, helper_program)).findings);
+    const other = try runEdited(pack.unsafe_set, helper_program, "fn issue(h: *Host) u32 { return of(h).n; }", "fn issue(h: *Host) u32 { var copy = h.*; copy.issue_fn = issue; return of(&copy).n; }");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, other.lines[0..other.findings]);
+    const public = try runEdited(pack.unsafe_set, helper_program, "        fn of(h: *Host) *W {", "        pub fn of(h: *Host) *W {");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, public.lines[0..public.findings]);
+    const stray = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 {", "pub fn stray(h: *Host) *W { return W.Hooks.twice(h); }\npub fn use(w: *W) u32 {");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, stray.lines[0..stray.findings]);
+    const chosen = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 {", "pub fn chosen() ?*const fn (*Host) bool { const f: ?*const fn (*Host) bool = if (enabled) W.Hooks.check else null; return f; }\npub fn use(w: *W) u32 {");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, chosen.lines[0..chosen.findings]);
+    // The function read out of C.F and called on another interface converts that one.
+    const elsewhere = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { return w.host.issue_fn(other); }");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, elsewhere.lines[0..elsewhere.findings]);
+    const direct =
+        \\const Host = struct { issue_fn: *const fn (*Host) u32 };
+        \\const W = struct {
+        \\    n: u32 = 0,
+        \\    host: Host = .{ .issue_fn = issue },
+        \\    fn issue(h: *Host) u32 {
+        \\        const w: *W = @alignCast(@fieldParentPtr("host", h));
+        \\        return w.n;
+        \\    }
+        \\};
+        \\pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, direct)).findings);
+    const read_out = try runEdited(pack.unsafe_set, direct, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { const f = w.host.issue_fn; return f(other); }");
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, read_out.lines[0..read_out.findings]);
+    const kept = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { const f = w.host.issue_fn; return f(other); }");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, kept.lines[0..kept.findings]);
+}
+
 const list_program =
     \\const std = @import("std");
     \\const Conn = struct { id: u32, node: std.DoublyLinkedList.Node = .{} };
