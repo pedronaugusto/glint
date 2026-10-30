@@ -116,6 +116,14 @@ const std_keeps = [_]Named{
 
 const Named = struct { path: []const u8, param: usize };
 
+/// std's calls that, succeeding, write the memory at `param` from the front for half the length
+/// of their input at `input`, and read none of it: all of it where that input is twice its
+/// length.
+const std_halving = [_]struct { path: []const u8, param: usize, input: usize }{
+    // Two hex digits a byte; odd input fails, and out.len * 2 < input.len does too.
+    .{ .path = "fmt.hexToBytes", .param = 0, .input = 1 },
+};
+
 /// How deep the program's callees are read, each handing the memory to the next.
 const depth_limit = 8;
 
@@ -198,6 +206,10 @@ const Walk = struct {
     targets: std.ArrayList(struct { node: Ast.Node.Index, exit: ?State = null }) = .empty,
     /// The local's parts: each written, it is written whole.
     shape: Shape = .none,
+    /// The call read as succeeding, where its success is what a branch takes.
+    succeeding: ?Ast.Node.Index = null,
+    /// The `bool` constants walked, each with what the local holds where it is true.
+    flags: std.ArrayList(struct { decl: Model.Declaration.Id, state: State }) = .empty,
     /// What the parts are of: the struct, or the array's length.
     owner: ?Owner = null,
     /// For a parameter's walk asking what of its memory the function reads (`needing`): the
@@ -359,10 +371,12 @@ const Walk = struct {
             },
             else => {},
         }
-        if (!w.mentioned(node) and !w.returnsIn(node)) {
-            // It leaves the local as it is, for what follows and for where a jump in it goes.
+        // An `if` may test a flag that says more of the local.
+        if (!w.mentioned(node) and !w.returnsIn(node) and (w.flags.items.len == 0 or tree.fullIf(node) == null)) {
+            // It leaves the local as it is, for what follows and for where a jump in it goes;
+            // one that never goes on reaches nothing after it.
             w.jumpsIn(node, state);
-            return state;
+            return if (leavesAlways(tree, node)) .left else state;
         }
         switch (tree.nodeTag(node)) {
             .@"defer", .@"errdefer" => {
@@ -385,8 +399,12 @@ const Walk = struct {
         if (tree.fullIf(node)) |branch| {
             const after = try w.statement(branch.ast.cond_expr, state);
             if (after.at != .unwritten) return after;
-            const then = try w.statement(branch.ast.then_expr, after);
-            const otherwise = if (branch.ast.else_expr.unwrap()) |e| try w.statement(e, after) else after;
+            // On an error union, its value is the call's success; otherwise a flag known true
+            // or false says what its being true showed.
+            const holds = if (branch.error_token != null) try w.succeeded(branch.ast.cond_expr, after) else w.knowing(branch.ast.cond_expr, after, true);
+            const fails = if (branch.error_token != null) after else w.knowing(branch.ast.cond_expr, after, false);
+            const then = try w.statement(branch.ast.then_expr, holds);
+            const otherwise = if (branch.ast.else_expr.unwrap()) |e| try w.statement(e, fails) else fails;
             return merge(then, otherwise);
         }
         if (tree.fullSwitch(node)) |choice| {
@@ -436,7 +454,195 @@ const Walk = struct {
             // what reaches the loop's end is what its passes end with and what jumps there take.
             return if (passes(tree, loop.ast.inputs[0])) body else state;
         }
-        return w.simple(node, state);
+        // A `bool` constant keeps what its being true shows: `const ok = n == 64 and if
+        // (fill(&buf)) |_| true else |_| false`.
+        const past = try w.simple(node, state);
+        if (past.at != .unwritten) return past;
+        if (tree.fullVarDecl(node)) |variable| if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+            const value = variable.ast.init_node.unwrap() orelse return past;
+            const decl = w.declaredAt(node) orelse return past;
+            try w.flags.append(w.c.allocator, .{ .decl = decl, .state = try w.whenTrue(value, past) });
+        };
+        return past;
+    }
+
+    /// Whether `input`, a slice no one assigns, is known at `call` to be twice the local's
+    /// length: the local declared `[input.len / 2]T`, or a test every path to the call passes
+    /// (`input.len == 64` with the local `[32]u8`, or `input.len == 2 * local.len`), in `and`'s
+    /// left side or an `if`'s condition around it, or in a guard before it that leaves
+    /// otherwise (`if (input.len != 64) return …;`).
+    fn twiceAsLong(w: *const Walk, call: Ast.Node.Index, input: Ast.Node.Index) bool {
+        const tree = w.tree;
+        if (tree.nodeTag(input) != .identifier) return false;
+        const x = (w.model.reference(input) orelse return false).declaration orelse return false;
+        const record = w.model.declarations[@backingInt(x)];
+        switch (record.kind) {
+            .parameter => {},
+            .variable => if (tree.tokenTag((tree.fullVarDecl(record.node) orelse return false).ast.mut_token) != .keyword_const) return false,
+            // A capture by value; one by pointer (`|*x|`) may see its slice change.
+            .capture => if (record.token == 0 or tree.tokenTag(record.token - 1) == .asterisk) return false,
+            else => return false,
+        }
+        if (w.halfOf(x)) return true;
+        var child = call;
+        while (w.model.parentOf(child)) |up| : (child = up) {
+            if (tree.nodeTag(up) == .fn_decl) return false;
+            if (tree.nodeTag(up) == .bool_and) {
+                const lhs, const rhs = tree.nodeData(up).node_and_node;
+                if (rhs == child and w.lengthIs(lhs, x, true)) return true;
+            }
+            if (tree.fullIf(up)) |branch| {
+                if (branch.ast.then_expr == child and branch.error_token == null and w.lengthIs(branch.ast.cond_expr, x, true)) return true;
+            }
+            if (!isBlock(tree, up)) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            for (tree.blockStatements(&buffer, up).?) |each| {
+                if (each == child) break;
+                const guard = tree.fullIf(each) orelse continue;
+                if (guard.ast.else_expr != .none or guard.payload_token != null or guard.error_token != null) continue;
+                if (leavesAlways(tree, guard.ast.then_expr) and w.lengthIs(guard.ast.cond_expr, x, false)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether the local is declared `[x.len / 2]T`.
+    fn halfOf(w: *const Walk, x: Model.Declaration.Id) bool {
+        const tree = w.tree;
+        const variable = tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return false;
+        const kind = variable.ast.type_node.unwrap() orelse return false;
+        if (tree.nodeTag(kind) != .array_type) return false;
+        const length = tree.nodeData(kind).node_and_node[0];
+        if (tree.nodeTag(length) != .div) return false;
+        const lhs, const rhs = tree.nodeData(length).node_and_node;
+        return w.lengthOf(lhs, x) and literalValue(tree, rhs) == 2;
+    }
+
+    /// Whether `condition` coming out `truth` shows `x.len` twice the local's length.
+    fn lengthIs(w: *const Walk, condition: Ast.Node.Index, x: Model.Declaration.Id, truth: bool) bool {
+        const tree = w.tree;
+        switch (tree.nodeTag(condition)) {
+            .grouped_expression => return w.lengthIs(tree.nodeData(condition).node_and_token[0], x, truth),
+            .bool_not => return w.lengthIs(tree.nodeData(condition).node, x, !truth),
+            .bool_and, .bool_or => {
+                if (truth != (tree.nodeTag(condition) == .bool_and)) return false;
+                const lhs, const rhs = tree.nodeData(condition).node_and_node;
+                return w.lengthIs(lhs, x, truth) or w.lengthIs(rhs, x, truth);
+            },
+            .equal_equal, .bang_equal => {
+                if (truth != (tree.nodeTag(condition) == .equal_equal)) return false;
+                const lhs, const rhs = tree.nodeData(condition).node_and_node;
+                return (w.lengthOf(lhs, x) and w.twiceLocal(rhs)) or (w.lengthOf(rhs, x) and w.twiceLocal(lhs));
+            },
+            else => return false,
+        }
+    }
+
+    /// Whether `node` is `x.len`.
+    fn lengthOf(w: *const Walk, node: Ast.Node.Index, x: Model.Declaration.Id) bool {
+        const tree = w.tree;
+        if (tree.nodeTag(node) != .field_access) return false;
+        const of, const member = tree.nodeData(node).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(member), "len") or tree.nodeTag(of) != .identifier) return false;
+        const ref = w.model.reference(of) orelse return false;
+        return ref.declaration == x;
+    }
+
+    /// Whether `node` is twice the local's length: a literal twice its literal length, or `2 *
+    /// local.len`.
+    fn twiceLocal(w: *const Walk, node: Ast.Node.Index) bool {
+        const tree = w.tree;
+        if (literalValue(tree, node)) |value| {
+            const variable = tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return false;
+            const kind = variable.ast.type_node.unwrap() orelse return false;
+            if (tree.nodeTag(kind) != .array_type) return false;
+            const length = literalValue(tree, tree.nodeData(kind).node_and_node[0]) orelse return false;
+            return value == 2 * length;
+        }
+        if (tree.nodeTag(node) != .mul) return false;
+        const lhs, const rhs = tree.nodeData(node).node_and_node;
+        return (literalValue(tree, lhs) == 2 and w.lengthOf(rhs, w.local)) or (literalValue(tree, rhs) == 2 and w.lengthOf(lhs, w.local));
+    }
+
+    /// The declaration a `const` statement makes.
+    fn declaredAt(w: *const Walk, node: Ast.Node.Index) ?Model.Declaration.Id {
+        for (w.model.declarations, 0..) |each, d| {
+            if (each.kind == .variable and each.node == node) return @fromBackingInt(@intCast(d));
+        }
+        return null;
+    }
+
+    /// What the local holds on the paths where `value`, a `bool`, is true: past `and`'s left
+    /// side, and in an `if` on a call's error union whose value is `true` where it succeeds and
+    /// `false` where it fails, past the call's success. Anything else holds no more.
+    fn whenTrue(w: *Walk, value: Ast.Node.Index, state: State) Context.Error!State {
+        const tree = w.tree;
+        switch (tree.nodeTag(value)) {
+            .grouped_expression => return w.whenTrue(tree.nodeData(value).node_and_token[0], state),
+            .bool_and => {
+                const lhs, const rhs = tree.nodeData(value).node_and_node;
+                return w.whenTrue(rhs, try w.whenTrue(lhs, state));
+            },
+            else => {},
+        }
+        const branch = tree.fullIf(value) orelse return state;
+        if (branch.error_token == null) return state;
+        if (!isWord(tree, branch.ast.then_expr, "true") or !isWord(tree, branch.ast.else_expr.unwrap() orelse return state, "false")) return state;
+        return w.succeeded(branch.ast.cond_expr, state);
+    }
+
+    /// What the local holds past `call` where it succeeds: written, where what it does with
+    /// the local is to write it whole once it succeeds; no more anywhere else.
+    fn succeeded(w: *Walk, call: Ast.Node.Index, state: State) Context.Error!State {
+        if (state.at != .unwritten) return state;
+        var buffer: [1]Ast.Node.Index = undefined;
+        _ = w.tree.fullCall(&buffer, call) orelse return state;
+        w.succeeding = call;
+        defer w.succeeding = null;
+        const first = w.tree.firstToken(call);
+        const last = w.tree.lastToken(call);
+        var now = state;
+        for (w.mentions.items) |mention| {
+            const token = w.tree.nodeMainToken(mention);
+            if (token < first or token > last) continue;
+            const use = (try w.classify(mention)) orelse continue;
+            if (use.effect != .write) return state;
+            now = .written;
+        }
+        return now;
+    }
+
+    /// What the local holds where `condition` came out `truth`: a flag (`const ok = …`) known
+    /// true adds what its being true showed, through `!`, `and` known true and `or` known false.
+    fn knowing(w: *const Walk, condition: Ast.Node.Index, state: State, truth: bool) State {
+        const tree = w.tree;
+        if (state.at != .unwritten) return state;
+        switch (tree.nodeTag(condition)) {
+            .grouped_expression => return w.knowing(tree.nodeData(condition).node_and_token[0], state, truth),
+            .bool_not => return w.knowing(tree.nodeData(condition).node, state, !truth),
+            .bool_and, .bool_or => {
+                // Both sides are known only where `and` is true or `or` false.
+                if (truth != (tree.nodeTag(condition) == .bool_and)) return state;
+                const lhs, const rhs = tree.nodeData(condition).node_and_node;
+                return w.knowing(rhs, w.knowing(lhs, state, truth), truth);
+            },
+            .identifier => {
+                if (!truth) return state;
+                const decl = (w.model.reference(condition) orelse return state).declaration orelse return state;
+                var i = w.flags.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const flag = w.flags.items[i];
+                    if (flag.decl != decl) continue;
+                    if (flag.state.at == .written) return .written;
+                    if (flag.state.at != .unwritten) return state;
+                    const parts = state.parts | flag.state.parts;
+                    return if (parts == w.everyPart() and parts != 0) .written else .{ .at = .unwritten, .parts = parts };
+                }
+                return state;
+            },
+            else => return state,
+        }
     }
 
     /// Whether an `inline for` writes the local whole: over every field of the local's own type
@@ -846,6 +1052,12 @@ const Walk = struct {
         const leaves = w.failureLeaves(node, origin);
         if (try named(w.c, &std_fills, origin, index)) return if (whole and leaves) written else null;
         if (try named(w.c, &std_keeps, origin, index) or try named(w.c, &std_counts, origin, index)) return null;
+        for (std_halving) |each| {
+            if (!try named(w.c, &.{.{ .path = each.path, .param = each.param }}, origin, index)) continue;
+            const at = each.input + position - index;
+            if (at >= call.ast.params.len) return null;
+            return if (whole and leaves and w.twiceAsLong(node, call.ast.params[at])) written else null;
+        }
         if (!w.c.project.at(origin.file).input.selected) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) return null;
@@ -888,6 +1100,7 @@ const Walk = struct {
     /// Whether a call that may fail leaves where it does: its error is `try`'s to return, or a
     /// `catch` that returns or cannot go on (`catch return`, `catch unreachable`).
     fn failureLeaves(w: *Walk, node: Ast.Node.Index, function: Facts.Decl) bool {
+        if (w.succeeding == node) return true;
         const tree = &w.c.project.at(function.file).file.tree;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, w.c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
@@ -1434,6 +1647,24 @@ fn spell(c: *Context, memo: *ParentNames, owner: ?Facts.Container, tree: *const 
         else => return memo.conversions.append(c.allocator, .{ .owner = owner, .name = null }),
     };
     try memo.conversions.append(c.allocator, .{ .owner = owner, .name = spelled });
+}
+
+/// Whether `node` never goes on to what follows it: a `return`, `break`, `continue` or
+/// `unreachable`, or an unlabeled block whose last statement is one.
+fn leavesAlways(tree: *const Ast, node: Ast.Node.Index) bool {
+    switch (tree.nodeTag(node)) {
+        .@"return", .@"break", .@"continue", .unreachable_literal => return true,
+        else => {},
+    }
+    if (!isBlock(tree, node) or blockLabel(tree, node) != null) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, node).?;
+    return statements.len > 0 and leavesAlways(tree, statements[statements.len - 1]);
+}
+
+/// Whether `node` is the identifier `text` (`true`, `false`).
+fn isWord(tree: *const Ast, node: Ast.Node.Index, text: []const u8) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), text);
 }
 
 /// The label a block carries (`blk: { … }`), by its token.

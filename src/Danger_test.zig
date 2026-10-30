@@ -152,7 +152,7 @@ const std_files = [_]sources.Extra{
     \\fn Sha2x32(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     \\fn Sha2x64(comptime bits: comptime_int) type { return struct { const Self = @This(); pub const digest_length = bits / 8; pub fn init() Self { return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[digest_length]u8) void { _ = d; _ = out; } pub fn hash(b: []const u8, out: *[digest_length]u8) void { _ = b; _ = out; } }; }
     },
-    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }" },
+    .{ .name = "std/fmt.zig", .bytes = "pub fn bufPrint(buf: []u8, comptime format: []const u8, args: anytype) ![]u8 { _ = format; _ = args; return buf[0..0]; }\npub fn hexToBytes(out: []u8, input: []const u8) ![]u8 { if (input.len & 1 != 0) return error.InvalidLength; if (out.len * 2 < input.len) return error.NoSpaceLeft; return out[0 .. input.len / 2]; }" },
     .{ .name = "std/DoublyLinkedList.zig", .bytes =
     \\const DoublyLinkedList = @This();
     \\first: ?*Node = null,
@@ -923,6 +923,28 @@ test "A019 writes a local whole by its parts: every field or element set on ever
         \\pub fn case_x(comptime p: []const u8) []const u8 { comptime var buffer: [p.len + 1]u8 = undefined; comptime for (p, buffer[0..p.len]) |ch, *slot| { slot.* = ch; }; const final = buffer; return &final; }
     );
     try std.testing.expectEqualSlices(u32, &.{ 5, 7, 9, 10, 13, 15, 17, 20, 22, 24, 26 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads hexToBytes as writing all of its output where it succeeds on an input every path shows twice as long, and a flag as what its being true showed" {
+    // Safe: a flag of a length test and the call's success, tested before the read (3), also
+    // in a loop's `or` guard that continues (4); a guard that leaves on another length (5); an
+    // output declared half the input (6). Unsafe: a test of the wrong length (7), a flag of
+    // `or` (8), a guard of only an upper bound (9), a failure caught and gone on from (10), an
+    // input assigned after its test (11).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(bytes: [32]u8) usize { return bytes[0]; }
+        \\pub fn a(text: []const u8) ?[32]u8 { var sha: [32]u8 = undefined; const hex = text.len == 64 and if (std.fmt.hexToBytes(&sha, text)) |_| true else |_| false; if (!hex) { return null; } return sha; }
+        \\pub fn b(items: []const []const u8, u: []const u8) usize { var n: usize = 0; for (items) |text| { var sha: [32]u8 = undefined; const hex = text.len == 64 and if (std.fmt.hexToBytes(&sha, text)) |_| true else |_| false; if (u.len == 0 or !hex) { n += 1; continue; } n += use(sha); } return n; }
+        \\pub fn c(sha: []const u8) ![32]u8 { var digest: [32]u8 = undefined; if (sha.len != 2 * digest.len) return error.Bad; _ = std.fmt.hexToBytes(&digest, sha) catch return error.Bad; return digest; }
+        \\pub fn d(digits: []const u8) usize { var out: [digits.len / 2]u8 = undefined; _ = std.fmt.hexToBytes(&out, digits) catch unreachable; return use(out[0..32].*); }
+        \\pub fn e(text: []const u8) ?[32]u8 { var sha: [32]u8 = undefined; const hex = text.len == 62 and if (std.fmt.hexToBytes(&sha, text)) |_| true else |_| false; if (!hex) return null; return sha; }
+        \\pub fn f(text: []const u8) ?[32]u8 { var sha: [32]u8 = undefined; const hex = text.len == 64 or if (std.fmt.hexToBytes(&sha, text)) |_| true else |_| false; if (!hex) return null; return sha; }
+        \\pub fn g(sha: []const u8) ![32]u8 { var digest: [32]u8 = undefined; if (sha.len > 2 * digest.len) return error.Bad; _ = try std.fmt.hexToBytes(&digest, sha); return digest; }
+        \\pub fn h(sha: []const u8) [32]u8 { var digest: [32]u8 = undefined; if (sha.len != 64) return @splat(0); _ = std.fmt.hexToBytes(&digest, sha) catch {}; return digest; }
+        \\pub fn i(t: []const u8) ![32]u8 { var text = t; var digest: [32]u8 = undefined; if (text.len != 64) return error.Bad; text = text[1..]; _ = try std.fmt.hexToBytes(&digest, text); return digest; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9, 10, 11 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads a field used in place as written once it is set, unless something converts a pointer to that field of that struct back to its parent" {
