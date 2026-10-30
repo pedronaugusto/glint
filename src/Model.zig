@@ -260,19 +260,7 @@ fn builtinAlias(a: std.mem.Allocator, tree: *const Ast, model: *const Model, nod
         return if (v.ast.init_node.unwrap()) |init_node| builtinAlias(a, tree, model, init_node, depth + 1) else false;
     }
     var buffer: [2]Ast.Node.Index = undefined;
-    const args: []const Ast.Node.Index = switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            const pair = tree.nodeData(node).opt_node_and_opt_node;
-            var count: usize = 0;
-            inline for (pair) |arg| if (arg.unwrap()) |n| {
-                buffer[count] = n;
-                count += 1;
-            };
-            break :blk buffer[0..count];
-        },
-        .builtin_call, .builtin_call_comma => tree.extraDataSlice(tree.nodeData(node).extra_range, Ast.Node.Index),
-        else => return false,
-    };
+    const args = tree.builtinCallParams(&buffer, node) orelse return false;
     if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import") or args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return false;
     const value = std.zig.string_literal.parseAlloc(a, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

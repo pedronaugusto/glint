@@ -27,7 +27,8 @@ const std_files = [_]sources.Extra{
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } };
-    \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } };
+    \\pub const Writer = struct { end: usize = 0, pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
+    \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
     \\pub const Cancelable = error{Canceled};
@@ -81,7 +82,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -104,7 +105,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -667,7 +668,7 @@ test "A021 finds a second lock taken while a guard is held, unless both are rank
     , 1);
 }
 
-test "A019 finds a local read while still undefined, one written on some paths only among them, and leaves written, filled and branch-written ones, an array's length and a field written by name" {
+test "A019 finds a local read while still undefined, one written on some paths only or in part among them, and leaves written and branch-written ones and an array's length" {
     try expect(pack.unsafe_set,
         \\fn fill(b: []u8) void { b[0] = 1; }
         \\pub fn bad() u8 { var x: u8 = undefined; const y = x + 1; x = 2; return y; }
@@ -692,13 +693,94 @@ test "A019 finds a local read while still undefined, one written on some paths o
         \\    return .{ eax, ebx };
         \\}
         \\pub fn tied() u32 { var v: u32 = undefined; asm volatile ("" : [_] "=r" (v) : [_] "r" (v)); return v; }
-    , 7); // 4 reads (`some`'s when `c` is false), `tied`'s input read before its output is written, and each `asm` itself
-    // Every branch that reaches the read writes it, the others leave; a range of literals runs.
+    , 11); // 4 reads (`some`'s when `c` is false); `filled`, `sliced`, `length` and `named`, each
+    // written in part only (`fill` sets one element); `tied`'s input read before its output is
+    // written; and each `asm` itself.
+    // Every branch that reaches the read writes it, the others leave; a range of literals runs,
+    // and one that sets elements one by one writes them in part only (`ranged`).
     try expect(pack.unsafe_set,
         \\pub fn left(c: bool) u8 { var x: u8 = undefined; if (c) { x = 1; } else return 0; return x; }
         \\pub fn ranged() u8 { var b: [2]u8 = undefined; for (0..2) |i| b[i] = 1; return b[0]; }
         \\pub fn loopLeft(n: usize) u8 { var x: u8 = undefined; for (0..n) |_| { x = 1; } return x; }
-    , 1);
+        \\pub fn once() u8 { var x: u8 = undefined; for (0..2) |_| { x = 1; } return x; }
+    , 2);
+}
+
+test "A019 reads a local handed to a call as written only where the call writes all of it: std's fills by name, the program's function whose body writes the whole parameter on every path that returns, and only where a failure leaves" {
+    // Written whole (no finding): fillAll (line 13), fillTry under `try` (16), fillSet (18),
+    // @memset (21), a `for` setting each element (23, 24), readSliceAll under `try` and under
+    // `catch return` (29, 30), a file's writer and a fixed writer keep the buffer (31, 32),
+    // io.random (34) and writeInt (35). Findings: fillOne sets a part (14), fillSome returns
+    // first (15), fillTry's failure caught (17, the read), fillCatch returns from a `catch`
+    // (19), readsFirst reads first (20), @memset of a part (22, the read), a `for` that reads
+    // the element (25), fields set one by one (26, 27, 28), std's fixed reader reads its bytes
+    // (33), a `defer` reads before the write (36), and a pointer kept in a local (37).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const P = struct { a: u8, b: u8 };
+        \\fn fillAll(out: *[4]u8) void { out.* = .{ 1, 2, 3, 4 }; }
+        \\fn fillOne(out: []u8) void { out[0] = 1; }
+        \\fn fillSome(out: *[4]u8, c: bool) void { if (c) return; out.* = @splat(0); }
+        \\fn fillTry(r: *std.Io.Reader, out: []u8) !void { try r.readSliceAll(out); }
+        \\fn fillSet(out: []u8) void { @memset(out, 0); }
+        \\fn fillCatch(out: *[4]u8) void { const v = get() catch return; out.* = v; }
+        \\fn get() ![4]u8 { return @splat(1); }
+        \\fn readsFirst(out: *[4]u8) void { const k = out[0]; out.* = @splat(k); }
+        \\fn print(x: u8) void { _ = x; }
+        \\
+        \\pub fn a1() u8 { var b: [4]u8 = undefined; fillAll(&b); return b[0]; }
+        \\pub fn a2() u8 { var b: [4]u8 = undefined; fillOne(&b); return b[0]; }
+        \\pub fn a3(c: bool) u8 { var b: [4]u8 = undefined; fillSome(&b, c); return b[0]; }
+        \\pub fn a4(r: *std.Io.Reader) !u8 { var b: [4]u8 = undefined; try fillTry(r, &b); return b[0]; }
+        \\pub fn a5(r: *std.Io.Reader) u8 { var b: [4]u8 = undefined; fillTry(r, &b) catch {}; return b[0]; }
+        \\pub fn a6() u8 { var b: [4]u8 = undefined; fillSet(&b); return b[0]; }
+        \\pub fn a7() u8 { var b: [4]u8 = undefined; fillCatch(&b); return b[0]; }
+        \\pub fn a8() u8 { var b: [4]u8 = undefined; readsFirst(&b); return b[0]; }
+        \\pub fn b1() u8 { var b: [4]u8 = undefined; @memset(&b, 0); return b[0]; }
+        \\pub fn b2(n: usize) u8 { var b: [4]u8 = undefined; @memset(b[0..n], 0); return b[0]; }
+        \\pub fn b3() u8 { var b: [4]u8 = undefined; for (&b) |*e| e.* = 0; return b[0]; }
+        \\pub fn b4() u8 { var b: [4]u8 = undefined; for (&b, 0..) |*e, i| e.* = @intCast(i); return b[0]; }
+        \\pub fn b5() u8 { var b: [4]u8 = undefined; for (&b) |*e| e.* +%= 1; return b[0]; }
+        \\pub fn c1() u8 { var p: P = undefined; p.a = 1; return p.a; }
+        \\pub fn c2() u8 { var p: P = undefined; p.a = 1; return p.b; }
+        \\pub fn c3() P { var p: P = undefined; p.a = 1; p.b = 2; return p; }
+        \\pub fn d1(r: *std.Io.Reader) !u8 { var b: [4]u8 = undefined; try r.readSliceAll(&b); return b[0]; }
+        \\pub fn d2(r: *std.Io.Reader) u8 { var b: [4]u8 = undefined; r.readSliceAll(&b) catch return 0; return b[0]; }
+        \\pub fn d3(f: std.Io.File, io: std.Io) void { var buf: [64]u8 = undefined; const w = f.writer(io, &buf); _ = w; }
+        \\pub fn d4() usize { var buf: [64]u8 = undefined; const w: std.Io.Writer = .fixed(&buf); return w.end; }
+        \\pub fn d5() u8 { var buf: [8]u8 = undefined; var r: std.Io.Reader = .fixed(&buf); return r.takeByte() catch 0; }
+        \\pub fn d6(io: std.Io) u8 { var b: [4]u8 = undefined; io.random(&b); return b[0]; }
+        \\pub fn d7() u8 { var b: [4]u8 = undefined; std.mem.writeInt(u32, &b, 7, .little); return b[0]; }
+        \\pub fn e1() u8 { var x: u8 = undefined; defer print(x); x = 1; return x; }
+        \\pub fn e2() u8 { var b: [4]u8 = undefined; const p = &b; p.* = @splat(0); return b[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 17, 19, 20, 22, 25, 26, 27, 28, 33, 36, 37 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads the program's function that only hands a buffer to std's keeps as keeping it, a declaration literal by its result location, and a `for` over several inputs that sets each element first" {
+    // Kept (no finding): writerOver returns `.fixed(buf)` by its result type (line 11), hold
+    // sets a field's `.fixed(buf)` (12), passOn hands it to writerOver (13), and a `for` sets
+    // each element from another input (15). Findings: peeks reads it first (14), and a `for`
+    // that may leave a pass before setting it (16, the read).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const Holder = struct { w: std.Io.Writer };
+        \\fn writerOver(buf: []u8) std.Io.Writer { return .fixed(buf); }
+        \\fn hold(buf: []u8) Holder { return .{ .w = .fixed(buf) }; }
+        \\fn passOn(buf: []u8) std.Io.Writer { return writerOver(buf); }
+        \\fn peeks(buf: []u8) std.Io.Writer { _ = buf[0]; return .fixed(buf); }
+        \\fn use(w: anytype) void { _ = w; }
+        \\
+        \\
+        \\
+        \\pub fn k1() void { var b: [8]u8 = undefined; use(writerOver(&b)); }
+        \\pub fn k2() void { var b: [8]u8 = undefined; use(hold(&b)); }
+        \\pub fn k3() void { var b: [8]u8 = undefined; use(passOn(&b)); }
+        \\pub fn k4() void { var b: [8]u8 = undefined; use(peeks(&b)); }
+        \\pub fn f1(src: [4]u8) u8 { var dst: [4]u8 = undefined; for (src, &dst) |v, *d| d.* = v; return dst[0]; }
+        \\pub fn f2(src: [4]u8) u8 { var dst: [4]u8 = undefined; for (src, &dst) |v, *d| { if (v == 0) continue; d.* = v; } return dst[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 14, 16 }, found.lines[0..found.findings]);
 }
 
 test "A014 finds a borrow of a std container's storage stored in a field" {

@@ -1,6 +1,7 @@
 //! Conservative declaration and shape facts over the frozen AST/ZIR project.
 //! Unknown comptime and cyclic aliases remain unknown; no spelling guesses.
 const std = @import("std");
+const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Ast = std.zig.Ast;
@@ -2248,6 +2249,64 @@ pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl 
     return null;
 }
 
+/// The container whose declaration a declaration literal at `node` names (`.init(...)`): the
+/// one its result location gives it, through `try` and the error union or optional around it.
+/// A variable's declared type, a returned value's function result, a struct literal's field's
+/// type, an assignment's target. Null where nothing written there names one.
+pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
+    var at = node;
+    // Each step is one parent outward; a struct literal's own location is the next.
+    for (0..8) |_| {
+        const tree = &self.project.at(file).file.tree;
+        const model = &self.project.at(file).model;
+        const parent = model.parentOf(at) orelse return null;
+        switch (tree.nodeTag(parent)) {
+            .@"try", .grouped_expression => {
+                at = parent;
+                continue;
+            },
+            .@"return" => {
+                var function = parent;
+                while (tree.nodeTag(function) != .fn_decl) function = model.parentOf(function) orelse return null;
+                var buffer: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return null;
+                return heldContainer(try self.resolve(file, proto.ast.return_type.unwrap() orelse return null));
+            },
+            .assign => {
+                const target, const value = tree.nodeData(parent).node_and_node;
+                return if (value == at) heldContainer(try self.resolve(file, target)) else null;
+            },
+            else => {},
+        }
+        if (tree.fullVarDecl(parent)) |variable| {
+            if (variable.ast.init_node.unwrap() != at) return null;
+            return heldContainer(try self.resolve(file, variable.ast.type_node.unwrap() orelse return null));
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        const literal = tree.fullStructInit(&buffer, parent) orelse return null;
+        // `.name = value`: the token before `=` names the field.
+        const first = tree.firstToken(at);
+        if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, at) == null or first < 2) return null;
+        if (tree.tokenTag(first - 1) != .equal or tree.tokenTag(first - 2) != .identifier) return null;
+        const container = if (literal.ast.type_expr.unwrap()) |kind| heldContainer(try self.resolve(file, kind)) else try self.resultContainer(file, parent);
+        const field = self.member(container orelse return null, try self.memberName(tree.tokenSlice(first - 2))) orelse return null;
+        const record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
+        if (record.kind != .field) return null;
+        const declared = (self.project.at(field.file).file.tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+        return heldContainer(try self.resolve(field.file, declared));
+    }
+    return null;
+}
+
+/// The container a type or a value is, through the error union or optional around it.
+fn heldContainer(value: Value) ?Container {
+    return switch (value) {
+        .container, .instance => |container| container,
+        .error_union, .optional => |inner| heldContainer(inner.*),
+        else => null,
+    };
+}
+
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(node) == .identifier or tree.nodeTag(node) == .test_decl) {
@@ -2293,12 +2352,11 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 /// Cycles, computed expressions and unsupported comptime retain uncertainty.
 pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
     var current = start;
-    var visited: [128]Decl = undefined;
-    var count: usize = 0;
-    while (count < visited.len) {
-        for (visited[0..count]) |earlier| if (std.meta.eql(earlier, current)) return null;
-        visited[count] = current;
-        count += 1;
+    var visited: aegis.bounded.Array(Decl, 128) = .init;
+    while (true) {
+        for (visited.constItems()) |earlier| if (std.meta.eql(earlier, current)) return null;
+        // More aliases than are followed: uncertain, as a cycle is.
+        visited.appendSlice(&.{current}) catch return null;
         const record = self.project.at(current.file).model.declarations[@backingInt(current.index)];
         if (record.kind != .variable) return current;
         const tree = &self.project.at(current.file).file.tree;
@@ -2307,7 +2365,6 @@ pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
         if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) return current;
         current = (try self.definition(current.file, expr)) orelse return null;
     }
-    return null;
 }
 
 /// A value of the type `value` names: an instance of a container, and through a pointer,
@@ -3111,21 +3168,7 @@ fn exportedContainers(self: *Facts) ResolveError!*const std.AutoHashMapUnmanaged
 }
 
 pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            var count: usize = 0;
-            inline for (tree.nodeData(node).opt_node_and_opt_node) |item| if (item.unwrap()) |arg| {
-                buffer[count] = arg;
-                count += 1;
-            };
-            break :blk buffer[0..count];
-        },
-        .builtin_call, .builtin_call_comma => blk: {
-            const range = tree.nodeData(node).extra_range;
-            break :blk tree.extraDataSlice(range, Ast.Node.Index);
-        },
-        else => &.{},
-    };
+    return tree.builtinCallParams(buffer, node) orelse &.{};
 }
 
 test "facts aliases cycles and absent module mappings stay unknown" {

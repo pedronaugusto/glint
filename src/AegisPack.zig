@@ -8,6 +8,7 @@ const Contract = @import("AegisContract.zig");
 const Ids = @import("AegisRules.zig");
 const Danger = @import("Danger.zig");
 const Shapes = @import("DangerShapes.zig");
+const Undefined = @import("Undefined.zig");
 const Flows = @import("DangerFlow.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
@@ -108,7 +109,7 @@ fn checkStateMachines(c: *Context) Context.Error!void {
 fn checkUnsafeSet(c: *Context) Context.Error!void {
     if (!try begin(c, unsafe_set)) return;
     try Danger.unsafeSet(c, unsafe_set);
-    try Shapes.undefinedReads(c, unsafe_set);
+    try Undefined.reads(c, unsafe_set);
 }
 fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
@@ -1347,7 +1348,7 @@ const Flow = struct {
         var out = before;
         out.breaks.setUnion(split.paths.breaks);
         out.continues.setUnion(split.paths.continues);
-        var falls: [2]?State = undefined;
+        var falls: [2]?State = @splat(null);
         for (0..2) |value| {
             var each = f;
             each.known = .{ .flag = split.flag, .value = value == 1 };
@@ -1556,7 +1557,7 @@ const Flow = struct {
     fn repeat(f: Flow, stmt: Ast.Node.Index, state: State) Context.Error!Outcome {
         var inner = f;
         inner.loop = stmt;
-        var heads: [2]Ast.Node.Index = undefined;
+        var heads: [2]Ast.Node.Index = @splat(.root);
         var head_count: usize = 0;
         var body: Ast.Node.Index = undefined;
         var otherwise: ?Ast.Node.Index = null;

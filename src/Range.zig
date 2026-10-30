@@ -12,6 +12,7 @@
 //! never overflows `usize` and a sum of a length and a decoded `u32` does on a 32-bit target.
 //! A site is clear only where it is clear at both.
 const std = @import("std");
+const aegis = @import("aegis");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
@@ -2191,12 +2192,8 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
         break :loop null;
     };
     // The loops around the use the condition is outside of: their back edges.
-    var around: [8]Ast.Node.Index = undefined;
-    var arounds: usize = 0;
-    if (also) |loop| {
-        around[0] = loop;
-        arounds = 1;
-    }
+    var around: aegis.bounded.Array(Ast.Node.Index, 8) = .init;
+    if (also) |loop| around.appendSlice(&.{loop}) catch return false;
     {
         const guard = tree.firstToken(condition);
         var at = use;
@@ -2205,12 +2202,10 @@ fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condi
             if (tree.fullWhile(parent) == null and tree.fullFor(parent) == null) continue;
             if (guard >= tree.firstToken(parent) and guard <= tree.lastToken(parent)) continue;
             // More loops than are kept: read as one around the whole function.
-            if (arounds == around.len) return false;
-            around[arounds] = parent;
-            arounds += 1;
+            around.appendSlice(&.{parent}) catch return false;
         }
     }
-    const region: Region = .{ .tree = tree, .from = from, .to = to, .skipped = skipped, .loops = around[0..arounds] };
+    const region: Region = .{ .tree = tree, .from = from, .to = to, .skipped = skipped, .loops = around.constItems() };
     // What the compared value reads, for the stores that reach it through other names.
     var places: Places = .{};
     try places.gather(c, file, compared, 0);
