@@ -1008,8 +1008,14 @@ test "A019 hands a local to the program's function that reads only parts of it, 
 
 /// The findings of `rule` on `program` with `edit` applied: each (old, new) replaced once.
 fn runEdited(rule: glint.Rule, comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) !Run {
-    const at = comptime std.mem.find(u8, program, old).?;
-    return run(rule, program[0..at] ++ new ++ program[at + old.len ..]);
+    return run(rule, comptime edited(program, old, new));
+}
+
+/// `program` with its first `old` replaced by `new`.
+fn edited(comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
+    const at = std.mem.find(u8, program, old).?;
+    return program[0..at] ++ new ++ program[at + old.len ..];
 }
 
 const interface_program =
@@ -3422,6 +3428,163 @@ test "A009 reads what a method of the file checked of its receiver, where the ca
         \\    try p.step(&q);
         \\}
     , 1);
+}
+
+test "A009 reads a std read's count as at most the one buffer it filled, through a function of the program that retries it" {
+    const program =
+        \\const std = @import("std");
+        \\fn readSome(io: std.Io, from: std.Io.File, buffers: []const []u8) !usize {
+        \\    while (true) {
+        \\        const n = try from.readStreaming(io, buffers);
+        \\        if (n != 0) return n;
+        \\    }
+        \\}
+        \\pub fn f(r: *std.Io.Reader, file: std.Io.File, io: std.Io) !u8 {
+        \\    var chunk: [512]u8 = undefined;
+        \\    const room: usize = try r.takeInt(u32, .little);
+        \\    const n = readSome(io, file, &.{chunk[0..@min(room, chunk.len)]}) catch |err| switch (err) {
+        \\        error.Canceled => return error.Canceled,
+        \\        else => return 0,
+        \\    };
+        \\    var buf: [64]u8 = undefined;
+        \\    const m = try r.readSliceShort(&buf);
+        \\    return chunk[0..n][0] +% buf[0..m][0];
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // A count the wrapper does not return as read, two buffers, and an end past the array.
+    try expect(pack.untrusted_input, comptime edited(program, "if (n != 0) return n;", "if (n != 0) return n + 1;"), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "&.{chunk[0..@min(room, chunk.len)]}", "&.{ chunk[0..@min(room, chunk.len)], chunk[0..1] }"), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "@min(room, chunk.len)", "@max(room, chunk.len)"), 2);
+}
+
+test "A009 reads what aegis asserted across another assertion, and a difference or a constant within where what it is made of is" {
+    const program =
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\const S = struct { buf: []u8, filled: usize, consumed: usize };
+        \\fn touch(s: *S) void {
+        \\    s.filled += 1;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, s: *S) !void {
+        \\    s.filled = try r.takeInt(u32, .little);
+        \\    s.consumed = try r.takeInt(u32, .little);
+        \\    aegis.assert.invariant(s.consumed <= s.filled, "consumed <= filled");
+        \\    aegis.assert.invariant(s.filled <= s.buf.len, "filled <= buf.len");
+        \\    const rest = s.filled - s.consumed;
+        \\    @memmove(s.buf[0..rest], s.buf[s.consumed..s.filled]);
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    try expect(pack.untrusted_input, comptime edited(program, "    const rest = s.filled - s.consumed;\n", "    touch(s);\n    const rest = s.filled - s.consumed;\n"), 2);
+    try expect(pack.untrusted_input, comptime edited(program, "    aegis.assert.invariant(s.filled <= s.buf.len, \"filled <= buf.len\");\n", ""), 2);
+    try expect(pack.untrusted_input, comptime edited(program, "@memmove(s.buf[0..rest]", "s.buf = s.buf[1..];\n    @memmove(s.buf[0..rest]"), 2);
+}
+
+test "A009 reads an array's length as its type spells it: a comptime width, a constant naming it, and a capture over addresses of arrays of one length" {
+    const program =
+        \\const std = @import("std");
+        \\const Curve = struct {
+        \\    pub const scalar_length = 32;
+        \\};
+        \\fn rightAligned(comptime width: usize, value: []const u8, out: *[width]u8) error{Long}!void {
+        \\    if (value.len > width) return error.Long;
+        \\    @memcpy(out[width - value.len ..], value);
+        \\}
+        \\fn rightAlignedType(comptime curve: type, value: []const u8, out: *[curve.scalar_length]u8) error{Long}!void {
+        \\    const width = curve.scalar_length;
+        \\    if (value.len > width) return error.Long;
+        \\    @memcpy(out[width - value.len ..], value);
+        \\}
+        \\fn pair(comptime curve: type, input: []const u8) error{Long}![2][curve.scalar_length]u8 {
+        \\    const width = curve.scalar_length;
+        \\    var r: [width]u8 = @splat(0);
+        \\    var s: [width]u8 = @splat(0);
+        \\    inline for (.{ &r, &s }, 0..) |out, i| {
+        \\        const value = input[i * 4 ..][0..4];
+        \\        if (value.len > width) return error.Long;
+        \\        @memcpy(out[width - value.len ..], value);
+        \\    }
+        \\    return .{ r, s };
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const v = try r.take(8);
+        \\    var out: [32]u8 = @splat(0);
+        \\    try rightAligned(32, v, &out);
+        \\    try rightAlignedType(Curve, v, &out);
+        \\    _ = try pair(Curve, try r.take(8));
+        \\}
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // Another width than the array's, and a capture over arrays of two lengths.
+    try expect(pack.untrusted_input, comptime edited(program, "fn rightAligned(comptime width: usize, value: []const u8, out: *[width]u8)", "fn rightAligned(comptime width: usize, value: []const u8, out: *[width - 1]u8)"), 1);
+    try expect(pack.untrusted_input, comptime edited(edited(program, "    var s: [width]u8 = @splat(0);", "    var s: [width + 1]u8 = @splat(0);"), "    return .{ r, s };", "    return .{ r, s[0..width].* };"), 1);
+    // Without the check, the start goes under zero: A010's.
+    try expect(pack.integers, comptime edited(program, "    if (value.len > width) return error.Long;\n    @memcpy(out[width - value.len ..], value);\n}\nfn rightAlignedType", "    @memcpy(out[width - value.len ..], value);\n}\nfn rightAlignedType"), 1);
+}
+
+test "A009 reads a callee's check of its receiver only while the rest of the callee leaves the receiver as checked" {
+    const program =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    fn check(self: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        self.at += 1;
+        \\    }
+        \\    fn peek(self: *P) !u8 {
+        \\        return if (self.at < self.table.len) self.table[self.at] else error.Range;
+        \\    }
+        \\    fn skip(self: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        return self.advance();
+        \\    }
+        \\    fn advance(self: *P) !void {
+        \\        self.at += 1;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.check();
+        \\        return self.table[self.at];
+        \\    }
+        \\    pub fn next(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.skip();
+        \\        return self.table[self.at];
+        \\    }
+        \\    pub fn look(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        const first = try self.peek();
+        \\        return first +% self.table[self.at];
+        \\    }
+        \\};
+    ;
+    // `check` and `skip` move the position past what they checked; `peek` only reads it.
+    try expect(pack.untrusted_input, program, 2);
+    // The checks with what follows them leaving the position where they saw it.
+    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        std.log.debug(\"checked\", .{});\n    }\n    fn peek"), "return self.advance();", "return std.log.debug(\"skipped\", .{});");
+    try expect(pack.untrusted_input, kept, 0);
+    // A guard after the move holds where the call succeeded, unless a statement before it may
+    // return without failing, so the call succeeded past it.
+    const entered =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    fn enter(self: *P) !void {
+        \\        self.at += 1;
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.enter();
+        \\        return self.table[self.at];
+        \\    }
+        \\};
+    ;
+    try expect(pack.untrusted_input, entered, 0);
+    try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 1);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
