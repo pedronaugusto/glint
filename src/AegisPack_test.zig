@@ -543,6 +543,49 @@ test "a scalar receiver is known through an unwrapped optional" {
     try std.testing.expectEqual(@as(usize, 1), try scalarFindings(&project)); // safe: one raw comparison, decided.
 }
 
+test "A004 strict: every operator, compound assignment and cast on a raw value, and one carried through a local or a branch" {
+    const head = "const Index = @import(\"aegis\").id.Id(struct {}, u16);\nfn use(v: u16) void { _ = v; }\npub fn f(i: Index, maybe: ?u16, limit: u16) !u16 {\n    _ = .{ i, maybe, limit };\n";
+    // Each unsafe probe computes with the raw value once; its safe twin hands it on or checks it.
+    const cases = .{
+        .{ "var n: u16 = 0; n += i.raw(); return n;", 1 },
+        .{ "var n: u16 = 1; n <<= @intCast(i.raw()); return n;", 1 },
+        .{ "return i.raw() >> 1;", 1 },
+        .{ "return i.raw() & limit;", 1 },
+        .{ "return i.raw() | limit;", 1 },
+        .{ "return i.raw() ^ limit;", 1 },
+        .{ "return i.raw() +| limit;", 1 },
+        .{ "return ~i.raw();", 1 },
+        .{ "return @bitCast(-%@as(i16, @bitCast(i.raw())));", 1 },
+        .{ "return @intFromFloat(@as(f32, @floatFromInt(i.raw())));", 1 },
+        .{ "return @divTrunc(i.raw(), 3);", 1 },
+        .{ "return @min(i.raw(), limit);", 1 },
+        .{ "return @byteSwap(i.raw());", 1 },
+        .{ "const v = i.raw(); return v + 1;", 1 },
+        .{ "const v = i.raw(); const w = v; return w * 2;", 1 },
+        .{ "var v: u16 = 0; v = i.raw(); return if (v < limit) 1 else 0;", 1 },
+        .{ "const v = if (limit > 0) i.raw() else 0; return v - 1;", 1 },
+        .{ "const v = maybe orelse i.raw(); return v / 2;", 1 },
+        .{ "const v = blk: { if (limit == 0) break :blk @as(u16, 0); break :blk i.raw(); }; return v % 7;", 1 },
+        .{ "const v = @as(u16, i.raw()); return v + 1;", 1 },
+        .{ "const v = switch (limit) { 0 => i.raw(), else => limit }; return v + 1;", 1 },
+        // Safe twins: the raw value handed on, widened or converted by a checked call, and a
+        // local that never held it.
+        .{ "use(i.raw()); return 0;", 0 },
+        .{ "const v = i.raw(); use(v); return v;", 0 },
+        .{ "const wide = @as(u32, i.raw()); _ = wide; return 0;", 0 },
+        .{ "return @import(\"std\").math.cast(u8, i.raw()) orelse error.Range;", 0 },
+        .{ "const v = limit; return v + 1;", 0 },
+        .{ "var v: u16 = limit; v += 1; return v;", 0 },
+    };
+    inline for (cases) |case| {
+        var project = try fixture(head ++ "    " ++ case[0] ++ "\n}\n");
+        defer project.deinit();
+        const found = try scalarFindings(&project);
+        if (found != case[1]) std.debug.print("{s}: {d} findings\n", .{ case[0], found });
+        try std.testing.expectEqual(@as(usize, case[1]), found);
+    }
+}
+
 /// One rule gated over `source`: whether the run decided every site, and how many findings.
 fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findings: usize } {
     var project = try fixture(source);
