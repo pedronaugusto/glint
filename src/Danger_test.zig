@@ -108,7 +108,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -718,9 +718,9 @@ test "A019 finds a local read while still undefined, one written on some paths o
         \\    return .{ eax, ebx };
         \\}
         \\pub fn tied() u32 { var v: u32 = undefined; asm volatile ("" : [_] "=r" (v) : [_] "r" (v)); return v; }
-    , 11); // 4 reads (`some`'s when `c` is false); `filled`, `sliced`, `length` and `named`, each
-    // written in part only (`fill` sets one element); `tied`'s input read before its output is
-    // written; and each `asm` itself.
+    , 10); // 4 reads (`some`'s when `c` is false); `filled`, `sliced` and `length`, each
+    // written in part only (`fill` sets one element; `named` sets its one field); `tied`'s
+    // input read before its output is written; and each `asm` itself.
     // Every branch that reaches the read writes it, the others leave; a range of literals runs,
     // and one that sets elements one by one writes them in part only (`ranged`).
     try expect(pack.unsafe_set,
@@ -733,13 +733,14 @@ test "A019 finds a local read while still undefined, one written on some paths o
 
 test "A019 reads a local handed to a call as written only where the call writes all of it: std's fills by name, the program's function whose body writes the whole parameter on every path that returns, and only where a failure leaves" {
     // Written whole (no finding): fillAll (line 13), fillTry under `try` (16), fillSet (18),
-    // @memset (21), a `for` setting each element (23, 24), readSliceAll under `try` and under
-    // `catch return` (29, 30), a file's writer and a fixed writer keep the buffer (31, 32),
-    // io.random (34) and writeInt (35). Findings: fillOne sets a part (14), fillSome returns
-    // first (15), fillTry's failure caught (17, the read), fillCatch returns from a `catch`
-    // (19), readsFirst reads first (20), @memset of a part (22, the read), a `for` that reads
-    // the element (25), fields set one by one (26, 27, 28), std's fixed reader reads its bytes
-    // (33), a `defer` reads before the write (36), and a pointer kept in a local (37).
+    // @memset (21), a `for` setting each element (23, 24), a field read once set and every
+    // field set (26, 28), readSliceAll under `try` and under `catch return` (29, 30), a file's
+    // writer and a fixed writer keep the buffer (31, 32), io.random (34) and writeInt (35).
+    // Findings: fillOne sets a part (14), fillSome returns first (15), fillTry's failure caught
+    // (17, the read), fillCatch returns from a `catch` (19), readsFirst reads first (20),
+    // @memset of a part (22, the read), a `for` that reads the element (25), a field never set
+    // read (27), std's fixed reader reads its bytes (33), a `defer` reads before the write
+    // (36), and a pointer kept in a local (37).
     const found = try run(pack.unsafe_set,
         \\const std = @import("std");
         \\const P = struct { a: u8, b: u8 };
@@ -779,7 +780,7 @@ test "A019 reads a local handed to a call as written only where the call writes 
         \\pub fn e1() u8 { var x: u8 = undefined; defer print(x); x = 1; return x; }
         \\pub fn e2() u8 { var b: [4]u8 = undefined; const p = &b; p.* = @splat(0); return b[0]; }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 17, 19, 20, 22, 25, 26, 27, 28, 33, 36, 37 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 17, 19, 20, 22, 25, 27, 33, 36, 37 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads the program's function that only hands a buffer to std's keeps as keeping it, a declaration literal by its result location, and a `for` over several inputs that sets each element first" {
@@ -882,6 +883,85 @@ test "A019 takes what a break or continue holds to where it goes, and a write on
         \\pub fn o(c: bool) u32 { var x: u32 = undefined; var y: u32 = 0; while (c) : (y += x) { x = 1; } return y; }
     );
     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5, 6, 7, 8, 9, 10 }, found.lines[0..found.findings]);
+}
+
+test "A019 writes a local whole by its parts: every field or element set on every path, by itself, its own init or an inline for over its type's fields" {
+    // Safe: its init setting each field (4), each set (6), a set field read (8), each set on
+    // both branches (11), each element (12), each by @field's spelled name (14), every field by
+    // an inline for, also through a constant and a comptime test of the name (16, 18, 19, 21),
+    // a parameter's (23), a comptime for (25). Unsafe: an init that sets one (5), one set (7),
+    // a field never set (9), a field set on one branch only (10), an element never set (13), a
+    // field read before its set (15), an inline for over part of the fields (17), a test that
+    // sets another field (20), a pass skipped (22), over another type's fields (24), a comptime
+    // for over part of it (26).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const Pair = struct { a: u32, b: u32, fn init(p: *Pair) void { p.a = 1; p.b = 2; } fn half(p: *Pair) void { p.a = 1; } };
+        \\fn take(p: Pair) u32 { return p.a; } fn sum(x: [2]u8) u32 { return x[0]; } fn get(comptime S: type) ?S { return null; }
+        \\pub fn case_a() u32 { var p: Pair = undefined; p.init(); return take(p); }
+        \\pub fn case_b() u32 { var p: Pair = undefined; p.half(); return take(p); }
+        \\pub fn case_c() u32 { var p: Pair = undefined; p.a = 1; p.b = 2; return take(p); }
+        \\pub fn case_d() u32 { var p: Pair = undefined; p.a = 1; return take(p); }
+        \\pub fn case_e() u32 { var p: Pair = undefined; p.a = 1; return p.a; }
+        \\pub fn case_f() u32 { var p: Pair = undefined; p.a = 1; return p.b; }
+        \\pub fn case_g(k: bool) u32 { var p: Pair = undefined; if (k) p.a = 1 else p.b = 2; p.b = 3; return take(p); }
+        \\pub fn case_h(k: bool) u32 { var p: Pair = undefined; if (k) p.a = 1 else p.a = 2; p.b = 3; return take(p); }
+        \\pub fn case_i() u32 { var x: [2]u8 = undefined; x[0] = 1; x[1] = 2; return sum(x); }
+        \\pub fn case_j() u32 { var x: [3]u8 = undefined; x[0] = 1; x[1] = 2; return x[0] + x[2]; }
+        \\pub fn case_k() u32 { var p: Pair = undefined; @field(p, "a") = 1; @field(p, "b") = 1; return take(p); }
+        \\pub fn case_l() u32 { var p: Pair = undefined; p.a = p.a; return 0; }
+        \\pub fn case_m(comptime T: type, v: u32) T { var out: T = undefined; inline for (@typeInfo(T).@"struct".fields) |field| @field(out, field.name) = v; return out; }
+        \\pub fn case_n(comptime T: type, v: u32) T { var out: T = undefined; inline for (@typeInfo(T).@"struct".fields[1..]) |field| @field(out, field.name) = v; return out; }
+        \\pub fn case_o() !Pair { var out: Pair = undefined; const info = @typeInfo(Pair).@"struct"; inline for (info.field_names, info.field_types) |name, F| { @field(out, name) = get(F) orelse return error.Missing; } return out; }
+        \\pub fn case_q(comptime T: type, from: T, v: u32) T { var to: T = undefined; inline for (@typeInfo(T).@"struct".field_names) |name| { if (comptime std.mem.eql(u8, name, "a")) to.a = v else @field(to, name) = @field(from, name); } return to; }
+        \\pub fn case_r(comptime T: type, from: T, v: u32) T { var to: T = undefined; inline for (@typeInfo(T).@"struct".field_names) |name| { if (comptime std.mem.eql(u8, name, "a")) to.b = v else @field(to, name) = @field(from, name); } return to; }
+        \\pub fn case_s() !Pair { var out: Pair = undefined; inline for (@typeInfo(Pair).@"struct".field_names) |name| { @field(out, name) = get(u32) orelse return error.Missing; } return out; }
+        \\pub fn case_t() !Pair { var out: Pair = undefined; inline for (@typeInfo(Pair).@"struct".field_names) |name| { @field(out, name) = get(u32) orelse continue; } return out; }
+        \\fn fill(out: *Pair) void { inline for (@typeInfo(Pair).@"struct".fields) |field| @field(out, field.name) = 0; } pub fn case_u() u32 { var p: Pair = undefined; fill(&p); return take(p); }
+        \\pub fn case_v(comptime T: type, comptime U: type, x: u32) T { var out: T = undefined; inline for (@typeInfo(U).@"struct".fields) |field| @field(out, field.name) = x; return out; }
+        \\pub fn case_w(comptime p: []const u8) []const u8 { comptime var buffer: [p.len]u8 = undefined; comptime for (p, &buffer) |ch, *slot| { slot.* = ch; }; const final = buffer; return &final; }
+        \\pub fn case_x(comptime p: []const u8) []const u8 { comptime var buffer: [p.len + 1]u8 = undefined; comptime for (p, buffer[0..p.len]) |ch, *slot| { slot.* = ch; }; const final = buffer; return &final; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7, 9, 10, 13, 15, 17, 20, 22, 24, 26 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a field used in place as written once it is set, unless something converts a pointer to that field of that struct back to its parent" {
+    // Safe: a field set, then a method called on it (5), where the only conversion of a field
+    // so named gives another struct (2). Unsafe: the same where a conversion gives this struct
+    // (8), or one whose name is a function's parameter, called with that name (11).
+    const found = try run(pack.unsafe_set,
+        \\const List = struct { n: u32 = 0, fn clear(l: *List) void { l.n = 0; } };
+        \\const Other = struct { list: List }; fn other(l: *List) *Other { return @fieldParentPtr("list", l); }
+        \\const Q = struct { a: u32, list: List };
+        \\const R = struct { a: u32, items: List }; const T = struct { a: u32, held: List };
+        \\pub fn a() void { var q: Q = undefined; q.list = .{}; q.list.clear(); }
+        \\fn back(l: *List) *R { return @fieldParentPtr("items", l); }
+        \\fn helper(comptime member: []const u8, l: *List) *T { return @fieldParentPtr(member, l); }
+        \\pub fn b() void { var r: R = undefined; r.items = .{}; r.items.clear(); }
+        \\pub fn c(l: *List) *T { return helper("held", l); }
+        \\
+        \\pub fn d() void { var t: T = undefined; t.held = .{}; t.held.clear(); }
+    );
+    // The conversions themselves are A019's too (2, 6, 7).
+    try std.testing.expectEqualSlices(u32, &.{ 2, 6, 7, 8, 11 }, found.lines[0..found.findings]);
+}
+
+test "A019 hands a local to the program's function that reads only parts of it, through a pointer to its type, as a read of those parts" {
+    // Safe: a method reading set fields through a helper (3), one setting a field before it
+    // reads it (6), a function called by its type (8). Unsafe: one reading a field never set
+    // (4), one keeping the pointer (5), one copying all of it (7), by its type (9).
+    const found = try run(pack.unsafe_set,
+        \\const W = struct { id: u32, root: []const u8, other: u64, fn rootLen(w: *const W) usize { return w.root.len; } fn touches(w: *W) u64 { return w.other; } fn via(w: *W) usize { return w.rootLen() + w.id; } fn keeps(w: *W, list: *[1]*W) void { list[0] = w; } fn first(w: *W) u64 { w.other = 5; return w.other + w.id; } fn copy(w: *W) W { return w.*; } };
+        \\var kept: [1]*W = undefined;
+        \\pub fn a() usize { var w: W = undefined; w.id = 1; w.root = "x"; return w.via(); }
+        \\pub fn b() u64 { var w: W = undefined; w.id = 1; w.root = "x"; return w.touches(); }
+        \\pub fn c() void { var w: W = undefined; w.id = 1; w.keeps(&kept); }
+        \\pub fn d() u64 { var w: W = undefined; w.id = 1; return w.first(); }
+        \\pub fn e() W { var w: W = undefined; w.id = 1; return w.copy(); }
+        \\pub fn f() usize { var w: W = undefined; w.root = "x"; return W.rootLen(&w); }
+        \\pub fn g() usize { var w: W = undefined; w.id = 1; return W.rootLen(&w); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 7, 9 }, found.lines[0..found.findings]);
 }
 
 /// The findings of `rule` on `program` with `edit` applied: each (old, new) replaced once.
