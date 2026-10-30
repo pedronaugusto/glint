@@ -1352,6 +1352,38 @@ test "A006 accepts a depth the cycle moves and compares, and recursion no untrus
     try expectJudged(head ++ "pub fn read(text: Text) bool { const b = text.readForParse(); return same([]const u8, b, b); }\nfn same(comptime T: type, a: T, b: T) bool { return switch (@typeInfo(T)) { .pointer => |i| same(i.child, a[0], b[0]), else => a == b }; }", pack.recursion, true, 1);
 }
 
+test "A006 strict: a guard that leaves before the call, the way the depth steps, against a bound the input does not choose" {
+    const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
+    const param = "pub fn read(text: Text) error{TooDeep}!usize { return nest(text.readForParse(), 0); }\n";
+    // The guard after the call: each level recurses before it checks.
+    try expectJudged(head ++ param ++ "fn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (bytes.len == 0) return 0; const r = 1 + try nest(bytes[1..], depth + 1); if (depth > 64) return error.TooDeep; return r; }", pack.recursion, true, 1);
+    try expectJudged(head ++ param ++ "fn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (depth > 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 1); }", pack.recursion, true, 0);
+    // A guard in a branch that does not lead to the call.
+    try expectJudged(head ++ param ++ "fn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (bytes.len == 0) { if (depth > 64) return error.TooDeep; return 0; } return 1 + try nest(bytes[1..], depth + 1); }", pack.recursion, true, 1);
+    // The wrong way: a growing depth held at least a bound.
+    try expectJudged(head ++ param ++ "fn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (depth < 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 1); }", pack.recursion, true, 1);
+    // A step of nothing.
+    try expectJudged(head ++ param ++ "fn nest(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (depth > 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 0); }", pack.recursion, true, 1);
+    // A bound the input chooses: its length.
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { const bytes = text.readForParse(); return nest(bytes, 0, bytes.len); }\nfn nest(bytes: []const u8, depth: usize, most: usize) error{TooDeep}!usize { if (depth > most) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 1, most); }", pack.recursion, true, 1);
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { const bytes = text.readForParse(); return nest(bytes, 0, 64); }\nfn nest(bytes: []const u8, depth: usize, most: usize) error{TooDeep}!usize { if (depth > most) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], depth + 1, most); }", pack.recursion, true, 0);
+    // A shrinking budget the input gives, and one the program gives.
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { const bytes = text.readForParse(); return nest(bytes, bytes.len); }\nfn nest(bytes: []const u8, budget: usize) error{TooDeep}!usize { if (budget == 0) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], budget - 1); }", pack.recursion, true, 1);
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { return nest(text.readForParse(), 64); }\nfn nest(bytes: []const u8, budget: usize) error{TooDeep}!usize { if (budget == 0) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], budget - 1); }", pack.recursion, true, 0);
+    // A field moved only in a `defer`, after the call; and a helper called after the call.
+    const parser = "pub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }\n";
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { defer p.depth += 1; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn enter(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; }\n fn value(p: *Parser) error{TooDeep}!void { if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); try p.enter(); } };", pack.recursion, true, 1);
+    // The field moved and guarded before the call, the guard first.
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { if (p.depth > 64) return error.TooDeep; p.depth += 1; defer p.depth -= 1; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };", pack.recursion, true, 0);
+}
+
+test "A006 strict: a call through anything but a function is undecided" {
+    const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
+    try expectJudged(head ++ "const Step = *const fn ([]const u8) usize;\npub fn read(text: Text, step: Step) usize { return step(text.readForParse()); }", pack.recursion, false, 0);
+    try expectJudged(head ++ "fn step(bytes: []const u8) usize { return bytes.len; }\npub fn read(text: Text) usize { return step(text.readForParse()); }", pack.recursion, true, 0);
+}
+
 test "A001 finds public text built by a literal, by the type the literal takes from its place" {
     const head = "const err = @import(\"aegis\").err;\nconst Other = struct { bytes: []const u8 };\nfn show(s: err.PublicSource) void { _ = s; }\nfn take(o: Other) void { _ = o; }\n";
     // A declaration's written type, a call's parameter, a function's result, a typed literal,
