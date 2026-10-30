@@ -858,6 +858,32 @@ test "A019 keeps nothing it read past its depth: a keeper first reached at the e
     try std.testing.expectEqualSlices(u32, &.{13}, found.lines[0..found.findings]);
 }
 
+test "A019 takes what a break or continue holds to where it goes, and a write on some paths through an expression writes nothing" {
+    // Unsafe: a jump past the write to a `for`'s end (2, 3), a labeled block's (4) or a
+    // labeled switch's (5) and an outer loop's (6); a write in a branch of an expression (7)
+    // or past `orelse` (8); a `continue` to a while's continue expression (9); a while's
+    // `else` (10). Safe: each jump after the write (11-13), a labeled block that does not
+    // hold the local (14), a continue expression after the body wrote it (15).
+    const found = try run(pack.unsafe_set,
+        \\fn work() void {}
+        \\pub fn a(c: bool) u32 { var x: u32 = undefined; for (0..1) |_| { if (c) continue; x = 1; } return x; }
+        \\pub fn b(c: bool) u32 { var x: u32 = undefined; for (0..1) |_| { if (c) break; x = 1; } return x; }
+        \\pub fn d(c: bool) u32 { var x: u32 = undefined; blk: { if (c) break :blk; x = 1; } return x; }
+        \\pub fn e(c: bool) u32 { var x: u32 = undefined; sw: switch (@as(u8, 0)) { 0 => { if (c) break :sw; x = 1; }, else => x = 2 } return x; }
+        \\pub fn f(c: bool) u32 { var x: u32 = undefined; outer: for (0..2) |_| { for (0..2) |_| { if (c) break :outer; } x = 1; } return x; }
+        \\pub fn g(c: bool) u32 { var x: u32 = undefined; const v: u32 = if (c) blk: { x = 1; break :blk 1; } else 2; return x + v; }
+        \\pub fn h(c: ?u32) u32 { var x: u32 = undefined; const v = c orelse blk: { x = 1; break :blk 0; }; return x + v; }
+        \\pub fn i(c: bool, q: bool) u32 { var x: u32 = undefined; var y: u32 = 0; while (c) : (y += x) { if (q) continue; x = 1; } return y; }
+        \\pub fn j(c: bool) u32 { var x: u32 = undefined; while (c) { x = 1; break; } else { return x; } return 0; }
+        \\pub fn k(c: bool) u32 { var x: u32 = undefined; blk: { x = 1; if (c) break :blk; work(); } return x; }
+        \\pub fn l(c: bool) u32 { var x: u32 = undefined; for (0..2) |at| { x = @intCast(at); if (c) continue; work(); } return x; }
+        \\pub fn m(c: bool) u32 { var x: u32 = undefined; outer: for (0..2) |_| { x = 1; for (0..2) |_| { if (c) break :outer; } } return x; }
+        \\pub fn n() u32 { var x: u32 = undefined; const v: u32 = blk: { break :blk 1; }; x = v; return x; }
+        \\pub fn o(c: bool) u32 { var x: u32 = undefined; var y: u32 = 0; while (c) : (y += x) { x = 1; } return y; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 5, 6, 7, 8, 9, 10 }, found.lines[0..found.findings]);
+}
+
 /// The findings of `rule` on `program` with `edit` applied: each (old, new) replaced once.
 fn runEdited(rule: glint.Rule, comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) !Run {
     const at = comptime std.mem.find(u8, program, old).?;

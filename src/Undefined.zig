@@ -12,11 +12,12 @@
 //! writes it whole, and neither reads it. Handed anywhere else (a call nothing shows writing it
 //! whole, a pointer kept in a local) it is read there.
 //!
-//! A branch that writes it on some paths only, and a loop that may run no pass, leave it
-//! unwritten for what follows; a branch that leaves (`return`, `break`, `continue`,
-//! `unreachable`) reaches nothing after it, and a `for` over a range of literals runs at least
-//! once. A deferred statement reads it as at its place: it runs at the scope's exits, where
-//! the local may be as unwritten as it is there.
+//! A branch that writes it on some paths only, a write in a part of an expression that runs on
+//! some paths only, and a loop that may run no pass, leave it unwritten for what follows; a
+//! branch that leaves (`return`, `unreachable`) reaches nothing after it, a `break` or
+//! `continue` reaches the end of where it goes with what it holds, and a `for` over a range of
+//! literals runs at least once. A deferred statement reads it as at its place: it runs at the
+//! scope's exits, where the local may be as unwritten as it is there.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
@@ -132,8 +133,22 @@ pub fn reads(c: *Context, rule: Rule) Context.Error!void {
 }
 
 /// Where the walk stands: the local unwritten, written, a read found (`done`), or the path left
-/// before what follows (`left`).
-const State = enum { unwritten, written, done, left };
+/// before what follows (`left`). While it is unwritten, `parts` holds what of it every path here
+/// has written: its fields, by their place in its struct, or its elements, by index.
+const State = struct {
+    at: enum { unwritten, written, done, left },
+    parts: u64 = 0,
+
+    const unwritten: State = .{ .at = .unwritten };
+    const written: State = .{ .at = .written };
+    const done: State = .{ .at = .done };
+    const left: State = .{ .at = .left };
+
+    /// The parts it holds written: all of them, once it is written whole.
+    fn have(state: State) u64 {
+        return if (state.at == .written) std.math.maxInt(u64) else state.parts;
+    }
+};
 
 const Effect = enum { read, handed, write };
 const Use = struct { key: Ast.TokenIndex, effect: Effect };
@@ -159,6 +174,10 @@ const Walk = struct {
     handed: bool = false,
     /// Whether a path returns with a parameter's memory not yet written whole.
     exit_unwritten: bool = false,
+    /// The constructs being walked that a `break` or `continue` in them may leave for their end
+    /// (a loop, a labeled block or `switch`), innermost last, each with what the jumps to it
+    /// so far take there.
+    targets: std.ArrayList(struct { node: Ast.Node.Index, exit: ?State = null }) = .empty,
 
     fn init(c: *Context, file: Project.FileId, local: Model.Declaration.Id, param: bool, depth: u8) Walk {
         return .{ .c = c, .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .local = local, .param = param, .depth = depth };
@@ -189,7 +208,7 @@ const Walk = struct {
     fn sequence(w: *Walk, statements: []const Ast.Node.Index, state: State) Context.Error!State {
         var now = state;
         for (statements) |each| {
-            if (now != .unwritten) return now;
+            if (now.at != .unwritten) return now;
             now = try w.statement(each, now);
         }
         return now;
@@ -199,73 +218,150 @@ const Walk = struct {
     fn statement(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!State {
         const tree = w.tree;
         // A path that leaves reads what it leaves with first; a parameter's walk sees each
-        // `return` that is not an error's with the memory unwritten.
+        // `return` that is not an error's with the memory unwritten. A `break` or `continue`
+        // takes what it holds to where it goes.
         switch (tree.nodeTag(node)) {
             .@"return", .@"break", .@"continue", .unreachable_literal => {
-                const past = if (w.mentioned(node)) try w.simple(node) else state;
-                if (past == .done) return .done;
-                if (tree.nodeTag(node) == .@"return" and past == .unwritten and !errorReturn(tree, node)) w.exit_unwritten = true;
+                const past = if (w.mentioned(node)) try w.simple(node, state) else state;
+                if (past.at == .done) return .done;
+                if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and !errorReturn(tree, node)) w.exit_unwritten = true;
+                w.jump(node, past);
                 return .left;
             },
             else => {},
         }
-        if (!w.mentioned(node) and !w.returnsIn(node)) return state;
+        if (!w.mentioned(node) and !w.returnsIn(node)) {
+            // It leaves the local as it is, for what follows and for where a jump in it goes.
+            w.jumpsIn(node, state);
+            return state;
+        }
         switch (tree.nodeTag(node)) {
             .@"defer", .@"errdefer" => {
                 // Run at the scope's exits, where the local may be as unwritten as here; what it
                 // writes holds before none of them.
                 const past = try w.statement(tree.nodeData(node).node, state);
-                return if (past == .done) .done else state;
+                return if (past.at == .done) .done else state;
             },
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                return w.sequence(tree.blockStatements(&buffer, node).?, state);
+                const statements = tree.blockStatements(&buffer, node).?;
+                if (blockLabel(tree, node) == null) return w.sequence(statements, state);
+                try w.enter(node);
+                return w.leave(try w.sequence(statements, state));
             },
             else => {},
         }
         if (tree.fullIf(node)) |branch| {
             const after = try w.statement(branch.ast.cond_expr, state);
-            if (after != .unwritten) return after;
+            if (after.at != .unwritten) return after;
             const then = try w.statement(branch.ast.then_expr, after);
             const otherwise = if (branch.ast.else_expr.unwrap()) |e| try w.statement(e, after) else after;
             return merge(then, otherwise);
         }
         if (tree.fullSwitch(node)) |choice| {
             const after = try w.statement(choice.ast.condition, state);
-            if (after != .unwritten) return after;
+            if (after.at != .unwritten) return after;
+            try w.enter(node);
             var all: ?State = null;
             for (choice.ast.cases) |case| {
-                const prong = tree.fullSwitchCase(case) orelse return .done;
+                const prong = tree.fullSwitchCase(case) orelse {
+                    all = .done;
+                    break;
+                };
                 const past = try w.statement(prong.ast.target_expr, after);
                 all = if (all) |sofar| merge(sofar, past) else past;
             }
-            return all orelse after;
+            return w.leave(all orelse after);
         }
         if (tree.fullWhile(node)) |loop| {
             const after = try w.statement(loop.ast.cond_expr, state);
-            if (after != .unwritten) return after;
+            if (after.at != .unwritten) return after;
             // The body runs first with the local unwritten; a loop may run no pass, so what it
-            // writes holds on some paths only.
-            const body = try w.statement(loop.ast.then_expr, after);
-            return if (body == .done) .done else after;
+            // writes holds on some paths only. Its continue expression runs where a pass ends,
+            // and its `else` where the condition fails.
+            try w.enter(node);
+            const body = w.leave(try w.statement(loop.ast.then_expr, after));
+            if (body.at == .done) return .done;
+            if (loop.ast.cont_expr.unwrap()) |more| {
+                if (body.at == .unwritten and (try w.statement(more, body)).at == .done) return .done;
+            }
+            if (loop.ast.else_expr.unwrap()) |e| if ((try w.statement(e, after)).at == .done) return .done;
+            return after;
         }
         if (tree.fullFor(node)) |loop| {
             for (loop.ast.inputs) |input| {
                 const past = try w.statement(input, state);
-                if (past != .unwritten) return past;
+                if (past.at != .unwritten) return past;
             }
-            const body = try w.statement(loop.ast.then_expr, state);
-            if (body == .done) return .done;
-            // A range of literals with passes in it runs the body, and its first pass is as read.
-            return if (body == .written and passes(tree, loop.ast.inputs[0])) .written else state;
+            try w.enter(node);
+            const body = w.leave(try w.statement(loop.ast.then_expr, state));
+            if (body.at == .done) return .done;
+            if (loop.ast.else_expr.unwrap()) |e| {
+                if ((try w.statement(e, state)).at == .done) return .done;
+                return state;
+            }
+            // A range of literals with passes in it runs the body, and its first pass is as read;
+            // what reaches the loop's end is what its passes end with and what jumps there take.
+            return if (passes(tree, loop.ast.inputs[0])) body else state;
         }
-        return w.simple(node);
+        return w.simple(node, state);
+    }
+
+    /// Opens a construct a `break` may leave for its end.
+    fn enter(w: *Walk, node: Ast.Node.Index) Context.Error!void {
+        try w.targets.append(w.c.allocator, .{ .node = node });
+    }
+
+    /// Closes the innermost construct, whose end what reaches it (`end`) and what the jumps to
+    /// it take both reach.
+    fn leave(w: *Walk, end: State) State {
+        const target = w.targets.pop().?;
+        return if (target.exit) |exit| merge(end, exit) else end;
+    }
+
+    /// Takes `state` to the end of the construct the `break` or `continue` at `node` goes to,
+    /// where that is one being walked. A `continue` to a labeled `switch` dispatches again, to
+    /// prongs walked from what the `switch` began with, which holds no more.
+    fn jump(w: *Walk, node: Ast.Node.Index, state: State) void {
+        const tag = w.tree.nodeTag(node);
+        if (tag != .@"break" and tag != .@"continue") return;
+        const goes = jumpTarget(w.tree, w.model, node) orelse return;
+        if (tag == .@"continue" and w.tree.fullSwitch(goes) != null) return;
+        var i = w.targets.items.len;
+        while (i > 0) {
+            i -= 1;
+            const target = &w.targets.items[i];
+            if (target.node != goes) continue;
+            target.exit = if (target.exit) |exit| merge(exit, state) else state;
+            return;
+        }
+    }
+
+    /// Takes `state` to where each `break` or `continue` in `node` goes, for a statement the
+    /// walk does not follow step by step: what it holds there is no less.
+    fn jumpsIn(w: *Walk, node: Ast.Node.Index, state: State) void {
+        const tree = w.tree;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        var token = first;
+        while (token <= last) : (token += 1) switch (tree.tokenTag(token)) {
+            .keyword_break, .keyword_continue => break,
+            else => {},
+        } else return;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"break" and tag != .@"continue") continue;
+            const each: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const at = tree.nodeMainToken(each);
+            if (at >= first and at <= last) w.jump(each, state);
+        }
     }
 
     /// A statement without control flow of its own: its mentions in evaluation order, an
-    /// assignment's target after its value. A parameter's walk takes a `return` inside it (`x
-    /// catch return`) as one with the memory unwritten.
-    fn simple(w: *Walk, node: Ast.Node.Index) Context.Error!State {
+    /// assignment's target after its value. A write in a part of it that runs on some paths
+    /// only (a branch, past `orelse`, a labeled block) writes nothing for what follows. A
+    /// parameter's walk takes a `return` inside it (`x catch return`) as one with the memory
+    /// unwritten.
+    fn simple(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!State {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
         for (w.returns.items) |each| {
@@ -273,19 +369,22 @@ const Walk = struct {
             const token = w.tree.firstToken(each);
             if (token >= first and token <= last) w.exit_unwritten = true;
         }
+        w.jumpsIn(node, state);
         var earliest: ?struct { use: Use, token: Ast.TokenIndex } = null;
         for (w.mentions.items) |mention| {
             const token = w.tree.nodeMainToken(mention);
             if (token < first or token > last) continue;
             const use = (try w.classify(mention)) orelse continue;
+            if (use.effect == .write and conditional(w.tree, w.model, mention, node)) continue;
             if (earliest == null or use.key < earliest.?.use.key) earliest = .{ .use = use, .token = token };
         }
         for (w.outputs.items) |output| {
             if (output.token < first or output.token > last) continue;
+            if (conditional(w.tree, w.model, output.asm_node, node)) continue;
             const key = w.tree.lastToken(output.asm_node);
             if (earliest == null or key < earliest.?.use.key) earliest = .{ .use = .{ .key = key, .effect = .write }, .token = output.token };
         }
-        const found = earliest orelse return .unwritten;
+        const found = earliest orelse return state;
         if (found.use.effect == .write) return .written;
         w.read = found.token;
         w.handed = found.use.effect == .handed;
@@ -752,7 +851,7 @@ fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
     const end = try walk.sequence(statements, .unwritten);
-    return walk.read == null and !walk.exit_unwritten and (end == .written or end == .left);
+    return walk.read == null and !walk.exit_unwritten and (end.at == .written or end.at == .left);
 }
 
 /// What the program's functions were found to do with a parameter, kept once per function,
@@ -801,13 +900,82 @@ fn errorReturn(tree: *const Ast, node: Ast.Node.Index) bool {
 }
 
 fn merge(a: State, b: State) State {
-    if (a == .done or b == .done) return .done;
+    if (a.at == .done or b.at == .done) return .done;
     // A path that left reaches nothing after the branch.
-    if (a == .left) return b;
-    if (b == .left) return a;
-    if (a == .written and b == .written) return .written;
-    // Written on some paths only: a read that follows may read it undefined.
-    return .unwritten;
+    if (a.at == .left) return b;
+    if (b.at == .left) return a;
+    if (a.at == .written and b.at == .written) return .written;
+    // Written on some paths only: a read that follows may read it undefined, past the parts
+    // every path wrote.
+    return .{ .at = .unwritten, .parts = a.have() & b.have() };
+}
+
+/// The label a block carries (`blk: { … }`), by its token.
+fn blockLabel(tree: *const Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
+    const brace = tree.nodeMainToken(node);
+    if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return null;
+    return brace - 2;
+}
+
+fn isBlock(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => true,
+        else => false,
+    };
+}
+
+/// Where a `break` or `continue` goes: the construct its label names, or the innermost loop
+/// whose body holds it; null past the function.
+fn jumpTarget(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    const label_token, _ = tree.nodeData(node).opt_token_and_opt_node;
+    const label: ?[]const u8 = if (label_token.unwrap()) |token| tree.tokenSlice(token) else null;
+    var at = node;
+    while (model.parentOf(at)) |up| : (at = up) {
+        if (tree.nodeTag(up) == .fn_decl) return null;
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&buffer, up) != null) return null;
+        var name: ?Ast.TokenIndex = null;
+        // A jump in a loop's condition, inputs or `else` goes past that loop.
+        var body = false;
+        if (tree.fullWhile(up)) |loop| {
+            name = loop.label_token;
+            body = at == loop.ast.then_expr or at.toOptional() == loop.ast.cont_expr;
+        } else if (tree.fullFor(up)) |loop| {
+            name = loop.label_token;
+            body = at == loop.ast.then_expr;
+        } else if (tree.fullSwitch(up)) |choice| {
+            name = choice.label_token;
+        } else if (isBlock(tree, up)) {
+            name = blockLabel(tree, up);
+        } else continue;
+        if (label) |wanted| {
+            if (name) |token| if (std.mem.eql(u8, tree.tokenSlice(token), wanted)) return up;
+        } else if (body) return up;
+    }
+    return null;
+}
+
+/// Whether what `inner` does runs on some paths through `top` only: in a branch of an `if` or a
+/// `switch`, past `orelse` or `catch`, `and` or `or`, in a loop, or in a labeled block a `break`
+/// may leave early.
+fn conditional(tree: *const Ast, model: *const Model, inner: Ast.Node.Index, top: Ast.Node.Index) bool {
+    var at = inner;
+    while (at != top) : (at = model.parentOf(at).?) {
+        const up = model.parentOf(at) orelse return true;
+        switch (tree.nodeTag(up)) {
+            .@"orelse", .@"catch", .bool_and, .bool_or => if (tree.nodeData(up).node_and_node[1] == at) return true,
+            else => {
+                if (tree.fullIf(up)) |branch| {
+                    if (branch.ast.cond_expr != at) return true;
+                } else if (tree.fullSwitch(up)) |choice| {
+                    if (choice.ast.condition != at) return true;
+                } else if (tree.fullWhile(up) != null or tree.fullFor(up) != null) {
+                    return true;
+                } else if (isBlock(tree, up) and blockLabel(tree, up) != null) return true;
+            },
+        }
+    }
+    return false;
 }
 
 /// Whether a `for` input is a range of literals with a pass in it (`0..2`).
