@@ -557,6 +557,25 @@ fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: 
     try std.testing.expectEqual(complete, got.complete);
     try std.testing.expectEqual(findings, got.findings);
 }
+/// A std of the parts a rule names by declaration (std's allocator), beside aegis.
+const std_fixture = [_]aegis_sources.Extra{
+    .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");" },
+    .{ .name = "std/mem.zig", .bytes = "pub const Allocator = @import(\"mem/Allocator.zig\");" },
+    .{ .name = "std/mem/Allocator.zig", .bytes = "const Allocator = @This();\nptr: *anyopaque,\npub const Error = error{OutOfMemory};\npub fn alloc(a: Allocator, comptime T: type, n: usize) Error![]T { _ = a; _ = n; return &.{}; }\npub fn dupe(a: Allocator, comptime T: type, m: []const T) Error![]T { _ = a; _ = m; return &.{}; }\npub fn print(a: Allocator, comptime format: []const u8, args: anytype) Error![]u8 { _ = a; _ = args; return &.{}; }\npub fn free(a: Allocator, memory: anytype) void { _ = a; _ = memory; }" },
+};
+const std_fixture_imports = [_]aegis_sources.ExtraImport{
+    .{ .spelling = "std", .target = 0 },
+    .{ .from = 0, .spelling = "mem.zig", .target = 1 },
+    .{ .from = 1, .spelling = "mem/Allocator.zig", .target = 2 },
+};
+fn expectJudgedStd(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &std_fixture, &std_fixture_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
 
 test "receivers bound by captures are decided by what they bind" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, lock: u32 };\n";
@@ -1090,15 +1109,18 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
 
 test "an adoption of a whole byte allocation, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
-    try expectJudged(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     // The owner is unmanaged: which allocator made the allocation is the caller's to give its
     // deinit, so another allocator's allocation is decided at the adoption too.
-    try expectJudged(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     // A pending errdefer, a later use or an element wider than a byte stay review sites.
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
+    // std's allocator by its declaration: a pool of the program's own with an `alloc` of the
+    // same shape hands out a part of its buffer, no whole allocation.
+    try expectJudgedStd(head ++ "const Pool = struct { buffer: [64]u8 = undefined, used: usize = 0, fn alloc(p: *Pool, comptime T: type, n: usize) ![]T { const part = p.buffer[p.used..][0..n]; p.used += n; return part; } };\npub fn f(pool: *Pool, n: usize) !Bytes { const buffer = try pool.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
 }
 
 test "an adoption of a private function's parameter is decided by every call's argument, through what a function returns" {
@@ -1106,12 +1128,12 @@ test "an adoption of a private function's parameter is decided by every call's a
     const session = "const S = struct {\n    gpa: std.mem.Allocator,\n    fn ask(s: *S, quiet: bool) !?[]u8 { if (quiet) { if (try s.helper()) |answer| return answer; return null; } const copy = try s.gpa.dupe(u8, \"x\"); return copy; }\n    fn helper(s: *S) !?[]u8 { if (s.gpa.vtable == undefined) return error.Unavailable; return try s.gpa.dupe(u8, \"y\"); }\n};\n";
     // Each argument a whole allocation: printed, duplicated, allocated into a local used only
     // before, and returned by a method on every path that gives one.
-    try expectJudged(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(s.gpa); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(buffer); b.deinit(s.gpa); var c = adopted(try s.ask(true) orelse return); c.deinit(s.gpa); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(s.gpa); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(buffer); b.deinit(s.gpa); var c = adopted(try s.ask(true) orelse return); c.deinit(s.gpa); }", pack.capacity, true, 0);
     // A public function, a returned local a `defer` frees, or a local read after the call stay
     // review sites.
-    try expectJudged("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try gpa.dupe(u8, \"x\")); a.deinit(gpa); }", pack.capacity, false, 0);
-    try expectJudged(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try made(gpa)); a.deinit(gpa); }", pack.capacity, false, 0);
-    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(buffer); a.deinit(gpa); buffer[0] = 0; }", pack.capacity, false, 0);
+    try expectJudgedStd("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try gpa.dupe(u8, \"x\")); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try made(gpa)); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(buffer); a.deinit(gpa); buffer[0] = 0; }", pack.capacity, false, 0);
 }
 
 test "an owner released on error by errdefer, carried out in what is returned, or moved out of a dead local is decided" {
@@ -1327,14 +1349,12 @@ test "A001 refutes an unresolved receiver by the other members the file reads of
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| _ = p.value; }", pack.access, false, 0);
 }
 
-test "A003 refutes an unresolved acquisition no aegis function can be by its arguments" {
-    // Every aegis `read` takes at most an `Io`: two arguments are more than any takes. (With
-    // std mapped, a type argument is refused too: `access.read([]const u8)`.)
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, true, 0);
-    // An argument a `read` could take leaves it undecided.
+test "A003 leaves an unresolved acquisition undecided even where no aegis function can be it: the program's own may return an owner" {
+    // No aegis `read` takes two arguments, but `access` may be the program's own type, whose
+    // `read` returns an owner.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, false, 0);
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
-    // A receiver held at run time calls a method: `read(self, io)` takes one argument there.
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, true, 0);
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, false, 0);
     // A function of a type parameter gives what each binding makes, checked at the binding.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, true, 0);
 }

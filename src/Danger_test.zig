@@ -474,7 +474,9 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
-test "A015 finds std resources held by value in a field its file releases or returned by value, not borrowed, owned or lent" {
+test "A015 finds std resources held by value in a field, released or not, or returned by value, not borrowed by pointer, owned or lent" {
+    // Options' `cwd` and `out` are released nowhere: an owner that leaks or a borrow, which
+    // own.Lent names; either way a finding.
     try expect(pack.ownership,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -486,7 +488,7 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
         \\fn shut(d: *std.Io.Dir) void { _ = d; }
         \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
-    , 5);
+    , 7);
     // A function each of whose returns reads what is already held hands over no owner:
     // shakedown's simulated working directory and standard streams, std's own stdio, a pipe end
     // named by the handle it is given.
@@ -515,7 +517,7 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\pub fn pipeFile(handle: std.Io.File.Handle) std.Io.File {
         \\    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
         \\}
-    , 0);
+    , 3); // Fields held by value and released nowhere (Slot.file, Process.cwd, Context.cwd): no function.
     // Only std's own stdio and a std handle's literal: a method of the program's that is named
     // `stdout` but returns what it opened (and its callers, and the open itself), and a literal
     // of the program's type with a `handle` field, are owners handed over.
@@ -539,7 +541,7 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\    const w: Wrapped = .{ .handle = f.opened() };
         \\    return w.handle;
         \\}
-    , 4);
+    , 6); // And the fields Proc.dir and Wrapped.handle.
     // A field moved out through a variable, a field of what was just opened, and an open are
     // owners handed over.
     try expect(pack.ownership,
@@ -560,7 +562,7 @@ test "A015 finds std resources held by value in a field its file releases or ret
         \\pub fn open(dir: std.Io.Dir, io: std.Io) !std.Io.File {
         \\    return dir.openFile(io, "x", .{});
         \\}
-    , 3);
+    , 4); // And the field Conn.stream.
 }
 
 test "A016 finds identifying integers of one type meeting, not other integers" {

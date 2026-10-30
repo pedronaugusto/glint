@@ -3,6 +3,7 @@ const std = @import("std");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Facts = @import("Facts.zig");
+const Governed = @import("Governed.zig");
 const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Ids = @import("AegisRules.zig");
@@ -563,42 +564,14 @@ fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.Token
     switch (read) {
         .owner => |k| return k,
         .other => return null,
+        // Unresolved, it may be an owner the program's own function returns, whatever aegis
+        // declares.
         .unknown => {
             const tree = try c.project.syntax(try c.source());
-            if (try noLibraryCall(c, tree, node)) return null;
             try c.undecided(rule, tree.tokenStart(token), .unresolved, "candidate receiver/value has no resolved operation contract");
             return null;
         },
     }
-}
-/// Whether `node` is a call `x.name(...)` that no function the library declares can be, by
-/// what Zig allows (`RuleContext.accepts`): `access.read([]const u8)` gives a type where every
-/// aegis `read` takes an `Io` or nothing. Whatever `x` is, the result is then no aegis owner
-/// an aegis operation gave.
-fn noLibraryCall(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!bool {
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, node) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
-    // A receiver held at run time calls a method, never a namespace's function.
-    const value = try c.facts.runtime(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
-    const found = try c.facts.publication(Contract.library);
-    for (found.files) |file| {
-        const model = &c.project.at(file).model;
-        for (model.declarations, 0..) |decl, i| {
-            if (!std.mem.eql(u8, decl.name, name) or model.scopes[@backingInt(decl.scope)].kind != .container) continue;
-            const candidate: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
-            // A constant or a field of no function's type is no callee; one that may hold a
-            // function (a pointer, or a type not known) may be.
-            switch (try c.facts.declaration(candidate)) {
-                .function => {},
-                .unknown, .pointer, .alternatives => return false,
-                else => continue,
-            }
-            if (try c.accepts(candidate, call, 1) or (!value and try c.accepts(candidate, call, 0))) return false;
-        }
-    }
-    return true;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
 /// Two readings of what parts or alternatives hold, as one: unknown stays unknown, one owner
@@ -2757,13 +2730,15 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
     }
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
+    const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return false;
+    const function = (try c.facts.origin(callee)) orelse return false;
+    // std's allocator by its declarations: a byte allocation, a copy of bytes or printed text.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
-        const made = if (std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dupe"))
+        const made = if (try allocates(c, function, "mem.Allocator.alloc") or try allocates(c, function, "mem.Allocator.dupe"))
             call.ast.params.len == 2 and isByte(c, call.ast.params[0])
         else
-            std.mem.eql(u8, name, "print") and call.ast.params.len == 2;
+            try allocates(c, function, "mem.Allocator.print") and call.ast.params.len == 2;
         if (made) {
             const expected = want orelse return true;
             const giver = (try pathOf(c, data[0])) orelse return false;
@@ -2772,8 +2747,6 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
         }
     }
     // A function of this file: what it returns on every path that gives a value.
-    const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return false;
-    const function = (try c.facts.origin(callee)) orelse return false;
     if (function.file != c.file or model.declarations[@backingInt(function.index)].kind != .function) return false;
     const body_fn = model.parentOf(model.declarations[@backingInt(function.index)].node) orelse return false;
     if (tree.nodeTag(body_fn) != .fn_decl) return false;
@@ -2790,6 +2763,14 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
         gives = true;
     }
     return gives;
+}
+
+/// Whether `function` is std's declaration at `path`.
+fn allocates(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!bool {
+    for ((try Governed.declarations(c, "std", path)) orelse &.{}) |each| {
+        if (std.meta.eql((try c.facts.origin(each)) orelse each, function)) return true;
+    }
+    return false;
 }
 
 /// Whether `node` never completes with a value: `return`, `unreachable`, a `break` or

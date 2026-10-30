@@ -14,10 +14,10 @@ const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-/// A015: a std resource held by value in a field its file releases (`close`, `deinit`), or
-/// returned by the program's own function, outside aegis's `own.Owned`. A field nothing in its
-/// file releases borrows a handle its caller owns (an options or context struct), and a function
-/// each of whose returns reads what is already held hands over no owner (`views`).
+/// A015: a std resource held by value in a field, or returned by the program's own function,
+/// outside aegis's `own.Owned` and `own.Lent`. A field, released or not, is its owner or a
+/// borrow, which `own.Lent` names; a function each of whose returns reads what is already held
+/// hands over no owner (`views`).
 pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     const paths = [_][]const u8{ "Io.File", "Io.Dir", "Io.net.Stream", "Io.net.Server", "process.Child" };
     const resources = try containersOf(c, rule, &paths);
@@ -38,7 +38,6 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         };
         const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
         const which = find(resources, held) orelse continue;
-        if (decl.kind == .field and !releasedAnywhere(c, decl.name)) continue;
         if (decl.kind == .function and try views(c, resources, decl)) continue;
         if (decl.kind == .function) {
             if (!looked) {
@@ -49,7 +48,7 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         }
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
-        try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once", .{ what, decl.name, how, paths[which] }));
+        try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ what, decl.name, how, paths[which] }));
     }
 }
 
@@ -198,43 +197,6 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, node: Ast.Node.Index
             return false;
         },
     }
-}
-
-/// Whether any of the program's files releases a field named `name`: wherever the owner is
-/// released, the field holds one.
-fn releasedAnywhere(c: *Context, name: []const u8) bool {
-    for (c.project.sources) |*source| {
-        if (source.input.selected and released(&source.file.tree, name)) return true;
-    }
-    return false;
-}
-
-/// Whether the file releases the field `name`: `x.name.close(`, `deinit(`, `kill(` or `wait(`,
-/// through an optional's `.?` too, or through a capture of it (`if (x.name) |f| f.close(`).
-/// A local of the same name is not the field.
-fn released(tree: *const Ast, name: []const u8) bool {
-    const tags = tree.tokens.items(.tag);
-    var i: usize = 1;
-    while (i + 2 < tags.len) : (i += 1) {
-        if (tags[i] != .identifier or tags[i - 1] != .period or !std.mem.eql(u8, tree.tokenSlice(@intCast(i)), name)) continue;
-        var at = i + 1;
-        if (tags[at] == .period_asterisk or (tags[at] == .period and at + 1 < tags.len and tags[at + 1] == .question_mark)) at += if (tags[at] == .period) 2 else 1;
-        if (at + 1 < tags.len and tags[at] == .period and tags[at + 1] == .identifier and release(tree.tokenSlice(@intCast(at + 1)))) return true;
-        // `(x.name) |capture| ... capture.close(`
-        if (at + 3 < tags.len and tags[at] == .r_paren and tags[at + 1] == .pipe and tags[at + 2] == .identifier and tags[at + 3] == .pipe) {
-            const capture = tree.tokenSlice(@intCast(at + 2));
-            var k = at + 4;
-            while (k + 2 < tags.len and k < at + 16) : (k += 1) {
-                if (tags[k] == .identifier and std.mem.eql(u8, tree.tokenSlice(@intCast(k)), capture) and tags[k + 1] == .period and release(tree.tokenSlice(@intCast(k + 2)))) return true;
-            }
-        }
-    }
-    return false;
-}
-
-fn release(method: []const u8) bool {
-    for ([_][]const u8{ "close", "deinit", "kill", "wait" }) |name| if (std.mem.eql(u8, method, name)) return true;
-    return false;
 }
 
 /// A021: lock order. A function that holds a guard of an aegis owner (`Guarded`,
