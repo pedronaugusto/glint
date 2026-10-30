@@ -26,6 +26,9 @@ pub const Success = union(enum) {
     count,
     /// `errno(result)` is `.SUCCESS`: std's raw Linux calls, which answer a `usize`.
     errno,
+    /// The length of all it was given: one of std's counts that filled what it was handed
+    /// (`readSliceShort`), its result tested against that length.
+    length,
 };
 
 pub const Entry = struct {

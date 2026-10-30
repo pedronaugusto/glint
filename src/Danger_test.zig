@@ -24,6 +24,7 @@ const std_files = [_]sources.Extra{
     \\pub const DoublyLinkedList = @import("DoublyLinkedList.zig");
     \\pub const ascii = @import("ascii.zig");
     \\pub const base64 = @import("base64.zig");
+    \\pub const Random = @import("Random.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
     },
@@ -107,6 +108,7 @@ const std_files = [_]sources.Extra{
     \\fn assert(ok: bool) void { if (!ok) unreachable; }
     \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
+    \\pub fn limited(r: *@This(), limit: Limit, buffer: []u8) @This() { _ = r; _ = limit; _ = buffer; return .{}; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
@@ -179,6 +181,11 @@ const std_files = [_]sources.Extra{
     \\pub const sha2 = struct { pub const HmacSha256 = Hmac(32); };
     \\fn Hmac(comptime len: comptime_int) type { return struct { const Self = @This(); pub const mac_length = len; pub fn init(key: []const u8) Self { _ = key; return .{}; } pub fn update(d: *Self, b: []const u8) void { _ = d; _ = b; } pub fn final(d: *Self, out: *[mac_length]u8) void { _ = d; _ = out; } pub fn create(out: *[mac_length]u8, msg: []const u8, key: []const u8) void { _ = out; _ = msg; _ = key; } }; }
     },
+    .{ .name = "std/Random.zig", .bytes =
+    \\ptr: *anyopaque,
+    \\pub const ChaCha = struct { state: [8]u32, pub fn fill(self: *ChaCha, buf: []u8) void { _ = self; for (buf) |*b| b.* = 0; } };
+    \\pub fn bytes(r: @This(), buf: []u8) void { _ = r; for (buf) |*b| b.* = 0; }
+    },
 };
 const std_imports = [_]sources.ExtraImport{
     .{ .spelling = "std", .target = 0 },
@@ -204,6 +211,7 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 0, .spelling = "ascii.zig", .target = 20 },
     .{ .from = 0, .spelling = "base64.zig", .target = 21 },
     .{ .from = 3, .spelling = "crypto/hmac.zig", .target = 22 },
+    .{ .from = 0, .spelling = "Random.zig", .target = 23 },
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
@@ -1183,6 +1191,51 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
     const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
+}
+
+test "A019 reads a buffer a std count filled where its count is all of it, a limited reader's buffer, and a generator's bytes" {
+    // Clean: past a count below the length leaving (3), and equal to it by `.len` (4), a
+    // limited reader keeping its buffer (6), a generator filling all of it (8). Findings: the
+    // count unchecked (5), checked against less than the length (9), the limited reader's
+    // buffer read (7).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn c1(r: *std.Io.Reader) !u8 { var sig: [4]u8 = undefined; const n = try r.readSliceShort(&sig); if (n < 4) return error.Short; return sig[0]; }
+        \\pub fn c2(r: *std.Io.Reader) !u8 { var sig: [4]u8 = undefined; const n = try r.readSliceShort(&sig); if (n != sig.len) return error.Short; return sig[3]; }
+        \\pub fn c3(r: *std.Io.Reader) !u8 { var sig: [4]u8 = undefined; _ = try r.readSliceShort(&sig); return sig[0]; }
+        \\pub fn l1(r: *std.Io.Reader) void { var buffer: [64]u8 = undefined; var bounded = r.limited(.unlimited, &buffer); _ = &bounded; }
+        \\pub fn l2(r: *std.Io.Reader) u8 { var buffer: [64]u8 = undefined; var bounded = r.limited(.unlimited, &buffer); _ = &bounded; return buffer[0]; }
+        \\pub fn g1(drbg: *std.Random.ChaCha) void { var draw: [34]u8 = undefined; drbg.fill(&draw); use(&draw); }
+        \\pub fn c4(r: *std.Io.Reader) !u8 { var sig: [4]u8 = undefined; const n = try r.readSliceShort(&sig); if (n < 2) return error.Short; return sig[3]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7, 9 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a prefix a counter stepped past each element after setting it, and what a per-build choice of std's hashers fills" {
+    // Clean: elements set then counted (7), a hasher a switch of types picks filling the part
+    // returned (10, 11). Findings: a count stepped where the set may not run (8), a counter set
+    // otherwise (9), past the part the chosen hasher filled (12), a part under its own name
+    // returned unwritten (16). Clean too: a part under its own name, filled, returned (15).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u32) void { _ = b; }
+        \\fn useBytes(b: []const u8) void { _ = b; }
+        \\fn Hasher(comptime wide: bool) type { return switch (wide) { false => std.crypto.hash.sha2.Sha256, true => std.crypto.hash.sha2.Sha512 }; }
+        \\fn digest(comptime wide: bool, m: []const u8, out: *[64]u8) []const u8 { const H = Hasher(wide); H.hash(m, out[0..H.digest_length]); return out[0..H.digest_length]; }
+        \\fn past(comptime wide: bool, m: []const u8, out: *[64]u8) []const u8 { const H = Hasher(wide); H.hash(m, out[0..H.digest_length]); return out[0..64]; }
+        \\pub fn a1(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { a[n] = x; n += 1; } use(a[0..n]); }
+        \\pub fn a2(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { if (x > 0) a[n] = x; n += 1; } use(a[0..n]); }
+        \\pub fn a3(src: []const u32) void { var a: [8]u32 = undefined; var n: usize = 0; for (src) |x| { a[n] = x; n += 1; } n = 8; use(a[0..n]); }
+        \\pub fn d1(m: []const u8, wide: bool) void { var b: [64]u8 = undefined; useBytes(if (wide) digest(true, m, &b) else digest(false, m, &b)); }
+        \\pub fn d2(m: []const u8) void { var b: [64]u8 = undefined; useBytes(digest(false, m, &b)); }
+        \\pub fn d3(m: []const u8) void { var b: [64]u8 = undefined; useBytes(past(false, m, &b)); }
+        \\fn named(out: *[16]u8, v: u32) struct { bytes: []const u8 } { const part = out[0..4]; std.mem.writeInt(u32, part, v, 0); return .{ .bytes = part }; }
+        \\fn unnamed(out: *[16]u8) struct { bytes: []const u8 } { const part = out[0..4]; return .{ .bytes = part }; }
+        \\pub fn n1(v: u32) void { var b: [16]u8 = undefined; useBytes(named(&b, v).bytes); }
+        \\pub fn n2() void { var b: [16]u8 = undefined; useBytes(unnamed(&b).bytes); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9, 12, 16 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads a local a function outside the program writes only where its result shows it did" {
