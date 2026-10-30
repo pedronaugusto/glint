@@ -34,7 +34,7 @@ pub fn cleared(c: *Context, node: Ast.Node.Index) Context.Error!bool {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
-    const parent = pointee(try resultType(c, node)) orelse return false;
+    const parent = pointee(try resultType(c, c.file, node)) orelse return false;
     const field = c.facts.member(parent, name) orelse return false;
     const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
     if (record.kind != .field) return false;
@@ -430,11 +430,17 @@ fn mayBe(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, source: So
     };
 }
 
+/// The struct a `@fieldParentPtr` at `node` in `file` converts to, where its result location
+/// names one.
+pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Container {
+    return pointee(try resultType(c, file, node));
+}
+
 /// The type the result location of `node` names: a declaration's type, `@as`, a function's
 /// result, an assignment's target; through `@alignCast`, `try` and parentheses.
-fn resultType(c: *Context, node: Ast.Node.Index) Context.Error!Facts.Value {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
+fn resultType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Facts.Value {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var at = node;
     for (0..8) |_| {
         const parent = model.parentOf(at) orelse return .{ .unknown = .unresolved };
@@ -447,12 +453,12 @@ fn resultType(c: *Context, node: Ast.Node.Index) Context.Error!Facts.Value {
                 const function = enclosingFunction(tree, model, parent) orelse return .{ .unknown = .unresolved };
                 var buffer: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buffer, function) orelse return .{ .unknown = .unresolved };
-                return c.facts.resolve(c.file, proto.ast.return_type.unwrap() orelse return .{ .unknown = .unresolved });
+                return c.facts.resolve(file, proto.ast.return_type.unwrap() orelse return .{ .unknown = .unresolved });
             },
             .assign => {
                 const target, const value = tree.nodeData(parent).node_and_node;
                 if (value != at) return .{ .unknown = .unresolved };
-                return c.facts.resolve(c.file, target);
+                return c.facts.resolve(file, target);
             },
             else => {},
         }
@@ -464,11 +470,11 @@ fn resultType(c: *Context, node: Ast.Node.Index) Context.Error!Facts.Value {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, parent, &buffer);
             if (args.len != 2 or args[1] != at) return .{ .unknown = .unresolved };
-            return c.facts.resolve(c.file, args[0]);
+            return c.facts.resolve(file, args[0]);
         }
         if (tree.fullVarDecl(parent)) |variable| {
             if (variable.ast.init_node.unwrap() != at) return .{ .unknown = .unresolved };
-            return c.facts.resolve(c.file, variable.ast.type_node.unwrap() orelse return .{ .unknown = .unresolved });
+            return c.facts.resolve(file, variable.ast.type_node.unwrap() orelse return .{ .unknown = .unresolved });
         }
         return .{ .unknown = .unresolved };
     }
