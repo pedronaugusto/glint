@@ -802,7 +802,10 @@ fn checkCopies(c: *Context) Context.Error!void {
         }
         if (tag == .@"return") {
             const expr = tree.nodeData(node).opt_node.unwrap() orelse continue;
-            if (try carriesExposure(c, expr, 0)) try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
+            var walk: Exposure = .{ .c = c };
+            if (try walk.carries(expr, 0)) {
+                try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
+            } else if (walk.cut) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "what this returns is nested past the depth A002 follows: a borrow it carries is not ruled out");
         }
     }
 }
@@ -886,52 +889,66 @@ fn heldAs(value: Facts.Value) Held {
 }
 
 /// Whether what a `return` gives carries a borrow of a secret or a guard's value: the borrow
-/// itself, a local it was put in, or a branch, field or element of what is returned.
-fn carriesExposure(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!bool {
-    if (depth == 64) return false;
-    const tree = try c.project.syntax(try c.source());
-    const model = &c.project.at(c.file).model;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return carriesExposure(c, tree.nodeData(node).node_and_token[0], depth + 1),
-        .@"try" => return carriesExposure(c, tree.nodeData(node).node, depth + 1),
-        .@"orelse", .@"catch" => {
-            const sides = tree.nodeData(node).node_and_node;
-            return try carriesExposure(c, sides[0], depth + 1) or try carriesExposure(c, sides[1], depth + 1);
-        },
-        .@"if", .if_simple => {
-            const branch = tree.fullIf(node).?; // unreachable: the tag is an `if`'s
-            if (try carriesExposure(c, branch.ast.then_expr, depth + 1)) return true;
-            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-            return carriesExposure(c, otherwise, depth + 1);
-        },
-        .identifier => {
-            const index = Contract.local(c, node) orelse return false;
-            const decl = model.declarations[@backingInt(index)];
-            if (decl.kind != .variable) return false;
-            const v = tree.fullVarDecl(decl.node) orelse return false;
-            if (v.ast.init_node.unwrap()) |init| if (try carriesExposure(c, init, depth + 1)) return true;
-            // Anything put in it later.
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag != .assign) continue;
-                const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-                if (tree.nodeTag(sides[0]) != .identifier or Contract.local(c, sides[0]) != index) continue;
-                if (try carriesExposure(c, sides[1], depth + 1)) return true;
-            }
+/// itself, a local it was put in, or a branch, field or element of what is returned. Each local
+/// is read once: a search for any borrow learns nothing more from a local already followed
+/// (`head = head orelse x`). Past the depth it follows, `cut` says so, and nothing is cleared.
+const Exposure = struct {
+    c: *Context,
+    seen: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty,
+    cut: bool = false,
+
+    fn carries(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+        const c = e.c;
+        if (depth == 256) {
+            e.cut = true;
             return false;
-        },
-        else => {},
+        }
+        const tree = try c.project.syntax(try c.source());
+        const model = &c.project.at(c.file).model;
+        switch (tree.nodeTag(node)) {
+            .grouped_expression => return e.carries(tree.nodeData(node).node_and_token[0], depth + 1),
+            .@"try" => return e.carries(tree.nodeData(node).node, depth + 1),
+            .@"orelse", .@"catch" => {
+                const sides = tree.nodeData(node).node_and_node;
+                return try e.carries(sides[0], depth + 1) or try e.carries(sides[1], depth + 1);
+            },
+            .@"if", .if_simple => {
+                const branch = tree.fullIf(node).?; // unreachable: the tag is an `if`'s
+                if (try e.carries(branch.ast.then_expr, depth + 1)) return true;
+                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+                return e.carries(otherwise, depth + 1);
+            },
+            .identifier => {
+                const index = Contract.local(c, node) orelse return false;
+                const decl = model.declarations[@backingInt(index)];
+                if (decl.kind != .variable) return false;
+                if ((try e.seen.getOrPut(c.allocator, index)).found_existing) return false;
+                const v = tree.fullVarDecl(decl.node) orelse return false;
+                if (v.ast.init_node.unwrap()) |init| if (try e.carries(init, depth + 1)) return true;
+                // Anything put in it later.
+                for (tree.nodes.items(.tag), 0..) |tag, i| {
+                    if (tag != .assign) continue;
+                    const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                    if (tree.nodeTag(sides[0]) != .identifier or Contract.local(c, sides[0]) != index) continue;
+                    if (try e.carries(sides[1], depth + 1)) return true;
+                }
+                return false;
+            },
+            else => {},
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullStructInit(&buffer, node)) |literal| {
+            for (literal.ast.fields) |field| if (try e.carries(field, depth + 1)) return true;
+            return false;
+        }
+        if (tree.fullArrayInit(&buffer, node)) |literal| {
+            for (literal.ast.elements) |element| if (try e.carries(element, depth + 1)) return true;
+            return false;
+        }
+        return exposure(c, node);
     }
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullStructInit(&buffer, node)) |literal| {
-        for (literal.ast.fields) |field| if (try carriesExposure(c, field, depth + 1)) return true;
-        return false;
-    }
-    if (tree.fullArrayInit(&buffer, node)) |literal| {
-        for (literal.ast.elements) |element| if (try carriesExposure(c, element, depth + 1)) return true;
-        return false;
-    }
-    return exposure(c, node);
-}
+};
+
 /// Whether an owner of kind `k` may move by assignment: no erasure owed to the bytes left
 /// behind (secrets), no address an owner or its borrowers keep (guarded values, a budget its
 /// reservations point at, an owner bound to its address in Debug).
