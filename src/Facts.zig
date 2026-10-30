@@ -1519,9 +1519,14 @@ fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Dec
     const result_node = function.ast.return_type.unwrap() orelse return null;
     // A type function declared in it makes its own container: read as a template.
     if (typeKeyword(target_tree, result_node)) return null;
+    // A result written in terms of the method's own generic parameters (`Result(parser)`) is
+    // this call's: the container's bindings alone would read them as every call's.
+    if (namesGenericParameter(target_tree, function, result_node)) return null;
     var result = try self.substituted(decl.file, result_node, made);
     if (result == .unknown) return null;
-    result = try self.madeWithin(result, container, made);
+    // A container declared beside the receiver's own in what the call made (an iterator's
+    // `Entry`, declared in the map) is made by the same call.
+    result = try self.madeWithin(result, self.madeOuter(container, made), made);
     if (Model.inferredErrors(target_tree, result_node)) return .{ .error_union = try self.boxed(try self.instance(result)) };
     return try self.instance(result);
 }
@@ -1539,6 +1544,21 @@ fn madeWithin(self: *Facts, value: Value, outer: Container, made: *const Made) R
         .array => |to| .{ .array = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         else => value,
     };
+}
+
+/// The outermost container around `container` that a type function returns: the one its
+/// call made, of which `container` (an iterator, a guard) is a part. A type function's
+/// container sits in its body, whose scope is no container's.
+fn madeOuter(self: *const Facts, container: Container, made: *const Made) Container {
+    const model = &self.project.at(container.file).model;
+    var outer = container.scope;
+    while (model.scopes[@backingInt(outer)].parent) |parent| {
+        const scope = model.scopes[@backingInt(parent)];
+        // A file's own scope holds no type function's container.
+        if (scope.kind != .container or scope.parent == null) break;
+        outer = parent;
+    }
+    return .{ .file = container.file, .scope = outer, .symbolic = container.symbolic, .made_by = made };
 }
 
 fn within(self: *const Facts, inner: Container, outer: Container) bool {
@@ -2542,6 +2562,26 @@ fn resultOf(self: *Facts, proto: Key) ResolveError!Value {
 }
 
 /// Whether a function takes a parameter only a call settles: `comptime` or `anytype`.
+/// Whether the expression `node` names one of `function`'s generic parameters (`comptime`,
+/// `anytype` or of type `type`).
+fn namesGenericParameter(tree: *const Ast, function: Ast.full.FnProto, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var it = function.iterate(tree);
+    while (it.next()) |param| {
+        const generic = param.anytype_ellipsis3 != null or
+            (if (param.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false) or
+            (if (param.type_expr) |t| tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type") else false);
+        if (!generic) continue;
+        const name = tree.tokenSlice(param.name_token orelse continue);
+        var token = first;
+        while (token <= last) : (token += 1) {
+            if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
+        }
+    }
+    return false;
+}
+
 fn isGeneric(tree: *const Ast, function: Ast.full.FnProto) bool {
     var it = function.iterate(tree);
     while (it.next()) |param| {
@@ -3439,4 +3479,103 @@ test "@errorReturnTrace and @src give std's own types where the project maps std
     }
     try std.testing.expect(found[0] == .pointer and found[0].pointer.* == .instance and found[0].pointer.instance.file == project.sources[2].id);
     try std.testing.expect(found[1] == .instance and found[1].instance.file == project.sources[2].id);
+}
+
+test "an entry a made container's iterator gives is read with the container's bindings" {
+    // The map is a library's, as std's is: its iterator's `next` gives an `Entry` declared
+    // beside the iterator in what the call made, not inside it.
+    const library =
+        \\pub fn Map(comptime K: type, comptime V: type, comptime Ctx: type, comptime load: u64) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        comptime { _ = Ctx; _ = load; }
+        \\        pub const Entry = struct { key_ptr: *K, value_ptr: *V };
+        \\        pub const Iterator = struct { m: *const Self, index: u32 = 0, pub fn next(it: *Iterator) ?Entry { if (it.m.size == 0) return null; const key = &it.m.keys()[it.index]; const value = &it.m.values()[it.index]; return Entry{ .key_ptr = key, .value_ptr = value }; } };
+        \\        size: u32 = 0,
+        \\        fn keys(self: Self) [*]K { _ = self; return undefined; }
+        \\        fn values(self: Self) [*]V { _ = self; return undefined; }
+        \\        pub fn iterator(self: *const Self) Iterator { return .{ .m = self }; }
+        \\    };
+        \\}
+        \\fn Context(comptime K: type) type { return struct { pub fn hash(self: @This(), key: K) u64 { _ = self; _ = key; return 0; } }; }
+        \\const default_load = 80;
+        \\pub fn Auto(comptime K: type, comptime V: type) type { return Map(K, V, Context(K), default_load); }
+    ;
+    const source =
+        \\const lib = @import("lib");
+        \\const Id = enum(u32) { a };
+        \\const M = lib.Auto(Id, u32);
+        \\pub fn f(m: *M) void { var it = m.iterator(); const e = it.next().?; const k = e.key_ptr.*; const i = it; _ = .{ k, i }; }
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = source },
+        .{ .name = "lib/lib.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const model = &project.sources[0].model;
+    var found: [3]Value = undefined;
+    for ([_][]const u8{ "i", "e", "k" }, &found) |name, *out| {
+        const d = for (model.declarations) |d| {
+            if (d.kind == .variable and std.mem.eql(u8, d.name, name)) break d;
+        } else unreachable; // unreachable: the source declares each name
+        out.* = try facts.resolve(project.sources[0].id, project.sources[0].file.tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?);
+    }
+    try std.testing.expect(found[0] == .instance);
+    try std.testing.expect(found[1] == .instance);
+    try std.testing.expect(found[2] == .instance);
+}
+
+test "a made container's method whose result names its own generic parameter is read with each call's argument" {
+    const library =
+        \\pub fn Untrusted(comptime T: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        value: T,
+        \\        pub fn init(value: T) Self { return .{ .value = value }; }
+        \\        pub fn parse(self: Self, context: anytype, comptime parser: anytype) Result(parser) { return parser(context, self.value); }
+        \\        fn Result(comptime parser: anytype) type {
+        \\            const info = @typeInfo(@TypeOf(parser));
+        \\            const R = info.@"fn".return_type.?;
+        \\            return R;
+        \\        }
+        \\    };
+        \\}
+    ;
+    const source =
+        \\const input = @import("input");
+        \\const Header = struct { n: u32 };
+        \\const Body = struct { bytes: []const u8 };
+        \\fn header(c: u8, bytes: []const u8) error{Bad}!Header { _ = c; _ = bytes; return .{ .n = 1 }; }
+        \\fn body(c: u8, bytes: []const u8) error{Bad}!Body { _ = c; return .{ .bytes = bytes }; }
+        \\pub fn f(bytes: []const u8) !void {
+        \\    const h = try input.Untrusted([]const u8).init(bytes).parse(@as(u8, 0), header);
+        \\    const b = try input.Untrusted([]const u8).init(bytes).parse(@as(u8, 0), body);
+        \\    _ = .{ h, b };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = source },
+        .{ .name = "input/input.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "input", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const model = &project.sources[0].model;
+    var found: [2]Value = undefined;
+    for ([_][]const u8{ "h", "b" }, &found) |name, *out| {
+        const d = for (model.declarations) |d| {
+            if (d.kind == .variable and std.mem.eql(u8, d.name, name)) break d;
+        } else unreachable; // unreachable: the source declares each name
+        out.* = try facts.resolve(project.sources[0].id, project.sources[0].file.tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?);
+    }
+    // Each is its own parser's result, not a choice among every call's.
+    try std.testing.expect(found[0] == .instance);
+    try std.testing.expect(found[1] == .instance);
+    try std.testing.expect(found[0].instance.scope != found[1].instance.scope);
 }
