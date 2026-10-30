@@ -4969,6 +4969,47 @@ test "A020 goes where a break or continue goes, by its label or its loop, not by
     };
 }
 
+/// `run` with the fixture std and a dependency imported as "dep", not selected.
+fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const u8) !Run {
+    const files = std_files ++ [_]sources.Extra{.{ .name = "dep/dep.zig", .bytes = dependency }};
+    const imports = std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } };
+    var project = try sources.projectWithSources(std.testing.allocator, program, &files, &imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var result: Run = .{ .findings = 0, .undecided = 0 };
+    for (report.diagnostics) |d| if (d.rule == rule) {
+        result.findings += 1;
+    };
+    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
+        result.undecided += 1;
+    };
+    return result;
+}
+
+test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
+    const dependency =
+        \\const std = @import("std");
+        \\pub fn tick(io: std.Io) std.Io.Cancelable!void {
+        \\    _ = io;
+        \\}
+        \\pub fn real(io: std.Io) std.Io.Cancelable!void {
+        \\    try io.checkCancel();
+        \\}
+    ;
+    const head =
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\
+    ;
+    const declared = try runWithDependency(pack.cancellation, head ++ "pub fn f(io: std.Io) !void {\n    while (true) try dep.tick(io);\n}\n", dependency);
+    try std.testing.expectEqual(@as(usize, 0), declared.undecided);
+    try std.testing.expectEqual(@as(usize, 1), declared.findings);
+    const reached = try runWithDependency(pack.cancellation, head ++ "pub fn f(io: std.Io) !void {\n    while (true) try dep.real(io);\n}\n", dependency);
+    try std.testing.expectEqual(@as(usize, 0), reached.undecided);
+    try std.testing.expectEqual(@as(usize, 0), reached.findings);
+}
+
 test "A020 reads an error returned as a value as no cancellation point: a dropped arm, a swallowing else, a value from the error, a payload that can hold it" {
     // The second probe review's helpers (N5): `case_e` returns the capture from a function whose
     // payload (`?anyerror`) can take it as a value; `case_g`'s helpers pass it on.

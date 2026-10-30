@@ -331,13 +331,15 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
 
 const Cancels = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, bool }, bool) = .empty };
 
-/// Whether a call of `callee` is a cancellation point: a function of the project where its body
-/// reaches one, whatever its error set declares (`error{Canceled}!void {}` cancels nothing);
-/// another where its declared error set holds `error.Canceled`. `errors_end` as `cancels` takes it.
+/// Whether a call of `callee` is a cancellation point: a function with a body outside std, the
+/// program's or a dependency's, where its body reaches one, whatever its error set declares
+/// (`error{Canceled}!void {}` cancels nothing); one of std's where its declared error set holds
+/// `error.Canceled`, as `Io`'s contract has each operation so declared return it to a task
+/// canceled (its bodies go through `Io`'s vtable). `errors_end` as `cancels` takes it.
 fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, errors_end: bool) Context.Error!bool {
     const callee_tree = &c.project.at(callee.file).file.tree;
     const callee_model = &c.project.at(callee.file).model;
-    if (c.project.at(callee.file).input.selected) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
+    if (!Taint.inStd(try Taint.get(c, .input), callee)) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
         const memo = try c.facts.memo(Cancels);
         if (memo.map.get(.{ callee, errors_end })) |known| return known;
         // A function that reaches itself is no cancellation point while it is being read.
@@ -346,6 +348,9 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, errors_end: bool) Con
         try memo.map.put(c.allocator, .{ callee, errors_end }, out);
         return out;
     };
+    // A dependency's function with no body here (`extern`, a declaration only) says nothing of
+    // what it does: none.
+    if (!Taint.inStd(try Taint.get(c, .input), callee)) return false;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[@backingInt(callee.index)].node) orelse return false;
     return canceling(c, callee.file, proto.ast.return_type.unwrap() orelse return false, 0);

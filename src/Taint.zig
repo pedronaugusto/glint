@@ -1394,7 +1394,7 @@ fn stdIs(c: *Context, decl: Facts.Decl, paths: []const []const u8) Context.Error
 
 /// Whether a function outside the program is one of std's.
 pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
-    return flow.std_files.contains(decl.file.raw());
+    return flow.std_files.contains(@backingInt(decl.file));
 }
 
 /// The container a fact recognizes std's reader, file, directory and stream by.
