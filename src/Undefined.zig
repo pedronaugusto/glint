@@ -67,6 +67,9 @@ const std_fills = [_]Named{
     .{ .path = "crypto.auth.hmac.sha2.HmacSha256.final", .param = 1 },
     .{ .path = "crypto.auth.hmac.sha2.HmacSha256.create", .param = 0 },
     .{ .path = "mem.writeInt", .param = 1 },
+    // A generator's bytes, every one of the buffer.
+    .{ .path = "Random.ChaCha.fill", .param = 1 },
+    .{ .path = "Random.bytes", .param = 1 },
     .{ .path = "crypto.secureZero", .param = 1 },
     // Each operation of the batch, then the last one's link.
     .{ .path = "Io.Batch.init", .param = 0 },
@@ -111,6 +114,8 @@ const std_keeps = [_]Named{
     // A queue's ring: a get takes only what a put wrote.
     .{ .path = "Io.Queue.init", .param = 0 },
     .{ .path = "Io.Select.init", .param = 1 },
+    // A limited reader's buffer, its end and seek at 0.
+    .{ .path = "Io.Reader.limited", .param = 2 },
     // A writer's or a reader's buffer, its end and seek at 0.
     .{ .path = "debug.lockStderr", .param = 0 },
     .{ .path = "compress.flate.Decompress.init", .param = 2 },
@@ -193,6 +198,9 @@ const Choice = union(enum) { fill: Facts.Decl, keep, contract: *const CContract.
 
 /// A call that writes the local when its result checks, and the constant holding that result,
 /// where one does (`const rc = f(&x);`).
+/// One of std's counts given all of the local: written whole where its count is all of it.
+const counted_whole: CContract.Entry = .{ .name = "", .writes = &.{}, .success = .length };
+
 const Guard = struct { call: Ast.Node.Index, entry: *const CContract.Entry, binding: ?Model.Declaration.Id };
 
 /// What a mention does: reads the local, hands it on, writes it whole, or sets or reads one of
@@ -1124,7 +1132,9 @@ const Walk = struct {
         const written: Use = .{ .key = tree.lastToken(node), .effect = .write };
         const leaves = w.failureLeaves(node, origin);
         if (try named(w.c, &std_fills, origin, index)) return if (whole and leaves) written else null;
-        if (try named(w.c, &std_keeps, origin, index) or try named(w.c, &std_counts, origin, index)) return null;
+        if (try named(w.c, &std_keeps, origin, index)) return null;
+        // A count given all of the local writes it all where its result is that length.
+        if (try named(w.c, &std_counts, origin, index)) return if (whole and leaves) .{ .key = tree.lastToken(node), .effect = .{ .guarded = .{ .call = node, .entry = &counted_whole, .binding = w.resultConstant(node) } } } else null;
         for (std_halving) |each| {
             if (!try named(w.c, &.{.{ .path = each.path, .param = each.param }}, origin, index)) continue;
             const at = each.input + position - index;
@@ -1444,6 +1454,24 @@ const Walk = struct {
         return found;
     }
 
+    /// The length a local declared an array of a literal length has.
+    fn arrayLength(w: *const Walk) ?u64 {
+        const tree = w.tree;
+        const variable = tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return null;
+        const kind = variable.ast.type_node.unwrap() orelse return null;
+        if (tree.nodeTag(kind) != .array_type) return null;
+        return literalValue(tree, tree.nodeData(kind).node_and_node[0]);
+    }
+
+    /// Whether `node` is the local's `.len`.
+    fn isLength(w: *const Walk, node: Ast.Node.Index) bool {
+        const tree = w.tree;
+        const at = ungrouped(tree, node);
+        if (tree.nodeTag(at) != .field_access) return false;
+        const of, const member = tree.nodeData(at).node_and_token;
+        return std.mem.eql(u8, tree.tokenSlice(member), "len") and w.isLocal(of);
+    }
+
     /// The mention of the local at `token`.
     fn mentionAt(w: *const Walk, token: Ast.TokenIndex) ?Ast.Node.Index {
         for (w.mentions.items) |mention| if (w.tree.nodeMainToken(mention) == token) return mention;
@@ -1452,9 +1480,15 @@ const Walk = struct {
 
     /// The constant a call's result is declared as (`const rc = f(&x);`), where it is one.
     fn resultConstant(w: *const Walk, call: Ast.Node.Index) ?Model.Declaration.Id {
-        const parent = w.model.parentOf(call) orelse return null;
+        var value = call;
+        var parent = w.model.parentOf(call) orelse return null;
+        // `const n = try r.readSliceShort(&buf);`: its error leaves, and n is its result.
+        if (w.tree.nodeTag(parent) == .@"try") {
+            value = parent;
+            parent = w.model.parentOf(parent) orelse return null;
+        }
         const variable = w.tree.fullVarDecl(parent) orelse return null;
-        if (w.tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.init_node.unwrap() != call) return null;
+        if (w.tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.init_node.unwrap() != value) return null;
         for (w.model.declarations, 0..) |each, d| {
             if (each.kind == .variable and each.node == parent) return @fromBackingInt(@intCast(d));
         }
@@ -1546,6 +1580,17 @@ const Walk = struct {
                 const call = tree.fullCall(&buffer, guard.call) orelse return null;
                 if (param >= call.ast.params.len or !sameText(tree, rhs, call.ast.params[param])) return null;
                 return equal;
+            },
+            .length => {
+                const length = w.arrayLength();
+                const literal = literalValue(tree, rhs);
+                const all = (literal != null and length != null and literal.? == length.?) or w.isLength(rhs);
+                if (!all) return null;
+                return switch (op) {
+                    .equal_equal, .greater_or_equal => true,
+                    .bang_equal, .less_than => false,
+                    else => null,
+                };
             },
             .count, .errno => return null,
         }
