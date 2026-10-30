@@ -1803,12 +1803,15 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, root: Ast.Nod
 }
 
 /// What a method call that succeeded checked: `try r.f(…)` where `f`, in this file, fails
-/// unless a condition on its receiver holds, by `return if (c) … else error.X;` or by leading
-/// `if (c) return error.X;` guards (`fn byte(self) !u8 { return if (self.at <
-/// self.input.len) self.input[self.at] else error.SyntaxError; }`). The condition is read with
-/// the receiver for the first parameter, so only where the call spells its receiver as `f`
-/// names it and the condition names no other parameter; it holds from the call while nothing
-/// after it assigns what it compares.
+/// unless a condition on its receiver holds, by `return if (c) … else error.X;` or by
+/// `if (c) return error.X;` guards among its statements (`fn byte(self) !u8 { return if
+/// (self.at < self.input.len) self.input[self.at] else error.SyntaxError; }`, `fn enter(self)
+/// !void { self.depth += 1; if (self.depth > max) return error.TooDeep; }`). A guard counts
+/// where no statement before it returns without failing, so a call that succeeded passed it, and
+/// none after it may change the receiver (`touches`), so what it saw still holds. The condition
+/// is read with the receiver for the first parameter, so only where the call spells its receiver
+/// as `f` names it and the condition names no other parameter; it holds from the call while
+/// nothing after it assigns what it compares.
 fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -1832,33 +1835,37 @@ fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
     if (tree.nodeTag(function) != .fn_decl) return;
     var statement_buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&statement_buffer, tree.nodeData(function).node_and_node[1]) orelse return;
-    // What the guards compared holds after the call only while the rest of the callee leaves the
-    // receiver as they saw it.
-    const guarded = out.items.len;
     for (statements, 0..) |statement, at| {
         if (tree.nodeTag(statement) == .@"return") {
             const result = tree.nodeData(statement).opt_node.unwrap() orelse return;
-            const branch = tree.fullIf(bare(tree, result)) orelse {
-                if (touches(tree, model, &.{result}, self_name)) out.shrinkRetainingCapacity(guarded);
-                return;
-            };
+            const branch = tree.fullIf(bare(tree, result)) orelse return;
             const otherwise = branch.ast.else_expr.unwrap() orelse return;
-            if (touches(tree, model, &.{ branch.ast.then_expr, otherwise }, self_name)) {
-                out.shrinkRetainingCapacity(guarded);
-                return;
-            }
             if (!receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
-            if (tree.nodeTag(bare(tree, otherwise)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
-            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
+            if (tree.nodeTag(bare(tree, otherwise)) == .error_value and !touches(tree, model, &.{branch.ast.then_expr}, self_name)) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
+            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value and !touches(tree, model, &.{otherwise}, self_name)) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
             return;
         }
-        const branch = tree.fullIf(statement);
-        if (branch == null or branch.?.ast.else_expr != .none or !failing(tree, branch.?.ast.then_expr) or !receiverOnly(tree, model, branch.?.ast.cond_expr, self_name)) {
-            if (touches(tree, model, statements[at..], self_name)) out.shrinkRetainingCapacity(guarded);
-            return;
-        }
-        try holds(c, file, out, branch.?.ast.cond_expr, false, use, call_node);
+        if (returnsQuietly(tree, statement)) return;
+        const branch = tree.fullIf(statement) orelse continue;
+        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, self_name)) continue;
+        if (touches(tree, model, statements[at + 1 ..], self_name)) continue;
+        try holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
     }
+}
+
+/// Whether `statement` may return without failing: a `return` in it that gives no error value.
+fn returnsQuietly(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const result = tree.nodeData(node).opt_node.unwrap() orelse return true;
+        if (tree.nodeTag(bare(tree, result)) != .error_value) return true;
+    }
+    return false;
 }
 
 /// Whether `nodes`, in order, may change what the receiver `self_name` holds: an assignment to

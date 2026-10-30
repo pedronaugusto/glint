@@ -865,6 +865,7 @@ fn runEdited(rule: glint.Rule, comptime program: []const u8, comptime old: []con
 
 /// `program` with its first `old` replaced by `new`.
 fn edited(comptime program: []const u8, comptime old: []const u8, comptime new: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
     const at = std.mem.find(u8, program, old).?;
     return program[0..at] ++ new ++ program[at + old.len ..];
 }
@@ -3209,6 +3210,26 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
     // The checks with what follows them leaving the position where they saw it.
     const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        std.log.debug(\"checked\", .{});\n    }\n    fn peek"), "return self.advance();", "return std.log.debug(\"skipped\", .{});");
     try expect(pack.untrusted_input, kept, 0);
+    // A guard after the move holds where the call succeeded, unless a statement before it may
+    // return without failing, so the call succeeded past it.
+    const entered =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    fn enter(self: *P) !void {
+        \\        self.at += 1;
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.enter();
+        \\        return self.table[self.at];
+        \\    }
+        \\};
+    ;
+    try expect(pack.untrusted_input, entered, 0);
+    try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 1);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
