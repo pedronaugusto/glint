@@ -1152,6 +1152,90 @@ test "A019 clears a parent pointer a helper converts for the installed functions
     try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, kept.lines[0..kept.findings]);
 }
 
+const file_program =
+    \\const std = @import("std");
+    \\const options = @import("options");
+    \\const Data = struct {
+    \\    count: usize = 0,
+    \\    spare: ?*const fn (*std.Io.Writer, []const []const u8, usize) std.Io.Writer.Error!usize = null,
+    \\    interface: std.Io.Writer,
+    \\    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    \\        const d: *Data = @alignCast(@fieldParentPtr("interface", w));
+    \\        d.count += splat;
+    \\        return data.len;
+    \\    }
+    \\};
+    \\const Body = union(enum) { none, data: Data };
+    \\const Out = struct { body: Body };
+    \\const Other = struct { interface: std.Io.Writer };
+    \\const Tables = struct {
+    \\    const data: std.Io.Writer.VTable = .{ .drain = Data.drain };
+    \\};
+    \\const data_vtable = Tables.data;
+    \\fn open(buffer: []u8) Out {
+    \\    return .{ .body = .{ .data = .{ .interface = .{ .vtable = &.{ .drain = Data.drain }, .buffer = buffer } } } };
+    \\}
+    \\fn reset(d: *Data, buffer: []u8) void {
+    \\    d.* = .{ .interface = .{ .vtable = &data_vtable, .buffer = buffer } };
+    \\}
+    \\pub fn use(buffer: []u8) !usize {
+    \\    var o = open(buffer);
+    \\    reset(&o.body.data, buffer);
+    \\    try o.body.data.interface.writeAll("x");
+    \\    if (options.drain) o.body.data.count += 1;
+    \\    return o.body.data.count + o.body.data.interface.end;
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer whose function its file installs into C.F of a C anywhere, through constants each named only so, and an import's member is no field read" {
+    // Clear: a union's payload built in place, a pointer's target assigned whole, through a
+    // vtable constant in a struct and a constant naming it. Findings (8, the conversion and
+    // its alignment): that vtable installed into another type's field, the function stored
+    // into C's other field or another struct's, the constant made `pub`, a read of the
+    // vtable's function through a receiver that does not resolve.
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, file_program)).findings);
+    const other = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "fn wrong(buffer: []u8) Other { return .{ .interface = .{ .vtable = &data_vtable, .buffer = buffer } }; }\npub fn use(buffer: []u8) !usize {");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, other.lines[0..other.findings]);
+    const spare = try runEdited(pack.unsafe_set, file_program, "    reset(&o.body.data, buffer);", "    reset(&o.body.data, buffer);\n    o.body.data.spare = Data.drain;");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, spare.lines[0..spare.findings]);
+    const held = try runEdited(pack.unsafe_set, file_program, "const Other = struct { interface: std.Io.Writer };", "const Other = struct { interface: std.Io.Writer };\nconst Hold = struct { f: *const fn (*std.Io.Writer, []const []const u8, usize) std.Io.Writer.Error!usize };\nfn hold() Hold { return .{ .f = Data.drain }; }");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, held.lines[0..held.findings]);
+    const public = try runEdited(pack.unsafe_set, file_program, "const data_vtable = Tables.data;", "pub const data_vtable = Tables.data;");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, public.lines[0..public.findings]);
+    const nested = try runEdited(pack.unsafe_set, file_program, "    const data: std.Io.Writer.VTable", "    pub const data: std.Io.Writer.VTable");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, nested.lines[0..nested.findings]);
+    const unknown = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "pub fn peek(t: anytype) void { _ = t.drain; }\npub fn use(buffer: []u8) !usize {");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, unknown.lines[0..unknown.findings]);
+}
+
+const lookup_program =
+    \\const Lookup = struct { lookup_fn: ?*const fn (u32, *Lookup) u32 = null };
+    \\const Static = struct {
+    \\    n: u32 = 0,
+    \\    resolving: Lookup = .{ .lookup_fn = find },
+    \\    fn find(port: u32, l: *Lookup) u32 {
+    \\        const s: *Static = @alignCast(@fieldParentPtr("resolving", l));
+    \\        return s.n + port;
+    \\    }
+    \\};
+    \\pub fn use(s: *Static) u32 {
+    \\    const l = &s.resolving;
+    \\    return l.lookup_fn.?(1, l);
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer whose interface is any parameter of the installed function, called through an optional, until it is handed another one" {
+    // Findings (6, the conversion and its alignment): another interface at the parameter, the
+    // function read out of its optional and called on another.
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, lookup_program)).findings);
+    const other = try runEdited(pack.unsafe_set, lookup_program, "pub fn use(s: *Static) u32 {", "pub fn use(s: *Static, x: *Lookup) u32 {\n    _ = s.resolving.lookup_fn.?(2, x);");
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, other.lines[0..other.findings]);
+    const read_out = try runEdited(pack.unsafe_set, lookup_program, "pub fn use(s: *Static) u32 {", "pub fn use(s: *Static, x: *Lookup) u32 {\n    const f = s.resolving.lookup_fn.?;\n    _ = f(2, x);");
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, read_out.lines[0..read_out.findings]);
+}
+
 const list_program =
     \\const std = @import("std");
     \\const Conn = struct { id: u32, node: std.DoublyLinkedList.Node = .{} };
