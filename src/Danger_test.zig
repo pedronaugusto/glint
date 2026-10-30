@@ -1182,6 +1182,41 @@ test "A019 reads a prefix a counter stepped past each element after setting it, 
     try std.testing.expectEqualSlices(u32, &.{ 8, 9, 12, 16 }, found.lines[0..found.findings]);
 }
 
+test "A019 reads the prefix a cursor writer counts, where its type steps the count only past what it wrote" {
+    // Clean: a writer's count over the local (15), a function building into what it is given
+    // through a writer it hands on, returning the prefix counted (23). Findings: past the count
+    // (16), a writer type that steps past what it wrote (17), a writer that starts at 4 (18), a
+    // writer a function points elsewhere (24), the local read with nothing written (25).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const Writer = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *Writer, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; }
+        \\    fn byte(self: *Writer, v: u8) error{Full}!void { try self.put(&.{v}); }
+        \\    fn written(self: *const Writer) []const u8 { return self.bytes[0..self.pos]; }
+        \\};
+        \\const Loose = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *Loose, b: []const u8) void { @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len + 1; }
+        \\};
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn a1() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf }; try w.put("ab"); try w.byte(1); use(buf[0..w.pos]); }
+        \\pub fn a2() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf }; try w.put("ab"); use(buf[0 .. w.pos + 2]); }
+        \\pub fn a3() void { var buf: [16]u8 = undefined; var w: Loose = .{ .bytes = &buf }; w.put("ab"); use(buf[0..w.pos]); }
+        \\pub fn a4() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf, .pos = 4 }; try w.put("ab"); use(buf[0..w.pos]); }
+        \\fn build(out: []u8, v: u8) ![]u8 { var w: Writer = .{ .bytes = out }; try w.byte(v); try more(&w); return out[0..w.pos]; }
+        \\fn more(w: *Writer) !void { try w.put("x"); }
+        \\fn reset(w: *Writer, other: []u8) void { w.* = .{ .bytes = other }; }
+        \\fn swapped(out: []u8, other: []u8) []u8 { var w: Writer = .{ .bytes = out }; reset(&w, other); w.put("x") catch {}; return out[0..w.pos]; }
+        \\pub fn b1(v: u8) !void { var buf: [16]u8 = undefined; use(try build(&buf, v)); }
+        \\pub fn b2() void { var buf: [16]u8 = undefined; var other: [4]u8 = undefined; use(swapped(&buf, &other)); }
+        \\pub fn c1() void { var buf: [16]u8 = undefined; const w: Writer = .{ .bytes = &buf }; _ = w.written(); use(buf[0..1]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 16, 17, 18, 24, 25 }, found.lines[0..found.findings]);
+}
+
 test "A019 reads a local a function outside the program writes only where its result shows it did" {
     // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
     // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size

@@ -1085,6 +1085,9 @@ const Walk = struct {
             },
             else => {},
         }
+        // `.{ .bytes = &buf }`: a cursor writer's memory, which it reads only below the count of
+        // what it wrote there.
+        if (try w.cursorAt(parent, memory) != null) return null;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| {
             // `std.mem.asBytes(&x)`: all of x's bytes, handed on as the view is.
@@ -1291,6 +1294,8 @@ const Walk = struct {
             if (args.len != 1) return false;
             end = args[0];
         }
+        // `buf[0..w.pos]`: the count of a cursor writer given all of the local.
+        if (tree.nodeTag(end) == .field_access) return w.cursorCounted(end);
         // `buf[0..std.fmt.printInt(&buf, …)]`: the count the call returns, read where it returns.
         var source = end;
         if (tree.nodeTag(end) == .identifier) {
@@ -1376,6 +1381,60 @@ const Walk = struct {
         if (!w.isLocal(memory) or tree.nodeTag(index) != .identifier) return false;
         const ref = w.model.reference(index) orelse return false;
         return ref.declaration == count;
+    }
+
+    /// The cursor writer a struct literal makes where `value` is what it gives the writer's
+    /// memory field (`.{ .bytes = &buf }`): its type's fields as `cursorCount` finds them, the
+    /// literal giving the count 0 where it names it. Null where it is no such writer.
+    fn cursorAt(w: *Walk, literal: Ast.Node.Index, value: Ast.Node.Index) Context.Error!?Cursor {
+        const tree = w.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const made = tree.fullStructInit(&buffer, literal) orelse return null;
+        if (std.mem.findScalar(Ast.Node.Index, made.ast.fields, value) == null) return null;
+        const container = if (made.ast.type_expr.unwrap()) |type_expr| switch (try w.c.facts.resolve(w.file, type_expr)) {
+            .container => |found| found,
+            else => return null,
+        } else (try w.c.facts.resultContainer(w.file, literal)) orelse return null;
+        const memory = w.c.facts.member(container, tree.tokenSlice(tree.firstToken(value) - 2)) orelse return null;
+        const source = w.c.project.at(memory.file);
+        if (source.model.declarations[@backingInt(memory.index)].kind != .field) return null;
+        const count = (try cursorCount(w.c, container, memory)) orelse return null;
+        for (made.ast.fields) |field| {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.firstToken(field) - 2), count)) continue;
+            if (literalValue(tree, field) != 0) return null;
+        }
+        return .{ .memory = source.model.declarations[@backingInt(memory.index)].name, .count = count };
+    }
+
+    /// Whether `end` (`w.pos`) is the count of a cursor writer declared over all of the local
+    /// (`var w: Writer = .{ .bytes = &buf }`) that still holds it: the writer is never
+    /// assigned over, and only its fields are named, or its address handed to the program's
+    /// functions that do the same with it (`keepsWriter`).
+    fn cursorCounted(w: *Walk, end: Ast.Node.Index) Context.Error!bool {
+        const tree = w.tree;
+        const object, const name = tree.nodeData(end).node_and_token;
+        if (tree.nodeTag(object) != .identifier) return false;
+        const writer = (w.model.reference(object) orelse return false).declaration orelse return false;
+        const record = w.model.declarations[@backingInt(writer)];
+        if (record.kind != .variable) return false;
+        const variable = tree.fullVarDecl(record.node) orelse return false;
+        const literal = variable.ast.init_node.unwrap() orelse return false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const made = tree.fullStructInit(&buffer, literal) orelse return false;
+        const counts = for (made.ast.fields) |field| {
+            if (!w.namesAlone(field)) continue;
+            const cursor = (try w.cursorAt(literal, field)) orelse return false;
+            break std.mem.eql(u8, cursor.count, tree.tokenSlice(name));
+        } else false;
+        if (!counts) return false;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const ref = w.model.reference(node) orelse continue;
+            if (ref.declaration != writer) continue;
+            if (!try keepsWriterAt(w.c, w.file, node, w.depth + 1)) return false;
+        }
+        return true;
     }
 
     /// Whether `arg` is the local's address (`&buf`), all of it sliced, or a vector of it
@@ -1789,6 +1848,8 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
             .slice_open, .slice, .slice_sentinel => {
                 if ((tree.fullSlice(parent) orelse return false).ast.sliced != mention) return false;
                 memory = parent;
+                // `p[0..w.pos]`: what a cursor writer, or a counting call, wrote there.
+                if (try walk.countedPrefix(parent)) continue;
                 // `p[a..b].* = v`.
                 const above = model.parentOf(parent) orelse return false;
                 if (tree.nodeTag(above) == .deref and assigned(model, tree, above)) {
@@ -1827,6 +1888,277 @@ fn writesPartsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
         if (coveredBefore(model, tree, written.items, if (memory == mention) null else memory, memory)) continue;
         return false;
     }
+    return true;
+}
+
+/// A cursor writer's fields: the memory it is given and its count of what it wrote there.
+const Cursor = struct { memory: []const u8, count: []const u8 };
+
+/// What the program's types were found to be as cursor writers, kept once per memory field
+/// (the count field's name, null where the type is none), and what its functions do with a
+/// writer they are given, once per function and parameter.
+const Cursors = struct {
+    counts: std.AutoHashMapUnmanaged(Facts.Decl, ?[]const u8) = .empty,
+    kept: std.AutoHashMapUnmanaged(Calls.Key, bool) = .empty,
+};
+
+/// The count field of a cursor writer whose memory is the struct `container`'s field `memory`
+/// (cloak's `Writer`: `bytes: []u8, pos: usize = 0`): its one integer field that starts at 0,
+/// which the program, wherever it holds one of these or may, only reads, sets to 0, or steps by
+/// `k` in the statement right after one that writes `x.bytes[x.pos..][0..k]` whole; and
+/// `memory`, which it only writes, measures, or reads below the count (`x.bytes[0..x.pos]`),
+/// and never sets. What such a writer holds below its count was written, through it. Null
+/// where the type is no such writer.
+fn cursorCount(c: *Context, container: Facts.Container, memory: Facts.Decl) Context.Error!?[]const u8 {
+    const memo = try c.facts.memo(Cursors);
+    if (memo.counts.get(memory)) |known| return known;
+    const found = try cursorCountRead(c, container, memory);
+    try memo.counts.put(c.allocator, memory, found);
+    return found;
+}
+
+fn cursorCountRead(c: *Context, container: Facts.Container, memory: Facts.Decl) Context.Error!?[]const u8 {
+    const source = c.project.at(container.file);
+    const tree = &source.file.tree;
+    const model = &source.model;
+    var count: ?[]const u8 = null;
+    for (model.declarations) |decl| {
+        if (decl.kind != .field or decl.scope != container.scope) continue;
+        const field = tree.fullContainerField(decl.node) orelse continue;
+        if (literalValue(tree, field.ast.value_expr.unwrap() orelse continue) != 0) continue;
+        const kind = field.ast.type_expr.unwrap() orelse continue;
+        if (tree.nodeTag(kind) != .identifier or !isUnsigned(tree.tokenSlice(tree.nodeMainToken(kind)))) continue;
+        // Two that start at 0: neither is known to be the count.
+        if (count != null) return null;
+        count = decl.name;
+    }
+    const counted = count orelse return null;
+    const held = model.declarations[@backingInt(memory.index)].name;
+    for (try c.facts.memberUses(counted)) |use| {
+        const holder = try holderOf(c, use, container);
+        if (holder == .other) continue;
+        if (!stepsCount(c, use, held)) return null;
+    }
+    for (try c.facts.memberUses(held)) |use| {
+        const holder = try holderOf(c, use, container);
+        if (holder == .other) continue;
+        if (!keepsBelow(c, use, counted)) return null;
+    }
+    return counted;
+}
+
+/// Whether the object a member access (`x.pos`) is made on is one of `container`'s, through
+/// pointers and optionals; `unknown` where what it is is not known.
+fn holderOf(c: *Context, use: Facts.Key, container: Facts.Container) Context.Error!enum { ours, other, unknown } {
+    const tree = &c.project.at(use.file).file.tree;
+    var value = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
+    while (true) switch (value) {
+        .pointer, .optional => |inner| value = inner.*,
+        else => break,
+    };
+    return switch (value) {
+        .instance => |found| if (found.file == container.file and found.scope == container.scope) .ours else .other,
+        .unknown, .alternatives, .reflected, .reified, .literal => .unknown,
+        else => .other,
+    };
+}
+
+/// Whether a mention of a cursor writer's count (`x.pos`) reads it, sets it to 0, or steps it
+/// by `k` right after the statement before it in its block writes `x.bytes[x.pos..][0..k]` whole.
+fn stepsCount(c: *Context, use: Facts.Key, memory: []const u8) bool {
+    const tree = &c.project.at(use.file).file.tree;
+    const model = &c.project.at(use.file).model;
+    const parent = model.parentOf(use.node) orelse return true;
+    switch (tree.nodeTag(parent)) {
+        .address_of => return false,
+        .assign => {
+            const target, const value = tree.nodeData(parent).node_and_node;
+            return target != use.node or literalValue(tree, value) == 0;
+        },
+        .assign_add => {
+            const target, const step = tree.nodeData(parent).node_and_node;
+            if (target != use.node) return true;
+            const block = model.parentOf(parent) orelse return false;
+            if (!isBlock(tree, block)) return false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, block) orelse return false;
+            const at = std.mem.findScalar(Ast.Node.Index, statements, parent) orelse return false;
+            if (at == 0) return false;
+            const span = filled(tree, statements[at - 1]) orelse return false;
+            // `x.bytes[x.pos..][0..k]`, the same `x`, `pos` and `k` as the step's.
+            const part = tree.fullSlice(span) orelse return false;
+            if (literalValue(tree, part.ast.start) != 0) return false;
+            if (!sameText(tree, part.ast.end.unwrap() orelse return false, step)) return false;
+            const rest = tree.fullSlice(part.ast.sliced) orelse return false;
+            if (rest.ast.end != .none or !sameText(tree, rest.ast.start, use.node)) return false;
+            const held = rest.ast.sliced;
+            if (tree.nodeTag(held) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(held).node_and_token[1]), memory)) return false;
+            if (!sameText(tree, tree.nodeData(held).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return false;
+            return true;
+        },
+        .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => return tree.nodeData(parent).node_and_node[0] != use.node,
+        else => return true,
+    }
+}
+
+/// The memory a statement writes whole: `@memcpy(m, …)`, `@memset(m, …)` or `m.* = …`.
+fn filled(tree: *const Ast, statement: Ast.Node.Index) ?Ast.Node.Index {
+    if (isBuiltin(tree, statement, "@memcpy") or isBuiltin(tree, statement, "@memset")) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const params = tree.builtinCallParams(&buffer, statement) orelse return null;
+        return if (params.len == 2) params[0] else null;
+    }
+    if (tree.nodeTag(statement) != .assign) return null;
+    const target = tree.nodeData(statement).node_and_node[0];
+    return if (tree.nodeTag(target) == .deref) tree.nodeData(target).node else null;
+}
+
+/// Whether a mention of a cursor writer's memory (`x.bytes`) measures it, reads it below the
+/// count (`x.bytes[0..x.pos]`), or is written: an element set, or a part of it written whole.
+fn keepsBelow(c: *Context, use: Facts.Key, count: []const u8) bool {
+    const tree = &c.project.at(use.file).file.tree;
+    const model = &c.project.at(use.file).model;
+    const parent = model.parentOf(use.node) orelse return false;
+    switch (tree.nodeTag(parent)) {
+        .field_access => return std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len"),
+        .array_access => return tree.nodeData(parent).node_and_node[0] == use.node and assigned(model, tree, parent),
+        .slice_open, .slice, .slice_sentinel => {
+            const slice = tree.fullSlice(parent) orelse return false;
+            if (slice.ast.sliced != use.node) return false;
+            if (literalValue(tree, slice.ast.start) == 0) if (slice.ast.end.unwrap()) |end| {
+                if (tree.nodeTag(end) == .field_access and
+                    std.mem.eql(u8, tree.tokenSlice(tree.nodeData(end).node_and_token[1]), count) and
+                    sameText(tree, tree.nodeData(end).node_and_token[0], tree.nodeData(use.node).node_and_token[0])) return true;
+            };
+            // A part, or a part of it, written whole.
+            var part = parent;
+            while (model.parentOf(part)) |up| {
+                const inner = tree.fullSlice(up) orelse break;
+                if (inner.ast.sliced != part) break;
+                part = up;
+            }
+            const above = model.parentOf(part) orelse return false;
+            if (filled(tree, above) == part) return true;
+            return tree.nodeTag(above) == .deref and filled(tree, model.parentOf(above) orelse return false) == part;
+        },
+        else => return false,
+    }
+}
+
+/// Whether a mention of a local cursor writer (`node`) keeps it over what it was given: it
+/// names one of its fields or calls a method on it, or hands its address to one of the
+/// program's functions, each of which does the same with the pointer. Nothing assigns over it
+/// or keeps its address elsewhere.
+fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const parent = model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    switch (tree.nodeTag(parent)) {
+        .field_access => {
+            // A method called on it is given it, or its address.
+            const grand = model.parentOf(parent) orelse return true;
+            const call = tree.fullCall(&buffer, grand) orelse return true;
+            if (call.ast.fn_expr != parent) return true;
+            const decl = switch (try c.facts.resolve(file, parent)) {
+                .function => |function| function,
+                else => return false,
+            };
+            return keepsWriter(c, (try c.facts.origin(decl)) orelse decl, 0, depth);
+        },
+        .address_of => {
+            const grand = model.parentOf(parent) orelse return false;
+            const call = tree.fullCall(&buffer, grand) orelse return false;
+            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, parent) orelse return false;
+            const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+                .function => |function| function,
+                else => return false,
+            };
+            var index = position;
+            if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+                .instance, .pointer, .optional => index += 1,
+                else => {},
+            };
+            return keepsWriter(c, (try c.facts.origin(decl)) orelse decl, index, depth);
+        },
+        else => return false,
+    }
+}
+
+/// Whether the program's function `decl` keeps the cursor writer its parameter `index` gives
+/// it as `keepsWriterAt` says: a copy, where the parameter is no pointer, holds nothing back.
+fn keepsWriter(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
+    if (!c.project.at(decl.file).input.selected) return false;
+    const memo = try c.facts.memo(Cursors);
+    const key: Calls.Key = .{ .decl = decl, .index = index, .question = .keeps };
+    if (memo.kept.get(key)) |known| return known;
+    if (depth > depth_limit) return false;
+    // A cycle back to a function being read adds nothing it does not already do.
+    try memo.kept.put(c.allocator, key, true);
+    const found = try keepsWriterRead(c, decl, index, depth);
+    try memo.kept.put(c.allocator, key, found);
+    return found;
+}
+
+fn keepsWriterRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(decl.file).file.tree;
+    const model = &c.project.at(decl.file).model;
+    const record = model.declarations[@backingInt(decl.index)];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    const param = while (it.next()) |each| : (position += 1) {
+        if (position == index) break each;
+    } else return false;
+    const name = param.name_token orelse return true;
+    const kind = param.type_expr orelse return false;
+    // A struct by value is a copy; a type named otherwise may be a pointer.
+    if (tree.fullPtrType(kind) == null) return try c.facts.resolve(decl.file, kind) == .container;
+    const id: Model.Declaration.Id = for (model.declarations, 0..) |each, d| {
+        if (each.kind == .parameter and each.token == name) break @fromBackingInt(@intCast(d));
+    } else return false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != id) continue;
+        if (!try keepsPointerAt(c, decl.file, node, depth + 1)) return false;
+    }
+    return true;
+}
+
+/// As `keepsWriterAt`, for a pointer to the writer: its fields named through it, or the
+/// pointer itself handed on.
+fn keepsPointerAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const parent = model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    switch (tree.nodeTag(parent)) {
+        .field_access => return keepsWriterAt(c, file, node, depth),
+        else => {
+            const call = tree.fullCall(&buffer, parent) orelse return false;
+            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return false;
+            const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+                .function => |function| function,
+                else => return false,
+            };
+            var index = position;
+            if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+                .instance, .pointer, .optional => index += 1,
+                else => {},
+            };
+            return keepsWriter(c, (try c.facts.origin(decl)) orelse decl, index, depth);
+        },
+    }
+}
+
+/// Whether a type's name is an unsigned integer's (`usize`, `u16`).
+fn isUnsigned(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "usize")) return true;
+    if (name.len < 2 or name[0] != 'u') return false;
+    for (name[1..]) |ch| if (!std.ascii.isDigit(ch)) return false;
     return true;
 }
 
