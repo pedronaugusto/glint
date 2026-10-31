@@ -1547,7 +1547,7 @@ const Frame = struct {
     /// What a loop gives: the invariant its passes preserve, from the state it is entered in
     /// and the conditions' non-strict forms the entry already holds, read once more for the
     /// verdicts; then its exits joined.
-    fn loop(f: *Frame, entry: State, node: Ast.Node.Index, label: ?[]const u8, candidates: []const Lin, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: ?fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Eval {
+    fn loop(f: *Frame, entry: State, node: Ast.Node.Index, label: ?[]const u8, candidates: []const Lin, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Eval {
         if (entry.dead) return .{ .s = entry };
         var invariant = entry;
         for (candidates) |row| if (try entails(f.a, entry, row)) {
@@ -1577,7 +1577,7 @@ const Frame = struct {
         return .{ .s = out, .v = .{ .lin = try single(f.a, t[1]) } };
     }
 
-    fn passOf(f: *Frame, invariant: State, node: Ast.Node.Index, label: ?[]const u8, value: Var, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: ?fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Pass {
+    fn passOf(f: *Frame, invariant: State, node: Ast.Node.Index, label: ?[]const u8, value: Var, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Pass {
         try f.targets.append(f.a, .{ .kind = .loop, .label = label, .defers = f.defers.items.len, .trial = f.trial, .value = value });
         const ran = body(f, invariant, node) catch |err| {
             _ = f.targets.pop();
@@ -1586,7 +1586,7 @@ const Frame = struct {
         const target = f.targets.pop().?; // unreachable: pushed above
         var back = ran.body;
         for (target.continues.items) |state| back = try join(f.a, back, state);
-        if (after) |step| back = try step(f, back, node);
+        back = try after(f, back, node);
         return .{ .back = back, .exit = ran.exit, .breaks = target.breaks.items };
     }
 
@@ -1692,9 +1692,16 @@ const Frame = struct {
         const counter = try f.variable(.{ .temp = .{ .node = node, .part = 6 } });
         _ = counter;
         try f.for_counts.put(f.a, node, count);
-        const result = try f.loop(out, node, label, &.{}, forBody, null);
+        const result = try f.loop(out, node, label, &.{}, forBody, forContinue);
         // Its `else` runs where the passes ran out.
         return result;
+    }
+
+    /// A `for` has no continue expression: its counter steps with its inputs.
+    fn forContinue(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        _ = f;
+        _ = node;
+        return s;
     }
 
     fn forBody(f: *Frame, s: State, node: Ast.Node.Index) RunError!Ran {
