@@ -77,7 +77,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                     try judged(c, flow, rule, lhs, try loopOperand(c, flow, node, lhs), .number, loop_message);
                     try judged(c, flow, rule, rhs, try loopOperand(c, flow, node, rhs), .number, loop_message);
                 }
-                for (decided.leaves.items) |leaf| try judged(c, flow, rule, leaf, try ranged(c, flow, leaf), .number, loop_message);
+                for (decided.leaves.items) |leaf| try judged(c, flow, rule, leaf, try loopOperand(c, flow, node, leaf), .number, loop_message);
             },
             // A table trusts its own ids to name its entries (Range.ownId): one made from an
             // integer is a finding unless it counts the table's entries, whatever the
@@ -1008,7 +1008,7 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
 
 /// A loop bound's level: a counter the loop steps by what it enters with and steps by
 /// (Taint.counterLevel); data where it counts no more passes than a short or the memory the
-/// function holds (Range.counts).
+/// function holds (Proof.counts).
 fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
     const level = try countered(c, flow, loop, node);
     if (level == .number and try Proof.counts(c, c.file, node)) return .data;
