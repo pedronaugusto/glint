@@ -97,7 +97,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\nconst File = @This();\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, file: File = undefined, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = io; _ = buffer; return .{ .file = f, .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
-    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; self.* = undefined; } }; }" },
+    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; const held = self.capacity; _ = held; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/Io/Reader.zig", .bytes =
@@ -2154,8 +2154,87 @@ test "A019 leaves undecided a call whose calls run past the depth it reads, what
     }
     try w.writeAll("};\n");
     const found = try run(pack.unsafe_set, program.written());
-    try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, found.lines[0..found.findings]);
+    try std.testing.expectEqual(0, found.undecided);
+}
+
+test "A019 leaves undecided a call it cannot resolve to its functions, reads @call as a call, and a per-build choice as any of its functions" {
+    // Undecided: a function pointer the caller gives (5), a public type's field its callers fill
+    // (6). Findings: @call of a function giving it `undefined` (7), a per-build choice one of
+    // whose functions does (9). Clean: @call of one that writes a field (8).
+    const found = try run(pack.unsafe_set,
+        \\const W = struct { data: [4]u8, n: u32 };
+        \\fn kill(w: *W) void { w.* = undefined; }
+        \\fn keep(w: *W) void { w.n += 1; }
+        \\pub const Ops = struct { free: *const fn (*W) void };
+        \\pub fn f1(free: *const fn (*W) void) u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; free(&w); return w.data[0]; }
+        \\pub fn f2(ops: Ops) u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; ops.free(&w); return w.data[0]; }
+        \\pub fn f3() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; @call(.auto, kill, .{&w}); return w.data[0]; }
+        \\pub fn f4() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; @call(.auto, keep, .{&w}); return w.data[0]; }
+        \\pub fn f5() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; pick(&w); return w.data[0]; }
+        \\const pick = if (@import("builtin").os.tag == .linux) kill else keep;
+        \\
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 7, 9 }, found.lines[0..found.findings]);
     try std.testing.expectEqual(2, found.undecided);
+}
+
+test "A019 follows a local through a pointer alias of it, in the caller and in the callee: handed on, or given `undefined` through it" {
+    // Findings: the caller's alias handed to a call giving it `undefined` (6) or given it itself
+    // (7), a callee handing its parameter on through an alias (8) or giving it `undefined`
+    // through one (9). Clean: a callee writing a field through one (10).
+    const found = try run(pack.unsafe_set,
+        \\const W = struct { data: [4]u8, n: u32 };
+        \\fn kill(w: *W) void { w.* = undefined; }
+        \\fn drop(w: *W) void { const q = w; kill(q); }
+        \\fn wipe(w: *W) void { const q = w; q.* = undefined; }
+        \\fn touch(w: *W) void { const q = w; q.n = 1; }
+        \\pub fn g1() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; const p = &w; kill(p); return w.data[0]; }
+        \\pub fn g2() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; const p = &w; p.* = undefined; return w.data[0]; }
+        \\pub fn g3() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; drop(&w); return w.data[0]; }
+        \\pub fn g4() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; wipe(&w); return w.data[0]; }
+        \\pub fn g5() u8 { var w: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 }; touch(&w); return w.data[0]; }
+        \\
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 6, 7, 8, 9 }, found.lines[0..found.findings]);
+    try std.testing.expectEqual(0, found.undecided);
+}
+
+test "A019 reads what a call leaves by the exit it goes on from: a `return` holding it goes nowhere after, `try` goes on from success, an errdefer leaves it on failure only" {
+    // Clean: the undefining call inside the `return` it gives its value to (6), a fill whose
+    // errdefer gives it `undefined` only on the failure `try` returns (7). Findings: the same
+    // fill whose failure a `catch` goes on from (8), the call outside a `return` (9).
+    const found = try run(pack.unsafe_set,
+        \\const W = struct { data: [4]u8, n: u32 };
+        \\fn release(w: *W) void { w.* = undefined; }
+        \\fn giveUp(w: *W) ?u8 { release(w); return null; }
+        \\fn fill(w: *W, fail: bool) !void { errdefer release(w); if (fail) return error.Failed; w.n = 1; }
+        \\const init: W = .{ .data = .{ 1, 2, 3, 4 }, .n = 0 };
+        \\pub fn p1(c: ?u8) ?u8 { var w: W = init; const x = c orelse return giveUp(&w); return x + w.data[0]; }
+        \\pub fn p2(fail: bool) !u8 { var w: W = init; try fill(&w, fail); return w.data[0]; }
+        \\pub fn p3(fail: bool) u8 { var w: W = init; fill(&w, fail) catch {}; return w.data[0]; }
+        \\pub fn p4(c: ?u8) ?u8 { var w: W = init; if (c == null) _ = giveUp(&w); return w.data[0]; }
+        \\
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, found.lines[0..found.findings]);
+    try std.testing.expectEqual(0, found.undecided);
+}
+
+test "A019 reads a part given `undefined` as that part where the local's type is its first value's, not written" {
+    // Clean: another field read after a field's deinit, the local's type its initializer's (6).
+    // Finding: the field itself read after (7).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const S = struct { list: std.ArrayList(u8), flag: bool };
+        \\fn make() S { return .{ .list = .empty, .flag = true }; }
+        \\fn unused() void {}
+        \\const gpa = std.heap.page_allocator;
+        \\pub fn q1() bool { var s = make(); s.list.deinit(gpa); return s.flag; }
+        \\pub fn q2() usize { var s = make(); s.list.deinit(gpa); return s.list.items.len; }
+        \\
+    );
+    try std.testing.expectEqualSlices(u32, &.{7}, found.lines[0..found.findings]);
+    try std.testing.expectEqual(0, found.undecided);
 }
 
 test "A019 reads a fill that may stop early as none: a `for` setting each element that may leave, an error set's error returned as a value, a labeled switch dispatching again into the prong its check guards" {
