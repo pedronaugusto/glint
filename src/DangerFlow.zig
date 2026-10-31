@@ -730,9 +730,29 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
 /// (Taint.counterLevel); data where it counts no more passes than a short or the memory the
 /// function holds (Range.counts).
 fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
-    const level = (try Taint.counterLevel(c, flow, c.file, loop, node)) orelse try Taint.levelAt(c, flow, c.file, node);
+    const level = try countered(c, flow, loop, node);
     if (level == .number and try Range.counts(c, c.file, node)) return .data;
     return level;
+}
+
+/// The level of a loop operand with each counter in it read by `Taint.counterLevel`: the
+/// counter itself, a sum with it (`at + 2`) or a difference from it (`end - 1`).
+fn countered(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.at(c.file).file.tree;
+    if (try Taint.counterLevel(c, flow, c.file, loop, node)) |level| return level;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return countered(c, flow, loop, tree.nodeData(node).node_and_token[0]),
+        .add, .add_wrap, .add_sat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return (try countered(c, flow, loop, lhs)).join(try countered(c, flow, loop, rhs));
+        },
+        .sub, .sub_wrap, .sub_sat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const counter = (try Taint.counterLevel(c, flow, c.file, loop, lhs)) orelse return Taint.levelAt(c, flow, c.file, node);
+            return counter.join(try countered(c, flow, loop, rhs));
+        },
+        else => return Taint.levelAt(c, flow, c.file, node),
+    }
 }
 
 /// A finding where the value is input at `least` (data, or only a number), undecided where the

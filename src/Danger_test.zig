@@ -3833,6 +3833,13 @@ test "A009 bounds a loop by a number the program checked against the memory it h
         \\    var i: usize = 0;
         \\    while (i < 1000) : (i += step) {}
         \\}
+        \\pub fn pairs(r: *std.Io.Reader, list: []const u8) !void {
+        \\    const m: usize = try r.takeInt(u32, .little);
+        \\    var at: usize = 0;
+        \\    while (at + 2 <= list.len) : (at += 2) {
+        \\        if (m == at) break;
+        \\    }
+        \\}
     );
     // A counter is judged by what it enters with and steps by: one a peer's number starts
     // (line 19) or strides (line 31), never one a peer's number only stops early (line 24).
