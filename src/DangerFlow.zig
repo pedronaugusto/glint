@@ -63,18 +63,20 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
                 try judged(c, flow, rule, end, try ranged(c, flow, end), .number, loop_message);
             },
-            // Each comparison of the condition, joined by `and`, `or` and `!` as it may be.
+            // What decides the condition (`decides`): each comparison it joins by `and`, `or` and
+            // `!`, a local's each value, a payload's leaf. A truth bounds no number: A020's.
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                var compared: std.ArrayList(Ast.Node.Index) = .empty;
-                try comparisons(c, loop.ast.cond_expr, &compared);
-                for (compared.items) |condition| {
+                var decided: Decided = .{};
+                try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
+                for (decided.compared.items) |condition| {
                     if (clears(c, condition, loop.ast.then_expr)) continue;
                     const lhs, const rhs = tree.nodeData(condition).node_and_node;
                     try judged(c, flow, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
                     try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
                 }
+                for (decided.leaves.items) |leaf| try judged(c, flow, rule, leaf, try ranged(c, flow, leaf), .number, loop_message);
             },
             // A table trusts its own ids to name its entries (Range.ownId): one made from an
             // integer is a finding unless it counts the table's entries, whatever the
@@ -304,26 +306,25 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             }
             // A `while` by what decides its condition (`decides`), or as `while (true)` where
             // nothing in it can change that (`invariant`); a `for` by each range's end.
-            var bounds: std.ArrayList(Ast.Node.Index) = .empty;
-            var truths: std.ArrayList(Ast.Node.Index) = .empty;
+            var decided: Decided = .{};
             var unbounded = false;
             const body = if (tree.fullWhile(node)) |loop| body: {
                 unbounded = forever(tree, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
-                if (!unbounded) try decides(c, loop.ast.cond_expr, loop.payload_token != null, &bounds, &truths, 0);
+                if (!unbounded) try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 break :body loop.ast.then_expr;
             } else if (tree.fullFor(node)) |loop| body: {
-                for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try bounds.append(c.allocator, end);
+                for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try decided.leaves.append(c.allocator, end);
                 break :body loop.ast.then_expr;
             } else continue;
             if (!within(c, node, decl.node) or !site(c, node)) continue;
             var by_input = false;
             var unknown = false;
-            for (bounds.items) |bound| {
+            for (try decided.bounds(c)) |bound| {
                 const level = try ranged(c, flow, bound);
                 by_input = by_input or level.reaches(.number);
                 unknown = unknown or level == .unknown;
             }
-            for (truths.items) |truth| {
+            for (decided.truths.items) |truth| {
                 const level = try Taint.levelAt(c, flow, c.file, truth);
                 by_input = by_input or level.reaches(.data);
                 unknown = unknown or level == .unknown;
@@ -1036,41 +1037,45 @@ fn callSite(c: *Context, at: Taint.Site) Context.Error![]const u8 {
     return c.allocator.print("{s}:{d} `{s}`", .{ c.project.at(at.file).input.name, line, spelled.items });
 }
 
-/// The comparisons a condition joins by `and`, `or` and `!`.
-fn comparisons(c: *Context, condition: Ast.Node.Index, out: *std.ArrayList(Ast.Node.Index)) Context.Error!void {
-    const tree = &c.project.at(c.file).file.tree;
-    switch (tree.nodeTag(condition)) {
-        .bool_and, .bool_or => {
-            const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            try comparisons(c, lhs, out);
-            try comparisons(c, rhs, out);
-        },
-        .bool_not => try comparisons(c, tree.nodeData(condition).node, out),
-        .grouped_expression => try comparisons(c, tree.nodeData(condition).node_and_token[0], out),
-        else => if (comparison(tree.nodeTag(condition))) try out.append(c.allocator, condition),
-    }
-}
+/// What decides how long a `while` runs, read by meaning, not spelling (`decides`): A009 and
+/// A020 read a condition through it alike.
+const Decided = struct {
+    /// Each comparison the condition joins by `and`, `or` and `!`: its operands bound the loop.
+    compared: std.ArrayList(Ast.Node.Index) = .empty,
+    /// Any other leaf of a loop that takes a payload (`while (left) |n|`): a bound itself.
+    leaves: std.ArrayList(Ast.Node.Index) = .empty,
+    /// Any other leaf of one that takes none (`while (self.more())`): a truth input may decide
+    /// every pass.
+    truths: std.ArrayList(Ast.Node.Index) = .empty,
 
-/// What decides how long a `while` runs, read by meaning, not spelling: each operand of a
-/// comparison its condition joins by `and`, `or` and `!` is a bound (`bounds`); a variable of
-/// the function whose address it never takes is each value it is given, read the same way
-/// (`more = n != 0` bounds `while (more)` by `n`); any other leaf is a bound where the loop
-/// takes a payload (`while (left) |n|`), else a truth (`truths`) input may decide every pass
-/// (`while (self.more())`). Past `depth` a variable is a leaf.
-fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, bounds: *std.ArrayList(Ast.Node.Index), truths: *std.ArrayList(Ast.Node.Index), depth: u8) Context.Error!void {
+    /// The comparisons' operands and the payload's leaves: what a number from input bounds.
+    fn bounds(d: *const Decided, c: *Context) Context.Error![]const Ast.Node.Index {
+        const tree = &c.project.at(c.file).file.tree;
+        var out: std.ArrayList(Ast.Node.Index) = .empty;
+        for (d.compared.items) |condition| try out.appendSlice(c.allocator, &tree.nodeData(condition).node_and_node);
+        try out.appendSlice(c.allocator, d.leaves.items);
+        return out.items;
+    }
+};
+
+/// Gathers into `into` what decides a `while` condition: its comparisons, and a variable of the
+/// function whose address it never takes as each value it is given, read the same way (`more =
+/// n != 0` is `while (n != 0)` for `while (more)`); any other leaf as `Decided` sorts it. Past
+/// `depth` a variable is a leaf.
+fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided, depth: u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     switch (tree.nodeTag(condition)) {
         .bool_and, .bool_or => {
             const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            try decides(c, lhs, payload, bounds, truths, depth);
-            return decides(c, rhs, payload, bounds, truths, depth);
+            try decides(c, lhs, payload, into, depth);
+            return decides(c, rhs, payload, into, depth);
         },
-        .bool_not => return decides(c, tree.nodeData(condition).node, payload, bounds, truths, depth),
-        .grouped_expression => return decides(c, tree.nodeData(condition).node_and_token[0], payload, bounds, truths, depth),
+        .bool_not => return decides(c, tree.nodeData(condition).node, payload, into, depth),
+        .grouped_expression => return decides(c, tree.nodeData(condition).node_and_token[0], payload, into, depth),
         .identifier => if (depth < 8) if (model.reference(condition)) |reference| if (reference.declaration) |declared| if (localVariable(c, c.file, declared)) {
             const record = model.declarations[@backingInt(declared)];
-            if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |value| try decides(c, value, payload, bounds, truths, depth + 1);
+            if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |value| try decides(c, value, payload, into, depth + 1);
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 if (!assigns(tag)) continue;
                 const written, const value = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
@@ -1079,12 +1084,12 @@ fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, bounds: *std.A
                 if (((model.reference(target) orelse continue).declaration orelse continue) != declared) continue;
                 // `left -= 1`, `left.? = n`: what it holds is its own arithmetic, read as itself.
                 if (tag != .assign or target != written) break;
-                try decides(c, value, payload, bounds, truths, depth + 1);
+                try decides(c, value, payload, into, depth + 1);
             } else return;
         },
-        else => if (comparison(tree.nodeTag(condition))) return bounds.appendSlice(c.allocator, &tree.nodeData(condition).node_and_node),
+        else => if (comparison(tree.nodeTag(condition))) return into.compared.append(c.allocator, condition),
     }
-    try (if (payload) bounds else truths).append(c.allocator, condition);
+    try (if (payload) &into.leaves else &into.truths).append(c.allocator, condition);
 }
 
 /// Whether nothing a loop does can change its condition, so once true it is `while (true)`:
