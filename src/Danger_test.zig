@@ -575,17 +575,19 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
 test "A015 judges a public generic at each binding, a consumer's among them, and leaves a type that does not resolve undecided" {
     // The package alone binds its type function and its generic only to a number: nothing.
     const lib =
-        \\pub fn Box(comptime T: type) type { return struct { v: T }; }
+        \\pub fn Box(comptime T: type) type { return struct { v: T, pub fn deinit(b: *@This()) void { b.v.close(); } }; }
+        \\pub fn View(comptime T: type) type { return struct { v: T }; }
         \\pub const Plain = Box(u32);
         \\pub fn make(comptime T: type) T { return undefined; }
         \\pub fn use() u32 { return make(u32); }
     ;
     try expect(pack.ownership, lib, 0);
-    // A consumer binding them to a file: a field and a result each hold it by value.
+    // A consumer binding them to a file: a field its type function releases holds an owner by
+    // hand, and a result hands one over; a field nothing releases is a borrow.
     const result = try runWithDependency(pack.ownership,
         \\const std = @import("std");
         \\const dep = @import("dep");
-        \\pub const S = struct { b: dep.Box(std.Io.File) };
+        \\pub const S = struct { b: dep.Box(std.Io.File), w: dep.View(std.Io.File) };
         \\pub fn f() void { _ = dep.make(std.Io.File); }
     , lib);
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
@@ -600,10 +602,11 @@ test "A015 judges a public generic at each binding, a consumer's among them, and
 }
 
 test "A015 reads a container a type function makes inside another's with the outer call's arguments, and a type function's every return" {
-    // `Outer(T)` holds a `Box(T)`: the consumer's `Outer(std.Io.File)` holds the file through
-    // it, and `Opt(std.Io.Dir)` through an optional; aegis's own owner holds it as the answer.
+    // `Outer(T)` holds a `Box(T)`, which releases what it holds: the consumer's
+    // `Outer(std.Io.File)` makes `Box`'s field own the file by hand, and `Opt(std.Io.Dir)` through
+    // an optional; aegis's own owner holds it as the answer.
     const lib =
-        \\pub fn Box(comptime T: type) type { return struct { f: T }; }
+        \\pub fn Box(comptime T: type) type { return struct { f: T, pub fn deinit(b: *@This()) void { b.f.close(); } }; }
         \\pub fn Outer(comptime T: type) type { return struct { b: Box(T) }; }
         \\pub fn Opt(comptime T: type) type { return struct { b: ?Box(T) }; }
         \\pub fn Bits(comptime n: usize) type { if (n <= 64) return Narrow(n); return Wide(n); }
@@ -671,7 +674,10 @@ test "A015 reads a type built by reflection on its argument: the fields a compti
         \\    return @Struct(.auto, null, fields.field_names, &final_types, &@splat(.{}));
         \\}
         \\pub fn Spec(comptime T: type) type {
-        \\    return struct { options: Options(T) = .{}, commands: Commands(T) = .{}, sets: Partial(T) = .{} };
+        \\    return struct { options: Options(T), commands: Commands(T), sets: Partial(T) };
+        \\}
+        \\pub fn Keep(comptime T: type) type {
+        \\    return struct { held: Partial(T), pub fn deinit(k: *@This()) void { k.held.deinit(); } };
         \\}
         \\pub fn Tag(comptime T: type) type {
         \\    return switch (@typeInfo(T)) {
@@ -693,7 +699,7 @@ test "A015 reads a type built by reflection on its argument: the fields a compti
     const plain = try runWithDependency(pack.ownership,
         \\const dep = @import("dep");
         \\const Value = union(enum) { a: u8, b };
-        \\const Plain = struct { name: []const u8, n: u32 = 0, pub const spec: dep.Spec(@This()) = .{}; };
+        \\const Plain = struct { name: []const u8, n: u32 = 0, pub const spec: dep.Spec(@This()) = undefined; };
         \\pub const K = dep.Tag(Value);
         \\pub const E = dep.Tag(enum(u8) { x });
         \\pub const F = dep.Fields(Plain);
@@ -701,17 +707,18 @@ test "A015 reads a type built by reflection on its argument: the fields a compti
     , lib);
     try std.testing.expectEqual(@as(usize, 0), plain.undecided);
     try std.testing.expectEqual(@as(usize, 0), plain.findings);
-    // One holding a file: `Partial` holds it, an optional of it; one whose field's type does
+    // One holding a file: `Partial` holds it, an optional of it, a borrow in a spec nothing
+    // releases and an owner by hand in `Keep`, which releases it; one whose field's type does
     // not resolve: undecided, never clear.
     const held = try runWithDependency(pack.ownership,
         \\const std = @import("std");
         \\const dep = @import("dep");
         \\const ext = @import("missing");
-        \\const Holds = struct { out: std.Io.File, pub const spec: dep.Spec(@This()) = .{}; };
-        \\const Unseen = struct { h: ext.Handle, pub const spec: dep.Spec(@This()) = .{}; };
+        \\const Holds = struct { out: std.Io.File, pub const spec: dep.Spec(@This()) = undefined; pub const kept: dep.Keep(@This()) = undefined; };
+        \\const Unseen = struct { h: ext.Handle, pub const spec: dep.Spec(@This()) = undefined; };
     , lib);
     try std.testing.expectEqual(@as(usize, 2), held.undecided);
-    try std.testing.expectEqual(@as(usize, 2), held.findings);
+    try std.testing.expectEqual(@as(usize, 1), held.findings);
 }
 
 test "A015 reads a tuple's fields, named by position only, as fields" {
