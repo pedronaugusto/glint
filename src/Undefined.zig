@@ -178,10 +178,27 @@ const std_halving = [_]struct { path: []const u8, param: usize, input: usize }{
 
 /// How deep the program's callees are read, each handing the memory to the next.
 const depth_limit = 8;
+/// How deep `undefines` follows what a function hands its parameter to: std's writers reach
+/// past `depth_limit` (`Writer.print`'s formatting), where a cut would leave all of it undefined.
+const undefines_depth_limit = 16;
 
-pub fn reads(c: *Context, rule: Rule) Context.Error!void {
+/// `follows`: whether another rule follows a local from its acquisition through its cleanup
+/// (A003), and reads a use of it after a call that gives it `undefined` in this one's place.
+pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declaration) Context.Error!bool) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
+    // The mentions that give a call a local, or a part of it, as its receiver or by address:
+    // where a call may give it `undefined` (a `deinit`), read as each local is.
+    var handed: std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const id = (model.reference(node) orelse continue).declaration orelse continue;
+        if (model.declarations[@backingInt(id)].kind != .variable) continue;
+        if (handedPlace(tree, model, node, false) == null) continue;
+        const entry = try handed.getOrPutValue(c.allocator, id, .empty);
+        try entry.value_ptr.append(c.allocator, node);
+    }
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or c.inTest(decl.token)) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
@@ -197,8 +214,9 @@ pub fn reads(c: *Context, rule: Rule) Context.Error!void {
         // Undefined where it is declared so, in whole or in part, or where it is given
         // `undefined` again.
         const declared = holdsUndefined(tree, init);
-        if (!declared and !spellsUndefined(tree, block)) continue;
         const local: Model.Declaration.Id = @fromBackingInt(@intCast(d));
+        const calls = if (handed.get(local)) |list| list.items else &.{};
+        if (!declared and !spellsUndefined(tree, block) and calls.len == 0) continue;
         var walk: Walk = .init(c, c.file, local, false, 0);
         try walk.collect();
         var found: ?Ast.TokenIndex = null;
@@ -224,6 +242,29 @@ pub fn reads(c: *Context, rule: Rule) Context.Error!void {
                 try c.allocator.print("'{s}' is handed on here while undefined again on a path from line {d}, which gives it `undefined`, where nothing shows it written whole since: a read of undefined memory, which no build checks", .{ decl.name, line })
             else
                 try c.allocator.print("'{s}' is read here while undefined again on a path from line {d}, which gives it `undefined`: a read of undefined memory, which no build checks", .{ decl.name, line }));
+        }
+        // A call that gives it `undefined` (`x.deinit(gpa)`): undefined from there until it is
+        // written whole again. A local A003 follows from its acquisition is A003's to read
+        // after its cleanup.
+        if (calls.len != 0 and try follows(c, decl)) continue;
+        for (calls) |call| {
+            const left = try walk.undoneBy(call);
+            if (left == 0) continue;
+            const line = tree.tokenLocation(0, tree.nodeMainToken(call)).line + 1;
+            if (try walk.aliasAfter(call, block)) |alias| {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unsupported, try c.allocator.print("'{s}' is given `undefined` here by the call, and an alias of it taken at line {d} may read it after: no read of it through that alias is followed", .{ decl.name, tree.tokenLocation(0, alias).line + 1 }));
+                continue;
+            }
+            var from: Walk = .init(c, c.file, local, false, 0);
+            try from.collect();
+            _ = try from.onFrom(call, left, block);
+            const token = from.read orelse continue;
+            if (found == token) continue;
+            found = token;
+            try c.at(rule, token, if (from.handed)
+                try c.allocator.print("'{s}' is handed on here while undefined on a path from line {d}, whose call gives it `undefined` (as a `deinit` does), where nothing shows it written whole since: a read of undefined memory, which no build checks", .{ decl.name, line })
+            else
+                try c.allocator.print("'{s}' is read here while undefined on a path from line {d}, whose call gives it `undefined` (as a `deinit` does): a read of undefined memory, which no build checks", .{ decl.name, line }));
         }
     }
 }
@@ -294,6 +335,9 @@ const Walk = struct {
     handed: bool = false,
     /// Whether a path returns with a parameter's memory not yet written whole.
     exit_unwritten: bool = false,
+    /// Whether an error's `return` counts as any other for `exit_unwritten`: where the walk
+    /// asks what a caller's `catch` may go on with (`undefines`), not what a call writes.
+    every_exit: bool = false,
     /// The constructs being walked that a `break` or `continue` in them may leave for their end
     /// (a loop, a labeled block or `switch`), innermost last, each with what the jumps to it
     /// so far take there, and for a labeled `switch`, what its `continue`s dispatch again with.
@@ -462,6 +506,173 @@ const Walk = struct {
         return state;
     }
 
+    /// What of the local a call leaves `undefined` where `mention` gives the call the local, or
+    /// a field or element of it, as its receiver or by address (`x.deinit(gpa)`, `f(&x)`,
+    /// `x.list.deinit(gpa)`; a parameter's pointer as it is, `f(p)`), and the function it
+    /// reaches gives what that parameter points at `undefined` on a path that returns
+    /// (`undefines`): those parts, or all of it where the part handed is not one known; 0 for
+    /// any other mention. A receiver held through a pointer hands on what it points at.
+    fn undoneBy(w: *Walk, mention: Ast.Node.Index) Context.Error!u64 {
+        const tree = w.tree;
+        const all = std.math.maxInt(u64);
+        const place = handedPlace(tree, w.model, mention, w.param) orelse return 0;
+        if (!try w.inMemory(mention, place)) return 0;
+        // A field or element handed: the part its first step names.
+        const part_handed: ?u64 = if (place == mention) null else part: {
+            const first = w.model.parentOf(mention).?;
+            const index = w.partAt(first, tree.nodeTag(first) == .field_access) orelse break :part all;
+            break :part @as(u64, 1) << index;
+        };
+        const holder = w.model.parentOf(place).?;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const receiver = tree.nodeTag(holder) == .field_access;
+        const node = if (receiver) w.model.parentOf(holder).? else w.model.parentOf(if (tree.nodeTag(holder) == .address_of) holder else place).?;
+        const call = tree.fullCall(&buffer, node).?;
+        // A local that is a pointer gives a method, or a field's address, what it points at.
+        if (!w.param and (receiver or place != mention)) {
+            if (try w.c.facts.resolve(w.file, mention) == .pointer) return 0;
+        }
+        if (receiver and place != mention and try w.c.facts.resolve(w.file, place) != .instance) return 0;
+        const decl = (try w.callee(node, call)) orelse return 0;
+        const origin = (try w.c.facts.origin(decl)) orelse decl;
+        const index = if (receiver) 0 else parameterAt(w.c, w.file, call, origin, std.mem.findScalar(Ast.Node.Index, call.ast.params, if (tree.nodeTag(holder) == .address_of) holder else place).?);
+        const found = try undefines(w.c, origin, index, w.depth + 1);
+        if (found.mask == 0) return 0;
+        if (part_handed) |handed| return handed;
+        if (found.mask == all) return all;
+        const owner = w.owner orelse return all;
+        const theirs = found.owner orelse return all;
+        return if (std.meta.eql(owner, theirs)) found.mask else all;
+    }
+
+    /// Whether `place`, reached from `mention` by fields and elements, lies in the local's own
+    /// memory (or a parameter's pointee): no step passes through a pointer it holds (`w.c.facts`
+    /// with `c: *Context`, a slice's element).
+    fn inMemory(w: *Walk, mention: Ast.Node.Index, place: Ast.Node.Index) Context.Error!bool {
+        const tree = w.tree;
+        var at = place;
+        while (at != mention) {
+            const inner = switch (tree.nodeTag(at)) {
+                .field_access => tree.nodeData(at).node_and_token[0],
+                .array_access => tree.nodeData(at).node_and_node[0],
+                else => return false,
+            };
+            // A parameter's pointer is how its memory is reached.
+            if (!(w.param and inner == mention) and try w.pointerAt(inner)) return false;
+            at = inner;
+        }
+        return true;
+    }
+
+    /// Whether `node`, the local or a part of it, holds a pointer (a slice too), whose fields
+    /// and elements are what it points at: by its value, or where that does not resolve (std's
+    /// own, read without its instantiation), a field of the local by the type its struct
+    /// spells for it (`[]T`, `*T`, or a constant of one, `Slice = if (a) |x| []align(x) T else
+    /// []T`).
+    fn pointerAt(w: *Walk, node: Ast.Node.Index) Context.Error!bool {
+        switch (try w.c.facts.resolve(w.file, node)) {
+            .pointer, .optional => return true,
+            .instance, .array, .primitive, .scalar, .error_union, .error_set, .container, .function, .literal => return false,
+            .alternatives => |each| for (each) |one| {
+                if (one != .pointer) break;
+            } else return true,
+            else => {},
+        }
+        if (w.tree.nodeTag(node) != .field_access) return false;
+        const of, const member = w.tree.nodeData(node).node_and_token;
+        if (std.mem.findScalar(Ast.Node.Index, w.mentions.items, of) == null) return false;
+        const owner = w.owner orelse return false;
+        if (owner != .container) return false;
+        const source = w.c.project.at(owner.container.file);
+        const tree = &source.file.tree;
+        const name = w.tree.tokenSlice(member);
+        for (source.model.declarations) |decl| {
+            if (decl.kind != .field or decl.scope != owner.container.scope or !std.mem.eql(u8, decl.name, name)) continue;
+            const field = tree.fullContainerField(decl.node) orelse return false;
+            const kind = field.ast.type_expr.unwrap() orelse return false;
+            return spelledPointer(tree, &source.model, owner.container.scope, kind, true);
+        }
+        return false;
+    }
+
+    /// Whether a parameter's memory is left `undefined`, the parts in `left`, on some path that
+    /// returns, walking on from `mention`, which leaves them so, to the end of `body`. One that
+    /// reads it there (its own fault) is taken as leaving it.
+    fn leftUndefined(w: *Walk, mention: Ast.Node.Index, left: u64, body: Ast.Node.Index) Context.Error!bool {
+        var from: Walk = .init(w.c, w.file, w.local, true, w.depth);
+        from.every_exit = true;
+        try from.collect();
+        const past = try from.onFrom(mention, left, body);
+        return from.read != null or from.exit_unwritten or past.at == .unwritten or past.at == .done;
+    }
+
+    /// Where an alias of the local, taken before `origin` (a call that leaves it `undefined`),
+    /// may read it after: its address, or a field's or element's (`const p = &x`), or what a
+    /// method given its address returns that may hold it (`var it = x.iterator()`), bound to
+    /// a name mentioned after `origin`, or again within a loop around it, or stored anywhere
+    /// else. The alias's token, or null.
+    fn aliasAfter(w: *Walk, origin: Ast.Node.Index, scope: Ast.Node.Index) Context.Error!?Ast.TokenIndex {
+        const tree = w.tree;
+        const at = tree.nodeMainToken(origin);
+        var buffer: [1]Ast.Node.Index = undefined;
+        for (w.mentions.items) |mention| {
+            if (tree.nodeMainToken(mention) >= at) continue;
+            const place = placeOf(tree, w.model, mention);
+            if (!try w.inMemory(mention, place)) continue;
+            const holder = w.model.parentOf(place) orelse continue;
+            const value = switch (tree.nodeTag(holder)) {
+                .address_of => holder,
+                .field_access => value: {
+                    const node = w.model.parentOf(holder) orelse continue;
+                    const call = tree.fullCall(&buffer, node) orelse continue;
+                    if (call.ast.fn_expr != holder) continue;
+                    if (!holdsResult(try w.c.facts.resolve(w.file, node))) continue;
+                    // Given by value, the method holds a copy.
+                    const decl = (try w.callee(node, call)) orelse break :value node;
+                    const function = (try w.c.facts.origin(decl)) orelse decl;
+                    if (try parameter(w.c, function, 0, false) == null) continue;
+                    break :value node;
+                },
+                else => continue,
+            };
+            // Through `try`, `catch` and grouping to where the value goes.
+            var result = value;
+            while (w.model.parentOf(result)) |up| : (result = up) switch (tree.nodeTag(up)) {
+                .@"try", .grouped_expression => {},
+                .@"catch", .@"orelse" => if (tree.nodeData(up).node_and_node[0] != result) break,
+                else => break,
+            };
+            const goes = w.model.parentOf(result) orelse continue;
+            if (tree.fullCall(&buffer, goes) != null or isBlock(tree, goes)) continue;
+            const binding = w.declaredAt(goes) orelse return tree.nodeMainToken(value);
+            if (tree.fullVarDecl(goes).?.ast.init_node.unwrap() != result) return tree.nodeMainToken(value);
+            if (w.mentionedAfter(binding, origin, scope)) return tree.nodeMainToken(value);
+        }
+        return null;
+    }
+
+    /// Whether the declaration `binding` is mentioned after `origin`, or anywhere in a loop
+    /// that holds `origin` within `scope`, the local's block.
+    fn mentionedAfter(w: *const Walk, binding: Model.Declaration.Id, origin: Ast.Node.Index, scope: Ast.Node.Index) bool {
+        const tree = w.tree;
+        const at = tree.nodeMainToken(origin);
+        var first = at;
+        var up = origin;
+        while (w.model.parentOf(up)) |next| : (up = next) {
+            if (next == scope) break;
+            if (tree.fullWhile(next) != null or tree.fullFor(next) != null) first = @min(first, tree.firstToken(next));
+        }
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const ref = w.model.reference(node) orelse continue;
+            if (ref.declaration != binding) continue;
+            const token = tree.nodeMainToken(node);
+            if (token > at or token >= first) return true;
+        }
+        return false;
+    }
+
     /// Every part of the local, as a set.
     fn everyPart(w: *const Walk) u64 {
         const count: u7 = switch (w.shape) {
@@ -498,7 +709,7 @@ const Walk = struct {
         const read: Use = .{ .key = key, .effect = .read };
         // `x.a = undefined`, `x.a.b = undefined`: that part undefined again, or all of it where
         // the part is not known.
-        if (w.undefinedThrough(access)) |assign| {
+        if (try w.undefinedThrough(access)) |assign| {
             return .{ .key = w.tree.lastToken(assign), .effect = .{ .unset = if (index) |at| @as(u64, 1) << at else std.math.maxInt(u64) } };
         }
         if (w.partSet(access, field)) {
@@ -513,13 +724,17 @@ const Walk = struct {
     }
 
     /// The assignment that gives `undefined` to `access`, or to a part of it (`x.a.b = …`), or
-    /// a value holding it (`x.a = .{ .n = 0, .buf = undefined }`).
-    fn undefinedThrough(w: *const Walk, access: Ast.Node.Index) ?Ast.Node.Index {
+    /// a value holding it (`x.a = .{ .n = 0, .buf = undefined }`); not what a pointer it holds
+    /// points at (`x.items[i] = undefined`, a slice's element).
+    fn undefinedThrough(w: *Walk, access: Ast.Node.Index) Context.Error!?Ast.Node.Index {
         const tree = w.tree;
         var at = access;
         while (w.model.parentOf(at)) |up| : (at = up) switch (tree.nodeTag(up)) {
-            .field_access => if (tree.nodeData(up).node_and_token[0] != at) return null,
-            .array_access => if (tree.nodeData(up).node_and_node[0] != at) return null,
+            .field_access, .array_access => {
+                const inner = if (tree.nodeTag(up) == .field_access) tree.nodeData(up).node_and_token[0] else tree.nodeData(up).node_and_node[0];
+                if (inner != at) return null;
+                if (try w.pointerAt(at)) return null;
+            },
             .assign => {
                 const target, const value = tree.nodeData(up).node_and_node;
                 return if (target == at and holdsUndefined(tree, value)) up else null;
@@ -614,7 +829,7 @@ const Walk = struct {
             .@"return", .@"break", .@"continue", .unreachable_literal => {
                 const past = if (w.mentioned(node)) try w.simple(node, state) else state;
                 if (past.at == .done) return .done;
-                if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and !errorReturn(tree, w.model, node)) w.exit_unwritten = true;
+                if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and w.exitsBy(node)) w.exit_unwritten = true;
                 w.jump(node, past);
                 return .left;
             },
@@ -1220,7 +1435,7 @@ const Walk = struct {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
         for (w.returns.items) |each| {
-            if (each == node or errorReturn(w.tree, w.model, each)) continue;
+            if (each == node or !w.exitsBy(each)) continue;
             const token = w.tree.firstToken(each);
             if (token >= first and token <= last) w.exit_unwritten = true;
         }
@@ -1452,16 +1667,7 @@ const Walk = struct {
             };
         };
         const origin = (try w.c.facts.origin(decl)) orelse decl;
-        var index = position;
-        if (receiver) {
-            index = 0;
-        } else if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-            // A method call hands its receiver first.
-            switch (try w.c.facts.resolve(w.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-                .instance, .pointer, .optional => index += 1,
-                else => {},
-            }
-        }
+        const index = if (receiver) 0 else parameterAt(w.c, w.file, call, origin, position);
         const written: Use = .{ .key = tree.lastToken(node), .effect = .write };
         const leaves = w.failureLeaves(node, origin);
         if (try named(w.c, &std_fills, origin, index)) return if (whole and leaves) written else null;
@@ -1509,14 +1715,8 @@ const Walk = struct {
     /// they differ or one is none of these. Each keeps its own failure: one that can fail where
     /// another cannot is one the build may take.
     fn chosen(w: *Walk, node: Ast.Node.Index, call: Ast.full.Call, position: usize) Context.Error!?Choice {
-        const tree = w.tree;
         const value = try w.c.facts.resolve(w.file, call.ast.fn_expr);
         if (value != .alternatives) return null;
-        var index = position;
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try w.c.facts.resolve(w.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-            .instance, .pointer, .optional => index += 1,
-            else => {},
-        };
         var found: ?Choice = null;
         for (value.alternatives) |each| {
             const decl = switch (each) {
@@ -1524,6 +1724,7 @@ const Walk = struct {
                 else => return null,
             };
             const origin = (try w.c.facts.origin(decl)) orelse decl;
+            const index = parameterAt(w.c, w.file, call, origin, position);
             const this: Choice = if (try named(w.c, &std_fills, origin, index)) fill: {
                 if (!w.failureLeaves(node, origin)) return null;
                 break :fill .{ .fill = origin };
@@ -2202,17 +2403,101 @@ const Walk = struct {
         return false;
     }
 
-    /// Whether a `return` that is not an error's sits in `node`, for a parameter's walk.
+    /// Whether a `return` the walk sees the memory leave by (`exitsBy`) sits in `node`, for a
+    /// parameter's walk.
     fn returnsIn(w: *const Walk, node: Ast.Node.Index) bool {
         const first = w.tree.firstToken(node);
         const last = w.tree.lastToken(node);
         for (w.returns.items) |each| {
             const token = w.tree.firstToken(each);
-            if (token >= first and token <= last and !errorReturn(w.tree, w.model, each)) return true;
+            if (token >= first and token <= last and w.exitsBy(each)) return true;
         }
         return false;
     }
+
+    /// Whether the `return` at `node` is one a parameter's walk sees its memory leave by: any
+    /// but an error's, or any at all where `every_exit` asks.
+    fn exitsBy(w: *const Walk, node: Ast.Node.Index) bool {
+        return w.every_exit or !errorReturn(w.tree, w.model, node);
+    }
 };
+
+/// Whether the type `kind` spells a pointer or slice: written so, or as the name of a constant of
+/// `scope` that is one, or a choice of them (`if (a) |x| []align(x) T else []T`), where `by_name`.
+fn spelledPointer(tree: *const Ast, model: *const Model, scope: Model.Scope.Id, kind: Ast.Node.Index, by_name: bool) bool {
+    const node = ungrouped(tree, kind);
+    if (tree.fullPtrType(node) != null) return true;
+    if (tree.fullIf(node)) |choice| {
+        const otherwise = choice.ast.else_expr.unwrap() orelse return false;
+        return spelledPointer(tree, model, scope, choice.ast.then_expr, by_name) and spelledPointer(tree, model, scope, otherwise, by_name);
+    }
+    if (!by_name or tree.nodeTag(node) != .identifier) return false;
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    for (model.declarations) |decl| {
+        if (decl.kind != .variable or decl.scope != scope or !std.mem.eql(u8, decl.name, name)) continue;
+        const variable = tree.fullVarDecl(decl.node) orelse return false;
+        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+        return spelledPointer(tree, model, scope, variable.ast.init_node.unwrap() orelse return false, false);
+    }
+    return false;
+}
+
+/// The parameter of `decl`, the function a call reaches, that the call's argument at `position`
+/// is: one further for a method's call, whose receiver comes first (`page.write(w, n)`). Read
+/// by how many parameters the function has, so a receiver whose type does not resolve counts
+/// the same; a namespace's function (`S.f(x)`) has none.
+fn parameterAt(c: *Context, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl, position: usize) usize {
+    if (c.project.at(file).file.tree.nodeTag(call.ast.fn_expr) != .field_access) return position;
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return position;
+    var count: usize = 0;
+    var it = proto.iterate(tree);
+    while (it.next()) |_| count += 1;
+    return if (count == call.ast.params.len + 1) position + 1 else position;
+}
+
+/// The place a mention of a local hands on with what holds it: the local, or the field or
+/// element of it (`x.list`, `x.lists[0]`) a method is called on or whose address is taken.
+fn placeOf(tree: *const Ast, model: *const Model, mention: Ast.Node.Index) Ast.Node.Index {
+    var buffer: [1]Ast.Node.Index = undefined;
+    var place = mention;
+    while (model.parentOf(place)) |up| {
+        const inner = switch (tree.nodeTag(up)) {
+            .field_access => tree.nodeData(up).node_and_token[0],
+            .array_access => tree.nodeData(up).node_and_node[0],
+            else => break,
+        };
+        if (inner != place) break;
+        if (tree.nodeTag(up) == .field_access) if (model.parentOf(up)) |grand| if (tree.fullCall(&buffer, grand)) |call| if (call.ast.fn_expr == up) break;
+        place = up;
+    }
+    return place;
+}
+
+/// The place (`placeOf`) a mention gives a call, as the call's receiver (`x.deinit(gpa)`) or
+/// by address (`f(&x.list)`), or for a parameter's pointer, as it is (`f(p)`); null where it
+/// gives none.
+fn handedPlace(tree: *const Ast, model: *const Model, mention: Ast.Node.Index, param: bool) ?Ast.Node.Index {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const place = placeOf(tree, model, mention);
+    const holder = model.parentOf(place) orelse return null;
+    switch (tree.nodeTag(holder)) {
+        .field_access => {
+            const call = tree.fullCall(&buffer, model.parentOf(holder) orelse return null) orelse return null;
+            return if (call.ast.fn_expr == holder) place else null;
+        },
+        .address_of => {
+            const call = tree.fullCall(&buffer, model.parentOf(holder) orelse return null) orelse return null;
+            return if (std.mem.findScalar(Ast.Node.Index, call.ast.params, holder) != null) place else null;
+        },
+        else => {
+            if (!param or place != mention) return null;
+            const call = tree.fullCall(&buffer, holder) orelse return null;
+            return if (std.mem.findScalar(Ast.Node.Index, call.ast.params, place) != null) place else null;
+        },
+    }
+}
 
 /// The name a `for`'s capture at `position` binds (`|x, *slot|`), where it is a pointer's as
 /// `pointer` asks.
@@ -2418,7 +2703,6 @@ fn holderKeptBy(c: *Context, file: Project.FileId, id: Model.Declaration.Id, dep
 /// `position`) keeps what it holds: std's, but those that hand back its room, or the
 /// program's, or a dependency's, whose parameter keeps it.
 fn holderKeptThrough(c: *Context, file: Project.FileId, call: Ast.full.Call, position: ?usize, depth: u8) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
     const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
         .function => |function| function,
         else => return false,
@@ -2428,11 +2712,7 @@ fn holderKeptThrough(c: *Context, file: Project.FileId, call: Ast.full.Call, pos
         if (std.meta.eql((try c.facts.origin(found)) orelse found, origin)) return false;
     };
     if (try inStd(c, origin.file)) return true;
-    var index = position orelse 0;
-    if (position != null and tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-        .instance, .pointer, .optional => index += 1,
-        else => {},
-    };
+    const index = if (position) |at| parameterAt(c, file, call, origin, at) else 0;
     return remembered(bool, c, .{ .decl = origin, .index = index, .question = .holds }, depth + 1, holderKeptByParameter, false);
 }
 
@@ -2800,11 +3080,7 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
                 .function => |function| function,
                 else => return false,
             };
-            var index = position;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-                .instance, .pointer, .optional => index += 1,
-                else => {},
-            };
+            const index = parameterAt(c, file, call, (try c.facts.origin(decl)) orelse decl, position);
             return keepsWriter(c, (try c.facts.origin(decl)) orelse decl, index, depth);
         },
         else => return false,
@@ -2876,11 +3152,7 @@ fn keepsPointerAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth
                 .function => |function| function,
                 else => return false,
             };
-            var index = position;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-                .instance, .pointer, .optional => index += 1,
-                else => {},
-            };
+            const index = parameterAt(c, file, call, (try c.facts.origin(decl)) orelse decl, position);
             return keepsWriter(c, (try c.facts.origin(decl)) orelse decl, index, depth);
         },
     }
@@ -3109,9 +3381,14 @@ fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
 /// past the depth) shows nothing, and what was read while one was is not kept: it depends on
 /// where the reading began, and another reading may show more.
 const Calls = struct {
-    const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps, parts, needs, holds } };
+    const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps, parts, needs, holds, undefines } };
     found: std.AutoHashMapUnmanaged(Key, bool) = .empty,
     needed: std.AutoHashMapUnmanaged(Key, ?Needs) = .empty,
+    left: std.AutoHashMapUnmanaged(Key, Left) = .empty,
+    /// The `undefines` readings under way, outermost first, each with what it has shown so far;
+    /// and the outermost of them a reading under way leaned on.
+    reading: std.ArrayList(struct { key: Key, sofar: Left }) = .empty,
+    lowest: usize = std.math.maxInt(usize),
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,
 };
@@ -3136,6 +3413,69 @@ fn remembered(comptime T: type, c: *Context, key: Calls.Key, depth: u8, comptime
     if (memo.cuts == cuts) try map.put(c.allocator, key, shown);
     return shown;
 }
+
+/// What of the memory its pointer parameter `index` points at a function `decl`, the program's
+/// or std's, gives `undefined` and leaves so on some path that returns: given it there
+/// (`self.* = undefined`, a field, `@memset(…, undefined)`), or handing it, or a field of it,
+/// to such a function (`self.list.deinit(gpa)`), with nothing after writing it again on that
+/// path. An error's `return` is such a path: a caller's `catch` goes on from it. The parts are
+/// of what the parameter points at (`owner`); a reading cut short leaves all of it.
+/// A function reached again while it is being read (recursion) is taken at what its reading
+/// has shown so far, from nothing, and read again until that holds still: what some path of it
+/// gives `undefined`, whatever the recursion. Only what such a reading showed of itself is
+/// kept; a reading past the depth leaves all of it.
+fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
+    const memo = try c.facts.memo(Calls);
+    const key: Calls.Key = .{ .decl = decl, .index = index, .question = .undefines };
+    if (memo.left.get(key)) |known| return known;
+    for (memo.reading.items, 0..) |each, at| if (std.meta.eql(each.key, key)) {
+        memo.lowest = @min(memo.lowest, at);
+        return each.sofar;
+    };
+    if (depth > undefines_depth_limit) {
+        memo.cuts += 1;
+        return .{ .mask = std.math.maxInt(u64), .owner = null };
+    }
+    const at = memo.reading.items.len;
+    const lowest = memo.lowest;
+    try memo.reading.append(c.allocator, .{ .key = key, .sofar = .{ .mask = 0, .owner = null } });
+    defer _ = memo.reading.pop();
+    const cuts = memo.cuts;
+    while (true) {
+        memo.lowest = std.math.maxInt(usize);
+        const shown = try undefinesRead(c, decl, index, depth);
+        const sofar = &memo.reading.items[at].sofar;
+        const recursed = memo.lowest <= at;
+        if (!recursed or (shown.mask | sofar.mask) == sofar.mask) {
+            // Settled: kept where it leaned on no reading above it and nothing was cut.
+            const settled: Left = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
+            const above = memo.lowest < at;
+            if (!above and memo.cuts == cuts) try memo.left.put(c.allocator, key, settled);
+            memo.lowest = @min(lowest, if (above) memo.lowest else std.math.maxInt(usize));
+            return settled;
+        }
+        sofar.* = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
+    }
+}
+
+fn undefinesRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
+    const found = (try parameter(c, decl, index, true)) orelse return .{ .mask = 0, .owner = null };
+    var walk: Walk = .init(c, decl.file, found.id, true, depth);
+    try walk.collect();
+    var mask: u64 = 0;
+    for (try walk.undefinings()) |again| {
+        if (try walk.leftUndefined(again.mention, again.left, found.body)) mask |= again.left;
+    }
+    for (walk.mentions.items) |mention| {
+        const left = try walk.undoneBy(mention);
+        if (left != 0 and try walk.leftUndefined(mention, left, found.body)) mask |= left;
+    }
+    return .{ .mask = mask, .owner = walk.owner };
+}
+
+/// The parts of what a parameter points at a function leaves `undefined` (`undefines`), of
+/// `owner`'s struct or array; every bit set, all of it.
+const Left = struct { mask: u64, owner: ?Owner };
 
 /// What of the memory its pointer parameter `index` points at the program's function `decl`
 /// may read before writing it, on any path, as parts of that memory: null where it may read
