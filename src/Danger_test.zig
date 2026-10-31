@@ -2688,6 +2688,38 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A010 reads a callee's summary on its failure paths only where its error union is written in place: a named or made error union may fail as well" {
+    // `check` and `verify` return an error union through a name (`R`) and a type function
+    // (`Result(u64)`); a failure the caller drops leaves the input unbounded (19, 20). Taken
+    // with `try`, the summary holds where the call succeeds (21).
+    const found = try run(pack.integers,
+        \\const std = @import("std");
+        \\const R = error{Big}!u64;
+        \\fn Result(comptime T: type) type { return error{Big}!T; }
+        \\fn check(n: u64) R {
+        \\    if (n >= 10) return error.Big;
+        \\    return n;
+        \\}
+        \\fn verify(n: u64) Result(u64) {
+        \\    if (n >= 10) return error.Big;
+        \\    return n;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    const a: u64 = try r.takeInt(u64, .little);
+        \\    const b: u64 = try r.takeInt(u64, .little);
+        \\    const c: u64 = try r.takeInt(u64, .little);
+        \\    _ = check(a) catch 0;
+        \\    _ = verify(b) catch 0;
+        \\    _ = try check(c);
+        \\    const x = a * 1000;
+        \\    const y = b * 1000;
+        \\    const z = c * 1000;
+        \\    return x +% y +% z;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 19, 20 }, found.lines[0..found.findings]);
+}
+
 test "A010 reads a position in a table std names by a u32 index as one: a node's position converts to u32" {
     // std's `Ast.nodes` holds at most `maxInt(u32) + 1` nodes, so a position in it converts,
     // counted over it (6) or up to its length (7); the source the tree holds, in a length the

@@ -2032,8 +2032,22 @@ const Frame = struct {
         const full = callee_tree.fullFnProto(&proto_buffer, proto) orelse return null;
         const result = full.ast.return_type.unwrap() orelse return null;
         const fails = callee_tree.nodeTag(result) == .error_union or
-            (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang);
+            (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang) or
+            try mayFail(f.c, decl.file, result);
         return .{ .rows = summary.rows, .params = summary.params, .fails = fails };
+    }
+
+    /// Whether a result type named rather than written in place (`R`, `Result(u64)`) may be an
+    /// error union: it resolves to one, to a choice among types one of which is, or to nothing
+    /// known.
+    fn mayFail(c: *Context, file: Project.FileId, node: Ast.Node.Index) Error!bool {
+        return switch (try c.facts.resolve(file, node)) {
+            .error_union, .unknown => true,
+            .alternatives => |each| for (each) |one| {
+                if (one == .error_union) break true;
+            } else false,
+            else => false,
+        };
     }
 };
 
