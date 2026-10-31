@@ -608,17 +608,14 @@ const Frame = struct {
     /// or above and below half the address space. A length's range holds everywhere, so no
     /// state keeps it: it takes no room a state's limit would give another fact, and a length
     /// first read inside a loop holds at the loop's entry as well.
-    fn axioms(f: *Frame, s: State, goal: ?Lin) Error!State {
+    fn axioms(f: *Frame, space: Space, s: State, goal: ?Lin) Error!State {
         if (s.dead) return s;
         var rows: std.ArrayList(Lin) = .empty;
         try rows.appendSlice(f.a, s.rows);
         var seen: std.AutoHashMapUnmanaged(Var, void) = .empty;
         const most = Range.longest(f.width);
         for ([_][]const Lin{ s.rows, if (goal) |g| &.{g} else &.{} }) |group| for (group) |row| for (row.terms) |term| {
-            switch (f.vars.keys()[term.v]) {
-                .length, .result_length => {},
-                else => continue,
-            }
+            if (!f.isLength(space, term.v)) continue;
             if ((try seen.getOrPut(f.a, term.v)).found_existing) continue;
             const x = try single(f.a, term.v);
             try rows.append(f.a, x);
@@ -627,19 +624,37 @@ const Frame = struct {
         return .{ .rows = rows.items };
     }
 
+    /// Which variables a state is written over: the frame's own, or a summary's slots
+    /// (`slot`), which name a parameter or the result and whether it is the length.
+    const Space = enum { frame, slots };
+
+    fn isLength(f: *Frame, space: Space, v: Var) bool {
+        return switch (space) {
+            .slots => v % 2 == 1,
+            .frame => switch (f.vars.keys()[v]) {
+                .length, .result_length => true,
+                else => false,
+            },
+        };
+    }
+
     /// Whether `s` shows `goal`, the lengths' ranges with it.
     fn shows(f: *Frame, s: State, goal: Lin) Error!bool {
         if (s.dead) return true;
-        return entails(f.a, try f.axioms(s, goal), goal);
+        return entails(f.a, try f.axioms(.frame, s, goal), goal);
     }
 
     /// What holds on either path: each constraint one holds that the other shows.
     fn join(f: *Frame, x: State, y: State) Error!State {
+        return f.joinIn(.frame, x, y);
+    }
+
+    fn joinIn(f: *Frame, space: Space, x: State, y: State) Error!State {
         if (x.dead) return y;
         if (y.dead) return x;
         var out: std.ArrayList(Lin) = .empty;
-        for (x.rows) |row| if (try f.shows(y, row)) try out.append(f.a, row);
-        for (y.rows) |row| if (try f.shows(x, row)) try out.append(f.a, row);
+        for (x.rows) |row| if (try entails(f.a, try f.axioms(space, y, row), row)) try out.append(f.a, row);
+        for (y.rows) |row| if (try entails(f.a, try f.axioms(space, x, row), row)) try out.append(f.a, row);
         return .{ .rows = try canonical(f.a, out.items) };
     }
 
@@ -794,7 +809,7 @@ const Frame = struct {
         for (f.exits.items) |exit| {
             if (exit.failed or exit.state.dead) continue;
             const projected = try f.project(exit.state);
-            joined = if (joined) |j| try f.join(j, projected) else projected;
+            joined = if (joined) |j| try f.joinIn(.slots, j, projected) else projected;
         }
         const s = joined orelse {
             // No successful exit: every call that succeeds is unreachable.
