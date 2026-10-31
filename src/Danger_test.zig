@@ -95,7 +95,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\nconst File = @This();\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, file: File = undefined, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = io; _ = buffer; return .{ .file = f, .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -7353,6 +7353,86 @@ test "A015 reads a switch over an owned-or-lent union as a view where each prong
     );
     try std.testing.expectEqual(@as(usize, 0), found.undecided);
     try std.testing.expectEqualSlices(u32, &.{ 4, 10, 13 }, found.lines[0..found.findings]);
+}
+
+test "A015 judges a public type's resource field where the program writes or releases it" {
+    // a15_base: a public type's raw field says lent, and nothing here writes or releases it.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\pub const S = struct { f: std.Io.File };
+    , 0);
+    // An importer writing an owner into it, closing it, or handing an owner to a keeper that
+    // stores it in a field the keeper releases, is flagged at its own line (`opened` returns an
+    // owner too), as is closing std's `File.Reader.file`; one it is lent (a parameter, one
+    // unwrapped `orelse return`, an `own.Lent`'s `get()`), an owner the caller releases itself,
+    // one a type that never releases its field is given (a reader, lent it), or one handed to
+    // std's `File.reader`, which std's keeps as a copy it is lent, is not.
+    const lib: sources.Extra = .{ .name = "lib.zig", .bytes =
+        \\const std = @import("std");
+        \\pub const S = struct { f: std.Io.File };
+        \\pub const Keeper = struct { held: std.Io.File, pub fn keep(k: *Keeper, f: std.Io.File) void { k.held = f; } pub fn deinit(k: *Keeper) void { k.held.close(); } };
+        \\pub const Reader = struct { file: std.Io.File, pub fn init(f: std.Io.File) Reader { return .{ .file = f }; } };
+    };
+    const imports = std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "lib.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } };
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn write(s: *lib.S) void { s.f = opened(); }
+        \\pub fn close(s: *lib.S) void { s.f.close(); }
+        \\pub fn keep(k: *lib.Keeper) void { k.keep(opened()); }
+        \\pub fn lend(s: *lib.S, f: std.Io.File) void { s.f = f; }
+        \\pub fn borrowed(k: *lib.Keeper) void { const f = opened(); defer f.close(); k.keep(f); }
+        \\pub fn read() lib.Reader { return .init(opened()); }
+        \\pub fn maybe(k: *lib.Keeper, f: ?std.Io.File) void { const g = f orelse return; k.keep(g); }
+        \\pub fn lent(k: *lib.Keeper, l: aegis.own.Lent(std.Io.File)) void { k.keep(l.get()); }
+        \\pub fn stream() void { var r = opened().reader(undefined, &.{}); _ = &r; }
+        \\pub fn done(r: *std.Io.File.Reader) void { r.file.close(); }
+        \\const aegis = @import("aegis");
+    , &(std_files ++ [_]sources.Extra{lib}), &imports);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 13 }, found.lines[0..found.findings]);
+    // Passed where nothing resolves, a release of it may be one: undecided, not flagged.
+    const passed = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\const ext = @import("missing");
+        \\pub fn pass(s: *lib.S) void { ext.release(s.f); }
+        \\pub fn sync(s: *lib.S) void { ext.sync(s.f.handle); }
+    , &(std_files ++ [_]sources.Extra{lib}), &imports);
+    try std.testing.expectEqual(@as(usize, 0), passed.findings);
+    try std.testing.expectEqual(@as(usize, 2), passed.undecided);
+    // A keeper that does not resolve may keep it: undecided.
+    const doubted = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn keep(k: ext.Keeper, f: std.Io.File) void { k.keep(f); }
+        \\pub fn give(k: ext.Keeper) void { k.keep(opened()); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{3}, doubted.lines[0..doubted.findings]);
+    try std.testing.expectEqual(@as(usize, 1), doubted.undecided);
+    // A type no other file can name is judged at its field, as before.
+    const private = try run(pack.ownership,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\const S = struct { f: std.Io.File };
+        \\pub fn write(s: *S) void { s.f = opened(); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, private.lines[0..private.findings]);
+}
+
+test "A003 follows a std handle acquired raw to its release: a discard leaks it, a close or deferred close releases it" {
+    const found = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn leak() void { const file = opened(); _ = file; }
+        \\pub fn closed() void { const file = opened(); defer file.close(); }
+        \\pub fn direct() void { const file = opened(); file.close(); }
+        \\pub fn lent(f: std.Io.File) void { const file = f; _ = file; }
+        \\pub fn standard() void { const out = std.Io.File.stdout(); _ = out; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {
