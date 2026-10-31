@@ -1606,6 +1606,16 @@ test "A006 strict: a call through anything but a function is undecided" {
     try expectJudged(head ++ "fn step(bytes: []const u8) usize { return bytes.len; }\npub fn read(text: Text) usize { return step(text.readForParse()); }", pack.recursion, true, 0);
 }
 
+test "A001 finds a public source's field written in place, by name, by @field or through its address" {
+    const head = "const err = @import(\"aegis\").err;\nconst Other = struct { bytes: []const u8 };\n";
+    try expectJudged(head ++ "pub fn f(secret: []const u8) err.PublicSource { var p = err.PublicSource.classify(\"fixed label\", \"ok\"); p.bytes = secret; return p; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource, secret: []const u8) void { p.bytes = secret; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource, secret: []const u8) void { @field(p, \"bytes\") = secret; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource) *[]const u8 { return &p.bytes; }", pack.access, true, 1);
+    // Another type's field of the same name, and a read, are not.
+    try expectJudged(head ++ "pub fn f(o: *Other, p: *const err.PublicSource, secret: []const u8) usize { o.bytes = secret; return p.bytes.len; }", pack.access, true, 0);
+}
+
 test "A001 finds public text built by a literal, by the type the literal takes from its place" {
     const head = "const err = @import(\"aegis\").err;\nconst Other = struct { bytes: []const u8 };\nfn show(s: err.PublicSource) void { _ = s; }\nfn take(o: Other) void { _ = o; }\n";
     // A declaration's written type, a call's parameter, a function's result, a typed literal,
