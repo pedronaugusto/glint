@@ -1848,6 +1848,31 @@ test "A019 reads `undefined` given to a local as no write: whole, a part, a lite
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 8, 10, 12, 14, 15, 18 }, found.lines[0..found.findings]);
 }
 
+test "A019 reads `undefined` a stride or a cursor writer gives as no write: @memset's and `.* =`, each pass or each step" {
+    // Findings: strides each given `undefined` by @memset (3) or `.* =` (4); a cursor writer's
+    // step over memory @memset gave `undefined` (15). Clean: strides each set (5), a cursor
+    // writer's steps over what it copied (16).
+    const found = try run(pack.unsafe_set,
+        \\fn use(b: []const u8) void { _ = b; }
+        \\const W = struct { bytes: []u8, pos: usize = 0, fn put(self: *W, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; } };
+        \\pub fn m1() void { var out: [32]u8 = undefined; for (0..4) |i| @memset(out[8 * i ..][0..8], undefined); use(&out); }
+        \\pub fn m2() void { var out: [32]u8 = undefined; for (0..4) |i| out[8 * i ..][0..8].* = undefined; use(&out); }
+        \\pub fn m3() void { var out: [32]u8 = undefined; for (0..4) |i| @memset(out[8 * i ..][0..8], 0); use(&out); }
+        \\const S = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *S, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; }
+        \\    fn skip(self: *S, b: []const u8) void {
+        \\        @memset(self.bytes[self.pos..][0..b.len], undefined);
+        \\        self.pos += b.len;
+        \\    }
+        \\};
+        \\pub fn c1() !void { var buf: [16]u8 = undefined; var w: S = .{ .bytes = &buf }; try w.put("ab"); w.skip("cd"); use(buf[0..w.pos]); }
+        \\pub fn c2() !void { var buf: [16]u8 = undefined; var w: W = .{ .bytes = &buf }; try w.put("ab"); try w.put("cd"); use(buf[0..w.pos]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 15 }, found.lines[0..found.findings]);
+}
+
 test "A019 reads a local after a call that gives it `undefined`: a deinit's, std's, a field's through the program's own, on some path, on a loop's next pass" {
     // Findings: read after its deinit (4), std's list read after its deinit (7), a field a
     // wrapper's deinit leaves undefined (8), deinit on one path (11), std's deinit twice (12),
