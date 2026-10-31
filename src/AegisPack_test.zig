@@ -909,6 +909,29 @@ test "generic parameters are what the project's own calls pass, when no consumer
     try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f() void { const taken = look; _ = taken; }", pack.access, false, 0);
 }
 
+test "a generic method std may call on a type the program hands it binds what std passes too: its parameters are not all the program's calls" {
+    // std's `Map` calls its context's `look` with what it is given: an owner here, while the
+    // program's own call passes a plain value. Undecided, not the program's binding alone.
+    const lib = "pub fn Map(comptime C: type) type { return struct { ctx: C, pub fn put(self: *@This(), g: anytype) void { self.ctx.look(g); } }; }";
+    const extra = std_fixture ++ [_]aegis_sources.Extra{.{ .name = "std/map.zig", .bytes = lib }};
+    const imports = std_fixture_imports ++ [_]aegis_sources.ExtraImport{ .{ .from = 0, .spelling = "map.zig", .target = std_fixture.len }, .{ .spelling = "map.zig", .target = std_fixture.len } };
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, owner: u32 };\nconst lib = @import(\"map.zig\");\n";
+    for ([_]struct { []const u8, bool }{
+        .{ "const Ctx = struct { pub fn look(_: Ctx, p: anytype) void { _ = p.data; } };\npub fn f(x: *Plain, g: *G(u32)) void { const c: Ctx = .{}; c.look(x); var m: lib.Map(Ctx) = .{ .ctx = c }; m.put(g); }", false },
+        // A private method std cannot name: the program's calls are all of them.
+        .{ "const Ctx = struct { fn look(_: Ctx, p: anytype) void { _ = p.data; } };\npub fn f(x: *Plain) void { const c: Ctx = .{}; c.look(x); }", true },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case[0] });
+        defer std.testing.allocator.free(source);
+        var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &extra, &imports);
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expectEqual(case[1], report.complete);
+        try std.testing.expectEqual(@as(usize, 0), count(report, pack.access));
+    }
+}
+
 test "a type function's result written with reflection is read at its call" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst Op = struct { owner: u32 };\n";
     const reflect =
