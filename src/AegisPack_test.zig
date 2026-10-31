@@ -1895,3 +1895,9 @@ test "A006 names each call that untrusted input reaches and that does not resolv
     };
     try std.testing.expect(named);
 }
+
+test "A002 reads an array's length as a number: a literal holding it beside plain data copies no owner, beside an owner it copies that owner" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst T = struct { n: usize, tag: u8 };\nconst H = struct { n: usize, s: S(u32) };\nconst base = [_]T{.{ .n = 0, .tag = 1 }};\n";
+    try expectJudged(head ++ "pub fn f() usize { const x = base ++ [_]T{.{ .n = base.len, .tag = 2 }}; return x.len; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(h: *H) void { const copy: H = .{ .n = base.len, .s = h.s }; _ = copy; }", pack.copies, true, 1);
+}
