@@ -506,9 +506,13 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             return constant(c, .{ .file = file, .index = d }, pointer, next);
         },
         .field_access => {
-            const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
-            // A length of memory the program holds: below half the address space.
-            if (std.mem.eql(u8, name, "len")) return length(pointer);
+            // A length of memory the program holds: below half the address space where its
+            // elements take room.
+            switch (try c.facts.memoryField(file, node)) {
+                .memory => return if (try lengthWritten(c, file, tree.nodeData(node).node_and_token[0])) filled(pointer) else length(pointer),
+                .unsized => return filled(pointer),
+                .field => {},
+            }
             const decl = (try c.facts.definition(file, node)) orelse return chosen(c, file, node, pointer, next);
             return constant(c, decl, pointer, next);
         },
@@ -840,6 +844,8 @@ fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: 
     try memo.map.put(c.allocator, key, null);
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
+    // Written by another name (an address, a method, a `|*p|` capture, an `asm` output).
+    if (try addressed(c, decl.file, decl.index)) return null;
     const function = enclosing(tree, model, model.declarations[@backingInt(decl.index)].node) orelse return null;
     const first = tree.firstToken(function);
     const last = tree.lastToken(function);
@@ -853,13 +859,21 @@ fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: 
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
         switch (tag) {
-            .address_of => if (namesDecl(model, tree, tree.nodeData(node).node, decl)) {
-                out = null;
-            },
             .assign => {
                 const target, const value = tree.nodeData(node).node_and_node;
                 if (!namesDecl(model, tree, target, decl) or empty(tree, value)) continue;
                 out = wider(out, try bound(c, decl.file, value, pointer, depth));
+            },
+            // `x, y = .{ a, b }`: each its element; from anything else, unknown.
+            .assign_destructure => {
+                const parts = tree.assignDestructure(node);
+                var buffer: [2]Ast.Node.Index = undefined;
+                const elements = tree.fullArrayInit(&buffer, parts.ast.value_expr);
+                for (parts.ast.variables, 0..) |variable_node, at| {
+                    if (!namesDecl(model, tree, variable_node, decl)) continue;
+                    const each = if (elements) |l| (if (l.ast.elements.len == parts.ast.variables.len) l.ast.elements[at] else null) else null;
+                    out = if (each) |given| (if (empty(tree, given)) out else wider(out, try bound(c, decl.file, given, pointer, depth))) else null;
+                }
             },
             .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
                 if (namesDecl(model, tree, tree.nodeData(node).node_and_node[0], decl)) out = null;
@@ -1231,7 +1245,7 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
             };
         },
         .identifier, .field_access => {
-            if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "len")) return .{ .int = .{ .bits = pointer, .signed = false } };
+            if (try c.facts.memoryField(file, node) != .field) return .{ .int = .{ .bits = pointer, .signed = false } };
             const decl = (try c.facts.definition(file, node)) orelse if (tree.nodeTag(node) == .identifier) blk: {
                 const ref = c.project.at(file).model.reference(node) orelse break :blk null;
                 break :blk if (ref.declaration) |d| Facts.Decl{ .file = file, .index = d } else null;
@@ -2925,6 +2939,39 @@ fn structured(c: *Context, file: Project.FileId, root: Ast.Node.Index) Context.E
 /// binds a pointer into it (`if (x) |*p|`), or an `asm` output names it. Found once per
 /// declaration.
 const Addressed = struct { map: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Declaration.Id }, bool) = .empty };
+
+/// Each file's declarations whose memory's length is written in place (`s.len = n`,
+/// `@field(s, "len") = n`), found once per file.
+const LengthWrites = struct { files: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Model.Declaration.Id, void)) = .empty };
+
+/// Whether the memory `memory` names may hold a length no build checks: one written in place,
+/// or written by another name for it (its address taken). Such a length is any `usize`.
+fn lengthWritten(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    // An array's length is its type's.
+    if (try c.facts.resolve(file, memory) == .array) return false;
+    const d = rootOf(tree, model, memory) orelse return false;
+    if (try addressed(c, file, d)) return true;
+    const memo = try c.facts.memo(LengthWrites);
+    const entry = try memo.files.getOrPut(c.allocator, file);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .empty;
+        for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
+                const target = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node[0];
+                const holder = switch (tree.nodeTag(target)) {
+                    .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), "len")) tree.nodeData(target).node_and_token[0] else continue,
+                    .builtin_call_two, .builtin_call_two_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) tree.nodeData(target).opt_node_and_opt_node[0].unwrap() orelse continue else continue,
+                    else => continue,
+                };
+                if (rootOf(tree, model, holder)) |held_by| try entry.value_ptr.put(c.allocator, held_by, {});
+            },
+            else => {},
+        };
+    }
+    return entry.value_ptr.contains(d);
+}
 
 fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error!bool {
     const memo = try c.facts.memo(Addressed);

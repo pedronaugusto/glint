@@ -3100,6 +3100,99 @@ pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl 
     return null;
 }
 
+/// What a field `len` or `ptr` reads. `memory`: the length (or the address) of an array or a
+/// slice (or one a single pointer reaches) whose elements take room, so one object's count of
+/// them is below half the address space. `unsized`: a length of memory whose elements may
+/// take none (`[]const void`, a struct of no field that takes room, an array of an unknown
+/// count), any `usize`. `field`: no memory's, a field a container declares by that name, or
+/// a receiver whose type does not resolve, which holds what that field holds.
+pub const Length = enum { field, memory, unsized };
+
+pub fn memoryField(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Length {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .field_access) return .field;
+    const receiver, const name = tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(name), "len") and !std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .field;
+    return self.lengthOfValue(try self.resolve(file, receiver), tree.tokenSlice(name));
+}
+
+/// Whether the memory a value of `value`'s type holds (a function's result through its error
+/// union or optional) has a length below half the address space: `memoryField`'s `memory`.
+pub fn sizedMemory(self: *Facts, value: Value) ResolveError!bool {
+    return switch (value) {
+        .error_union, .optional => |inner| self.sizedMemory(inner.*),
+        else => try self.lengthOfValue(value, "len") == .memory,
+    };
+}
+
+fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!Length {
+    switch (value) {
+        // A string literal's bytes.
+        .scalar => return .memory,
+        .array => |each| return if (try self.sized(each.*, 0)) .memory else .unsized,
+        .pointer => |inner| switch (inner.*) {
+            // A single pointer to a container reads its field; a slice of one, its count.
+            // The value is the same for both, so a container that declares `len` is read
+            // as declaring it.
+            .instance, .container => |k| {
+                if (self.member(k, name) != null) return .field;
+                return if (try self.sized(inner.*, 0)) .memory else .unsized;
+            },
+            // A pointer to an array or a slice, or a slice of them: the count is of
+            // what the inner one holds for the first, of the inner one for the second.
+            // An array's own size is its count's, which the value does not hold.
+            .array => return .unsized,
+            .unknown, .literal, .reified, .reflected, .alternatives => return .field,
+            else => return if (try self.sized(inner.*, 0)) .memory else .unsized,
+        },
+        .alternatives => |each| {
+            var out: Length = .memory;
+            for (each) |one| switch (try self.lengthOfValue(one, name)) {
+                .field => return .field,
+                .unsized => out = .unsized,
+                .memory => {},
+            };
+            return out;
+        },
+        else => return .field,
+    }
+}
+
+/// Whether a value of `value`'s type takes room: a known primitive wider than zero bits, a
+/// pointer to such, an optional, an error, or a container with a field (two for an enum)
+/// that takes room. What does not resolve may take none.
+fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
+    if (depth > 4) return false;
+    switch (value) {
+        .primitive => |p| {
+            if (p.len > 1 and (p[0] == 'u' or p[0] == 'i')) if (std.fmt.parseInt(u16, p[1..], 10)) |bits| return bits > 0 else |_| {};
+            for ([_][]const u8{ "bool", "usize", "isize", "f16", "f32", "f64", "f80", "f128", "c_char", "c_short", "c_ushort", "c_int", "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong", "c_longdouble", "anyerror" }) |one| if (std.mem.eql(u8, p, one)) return true;
+            return false;
+        },
+        .pointer => |inner| return (inner.* == .primitive and std.mem.eql(u8, inner.primitive, "anyopaque")) or try self.sized(inner.*, depth + 1),
+        .optional, .error_union, .error_set, .function, .fn_type => return true,
+        .instance, .container => |k| {
+            const model = &self.project.at(k.file).model;
+            const tree = &self.project.at(k.file).file.tree;
+            const scope = model.scopes[@backingInt(k.scope)];
+            if (scope.kind != .container) return false;
+            const is_enum = tree.tokenTag(tree.nodeMainToken(scope.node)) == .keyword_enum;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const container = tree.fullContainerDecl(&buffer, scope.node) orelse return false;
+            var fields: usize = 0;
+            for (container.ast.members) |item| {
+                const field = tree.fullContainerField(item) orelse continue;
+                fields += 1;
+                if (is_enum) continue;
+                const t = field.ast.type_expr.unwrap() orelse continue;
+                if (try self.sized(try self.instance(try self.resolve(k.file, t)), depth + 1)) return true;
+            }
+            return is_enum and fields > 1;
+        },
+        else => return false,
+    }
+}
+
 /// The container whose declaration a declaration literal at `node` names (`.init(...)`): the
 /// one its result location gives it, through `try` and the error union or optional around it.
 /// A variable's declared type, a returned value's function result, a struct literal's field's
