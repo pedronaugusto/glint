@@ -26,6 +26,7 @@ test {
     _ = Fix;
     _ = @import("Facts.zig");
     _ = @import("Taint.zig");
+    _ = @import("Undefined.zig");
     _ = token;
     _ = cli;
 }

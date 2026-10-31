@@ -126,7 +126,7 @@ fn checkStateMachines(c: *Context) Context.Error!void {
 fn checkUnsafeSet(c: *Context) Context.Error!void {
     if (!try begin(c, unsafe_set)) return;
     try Danger.unsafeSet(c, unsafe_set);
-    try Undefined.reads(c, unsafe_set);
+    try Undefined.reads(c, unsafe_set, followsCleanup);
 }
 fn checkRecursion(c: *Context) Context.Error!void {
     if (!try begin(c, recursion)) return;
@@ -604,14 +604,7 @@ fn releaseName(k: Contract.Kind, name: []const u8) bool {
     return false;
 }
 fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.TokenIndex) Context.Error!?Contract.Kind {
-    if (try Contract.owner(c, node)) |k| return k;
-    const value = try c.facts.resolve(c.file, node);
-    // A type chosen at compile time is one type per build: an operation on it is the
-    // owner's in the builds that choose the owner. Cleanup is owed along the paths of those
-    // builds, which are every path unless the function branches on a comptime condition
-    // (`if (wrapped) owner.deinit();`); then A003 leaves a choice that disagrees undecided.
-    const read = if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
-    switch (read) {
+    switch (try ownerKind(c, node, rule)) {
         .owner => |k| return k,
         .other => return null,
         // Unresolved, it may be an owner the program's own function returns, whatever aegis
@@ -622,6 +615,16 @@ fn requiredOwner(c: *Context, node: Ast.Node.Index, rule: Rule, token: Ast.Token
             return null;
         },
     }
+}
+/// What owner `node` is for `rule`: its contract's, or what its type reads as.
+fn ownerKind(c: *Context, node: Ast.Node.Index, rule: Rule) Context.Error!Typed {
+    if (try Contract.owner(c, node)) |k| return .{ .owner = k };
+    const value = try c.facts.resolve(c.file, node);
+    // A type chosen at compile time is one type per build: an operation on it is the
+    // owner's in the builds that choose the owner. Cleanup is owed along the paths of those
+    // builds, which are every path unless the function branches on a comptime condition
+    // (`if (wrapped) owner.deinit();`); then A003 leaves a choice that disagrees undecided.
+    return if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
 /// Two readings of what parts or alternatives hold, as one: unknown stays unknown, one owner
@@ -1608,29 +1611,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
     const model = &c.project.at(c.file).model;
     for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup);
     for (model.declarations) |decl| {
-        if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .block) continue;
-        const v = tree.fullVarDecl(decl.node) orelse continue;
-        const init = v.ast.init_node.unwrap() orelse continue;
-        // Only actual acquisition expressions, never an owner alias or type alias: an owner's
-        // constructor, a guard's acquisition, or a function of the program's own that returns
-        // an owner. One that fails holds nothing: `try` and `catch` leave the acquisition itself.
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const acquisition = switch (tree.nodeTag(init)) {
-            .@"try" => tree.nodeData(init).node,
-            .@"catch", .@"orelse" => tree.nodeData(init).node_and_node[0],
-            else => init,
-        };
-        const acquired = tree.fullCall(&call_buffer, acquisition) orelse continue;
-        // By a function of the generic's type parameter: each binding's, checked at the binding.
-        if (c.facts.madeByParameter(c.file, init) != null) continue;
-        const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
-            const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
-            break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
-        };
-        if (!named and !try givesOwner(c, acquisition, acquired.ast.fn_expr)) continue;
-        if (try unlisted(c, acquisition)) continue;
-        const k = (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse continue;
-        if (releases(k) == null) continue;
+        const k = (try acquiredOwner(c, tree, model, decl, true)) orelse continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, model.scopes[@backingInt(decl.scope)].node) orelse continue;
         const at = for (statements, 0..) |stmt, i| {
@@ -1642,6 +1623,52 @@ fn checkCleanup(c: *Context) Context.Error!void {
             .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
+}
+
+/// The kind of owner A003 follows the local `decl` as, from its acquisition to block end: a
+/// block's local initialised by an actual acquisition expression, never an owner alias or type
+/// alias (an owner's constructor, a guard's acquisition, or a function of the program's own that
+/// returns an owner), of a kind with a release. One that fails holds nothing: `try` and `catch`
+/// leave the acquisition itself. `report`: whether a receiver that does not resolve is reported
+/// undecided, as A003's own.
+fn acquiredOwner(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration, report: bool) Context.Error!?Contract.Kind {
+    if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .block) return null;
+    const v = tree.fullVarDecl(decl.node) orelse return null;
+    const init = v.ast.init_node.unwrap() orelse return null;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const acquisition = switch (tree.nodeTag(init)) {
+        .@"try" => tree.nodeData(init).node,
+        .@"catch", .@"orelse" => tree.nodeData(init).node_and_node[0],
+        else => init,
+    };
+    const acquired = tree.fullCall(&call_buffer, acquisition) orelse return null;
+    // By a function of the generic's type parameter: each binding's, checked at the binding.
+    if (c.facts.madeByParameter(c.file, init) != null) return null;
+    const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
+        const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
+        break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
+    };
+    if (!named and !try givesOwner(c, acquisition, acquired.ast.fn_expr)) return null;
+    if (try unlisted(c, acquisition)) return null;
+    const k = if (report)
+        (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse return null
+    else switch (try ownerKind(c, acquisition, cleanup)) {
+        .owner => |k| k,
+        .other, .unknown => return null,
+    };
+    if (releases(k) == null) return null;
+    return k;
+}
+
+/// Whether A003 follows the local `decl` from its acquisition (`acquiredOwner`) on this file,
+/// where it runs: a use of it after its cleanup is then A003's to report or leave undecided, and
+/// A019 leaves it there. Anything short of that, a limit or a receiver that does not resolve
+/// among it, leaves the local A019's.
+fn followsCleanup(c: *Context, decl: Model.Declaration) Context.Error!bool {
+    if (!c.config.has(cleanup)) return false;
+    if (try c.inLibrary(Contract.library, c.file)) return false;
+    const tree = try c.project.syntax(try c.source());
+    return try acquiredOwner(c, tree, &c.project.at(c.file).model, decl, false) != null;
 }
 
 /// Whether the local declared at `site` is initialised by an acquisition: an owner's

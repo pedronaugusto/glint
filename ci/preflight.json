@@ -32,7 +32,8 @@
     ],
     "escapes": {
       "no-danger": 2,
-      "internal": 1
+      "internal": 1,
+      "design": 2
     }
   },
   "fuzz": {

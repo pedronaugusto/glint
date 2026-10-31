@@ -34,7 +34,7 @@ const std_files = [_]sources.Extra{
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } pub fn readLink(dir: Dir, io: anytype, sub_path: []const u8, buffer: []u8) !usize { _ = dir; _ = io; _ = sub_path; _ = buffer; return 0; } };
-    \\pub const Writer = struct { end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
+    \\pub const Writer = struct { buffer: []u8 = &.{}, end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { return .{ .buffer = buffer }; } pub fn buffered(w: *const Writer) []u8 { return w.buffer[0..w.end]; } pub fn unusedCapacitySlice(w: *const Writer) []u8 { return w.buffer[w.end..]; } };
     \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
@@ -97,7 +97,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
-    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
+    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/Io/Reader.zig", .bytes =
@@ -1846,6 +1846,129 @@ test "A019 reads what a C call writes by its contract: the error number it answe
         \\pub fn c2(src: *std.Io.Reader) !u8 { var buf: [16]u8 = undefined; try std.Io.Reader.readSliceAll(src, &buf); return buf[15]; }
     );
     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 6, 7, 8, 10, 11, 12, 17 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads `undefined` given to a local as no write: whole, a part, a literal's field, @memset's, again after a write and on a loop's next pass; and nothing in @TypeOf runs" {
+    // Findings: given `undefined` after a write on some paths (5), after a write on all (6), a
+    // part given it (8), a literal's field (10), @memset's (12), init(*Self)'s literal leaving a
+    // field undefined (14), a fill only @TypeOf names (15), a loop's next pass reading what the
+    // last gave `undefined` (18). Clean: written again after (7), only the other part read (9,
+    // 11), written after @memset's (13), @TypeOf of the local (16), a deferred one at the scope's
+    // end (17), written on each pass first (19).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const S = struct { a: u32, b: u32 };
+        \\const T = struct { n: u32, buf: [8]u8, fn init(self: *T) void { self.* = .{ .n = 0, .buf = undefined }; } };
+        \\fn fill(p: *[4]u8) void { p.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn w1(c: bool) u32 { var x: u32 = undefined; if (c) x = 1; x = undefined; return x + 1; }
+        \\pub fn w2() u32 { var x: u32 = undefined; x = 1; x = undefined; return x; }
+        \\pub fn w3() u32 { var x: u32 = undefined; x = 1; x = undefined; x = 2; return x; }
+        \\pub fn p1() u32 { var s: S = undefined; s.a = 1; s.b = undefined; return s.a + s.b; }
+        \\pub fn p2() u32 { var s: S = undefined; s.a = 1; s.b = undefined; return s.a; }
+        \\pub fn l1() u32 { var s: S = .{ .a = 1, .b = undefined }; s.a += 1; return s.b; }
+        \\pub fn l2() u32 { var s: S = .{ .a = 1, .b = undefined }; s.a += 1; return s.a; }
+        \\pub fn m1(c: bool) u8 { var buf: [4]u8 = undefined; if (c) buf[0] = 1; @memset(&buf, undefined); return buf[3]; }
+        \\pub fn m2() u8 { var buf: [4]u8 = undefined; @memset(&buf, undefined); @memset(&buf, 0); return buf[3]; }
+        \\pub fn n1() u8 { var t: T = undefined; t.init(); return t.buf[3]; }
+        \\pub fn t1() u8 { var buf: [4]u8 = undefined; const K = @TypeOf(fill(&buf)); if (K != void) return 0; return buf[3]; }
+        \\pub fn t2() u8 { var buf: [4]u8 = undefined; const K = @TypeOf(buf); _ = K; fill(&buf); return buf[3]; }
+        \\pub fn d1() u8 { var buf: [4]u8 = undefined; fill(&buf); defer buf = undefined; return buf[0]; }
+        \\pub fn r1(n: usize) void { var x: u32 = undefined; x = 0; var i: usize = 0; while (i < n) : (i += 1) { const y = x; x = undefined; _ = y; } }
+        \\pub fn r2(n: usize) void { var x: u32 = undefined; var i: usize = 0; while (i < n) : (i += 1) { x = 1; const y = x; x = undefined; _ = y; } }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 8, 10, 12, 14, 15, 18 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads `undefined` a stride or a cursor writer gives as no write: @memset's and `.* =`, each pass or each step" {
+    // Findings: strides each given `undefined` by @memset (3) or `.* =` (4); a cursor writer's
+    // step over memory @memset gave `undefined` (15). Clean: strides each set (5), a cursor
+    // writer's steps over what it copied (16).
+    const found = try run(pack.unsafe_set,
+        \\fn use(b: []const u8) void { _ = b; }
+        \\const W = struct { bytes: []u8, pos: usize = 0, fn put(self: *W, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; } };
+        \\pub fn m1() void { var out: [32]u8 = undefined; for (0..4) |i| @memset(out[8 * i ..][0..8], undefined); use(&out); }
+        \\pub fn m2() void { var out: [32]u8 = undefined; for (0..4) |i| out[8 * i ..][0..8].* = undefined; use(&out); }
+        \\pub fn m3() void { var out: [32]u8 = undefined; for (0..4) |i| @memset(out[8 * i ..][0..8], 0); use(&out); }
+        \\const S = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *S, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; }
+        \\    fn skip(self: *S, b: []const u8) void {
+        \\        @memset(self.bytes[self.pos..][0..b.len], undefined);
+        \\        self.pos += b.len;
+        \\    }
+        \\};
+        \\pub fn c1() !void { var buf: [16]u8 = undefined; var w: S = .{ .bytes = &buf }; try w.put("ab"); w.skip("cd"); use(buf[0..w.pos]); }
+        \\pub fn c2() !void { var buf: [16]u8 = undefined; var w: W = .{ .bytes = &buf }; try w.put("ab"); try w.put("cd"); use(buf[0..w.pos]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 15 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a local after a call that gives it `undefined`: a deinit's, std's, a field's through the program's own, on some path, on a loop's next pass" {
+    // Findings: read after its deinit (4), std's list read after its deinit (7), a field a
+    // wrapper's deinit leaves undefined (8), deinit on one path (11), std's deinit twice (12),
+    // the next pass reading what the last gave `undefined` (13). Clean: read before (5), written
+    // whole again after (6), a part the deinit leaves written (9), a reset that writes it again
+    // (10), a deferred deinit (14).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const S = struct { n: u32, fn deinit(self: *S) void { self.* = undefined; } };
+        \\const L = struct { a: std.ArrayList(u8) = .{}, b: u32 = 0, fn deinit(self: *L) void { self.a.deinit(0); } fn reset(self: *L) void { self.deinit(); self.* = .{}; } };
+        \\pub fn k1() u32 { var s: S = undefined; s.n = 1; s.deinit(); return s.n; }
+        \\pub fn k2() u32 { var s: S = undefined; s.n = 1; const n = s.n; s.deinit(); return n; }
+        \\pub fn k3() u32 { var s: S = .{ .n = 1 }; s.deinit(); s = .{ .n = 2 }; return s.n; }
+        \\pub fn k4() usize { var l: std.ArrayList(u8) = .{}; l.deinit(0); return l.items.len; }
+        \\pub fn k5() usize { var l: L = .{}; l.deinit(); return l.a.items.len; }
+        \\pub fn k6() u32 { var l: L = .{}; l.deinit(); return l.b; }
+        \\pub fn k7() usize { var l: L = .{}; l.reset(); return l.a.items.len; }
+        \\pub fn k8(c: bool) u32 { var s: S = .{ .n = 1 }; if (c) s.deinit(); return s.n; }
+        \\pub fn k9() void { var l: std.ArrayList(u8) = .{}; l.deinit(0); l.deinit(0); }
+        \\pub fn k10(n: usize) void { var s: S = .{ .n = 1 }; for (0..n) |_| { s.n += 1; s.deinit(); } }
+        \\pub fn k11() u32 { var s: S = .{ .n = 1 }; defer s.deinit(); return s.n; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 4, 7, 8, 11, 12, 13 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a fill that may stop early as none: a `for` setting each element that may leave, an error set's error returned as a value, a labeled switch dispatching again into the prong its check guards" {
+    // Findings: the extern (2), a `for` setting each element that may `break` (5) or `continue`
+    // an outer loop (7), a function answering an error set returning before its write (8), a
+    // `continue :sw .SUCCESS` from a failure into the success prong (10). Clean: a `continue` of
+    // the setting loop itself (6), an error union's error left by `try` (9), the prongs entered
+    // only by the errno's value (11).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\extern "c" fn @"fstat$INODE64"(fd: c_int, buf: *std.c.Stat) c_int;
+        \\fn early(p: *[4]u8, c: bool) anyerror { if (c) return error.Skipped; p.* = .{ 1, 2, 3, 4 }; return error.Done; }
+        \\fn failing(p: *[4]u8, c: bool) !void { if (c) return error.Skipped; p.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn f1(stop: bool) u8 { var buf: [4]u8 = undefined; for (&buf) |*b| { b.* = 0; if (stop) break; } return buf[3]; }
+        \\pub fn f2(stop: bool) u8 { var buf: [4]u8 = undefined; for (&buf) |*b| { b.* = 0; if (stop) continue; } return buf[3]; }
+        \\pub fn f3(stop: bool) u8 { var buf: [4]u8 = undefined; outer: for (0..2) |_| { for (&buf) |*b| { b.* = 0; if (stop) continue :outer; } } return buf[3]; }
+        \\pub fn e1(c: bool) u8 { var buf: [4]u8 = undefined; if (early(&buf, c) == error.Never) return 0; return buf[3]; }
+        \\pub fn e2(c: bool) !u8 { var buf: [4]u8 = undefined; try failing(&buf, c); return buf[3]; }
+        \\pub fn s1(fd: c_int) u64 { var st: std.c.Stat = undefined; const rc = @"fstat$INODE64"(fd, &st); sw: switch (std.c.errno(rc)) { .SUCCESS => return st.ino, .AGAIN => continue :sw .SUCCESS, else => return 0 } }
+        \\pub fn s2(fd: c_int) u64 { var st: std.c.Stat = undefined; const rc = @"fstat$INODE64"(fd, &st); switch (std.c.errno(rc)) { .SUCCESS => return st.ino, .AGAIN => return 1, else => return 0 } }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7, 8, 10 }, found.lines[0..found.findings]);
+}
+
+test "A019 keeps what a holder keeps only where nothing hands it back unwritten: its memory field, its room, a function returning either" {
+    // Findings: the writer's buffer read past what it wrote (5), its room (7), a function
+    // returning the writer's buffer (8), one returning its room (10). Clean: what it wrote
+    // (6), the writer handed to a function that only writes through it, then its count read
+    // (9).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn view(p: *[16]u8) []u8 { const w: std.Io.Writer = .fixed(p); return w.buffer; }
+        \\fn emit(w: *std.Io.Writer) !void { try w.writeAll("ab"); }
+        \\fn room(w: *std.Io.Writer) []u8 { return w.unusedCapacitySlice(); }
+        \\pub fn h1() !u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.buffer[10]; }
+        \\pub fn h2() !usize { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.buffered().len; }
+        \\pub fn h3() !u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.unusedCapacitySlice()[0]; }
+        \\pub fn h4() u8 { var buf: [16]u8 = undefined; const s = view(&buf); return s[10]; }
+        \\pub fn h5() !usize { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try emit(&w); return w.end; }
+        \\pub fn h6() u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); return room(&w)[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7, 8, 10 }, found.lines[0..found.findings]);
 }
 
 test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
