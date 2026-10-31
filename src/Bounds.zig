@@ -459,6 +459,10 @@ const Value = struct {
     lin: ?Lin = null,
     length: ?Lin = null,
     unwrapped: []const Lin = &.{},
+    /// Its length is the program's word, not memory shown to hold it: a many-item or C
+    /// pointer sliced (`p[0..n]`), or a length stored (`s.len = n`). Such a length counts no
+    /// work the function holds (`counted`).
+    claimed: bool = false,
 };
 
 const Target = struct {
@@ -498,6 +502,8 @@ const Frame = struct {
     decls: std.AutoHashMapUnmanaged(Ast.TokenIndex, Model.Declaration.Id) = .empty,
     /// The variables whose type's range a state was given since last assigned.
     typed_vars: std.AutoHashMapUnmanaged(Var, void) = .empty,
+    /// The length variables whose value is claimed, not held (`Value.claimed`).
+    claimed: std.AutoHashMapUnmanaged(Var, void) = .empty,
     /// Whether the function returns an integer, or an error union or optional of one.
     returns_int: bool = false,
     /// Each `for` loop's count of passes, read once before them.
@@ -610,7 +616,8 @@ const Frame = struct {
     }
 
     /// `s` with what holds of every length it or `goal` reads: one object's length is at zero
-    /// or above and below half the address space. A length's range holds everywhere, so no
+    /// or above and below half the address space (a claimed one, `Value.claimed`, only the
+    /// first). A length's range holds everywhere, so no
     /// state keeps it: it takes no room a state's limit would give another fact, and a length
     /// first read inside a loop holds at the loop's entry as well.
     fn axioms(f: *Frame, space: Space, s: State, goal: ?Lin) Error!State {
@@ -624,6 +631,9 @@ const Frame = struct {
             if ((try seen.getOrPut(f.a, term.v)).found_existing) continue;
             const x = try single(f.a, term.v);
             try rows.append(f.a, x);
+            // A claimed length (`s.len = n`, a many-item pointer's slice) is no object's: any
+            // `usize`.
+            if (space == .frame and f.claimed.contains(term.v)) continue;
             if (most <= std.math.maxInt(Coef)) if (try atLeast(f.a, constant(@intCast(most)), x)) |row_most| try rows.append(f.a, row_most);
         };
         return .{ .rows = rows.items };
@@ -698,7 +708,7 @@ const Frame = struct {
         if (try f.holds(s, try atLeast(f.a, short, x)) and try f.holds(s, try plus(f.a, x, short))) return f.record(node, .count, true);
         if (try f.holds(s, try atLeast(f.a, x, constant(0)))) {
             for (f.vars.keys(), f.vars.values()) |key, v| {
-                if (key != .length) continue;
+                if (key != .length or f.claimed.contains(v)) continue;
                 if (try f.holds(s, try atLeast(f.a, try single(f.a, v), x))) return f.record(node, .count, true);
             }
         }
@@ -915,6 +925,7 @@ const Frame = struct {
         var out = try f.assign(s, try f.variable(.{ .value = d }), if (int != null) value.lin else null, int);
         const length = try f.variable(.{ .length = d });
         out = try f.assign(out, length, value.length, null);
+        if (value.claimed) try f.claimed.put(f.a, length, {}) else _ = f.claimed.remove(length);
         return out;
     }
 
@@ -922,6 +933,7 @@ const Frame = struct {
         const tag = f.tree.nodeTag(node);
         const target, const rhs = f.tree.nodeData(node).node_and_node;
         const d = f.trackedName(target) orelse {
+            if (try f.lengthStored(target)) |memory| return f.storeLength(s, node, target, rhs, memory);
             // A store to memory: what it reads is evaluated, and no tracked variable changes.
             const place = try f.eval(s, target);
             return (try f.eval(place.s, rhs)).s;
@@ -934,7 +946,13 @@ const Frame = struct {
         }
         const v = try f.variable(.{ .value = d });
         const current = try f.name(e.s, target);
-        const op: Ast.Node.Tag = switch (tag) {
+        const result = try f.arith(current.s, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
+        return f.assign(result.s, v, result.v.lin, int);
+    }
+
+    /// The operation a compound assignment applies (`+=` adds).
+    fn opOf(tag: Ast.Node.Tag) Ast.Node.Tag {
+        return switch (tag) {
             .assign_add => .add,
             .assign_add_wrap => .add_wrap,
             .assign_add_sat => .add_sat,
@@ -953,8 +971,6 @@ const Frame = struct {
             .assign_bit_or => .bit_or,
             else => .bit_xor,
         };
-        const result = try f.arith(current.s, node, op, current.v.lin, e.v.lin, rhs, int);
-        return f.assign(result.s, v, result.v.lin, int);
     }
 
     fn destructure(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
@@ -973,6 +989,53 @@ const Frame = struct {
             out = (try f.eval(out, target)).s;
         }
         return out;
+    }
+
+    /// Whether `memory` names a tracked declaration whose length is claimed.
+    fn lengthClaimed(f: *Frame, memory: Ast.Node.Index) bool {
+        const d = f.trackedName(memory) orelse return false;
+        const v = f.known(.{ .length = d }) orelse return false;
+        return f.claimed.contains(v);
+    }
+
+    /// Whether `node` is memory with a length: a slice or an array, `len` its length.
+    fn holdsLength(f: *Frame, node: Ast.Node.Index) Error!bool {
+        return switch (try memoryKind(f.c, f.file, node, 0)) {
+            .checked, .sentinel => true,
+            .unchecked, .unknown => false,
+        };
+    }
+
+    /// The tracked slice whose length a store to `target` sets: `s.len = n`, or
+    /// `@field(s, name)`, whose name may be `len`.
+    fn lengthStored(f: *Frame, target: Ast.Node.Index) Error!?Model.Declaration.Id {
+        switch (f.tree.nodeTag(target)) {
+            .field_access => {
+                const holder, const member = f.tree.nodeData(target).node_and_token;
+                if (!std.mem.eql(u8, f.tree.tokenSlice(member), "len")) return null;
+                const d = f.trackedName(holder) orelse return null;
+                return if (try f.holdsLength(holder)) d else null;
+            },
+            .builtin_call_two, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "@field")) return null;
+                return f.trackedName(f.tree.nodeData(target).opt_node_and_opt_node[0].unwrap() orelse return null);
+            },
+            else => return null,
+        }
+    }
+
+    /// `s.len = n` (or `op=`): the slice's length takes the value; through `@field`, whose name
+    /// is read as the program compiles, nothing is known of it.
+    fn storeLength(f: *Frame, s: State, node: Ast.Node.Index, target: Ast.Node.Index, rhs: Ast.Node.Index, d: Model.Declaration.Id) RunError!State {
+        const tag = f.tree.nodeTag(node);
+        const e = try f.eval(s, rhs);
+        const v = try f.variable(.{ .length = d });
+        try f.claimed.put(f.a, v, {});
+        if (f.tree.nodeTag(target) != .field_access) return f.assign(e.s, v, null, null);
+        if (tag == .assign) return f.assign(e.s, v, e.v.lin, null);
+        const int = try f.intOf(target);
+        const result = try f.arith(e.s, node, opOf(tag), try single(f.a, v), e.v.lin, rhs, int);
+        return f.assign(result.s, v, result.v.lin, null);
     }
 
     /// The tracked declaration an identifier names, where it names one.
@@ -1112,7 +1175,8 @@ const Frame = struct {
     fn field(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         const holder, const field_token = f.tree.nodeData(node).node_and_token;
         const e = try f.eval(s, holder);
-        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len")) return f.fresh(e.s, node, 0);
+        // `len` is a slice's or an array's length; a struct's own field of that name is a field.
+        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder)) return f.fresh(e.s, node, 0);
         const measured = try f.lengthOf(e.s, holder, e.v);
         return .{ .s = measured[0], .v = .{ .lin = measured[1] } };
     }
@@ -1138,6 +1202,11 @@ const Frame = struct {
     /// What evaluating `memory` gave of its length, an array's fixed length, or a tracked
     /// slice's length variable.
     fn knownLength(f: *Frame, s: State, memory: Ast.Node.Index, value: Value) Error!struct { State, ?Lin } {
+        // A many-item or C pointer has no length, and memory of a type not read has none known.
+        switch (try memoryKind(f.c, f.file, memory, 0)) {
+            .checked, .sentinel => {},
+            .unchecked, .unknown => return .{ s, null },
+        }
         if (value.length) |known_length| return .{ s, known_length };
         if (try Range.memoryLength(f.c, f.file, memory)) |fixed| if (fixed <= std.math.maxInt(Coef)) return .{ s, constant(@intCast(fixed)) };
         const d = f.trackedName(memory) orelse return .{ s, null };
@@ -1153,7 +1222,8 @@ const Frame = struct {
         var out = measured[0];
         if (i.v.lin) |position| if (measured[1]) |length| {
             const low = try atLeast(f.a, position, constant(0));
-            const high = try above(f.a, length, position);
+            // Memory with a sentinel reads it at its length: a safe build checks `i <= len`.
+            const high = if (try memoryKind(f.c, f.file, memory, 0) == .sentinel) try atLeast(f.a, length, position) else try above(f.a, length, position);
             try f.record(at, .index, (low != null and try f.shows(out, low.?)) and (high != null and try f.shows(out, high.?)));
             out = try assume(f.a, out, low);
             out = try assume(f.a, out, high);
@@ -1180,8 +1250,10 @@ const Frame = struct {
         const measured = try f.lengthOf(out, full.ast.sliced, m.v);
         out = measured[0];
         const length = measured[1];
-        // A sentinel's slice reads the element at its end too.
-        const room: ?Lin = if (length) |l| (if (full.ast.sentinel != .none) shiftedBy(l, -1) else l) else null;
+        // A sentinel's slice reads the element at its end too, which memory with a sentinel of its
+        // own holds at its length.
+        const own_sentinel = try memoryKind(f.c, f.file, full.ast.sliced, 0) == .sentinel;
+        const room: ?Lin = if (length) |l| (if (full.ast.sentinel != .none and !own_sentinel) shiftedBy(l, -1) else l) else null;
         // An open slice ends at its length; an end with no known value proves nothing.
         const last = if (full.ast.end != .none) end else length;
         if (full.ast.end.unwrap()) |end_node| {
@@ -1196,7 +1268,9 @@ const Frame = struct {
         try f.record(full.ast.start, .start, fits_start != null and try f.shows(out, fits_start.?));
         out = try assume(f.a, out, fits_start);
         const size: ?Lin = if (last != null and start.v.lin != null) try minus(f.a, last.?, start.v.lin.?) else null;
-        return .{ .s = out, .v = .{ .length = size } };
+        // A part of memory whose length is claimed, or of a pointer with none, holds a claim.
+        const claimed = m.v.claimed or try memoryKind(f.c, f.file, full.ast.sliced, 0) == .unchecked or f.lengthClaimed(full.ast.sliced);
+        return .{ .s = out, .v = .{ .length = size, .claimed = claimed } };
     }
 
     /// Arithmetic `op` of `x` and `y` in `int`, at `node`: a checked operation's verdict, and its
@@ -1681,7 +1755,9 @@ const Frame = struct {
             const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = f.tree.nodeMainToken(inner);
             if (token < first or token > last) continue;
-            const d = f.trackedName(f.tree.nodeData(inner).node_and_node[0]) orelse continue;
+            const target = f.tree.nodeData(inner).node_and_node[0];
+            // `s.len = n` and `@field(s, …) = v` assign `s`'s length.
+            const d = f.trackedName(target) orelse (try f.lengthStored(target)) orelse continue;
             try assigned.put(f.a, d, {});
         }
         var kept = s;
@@ -2057,6 +2133,170 @@ const Frame = struct {
         };
     }
 };
+
+/// What indexing memory checks, by its type: a slice or an array, a position below its length;
+/// one with a sentinel, at most its length (the sentinel is read there); a many-item or C
+/// pointer, nothing, and it has no length. Memory whose type is not read checks nothing known.
+const Memory = enum { checked, sentinel, unchecked, unknown };
+
+/// A type expression in its file.
+const TypeRef = struct { file: Project.FileId, node: Ast.Node.Index };
+
+const type_depth = 16;
+
+/// What indexing `node` checks (`Memory`), read from the expression's own form or its type.
+fn memoryKind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!Memory {
+    if (depth > type_depth) return .unknown;
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .string_literal, .multiline_string_literal => return .sentinel,
+        .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => return .checked,
+        .grouped_expression => return memoryKind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"try", .@"comptime", .@"nosuspend", .address_of => return memoryKind(c, file, tree.nodeData(node).node, depth + 1),
+        .slice_open, .slice, .slice_sentinel => {
+            const full = tree.fullSlice(node).?; // unreachable: the tag is a slice's
+            if (full.ast.sentinel != .none) return .sentinel;
+            // A many-item pointer sliced with no end is one still.
+            if (full.ast.end == .none) return memoryKind(c, file, full.ast.sliced, depth + 1);
+            return .checked;
+        },
+        .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "ptr")) return .unchecked,
+        // A local with no type written is what it is made from (`const s = buf[0..n];`).
+        .identifier => if (c.project.at(file).model.reference(node)) |ref| if (ref.declaration) |d| {
+            const decl = c.project.at(file).model.declarations[@backingInt(d)];
+            if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |full| if (full.ast.type_node == .none) {
+                return memoryKind(c, file, full.ast.init_node.unwrap() orelse return .unknown, depth + 1);
+            };
+        },
+        else => {},
+    }
+    const t = (try exprType(c, file, node, depth + 1)) orelse return .unknown;
+    return typeKind(c, t, depth + 1);
+}
+
+/// The type an expression is declared with: a name's (its declaration's type, or its
+/// initializer's), a field's, a call's result, an element's, a payload's; null where none is
+/// written.
+fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!?TypeRef {
+    if (depth > type_depth) return null;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return exprType(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"try", .@"comptime", .@"nosuspend" => return exprType(c, file, tree.nodeData(node).node, depth + 1),
+        .unwrap_optional => return payloadOf(c, (try exprType(c, file, tree.nodeData(node).node_and_token[0], depth + 1)) orelse return null, depth + 1),
+        .@"orelse", .@"catch" => return payloadOf(c, (try exprType(c, file, tree.nodeData(node).node_and_node[0], depth + 1)) orelse return null, depth + 1),
+        .deref => {
+            const pointer = (try exprType(c, file, tree.nodeData(node).node, depth + 1)) orelse return null;
+            const pointer_tree = &c.project.at(pointer.file).file.tree;
+            const full = pointer_tree.fullPtrType(pointer.node) orelse return null;
+            return if (full.size == .one) .{ .file = pointer.file, .node = full.ast.child_type } else null;
+        },
+        .array_access => return elementType(c, (try exprType(c, file, tree.nodeData(node).node_and_node[0], depth + 1)) orelse return null, depth + 1),
+        .identifier => {
+            const d = (model.reference(node) orelse return null).declaration orelse return null;
+            const decl = model.declarations[@backingInt(d)];
+            switch (decl.kind) {
+                .variable => {
+                    const full = tree.fullVarDecl(decl.node) orelse return null;
+                    if (full.ast.type_node.unwrap()) |t| return .{ .file = file, .node = t };
+                    return exprType(c, file, full.ast.init_node.unwrap() orelse return null, depth + 1);
+                },
+                // A parameter's declaration node is its type expression.
+                .parameter => return if (tree.nodeTag(decl.node) == .fn_proto or tree.nodeTag(decl.node) == .fn_proto_one or tree.nodeTag(decl.node) == .fn_proto_multi or tree.nodeTag(decl.node) == .fn_proto_simple) null else .{ .file = file, .node = decl.node },
+                .capture => {
+                    const loop = tree.fullFor(decl.node) orelse return null;
+                    const position = Model.capturePosition(tree, loop, decl.token) orelse return null;
+                    if (position >= loop.ast.inputs.len) return null;
+                    const input = loop.ast.inputs[position];
+                    if (tree.nodeTag(input) == .for_range) return null;
+                    return elementType(c, (try exprType(c, file, input, depth + 1)) orelse return null, depth + 1);
+                },
+                else => return null,
+            }
+        },
+        .field_access => {
+            const decl = (try c.facts.definition(file, node)) orelse return null;
+            const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+            const field = c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return null;
+            return .{ .file = decl.file, .node = field.ast.type_expr.unwrap() orelse return null };
+        },
+        .call_one, .call_one_comma, .call, .call_comma => {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+            const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+                .function => |d| d,
+                else => return null,
+            };
+            const callee_tree = &c.project.at(decl.file).file.tree;
+            var proto_buffer: [1]Ast.Node.Index = undefined;
+            const proto = callee_tree.fullFnProto(&proto_buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
+            return .{ .file = decl.file, .node = proto.ast.return_type.unwrap() orelse return null };
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return null;
+            return .{ .file = file, .node = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return null };
+        },
+        else => return null,
+    }
+}
+
+/// What indexing memory of type `t` checks.
+fn typeKind(c: *Context, t: TypeRef, depth: u8) Error!Memory {
+    if (depth > type_depth) return .unknown;
+    const tree = &c.project.at(t.file).file.tree;
+    if (tree.fullPtrType(t.node)) |pointer| return switch (pointer.size) {
+        .many, .c => .unchecked,
+        .slice => if (pointer.ast.sentinel != .none) .sentinel else .checked,
+        // A pointer to an array indexes as the array.
+        .one => if (tree.fullArrayType(pointer.ast.child_type)) |array| (if (array.ast.sentinel != .none) .sentinel else .checked) else .unknown,
+    };
+    if (tree.fullArrayType(t.node)) |array| return if (array.ast.sentinel != .none) .sentinel else .checked;
+    switch (tree.nodeTag(t.node)) {
+        .optional_type => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node }, depth + 1),
+        .error_union => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] }, depth + 1),
+        .grouped_expression => return typeKind(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, depth + 1),
+        .identifier, .field_access => return typeKind(c, (try aliased(c, t)) orelse return .unknown, depth + 1),
+        else => return .unknown,
+    }
+}
+
+/// The element type of memory of type `t`.
+fn elementType(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
+    if (depth > type_depth) return null;
+    const tree = &c.project.at(t.file).file.tree;
+    if (tree.fullPtrType(t.node)) |pointer| {
+        if (pointer.size != .one) return .{ .file = t.file, .node = pointer.ast.child_type };
+        const array = tree.fullArrayType(pointer.ast.child_type) orelse return null;
+        return .{ .file = t.file, .node = array.ast.elem_type };
+    }
+    if (tree.fullArrayType(t.node)) |array| return .{ .file = t.file, .node = array.ast.elem_type };
+    return switch (tree.nodeTag(t.node)) {
+        .identifier, .field_access => elementType(c, (try aliased(c, t)) orelse return null, depth + 1),
+        else => null,
+    };
+}
+
+/// What an optional or error union of type `t` holds; `t` where it is neither.
+fn payloadOf(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
+    if (depth > type_depth) return null;
+    const tree = &c.project.at(t.file).file.tree;
+    return switch (tree.nodeTag(t.node)) {
+        .optional_type => .{ .file = t.file, .node = tree.nodeData(t.node).node },
+        .error_union => .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] },
+        .identifier, .field_access => payloadOf(c, (try aliased(c, t)) orelse return null, depth + 1),
+        else => t,
+    };
+}
+
+/// The type a name for a type stands for (`const Bytes = []const u8;`).
+fn aliased(c: *Context, t: TypeRef) Error!?TypeRef {
+    const decl = (try c.facts.definition(t.file, t.node)) orelse return null;
+    const declared = (try c.facts.origin(decl)) orelse decl;
+    const tree = &c.project.at(declared.file).file.tree;
+    const full = tree.fullVarDecl(c.project.at(declared.file).model.declarations[@backingInt(declared.index)].node) orelse return null;
+    return .{ .file = declared.file, .node = full.ast.init_node.unwrap() orelse return null };
+}
 
 /// The most entries `memory` holds where it is one of the tables std names by a u32 index (an
 /// `Ast`'s `nodes` or `tokens`), or a field's view of one (`t.nodes.items(.tag)`). std makes

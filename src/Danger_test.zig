@@ -2688,6 +2688,73 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A009 reads what an access checks by the memory's type: a sentinel's end is read, a many-item pointer checks nothing and holds no length" {
+    // `z[z.len]` reads the sentinel, so that branch still leaves `i` unbounded (10); a slice of
+    // a many-item pointer checks nothing (19), and its length is the program's claim, so the
+    // loop it counts is bound by input (21). A slice of held memory counts (24-31).
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn sentinel(r: *std.Io.Reader, z: [:0]const u8, c: bool, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    var acc: u8 = 0;
+        \\    if (c) {
+        \\        acc = z[z.len];
+        \\    } else {
+        \\        if (i >= 16) return 0;
+        \\    }
+        \\    return acc +% table[i];
+        \\}
+        \\pub fn checked(r: *std.Io.Reader, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= 16) return 0;
+        \\    return table[i];
+        \\}
+        \\pub fn many(r: *std.Io.Reader, p: [*]const u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    const s = p[0..n];
+        \\    var acc: u8 = 0;
+        \\    for (0..n) |i| acc +%= s[i];
+        \\    return acc;
+        \\}
+        \\pub fn held(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n > buf.len) return 0;
+        \\    const s = buf[0..n];
+        \\    var acc: u8 = 0;
+        \\    for (0..n) |i| acc +%= s[i];
+        \\    return acc;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 10, 19, 21 }, found.lines[0..found.findings]);
+}
+
+test "A010 reads a slice's length as its stores set it: `s.len = n` sets it, and a length read through a pointer holds no fact" {
+    // A length stored from input (7); a slice behind a pointer, emptied after its check (13);
+    // a slice nothing writes keeps its check (18).
+    const found = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn stored(r: *std.Io.Reader) !usize {
+        \\    var memory: [512]u8 = @splat(0);
+        \\    var s: []u8 = memory[0..];
+        \\    const n: usize = try r.takeInt(u64, .little);
+        \\    s.len = n;
+        \\    return s.len - 86;
+        \\}
+        \\pub fn pointed(r: *std.Io.Reader, p: *[]const u8) !usize {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i > p.len) return 0;
+        \\    p.* = p.*[0..0];
+        \\    return p.len - i;
+        \\}
+        \\pub fn kept(r: *std.Io.Reader, s: []const u8) !usize {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i > s.len) return 0;
+        \\    return s.len - i;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 7, 13 }, found.lines[0..found.findings]);
+}
+
 test "A009 reads a for loop's count as its inputs gave it at entry: a position below it is within an input the body leaves alone, not one it shrinks" {
     // `n` equal to the counter is below `big.len` (7); `s` shrinks each pass, and the count
     // its entry length gave says nothing of what is left of it (10).
