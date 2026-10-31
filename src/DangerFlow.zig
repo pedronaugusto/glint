@@ -61,7 +61,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const parent = c.project.at(c.file).model.parentOf(node) orelse continue;
                 const loop = tree.fullFor(parent) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                try judged(c, flow, rule, end, try ranged(c, flow, end), .number, loop_message);
+                try judged(c, flow, rule, end, try loopOperand(c, flow, parent, end), .number, loop_message);
             },
             // Each comparison of the condition, joined by `and`, `or` and `!` as it may be.
             .@"while", .while_simple, .while_cont => {
@@ -72,8 +72,8 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 for (compared.items) |condition| {
                     if (clears(c, condition, loop.ast.then_expr)) continue;
                     const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                    try judged(c, flow, rule, lhs, try ranged(c, flow, lhs), .number, loop_message);
-                    try judged(c, flow, rule, rhs, try ranged(c, flow, rhs), .number, loop_message);
+                    try judged(c, flow, rule, lhs, try loopOperand(c, flow, node, lhs), .number, loop_message);
+                    try judged(c, flow, rule, rhs, try loopOperand(c, flow, node, rhs), .number, loop_message);
                 }
             },
             // A table trusts its own ids to name its entries (Range.ownId): one made from an
@@ -319,7 +319,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             var by_input = false;
             var unknown = false;
             for (bounds.items) |bound| {
-                const level = try ranged(c, flow, bound);
+                const level = try loopOperand(c, flow, node, bound);
                 by_input = by_input or level.reaches(.number);
                 unknown = unknown or level == .unknown;
             }
@@ -1002,6 +1002,35 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
     const level = try Taint.levelAt(c, flow, c.file, node);
     if (level == .number and try Range.small(c, c.file, node)) return .data;
     return level;
+}
+
+/// A loop bound's level: a counter the loop steps by what it enters with and steps by
+/// (Taint.counterLevel); data where it counts no more passes than a short or the memory the
+/// function holds (Range.counts).
+fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const level = try countered(c, flow, loop, node);
+    if (level == .number and try Range.counts(c, c.file, node)) return .data;
+    return level;
+}
+
+/// The level of a loop operand with each counter in it read by `Taint.counterLevel`: the
+/// counter itself, a sum with it (`at + 2`) or a difference from it (`end - 1`).
+fn countered(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const tree = &c.project.at(c.file).file.tree;
+    if (try Taint.counterLevel(c, flow, c.file, loop, node)) |level| return level;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return countered(c, flow, loop, tree.nodeData(node).node_and_token[0]),
+        .add, .add_wrap, .add_sat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return (try countered(c, flow, loop, lhs)).join(try countered(c, flow, loop, rhs));
+        },
+        .sub, .sub_wrap, .sub_sat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const counter = (try Taint.counterLevel(c, flow, c.file, loop, lhs)) orelse return Taint.levelAt(c, flow, c.file, node);
+            return counter.join(try countered(c, flow, loop, rhs));
+        },
+        else => return Taint.levelAt(c, flow, c.file, node),
+    }
 }
 
 /// A finding where the value is input at `least` (data, or only a number), undecided where the
