@@ -510,6 +510,8 @@ const Frame = struct {
     typed_vars: std.AutoHashMapUnmanaged(Var, void) = .empty,
     /// The length variables whose value is claimed, not held (`Value.claimed`).
     claimed: std.AutoHashMapUnmanaged(Var, void) = .empty,
+    /// Each place's variable, its value's or its length's (`placeVar`).
+    places: std.AutoArrayHashMapUnmanaged(Var, Place) = .empty,
     /// Whether the function returns an integer, or an error union or optional of one.
     returns_int: bool = false,
     /// Whether the memory the function returns holds elements that take room.
@@ -1016,7 +1018,7 @@ const Frame = struct {
     fn placeValue(f: *Frame, s: State, node: Ast.Node.Index, p: Place) Error!Eval {
         var out = s;
         if (try f.intOf(node)) |int| {
-            const v = try f.variable(.{ .place = p });
+            const v = try f.placeVar(p, false);
             if (!f.typed_vars.contains(v)) {
                 out = try f.typed(out, v, int);
                 try f.typed_vars.put(f.a, v, {});
@@ -1026,7 +1028,7 @@ const Frame = struct {
         // An array's length is its type's (`knownLength`); a struct or a pointer with no length
         // holds none.
         if (!try f.holdsLength(node) or try Range.memoryLength(f.c, f.file, node) != null) return .{ .s = out };
-        const l = try f.variable(.{ .place_length = p });
+        const l = try f.placeVar(p, true);
         return .{ .s = out, .v = .{ .length = try single(f.a, l), .claimed = f.claimed.contains(l) } };
     }
 
@@ -1038,15 +1040,15 @@ const Frame = struct {
         const out = try f.forgetPlaces(e.s, null, p.field, p.root);
         const int = try f.intOf(target);
         if (tag == .assign) {
-            if (int != null) return f.assign(out, try f.variable(.{ .place = p }), e.v.lin, int);
+            if (int != null) return f.assign(out, try f.placeVar(p, false), e.v.lin, int);
             if (!try f.holdsLength(target) or try Range.memoryLength(f.c, f.file, target) != null) return out;
-            const l = try f.variable(.{ .place_length = p });
+            const l = try f.placeVar(p, true);
             if (e.v.claimed) try f.claimed.put(f.a, l, {}) else _ = f.claimed.remove(l);
             return f.assign(out, l, e.v.length, null);
         }
         const current = try f.placeValue(out, target, p);
         const result = try f.arith(current.s, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
-        return f.assign(result.s, try f.variable(.{ .place = p }), result.v.lin, int);
+        return f.assign(result.s, try f.placeVar(p, false), result.v.lin, int);
     }
 
     /// The state past a store to `target`, no place of this function's: the same field of a
@@ -1076,11 +1078,7 @@ const Frame = struct {
     /// `member` (any where null), but those of `except`.
     fn forgetPlaces(f: *Frame, s: State, root: ?Model.Declaration.Id, member: ?Facts.Decl, except: ?Model.Declaration.Id) Error!State {
         var out = s;
-        for (f.vars.keys(), f.vars.values()) |key, v| {
-            const p = switch (key) {
-                .place, .place_length => |p| p,
-                else => continue,
-            };
+        for (f.places.keys(), f.places.values()) |v, p| {
             if (root) |r| if (p.root != r) continue;
             if (member) |d| if (!std.meta.eql(p.field, d)) continue;
             if (except) |r| if (p.root == r) continue;
@@ -1089,6 +1087,13 @@ const Frame = struct {
             _ = f.claimed.remove(v);
         }
         return out;
+    }
+
+    /// The variable of a place's value or its length, recorded as a place's.
+    fn placeVar(f: *Frame, p: Place, length: bool) Error!Var {
+        const v = try f.variable(if (length) .{ .place_length = p } else .{ .place = p });
+        try f.places.put(f.a, v, p);
+        return v;
     }
 
     fn destructure(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
@@ -2192,7 +2197,7 @@ const Frame = struct {
                     const measured = try f.lengthOf(out, holder, e.v);
                     out = measured[0];
                     receiver = .{ .lin = e.v.lin, .length = measured[1] };
-                    out = try f.heldAtCall(out, node, 2, &receiver.?);
+                    out = try f.heldAtCall(out, node, 1, &receiver.?);
                 },
                 else => {},
             }
@@ -2208,7 +2213,7 @@ const Frame = struct {
                 out = measured[0];
                 arg = .{ .length = measured[1] };
             }
-            if (i < 120) out = try f.heldAtCall(out, node, @intCast(4 + 2 * i), &arg);
+            if (i < 120) out = try f.heldAtCall(out, node, @intCast(2 + i), &arg);
             try args.append(f.a, arg);
         }
         const made = try f.fresh(out, node, 0);
@@ -2240,13 +2245,13 @@ const Frame = struct {
         return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
     }
 
-    /// `value`, where it reads a place, held in the call's own temporaries (`part`, `part + 1`):
-    /// the callee may store into the place, and what its summary says is of the value it was
-    /// given.
-    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, part: u8, value: *Value) Error!State {
+    /// `value`, where it reads a place, held in the call's own temporaries for its `ordinal`th
+    /// operand (the receiver's first, `2 * ordinal` and the next): the callee may store into the
+    /// place, and what its summary says is of the value it was given.
+    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, ordinal: u7, value: *Value) Error!State {
         var out = s;
         inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(value, part_name)) |lin| if (f.readsPlace(lin)) {
-            const t = try f.temp(out, node, part + @as(u8, k));
+            const t = try f.temp(out, node, @as(u8, ordinal) * 2 + @as(u8, k));
             out = try f.equal(t[0], t[1], lin);
             @field(value, part_name) = try single(f.a, t[1]);
         };
@@ -2254,10 +2259,7 @@ const Frame = struct {
     }
 
     fn readsPlace(f: *Frame, lin: Lin) bool {
-        for (lin.terms) |term| switch (f.vars.keys()[term.v]) {
-            .place, .place_length => return true,
-            else => {},
-        };
+        for (lin.terms) |term| if (f.places.contains(term.v)) return true;
         return false;
     }
 
