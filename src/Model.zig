@@ -304,7 +304,7 @@ fn walkLowered(a: std.mem.Allocator, zir: std.zig.Zir, body: []const std.zig.Zir
         if (visited[i]) continue;
         visited[i] = true;
         const tag = zir.instructions.items(.tag)[i];
-        const data = zir.instructions.items(.data)[i];
+        const data: Inst.Data = zir.instructions.items(.data)[i];
         switch (tag) {
             .call, .field_call, .field_ptr, .field_ptr_load, .field_ptr_named, .field_ptr_named_load, .has_decl, .type_info => {
                 const node = (if (tag == .type_info) data.un_node.src_node else data.pl_node.src_node).toAbsolute(baseline_node);

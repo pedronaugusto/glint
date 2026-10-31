@@ -26,6 +26,8 @@ copier_names: std.StringHashMapUnmanaged(void) = .empty,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
 bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, void) = .empty,
+/// The builtins `scalarCasts` finds: casts each binding decides (`castAtBinding`).
+cast_sites: std.AutoHashMapUnmanaged(Key, void) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
@@ -184,6 +186,7 @@ pub fn deinit(self: *Facts) void {
     if (self.copies) |*found| found.deinit(self.gpa);
     self.copier_names.deinit(self.gpa);
     self.bound_places.deinit(self.gpa);
+    self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
@@ -500,7 +503,7 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 pub const ParameterCopy = struct {
     position: usize,
     site: Key,
-    kind: enum { copy, made } = .copy,
+    kind: enum { copy, made, cast } = .copy,
     source: ?Key = null,
     path: []const Key = &.{},
     crowded: bool = false,
@@ -749,6 +752,78 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, {});
         }
     }
+    try self.scalarCasts(function, out);
+}
+
+/// The integers the language makes into a type, or reads out of a value, by the type of
+/// `function`'s generic parameter: `@enumFromInt` and `@fromBackingInt` into a type its result
+/// place writes in terms of one (`@as(@TypeOf(library).Role, ...)`), `@intFromEnum` and
+/// `@backingInt` of a value one gives. Each is the binding's: its type is the bound one's
+/// (`kind = .cast`, `source` the type written, or the value read).
+fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const whole = self.scopeNode(function);
+    const first = t.firstToken(whole);
+    const last = t.lastToken(whole);
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const name = t.tokenSlice(at);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = builtinArgs(t, node, &buffer);
+        const source: Ast.Node.Index = if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt"))
+            self.writtenType(function.file, node, 0) orelse continue
+        else if ((std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@backingInt")) and args.len == 1)
+            args[0]
+        else
+            continue;
+        const position = self.derivedParameter(function, source, 0) orelse continue;
+        const site: Key = .{ .file = function.file, .node = node };
+        try out.append(self.gpa, .{ .position = position, .site = site, .kind = .cast, .source = .{ .file = function.file, .node = source } });
+        try self.cast_sites.put(self.gpa, site, {});
+    }
+}
+
+/// The type written for the place `node`'s value goes to: `@as`'s, a declaration's, the
+/// function's result for a `return`, through a grouping, `try`, either side of `orelse` or
+/// `catch`, a branch or a prong. Null where none is written there.
+fn writtenType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ?Ast.Node.Index {
+    if (depth == 16) return null;
+    const t = self.syntaxOf(file);
+    const model = &self.project.at(file).model;
+    const parent = model.parentOf(node) orelse return null;
+    if (t.fullVarDecl(parent)) |variable| return if (variable.ast.init_node.unwrap() == node) variable.ast.type_node.unwrap() else null;
+    switch (t.nodeTag(parent)) {
+        .grouped_expression, .@"try", .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.writtenType(file, parent, depth + 1),
+        .@"return" => {
+            var at: ?Ast.Node.Index = model.parentOf(parent);
+            while (at) |candidate| : (at = model.parentOf(candidate)) {
+                if (t.nodeTag(candidate) != .fn_decl) continue;
+                var fn_buffer: [1]Ast.Node.Index = undefined;
+                return (t.fullFnProto(&fn_buffer, t.nodeData(candidate).node_and_node[0]) orelse return null).ast.return_type.unwrap();
+            }
+            return null;
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(parent)), "@as")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(t, parent, &buffer);
+            return if (args.len == 2 and args[1] == node) args[0] else null;
+        },
+        else => return null,
+    }
+}
+
+/// Whether the builtin `node` makes or reads an integer by the type of a generic parameter,
+/// which each binding of the generic decides (`scalarCasts`).
+pub fn castAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (self.copies == null) try self.findCopies();
+    return self.cast_sites.contains(.{ .file = file, .node = node });
 }
 
 /// What a copy of the value written `node` copies: the places it reads (a name, a field,
