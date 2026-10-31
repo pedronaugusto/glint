@@ -1034,6 +1034,40 @@ const Carry = struct {
             else => return .undecided,
         };
         const decl = (try c.facts.origin(found)) orelse found;
+        // std's `Io.async` and `Io.concurrent`, a `Group`'s and a `Select`'s, call `function`
+        // with `args`, the tuple they copy whole: a carrier in a tuple written there is handed
+        // to `function` where it stands in it.
+        if (position > 0 and try spawnArguments(c, decl, index)) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullArrayInit(&buffer, strip(tree, call.ast.params[position]))) |tuple| {
+                return k.spawned(file, call.ast.params[position - 1], tuple.ast.elements, from_program);
+            }
+        }
+        return k.parameter(decl, index, shape, from_program);
+    }
+
+    /// A function `function` names, given the elements of the tuple `args` in order: each
+    /// carrier among them handed to its parameter there.
+    fn spawned(k: *Carry, file: Project.FileId, function: Ast.Node.Index, args: []const Ast.Node.Index, from_program: bool) Context.Error!Verdict {
+        const c = k.c;
+        const found = switch (try c.facts.resolve(file, function)) {
+            .function => |each| each,
+            else => return .undecided,
+        };
+        const decl = (try c.facts.origin(found)) orelse found;
+        var verdict: Verdict = .shown;
+        for (args, 0..) |argument, at| {
+            const shape = (try k.carries(file, argument, 0)) orelse continue;
+            verdict = worst(verdict, try k.parameter(decl, at, shape, from_program));
+            if (verdict == .open) return .open;
+        }
+        return verdict;
+    }
+
+    /// The function `decl` given a carrier as its parameter `index`: that parameter followed
+    /// through its body.
+    fn parameter(k: *Carry, decl: Facts.Decl, index: usize, shape: Shape, from_program: bool) Context.Error!Verdict {
+        const c = k.c;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind != .function) return .undecided;
         // std's `mem.Allocator` frees, resizes and copies items whole, by its contract: a C
@@ -1267,6 +1301,41 @@ fn allocatorMethod(c: *Context, decl: Facts.Decl) Context.Error!bool {
     for ((try Governed.declarations(c, "std", "mem.Allocator")) orelse &.{}) |found| {
         const allocator = held(try c.facts.declaration(found)) orelse continue;
         if (allocator.file == decl.file and allocator.scope == scope) return true;
+    }
+    return false;
+}
+
+/// Whether the parameter `index` of std's function `decl` is the `args` tuple an Io spawn
+/// (`Io.async`, `Io.concurrent`, a `Group`'s, a `Select`'s) calls the `function` before it
+/// with: `function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))`, in std's Io.
+fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!bool {
+    if (index == 0 or !try c.facts.standard(decl.file)) return false;
+    const io = for ((try Governed.declarations(c, "std", "Io")) orelse &.{}) |found| {
+        if (held(try c.facts.declaration(found))) |container| break container;
+    } else return false;
+    if (io.file != decl.file) return false;
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
+    var it = proto.iterate(tree);
+    var at: usize = 0;
+    var function: ?[]const u8 = null;
+    while (it.next()) |param| : (at += 1) {
+        const name = tree.tokenSlice(param.name_token orelse return false);
+        if (at + 1 == index) {
+            if (param.anytype_ellipsis3 == null) return false;
+            function = name;
+        }
+        if (at != index) continue;
+        if (!std.mem.eql(u8, name, "args")) return false;
+        // `std.meta.ArgsTuple(@TypeOf(function))`.
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const tuple = tree.fullCall(&call_buffer, param.type_expr orelse return false) orelse return false;
+        if (tree.nodeTag(tuple.ast.fn_expr) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(tuple.ast.fn_expr).node_and_token[1]), "ArgsTuple")) return false;
+        if (tuple.ast.params.len != 1 or !isBuiltin(tree, tuple.ast.params[0], "@TypeOf")) return false;
+        var args_buffer: [2]Ast.Node.Index = undefined;
+        const typed = Facts.builtinArgs(tree, tuple.ast.params[0], &args_buffer);
+        return typed.len == 1 and tree.nodeTag(typed[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(typed[0])), function orelse return false);
     }
     return false;
 }

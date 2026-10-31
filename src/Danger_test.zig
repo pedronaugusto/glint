@@ -41,6 +41,7 @@ const std_files = [_]sources.Extra{
     \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub fn recancel(io: @This()) void { _ = io; }
+    \\pub fn concurrent(io: @This(), function: anytype, args: @import("std").meta.ArgsTuple(@TypeOf(function))) error{ConcurrencyUnavailable}!void { const erased: *const anyopaque = @ptrCast(&args); _ = erased; _ = io; }
     \\pub fn futexWait(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) error{Canceled}!void { _ = io; _ = ptr; _ = expected; }
     \\pub fn futexWaitTimeout(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T, timeout: u64) error{Canceled}!void { _ = io; _ = ptr; _ = expected; _ = timeout; }
     \\pub fn futexWaitUncancelable(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) void { _ = io; _ = ptr; _ = expected; }
@@ -1453,6 +1454,53 @@ test "A019 reads an interface's pointer to a struct with no function of its own 
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, table)).findings);
     const out = try run(pack.unsafe_set, comptime edited(table, "        const in = t.reader;\n        return in.bufferedLen();", "        const in = t.ops;\n        return @intFromPtr(in);"));
     try std.testing.expectEqualSlices(u32, &.{ 7, 21, 21 }, out.lines[0..out.findings]);
+}
+
+test "A019 reads a carrier in the tuple an Io spawn is given as handed to the function it calls" {
+    // Clean: `io.concurrent(ask, .{ d, 1 })` calls `ask(d, 1)` with the tuple it copies whole,
+    // and `ask` keeps the Dns a Dns. Findings at the conversion (19): the function taking it
+    // as `anyopaque` and casting it back, and a tuple held apart, which the spawn's body erases.
+    const spawn =
+        \\const std = @import("std");
+        \\const Resolver = struct {
+        \\    interface: ?*Interface = null,
+        \\    pub const Interface = struct {
+        \\        lookupFn: *const fn (u32, *Interface) u32,
+        \\    };
+        \\    pub fn lookup(r: Resolver, io: u32) u32 {
+        \\        const i = r.interface orelse return 0;
+        \\        return i.lookupFn(io, i);
+        \\    }
+        \\};
+        \\const Dns = struct {
+        \\    n: u32 = 0,
+        \\    resolving: Resolver.Interface = .{ .lookupFn = lookupFn },
+        \\    pub fn resolver(d: *Dns) Resolver {
+        \\        return .{ .interface = &d.resolving };
+        \\    }
+        \\    fn lookupFn(io: u32, interface: *Resolver.Interface) u32 {
+        \\        const d: *Dns = @alignCast(@fieldParentPtr("resolving", interface));
+        \\        return d.ask(io);
+        \\    }
+        \\    fn ask(d: *const Dns, io: u32) u32 {
+        \\        return d.n +% io;
+        \\    }
+        \\    pub fn both(d: *const Dns, io: std.Io) !u32 {
+        \\        try io.concurrent(ask, .{ d, 1 });
+        \\        return d.n;
+        \\    }
+        \\};
+        \\pub fn run(io: std.Io) !u32 {
+        \\    var d: Dns = .{};
+        \\    return d.resolver().lookup(1) +% try d.both(io);
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, spawn)).findings);
+    const erased = try run(pack.unsafe_set, comptime edited(edited(spawn, "concurrent(ask, ", "concurrent(erased, "), "    fn ask(", "    fn erased(p: *const anyopaque, io: u32) u32 {\n        const other: *const Dns = @ptrCast(@alignCast(p));\n        return other.n +% io;\n    }\n    fn ask("));
+    try std.testing.expectEqualSlices(u32, &.{ 19, 19, 23, 23 }, erased.lines[0..erased.findings]);
+    const held = try run(pack.unsafe_set, comptime edited(spawn, "        try io.concurrent(ask, .{ d, 1 });", "        const args = .{ d, @as(u32, 1) };\n        try io.concurrent(ask, args);"));
+    try std.testing.expectEqualSlices(u32, &.{ 19, 19 }, held.lines[0..held.findings]);
 }
 
 /// `program`'s findings of `rule` at report level, the only file the project loads.
