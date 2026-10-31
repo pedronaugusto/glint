@@ -440,6 +440,29 @@ test "aegis is recognized by its published names in the pinned layout and the fi
     defer flat_report.deinit();
     try expectEverySite(flat_report);
 }
+test "A004 reads a scalar's raw integer by meaning, through every place it is put, and a scalar made by a cast" {
+    const head = "const aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u16);\nconst Box = struct { v: u16 };\n";
+    // Read out by the language, by a name for `raw`, or through `@call`.
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @backingInt(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @intFromEnum(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return Index.raw(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @call(.auto, Index.raw, .{i}) + 1; }", pack.scalar, true, 1);
+    // Put in a field, a literal, an array, behind a pointer, an optional captured, a
+    // destructuring and a vector's lanes.
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { var b: Box = .{ .v = 0 }; b.v = i.raw(); return b.v + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const b: Box = .{ .v = i.raw() }; return b.v + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const a = [_]u16{i.raw()}; return a[0] + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { var v = i.raw(); const p = &v; return p.* + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index, c: bool) u16 { const m: ?u16 = if (c) i.raw() else null; if (m) |v| return v + 1; return 0; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const a, const b = .{ i.raw(), @as(u16, 0) }; return a + b; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) @Vector(2, u16) { const v: @Vector(2, u16) = @splat(i.raw()); return v + v; }", pack.scalar, true, 1);
+    // A scalar made from an integer by a cast skips its checked construction.
+    try expectJudged(head ++ "pub fn f(v: u16) Index { return @enumFromInt(v); }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(v: u16) Index { return @fromBackingInt(v); }", pack.scalar, true, 1);
+    // An enum of the program's own, an array's length, a comparison of scalars: no raw integer.
+    try expectJudged(head ++ "const Color = enum(u8) { red, green };\npub fn f(i: Index, x: u8) usize { const c: Color = @enumFromInt(x); const a = [_]u16{ i.raw(), 3 }; return a.len + @intFromEnum(c); }", pack.scalar, true, 0);
+}
+
 test "a standalone aegis namespace module is recognized" {
     var project = try fixture("const Id = @import(\"aegis.id\").Id; const Tag = struct {}; pub fn f() void { const v = Id(Tag, u32).fromRaw(1); _ = v.raw() + 2; }");
     defer project.deinit();
