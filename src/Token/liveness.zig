@@ -397,6 +397,7 @@ pub const Words = struct {
     /// keeps its kind, since dead code is no evidence of a test. `where`
     /// holds the index in the stream of each spec's token.
     pub fn classify(self: *Words, scratch: std.mem.Allocator, specs: []types.Import, where: []const u32) std.mem.Allocator.Error!void {
+        // aegis: no-danger(A013): Token.zig appends each spec and its token together, at every site that makes them
         std.debug.assert(specs.len == where.len);
         const reach = try self.reachable(scratch);
         var member: usize = 0;
