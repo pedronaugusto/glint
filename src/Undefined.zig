@@ -1483,7 +1483,10 @@ const Walk = struct {
         if (!try Program.owns(w.c, origin.file)) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         // What it returns may hold what it keeps: followed here as a holder.
-        if (try keepsOnly(w.c, origin, index, w.depth + 1)) return if (try holderKept(w.c, w.file, node, w.depth)) null else handed;
+        if (try keepsOnly(w.c, origin, index, w.depth + 1)) {
+            if (!holdsResult(try w.c.facts.resolve(w.file, node))) return null;
+            return if (try holderKept(w.c, w.file, node, w.depth)) null else handed;
+        }
         if (try writesParts(w.c, origin, index, w.depth + 1)) return null;
         // One that reads only some parts of what it is given, through a pointer to the same
         // type, reads those.
@@ -2318,10 +2321,10 @@ fn holderKept(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8
             if (model.parentOf(parent)) |grand| if (tree.fullCall(&buffer, grand)) |call| if (call.ast.fn_expr == parent) {
                 return holderKeptThrough(c, file, call, null, depth);
             };
-            return switch (try c.facts.resolve(file, parent)) {
-                .primitive => true,
-                .instance => holderKept(c, file, parent, depth + 1),
-                else => false,
+            return switch (try heldField(c, file, parent)) {
+                .number => true,
+                .holder => holderKept(c, file, parent, depth + 1),
+                .memory => false,
             };
         },
         .assign => {
@@ -2344,6 +2347,52 @@ fn holderKept(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8
     }
     if (tree.fullStructInit(&literal, parent) != null or tree.fullArrayInit(&literal, parent) != null) return holderKept(c, file, parent, depth + 1);
     return false;
+}
+
+/// What a holder's field `access` is: a number; a holder to follow, a struct or a pointer to
+/// one item; or what may be the memory it holds, a slice, a many-item pointer, an array, or
+/// what is not known.
+fn heldField(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.Error!enum { number, holder, memory } {
+    const tree = &c.project.at(file).file.tree;
+    switch (try c.facts.resolve(file, access)) {
+        .primitive, .scalar, .error_set => return .number,
+        .instance => return .holder,
+        else => {},
+    }
+    const object, const member = tree.nodeData(access).node_and_token;
+    const container = switch (try c.facts.resolve(file, object)) {
+        .instance => |found| found,
+        .pointer => |to| switch (to.*) {
+            .instance => |found| found,
+            else => return .memory,
+        },
+        else => return .memory,
+    };
+    const source = c.project.at(container.file);
+    const name = tree.tokenSlice(member);
+    for (source.model.declarations) |decl| {
+        if (decl.kind != .field or decl.scope != container.scope or !std.mem.eql(u8, decl.name, name)) continue;
+        const field = source.file.tree.fullContainerField(decl.node) orelse return .memory;
+        var kind = field.ast.type_expr.unwrap() orelse return .memory;
+        if (source.file.tree.nodeTag(kind) == .optional_type) kind = source.file.tree.nodeData(kind).node;
+        const pointer = source.file.tree.fullPtrType(kind) orelse return .memory;
+        return if (pointer.size == .one) .holder else .memory;
+    }
+    return .memory;
+}
+
+/// Whether a call's result may hold what the call keeps: a struct, or what is not known; a
+/// number, a slice or a pointer holds none of a holder but what the callee itself handed back,
+/// which `holderKept` refuses there.
+fn holdsResult(value: Facts.Value) bool {
+    return switch (value) {
+        .instance, .unknown, .literal, .reified => true,
+        .optional, .error_union => |inner| holdsResult(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (holdsResult(one)) break true;
+        } else false,
+        else => false,
+    };
 }
 
 /// Whether every mention of `id`, a local or a parameter holding a holder or a pointer to one,
