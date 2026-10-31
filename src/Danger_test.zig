@@ -5097,6 +5097,82 @@ test "A020 reads a loop bound by input by what bounds it: a for range's end, eac
     , 0);
 }
 
+test "A020 reads what decides how long a while runs by meaning: a variable by each value it is given, a payload or a call's truth from input, a condition nothing in the loop changes as while (true)" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var more = (try r.takeByte()) != 0;
+        \\    var total: u64 = 0;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    while (more) {
+        \\        total +%= seed;
+        \\        more = total != seed *% 7;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn count(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var left: ?u32 = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    while (left) |n| {
+        \\        total +%= n;
+        \\        left = if (n == 0) null else n - 1;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn stuck(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const go = (try r.takeByte()) & 1 != 0;
+        \\    var total: u64 = 0;
+        \\    while (go) total +%= 1;
+        \\    return total;
+        \\}
+        \\pub fn asked(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    var total: u64 = 0;
+        \\    while (notYet(total, seed)) total +%= 3;
+        \\    return total;
+        \\}
+        \\fn notYet(total: u64, seed: u64) bool {
+        \\    return total != seed;
+        \\}
+    , 4);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var more = (try r.takeByte()) != 0;
+        \\    var total: u64 = 0;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    while (more) {
+        \\        try io.checkCancel();
+        \\        total +%= seed;
+        \\        more = total != seed *% 7;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn varint(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var more = true;
+        \\    var value: u64 = 0;
+        \\    while (more) {
+        \\        const b = try r.takeByte();
+        \\        value = value << 7 | (b & 0x7f);
+        \\        more = b & 0x80 != 0;
+        \\    }
+        \\    return value;
+        \\}
+        \\pub fn small(io: std.Io) u64 {
+        \\    _ = io;
+        \\    var i: u32 = 0;
+        \\    var total: u64 = 0;
+        \\    while (i != 16) : (i += 1) total +%= i;
+        \\    return total;
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");
