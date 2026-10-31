@@ -6511,7 +6511,7 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
-test "A020 takes a periodic point's counter only where it is declared before the loop: one made in the body starts again each pass" {
+test "A020 takes a periodic point's counter only where it is declared before the loop and written by `=` and the compound operators alone: one made in the body starts again each pass, one destructured is set" {
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\pub fn spin(io: std.Io) !void {
@@ -6559,7 +6559,30 @@ test "A020 takes a periodic point's counter only where it is declared before the
         \\        n +%= 1;
         \\    }
         \\}
+        \\pub fn paired(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        n +%= 1;
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\    }
+        \\}
     , 0);
+    // A destructure writes the counter as an assignment does (`i, n = .{ 1, n +% 1 }` sets it to
+    // 1 each pass, so `i % 64` is never 0): it is not stepped.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        i, n = .{ 1, n +% 1 };
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\    }
+        \\}
+    , 1);
 }
 
 test "A020 takes a periodic point's counter only where the function alone writes it: never one written through its address or a container's" {

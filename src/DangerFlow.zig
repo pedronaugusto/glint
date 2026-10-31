@@ -1295,8 +1295,9 @@ fn invariant(c: *Context, condition: Ast.Node.Index, loop: Ast.Node.Index) bool 
     return true;
 }
 
-/// Whether a declaration is a variable of a function whose address it never takes: only the
-/// function's own assignments write it.
+/// Whether a declaration is a variable of a function whose address it never takes, nor writes
+/// but by `=` and the compound operators (`assigns`): only those of the function's own
+/// assignments write it. A destructure's target (`n, _ = .{ x, 0 }`) is written otherwise.
 fn localVariable(c: *Context, file: Project.FileId, declared: Model.Declaration.Id) bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -1307,11 +1308,21 @@ fn localVariable(c: *Context, file: Project.FileId, declared: Model.Declaration.
         else => {},
     }
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .address_of) continue;
-        var operand = tree.nodeData(@fromBackingInt(@intCast(i))).node;
-        while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
-        if (tree.nodeTag(operand) != .identifier) continue;
-        if ((model.reference(operand) orelse continue).declaration == declared) return false;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .address_of => {
+                var operand = tree.nodeData(node).node;
+                while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
+                if (tree.nodeTag(operand) != .identifier) continue;
+                if ((model.reference(operand) orelse continue).declaration == declared) return false;
+            },
+            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |target| {
+                const root = rootOf(tree, target);
+                if (tree.nodeTag(root) != .identifier) continue;
+                if ((model.reference(root) orelse continue).declaration == declared) return false;
+            },
+            else => {},
+        }
     }
     return true;
 }
