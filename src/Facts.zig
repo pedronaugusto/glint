@@ -9,6 +9,9 @@ const Facts = @This();
 
 project: *const Project,
 gpa: std.mem.Allocator,
+/// The module names of the libraries the analyses know by their declarations (aegis's), as a
+/// program imports them: their files, like std's, are not the program's (`program`).
+known: []const []const u8 = &.{},
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
 /// The sets of comptime `bool` parameters' values that the paths read so far settle, each once.
@@ -38,7 +41,7 @@ dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
 /// Per-run state rules keep across files, by the key they name it with (`memo`).
 memos: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
-/// Every member access in the selected files, by the member's name, found once (`memberUses`).
+/// Every member access in the program's files, by the member's name, found once (`memberUses`).
 member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
 remaining: usize = 100_000,
 
@@ -196,7 +199,7 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
     if (self.publications.get(key)) |found| return found;
     var entries: std.ArrayList(Entry) = .empty;
     var gaps: std.ArrayList(Gap) = .empty;
-    var reached: std.array_hash_map.Auto(Project.FileId, void) = .empty;
+    var reached: FileSet = .empty;
     for (library.modules) |module| {
         for (self.project.imports, 0..) |mapping, index| {
             if (!std.mem.eql(u8, mapping.spelling, module.name)) continue;
@@ -206,7 +209,7 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
                 repeated = true;
             };
             if (repeated) continue;
-            try reached.put(self.gpa, mapping.target, {});
+            try reached.put(self.gpa, @backingInt(mapping.target), {});
             for (module.members) |listed| switch (try self.published(mapping.target, listed.path)) {
                 .found => |target| {
                     const role_value: u32 = @intCast(@backingInt(listed.role));
@@ -220,18 +223,12 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
             };
         }
     }
-    var growing = true;
-    while (growing) {
-        growing = false;
-        for (self.project.imports) |mapping| {
-            if (!reached.contains(mapping.from) or reached.contains(mapping.target)) continue;
-            if (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root")) continue;
-            try reached.put(self.gpa, mapping.target, {});
-            growing = true;
-        }
-    }
+    try self.reach(&reached, .library);
+    var files: std.ArrayList(Project.FileId) = .empty;
+    var each = reached.keyIterator();
+    while (each.next()) |file| try files.append(self.gpa, @fromBackingInt(file.*));
     const result = try self.gpa.create(Publication);
-    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = reached.keys() };
+    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
     try self.publications.put(self.gpa, key, result);
     return result;
 }
@@ -496,13 +493,13 @@ pub fn parameterCopies(self: *Facts, function: Decl) ResolveError![]const Parame
 fn findCopies(self: *Facts) ResolveError!void {
     var found: std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = .empty;
     self.copies = found;
-    const outside = try self.standardFiles();
+    const standard = &(try self.outside()).std_files;
     var functions: std.ArrayList(Decl) = .empty;
     for (self.project.sources) |*source| {
         const file = &source.file;
         const model = &source.model;
         const id = source.id;
-        if (file.status != .parsed or outside.contains(id)) continue;
+        if (file.status != .parsed or standard.contains(@backingInt(id))) continue;
         for (model.declarations, 0..) |d, i| {
             if (d.kind != .function) continue;
             const decl: Decl = .{ .file = id, .index = @fromBackingInt(@intCast(i)) };
@@ -550,56 +547,64 @@ fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
 /// std computes from the program it is in and the target it is built for.
 fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError!bool {
     if (!std.mem.eql(u8, spelling, "root") and !std.mem.eql(u8, spelling, "builtin")) return false;
-    const known = try self.memo(Standard);
-    if (known.reached == null) known.reached = try self.standardFiles();
-    return known.reached.?.contains(file);
+    return (try self.outside()).std_files.contains(@backingInt(file));
 }
-const Standard = struct { reached: ?Files = null };
 
-/// Whether a scan of "every use in the program" reads `file`: a file selected, or any file a
-/// path import (`@import("other.zig")`) joins to one, either way: a use in a file of the package
-/// left out of the selection is still a use. A module imported by name (std, a dependency) is
-/// another package's, which names none of this one's declarations.
+/// Whether `file` is the program's: every loaded file but those std's import reaches and those
+/// a known library's module roots reach (`known`), which the analyses know by their
+/// declarations. A file of the package the run did not select and a dependency's are the
+/// program's as much as a selected one: what they do runs as its own, so a scan of "every use
+/// in the program" reads them, and one that stops at a selection decides nothing past it.
 pub fn program(self: *Facts, file: Project.FileId) ResolveError!bool {
-    if (self.project.at(file).input.selected) return true;
-    const known = try self.memo(Program);
-    if (known.files == null) {
-        var files: Files = .empty;
-        for (self.project.sources) |*source| if (source.input.selected) try files.put(self.gpa, source.id, {});
-        var growing = true;
-        while (growing) {
-            growing = false;
-            for (self.project.imports) |mapping| {
-                if (!std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
-                if (files.contains(mapping.from) == files.contains(mapping.target)) continue;
-                try files.put(self.gpa, if (files.contains(mapping.from)) mapping.target else mapping.from, {});
-                growing = true;
-            }
-        }
-        known.files = files;
-    }
-    return known.files.?.contains(file);
+    return (try self.outside()).own(file);
 }
-const Program = struct { files: ?Files = null };
-const Files = std.AutoHashMapUnmanaged(Project.FileId, void);
 
-/// The files std's module reaches: its own generics are std's, not the program's.
-fn standardFiles(self: *Facts) ResolveError!Files {
-    var reached: Files = .empty;
-    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) {
-        try reached.put(self.gpa, mapping.target, {});
+/// The files that are not the program's, found once: std's and the known libraries'.
+pub fn outside(self: *Facts) ResolveError!*const Outside {
+    const found = try self.memo(Outside);
+    if (found.built) return found;
+    found.built = true;
+    found.project = self.project;
+    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
+    try self.reach(&found.std_files, .standard);
+    for (self.known) |name| for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, name)) {
+        try found.known_files.put(self.gpa, @backingInt(mapping.target), {});
     };
+    try self.reach(&found.known_files, .library);
+    return found;
+}
+pub const Outside = struct {
+    /// The files std's import reaches.
+    std_files: FileSet = .empty,
+    /// The files a known library's module roots reach, std's aside.
+    known_files: FileSet = .empty,
+    project: *const Project = undefined,
+    built: bool = false,
+
+    /// Whether `file` is the program's. A file the run selected is: what is linted is the
+    /// program, a library's own sources among them when the run is the library's.
+    pub fn own(self: *const Outside, file: Project.FileId) bool {
+        if (self.project.at(file).input.selected) return true;
+        return !self.std_files.contains(@backingInt(file)) and !self.known_files.contains(@backingInt(file));
+    }
+};
+
+/// Grows `files` to every file their imports reach. std's reach follows every import of its
+/// own; a library's stops at std, builtin and root, which are not its files.
+fn reach(self: *Facts, files: *FileSet, from: enum { standard, library }) ResolveError!void {
     var growing = true;
     while (growing) {
         growing = false;
         for (self.project.imports) |mapping| {
-            if (!reached.contains(mapping.from) or reached.contains(mapping.target)) continue;
-            try reached.put(self.gpa, mapping.target, {});
+            if (!files.contains(@backingInt(mapping.from)) or files.contains(@backingInt(mapping.target))) continue;
+            if (from == .library and (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root"))) continue;
+            try files.put(self.gpa, @backingInt(mapping.target), {});
             growing = true;
         }
     }
-    return reached;
 }
+/// Files by their ids' numbers.
+pub const FileSet = std.AutoHashMapUnmanaged(u32, void);
 
 /// The position of each parameter of `function` that takes a type or `anytype`, by its
 /// declaration's index; null for any other parameter.
@@ -2260,7 +2265,7 @@ pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     return @ptrCast(@alignCast(entry.value_ptr.*)); // aegis: internal(A019): the key is this type's own name.
 }
 
-/// The member accesses (`x.name`) in the project's selected files that spell `name`, each a
+/// The member accesses (`x.name`) in the program's files (`program`) that spell `name`, each a
 /// `field_access` node: an index built once, for rules that follow one member across files.
 pub fn memberUses(self: *Facts, name: []const u8) ResolveError![]const Key {
     if (self.member_uses == null) {
@@ -3202,13 +3207,27 @@ fn exportedFunction(self: *Facts, function: Decl) ResolveError!bool {
     return set.contains(.{ .file = function.file, .scope = scope });
 }
 
+/// Whether `file` is of the package the run lints: selected, or of a package a selected file is.
+fn linted(self: *const Facts, file: Project.FileId) bool {
+    const input = self.project.at(file).input;
+    if (input.selected) return true;
+    if (input.package.len == 0) return false;
+    for (self.project.sources) |*source| {
+        if (source.input.selected and std.mem.eql(u8, source.input.package, input.package)) return true;
+    }
+    return false;
+}
+
 fn exportedContainers(self: *Facts) ResolveError!*const std.AutoHashMapUnmanaged(Container, void) {
     if (self.exported) |*set| return set;
     var set: std.AutoHashMapUnmanaged(Container, void) = .empty;
     var queue: std.ArrayList(Container) = .empty;
-    // A module root: a file imported by a module name rather than a path.
+    // A module root of the package the run lints: a file imported by a module name rather than
+    // a path. A consumer outside this build may call what it exports; a dependency's module is
+    // called by nothing this build does not load.
     for (self.project.imports) |edge| {
         if (std.mem.endsWith(u8, edge.spelling, ".zig") or std.mem.eql(u8, edge.spelling, "std") or std.mem.eql(u8, edge.spelling, "builtin")) continue;
+        if (!self.linted(edge.target)) continue;
         const root = self.rootOf(edge.target);
         if ((try set.getOrPut(self.gpa, root)).found_existing) continue;
         try queue.append(self.gpa, root);

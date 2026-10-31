@@ -80,6 +80,9 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     try governed(c, rule, &calls, true, "{s}: secret material handled by hand; aegis Secret and SecretBytes wipe it, Choice compares in constant time");
     const keys = try secretKeys(c);
     if (keys.len == 0) return;
+    // The names an alias the run does not report gives them: a use spelling one is the site.
+    var renamed: std.ArrayList([]const u8) = .empty;
+    try Governed.aliasNames(c, keys, null, &renamed);
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -90,7 +93,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
             else => continue,
         };
         const spelled = tree.tokenSlice(site);
-        if (!std.mem.eql(u8, spelled, "SecretKey") and !std.mem.eql(u8, spelled, "KeyPair")) continue;
+        if (!std.mem.eql(u8, spelled, "SecretKey") and !std.mem.eql(u8, spelled, "KeyPair") and !named(renamed.items, spelled)) continue;
         if (c.inTest(site)) continue;
         const decl = (try c.facts.definition(c.file, node)) orelse continue;
         const origin = (try c.facts.origin(decl)) orelse decl;
@@ -103,8 +106,15 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
             .equal_equal, .bang_equal => continue,
             else => {},
         };
-        try c.at(rule, site, try c.allocator.print("std.crypto {s} held by value outside aegis Secret: its bytes are copied and never wiped", .{spelled}));
+        const held = c.project.at(origin.file).model.declarations[@backingInt(origin.index)].name;
+        try c.at(rule, site, try c.allocator.print("std.crypto {s} held by value outside aegis Secret: its bytes are copied and never wiped", .{held}));
     }
+}
+
+/// Whether `spelled` is one of `names`.
+fn named(names: []const []const u8, spelled: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, spelled)) return true;
+    return false;
 }
 
 /// The declarations of std's secret-key and key-pair types: those named `SecretKey` or

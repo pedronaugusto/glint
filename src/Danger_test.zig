@@ -328,6 +328,24 @@ test "A008 finds hand wipes, hand comparisons and std secret keys held by value"
     , 4);
 }
 
+test "A008 finds a use through an alias another name gives in a file the run did not select, where the alias itself is no site this run reports" {
+    // `other.zig` names std's wipe `zero` and the secret key `Key`: the call (3) and the key
+    // held by value (5) are the sites. A comparison of the key's type is still no site (6).
+    const found = try runWithFile(pack.secrets,
+        \\const other = @import("other.zig");
+        \\pub fn f(buffer: []u8) void {
+        \\    other.zero(u8, buffer);
+        \\}
+        \\pub fn g(k: other.Key) usize { return k.bytes.len; }
+        \\pub const same = other.Key == other.Key;
+    ,
+        \\const std = @import("std");
+        \\pub const zero = std.crypto.secureZero;
+        \\pub const Key = std.crypto.sign.Ed25519.SecretKey;
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5 }, found.lines[0..found.findings]);
+}
+
 test "A008 leaves borrowed keys, sealed keys, public keys and compared key types alone" {
     try expect(pack.secrets,
         \\const std = @import("std");
@@ -1143,20 +1161,38 @@ const generic_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
     \\pub fn through(x: anytype, f: *const fn (@TypeOf(x)) usize) usize { return f(x); }
 };
 
+/// Dependencies whose generics read what they are handed and copy no field of it. A generic
+/// nothing calls binds no argument, and one that names the field of what it may be handed
+/// shows nothing (as in the program's own file), so each holds only what is called.
+const total_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes = "pub fn total(x: anytype) usize { return x.count; }" };
+const part_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes = "pub fn part(x: anytype) usize { return x.interface.end; }" };
+/// A dependency whose generic hands what it is given to a function pointer it is given.
+const pointer_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
+    \\pub fn total(x: anytype) usize { return x.count; }
+    \\pub fn through(x: anytype, f: *const fn (@TypeOf(x)) usize) usize { return f(x); }
+};
+
 /// `interface_program` returning `value`, with the dependency imported and `extra` declared.
 fn handed(comptime value: []const u8, comptime extra: []const u8) !Run {
+    return handedTo(generic_dependency, value, extra);
+}
+fn handedTo(dependency: sources.Extra, comptime value: []const u8, comptime extra: []const u8) !Run {
     const program = comptime edited(edited(interface_program, "    return s.count + s.interface.end;", "    return " ++ value ++ ";"), "pub fn use() !usize {", "const dep = @import(\"dep\");\n" ++ extra ++ "pub fn use() !usize {");
-    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{generic_dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
+    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
 }
 
-test "A019 follows a parent handed to a generic outside the program into its body, where a copy of the field by its name or a computed one leaves the conversion a finding" {
-    // Clean: another field read, by pointer and by value; a part of the interface read.
-    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.total(&s) + dep.total(s)", "")).findings);
-    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.part(&s)", "")).findings);
-    // Findings (11, the conversion and its alignment): the field copied by name, by pointer
-    // and by value; by a name the caller gives; each field of a tuple holding a C copied, as
-    // std.fmt's `{any}` does, from the program or through a generic of its own.
+test "A019 reads a parent handed to a dependency's generic: its body is the program's, where a copy of the field by its name or a computed one leaves the conversion a finding" {
+    // Clean: a dependency's generics that read another field, by pointer and by value, or a
+    // part of the interface.
+    try std.testing.expectEqual(@as(usize, 0), (try handedTo(total_dependency, "dep.total(&s) + dep.total(s)", "")).findings);
+    try std.testing.expectEqual(@as(usize, 0), (try handedTo(part_dependency, "dep.part(&s)", "")).findings);
+    // Findings (11, the conversion and its alignment): a dependency's generic that copies the
+    // field leaves the conversion a finding whether or not it is handed the parent (`grab`
+    // beside `total`); the field copied by name, by pointer and by value; by a name the caller
+    // gives; each field of a tuple holding a C copied, as std.fmt's `{any}` does, from the
+    // program or through a generic of its own.
     for ([_]Run{
+        try handed("dep.total(&s)", ""),
         try handed("dep.grab(&s)", ""),
         try handed("dep.grab(s)", ""),
         try handed("dep.named(&s, \"interface\")", ""),
@@ -1164,8 +1200,8 @@ test "A019 follows a parent handed to a generic outside the program into its bod
         try handed("log(s)", "fn log(x: anytype) usize { return dep.print(.{x}); }\n"),
     }) |found| try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
     // Undecided: a function pointer the C is handed through, whose body is not known.
-    const baseline = try handed("dep.total(&s)", "");
-    const unread = try handed("dep.through(&s, show)", "fn show(x: *Sink) usize { return x.count; }\n");
+    const baseline = try handedTo(pointer_dependency, "dep.total(&s)", "");
+    const unread = try handedTo(pointer_dependency, "dep.through(&s, show)", "fn show(x: *Sink) usize { return x.count; }\n");
     try std.testing.expectEqual(@as(usize, 0), unread.findings);
     try std.testing.expect(unread.undecided > baseline.undecided);
 }
@@ -1490,6 +1526,31 @@ test "A019 reads the prefix a cursor writer counts, where its type steps the cou
         \\pub fn c1() void { var buf: [16]u8 = undefined; const w: Writer = .{ .bytes = &buf }; _ = w.written(); use(buf[0..1]); }
     );
     try std.testing.expectEqualSlices(u32, &.{ 16, 17, 18, 24, 24, 25 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a function in a file the run did not select as the program's: what it writes of a local, and a cursor writer it keeps" {
+    // Clean: `fill` writes all of the local (3); `more` keeps the writer over what it was given
+    // (5). Findings: `first` writes one byte of four (4); `elsewhere` points the writer at other
+    // memory (6).
+    const found = try runWithFile(pack.unsafe_set,
+        \\const other = @import("other.zig");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn fa() void { var buf: [4]u8 = undefined; other.fill(&buf); use(&buf); }
+        \\pub fn fb() void { var buf: [4]u8 = undefined; other.first(&buf); use(&buf); }
+        \\pub fn fc() !void { var buf: [16]u8 = undefined; var w: other.Writer = .{ .bytes = &buf }; try w.put("ab"); try other.more(&w); use(buf[0..w.pos]); }
+        \\pub fn fd(to: []u8) !void { var buf: [16]u8 = undefined; var w: other.Writer = .{ .bytes = &buf }; try w.put("ab"); other.elsewhere(&w, to); try w.put("y"); use(buf[0..w.pos]); }
+    ,
+        \\pub fn fill(b: *[4]u8) void { b.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn first(b: *[4]u8) void { b[0] = 1; }
+        \\pub const Writer = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    pub fn put(self: *Writer, v: []const u8) error{Full}!void { if (v.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..v.len], v); self.pos += v.len; }
+        \\};
+        \\pub fn more(w: *Writer) !void { try w.put("x"); }
+        \\pub fn elsewhere(w: *Writer, to: []u8) void { w.* = .{ .bytes = to }; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 4, 6 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads a local a range's passes wrote a stride at a time, all of it" {
@@ -4392,6 +4453,30 @@ test "A015 reads a function std's Io calls through its vtable as returning what 
         \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
         \\pub const Routed = Layer(.{ .start = &routedSpawn, .processSpawn = spawn });
     , 2);
+}
+
+test "A015 finds the vtable slot a function is given in any file of the program, selected or not" {
+    // `layer.zig`, outside the selection, gives `routedSpawn` the `processSpawn` slot; `spawn`
+    // takes no userdata (7).
+    const layer: sources.Extra = .{ .name = "layer.zig", .bytes =
+        \\const main = @import("main.zig");
+        \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
+        \\pub const Routed = Layer(.{ .processSpawn = &main.routedSpawn });
+        \\pub const Plain = Layer(.{ .start = &main.spawn });
+    };
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const State = struct { base: std.Io };
+        \\pub fn routedSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    const state: *State = @ptrCast(@alignCast(userdata.?));
+        \\    return std.process.spawn(state.base, options);
+        \\}
+        \\pub fn spawn(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    return std.process.spawn(io, options);
+        \\}
+        \\pub const routed = @import("layer.zig").Routed;
+    , &(std_files ++ [_]sources.Extra{layer}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "layer.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "main.zig", .target = sources.consumer_file } }));
+    try std.testing.expectEqualSlices(u32, &.{7}, found.lines[0..found.findings]);
 }
 
 test "A014 reads a local list nothing grows or frees once its items are stored as no borrow a growth moves" {

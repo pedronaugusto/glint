@@ -61,6 +61,13 @@ pub const Kind = enum {
 /// reports one that drops them (Context.drift). The same members are listed once per way aegis
 /// is imported: the root, and each namespace module a program may depend on alone.
 pub const library: Lib = .{ .modules = &modules };
+/// The names aegis's modules are imported by: the files they reach are not the program's
+/// (`Facts.known`), as the analyses know aegis by its declarations.
+pub const module_names: [modules.len][]const u8 = blk: {
+    var names: [modules.len][]const u8 = undefined;
+    for (modules, &names) |module, *name| name.* = module.name;
+    break :blk names;
+};
 const Lib = Library(Kind);
 const modules = [_]Lib.Module{
     .{ .name = "aegis", .members = &root_members },
