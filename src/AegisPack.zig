@@ -133,7 +133,11 @@ fn checkAccess(c: *Context) Context.Error!void {
     const made_by_constructor = try constructed(c);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (made_by_constructor.len != 0) try checkLiteral(c, tree, node, made_by_constructor);
+        if (made_by_constructor.len != 0) {
+            try checkLiteral(c, tree, node, made_by_constructor);
+            if (assigning(tag)) try checkFieldWrite(c, tree, tree.nodeData(node).node_and_node[0], node, made_by_constructor);
+            if (tag == .address_of) try checkFieldWrite(c, tree, tree.nodeData(node).node, node, made_by_constructor);
+        }
         if (tag != .field_access) continue;
         const data = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
@@ -166,6 +170,36 @@ fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []
         .owner => |k| if (k == .public_source) try c.at(access, tree.firstToken(node), "public text built by a literal skips its reviewed classification; use err.PublicSource.classify(reason, bytes)"),
         .other => {},
         .unknown => try c.undecided(access, tree.tokenStart(tree.firstToken(node)), .unresolved, "a literal that may be a public source has no resolved result type"),
+    }
+}
+/// A field of a type only its constructor makes, written in place (`p.bytes = x`,
+/// `@field(p, "bytes") = x`) or its address taken (`&p.bytes`), outside the library: its
+/// classification no longer describes what it holds. A finding where the value is one,
+/// undecided where it does not resolve.
+fn checkFieldWrite(c: *Context, tree: *const Ast, target: Ast.Node.Index, at: Ast.Node.Index, targets: []const Facts.Container) Context.Error!void {
+    var place = target;
+    while (tree.nodeTag(place) == .grouped_expression) place = tree.nodeData(place).node_and_token[0];
+    const base: Ast.Node.Index, const name: []const u8 = switch (tree.nodeTag(place)) {
+        .field_access => .{ tree.nodeData(place).node_and_token[0], try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(place).node_and_token[1])) },
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(place)), "@field")) return;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, place, &buffer);
+            if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return;
+            const quoted = tree.tokenSlice(tree.nodeMainToken(args[1]));
+            break :blk .{ args[0], quoted[1 .. quoted.len - 1] };
+        },
+        else => return,
+    };
+    var declared = false;
+    for (targets) |container| if (c.facts.member(container, name)) |field| {
+        declared = declared or c.project.at(field.file).model.declarations[@backingInt(field.index)].kind == .field;
+    };
+    if (!declared) return;
+    switch (try perBuild(c, try c.facts.resolve(c.file, base))) {
+        .owner => |k| if (k == .public_source) try c.at(access, tree.nodeMainToken(at), "a public source's field written in place keeps a classification that no longer describes it; make a new one with err.PublicSource.classify(reason, bytes)"),
+        .other => {},
+        .unknown => try c.undecided(access, tree.tokenStart(tree.nodeMainToken(at)), .unresolved, "a field written in place may be a public source's: its classification would no longer describe it"),
     }
 }
 /// Whether a literal could be a value of `container`: every field it names is one of the
