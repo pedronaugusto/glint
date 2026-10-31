@@ -3718,7 +3718,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, parent)) |call| {
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .{ .unknown = .unsupported };
-        return self.parameterType(file, call, position);
+        return self.parameterType(file, parent, call, position);
     }
     var parent_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&parent_buffer, parent) != null) {
@@ -3797,7 +3797,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
 /// The written type of a call's argument at `position`: the callee's parameter (a method's
 /// receiver first), a made container's method read with the arguments that made it.
 /// `.scalar` for `anytype`, which takes the argument's own type.
-fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, position: usize) ResolveError!Value {
+fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call, position: usize) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     const callee = try self.resolve(file, call.ast.fn_expr);
     if (callee == .unknown) return callee;
@@ -3821,7 +3821,18 @@ fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, positi
                 made = m;
             };
         }
+        // A function of a made type called on the type (`Atomic(T).init(x)`): its bindings.
+        if (on == .container) if (on.container.made_by) |m| if (decl.file == on.container.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == on.container.scope) {
+            made = m;
+        };
     }
+    // A declaration literal's call (`.init(x)`) is a function of the type its place takes.
+    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) switch (try self.placeType(file, node, 1)) {
+        .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
+            made = m;
+        },
+        else => {},
+    };
     const target_tree = &self.project.at(decl.file).file.tree;
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{ .unknown = .unsupported };
