@@ -774,6 +774,18 @@ test "A002 follows a returned or stored borrow through every shape that keeps it
     try expectJudged(head ++ "fn sum(p: *const u32) u32 { return p.*; }\npub fn f(s: *S(u32), k: u8, out: *u32) u32 { var buf: u32 = 0; const p = &buf; p.* = s.expose().*; out.* = buf; const n = switch (k) { 0 => s.expose().*, else => sum(s.expose()) }; return n + @sizeOf(@TypeOf(s.expose())); }", pack.copies, true, 0);
 }
 
+test "A002 follows a generic's copy through any number of generics passing it on" {
+    // Declared callee-last, each hop is found only after the one it calls: the search runs to
+    // a fixed point, not a set number of rounds.
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(std.testing.allocator);
+    try chain.appendSlice(std.testing.allocator, "const S = @import(\"aegis\").Secret;\npub fn use(s: S(u32)) void { h40(s); }\n");
+    var i: usize = 40;
+    while (i > 0) : (i -= 1) try chain.print(std.testing.allocator, "fn h{d}(x: anytype) void {{ h{d}(x); }}\n", .{ i, i - 1 });
+    try chain.appendSlice(std.testing.allocator, "fn h0(x: anytype) void { var kept = x; kept.deinit(); }\n");
+    try expectJudged(chain.items, pack.copies, true, 1);
+}
+
 test "A002 clears a move only of the function's own local or a value captured in place, with no copy or address of it before" {
     const head = "const bounded = @import(\"aegis\").bounded;\nconst R = bounded.Budget(u32).Reservation;\nconst Hold = struct { maybe: ?R, list: [2]R };\n";
     // A capture of a place another still holds is a copy of it.
