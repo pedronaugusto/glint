@@ -985,6 +985,12 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
         return out;
     }
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    // A writer the configuration declares a peer's is one wherever it is declared, the
+    // program's own among them: the declaration says where its bytes go, not its body.
+    if (flow.fact == .peer) for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) {
+        out.kind = .source;
+        return out;
+    };
     if (flow.by_node.get(.{ .file = decl.file, .node = fnDecl(c, decl) orelse record.node })) |target| {
         out.kind = .{ .program = target };
         return out;

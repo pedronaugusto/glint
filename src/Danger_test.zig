@@ -1806,6 +1806,38 @@ test "A018 reads the peer writers a package declares" {
     }
 }
 
+test "A018 reads a peer writer a package declares as one wherever it is declared, its body the program's or not" {
+    // Declared in the selected file, and in `wire.zig`, of the package and outside the
+    // selection: each is a peer writer when the configuration names it, and nothing else.
+    const wire: sources.Extra = .{ .name = "wire.zig", .package = "pkg", .bytes = "const std = @import(\"std\");\npub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }" };
+    const programs = [_][]const u8{
+        \\const std = @import("std");
+        \\pub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }
+        \\pub fn reply(err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = peer(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\}
+        ,
+        \\const wire = @import("wire.zig");
+        \\pub fn reply(err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = wire.peer(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\}
+    };
+    for (programs) |program| {
+        var project = try sources.projectInPackage(std.testing.allocator, program, "pkg", &(std_files ++ [_]sources.Extra{wire}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wire.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+        defer project.deinit();
+        const declared = [_]glint.Config.PeerWriter{.{ .module = "pkg", .declaration = "peer" }};
+        for ([_]usize{ 0, 1 }) |given| {
+            var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }}, .peer_writers = declared[0..given] }, .{ .project_rules = &pack.rules });
+            defer report.deinit();
+            try std.testing.expectEqual(given, report.diagnostics.len);
+        }
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,

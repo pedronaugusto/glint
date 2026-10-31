@@ -194,19 +194,25 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     return Project.init(gpa, &inputs, &all, .{});
 }
 
-/// A source of another module beside aegis's, such as a fixture standing for std.
-pub const Extra = struct { name: []const u8, bytes: []const u8 };
+/// A source of another module beside aegis's, such as a fixture standing for std, in the
+/// package `package` names (none where empty).
+pub const Extra = struct { name: []const u8, bytes: []const u8, package: []const u8 = "" };
 /// An import among the extra sources, by their index in what the caller gives; a null `from` is
 /// the consumer's.
 pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target: u32 };
 
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
 pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
+    return projectInPackage(gpa, consumer, "", extra, extra_imports);
+}
+
+/// `projectWithSources`, the consumer a file of `package`.
+pub fn projectInPackage(gpa: std.mem.Allocator, consumer: []const u8, package: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
     const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);
     defer gpa.free(inputs);
-    inputs[0] = .{ .name = "consumer", .bytes = consumer };
+    inputs[0] = .{ .name = "consumer", .bytes = consumer, .package = package };
     for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
-    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = source.package };
     const mapped = imports();
     const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len);
     defer gpa.free(all);
