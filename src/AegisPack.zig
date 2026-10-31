@@ -782,7 +782,9 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
     }
     const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
     for (made) |copy| {
-        if ((copy.kind == .made) != (rule == cleanup)) continue;
+        // A cast by a parameter's type is A004's; a copy A002's, an acquisition A003's.
+        if ((copy.kind == .cast) != (rule == scalar)) continue;
+        if (copy.kind != .cast and (copy.kind == .made) != (rule == cleanup)) continue;
         if (copy.kind == .made and !try acquiring(c, copy.site)) continue;
         if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
         if (!types[copy.position] and !values[copy.position]) continue;
@@ -800,6 +802,18 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             continue
         else
             try c.facts.resolve(c.file, argument);
+        if (copy.kind == .cast) {
+            // The library's own generics are its safe types' internals.
+            if (try c.inLibrary(Contract.library, copy.site.file)) continue;
+            const site = &c.project.at(copy.site.file).file;
+            const line = site.line(site.tree.tokenStart(site.tree.nodeMainToken(copy.site.node))) + 1;
+            switch (try perBuild(c, try instanceOf(c, value))) {
+                .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), try c.allocator.print("this binding makes the integer {s}:{d} casts by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{ c.project.at(copy.site.file).input.name, line })),
+                .other => {},
+                .unknown => if (!bindingTyped(value)) try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve"),
+            }
+            continue;
+        }
         // A pointer type: its copies are aliases, which A002 leaves out.
         if (pointerShaped(value)) continue;
         // A type argument stands for its values.
@@ -3132,7 +3146,11 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             if (std.mem.eql(u8, name, "@as")) return args.len == 2 and try rawValue(c, args[1], seen);
             if (std.mem.eql(u8, name, "@splat")) return args.len == 1 and try rawValue(c, args[0], seen);
             // A scalar's integer read out by the language.
-            if (std.mem.eql(u8, name, "@backingInt") or std.mem.eql(u8, name, "@intFromEnum")) return args.len == 1 and try requiredOwner(c, args[0], scalar, tree.nodeMainToken(node)) == .scalar;
+            if (std.mem.eql(u8, name, "@backingInt") or std.mem.eql(u8, name, "@intFromEnum")) {
+                // Of a value a generic parameter gives: each binding's.
+                if (try c.facts.castAtBinding(c.file, node)) return false;
+                return args.len == 1 and try requiredOwner(c, args[0], scalar, tree.nodeMainToken(node)) == .scalar;
+            }
             // `@call(modifier, Index.raw, .{s})`.
             if (std.mem.eql(u8, name, "@call") and args.len == 3) {
                 var tuple_buffer: [2]Ast.Node.Index = undefined;
@@ -3248,6 +3266,7 @@ fn checkScalar(c: *Context) Context.Error!void {
     const operation = "raw aegis scalar operation bypasses domain/unit or checked arithmetic; explicit boundary semantics required";
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        try checkBinding(c, tree, node, scalar);
         switch (tag) {
             .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const operands = tree.nodeData(node).node_and_node;
@@ -3263,6 +3282,8 @@ fn checkScalar(c: *Context) Context.Error!void {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 // An integer made into a scalar by the language skips its checked construction.
                 if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) {
+                    // By a generic parameter's type: each binding's, checked there.
+                    if (try c.facts.castAtBinding(c.file, node)) continue;
                     switch (try perBuild(c, try instanceOf(c, try c.facts.literalType(c.file, node)))) {
                         .owner => |k| if (k == .scalar) {
                             try c.at(scalar, tree.nodeMainToken(node), "an integer made into an aegis scalar by a cast skips its checked construction; use the scalar's checked constructor or justify the boundary");

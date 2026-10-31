@@ -459,6 +459,14 @@ test "A004 reads a scalar's raw integer by meaning, through every place it is pu
     // A scalar made from an integer by a cast skips its checked construction.
     try expectJudged(head ++ "pub fn f(v: u16) Index { return @enumFromInt(v); }", pack.scalar, true, 1);
     try expectJudged(head ++ "pub fn f(v: u16) Index { return @fromBackingInt(v); }", pack.scalar, true, 1);
+    // A made type's function called on the type or by a declaration literal types its
+    // argument with the type's bindings.
+    try expectJudged(head ++ "const Color = enum(u8) { red, _ };\nvar a: aegis.Atomic(Color) = .init(@fromBackingInt(0));\nvar b: aegis.Atomic(Index) = .init(@fromBackingInt(0));\nvar d: aegis.Atomic(Index) = aegis.Atomic(Index).init(@fromBackingInt(0));\npub fn f() void { _ = &a; _ = &b; _ = &d; }", pack.scalar, true, 2);
+    // A cast by a generic parameter's type is each binding's: decided where it is bound.
+    const generic = "fn Lib(comptime R: type) type { return struct { pub const Role = R; roles: []const R }; }\nfn role(library: anytype, n: u32) @TypeOf(library).Role { const Role = @TypeOf(library).Role; return @as(Role, @fromBackingInt(@as(u16, @intCast(n)))); }\nfn total(library: anytype) u32 { var sum: u32 = 0; for (library.roles) |r| sum += @intCast(@backingInt(r)); return sum; }\n";
+    try expectJudged(head ++ generic ++ "pub fn open(library: anytype, n: u32) @TypeOf(library).Role { return role(library, n); }", pack.scalar, true, 0);
+    try expectJudged(head ++ generic ++ "const Kind = enum(u16) { a, _ };\nconst lib: Lib(Kind) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 0);
+    try expectJudged(head ++ generic ++ "const lib: Lib(Index) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 2);
     // An enum of the program's own, an array's length, a comparison of scalars: no raw integer.
     try expectJudged(head ++ "const Color = enum(u8) { red, green };\npub fn f(i: Index, x: u8) usize { const c: Color = @enumFromInt(x); const a = [_]u16{ i.raw(), 3 }; return a.len + @intFromEnum(c); }", pack.scalar, true, 0);
 }
