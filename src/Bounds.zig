@@ -31,11 +31,9 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Context = @import("RuleContext.zig");
-const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
-const Governed = @import("Governed.zig");
 
 const Error = Context.Error;
 
