@@ -20,7 +20,6 @@ const Model = @import("Model.zig");
 const File = @import("File.zig");
 const Contract = @import("AegisContract.zig");
 const Program = @import("Program.zig");
-const Bounds = @import("Bounds.zig");
 const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
 const Ast = std.zig.Ast;
@@ -96,7 +95,6 @@ const expression_tokens = @as(File.Limits, .{}).expression_tokens;
 /// cannot underflow.
 pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     // Every path to it shows it within its type.
-    if (try Bounds.cleared(c, file, node, .arith)) return true;
     const tree = &c.project.at(file).file.tree;
     const tag = tree.nodeTag(node);
     const assigns = switch (tag) {
@@ -147,7 +145,6 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 /// Whether the conversion `node` (`@intCast(x)`) cannot fail: its destination holds every
 /// value the operand's range does, at every pointer width.
 pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!bool {
-    if (try Bounds.cleared(c, file, node, .cast)) return true;
     for (widths(c)) |pointer| {
         const into = (try destination(c, file, node, pointer)) orelse return false;
         const from = switch (try typeOf(c, file, operand, pointer, 0)) {
@@ -232,12 +229,6 @@ fn unwrapped(c: *Context, file: Project.FileId, value: Ast.Node.Index) Ast.Node.
 /// Whether a type expression names an integer type.
 pub fn integral(c: *Context, file: Project.FileId, type_node: Ast.Node.Index) Context.Error!bool {
     return (try named(c, file, type_node, widths(c)[0])) != null;
-}
-
-/// Whether a loop's bound is held to a short's count, or between zero and the length of memory
-/// the function holds: a peer chooses no more passes than the work it already sent.
-pub fn counts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    return try small(c, file, node) or try Bounds.cleared(c, file, node, .count);
 }
 
 /// Whether a value is held to 16 bits at every pointer width: what it can be is a short's
@@ -1190,7 +1181,6 @@ fn prong(c: *Context, decl: Facts.Decl) ?Reach {
 /// 1)`, or above another value that cannot be negative: the `else` of `if (a >= len)`).
 pub fn nonzero(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     // A divisor every path to it shows other than zero.
-    if (try Bounds.cleared(c, file, node, .divisor)) return true;
     return nonzeroAt(c, file, node, node, 0);
 }
 
@@ -3234,7 +3224,7 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     if (nesting.level >= 16) return false;
     nesting.level += 1;
     defer nesting.level -= 1;
-    return (try withinOnce(c, file, index, memory, end)) or try Bounds.within(c, file, index, memory, end);
+    return withinOnce(c, file, index, memory, end);
 }
 
 /// How deep `within` is in reading itself.
@@ -3517,7 +3507,7 @@ pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: A
         if (fact.differs or fact.read) continue;
         if (oneValue(c, file, fact.small, start) and oneValue(c, file, fact.large, end)) return true;
     }
-    return Bounds.notAfter(c, file, start, end);
+    return false;
 }
 
 /// Whether the facts keep `index` within `memory`'s length (at most it, for a slice's end), in

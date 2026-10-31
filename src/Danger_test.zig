@@ -2425,6 +2425,38 @@ test "A018 reads the peer writers a package declares" {
     }
 }
 
+test "A018 reads a peer writer a package declares as one wherever it is declared, its body the program's or not" {
+    // Declared in the selected file, and in `wire.zig`, of the package and outside the
+    // selection: each is a peer writer when the configuration names it, and nothing else.
+    const wire: sources.Extra = .{ .name = "wire.zig", .package = "pkg", .bytes = "const std = @import(\"std\");\npub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }" };
+    const programs = [_][]const u8{
+        \\const std = @import("std");
+        \\pub fn peer(buffer: []u8) std.Io.Writer { return std.Io.protocolWriter(buffer); }
+        \\pub fn reply(err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = peer(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\}
+        ,
+        \\const wire = @import("wire.zig");
+        \\pub fn reply(err: anyerror) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = wire.peer(&buf);
+        \\    try w.print("{s}", .{@errorName(err)});
+        \\}
+    };
+    for (programs) |program| {
+        var project = try sources.projectInPackage(std.testing.allocator, program, "pkg", &(std_files ++ [_]sources.Extra{wire}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wire.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+        defer project.deinit();
+        const declared = [_]glint.Config.PeerWriter{.{ .module = "pkg", .declaration = "peer" }};
+        for ([_]usize{ 0, 1 }) |given| {
+            var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }}, .peer_writers = declared[0..given] }, .{ .project_rules = &pack.rules });
+            defer report.deinit();
+            try std.testing.expectEqual(given, report.diagnostics.len);
+        }
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,
@@ -4464,6 +4496,172 @@ test "A009 bounds a loop by a number the program checked against the memory it h
     // (line 19) or strides (line 31), never one a peer's number only stops early (line 24).
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
     try std.testing.expectEqualSlices(u32, &.{ 14, 14, 19, 31 }, result.lines[0..result.findings]);
+}
+
+test "Bounds clears an index or a slice the relations along every path keep within its memory: a sum checked against what is left, an index a safe build already checked, a callee's checked result, a counter its loop's checks keep, a reslice" {
+    // Each safe case beside its twin: unchecked (line 14), the first read (line 18), a callee
+    // that checks nothing (line 34), a loop that reads one past the memory (line 47).
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn sum(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const a: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (a > buf.len) return error.Bad;
+        \\    if (n > buf.len - a) return error.Bad;
+        \\    return buf[a..][0..n][0] +% buf[a + n - 1];
+        \\}
+        \\pub fn sumUnchecked(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const a: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (a > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return buf[a + n - 1];
+        \\}
+        \\pub fn again(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const first = buf[i];
+        \\    return first +% buf[i];
+        \\}
+        \\fn fit(n: usize, len: usize) error{Long}!usize {
+        \\    if (n > len) return error.Long;
+        \\    return n;
+        \\}
+        \\fn pass(n: usize) usize {
+        \\    return n;
+        \\}
+        \\pub fn summary(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    return buf[0..try fit(n, buf.len)];
+        \\}
+        \\pub fn summaryUnchecked(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    return buf[0..pass(n)];
+        \\}
+        \\pub fn walk(r: *std.Io.Reader, bytes: []const u8) !u32 {
+        \\    var at: usize = try r.takeInt(u32, .little);
+        \\    if (at >= bytes.len) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    while (at < bytes.len) : (at += 1) total +%= bytes[at];
+        \\    return total;
+        \\}
+        \\pub fn walkPast(r: *std.Io.Reader, bytes: []const u8) !u32 {
+        \\    var at: usize = try r.takeInt(u32, .little);
+        \\    if (at >= bytes.len) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    while (at <= bytes.len) : (at += 1) total +%= bytes[at];
+        \\    return total;
+        \\}
+        \\pub fn reslice(r: *std.Io.Reader, start: []const u8) !u8 {
+        \\    var in = start;
+        \\    const ip: usize = try r.takeInt(u32, .little);
+        \\    if (ip <= in.len - 32) {
+        \\        in = in[16..];
+        \\        return in[ip + 1];
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 14, 18, 34, 47 }, result.lines[0..result.findings]);
+}
+
+test "Bounds clears arithmetic and a conversion the relations along every path keep within its type: a difference past its check, a switch prong's range" {
+    // Line 5: a sum of a decoded u32 and 2 overflows a 32-bit usize. Each twin's check leaves
+    // the operation open: a difference one short (line 12), a prong from zero (line 24), a
+    // value one past the destination (line 36), a divisor that may be zero (line 46).
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn diff(r: *std.Io.Reader) !usize {
+        \\    const em_len: usize = try r.takeInt(u32, .little);
+        \\    const h_len: usize = try r.takeInt(u32, .little);
+        \\    if (em_len < h_len + 2) return error.Bad;
+        \\    return em_len - h_len - 1;
+        \\}
+        \\pub fn diffShort(r: *std.Io.Reader) !usize {
+        \\    const em_len: usize = try r.takeInt(u32, .little);
+        \\    const h_len: usize = try r.takeInt(u32, .little);
+        \\    if (em_len < h_len) return error.Bad;
+        \\    return em_len - h_len - 1;
+        \\}
+        \\pub fn prong(r: *std.Io.Reader) !usize {
+        \\    const first = try r.takeByte();
+        \\    return switch (first) {
+        \\        192...254 => (@as(usize, first - 192) << 8) + try r.takeByte() + 192,
+        \\        else => first,
+        \\    };
+        \\}
+        \\pub fn prongWide(r: *std.Io.Reader) !usize {
+        \\    const first = try r.takeByte();
+        \\    return switch (first) {
+        \\        0...254 => (@as(usize, first - 192) << 8) + try r.takeByte() + 192,
+        \\        else => first,
+        \\    };
+        \\}
+        \\pub fn narrowed(r: *std.Io.Reader) !u8 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    if (n >= 200) return error.Bad;
+        \\    return @intCast(n + 50);
+        \\}
+        \\pub fn narrowedWide(r: *std.Io.Reader) !u8 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    if (n >= 250) return error.Bad;
+        \\    return @intCast(n + 50);
+        \\}
+        \\pub fn divisor(r: *std.Io.Reader, total: u32) !u32 {
+        \\    const k = try r.takeInt(u32, .little);
+        \\    if (k < 1) return error.Bad;
+        \\    return total / k;
+        \\}
+        \\pub fn divisorZero(r: *std.Io.Reader, total: u32) !u32 {
+        \\    const k = try r.takeInt(u32, .little);
+        \\    if (k > 100) return error.Bad;
+        \\    return total / k;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 12, 24, 36, 46 }, result.lines[0..result.findings]);
+}
+
+test "Bounds bounds what a loop steps by how far each pass steps it and how many passes run: a sum of a table's days, a count of matches" {
+    // Each twin's counter can pass its type: a u8 count over a slice of any length (line 21), a
+    // u32 count over a slice past 2^32 items on a 64-bit target (line 30).
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        \\pub fn table(r: *std.Io.Reader) !u64 {
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    var total: u64 = 0;
+        \\    for (days[0..@min(n, days.len)]) |d| total += d;
+        \\    return total;
+        \\}
+        \\pub fn count(r: *std.Io.Reader, items: []const u8) !usize {
+        \\    const m = try r.takeByte();
+        \\    var found: usize = 0;
+        \\    for (items) |b| {
+        \\        if (b == m) found += 1;
+        \\    }
+        \\    return found;
+        \\}
+        \\pub fn twice(r: *std.Io.Reader, items: []const u8) !u8 {
+        \\    const m = try r.takeByte();
+        \\    var found: u8 = 0;
+        \\    for (items) |b| {
+        \\        if (b == m) found += 1;
+        \\    }
+        \\    return found;
+        \\}
+        \\pub fn walk(r: *std.Io.Reader, items: []const u8) !u32 {
+        \\    const m = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    var seen: u32 = 0;
+        \\    while (i < items.len) : (i += 1) {
+        \\        if (items[i] == m) seen += 1;
+        \\    }
+        \\    return seen;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 21, 30 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
@@ -6626,10 +6824,9 @@ test "A010 reads a slice's length as its bounds set it, apart from what it holds
         \\    return total;
         \\}
     );
-    // Each difference. Line 40: the sum of the table's own days runs as many passes as the
-    // peer chose, which Bounds does not yet read as at most 12 days (counter steps).
+    // Each difference, and no sum of the table's own days: at most 12 passes of a byte each.
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 4, 16, 20, 28, 32, 35, 40 }, result.lines[0..result.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 16, 20, 28, 32, 35 }, result.lines[0..result.findings]);
 }
 
 test "A010 reads what a function stores through a parameter in its callers' memory: a value through a pointer, a slice through a pointer to it, and on through a caller that passes its own parameter" {
@@ -6732,7 +6929,7 @@ test "A009 follows input through a chain of calls of any length: the fact's roun
     // Each function calls the one below it, declared after it: one round reaches one step.
     var i: usize = 80;
     while (i > 0) : (i -= 1) {
-        const line = try std.fmt.allocPrint(std.testing.allocator, "fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
+        const line = try std.testing.allocator.print("fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
         defer std.testing.allocator.free(line);
         try text.appendSlice(std.testing.allocator, line);
     }

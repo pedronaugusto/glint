@@ -11,6 +11,7 @@ const Project = @import("Project.zig");
 const Taint = @import("Taint.zig");
 const Program = @import("Program.zig");
 const Range = @import("Range.zig");
+const Proof = @import("Proof.zig");
 const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
 const Rule = @import("Rule.zig").Rule;
@@ -30,7 +31,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             // value, a shorter or unknown one not.
             .array_access => {
                 const array, const index = tree.nodeData(node).node_and_node;
-                if (try Range.within(c, c.file, index, array, false)) continue;
+                if (try Proof.within(c, c.file, index, array, false)) continue;
                 try judged(c, flow, rule, index, try Taint.levelAt(c, flow, c.file, index), .data, "input indexes memory: a peer chooses the position; parse it into a refined type with aegis input.Untrusted");
             },
             .slice_open, .slice, .slice_sentinel => {
@@ -41,13 +42,13 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 // order (`b[i..n]`), and a peer choosing either chooses that.
                 const extent = "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted";
                 if (slice.ast.end.unwrap()) |end| {
-                    const end_within = try Range.within(c, c.file, end, slice.ast.sliced, true);
+                    const end_within = try Proof.within(c, c.file, end, slice.ast.sliced, true);
                     if (!end_within) try sink(c, flow, rule, end, extent);
-                    if (!try Range.notAfter(c, c.file, slice.ast.start, end, slice.ast.sliced)) {
+                    if (!try Proof.notAfter(c, c.file, slice.ast.start, end, slice.ast.sliced)) {
                         try sink(c, flow, rule, slice.ast.start, extent);
                         if (end_within) try sink(c, flow, rule, end, extent);
                     }
-                } else if (!try Range.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, extent);
+                } else if (!try Proof.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, extent);
             },
             // A pointer moved by input reaches the address a peer chooses: no length checks it,
             // unless its offset is shown within the memory it came from (`x.ptr + o`, `o < x.len`).
@@ -132,7 +133,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
-                if (level.reaches(.data) and try Range.fits(c, c.file, node)) continue;
+                if (level.reaches(.data) and try Proof.fits(c, c.file, node)) continue;
                 try judged(c, flow, rule, node, level, .data, "arithmetic on a number from input: a peer's value that overflows it stops the program; aegis int.Checked or Ranged returns the overflow");
             },
             // A difference underflows on what it takes away, a byte of input enough.
@@ -141,13 +142,13 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
-                if (level.reaches(.data) and try Range.fits(c, c.file, node)) continue;
+                if (level.reaches(.data) and try Proof.fits(c, c.file, node)) continue;
                 try judged(c, flow, rule, node, level, .data, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
                 if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
-                if (try Range.nonzero(c, c.file, rhs)) continue;
+                if (try Proof.nonzero(c, c.file, rhs)) continue;
                 var level = try Taint.levelAt(c, flow, c.file, rhs);
                 // The length of memory a peer sized is the peer's to make zero (`x % buf.len`
                 // over an empty read), though a length is no peer's number.
@@ -171,7 +172,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 const args = Facts.builtinArgs(tree, node, &buffer);
                 if (args.len != 1) continue;
                 const level = try Taint.levelAt(c, flow, c.file, args[0]);
-                if (level.reaches(.data) and std.mem.eql(u8, name, "@intCast") and try Range.converts(c, c.file, node, args[0])) continue;
+                if (level.reaches(.data) and std.mem.eql(u8, name, "@intCast") and try Proof.converts(c, c.file, node, args[0])) continue;
                 // A type whose values are each of its backing integers, or the operand's
                 // range among the tags it names, holds whatever the operand is.
                 if (level.reaches(.data) and !std.mem.eql(u8, name, "@intCast") and !std.mem.eql(u8, name, "@intFromFloat") and try Range.fills(c, c.file, node, args[0])) continue;
@@ -1010,7 +1011,7 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
 /// function holds (Range.counts).
 fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
     const level = try countered(c, flow, loop, node);
-    if (level == .number and try Range.counts(c, c.file, node)) return .data;
+    if (level == .number and try Proof.counts(c, c.file, node)) return .data;
     return level;
 }
 
@@ -1223,7 +1224,7 @@ fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!
             if (tree.nodeTag(value) != .slice_open) continue;
             const slice = tree.fullSlice(value).?;
             if (!std.mem.eql(u8, tree.getNodeSource(slice.ast.sliced), tree.getNodeSource(target))) continue;
-            if (try Range.nonzero(c, c.file, slice.ast.start) and try always(c, c.file, node, body, .{})) return true;
+            if (try Proof.nonzero(c, c.file, slice.ast.start) and try always(c, c.file, node, body, .{})) return true;
             continue;
         }
         var buffer: [1]Ast.Node.Index = undefined;
@@ -1232,7 +1233,7 @@ fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!
         const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
         const counted = std.mem.eql(u8, name, "take") or std.mem.eql(u8, name, "discard") or std.mem.eql(u8, name, "toss") or std.mem.eql(u8, name, "readSliceAll");
         const whole = std.mem.eql(u8, name, "takeByte") or std.mem.eql(u8, name, "takeByteSigned") or std.mem.eql(u8, name, "takeInt") or std.mem.eql(u8, name, "takeVarInt") or std.mem.eql(u8, name, "takeLeb128") or std.mem.eql(u8, name, "takeEnum");
-        const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Range.nonzero(c, c.file, call.ast.params[0]) else false;
+        const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Proof.nonzero(c, c.file, call.ast.params[0]) else false;
         if (taken and try Taint.isRead(c, flow, c.file, call) and try always(c, c.file, node, body, .{})) return true;
         if (std.mem.eql(u8, name, "checkCancel") and try passedOn(c, c.file, node) and try always(c, c.file, node, body, .{})) return true;
     }
