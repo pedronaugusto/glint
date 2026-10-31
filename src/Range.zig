@@ -2229,7 +2229,8 @@ fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition
                     &.{.{ .small = lhs, .large = rhs, .strict = true }}
                 else
                     &.{},
-                else => unreachable,
+                // The prong's own tags are above: another states nothing.
+                else => &.{},
             };
             try out.appendSlice(c.allocator, facts_of);
             // `x -% 1 < a` of an unsigned `x` holds exactly where `1 <= x <= a`: at zero the

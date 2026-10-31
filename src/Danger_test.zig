@@ -2302,6 +2302,29 @@ test "A012 leaves a size std only moves a position by, and finds one it passes o
     , 1);
 }
 
+test "A012 reads a length that views a slice std holds as no work: what is done over the view is sized by memory already there" {
+    // std's `slice` views its declared slice (clean); `raw` views a many-item pointer, which
+    // no length check bounds (6).
+    const held: sources.Extra = .{ .name = "std/held.zig", .bytes =
+        \\pub const Held = struct {
+        \\    extra: []u32,
+        \\    many: [*]u32,
+        \\    pub fn slice(h: Held, start: usize, len: usize) []u32 { return h.extra[start..][0..len]; }
+        \\    pub fn raw(h: Held, len: usize) []u32 { return h.many[0..][0..len]; }
+        \\};
+    };
+    const found = try runWith(pack.bounded_work,
+        \\const std = @import("std");
+        \\const held = @import("held.zig");
+        \\pub fn f(r: *std.Io.Reader, h: held.Held) !usize {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    const viewed = h.slice(0, n).len;
+        \\    return viewed + h.raw(n).len;
+        \\}
+    , &(std_files ++ [_]sources.Extra{held}), &(std_imports ++ [_]sources.ExtraImport{ .{ .from = 0, .spelling = "held.zig", .target = std_files.len }, .{ .spelling = "held.zig", .target = std_files.len } }));
+    try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
+}
+
 test "A018 finds an error's name written to a peer, not to another writer" {
     try expect(pack.diagnostics,
         \\const std = @import("std");
@@ -6639,7 +6662,7 @@ test "A009 follows input through a chain of calls of any length: the fact's roun
     // Each function calls the one below it, declared after it: one round reaches one step.
     var i: usize = 80;
     while (i > 0) : (i -= 1) {
-        const line = try std.fmt.allocPrint(std.testing.allocator, "fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
+        const line = try std.testing.allocator.print("fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
         defer std.testing.allocator.free(line);
         try text.appendSlice(std.testing.allocator, line);
     }

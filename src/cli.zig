@@ -96,6 +96,8 @@ const Loader = struct {
             var lexer: std.zig.Tokenizer = .init(sentinel);
             // Discovery only: actual semantics comes from each model's AST/ZIR.
             while (true) {
+                // A source as long as the limit allows is a long walk: it stops when the run does.
+                try self.io.checkCancel();
                 const token = lexer.next();
                 if (token.tag == .eof) break;
                 if (token.tag != .builtin or !std.mem.eql(u8, sentinel[token.loc.start..token.loc.end], "@import")) continue;
@@ -339,8 +341,9 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
             try version.write(writer);
             return told(writer, record);
         },
-        // Only `parseArgs` answers a completion; these are the arguments themselves.
-        .complete => unreachable,
+        // Only `parseArgs` answers a completion; these are the arguments themselves, and an
+        // outcome no parse of them gives is a refusal, not a state the program cannot reach.
+        .complete => return error.InvalidArguments,
     };
     const configured = try options(a, io, arguments, definitions);
     if (configured.files.items.len == 0) return error.MissingSource;
