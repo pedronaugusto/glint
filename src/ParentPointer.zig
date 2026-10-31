@@ -25,39 +25,46 @@ const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Ast = std.zig.Ast;
 
-/// Whether the `@fieldParentPtr` call `node` in the checked file is one of the two shapes.
-pub fn cleared(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+/// Whether the `@fieldParentPtr` call `node` in the checked file is one of the two shapes,
+/// with every generic a C is handed to read: shown, or undecided where one could not be.
+pub fn cleared(c: *Context, node: Ast.Node.Index) Context.Error!Verdict {
+    const field, const kind = (try shown(c, node)) orelse return .open;
+    return generics(c, field, kind);
+}
+
+/// The field a conversion is of, and its type, where it is one of the two shapes.
+fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts.Container } {
     const tree = &c.project.at(c.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 2 or tree.nodeTag(args[0]) != .string_literal) return false;
+    if (args.len != 2 or tree.nodeTag(args[0]) != .string_literal) return null;
     const name = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
+        else => return null,
     };
-    const parent = pointee(try resultType(c, c.file, node)) orelse return false;
-    const field = c.facts.member(parent, name) orelse return false;
+    const parent = pointee(try resultType(c, c.file, node)) orelse return null;
+    const field = c.facts.member(parent, name) orelse return null;
     const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
-    if (record.kind != .field) return false;
+    if (record.kind != .field) return null;
     const written = &c.project.at(field.file).file.tree;
-    const declared = (written.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
-    const kind = held(try c.facts.resolve(field.file, declared)) orelse return false;
+    const declared = (written.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    const kind = held(try c.facts.resolve(field.file, declared)) orelse return null;
     const field_of: Field = .{ .parent = parent, .name = name };
     const pointer = strip(tree, args[1]);
-    if (try interfaceField(c, node, pointer, field_of, kind)) return true;
-    if (try listNode(c, pointer, field_of, kind)) return true;
-    return false;
+    if (try interfaceField(c, node, pointer, field_of, kind)) return .{ field_of, kind };
+    if (try listNode(c, pointer, field_of, kind)) return .{ field_of, kind };
+    return null;
 }
 
 /// Whether the `@alignCast` call `node` is around a cleared `@fieldParentPtr`: its alignment
 /// is the parent's, which that shape shows the pointer is.
-pub fn clearedAlignment(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+pub fn clearedAlignment(c: *Context, node: Ast.Node.Index) Context.Error!Verdict {
     const tree = &c.project.at(c.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 1) return false;
+    if (args.len != 1) return .open;
     const inner = strip(tree, args[0]);
-    if (!isBuiltin(tree, inner, "@fieldParentPtr")) return false;
+    if (!isBuiltin(tree, inner, "@fieldParentPtr")) return .open;
     return cleared(c, inner);
 }
 
@@ -717,6 +724,346 @@ const Follow = struct {
         return true;
     }
 };
+
+/// What C.F's conversions come to once every generic a C is handed to has been read.
+pub const Verdict = enum { shown, open, undecided };
+
+/// Whether a C handed to a generic (an `anytype` parameter, or one whose type the program
+/// does not fix) keeps C.F in a C there, read in the callee's body wherever it is: the
+/// program's, std's or a dependency's. Memoized per field: every conversion of C.F shares it.
+fn generics(c: *Context, field: Field, kind: Facts.Container) Context.Error!Verdict {
+    const decl = c.facts.member(field.parent, field.name) orelse return .open;
+    const known = try c.facts.memo(Generics);
+    if (known.verdicts.get(decl)) |verdict| return verdict;
+    var carry: Carry = .{ .c = c, .field = field, .follow = .{ .c = c, .kind = kind } };
+    const verdict = try carry.program();
+    try known.verdicts.put(c.allocator, decl, verdict);
+    return verdict;
+}
+
+const Generics = struct { verdicts: std.AutoHashMapUnmanaged(Facts.Decl, Verdict) = .empty };
+
+/// A C (`.whole`: a C, a pointer to one) or something that may hold one (`.held`: a tuple or
+/// struct with one among its values, an array of them), followed from where the program hands
+/// it to a function into that function's body and on. A copy of a whole C is a C, with its F
+/// in it. C.F read out by value, by its name or by a `@field` name that may be it, or a carrier
+/// given to a builtin other than a type's, is a copy of the interface: open. A body that is
+/// not there to read (an `extern`, a function pointer, `@call`), a place the follow does not
+/// know, or a step past the budget, is undecided.
+const Carry = struct {
+    c: *Context,
+    field: Field,
+    follow: Follow,
+    seen: std.AutoHashMapUnmanaged(struct { Facts.Decl, Shape }, void) = .empty,
+    steps: usize = 0,
+
+    const Shape = enum { whole, held };
+    const budget = 8192;
+
+    fn worst(a: Verdict, b: Verdict) Verdict {
+        if (a == .open or b == .open) return .open;
+        if (a == .undecided or b == .undecided) return .undecided;
+        return .shown;
+    }
+
+    /// Every call in the program given a carrier.
+    fn program(k: *Carry) Context.Error!Verdict {
+        const c = k.c;
+        var verdict: Verdict = .shown;
+        for (c.project.sources) |*source| {
+            if (!try c.facts.program(source.id)) continue;
+            const tree = &source.file.tree;
+            for (tree.nodes.items(.tag), 0..) |_, i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node) orelse continue;
+                for (call.ast.params, 0..) |argument, position| {
+                    const shape = (try k.carries(source.id, argument, 0)) orelse continue;
+                    verdict = worst(verdict, try k.handedOn(source.id, call, position, shape, true));
+                    if (verdict == .open) return .open;
+                }
+            }
+        }
+        return verdict;
+    }
+
+    /// Whether the expression `node` is a carrier, and how.
+    fn carries(k: *Carry, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!?Shape {
+        if (depth == 8) return .held;
+        const c = k.c;
+        const tree = &c.project.at(file).file.tree;
+        const at = strip(tree, node);
+        if (tree.nodeTag(at) == .address_of) return k.carries(file, tree.nodeData(at).node, depth + 1);
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullStructInit(&buffer, at)) |literal| {
+            for (literal.ast.fields) |value| if (try k.carries(file, value, depth + 1) != null) return .held;
+            return null;
+        }
+        if (tree.fullArrayInit(&buffer, at)) |literal| {
+            for (literal.ast.elements) |value| if (try k.carries(file, value, depth + 1) != null) return .held;
+            return null;
+        }
+        const value = try c.facts.resolve(file, at);
+        if (value == .literal) return if (try k.carries(value.literal.file, value.literal.node, depth + 1) != null) .held else null;
+        return k.holds(value, depth);
+    }
+
+    /// Whether a value is a C, a pointer to one, or holds them.
+    fn holds(k: *Carry, value: Facts.Value, depth: u8) Context.Error!?Shape {
+        if (depth == 8) return .held;
+        return switch (value) {
+            .instance => |container| if (same(container, k.field.parent)) .whole else null,
+            .pointer, .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
+            .array => |element| if (try k.holds(element.*, depth + 1) != null) .held else null,
+            else => null,
+        };
+    }
+
+    /// A call given a carrier at `position`: the callee's parameter there followed through its
+    /// body. A parameter of the program's own that is a C or a pointer to one is read by the
+    /// program-wide checks already.
+    fn handedOn(k: *Carry, file: Project.FileId, call: Ast.full.Call, position: usize, shape: Shape, from_program: bool) Context.Error!Verdict {
+        const c = k.c;
+        const tree = &c.project.at(file).file.tree;
+        var index = position;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+            .instance, .pointer, .optional => index += 1,
+            else => {},
+        };
+        const found = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+            .function => |function| function,
+            else => return .undecided,
+        };
+        const decl = (try c.facts.origin(found)) orelse found;
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .function) return .undecided;
+        const callee = &c.project.at(decl.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = callee.fullFnProto(&buffer, record.node) orelse return .undecided;
+        var it = proto.iterate(callee);
+        var at: usize = 0;
+        const param = while (it.next()) |each| : (at += 1) {
+            if (at == index) break each;
+        } else return .undecided;
+        if (param.type_expr) |declared| {
+            const value = try c.facts.resolve(decl.file, declared);
+            // Typed, in the program: what the program does with a C is read there.
+            if (from_program and try c.facts.program(decl.file) and try k.holds(value, 0) == .whole) return .shown;
+            if (pointee(value)) |to| if (opaqueType(c, to)) return .open;
+        }
+        const body = c.project.at(decl.file).model.parentOf(record.node) orelse return .undecided;
+        if (callee.nodeTag(body) != .fn_decl) return .undecided;
+        const name = param.name_token orelse return .shown;
+        for (c.project.at(decl.file).model.declarations, 0..) |each, d| {
+            if (each.kind == .parameter and each.token == name) return k.local(decl.file, @fromBackingInt(@intCast(d)), shape);
+        }
+        return .undecided;
+    }
+
+    /// Every reference to a parameter or local holding a carrier.
+    fn local(k: *Carry, file: Project.FileId, index: Model.Declaration.Id, shape: Shape) Context.Error!Verdict {
+        const c = k.c;
+        if ((try k.seen.getOrPut(c.allocator, .{ .{ .file = file, .index = index }, shape })).found_existing) return .shown;
+        const tree = &c.project.at(file).file.tree;
+        const model = &c.project.at(file).model;
+        var verdict: Verdict = .shown;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const ref = model.reference(node) orelse continue;
+            if (ref.declaration != index) continue;
+            verdict = worst(verdict, try k.goes(file, node, shape));
+            if (verdict == .open) return .open;
+        }
+        return verdict;
+    }
+
+    /// Where the carrier `node` goes.
+    fn goes(k: *Carry, file: Project.FileId, node: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
+        k.steps += 1;
+        if (k.steps > budget) return .undecided;
+        const c = k.c;
+        const tree = &c.project.at(file).file.tree;
+        const model = &c.project.at(file).model;
+        const parent = model.parentOf(node) orelse return .undecided;
+        switch (tree.nodeTag(parent)) {
+            .grouped_expression, .@"try", .unwrap_optional, .@"orelse", .@"catch", .deref, .address_of => return k.goes(file, parent, shape),
+            .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return .shown,
+            .add, .sub, .mul, .div, .mod, .shl, .shr, .bit_and, .bit_or, .bit_xor, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .bool_and, .bool_or, .bool_not, .negation, .bit_not => return .shown,
+            .field_access => return k.member(file, parent, shape),
+            .assign => {
+                const target, const value = tree.nodeData(parent).node_and_node;
+                if (target == node) return .shown;
+                if (value != node) return .undecided;
+                return k.into(file, target, shape);
+            },
+            else => {},
+        }
+        if (tree.fullVarDecl(parent)) |variable| {
+            if (variable.ast.init_node.unwrap() != node) return .shown;
+            for (model.declarations, 0..) |each, d| {
+                if (each.node == parent and each.kind == .variable) return k.local(file, @fromBackingInt(@intCast(d)), shape);
+            }
+            return .undecided;
+        }
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr != node) return k.goes(file, parent, shape);
+            return k.captured(file, parent, branch.payload_token, branch.error_token, shape);
+        }
+        if (tree.fullWhile(parent)) |loop| {
+            if (loop.ast.cond_expr != node) return .undecided;
+            return k.captured(file, parent, loop.payload_token, loop.error_token, shape);
+        }
+        if (tree.fullFor(parent)) |loop| {
+            if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, node) == null) return .undecided;
+            // Its elements, each captured: any of them may be a C.
+            var verdict: Verdict = .shown;
+            for (model.declarations, 0..) |each, d| {
+                if (each.kind != .capture or each.node != parent) continue;
+                verdict = worst(verdict, try k.local(file, @fromBackingInt(@intCast(d)), .held));
+            }
+            return verdict;
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, parent)) |call| {
+            if (call.ast.fn_expr == node) return .undecided;
+            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .undecided;
+            return k.handedOn(file, call, position, shape, false);
+        }
+        var literal_buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullStructInit(&literal_buffer, parent) != null or tree.fullArrayInit(&literal_buffer, parent) != null) return k.goes(file, parent, .held);
+        switch (tree.nodeTag(parent)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => return .undecided,
+        }
+        const name = tree.tokenSlice(tree.nodeMainToken(parent));
+        for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@intFromPtr" }) |typed| {
+            if (std.mem.eql(u8, name, typed)) return .shown;
+        }
+        if (std.mem.eql(u8, name, "@as")) return k.goes(file, parent, shape);
+        if (std.mem.eql(u8, name, "@field")) {
+            var args_buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, parent, &args_buffer);
+            if (args.len != 2 or args[0] != node) return .shown;
+            return k.part(file, parent, args[1], shape);
+        }
+        if (std.mem.eql(u8, name, "@call")) return .undecided;
+        return .open;
+    }
+
+    /// `if (x) |v|`, `while (x) |v|`: the capture holds the carrier; an error's capture does
+    /// not.
+    fn captured(k: *Carry, file: Project.FileId, owner: Ast.Node.Index, payload: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, shape: Shape) Context.Error!Verdict {
+        _ = error_token;
+        const token = payload orelse return .shown;
+        const tree = &k.c.project.at(file).file.tree;
+        const name = if (tree.tokenTag(token) == .asterisk) token + 1 else token;
+        for (k.c.project.at(file).model.declarations, 0..) |each, d| {
+            if (each.kind == .capture and each.node == owner and each.token == name) return k.local(file, @fromBackingInt(@intCast(d)), shape);
+        }
+        return .undecided;
+    }
+
+    /// `x = carrier`: into a local, followed; into a carrier's own place (`a.* = b.*`), a C
+    /// where a C was; elsewhere undecided.
+    fn into(k: *Carry, file: Project.FileId, target: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
+        const c = k.c;
+        const tree = &c.project.at(file).file.tree;
+        const model = &c.project.at(file).model;
+        if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return .shown;
+        var root = strip(tree, target);
+        while (true) switch (tree.nodeTag(root)) {
+            .deref, .unwrap_optional => root = strip(tree, tree.nodeData(root).node),
+            .field_access => root = strip(tree, tree.nodeData(root).node_and_token[0]),
+            .array_access => root = strip(tree, tree.nodeData(root).node_and_node[0]),
+            else => break,
+        };
+        if (tree.nodeTag(root) != .identifier) return .undecided;
+        const index = (model.reference(root) orelse return .undecided).declaration orelse return .undecided;
+        if (root == target) return k.local(file, index, shape);
+        if (k.seen.contains(.{ .{ .file = file, .index = index }, .whole }) or k.seen.contains(.{ .{ .file = file, .index = index }, .held })) return .shown;
+        return .undecided;
+    }
+
+    /// `carrier.name`: C.F where it may be it, and what else the part may hold.
+    fn member(k: *Carry, file: Project.FileId, access: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
+        const tree = &k.c.project.at(file).file.tree;
+        const name = try Model.identifier(k.c.allocator, tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
+        return k.named(file, access, name, shape);
+    }
+
+    /// `@field(carrier, name)`: a name computed as the program compiles may be any part.
+    fn part(k: *Carry, file: Project.FileId, access: Ast.Node.Index, spelling: Ast.Node.Index, shape: Shape) Context.Error!Verdict {
+        const c = k.c;
+        const tree = &c.project.at(file).file.tree;
+        if (tree.nodeTag(spelling) == .string_literal) {
+            const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(spelling))) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return k.anyPart(file, access),
+            };
+            return k.named(file, access, spelled, shape);
+        }
+        return k.anyPart(file, access);
+    }
+
+    fn anyPart(k: *Carry, file: Project.FileId, access: Ast.Node.Index) Context.Error!Verdict {
+        return worst(try k.interface(file, access), try k.goes(file, access, .held));
+    }
+
+    fn named(k: *Carry, file: Project.FileId, access: Ast.Node.Index, name: []const u8, shape: Shape) Context.Error!Verdict {
+        const c = k.c;
+        const is_field = std.mem.eql(u8, name, k.field.name);
+        switch (shape) {
+            .held => {
+                const rest = try k.goes(file, access, .held);
+                return if (is_field) worst(try k.interface(file, access), rest) else rest;
+            },
+            .whole => {
+                if (is_field) return k.interface(file, access);
+                const decl = c.facts.member(k.field.parent, name) orelse return .shown;
+                const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                // A method of C, or a declaration: the program's, typed, read there.
+                if (record.kind != .field) return .shown;
+                const declared = (c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return .undecided).ast.type_expr.unwrap() orelse return .undecided;
+                const value = try c.facts.resolve(decl.file, declared);
+                if (value == .unknown) return k.goes(file, access, .held);
+                return if (try k.holds(value, 0)) |inner| k.goes(file, access, inner) else .shown;
+            },
+        }
+    }
+
+    /// C.F itself, reached in a body: its address followed, a part of it read or a method of
+    /// it called, written whole; anything else copies it.
+    fn interface(k: *Carry, file: Project.FileId, access: Ast.Node.Index) Context.Error!Verdict {
+        const tree = &k.c.project.at(file).file.tree;
+        const parent = k.c.project.at(file).model.parentOf(access) orelse return .undecided;
+        switch (tree.nodeTag(parent)) {
+            .address_of => return if (try k.follow.stays(file, parent)) .shown else .open,
+            .field_access => {
+                // Its part or method by name on F's type: in a generic, `x` does not resolve.
+                const c = k.c;
+                const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
+                const decl = c.facts.member(k.follow.kind, name) orelse return .open;
+                const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                if (record.kind == .field) return .shown;
+                if (record.kind != .function) return .open;
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, k.c.project.at(file).model.parentOf(parent) orelse return .open) orelse return .open;
+                if (call.ast.fn_expr != parent) return .open;
+                return if (try k.follow.handed((try c.facts.origin(decl)) orelse decl, 0)) .shown else .open;
+            },
+            .assign => return if (tree.nodeData(parent).node_and_node[0] == access) .shown else .open,
+            else => return .open,
+        }
+    }
+};
+
+/// Whether a container is `anyopaque`, which a pointer to anything coerces to.
+fn opaqueType(c: *Context, container: Facts.Container) bool {
+    const tree = &c.project.at(container.file).file.tree;
+    const node = c.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
+    return tree.nodeTag(node) == .container_decl and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "opaque");
+}
 
 const List = enum { doubly, singly };
 

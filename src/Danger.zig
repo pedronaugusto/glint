@@ -483,8 +483,18 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         // ReleaseFast, where nothing checks either.
         // Where the program shows the pointer is that field's (an interface's own field, a
         // node of an intrusive list), the parent is shown and its alignment with it.
-        if (std.mem.eql(u8, name, "@fieldParentPtr") and try ParentPointer.cleared(c, node)) continue;
-        if (std.mem.eql(u8, name, "@alignCast") and try ParentPointer.clearedAlignment(c, node)) continue;
+        // A C handed to a generic whose body could not be read leaves it undecided.
+        const verdict: ParentPointer.Verdict = if (std.mem.eql(u8, name, "@fieldParentPtr"))
+            try ParentPointer.cleared(c, node)
+        else if (std.mem.eql(u8, name, "@alignCast")) try ParentPointer.clearedAlignment(c, node) else .open;
+        switch (verdict) {
+            .shown => continue,
+            .undecided => {
+                try c.undecided(rule, tree.tokenStart(token), .unsupported, "a parent pointer whose parent is handed to a generic that is not read to its end: a copy of the field there is not ruled out");
+                continue;
+            },
+            .open => {},
+        }
         for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@ptrFromInt", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast)) {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };

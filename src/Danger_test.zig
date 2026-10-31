@@ -1113,6 +1113,42 @@ test "A019 reads every file a path import joins to the program, selected or not:
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
 }
 
+const dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
+    \\pub fn grab(x: anytype) usize { const copy = @field(x, "interface"); return copy.end; }
+    \\pub fn named(x: anytype, comptime name: []const u8) usize { const copy = @field(x, name); return copy.end; }
+    \\pub fn print(args: anytype) usize { inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |f| { const v = @field(args, f.name); _ = v; } return 0; }
+    \\pub fn total(x: anytype) usize { return x.count; }
+    \\pub fn part(x: anytype) usize { return x.interface.end; }
+    \\pub fn through(x: anytype, f: *const fn (@TypeOf(x)) usize) usize { return f(x); }
+};
+
+/// `interface_program` returning `value`, with the dependency imported and `extra` declared.
+fn handed(comptime value: []const u8, comptime extra: []const u8) !Run {
+    const program = comptime edited(edited(interface_program, "    return s.count + s.interface.end;", "    return " ++ value ++ ";"), "pub fn use() !usize {", "const dep = @import(\"dep\");\n" ++ extra ++ "pub fn use() !usize {");
+    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
+}
+
+test "A019 follows a parent handed to a generic outside the program into its body, where a copy of the field by its name or a computed one leaves the conversion a finding" {
+    // Clean: another field read, by pointer and by value; a part of the interface read.
+    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.total(&s) + dep.total(s)", "")).findings);
+    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.part(&s)", "")).findings);
+    // Findings (11, the conversion and its alignment): the field copied by name, by pointer
+    // and by value; by a name the caller gives; each field of a tuple holding a C copied, as
+    // std.fmt's `{any}` does, from the program or through a generic of its own.
+    for ([_]Run{
+        try handed("dep.grab(&s)", ""),
+        try handed("dep.grab(s)", ""),
+        try handed("dep.named(&s, \"interface\")", ""),
+        try handed("dep.print(.{ s.count, s })", ""),
+        try handed("log(s)", "fn log(x: anytype) usize { return dep.print(.{x}); }\n"),
+    }) |found| try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
+    // Undecided: a function pointer the C is handed through, whose body is not known.
+    const baseline = try handed("dep.total(&s)", "");
+    const unread = try handed("dep.through(&s, show)", "fn show(x: *Sink) usize { return x.count; }\n");
+    try std.testing.expectEqual(@as(usize, 0), unread.findings);
+    try std.testing.expect(unread.undecided > baseline.undecided);
+}
+
 const observer_program =
     \\const Observer = struct {
     \\    vtable: *const VTable,
