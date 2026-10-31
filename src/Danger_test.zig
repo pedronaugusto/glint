@@ -5707,7 +5707,7 @@ test "A009 follows input through a chain of calls of any length: the fact's roun
     // Each function calls the one below it, declared after it: one round reaches one step.
     var i: usize = 80;
     while (i > 0) : (i -= 1) {
-        const line = try std.fmt.allocPrint(std.testing.allocator, "fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
+        const line = try std.testing.allocator.print("fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
         defer std.testing.allocator.free(line);
         try text.appendSlice(std.testing.allocator, line);
     }

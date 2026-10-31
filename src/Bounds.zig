@@ -11,8 +11,8 @@
 //! Each check a safe build makes (an index below its memory's length, a slice's bounds, a
 //! difference at zero or above, arithmetic within its type, a conversion within its
 //! destination, a divisor other than zero) is decided on every path that reaches it, at every
-//! pointer width the package builds for. Range asks it as one more way to clear a site, and a
-//! site is clear only where every path proved it.
+//! pointer width the package builds for. Proof asks it after Range as one more way to clear a
+//! site, and a site is clear only where every path proved it.
 //!
 //! What it never does is clear a check it did not prove:
 //! - Zig's integers are bounded, and an operation's result carries a fact only where Bounds
@@ -506,7 +506,7 @@ const Frame = struct {
     model: *const Model,
     width: u16,
     function: Ast.Node.Index,
-    vars: std.AutoArrayHashMapUnmanaged(Key, Var) = .empty,
+    vars: std.array_hash_map.Auto(Key, Var) = .empty,
     addressed: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty,
     /// Each declaration of the function by its name's token.
     decls: std.AutoHashMapUnmanaged(Ast.TokenIndex, Model.Declaration.Id) = .empty,
@@ -788,7 +788,7 @@ const Frame = struct {
         if (f.known(.result_length)) |v| try slots.put(f.a, v, slot(f.params.len, true));
         var others: std.ArrayList(Var) = .empty;
         for (s.rows) |row| for (row.terms) |term| if (!slots.contains(term.v)) {
-            if (std.mem.indexOfScalar(Var, others.items, term.v) == null) try others.append(f.a, term.v);
+            if (std.mem.findScalar(Var, others.items, term.v) == null) try others.append(f.a, term.v);
         };
         std.mem.sort(Var, others.items, {}, std.sort.asc(Var));
         for (others.items) |v| out = try forget(f.a, out, v);
