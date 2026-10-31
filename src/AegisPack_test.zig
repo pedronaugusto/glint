@@ -771,10 +771,11 @@ test "A002 follows a copy's value through every shape it is written in to the pl
     // A `return` copies what it reads, as a declaration does; the function's own local moves.
     try expectJudged(head ++ "pub fn f(h: *H) S(u32) { return h.s; }", pack.copies, true, 1);
     try expectJudged(head ++ "pub fn f() S(u32) { const s = S(u32).init(1); return s; }", pack.copies, true, 0);
-    // A part of a generic's value, chosen or wrapped, is each binding's copy: decided where
-    // it is bound, the binding's argument read through the part.
+    // A part of a generic's value, chosen or wrapped, is each binding's copy where only the
+    // binding settles it; where its callers settle it (a private generic), each part is
+    // decided where it is written.
     try expectJudged(head ++ "pub fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, true, 0);
-    try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 2);
     try expectJudged(head ++ "const P = struct { s: u32, t: u32 };\nfn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; _ = &copy; }\npub fn g(h: *P) void { f(h, true); }", pack.copies, true, 0);
     // Plain data written any of these ways is decided.
     try expectJudged(head ++ "pub fn f(c: bool, k: u8, n: u32) u32 { const a = if (c) n else 1; const b = switch (k) { 0 => a, else => blk: { break :blk @as(u32, 2); } }; return b; }", pack.copies, true, 0);
@@ -815,6 +816,18 @@ test "A002 follows a generic's copy through any number of generics passing it on
     while (i > 0) : (i -= 1) try chain.print(std.testing.allocator, "fn h{d}(x: anytype) void {{ h{d}(x); }}\n", .{ i, i - 1 });
     try chain.appendSlice(std.testing.allocator, "fn h0(x: anytype) void { var kept = x; kept.deinit(); }\n");
     try expectJudged(chain.items, pack.copies, true, 1);
+}
+
+test "A002 records for a generic's bindings only a copy whose value a binding settles" {
+    // gantry's `scan(context: anytype, comptime read: anytype)` shapes, bound to a function
+    // and a pointer: a `comptime` block's locals, what `@TypeOf` is given, a copy into a type
+    // written apart from the parameters, and a place whose value resolves where it is written
+    // are each decided where they are written, so a binding has nothing left to settle.
+    const head = "const R = struct { specs: []const u8 = &.{} };\nfn extract(text: []const u8) !R { _ = text; return .{}; }\nconst Kind = enum { a, b };\nconst Spec = struct { kind: Kind };\n";
+    const generic = "pub fn scan(context: anytype, comptime read: anytype, cached: []?R, i: usize) !void { comptime { const Inner = @typeInfo(@TypeOf(read(context))).error_union.error_set; _ = Inner; } const text = try read(context); const prior = if (cached.len > 0) cached[i] else null; const recovery = (prior orelse extract(text)) catch R{}; const specs = recovery.specs; _ = specs; const spec: Spec = .{ .kind = .a }; const kind: Kind = if (text.len == 0) .b else spec.kind; _ = kind; }\n";
+    try expectJudged(head ++ generic ++ "fn reader(c: *u32) error{Bad}![]const u8 { _ = c; return \"\"; }\npub fn f(store: *u32, cached: []?R) !void { try scan(store, reader, cached, 0); }", pack.copies, true, 0);
+    // `?R orelse f()` with `f` returning `!R` is an error union: `catch` unwraps it.
+    try expectJudged(head ++ "pub fn f(cached: []?R, i: usize, text: []const u8) void { const prior = if (cached.len > 0) cached[i] else null; const recovery = (prior orelse extract(text)) catch R{}; const specs = recovery.specs; _ = specs; }", pack.copies, true, 0);
 }
 
 test "A002 clears a move only of the function's own local or a value captured in place, with no copy or address of it before" {

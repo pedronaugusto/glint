@@ -729,6 +729,8 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         if (d.kind != .variable or model.scopes[@backingInt(d.scope)].kind != .block or !self.enclosed(function.file, d.scope, whole)) continue;
         const v = t.fullVarDecl(d.node) orelse continue;
         if (v.comptime_token != null) continue;
+        // A `comptime` block runs as the program compiles: its locals copy nothing at run time.
+        if (inComptime(t, model, d.node)) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
         if (self.madeByParameter(function.file, init)) |position| {
             try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node }, .kind = .made });
@@ -742,9 +744,15 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         }
         // A value chosen or wrapped (`out catch |e| return e`, `if (c) v.a else v.b`): each
         // place it reads that a generic parameter gives, read with the binding's arguments.
+        // Into a type written apart from the parameters (`const kind: Kind = ...`) it is the
+        // same copy in every binding, decided where it is written.
+        if (v.ast.type_node.unwrap()) |declared| if (self.derivedParameter(function, declared, 0) == null) continue;
         const parts = try self.copiedParts(function.file, init);
         for (parts.places) |place| {
             const position = self.runtimeParameter(function, place, 0) orelse continue;
+            // A place whose value resolves where it is written is the same copy in every
+            // binding, decided there; only what the binding settles is read with it.
+            if (try self.resolve(function.file, place) != .unknown) continue;
             const site: Key = .{ .file = function.file, .node = d.node };
             // The parameter itself is its argument, read as written where it is bound.
             const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
@@ -1236,8 +1244,15 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
     const last = t.lastToken(node);
+    var skip_to: Ast.TokenIndex = 0;
     for (t.firstToken(node)..last + 1) |raw| {
         const token: Ast.TokenIndex = @intCast(raw);
+        if (token < skip_to) continue;
+        // What a type query is given is never evaluated: `@TypeOf(x)`, `@sizeOf(T)`.
+        if (t.tokenTag(token) == .builtin and unevaluated(t.tokenSlice(token)) and token < last and t.tokenTag(token + 1) == .l_paren) {
+            skip_to = closing(t, token + 1, last) + 1;
+            continue;
+        }
         if (t.tokenTag(token) != .identifier) continue;
         const index = self.lexical(function.file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
         const record = model.declarations[@backingInt(index)];
@@ -1257,6 +1272,39 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         if (self.runtimeParameter(function, init, depth + 1)) |position| return position;
     }
     return null;
+}
+
+/// Whether `node` is inside a `comptime` block or expression.
+fn inComptime(t: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) switch (t.nodeTag(parent)) {
+        .@"comptime" => return true,
+        .fn_decl => return false,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether a builtin only asks what its operands' types are, never evaluating them.
+fn unevaluated(name: []const u8) bool {
+    const queries = [_][]const u8{ "@TypeOf", "@typeInfo", "@sizeOf", "@alignOf", "@bitSizeOf", "@typeName", "@hasDecl", "@hasField", "@FieldType" };
+    for (queries) |each| if (std.mem.eql(u8, name, each)) return true;
+    return false;
+}
+
+/// The token closing the parenthesis that opens at `open`, at most `last`.
+fn closing(t: *const Ast, open: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var depth: usize = 0;
+    var token = open;
+    while (token <= last) : (token += 1) switch (t.tokenTag(token)) {
+        .l_paren => depth += 1,
+        .r_paren => {
+            depth -= 1;
+            if (depth == 0) return token;
+        },
+        else => {},
+    };
+    return last;
 }
 
 /// The declaration `name` reaches from `scope`, looking outward.
@@ -1398,9 +1446,20 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         // A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the
-        // payload's type (Zig requires the other side to coerce to it), as `x.?` has.
-        .@"catch" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .error_union),
-        .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
+        // payload's type, as `x.?` has, where the other side coerces to it; the peer type of
+        // both where the other side wraps the payload itself (`opt orelse f()` with `f`
+        // returning `E!T` is an `E!T`, `x catch null` a `?T`).
+        .@"catch", .@"orelse" => {
+            const sides = tree.nodeData(node).node_and_node;
+            const wrapper: std.meta.Tag(Value) = if (tag == .@"catch") .error_union else .optional;
+            const inner = try self.payload(try self.resolve(file, sides[0]), wrapper);
+            if (inner == .unknown or never(tree, sides[1])) return inner;
+            return switch (try self.resolve(file, sides[1])) {
+                .error_union => if (tag == .@"orelse") .{ .error_union = try self.boxed(inner) } else inner,
+                .optional => if (tag == .@"catch") .{ .optional = try self.boxed(inner) } else inner,
+                else => inner,
+            };
+        },
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(null, file, node)) |value| return value,
