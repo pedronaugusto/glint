@@ -25,6 +25,7 @@ test {
     _ = @import("Runner.zig");
     _ = Fix;
     _ = @import("Facts.zig");
+    _ = @import("Undefined.zig");
     _ = token;
     _ = cli;
 }
