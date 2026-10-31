@@ -1416,6 +1416,29 @@ test "A019 clears a parent pointer a helper converts for the installed functions
     try std.testing.expectEqualSlices(u32, &.{ 6, 6, 10 }, read_out.lines[0..read_out.findings]);
     const kept = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { const f = w.host.issue_fn; return f(other); }");
     try std.testing.expectEqualSlices(u32, &.{ 9, 9, 16 }, kept.lines[0..kept.findings]);
+    // Installed by a choice and also a helper of the other choice, given its own parameter.
+    const both =
+        \\const Host = struct { issue_fn: *const fn (*Host) u32 };
+        \\const twice = false;
+        \\const W = struct {
+        \\    n: u32 = 0,
+        \\    host: Host = .{ .issue_fn = if (twice) again else issue },
+        \\    fn issue(h: *Host) u32 {
+        \\        const w: *W = @alignCast(@fieldParentPtr("host", h));
+        \\        return w.n;
+        \\    }
+        \\    fn again(h: *Host) u32 {
+        \\        return issue(h) + issue(h);
+        \\    }
+        \\};
+        \\pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, both)).findings);
+    const spare = try runEdited(pack.unsafe_set, both, "        return issue(h) + issue(h);", "        var spare: Host = .{ .issue_fn = h.issue_fn };\n        return issue(h) + issue(&spare);");
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 11 }, spare.lines[0..spare.findings]);
+    const field_named = try runEdited(pack.unsafe_set, both, "pub fn use(w: *W) u32 {", "pub fn named() *const fn (*Host) u32 { return @field(W, \"issue\"); }\npub fn use(w: *W) u32 {");
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7 }, field_named.lines[0..field_named.findings]);
 }
 
 const file_program =

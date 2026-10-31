@@ -331,8 +331,9 @@ fn sameTokens(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
 
 /// Whether the parameter at `token` of `function` is only ever given a pointer to C.F: the
 /// function is not `pub`, and named only where C's own code installs it into C.F's value; or
-/// only called directly, that parameter given the same parameter of a function that is so, a
-/// pointer to F's type (a helper the installed functions share, at most four calls deep).
+/// each naming installs it so or calls it directly, that parameter given the same parameter of
+/// a function that is so, a pointer to F's type (a helper the installed functions share, at
+/// most four calls deep, which may be installed itself).
 fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenIndex, field: Field, kind: Facts.Container, depth: u8) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -360,6 +361,11 @@ fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenI
             },
             else => continue,
         }
+        // Installed here, into C.F's value as C's own code does: no call to follow.
+        if (try installs(c, node, field, 4)) {
+            called = true;
+            continue;
+        }
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, model.parentOf(node) orelse return false) orelse return false;
         if (call.ast.fn_expr != node or position >= call.ast.params.len) return false;
@@ -374,7 +380,7 @@ fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenI
         if (!try reachedOnlyInstalled(c, caller, given.token, field, kind, depth + 1)) return false;
         called = true;
     }
-    return called;
+    return called and !try namedByField(c, decl);
 }
 
 /// Whether every reference to `decl` in the checked file installs it into C.F's value, from
@@ -395,7 +401,14 @@ fn namedOnlyInstalling(c: *Context, decl: Model.Declaration.Id, field: Field, th
         named = true;
         if (!try installs(c, node, field, through)) return false;
     }
-    // `@field(C, "f")` names it too, and installs nothing this follows.
+    return named and !try namedByField(c, decl);
+}
+
+/// Whether a `@field(C, "f")` in the checked file may name the function `decl`: it installs
+/// nothing either path follows.
+fn namedByField(c: *Context, decl: Model.Declaration.Id) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     const record = model.declarations[@backingInt(decl)];
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -408,9 +421,9 @@ fn namedOnlyInstalling(c: *Context, decl: Model.Declaration.Id, field: Field, th
             .unknown => {},
             else => continue,
         }
-        if (try namedBy(c, tree, model, args[1], record.name)) return false;
+        if (try namedBy(c, tree, model, args[1], record.name)) return true;
     }
-    return named;
+    return false;
 }
 
 /// Whether the expression around `reference` puts it into C.F's value, in C's file: through
