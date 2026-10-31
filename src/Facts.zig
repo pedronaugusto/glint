@@ -127,7 +127,7 @@ pub const Env = struct {
 /// information (`.@"struct".fields`, a field's `name`): a `std.builtin.Type` value whose own
 /// members are not followed. A type that does not resolve still has information: what it
 /// describes stays unknown, never what the information is.
-pub const Reflected = struct { of: *const Value, at: enum { info, pointer, optional, array, error_union, function, params, part } };
+pub const Reflected = struct { of: *const Value, at: enum { info, pointer, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
 /// A library's declarations in this project, found through its modules' roots. Roles are the
 /// caller's enum values; the resolver never interprets them.
 pub const Publication = struct {
@@ -1693,6 +1693,8 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     // An integer type of a signedness and width computed at compile time: a number, whose width
     // nothing here reads.
     if (std.mem.eql(u8, name, "@Int")) return .{ .primitive = "@Int" };
+    // An enum type built from names and values: it holds no value but its tag.
+    if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
     if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
@@ -1788,6 +1790,13 @@ fn fieldType(self: *Facts, file: Project.FileId, of: Value, name_node: Ast.Node.
         const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
         return typeOf(self, try self.memberOf(container, field), {});
     }
+    return self.fieldTypes(container);
+}
+
+/// The type of any of a container's fields, the choice of them: what `@FieldType` gives for a
+/// name not known here, and `field_types` of its type information.
+fn fieldTypes(self: *Facts, container: Container) ResolveError!Value {
+    if (container.symbolic and container.made_by == null) return .{ .unknown = .comptime_dependent };
     const model = &self.project.at(container.file).model;
     var each: std.ArrayList(Value) = .empty;
     for (model.declarations, 0..) |d, i| {
@@ -2557,7 +2566,9 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     var values: std.ArrayList(Value) = .empty;
     var peers: Peers = .{};
     if (tree.fullSwitch(node)) |whole| {
-        for (whole.ast.cases) |case| {
+        const taken = try self.takenProng(env, file, whole);
+        for (whole.ast.cases, 0..) |case, i| {
+            if (taken) |t| if (t != i) continue;
             const branch = tree.fullSwitchCase(case).?.ast.target_expr;
             // A prong the path rules out: Zig analyses only the one a comptime operand takes.
             if (never(tree, branch) or try self.dead(file, branch)) continue;
@@ -2578,6 +2589,45 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
         }
     } else return null;
     return try self.peered(try self.choose(values.items), peers);
+}
+
+/// The prong a `switch` on type information takes where the type is one container: the one
+/// naming its kind (`.@"union"`), else its `else`. Zig analyses no other. Null where the
+/// subject is anything else, or a prong names its kind other than by a literal.
+fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.full.Switch) ResolveError!?usize {
+    const tree = &self.project.at(file).file.tree;
+    if (!isTypeInfo(tree, whole.ast.condition)) return null;
+    const subject = try self.resolveIn(env, file, whole.ast.condition);
+    if (subject != .reflected or subject.reflected.at != .info) return null;
+    const container = switch (subject.reflected.of.*) {
+        .container => |c| c,
+        else => return null,
+    };
+    const kind: []const u8 = switch (self.kindOf(container) orelse return null) {
+        .keyword_struct => "struct",
+        .keyword_union => "union",
+        .keyword_enum => "enum",
+        .keyword_opaque => "opaque",
+        else => return null,
+    };
+    var otherwise: ?usize = null;
+    for (whole.ast.cases, 0..) |case, i| {
+        const full = tree.fullSwitchCase(case).?; // unreachable: a switch's cases are cases
+        if (full.ast.values.len == 0) otherwise = i;
+        for (full.ast.values) |item| {
+            if (tree.nodeTag(item) != .enum_literal) return null;
+            if (std.mem.eql(u8, try self.memberName(tree.tokenSlice(tree.nodeMainToken(item))), kind)) return i;
+        }
+    }
+    return otherwise;
+}
+
+/// Whether `node` is `@typeInfo(...)`.
+fn isTypeInfo(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo"),
+        else => false,
+    };
 }
 
 /// What a `null` or an error value among a value's branches or breaks adds to the others:
@@ -3361,7 +3411,7 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
     const unsupported: Value = .{ .unknown = .unsupported };
     switch (r.at) {
         .info => {
-            const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "error_union", .error_union }, .{ "fn", .function } };
+            const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "error_union", .error_union }, .{ "fn", .function }, .{ "struct", .structure }, .{ "union", .tagged }, .{ "enum", .enumeration } };
             inline for (kinds) |kind| if (std.mem.eql(u8, name, kind[0])) return .{ .reflected = .{ .of = r.of, .at = kind[1] } };
             return .{ .reflected = .{ .of = r.of, .at = .part } };
         },
@@ -3378,8 +3428,68 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             if (result == .unknown) return result;
             return .{ .optional = try self.boxed(result) };
         },
+        // A container's fields' types, the choice of them, as a slice; their names; and an
+        // enum's or a tagged union's tag type. A type of another kind is a prong Zig does not
+        // analyse for it.
+        .structure, .tagged, .enumeration => {
+            const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
+            if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return .{ .pointer = try self.boxed(try self.fieldTypes(container)) };
+            if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return .{ .pointer = try self.boxed(.{ .pointer = try self.boxed(.{ .primitive = "u8" }) }) };
+            if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return .{ .pointer = try self.boxed(.scalar) };
+            if (std.mem.eql(u8, name, "is_tuple") and r.at == .structure) return .scalar;
+            if (std.mem.eql(u8, name, "tag_type") and r.at != .structure) return self.tagType(container, r.at == .tagged);
+            return unsupported;
+        },
         .params, .part => return unsupported,
     }
+}
+
+/// The container a reflection of a struct, a union or an enum is of, where it is one of
+/// that kind.
+fn reflectedContainer(self: *const Facts, r: Reflected) ?Container {
+    const container = switch (r.of.*) {
+        .container => |c| c,
+        else => return null,
+    };
+    const kind = self.kindOf(container) orelse return null;
+    const wanted: std.zig.Token.Tag = switch (r.at) {
+        .structure => .keyword_struct,
+        .tagged => .keyword_union,
+        .enumeration => .keyword_enum,
+        else => return null,
+    };
+    return if (kind == wanted) container else null;
+}
+
+/// The keyword a container is declared with; a file is a struct.
+fn kindOf(self: *const Facts, container: Container) ?std.zig.Token.Tag {
+    const node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
+    if (node == .root) return .keyword_struct;
+    const tree = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, node) orelse return null;
+    return tree.tokenTag(decl.ast.main_token);
+}
+
+/// An enum's integer tag type (`enum(u8)`, else one Zig fits to its fields), or a union's
+/// optional tag (`union(Kind)`, an enum Zig makes for `union(enum)`, null for a bare union,
+/// whose tag nothing here reads). A container a type function made reads its argument with
+/// the call's bindings.
+fn tagType(self: *Facts, container: Container, tagged: bool) ResolveError!Value {
+    const node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
+    const tree = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, node) orelse return .{ .unknown = .unsupported };
+    const tag: Value = if (decl.ast.arg.unwrap()) |arg|
+        if (container.made_by) |made| try self.substituted(container.file, arg, made) else try self.resolve(container.file, arg)
+    else if (!tagged)
+        .{ .primitive = "@Int" }
+    else if (decl.ast.enum_token != null)
+        .{ .primitive = "@Enum" }
+    else
+        return .{ .unknown = .unsupported };
+    if (tag == .unknown or !tagged) return tag;
+    return .{ .optional = try self.boxed(tag) };
 }
 
 /// `param_types[i]` of a reflected function, `?type` as Zig gives it: the parameter's
@@ -3574,6 +3684,45 @@ fn finalReturn(tree: *const Ast, model: *const Model, record: Model.Declaration)
     return tree.nodeData(last).opt_node.unwrap();
 }
 
+/// Whether `node` is `undefined`.
+fn isUndefined(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
+}
+
+/// A local array of types, `undefined` where declared, as what is written to its elements in
+/// `function`: an array of the choice of them. Unknown where it is used other than by an
+/// element, a slice or its length (assigned whole, its address taken or passed), where a
+/// write is unseen, or where nothing is written.
+fn writtenElements(self: *Facts, env: ?*const Env, file: Project.FileId, index: Model.Declaration.Id, function: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const first = tree.firstToken(function);
+    const last = tree.lastToken(function);
+    var elements: std.ArrayList(Value) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != index) continue;
+        const parent = model.parentOf(node) orelse return .{ .unknown = .unsupported };
+        switch (tree.nodeTag(parent)) {
+            .array_access => {
+                if (tree.nodeData(parent).node_and_node[0] != node) return .{ .unknown = .unsupported };
+                const above = model.parentOf(parent) orelse continue;
+                if (tree.nodeTag(above) == .assign and tree.nodeData(above).node_and_node[0] == parent)
+                    try elements.append(self.gpa, try self.resolveIn(env, file, tree.nodeData(above).node_and_node[1]));
+            },
+            .slice_open, .slice, .slice_sentinel => if (tree.fullSlice(parent).?.ast.sliced != node) return .{ .unknown = .unsupported }, // unreachable: a slice node is a full slice
+            .field_access => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len")) return .{ .unknown = .unsupported },
+            else => return .{ .unknown = .unsupported },
+        }
+    }
+    if (elements.items.len == 0) return .{ .unknown = .unsupported };
+    return .{ .array = try self.boxed(try self.choose(elements.items)) };
+}
+
 /// What a type function returns where more than its final statement returns: the choice of
 /// every type one of its own `return`s gives with the call's bindings (`bit_set.Static`'s
 /// `Integer(size)` or `Array(usize, size)`), a superset of the one a build takes. Null where
@@ -3602,15 +3751,53 @@ fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declar
         try self.type_returns.put(self.gpa, decl, list.items);
         break :found list.items;
     };
-    if (returns.len == 0) return null;
-    const values = try self.gpa.alloc(Value, returns.len);
-    for (returns, values) |returned, *value| {
+    var values: std.ArrayList(Value) = .empty;
+    each: for (returns) |returned| {
+        // One in a prong of a switch on type information this type does not take.
+        var child = returned;
+        var parent = model.parentOf(returned);
+        while (parent) |p| : ({
+            child = p;
+            parent = model.parentOf(p);
+        }) {
+            if (tree.nodeTag(p) == .fn_decl) break;
+            const whole = tree.fullSwitch(p) orelse continue;
+            const taken = try self.takenProng(bound, decl.file, whole) orelse continue;
+            if (std.mem.findScalar(Ast.Node.Index, whole.ast.cases, child) != taken) continue :each;
+        }
         var container_buffer: [2]Ast.Node.Index = undefined;
-        if (tree.fullContainerDecl(&container_buffer, returned) != null) return null;
-        value.* = try self.resolveIn(bound, decl.file, returned);
-        if (value.* == .unknown) return null;
+        const value = if (tree.fullContainerDecl(&container_buffer, returned) != null)
+            // A container it declares is the template's, the same in every call where it
+            // names nothing the function declares (`return struct {};`).
+            if (self.namesNothingOf(decl, returned)) try self.resolve(decl.file, returned) else return null
+        else
+            try self.resolveIn(bound, decl.file, returned);
+        if (value == .unknown) return null;
+        try values.append(self.gpa, value);
     }
-    return try self.choose(values);
+    if (values.items.len == 0) return null;
+    return try self.choose(values.items);
+}
+
+/// Whether the expression `node` in function `decl` names none of the function's parameters
+/// or locals, so reads the same whatever a call binds.
+fn namesNothingOf(self: *Facts, decl: Decl, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(decl.file).file.tree;
+    const model = &self.project.at(decl.file).model;
+    const function = self.scopeNode(decl);
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (model.declarations) |d| {
+        if (d.token >= first and d.token <= last) continue;
+        if (d.token < tree.firstToken(function) or d.token > tree.lastToken(function)) continue;
+        const name = Model.identifier(self.gpa, tree.tokenSlice(d.token)) catch return false;
+        for (first..last + 1) |t| {
+            if (tree.tokenTag(@intCast(t)) != .identifier) continue;
+            const used = Model.identifier(self.gpa, tree.tokenSlice(@intCast(t))) catch return false;
+            if (std.mem.eql(u8, used, name)) return false;
+        }
+    }
+    return true;
 }
 
 /// `node` read with `env`'s bindings: a parameter of the function being read is its argument,
@@ -3640,6 +3827,9 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                 if (variable.ast.type_node.unwrap()) |t| {
                     const type_value = try self.resolveIn(env, file, t);
                     if (!holdsTypes(type_value)) return self.instance(type_value);
+                    // An array of types written element by element (`types[len] = ?F;`).
+                    if (type_value == .array and tree.tokenTag(variable.ast.mut_token) == .keyword_var) if (variable.ast.init_node.unwrap()) |init| if (isUndefined(tree, init))
+                        return self.writtenElements(env, file, index, function_scope);
                 }
                 if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env, file, init);
             }

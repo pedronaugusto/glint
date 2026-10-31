@@ -195,7 +195,7 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
 
 /// What a value holds by value of the std resources: one of them (`resource`, its index);
 /// none; a type a generic's binding gives (`generic`); or a type that does not resolve. A
-/// pointer borrows; an optional, an error union and an array hold what they wrap; a choice of
+/// pointer borrows; an optional, an error union and an array hold what they wrap, a type built from field types (`@Struct`) what they hold; a choice of
 /// types per build holds what any of them holds; a container a type function made holds what
 /// its fields hold with the call's arguments (`Box(T)` inside `Outer(T)`), one declared once
 /// being judged at its declaration, and aegis's own (`own.Owned`) being the answer.
@@ -213,6 +213,8 @@ fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, 
             break :blk found;
         },
         .optional, .error_union, .array => |inner| heldBy(c, resources, inner.*, depth + 1),
+        // A type Zig builds from a list of field types holds what they do.
+        .reified => |built| heldBy(c, resources, built.fields.*, depth + 1),
         .alternatives => |each| blk: {
             var found: Holding = .other;
             for (each) |one| found = holdingOf(found, try heldBy(c, resources, one, depth + 1));

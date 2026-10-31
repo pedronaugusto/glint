@@ -642,6 +642,78 @@ test "A015 reads a container a type function makes inside another's with the out
     try std.testing.expectEqual(@as(usize, 0), chosen.findings);
 }
 
+test "A015 reads a type built by reflection on its argument: the fields a comptime loop writes, the prong a switch on type information takes" {
+    // ensign's shapes: options and commands each of one type, `Partial(T)` an optional of each
+    // of T's fields' types written element by element, `Tag(T)` and `Fields(T)` enums.
+    const lib =
+        \\pub const Option = struct { short: ?u8 = null };
+        \\pub fn Options(comptime T: type) type {
+        \\    const fields = @typeInfo(T).@"struct";
+        \\    const final = fields.field_names[0..fields.field_names.len].*;
+        \\    return @Struct(.auto, null, &final, &@splat(Option), &@splat(.{}));
+        \\}
+        \\pub fn Commands(comptime T: type) type {
+        \\    for (@typeInfo(T).@"struct".field_types) |F| {
+        \\        if (@typeInfo(F) != .@"union") continue;
+        \\        return @Struct(.auto, null, @typeInfo(F).@"union".field_names, &@splat(Option), &@splat(.{}));
+        \\    }
+        \\    return struct {};
+        \\}
+        \\pub fn Partial(comptime T: type) type {
+        \\    const fields = @typeInfo(T).@"struct";
+        \\    var types: [fields.field_names.len]type = undefined;
+        \\    var len: usize = 0;
+        \\    for (fields.field_types) |F| {
+        \\        types[len] = ?F;
+        \\        len += 1;
+        \\    }
+        \\    const final_types = types[0..len].*;
+        \\    return @Struct(.auto, null, fields.field_names, &final_types, &@splat(.{}));
+        \\}
+        \\pub fn Spec(comptime T: type) type {
+        \\    return struct { options: Options(T) = .{}, commands: Commands(T) = .{}, sets: Partial(T) = .{} };
+        \\}
+        \\pub fn Tag(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .@"enum" => |info| info.tag_type,
+        \\        .@"union" => |info| info.tag_type orelse @compileError("untagged"),
+        \\        else => @compileError("no tag"),
+        \\    };
+        \\}
+        \\pub fn Fields(comptime T: type) type {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => |u| if (u.tag_type) |EnumTag| return EnumTag,
+        \\        else => {},
+        \\    }
+        \\    if (@typeInfo(T).@"struct".field_names.len == 0) return enum {};
+        \\    return @Enum(u8, .exhaustive, @typeInfo(T).@"struct".field_names, &@splat(0));
+        \\}
+    ;
+    // A plain argument: every one decided, nothing held.
+    const plain = try runWithDependency(pack.ownership,
+        \\const dep = @import("dep");
+        \\const Value = union(enum) { a: u8, b };
+        \\const Plain = struct { name: []const u8, n: u32 = 0, pub const spec: dep.Spec(@This()) = .{}; };
+        \\pub const K = dep.Tag(Value);
+        \\pub const E = dep.Tag(enum(u8) { x });
+        \\pub const F = dep.Fields(Plain);
+        \\pub const G = dep.Fields(Value);
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), plain.undecided);
+    try std.testing.expectEqual(@as(usize, 0), plain.findings);
+    // One holding a file: `Partial` holds it, an optional of it; one whose field's type does
+    // not resolve: undecided, never clear.
+    const held = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\const ext = @import("missing");
+        \\const Holds = struct { out: std.Io.File, pub const spec: dep.Spec(@This()) = .{}; };
+        \\const Unseen = struct { h: ext.Handle, pub const spec: dep.Spec(@This()) = .{}; };
+    , lib);
+    try std.testing.expectEqual(@as(usize, 2), held.undecided);
+    try std.testing.expectEqual(@as(usize, 2), held.findings);
+}
+
 test "A015 reads a tuple's fields, named by position only, as fields" {
     try expect(pack.ownership,
         \\const std = @import("std");
