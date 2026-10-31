@@ -4719,6 +4719,64 @@ test "Bounds clears an index or a slice the relations along every path keep with
     try std.testing.expectEqualSlices(u32, &.{ 14, 18, 34, 47 }, result.lines[0..result.findings]);
 }
 
+test "Bounds reads a function's parameters from what every caller gives them, where every caller is in the program" {
+    // Each call of `at` checks its index: cleared. `loose` has a caller that does not (line
+    // 16); `named` is named other than as a callee (line 24); `down` calls itself (line 34);
+    // `open` is public, which a consumer may call (line 42).
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn at(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn get(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return at(buf, i);
+        \\}
+        \\pub fn next(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i + 1 >= buf.len) return error.Bad;
+        \\    return at(buf, i + 1);
+        \\}
+        \\fn loose(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn getLoose(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    return loose(buf, i);
+        \\}
+        \\fn named(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\const kept = named;
+        \\pub fn getNamed(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return named(buf, i);
+        \\}
+        \\fn down(buf: []const u8, i: usize) u8 {
+        \\    if (i == 0) return buf[0];
+        \\    return buf[i] +% down(buf, i - 1);
+        \\}
+        \\pub fn getDown(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return down(buf, i);
+        \\}
+        \\pub fn open(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn getOpen(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return open(buf, i);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 16, 24, 34, 42 }, result.lines[0..result.findings]);
+}
+
 test "A010 reads one object's length as at most maxInt(isize): two lengths and 1 fit a usize; two lengths and 2, or three lengths, may not" {
     const result = try run(pack.integers,
         \\const std = @import("std");

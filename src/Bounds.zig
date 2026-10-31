@@ -35,6 +35,7 @@ const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
 const Program = @import("Program.zig");
+const Facts = @import("Facts.zig");
 
 const Error = Context.Error;
 
@@ -354,7 +355,17 @@ const Analysis = struct {
     supported: bool = false,
     verdicts: std.AutoHashMapUnmanaged(Site, bool) = .empty,
     summary: ?Summary = null,
+    /// What each program function this one calls is given: the join, over its calls here
+    /// that the reading reached, of the state at the call projected onto the callee's
+    /// parameter slots (`slot`); null where a call's arguments do not match its parameters.
+    calls: std.AutoHashMapUnmanaged(Callee, ?[]const Lin) = .empty,
+    /// The calls the reading reached, on a path it did not try: a call it did not reach
+    /// leaves what it gives its callee unknown.
+    reached: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty,
 };
+
+/// A function of the program by its `fn` declaration.
+const Callee = struct { file: Project.FileId, function: Ast.Node.Index };
 
 /// What a function's successful returns give of its parameters and result: constraints over
 /// slots, each parameter's value and length and the result's (`slot`).
@@ -384,22 +395,35 @@ fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: 
     }
     memo.depth += 1;
     defer memo.depth -= 1;
+    try readInto(c, made, file, function, width, null);
+    return made;
+}
+
+/// One reading of `function` into `made`, its parameters starting from their types and, where
+/// given, `entry`: constraints over their slots that every call of it in the program holds.
+fn readInto(c: *Context, made: *Analysis, file: Project.FileId, function: Ast.Node.Index, width: u16, given: ?[]const Lin) Error!void {
     var scratch: std.heap.ArenaAllocator = .init(c.allocator);
     defer scratch.deinit();
-    var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .width = width, .function = function };
+    var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .width = width, .function = function, .entry = given };
     frame.run() catch |err| switch (err) {
-        error.Unsupported => return made,
+        error.Unsupported => return,
         else => |e| return e,
     };
     made.supported = true;
+    var calls = frame.calls.iterator();
+    while (calls.next()) |call| try made.calls.put(c.allocator, call.key_ptr.*, if (call.value_ptr.*) |rows| try persisted(c.allocator, rows) else null);
+    var reached = frame.reached.keyIterator();
+    while (reached.next()) |call| try made.reached.put(c.allocator, call.*, {});
     var it = frame.verdicts.iterator();
     while (it.next()) |entry| try made.verdicts.put(c.allocator, entry.key_ptr.*, entry.value_ptr.*);
-    if (frame.summary) |summary| {
-        const rows = try c.allocator.alloc(Lin, summary.rows.len);
-        for (summary.rows, rows) |row, *out| out.* = .{ .terms = try c.allocator.dupe(Term, row.terms), .c = row.c };
-        made.summary = .{ .rows = rows, .params = summary.params };
-    }
-    return made;
+    if (frame.summary) |summary| made.summary = .{ .rows = try persisted(c.allocator, summary.rows), .params = summary.params };
+}
+
+/// Rows copied out of a reading's scratch memory.
+fn persisted(a: std.mem.Allocator, rows: []const Lin) Error![]const Lin {
+    const out = try a.alloc(Lin, rows.len);
+    for (rows, out) |row, *copy| copy.* = .{ .terms = try a.dupe(Term, row.terms), .c = row.c };
+    return out;
 }
 
 /// The function a node is in: its innermost `fn` declaration.
@@ -416,12 +440,238 @@ fn functionOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node
 /// Whether every path to `node` in its function proves its check, at every pointer width.
 pub fn cleared(c: *Context, file: Project.FileId, node: Ast.Node.Index, kind: Kind) Error!bool {
     const function = functionOf(c, file, node) orelse return false;
+    const site: Site = .{ .node = node, .kind = kind };
     for (Range.pointerWidths(c)) |width| {
-        const read = try analysis(c, file, function, width);
-        if (!read.supported) return false;
-        if (!(read.verdicts.get(.{ .node = node, .kind = kind }) orelse return false)) return false;
+        // Read from the parameters' types, or from what every caller gives them.
+        const alone = try analysis(c, file, function, width);
+        if (alone.supported and (alone.verdicts.get(site) orelse false)) continue;
+        const called = try byCallers(c, file, function, width);
+        if (called.supported and (called.verdicts.get(site) orelse false)) continue;
+        return false;
     }
     return true;
+}
+
+//======================================================================
+// Caller ranges.
+//======================================================================
+
+/// A reading of each function from its callers, at one pointer width: the function read with
+/// an entry state, where every caller is known, and else its reading alone.
+const Entries = struct {
+    map: std.AutoHashMapUnmanaged(struct { Project.FileId, Ast.Node.Index, u16 }, *Analysis) = .empty,
+};
+
+/// How many callers deep an entry state is read: a function further from every root than this
+/// is read alone.
+const entry_depth = 32;
+
+/// `function` read with the entry state its callers give it (`entryOf`), or its reading
+/// alone where they give none. Its calls' states come from this reading, so a caller's own
+/// entry reaches its callees in turn.
+fn byCallers(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: u16) Error!*Analysis {
+    const memo = try c.facts.memo(Entries);
+    const key = .{ file, function, width };
+    if (memo.map.get(key)) |found| return found;
+    const rows = (try entryOf(c, .{ .file = file, .function = function }, width)) orelse {
+        const alone = try analysis(c, file, function, width);
+        try memo.map.put(c.allocator, key, alone);
+        return alone;
+    };
+    const made = try c.allocator.create(Analysis);
+    made.* = .{};
+    try readInto(c, made, file, function, width, rows);
+    try memo.map.put(c.allocator, key, made);
+    return made;
+}
+
+/// What every call of `function` in the program gives its parameter slots: the join over its
+/// callers of each one's state at its calls (`Analysis.calls`), read from that caller's own
+/// entry. Null where a caller may be missing: `function` is exported to consumers or by
+/// `export`, is named other than as a callee, is called outside a function or within a cycle
+/// of calls, lies further than `entry_depth` callers from every root, or where a caller's
+/// reading did not model it or reach a call of it, or a call does not match its parameters.
+fn entryOf(c: *Context, function: Callee, width: u16) Error!?[]const Lin {
+    const index = try callersIndex(c);
+    if (index.reflective) return null;
+    const facts = index.callers.get(function) orelse return null;
+    if (facts.escapes or facts.depth > entry_depth) return null;
+    var joined: ?State = null;
+    for (facts.sites.items) |site| {
+        const caller = try byCallers(c, site.file, site.function, width);
+        if (!caller.supported or !caller.reached.contains(site.call)) return null;
+        const given = (caller.calls.get(function) orelse return null) orelse return null;
+        const state: State = .{ .rows = given };
+        joined = if (joined) |j| try join(c.allocator, j, state) else state;
+    }
+    const s = joined orelse return null;
+    return s.rows;
+}
+
+/// Each program function's calls in the program, and whether all of them are known.
+const Callers = struct {
+    callers: std.AutoHashMapUnmanaged(Callee, Called) = .empty,
+    built: bool = false,
+    /// A program file names a declaration by a name it computes (`@field(T, name)`): any
+    /// function may be reached so, and none has every caller known.
+    reflective: bool = false,
+};
+const Called = struct {
+    sites: std.ArrayList(struct { file: Project.FileId, function: Ast.Node.Index, call: Ast.Node.Index }) = .empty,
+    /// Named other than as a callee, called outside a function, exported, or in a cycle.
+    escapes: bool = false,
+    /// The longest chain of callers above it.
+    depth: usize = 0,
+};
+
+fn callersIndex(c: *Context) Error!*Callers {
+    const memo = try c.facts.memo(Callers);
+    if (memo.built) return memo;
+    memo.built = true;
+    // Every name a program function is declared under, to resolve only what may reach one.
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    for (c.project.sources) |*source| {
+        if (source.file.status != .parsed or !try Program.owns(c, source.id)) continue;
+        for (source.model.declarations) |decl| if (decl.kind == .function) try names.put(c.allocator, decl.name, {});
+    }
+    for (c.project.sources) |*source| {
+        if (source.file.status != .parsed or !try Program.owns(c, source.id)) continue;
+        const file = source.id;
+        const tree = &source.file.tree;
+        const model = &source.model;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const name_token = switch (tag) {
+                .identifier, .enum_literal => tree.nodeMainToken(node),
+                .field_access => tree.nodeData(node).node_and_token[1],
+                .builtin_call_two, .builtin_call_two_comma => {
+                    // `@field(T, "f")` names `f` by text: each function of that name may be
+                    // reached so; a name computed may be any.
+                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, node, &buffer);
+                    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) {
+                        memo.reflective = true;
+                        continue;
+                    }
+                    const quoted = tree.tokenSlice(tree.nodeMainToken(args[1]));
+                    try fieldNamed(c, memo, quoted[1 .. quoted.len - 1]);
+                    continue;
+                },
+                else => continue,
+            };
+            if (!names.contains(tree.tokenSlice(name_token))) continue;
+            // A declaration's own name is no use of it.
+            const decl = switch (try c.facts.resolve(file, node)) {
+                .function => |d| d,
+                else => continue,
+            };
+            const callee = calleeOf(c, decl) orelse continue;
+            const entry = try memo.callers.getOrPut(c.allocator, callee);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            const parent = model.parentOf(node);
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            const called = if (parent) |p| if (tree.fullCall(&call_buffer, p)) |call| call.ast.fn_expr == node else false else false;
+            const caller = if (parent) |p| functionOf(c, file, p) else null;
+            if (!called or caller == null) {
+                entry.value_ptr.escapes = true;
+                continue;
+            }
+            try entry.value_ptr.sites.append(c.allocator, .{ .file = file, .function = caller.?, .call = parent.? });
+        }
+    }
+    // Callers the program may not hold: by `export`, or by name from another package.
+    var it = memo.callers.iterator();
+    while (it.next()) |entry| {
+        const decl = declOf(c, entry.key_ptr.*) orelse {
+            entry.value_ptr.escapes = true;
+            continue;
+        };
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        // `pub`: a consumer of the package may call it, and a run need not hold any file that
+        // imports the package by name, so a public function's callers are never all known.
+        if (record.exported or record.public) entry.value_ptr.escapes = true;
+    }
+    // Each function's depth below the roots; every function on a cycle of callers has no
+    // entry, whichever of them the search starts from.
+    var keys: std.ArrayList(Callee) = .empty;
+    var keys_it = memo.callers.keyIterator();
+    while (keys_it.next()) |k| try keys.append(c.allocator, k.*);
+    var walk: Walk = .{ .memo = memo };
+    for (keys.items) |k| _ = try walk.depthOf(c, k);
+    return memo;
+}
+
+/// Every program function `@field` may name by `name`: none of them has its callers known.
+fn fieldNamed(c: *Context, memo: *Callers, name: []const u8) Error!void {
+    for (c.project.sources) |*source| {
+        if (source.file.status != .parsed or !try Program.owns(c, source.id)) continue;
+        for (source.model.declarations, 0..) |decl, i| {
+            if (decl.kind != .function or !std.mem.eql(u8, decl.name, name)) continue;
+            const callee = calleeOf(c, .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) }) orelse continue;
+            const entry = try memo.callers.getOrPut(c.allocator, callee);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.escapes = true;
+        }
+    }
+}
+
+/// A search of the callers above each function: the longest chain to a root, past
+/// `entry_depth` none, and each function on a cycle marked as escaping.
+const Walk = struct {
+    memo: *Callers,
+    state: std.AutoHashMapUnmanaged(Callee, enum { active, done }) = .empty,
+    stack: std.ArrayList(Callee) = .empty,
+
+    fn depthOf(w: *Walk, c: *Context, function: Callee) Error!usize {
+        const called = w.memo.callers.getPtr(function) orelse return 0;
+        if (w.state.get(function)) |at| switch (at) {
+            .done => return called.depth,
+            // A cycle: each function from this one up the stack reaches itself again.
+            .active => {
+                var i = w.stack.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const on = w.stack.items[i];
+                    w.memo.callers.getPtr(on).?.escapes = true; // unreachable: each function on the stack is indexed
+                    if (std.meta.eql(on, function)) break;
+                }
+                return entry_depth + 1;
+            },
+        };
+        // A chain longer than any read: the search goes no deeper.
+        if (w.stack.items.len > entry_depth) {
+            called.escapes = true;
+            return entry_depth + 1;
+        }
+        try w.state.put(c.allocator, function, .active);
+        try w.stack.append(c.allocator, function);
+        var deepest: usize = 0;
+        for (called.sites.items) |site| deepest = @max(deepest, (try w.depthOf(c, .{ .file = site.file, .function = site.function })) +| 1);
+        _ = w.stack.pop();
+        called.depth = deepest;
+        if (deepest > entry_depth) called.escapes = true;
+        try w.state.put(c.allocator, function, .done);
+        return deepest;
+    }
+};
+
+/// The `fn` declaration of a program function, or null for one without a body there.
+fn calleeOf(c: *Context, decl: Facts.Decl) ?Callee {
+    const model = &c.project.at(decl.file).model;
+    const proto = model.declarations[@backingInt(decl.index)].node;
+    const function = model.parentOf(proto) orelse return null;
+    if (c.project.at(decl.file).file.tree.nodeTag(function) != .fn_decl) return null;
+    return .{ .file = decl.file, .function = function };
+}
+
+/// The declaration of the function a `fn` declaration makes.
+fn declOf(c: *Context, callee: Callee) ?Facts.Decl {
+    const model = &c.project.at(callee.file).model;
+    const tree = &c.project.at(callee.file).file.tree;
+    const proto = tree.nodeData(callee.function).node_and_node[0];
+    for (model.declarations, 0..) |decl, i| if (decl.kind == .function and decl.node == proto) return .{ .file = callee.file, .index = @fromBackingInt(@intCast(i)) };
+    return null;
 }
 
 /// Range's question of an index or a slice's bound: `index` within `memory`, as the access
@@ -532,6 +782,12 @@ const Frame = struct {
     trial: u32 = 0,
     params: []const ?Model.Declaration.Id = &.{},
     summary: ?Summary = null,
+    /// What every caller gives the parameters' slots (`entryOf`), assumed from the start.
+    entry: ?[]const Lin = null,
+    /// What this function gives each program function it calls (`Analysis.calls`).
+    calls: std.AutoHashMapUnmanaged(Callee, ?[]const Lin) = .empty,
+    /// The calls reached on a path not being tried.
+    reached: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty,
 
     const RunError = Error || error{Unsupported};
 
@@ -569,6 +825,7 @@ const Frame = struct {
             };
         }
         f.params = params.items;
+        if (f.entry) |rows| s = try f.fromCallers(s, rows);
         if (proto.ast.return_type.unwrap()) |result| {
             var t = result;
             if (f.tree.nodeTag(t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
@@ -579,6 +836,83 @@ const Frame = struct {
         const out = try f.exec(s, body);
         if (!out.dead) try f.exits.append(f.a, .{ .state = out, .failed = false });
         try f.summarize();
+    }
+
+    /// `s` with what every caller gives the parameters: each row over their slots, read as
+    /// the parameters' values and lengths. A row naming a slot with no parameter is dropped.
+    fn fromCallers(f: *Frame, s: State, rows: []const Lin) Error!State {
+        var out = s;
+        each: for (rows) |row| {
+            var renamed: Lin = constant(row.c);
+            for (row.terms) |term| {
+                const param = term.v / 2;
+                if (param >= f.params.len) continue :each;
+                const d = f.params[param] orelse continue :each;
+                const v = try f.variable(if (term.v % 2 == 1) .{ .length = d } else .{ .value = d });
+                renamed = (try combine(f.a, renamed, 1, try single(f.a, v), term.k)) orelse continue :each;
+            }
+            out = try assume(f.a, out, renamed);
+        }
+        return out;
+    }
+
+    /// What a call gives a program function it reaches, joined with its other calls' in this
+    /// function: the state there projected onto the callee's parameter slots, each argument's
+    /// value and length. Recorded only on a path not being tried; a call whose arguments do
+    /// not match the callee's parameters gives it nothing known.
+    fn recordCall(f: *Frame, s: State, node: Ast.Node.Index, fn_expr: Ast.Node.Index, args: []const Value) Error!void {
+        if (f.trial > 0) return;
+        try f.reached.put(f.a, node, {});
+        const decl = switch (try f.c.facts.resolve(f.file, fn_expr)) {
+            .function => |d| d,
+            else => return,
+        };
+        if (!try Program.owns(f.c, decl.file)) return;
+        const callee = calleeOf(f.c, decl) orelse return;
+        const callee_tree = &f.c.project.at(decl.file).file.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = callee_tree.fullFnProto(&proto_buffer, f.c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return;
+        var count: usize = 0;
+        var it = proto.iterate(callee_tree);
+        while (it.next()) |_| count += 1;
+        const entry = try f.calls.getOrPut(f.a, callee);
+        if (count != args.len or count > 64) {
+            entry.value_ptr.* = null;
+            return;
+        }
+        if (entry.found_existing and entry.value_ptr.* == null) return;
+        const projected = try f.projectArgs(s, args);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = projected.rows;
+            return;
+        }
+        const joined = try join(f.a, .{ .rows = entry.value_ptr.*.? }, projected); // unreachable: a null entry returned above
+        entry.value_ptr.* = joined.rows;
+    }
+
+    /// `s`'s constraints on a call's arguments alone, each renamed to its slot.
+    fn projectArgs(f: *Frame, s: State, args: []const Value) Error!State {
+        // Variables of their own for the slots, past any the frame makes.
+        const base: Var = 1 << 30;
+        var out = s;
+        for (args, 0..) |arg, i| {
+            if (arg.lin) |lin| out = try f.equal(out, base + slot(i, false), lin);
+            if (arg.length) |lin| out = try f.equal(out, base + slot(i, true), lin);
+        }
+        if (out.dead) return out;
+        var others: std.ArrayList(Var) = .empty;
+        for (out.rows) |row| for (row.terms) |term| if (term.v < base) {
+            if (std.mem.findScalar(Var, others.items, term.v) == null) try others.append(f.a, term.v);
+        };
+        std.mem.sort(Var, others.items, {}, std.sort.asc(Var));
+        for (others.items) |v| out = try forget(f.a, out, v);
+        var rows: std.ArrayList(Lin) = .empty;
+        for (out.rows) |row| {
+            const terms = try f.a.alloc(Term, row.terms.len);
+            for (row.terms, terms) |term, *renamed| renamed.* = .{ .v = term.v - base, .k = term.k };
+            try rows.append(f.a, .{ .terms = terms, .c = row.c });
+        }
+        return .{ .rows = try canonical(f.a, rows.items) };
     }
 
     /// The locals whose address is taken, and each declaration by its name's token.
@@ -1938,6 +2272,7 @@ const Frame = struct {
             out = measured[0];
             try args.append(f.a, .{ .length = measured[1] });
         }
+        try f.recordCall(out, node, full.ast.fn_expr, args.items);
         const made = try f.fresh(out, node, 0);
         out = made.s;
         const t = made.v.lin;
