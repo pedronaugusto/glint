@@ -781,6 +781,24 @@ test "A002 reads a copy through a pointer a call returns, and an iterator a type
     try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { const n = m.getPtr(0).?.n; _ = n; }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f(m: *Map(u32, u32)) void { var it = m.valueIterator(); while (it.next()) |p| { const n = p.*; _ = n; } }", pack.copies, true, 0);
     try expectJudged(head ++ "pub fn f() void { const s = make().s; _ = s; }", pack.copies, true, 0);
+    // A column of a list of rows (std's MultiArrayList): `items(field)` gives the row type's
+    // field, `Elem` a constant of the made container read through the method's reading.
+    const columns =
+        \\fn Columns(comptime T: type) type {
+        \\    return struct {
+        \\        const Elem = switch (@typeInfo(T)) { .@"struct" => T, else => @compileError("rows") };
+        \\        rows: []Elem,
+        \\        pub const Slice = struct { base: []Elem, pub fn items(self: Slice, comptime field: []const u8) []FieldType(field) { _ = self; return undefined; } };
+        \\        fn FieldType(comptime field: []const u8) type { return @FieldType(Elem, field); }
+        \\        pub fn slice(c: *@This()) Slice { return .{ .base = c.rows }; }
+        \\    };
+        \\}
+        \\
+    ;
+    try expectJudged(head ++ columns ++ "pub fn f(c: *Columns(Pair), i: usize) void { const copy = c.slice().items(\"s\")[i]; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ columns ++ "pub fn f(c: *Columns(Pair), i: usize) void { const n = c.slice().items(\"n\")[i]; _ = n; }", pack.copies, true, 0);
+    // A branch a `@hasDecl` known as the program compiles rules out is not analysed.
+    try expectJudged(head ++ "const A = struct { pub fn scan() void {} };\nconst B = struct {};\npub fn f(m: *Map(u32, Pair)) void { const p = m.getPtr(0).?; const x = if (comptime @hasDecl(A, \"scan\")) p.s else 0; const y = if (comptime @hasDecl(B, \"scan\")) p.s else 0; _ = .{ x, y }; }", pack.copies, true, 1);
     // A `while (true)` gives what its breaks give.
     try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { var i: usize = 0; const p = while (true) { if (m.getPtr(i)) |found| break found; i += 1; }; const n = p.n; const copy = p.s; _ = .{ n, copy }; }", pack.copies, true, 1);
 }

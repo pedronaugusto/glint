@@ -124,7 +124,12 @@ pub const Env = struct {
     /// declared in a type function's container (std's `FieldIterator(V)` in a hash map),
     /// whose parameters it reads as that reading binds them.
     outer: ?*const Env = null,
+    /// Where each argument is written, in order with `args` (none for a receiver): what a
+    /// name a type function is given (`items(.tag)`, `@tagName(field)`) is read from.
+    sources: []const ?Source = &.{},
 };
+/// An argument as written: its node, in its file, and the reading it is written in.
+pub const Source = struct { file: Project.FileId, node: Ast.Node.Index, env: ?*const Env };
 /// A type seen through `@typeInfo`, and how far into its information a chain of fields has
 /// gone: `.pointer.child`, `.optional.child`, `.array.child`, `.error_union.payload`,
 /// `.@"fn".return_type` and `.@"fn".param_types[i]`. `part` is any other part of the
@@ -940,6 +945,11 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
         },
         .@"if", .if_simple => {
             const branch = t.fullIf(node).?; // unreachable: the tag is an `if`'s
+            // A condition known as the program compiles: Zig analyses only the branch it takes.
+            if (branch.payload_token == null and branch.error_token == null) if (try self.comptimeTruth(file, branch.ast.cond_expr)) |taken| {
+                const chosen = if (taken) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return;
+                return self.copiedWalk(file, chosen, depth + 1, places, rest, deep);
+            };
             try self.copiedWalk(file, branch.ast.then_expr, depth + 1, places, rest, deep);
             if (branch.ast.else_expr.unwrap()) |otherwise| try self.copiedWalk(file, otherwise, depth + 1, places, rest, deep);
             return;
@@ -1474,6 +1484,38 @@ fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.N
     return null;
 }
 
+/// A condition known as the program compiles: `truth`'s, and `@hasDecl(T, "name")` where `T`
+/// is a container that resolves (a module a driver is built against).
+fn comptimeTruth(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    if (self.truth(null, file, node)) |known| return known;
+    const tree = &self.project.at(file).file.tree;
+    var at = node;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .grouped_expression => tree.nodeData(at).node_and_token[0],
+        .@"comptime" => tree.nodeData(at).node,
+        else => break,
+    };
+    switch (tree.nodeTag(at)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@hasDecl")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, at, &buffer);
+    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
+    const container = switch (try self.resolve(file, args[0])) {
+        .container => |c| c,
+        else => return null,
+    };
+    if (container.symbolic) return null;
+    const name = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
+    return self.project.at(container.file).model.declarations[@backingInt(decl)].kind != .field;
+}
+
 /// Whether a branch never completes: a jump or a stop, or a block whose last statement is one.
 fn completesNever(tree: *const Ast, node: Ast.Node.Index) bool {
     if (never(tree, node) and tree.nodeTag(node) != .identifier) return true;
@@ -1699,7 +1741,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@Int")) return .{ .primitive = "@Int" };
     // An enum type built from names and values: it holds no value but its tag.
     if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
-    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
+    if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
@@ -1776,7 +1818,7 @@ fn reifiedEach(self: *Facts, types: Value, _: void) ResolveError!Value {
 
 /// `@FieldType(T, name)`: the type of `T`'s field `name`; for a name computed at compile
 /// time, one of its fields' types, each a choice.
-fn fieldType(self: *Facts, file: Project.FileId, of: Value, name_node: Ast.Node.Index) ResolveError!Value {
+fn fieldType(self: *Facts, of: Value, field_name: ?[]const u8) ResolveError!Value {
     const container = switch (of) {
         .container => |c| c,
         .unknown => |why| return .{ .unknown = why },
@@ -1785,16 +1827,50 @@ fn fieldType(self: *Facts, file: Project.FileId, of: Value, name_node: Ast.Node.
     // A container a type function makes has its fields' types where the call that made it is
     // known, read with that call's bindings.
     if (container.symbolic and container.made_by == null) return .{ .unknown = .comptime_dependent };
-    const t = self.syntaxOf(file);
-    if (t.nodeTag(name_node) == .string_literal) {
-        const name = std.zig.string_literal.parseAlloc(self.gpa, t.tokenSlice(t.nodeMainToken(name_node))) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .{ .unknown = .unsupported },
-        };
+    if (field_name) |name| {
         const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
         return typeOf(self, try self.memberOf(container, field), {});
     }
     return self.fieldTypes(container);
+}
+
+/// The name a comptime expression spells, read with `env`'s bindings: a string literal, an
+/// enum literal's name, `@tagName` of one, or a parameter whose argument, where it is written,
+/// spells one. Null where none is known.
+fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!?[]const u8 {
+    if (depth == 8) return null;
+    const tree = &self.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .string_literal => return std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(node))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        },
+        .enum_literal => return try self.memberName(tree.tokenSlice(tree.nodeMainToken(node))),
+        .grouped_expression => return self.nameIn(env, file, tree.nodeData(node).node_and_token[0], depth + 1),
+        .@"comptime" => return self.nameIn(env, file, tree.nodeData(node).node, depth + 1),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@tagName")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, node, &buffer);
+            if (args.len != 1) return null;
+            return self.nameIn(env, file, args[0], depth + 1);
+        },
+        .identifier => {},
+        else => return null,
+    }
+    const model = &self.project.at(file).model;
+    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(index)];
+    if (record.kind != .parameter) return null;
+    var at: ?*const Env = env;
+    while (at) |reading| : (at = reading.outer) {
+        if (reading.function.file != file or model.scopes[@backingInt(record.scope)].node != self.scopeNode(reading.function)) continue;
+        const position = self.parameterPosition(file, reading.function, record.token) orelse return null;
+        if (position >= reading.sources.len) return null;
+        const source = reading.sources[position] orelse return null;
+        return self.nameIn(source.env, source.file, source.node, depth + 1);
+    }
+    return null;
 }
 
 /// The type of any of a container's fields, the choice of them: what `@FieldType` gives for a
@@ -2461,7 +2537,9 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
     self.assumed = made.assumed;
     const args = try self.gpa.alloc(Value, call.ast.params.len);
     const truths = try self.gpa.alloc(?bool, call.ast.params.len);
-    for (call.ast.params, args, truths, 0..) |param, *arg, *t, position| {
+    const sources = try self.gpa.alloc(?Source, call.ast.params.len);
+    for (call.ast.params, args, truths, sources, 0..) |param, *arg, *t, *source, position| {
+        source.* = .{ .file = made.file, .node = param, .env = outer_env };
         const changed = try self.passedOnChanged(made.function, position);
         arg.* = if (changed)
             .{ .unknown = .comptime_dependent }
@@ -2469,7 +2547,7 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
     const env = try self.gpa.create(Env);
-    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = outer_env };
+    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = outer_env, .sources = sources };
     return env;
 }
 
@@ -3608,9 +3686,24 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     const tree = &self.project.at(file).file.tree;
     var args: std.ArrayList(Value) = .empty;
     var truths: std.ArrayList(?bool) = .empty;
+    // The reading this call is made in: a made container's, for its method (`Slice.items`
+    // reading `Elem` of `MultiArrayList(Elem)`), else the calling one.
+    var outer = env;
+    var sources: std.ArrayList(?Source) = .empty;
     // A method called on a value takes that value as its first parameter.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const receiver = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        const holder: ?Container = switch (receiver) {
+            .instance, .container => |c| c,
+            .pointer => |p| switch (p.*) {
+                .instance, .container => |c| c,
+                else => null,
+            },
+            else => null,
+        };
+        if (holder) |h| if (h.made_by) |made| {
+            outer = try self.madeEnv(made);
+        };
         const on_value = switch (receiver) {
             .instance => true,
             .pointer => |p| p.* == .instance,
@@ -3619,14 +3712,16 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         if (on_value) {
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
+            try sources.append(self.gpa, null);
         }
     }
     for (call.ast.params) |arg| {
         try args.append(self.gpa, try self.resolveIn(env, file, arg));
         try truths.append(self.gpa, self.truth(env, file, arg));
+        try sources.append(self.gpa, .{ .file = file, .node = arg, .env = env });
     }
     const bound = try self.gpa.create(Env);
-    bound.* = .{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items };
+    bound.* = .{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items, .outer = outer, .sources = sources.items };
     const result_tree = target_tree;
     if (returns_type) {
         const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
@@ -3854,17 +3949,24 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
                     return .{ .unknown = .comptime_dependent };
                 }
             }
-            if (record.kind == .variable and self.enclosed(file, record.scope, function_scope)) {
+            // A constant of this reading's function, or of one it is made in (`Elem` in
+            // `MultiArrayList(T)`'s container, read by its `Slice.items`), read with that one.
+            var reading: ?*const Env = e;
+            const declared_in = while (reading) |r| : (reading = r.outer) {
+                if (r.function.file == file and self.enclosed(file, record.scope, self.scopeNode(r.function))) break r;
+            } else null;
+            if (record.kind == .variable) if (declared_in) |r| {
+                const env_here: ?*const Env = r;
                 const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);
                 if (variable.ast.type_node.unwrap()) |t| {
-                    const type_value = try self.resolveIn(env, file, t);
+                    const type_value = try self.resolveIn(env_here, file, t);
                     if (!holdsTypes(type_value)) return self.instance(type_value);
                     // An array of types written element by element (`types[len] = ?F;`).
                     if (type_value == .array and tree.tokenTag(variable.ast.mut_token) == .keyword_var) if (variable.ast.init_node.unwrap()) |init| if (isUndefined(tree, init))
-                        return self.writtenElements(env, file, index, function_scope);
+                        return self.writtenElements(env_here, file, index, self.scopeNode(r.function));
                 }
-                if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env, file, init);
-            }
+                if (variable.ast.init_node.unwrap()) |init| return self.resolveIn(env_here, file, init);
+            };
             // A capture of the function's own: what it captures, read with the call's bindings.
             if (record.kind == .capture and self.enclosed(file, record.scope, function_scope)) return self.captured(env, .{ .file = file, .index = index });
             return self.resolve(file, node);
