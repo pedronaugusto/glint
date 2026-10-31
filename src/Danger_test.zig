@@ -6806,6 +6806,152 @@ test "A020 reads a labeled switch that continues itself as a loop, each prong th
     , 0);
 }
 
+test "A020 judges a function whose Io a field's field holds, and leaves undecided one whose Io sits in a form it does not read" {
+    // A struct given by value holds its field's Io as one behind a pointer does.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Worker = struct { io: std.Io, count: u64 = 0 };
+        \\pub fn run(w: Worker) void {
+        \\    const io = w.io;
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+    , 1);
+    // `self.ctx.io`: read, flagged as `self.io` is.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Ctx = struct { io: std.Io };
+        \\const Worker = struct {
+        \\    ctx: Ctx,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) void {
+        \\        while (true) self.count +%= 1;
+        \\    }
+        \\};
+        \\pub fn start(w: *Worker) void {
+        \\    w.run();
+        \\}
+    , 1);
+    // An optional, a field holding one, anytype, a tuple's field, behind two pointers: each may be
+    // an Io, so each loop with no point is undecided, never cleared.
+    const found = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn optional(io: ?std.Io) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\const Worker = struct {
+        \\    io: ?std.Io,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) void {
+        \\        while (true) self.count +%= 1;
+        \\    }
+        \\};
+        \\pub fn any(io: anytype) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\pub fn tuple(ctx: struct { std.Io, u8 }) void {
+        \\    _ = ctx;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\pub fn twice(io: *const *const std.Io) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.findings);
+    try std.testing.expectEqual(@as(usize, 5), found.undecided);
+    // One that holds no Io, nor anything that may be one, is not given one: a type reached
+    // through `std.Io` as a namespace is not an Io.
+    const none = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(n: ?u8, t: struct { u8, u16 }, l: std.Io.Reader.Limit) void {
+        \\    _ = n;
+        \\    _ = t;
+        \\    _ = l;
+        \\    var k: u64 = 0;
+        \\    while (true) k +%= 1;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), none.findings);
+    try std.testing.expectEqual(@as(usize, 0), none.undecided);
+}
+
+test "A020 and A009 read a call inside @TypeOf, never evaluated, as no cancellation point and no read" {
+    // `@TypeOf(try io.checkCancel())` checks nothing, in the loop, a callee, or a labeled switch.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        _ = @TypeOf(try io.checkCancel());
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\fn tick(io: std.Io) !void {
+        \\    _ = @TypeOf(try io.checkCancel());
+        \\}
+        \\pub fn called(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        try tick(io);
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn state(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    s: switch (@as(u8, 0)) {
+        \\        0 => {
+        \\            _ = @TypeOf(try io.checkCancel());
+        \\            n +%= 1;
+        \\            continue :s 0;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+    , 3);
+    // The same check made: a point.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+    , 0);
+    // A read inside `@TypeOf` consumes nothing: the loop bound by input is A009's.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = @TypeOf(try r.takeByte());
+        \\        out.* +%= i;
+        \\    }
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = try r.takeByte();
+        \\        out.* +%= i;
+        \\    }
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");
