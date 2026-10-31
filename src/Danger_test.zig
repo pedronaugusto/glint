@@ -1326,7 +1326,7 @@ const input_program =
     \\    var fr: std.Io.Reader = .fixed("abc");
     \\    const own = try fr.takeByte();
     \\    _ = table[own];
-    \\    _ = table[pick(n)];
+    \\    _ = table[pick(try r.takeByte())];
     \\    _ = table[pick(3)];
     \\    const wrapped = aegis.input.Untrusted(u8).init(n);
     \\    _ = table[wrapped.readForParse()];
@@ -1467,7 +1467,7 @@ test "A010 leaves what a number's range holds: arithmetic that cannot overflow i
         \\    const short: u16 = @intCast(n);
         \\    _ = short;
         \\    _ = @as(u64, n) - 5;
-        \\    var total: u64 = 0;
+        \\    var total: u64 = try r.takeInt(u64, 0);
         \\    total += n;
         \\}
     , 4);
@@ -1753,7 +1753,8 @@ test "a number held to 16 bits bounds a loop and sizes work as data does" {
         \\    const low: u16 = @intCast(n);
         \\    for (0..@as(u16, @intCast(n))) |_| {}
         \\    _ = try gpa.alloc(u8, low);
-        \\    for (0..n) |_| {}
+        \\    const m = try r.takeInt(u32, 0);
+        \\    for (0..m) |_| {}
         \\}
     ;
     try expect(pack.untrusted_input, program, 1);
@@ -2246,7 +2247,9 @@ test "A009 reads a parser's returned literal as the parse refines it: its number
     // The parsed count (at most 16 bits) picking an entry of a table of unknown length, and
     // the loops the parsed memory's bytes and the direct call's count bound; never the loop the
     // parsed count bounds, through the header it is stored in.
-    try std.testing.expectEqualSlices(u32, &.{ 16, 21, 26 }, result.lines[0..result.findings]);
+    // Line 10: the bytes the parse counts are 1 or 3 as the peer's first byte picks; the
+    // parser's length check is its own, so the slice's start past `in` is the peer's choice here.
+    try std.testing.expectEqualSlices(u32, &.{ 10, 16, 21, 26 }, result.lines[0..result.findings]);
 }
 
 test "A009 judges a pointer moved by input: no length checks the address it reaches, unless the offset is within the memory it came from" {
@@ -2312,7 +2315,7 @@ test "A009 ends a length's fact where its memory is assigned between the check a
         \\    const ip: usize = try r.takeInt(u32, 0);
         \\    const in_end = in.len - 32;
         \\    if (ip <= in_end) {
-        \\        in = in[16..];
+        \\        in = in[40..];
         \\        return in[ip + 1 ..][0..16][0];
         \\    }
         \\    return 0;
@@ -2321,7 +2324,7 @@ test "A009 ends a length's fact where its memory is assigned between the check a
         \\    var in: []u8 = start;
         \\    const ip: usize = try r.takeInt(u32, 0);
         \\    if (ip <= in.len - 32) {
-        \\        in = in[16..];
+        \\        in = in[40..];
         \\        return in[ip + 1 ..][0..16][0];
         \\    }
         \\    return 0;
@@ -3220,16 +3223,25 @@ test "A009 reads a difference computed before the use: its subtrahend is at most
         \\}
     , 0);
     // A difference only a branch computes, one an `and` may skip, and one whose operand
-    // changes after it keep nothing.
+    // changes after it keep nothing; each in its own function, as a slice a safe build ran
+    // keeps its own bound for what follows.
     try expect(pack.untrusted_input,
         \\const std = @import("std");
-        \\pub fn f(r: *std.Io.Reader, flag: bool) !void {
+        \\pub fn branch(r: *std.Io.Reader, flag: bool) !void {
         \\    const in = try r.take(64);
-        \\    var ip: usize = try r.takeInt(u8, 0);
+        \\    const ip: usize = try r.takeInt(u8, 0);
         \\    if (flag) _ = in.len - ip;
         \\    _ = in[ip..];
+        \\}
+        \\pub fn skipped(r: *std.Io.Reader, flag: bool) !void {
+        \\    const in = try r.take(64);
+        \\    const ip: usize = try r.takeInt(u8, 0);
         \\    if (flag and in.len - ip > 4) {}
         \\    _ = in[ip..];
+        \\}
+        \\pub fn changed(r: *std.Io.Reader) !void {
+        \\    const in = try r.take(64);
+        \\    var ip: usize = try r.takeInt(u8, 0);
         \\    _ = in.len - ip;
         \\    ip += try r.takeInt(u8, 0);
         \\    _ = in[ip..];
@@ -3682,25 +3694,132 @@ test "A009 reads a callee's check only where nothing after it, its defers includ
 }
 
 test "A009 judges a slice's bounds in order: each at most the length leaves the start past the end a peer may choose" {
+    // Each slice in its own function: a slice a safe build ran checks its order for what follows.
     const result = try run(pack.untrusted_input,
         \\const std = @import("std");
-        \\pub fn f(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\pub fn f1(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
         \\    const i: usize = try r.takeInt(u32, .little);
         \\    const n: usize = try r.takeInt(u32, .little);
         \\    if (i > buf.len) return error.Bad;
         \\    if (n > buf.len) return error.Bad;
-        \\    _ = buf[i..n];
-        \\    _ = buf[i..@min(n, buf.len)];
-        \\    _ = buf[5..n];
-        \\    if (i != n) _ = buf[i..n];
-        \\    _ = buf[0..n];
-        \\    _ = buf[i..buf.len];
+        \\    return buf[i..n];
+        \\}
+        \\pub fn f2(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return buf[i..@min(n, buf.len)];
+        \\}
+        \\pub fn f3(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return buf[5..n];
+        \\}
+        \\pub fn f4(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return if (i != n) buf[i..n] else buf;
+        \\}
+        \\pub fn f5(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return buf[0..n];
+        \\}
+        \\pub fn f6(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    return buf[i..buf.len];
+        \\}
+        \\pub fn f7(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
         \\    if (i > n) return error.Bad;
         \\    return buf[i..n];
         \\}
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 8, 8, 9, 10, 10 }, result.lines[0..result.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 14, 14, 21, 28, 28 }, result.lines[0..result.findings]);
+}
+
+test "A009 reads what a branch or a loop a peer decides assigns as the peer's: a counter its number steps and a value its flag picks, within memory only where the program shows it" {
+    // Lines 7 and 14: counters stepped up to a number checked against 1000, not the memory.
+    // Line 29: a value a peer's flag picks indexes a fixed table that holds it (clean) and a
+    // slice that may not (line 35). Line 21: the counter below a number checked against the
+    // memory's length. No loop's bound is a finding: each counts at most a short or the memory.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn counted(r: *std.Io.Reader, buf: []const u8) !u32 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n > 1000) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) total +%= buf[i];
+        \\    return total;
+        \\}
+        \\pub fn ranged(r: *std.Io.Reader, buf: []const u8) !u32 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n > 1000) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    for (0..n) |i| total +%= buf[i];
+        \\    return total;
+        \\}
+        \\pub fn checked(r: *std.Io.Reader, buf: []const u8) !u32 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n > buf.len) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    for (0..n) |i| total +%= buf[i];
+        \\    return total;
+        \\}
+        \\const table: [2000]u8 = @splat(0);
+        \\pub fn fixed(r: *std.Io.Reader) !u8 {
+        \\    const flag = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    if (flag == 1) i = 1000;
+        \\    return table[i];
+        \\}
+        \\pub fn sliced(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const flag = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    if (flag == 1) i = 1000;
+        \\    return buf[i];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 14, 35 }, result.lines[0..result.findings]);
+}
+
+test "A009 bounds a loop by a number the program checked against the memory it holds, and the counter the loop steps up to it; not one it did not check" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn loop(r: *std.Io.Reader, buf: []const u8) !u32 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n > buf.len) return error.Bad;
+        \\    var total: u32 = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) total +%= buf[i];
+        \\    return total;
+        \\}
+        \\pub fn unchecked(r: *std.Io.Reader, buf: []const u8) !u32 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    var total: u32 = 0;
+        \\    var i: usize = 0;
+        \\    while (i <= n) : (i += 1) total +%= buf[i];
+        \\    return total;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 14, 14 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
@@ -5380,7 +5499,8 @@ test "A021 holds a guard until a release of its own block runs, and one bound by
 }
 
 test "A010 reads a slice's length as its bounds set it, apart from what it holds: through a local, a parameter, a field, a return and a reassignment" {
-    const program =
+    // Each way in its own function, as a difference a safe build ran keeps its operand past it.
+    const result = try run(pack.integers,
         \\const std = @import("std");
         \\const Holder = struct { part: []const u8 };
         \\fn take(s: []const u8) usize {
@@ -5391,23 +5511,43 @@ test "A010 reads a slice's length as its bounds set it, apart from what it holds
         \\}
         \\const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
         \\var holder: Holder = .{ .part = "" };
-        \\pub fn f(r: *std.Io.Reader) !u64 {
-        \\    var memory: [512]u8 = @splat(0);
-        \\    const out = &memory;
-        \\    const n: usize = try r.takeInt(u16, .little);
-        \\    const bytes = out[0..n];
-        \\    const rest = out[n..];
+        \\fn read(r: *std.Io.Reader) !usize {
+        \\    return try r.takeInt(u16, .little);
+        \\}
+        \\pub fn local(r: *std.Io.Reader, out: *[512]u8) !usize {
+        \\    const bytes = out[0..try read(r)];
+        \\    return bytes.len - 86;
+        \\}
+        \\pub fn tail(r: *std.Io.Reader, out: *[512]u8) !usize {
+        \\    const rest = out[try read(r)..];
+        \\    return rest.len - 86;
+        \\}
+        \\pub fn param(r: *std.Io.Reader, out: *[512]u8) !usize {
+        \\    return take(out[0..try read(r)]);
+        \\}
+        \\pub fn reassigned(r: *std.Io.Reader, out: *[512]u8) !usize {
         \\    var moved: []u8 = out[0..0];
-        \\    moved = out[0..n];
-        \\    holder.part = out[0..n];
+        \\    moved = out[0..try read(r)];
+        \\    return moved.len - 86;
+        \\}
+        \\pub fn field(r: *std.Io.Reader, out: *[512]u8) !usize {
+        \\    holder.part = out[0..try read(r)];
+        \\    return holder.part.len - 86;
+        \\}
+        \\pub fn returned(r: *std.Io.Reader, out: *[512]u8) !usize {
+        \\    return prefix(out, try read(r)).len - 86;
+        \\}
+        \\pub fn table(r: *std.Io.Reader) !u64 {
+        \\    const n = try read(r);
         \\    var total: u64 = 0;
         \\    for (days[0..@min(n, days.len)]) |d| total += d;
-        \\    const sum = (bytes.len - 86) +% (rest.len - 86) +% take(out[0..n]) +% (moved.len - 86) +% (holder.part.len - 86) +% (prefix(out, n).len - 86);
-        \\    return total +% sum;
+        \\    return total;
         \\}
-    ;
-    // Each difference, and no sum of the table's own days, sliced as far as the peer chose.
-    try expect(pack.integers, program, 6);
+    );
+    // Each difference. Line 40: the sum of the table's own days runs as many passes as the
+    // peer chose, which Bounds does not yet read as at most 12 days (counter steps).
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 16, 20, 28, 32, 35, 40 }, result.lines[0..result.findings]);
 }
 
 test "A010 reads what a function stores through a parameter in its callers' memory: a value through a pointer, a slice through a pointer to it, and on through a caller that passes its own parameter" {

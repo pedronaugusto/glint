@@ -234,6 +234,12 @@ pub fn integral(c: *Context, file: Project.FileId, type_node: Ast.Node.Index) Co
     return (try named(c, file, type_node, widths(c)[0])) != null;
 }
 
+/// Whether a loop's bound is held to a short's count, or between zero and the length of memory
+/// the function holds: a peer chooses no more passes than the work it already sent.
+pub fn counts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return try small(c, file, node) or try Bounds.cleared(c, file, node, .count);
+}
+
 /// Whether a value is held to 16 bits at every pointer width: what it can be is a short's
 /// count, never a peer's past it.
 pub fn small(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {

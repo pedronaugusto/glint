@@ -301,6 +301,14 @@ fn join(a: std.mem.Allocator, x: State, y: State) Error!State {
     return .{ .rows = try canonical(a, out.items) };
 }
 
+/// Whether `s` implies every constraint of `t`.
+fn implies(a: std.mem.Allocator, s: State, t: State) Error!bool {
+    if (s.dead) return true;
+    if (t.dead) return false;
+    for (t.rows) |row| if (!try entails(a, s, row)) return false;
+    return true;
+}
+
 /// The constraints of `s` that `t` implies: what a loop's pass preserved.
 fn preserved(a: std.mem.Allocator, s: State, t: State) Error!State {
     if (s.dead) return s;
@@ -329,6 +337,10 @@ pub const Kind = enum {
     cast,
     /// A divisor other than zero, keyed by the divisor.
     divisor,
+    /// A loop's bound at most a short's count, or between zero and the length of memory the
+    /// function holds: no more passes than the work a peer already sent. Keyed by the operand
+    /// of a `while` condition's comparison or a `for` range's end.
+    count,
 };
 
 const Site = struct { node: Ast.Node.Index, kind: Kind };
@@ -508,6 +520,8 @@ const Frame = struct {
     targets: std.ArrayList(Target) = .empty,
     defers: std.ArrayList(Deferred) = .empty,
     exits: std.ArrayList(Exit) = .empty,
+    /// Whether a `while` condition is being read: its comparisons' operands get a count verdict.
+    looping: bool = false,
     /// How many loop passes being tried enclose the reading: their verdicts and jumps out
     /// count for nothing.
     trial: u32 = 0,
@@ -626,6 +640,26 @@ const Frame = struct {
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* and proven else proven;
     }
 
+    /// A loop's bound `node`, valued `value` in `s`: within a short's count either way, or
+    /// between zero and the length of some memory the function holds.
+    fn counted(f: *Frame, s: State, node: Ast.Node.Index, value: ?Lin) Error!void {
+        if (f.trial > 0) return;
+        const x = value orelse return f.record(node, .count, false);
+        const short = constant(std.math.maxInt(u16));
+        if (try f.holds(s, try atLeast(f.a, short, x)) and try f.holds(s, try plus(f.a, x, short))) return f.record(node, .count, true);
+        if (try f.holds(s, try atLeast(f.a, x, constant(0)))) {
+            for (f.vars.keys(), f.vars.values()) |key, v| {
+                if (key != .length) continue;
+                if (try f.holds(s, try atLeast(f.a, try single(f.a, v), x))) return f.record(node, .count, true);
+            }
+        }
+        try f.record(node, .count, false);
+    }
+
+    fn holds(f: *Frame, s: State, goal: ?Lin) Error!bool {
+        return goal != null and try entails(f.a, s, goal.?);
+    }
+
     /// Whether a declaration is a variable this function alone writes: a parameter, a local
     /// or a capture whose address is never taken.
     fn tracked(f: *Frame, d: Model.Declaration.Id) bool {
@@ -722,6 +756,9 @@ const Frame = struct {
         if (f.trial == 0) try f.exits.append(f.a, .{ .state = out, .failed = failed });
     }
 
+    /// `-1 ≥ 0`: the summary of a function that never succeeds.
+    const never = [_]Lin{constant(-1)};
+
     /// The summary: what the successful exits give of the parameters' slots and the result's.
     fn summarize(f: *Frame) Error!void {
         var joined: ?State = null;
@@ -732,7 +769,7 @@ const Frame = struct {
         }
         const s = joined orelse {
             // No successful exit: every call that succeeds is unreachable.
-            f.summary = .{ .rows = &.{constant(-1)}, .params = f.params.len };
+            f.summary = .{ .rows = &never, .params = f.params.len };
             return;
         };
         f.summary = .{ .rows = s.rows, .params = f.params.len };
@@ -907,6 +944,8 @@ const Frame = struct {
                 else => null,
             } } },
             .identifier => return f.name(s, node),
+            // A statement as a branch's or a loop's whole body (`if (a) i = 0;`).
+            .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_destructure => return .{ .s = try f.exec(s, node) },
             .grouped_expression => return f.eval(s, tree.nodeData(node).node_and_token[0]),
             .@"nosuspend" => return f.eval(s, tree.nodeData(node).node),
             .field_access => return f.field(s, node),
@@ -1076,7 +1115,8 @@ const Frame = struct {
         const length = measured[1];
         // A sentinel's slice reads the element at its end too.
         const room: ?Lin = if (length) |l| (if (full.ast.sentinel != .none) shiftedBy(l, -1) else l) else null;
-        const last = end orelse length;
+        // An open slice ends at its length; an end with no known value proves nothing.
+        const last = if (full.ast.end != .none) end else length;
         if (full.ast.end.unwrap()) |end_node| {
             const fits_end = if (last != null and room != null) try atLeast(f.a, room.?, last.?) else null;
             try f.record(end_node, .end, fits_end != null and try entails(f.a, out, fits_end.?));
@@ -1303,6 +1343,10 @@ const Frame = struct {
                 const left = try f.eval(s, lhs);
                 const right = try f.eval(left.s, rhs);
                 const base = right.s;
+                if (f.looping) {
+                    try f.counted(base, lhs, left.v.lin);
+                    try f.counted(base, rhs, right.v.lin);
+                }
                 const x = left.v.lin orelse return .{ .yes = base, .no = base };
                 const y = right.v.lin orelse return .{ .yes = base, .no = base };
                 return switch (tree.nodeTag(node)) {
@@ -1330,13 +1374,14 @@ const Frame = struct {
         return assume(f.a, out, try atLeast(f.a, y, x));
     }
 
-    /// Binds a capture's declaration to what it captures, from the token its name is at.
-    fn capture(f: *Frame, s: State, token: ?Ast.TokenIndex, value: Value) Error!State {
+    /// Binds a capture's declaration to what it captures, from the token its name is at, as the
+    /// integer `int` where it is one.
+    fn capture(f: *Frame, s: State, token: ?Ast.TokenIndex, value: Value, int: ?Range.Int) Error!State {
         var at = token orelse return s;
         if (f.tree.tokenTag(at) == .asterisk) at += 1;
         const d = f.decls.get(at) orelse return s;
         if (!f.tracked(d)) return s;
-        return f.bind(s, d, value, null);
+        return f.bind(s, d, value, int);
     }
 
     fn branch(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
@@ -1354,13 +1399,13 @@ const Frame = struct {
         var yes = try forget(f.a, try forget(f.a, split.no, t[1]), tl);
         _ = &yes;
         var then_state = try forget(f.a, t[0], tl);
-        then_state = try f.capture(then_state, full.payload_token, payload);
+        then_state = try f.capture(then_state, full.payload_token, payload, try f.intOf(full.ast.cond_expr));
         const then_value = try f.eval(then_state, full.ast.then_expr);
         var then_out = try f.assign(then_value.s, t[1], then_value.v.lin, null);
         then_out = try f.assign(then_out, tl, then_value.v.length, null);
         var else_out = yes;
         if (full.ast.else_expr.unwrap()) |else_expr| {
-            else_out = try f.capture(else_out, full.error_token, .{});
+            else_out = try f.capture(else_out, full.error_token, .{}, null);
             const else_value = try f.eval(else_out, else_expr);
             else_out = try f.assign(else_value.s, t[1], else_value.v.lin, null);
             else_out = try f.assign(else_out, tl, else_value.v.length, null);
@@ -1396,7 +1441,7 @@ const Frame = struct {
         var missing = base;
         if (f.tree.nodeTag(node) == .@"catch") {
             const after = f.tree.nodeMainToken(node) + 1;
-            if (f.tree.tokenTag(after) == .pipe) missing = try f.capture(missing, after + 1, .{});
+            if (f.tree.tokenTag(after) == .pipe) missing = try f.capture(missing, after + 1, .{}, null);
         }
         const fallback = try f.eval(missing, rhs);
         missing = try f.assign(fallback.s, t[1], fallback.v.lin, null);
@@ -1432,7 +1477,7 @@ const Frame = struct {
                     if (value.v.lin) |k| arm = try f.same(arm, x, k);
                 }
             };
-            arm = try f.capture(arm, case.payload_token, .{});
+            arm = try f.capture(arm, case.payload_token, .{}, null);
             const e = try f.eval(arm, case.ast.target_expr);
             var done = try f.assign(e.s, t[1], e.v.lin, null);
             done = try f.assign(done, tl, e.v.length, null);
@@ -1516,8 +1561,14 @@ const Frame = struct {
             f.trial += 1;
             const pass = try f.passOf(invariant, node, label, t[1], body, after);
             f.trial -= 1;
-            const next = try preserved(f.a, invariant, pass.back);
-            if (next.rows.len == invariant.rows.len) break;
+            var next = try preserved(f.a, invariant, pass.back);
+            // A candidate the head holds and the pass keeps is kept, though the head held it
+            // in a tighter form the pass does not keep (`i < n` on entry, `i <= n` after).
+            for (candidates) |row| {
+                if (try entails(f.a, next, row)) continue;
+                if (try entails(f.a, invariant, row) and try entails(f.a, pass.back, row)) next = try assume(f.a, next, row);
+            }
+            if (try implies(f.a, next, invariant)) break;
             invariant = next;
         }
         const final = try f.passOf(invariant, node, label, t[1], body, after);
@@ -1555,11 +1606,16 @@ const Frame = struct {
             const e = try f.eval(s, full.ast.cond_expr);
             split = .{ .yes = try f.unwrap(e.s, e.v), .no = e.s };
             payload = .{ .lin = e.v.lin, .length = e.v.length };
-        } else split = try f.cond(s, full.ast.cond_expr);
-        const entered = try f.capture(split.yes, full.payload_token, payload);
+        } else {
+            const was_looping = f.looping;
+            f.looping = true;
+            defer f.looping = was_looping;
+            split = try f.cond(s, full.ast.cond_expr);
+        }
+        const entered = try f.capture(split.yes, full.payload_token, payload, try f.intOf(full.ast.cond_expr));
         const ran = try f.exec(entered, full.ast.then_expr);
         var exit = split.no;
-        if (full.ast.else_expr.unwrap()) |else_expr| exit = (try f.eval(try f.capture(exit, full.error_token, .{}), else_expr)).s;
+        if (full.ast.else_expr.unwrap()) |else_expr| exit = (try f.eval(try f.capture(exit, full.error_token, .{}, null), else_expr)).s;
         return .{ .body = ran, .exit = exit };
     }
 
@@ -1616,6 +1672,7 @@ const Frame = struct {
                 if (end_node.unwrap()) |e_node| {
                     const end = try f.eval(out, e_node);
                     out = end.s;
+                    try f.counted(out, e_node, end.v.lin);
                     if (start.v.lin != null and end.v.lin != null) {
                         length = try minus(f.a, end.v.lin.?, start.v.lin.?);
                         // A range's end is at least its start, which a safe build checks.
@@ -1665,7 +1722,7 @@ const Frame = struct {
                 f.trial = was_trial;
                 if (start.v.lin) |first| value.lin = try plus(f.a, first, k);
             }
-            entered = try f.capture(entered, token, value);
+            entered = try f.capture(entered, token, value, if (f.tree.nodeTag(input) == .for_range) .{ .bits = f.width, .signed = false } else null);
             token += 1;
             if (f.tree.tokenTag(token) == .comma) token += 1;
         }
