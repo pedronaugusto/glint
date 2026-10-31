@@ -95,7 +95,7 @@ const std_files = [_]sources.Extra{
     \\};
     },
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
-    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
+    .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\nconst File = @This();\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, file: File = undefined, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = io; _ = buffer; return .{ .file = f, .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
     .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
@@ -580,9 +580,9 @@ test "A015 reads a tuple's fields, named by position only, as fields" {
     , 2);
 }
 
-test "A015 finds std resources held by value in a field, released or not, or returned by value, not borrowed by pointer, owned or lent" {
-    // Options' `cwd` and `out` are released nowhere: an owner that leaks or a borrow, which
-    // own.Lent names; either way a finding.
+test "A015 finds std resources held by value in a field the program releases, or returned by value, not borrowed by pointer" {
+    // Conn's stream and log and Log's file are released, as Options' `cwd` is through a local;
+    // Options' `out`, written and released nowhere, holds what its caller gives it.
     try expect(pack.ownership,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -594,7 +594,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
         \\fn shut(d: *std.Io.Dir) void { _ = d; }
         \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
-    , 7);
+    , 6);
     // A function each of whose returns reads what is already held hands over no owner:
     // shakedown's simulated working directory and standard streams, std's own stdio, a pipe end
     // named by the handle it is given.
@@ -623,7 +623,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn pipeFile(handle: std.Io.File.Handle) std.Io.File {
         \\    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
         \\}
-    , 3); // Fields held by value and released nowhere (Slot.file, Process.cwd, Context.cwd): no function.
+    , 0); // Nor the fields (Slot.file, Process.cwd, Context.cwd): written and released nowhere.
     // Only std's own stdio and a std handle's literal: a method of the program's that is named
     // `stdout` but returns what it opened (and its callers, and the open itself), and a literal
     // of the program's type with a `handle` field, are owners handed over.
@@ -647,7 +647,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\    const w: Wrapped = .{ .handle = f.opened() };
         \\    return w.handle;
         \\}
-    , 6); // And the fields Proc.dir and Wrapped.handle.
+    , 5); // And the field Wrapped.handle, given what `opened` made; Proc.dir is given nothing.
     // A field moved out through a variable, a field of what was just opened, and an open are
     // owners handed over.
     try expect(pack.ownership,
@@ -668,7 +668,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn open(dir: std.Io.Dir, io: std.Io) !std.Io.File {
         \\    return dir.openFile(io, "x", .{});
         \\}
-    , 4); // And the field Conn.stream.
+    , 3); // Conn.stream, moved out but never written or released, holds what it is given.
 }
 
 test "A016 finds identifying integers of one type meeting, not other integers" {
@@ -6708,6 +6708,124 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
+test "A020 and A009 read a flag given only literals by the conditions it is given them under" {
+    // `if (total == seed) more = false`: `while (more)` runs as long as the peer's seed says.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const seed = try r.takeInt(u64, 0);
+        \\    var more = true;
+        \\    var total: u64 = 0;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        if (total == seed) more = false;
+        \\    }
+        \\    return total;
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    var more = true;
+        \\    while (more) : (i += 1) {
+        \\        out.* +%= i;
+        \\        if (i == n) more = false;
+        \\    }
+        \\}
+    , 1);
+    // Under a condition the program sets, the same flag is bounded by the program.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io) u64 {
+        \\    _ = io;
+        \\    var more = true;
+        \\    var total: u64 = 0;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        if (total == 64) more = false;
+        \\    }
+        \\    return total;
+        \\}
+    , 0);
+}
+
+test "A020 takes a periodic point's counter only where it is declared before the loop and written by `=` and the compound operators alone: one made in the body starts again each pass, one destructured is set" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        var i: u64 = 0;
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        var left: u64 = 5;
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 5;
+        \\            try io.checkCancel();
+        \\        }
+        \\        n +%= 1;
+        \\    }
+        \\}
+    , 2);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var left: u64 = 5;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 5;
+        \\            try io.checkCancel();
+        \\        }
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn paired(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        n +%= 1;
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\    }
+        \\}
+    , 0);
+    // A destructure writes the counter as an assignment does (`i, n = .{ 1, n +% 1 }` sets it to
+    // 1 each pass, so `i % 64` is never 0): it is not stepped.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        i, n = .{ 1, n +% 1 };
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\    }
+        \\}
+    , 1);
+}
+
 test "A020 takes a periodic point's counter only where the function alone writes it: never one written through its address or a container's" {
     // A helper given the counter's address sets it every pass, so `n % 64` never reaches 0; a
     // container's counter any other code may set; each a counting-down form too.
@@ -6999,6 +7117,152 @@ test "A020 reads a labeled switch that continues itself as a loop, each prong th
         \\};
         \\pub fn start(w: *Worker) !void {
         \\    try w.run();
+        \\}
+    , 0);
+}
+
+test "A020 judges a function whose Io a field's field holds, and leaves undecided one whose Io sits in a form it does not read" {
+    // A struct given by value holds its field's Io as one behind a pointer does.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Worker = struct { io: std.Io, count: u64 = 0 };
+        \\pub fn run(w: Worker) void {
+        \\    const io = w.io;
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+    , 1);
+    // `self.ctx.io`: read, flagged as `self.io` is.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Ctx = struct { io: std.Io };
+        \\const Worker = struct {
+        \\    ctx: Ctx,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) void {
+        \\        while (true) self.count +%= 1;
+        \\    }
+        \\};
+        \\pub fn start(w: *Worker) void {
+        \\    w.run();
+        \\}
+    , 1);
+    // An optional, a field holding one, anytype, a tuple's field, behind two pointers: each may be
+    // an Io, so each loop with no point is undecided, never cleared.
+    const found = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn optional(io: ?std.Io) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\const Worker = struct {
+        \\    io: ?std.Io,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) void {
+        \\        while (true) self.count +%= 1;
+        \\    }
+        \\};
+        \\pub fn any(io: anytype) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\pub fn tuple(ctx: struct { std.Io, u8 }) void {
+        \\    _ = ctx;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\pub fn twice(io: *const *const std.Io) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.findings);
+    try std.testing.expectEqual(@as(usize, 5), found.undecided);
+    // One that holds no Io, nor anything that may be one, is not given one: a type reached
+    // through `std.Io` as a namespace is not an Io.
+    const none = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(n: ?u8, t: struct { u8, u16 }, l: std.Io.Reader.Limit) void {
+        \\    _ = n;
+        \\    _ = t;
+        \\    _ = l;
+        \\    var k: u64 = 0;
+        \\    while (true) k +%= 1;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), none.findings);
+    try std.testing.expectEqual(@as(usize, 0), none.undecided);
+}
+
+test "A020 and A009 read a call inside @TypeOf, never evaluated, as no cancellation point and no read" {
+    // `@TypeOf(try io.checkCancel())` checks nothing, in the loop, a callee, or a labeled switch.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        _ = @TypeOf(try io.checkCancel());
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\fn tick(io: std.Io) !void {
+        \\    _ = @TypeOf(try io.checkCancel());
+        \\}
+        \\pub fn called(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        try tick(io);
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn state(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    s: switch (@as(u8, 0)) {
+        \\        0 => {
+        \\            _ = @TypeOf(try io.checkCancel());
+        \\            n +%= 1;
+        \\            continue :s 0;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+    , 3);
+    // The same check made: a point.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+    , 0);
+    // A read inside `@TypeOf` consumes nothing: the loop bound by input is A009's.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = @TypeOf(try r.takeByte());
+        \\        out.* +%= i;
+        \\    }
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = try r.takeByte();
+        \\        out.* +%= i;
+        \\    }
         \\}
     , 0);
 }
@@ -7431,12 +7695,19 @@ test "A007 finds std's synchronization a dependency names under its own name, he
     , dependency);
     try std.testing.expectEqual(@as(usize, 0), clean.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 0), clean.findings);
-    // A type the dependency names that does not resolve may be one: undecided, never clean.
+    // A type the dependency names that does not resolve may be one: undecided, never clean,
+    // but where every value a variable is given is an enum literal, a tag.
     const unknown = try runWithDependency(pack.shared_state,
         \\const dep = @import("dep");
         \\const Held = struct { lock: [2]dep.Elsewhere };
+        \\pub fn pick(x: bool) void {
+        \\    const tag: dep.Elsewhere = if (x) .a else .b;
+        \\    _ = tag;
+        \\    var lock: dep.Elsewhere = undefined;
+        \\    _ = &lock;
+        \\}
     , dependency);
-    try std.testing.expectEqual(@as(usize, 1), unknown.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 2), unknown.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }
 
@@ -7460,6 +7731,189 @@ test "A013 reads std's assert called through any alias the program declares, pub
         \\}
     );
     try std.testing.expectEqual(@as(usize, 1), result.undecided);
+}
+
+test "A015 flags a field the program releases or writes an owner into, and a borrow it is only given as none" {
+    // Lent's fields hold what they are given: an own.OwnedIo's borrow().*, a handle made from a
+    // parameter's, a parameter. An opened file stored and never released is a leak (Leak,
+    // Stored); a borrow released by mistake (Mistake) is an owner by hand, as is one released
+    // by a call, through a capture, or through a getter's return (`opened` returns an owner too).
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(f: *std.Io.File, io: std.Io) void { _ = io; f.close(); }
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn release(f: std.Io.File) void { f.close(); }
+        \\const Lent = struct { file: std.Io.File, dir: std.Io.Dir, out: std.Io.File };
+        \\pub fn lend(dir: std.Io.Dir, out: std.Io.File, owner: *aegis.own.OwnedIo(std.Io.File, shut)) Lent { return .{ .file = owner.borrow().*, .dir = .{ .handle = dir.handle }, .out = out }; }
+        \\const Leak = struct { file: std.Io.File };
+        \\pub fn leak() Leak { return .{ .file = opened() }; }
+        \\const Mistake = struct { file: std.Io.File };
+        \\pub fn mistake(file: std.Io.File) void { const m: Mistake = .{ .file = file }; m.file.close(); }
+        \\const ByCall = struct { file: std.Io.File };
+        \\pub fn byCall(b: *ByCall) void { release(b.file); }
+        \\const ByCapture = struct { file: ?std.Io.File };
+        \\pub fn byCapture(b: *ByCapture) void { if (b.file) |f| f.close(); }
+        \\const ByGetter = struct { file: std.Io.File, fn get(b: *ByGetter) std.Io.File { return b.file; } };
+        \\pub fn byGetter(b: *ByGetter) void { b.get().close(); }
+        \\const Stored = struct { file: std.Io.File };
+        \\pub fn store(s: *Stored) void { s.file = opened(); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 8, 10, 12, 14, 16, 18 }, found.lines[0..found.findings]);
+    // A release through a receiver that does not resolve may be this field's: undecided, not
+    // cleared; one that releases nothing decides nothing.
+    const doubted = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\const Held = struct { file: std.Io.File };
+        \\pub fn f(x: ext.T) void { x.file.close(); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), doubted.findings);
+    try std.testing.expectEqual(@as(usize, 1), doubted.undecided);
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\const Held = struct { file: std.Io.File };
+        \\pub fn f(x: ext.T) i32 { return x.file.handle; }
+    , 0);
+}
+
+test "A015 reads a function returning a call of a view, in any file, as a view" {
+    // airlock's `Lock.file`, returning `l.pending.file()`, Pending's view of its field.
+    const views: sources.Extra = .{ .name = "pending.zig", .bytes =
+        \\const std = @import("std");
+        \\pub const Pending = struct {
+        \\    held: std.Io.File,
+        \\    pub fn file(p: *Pending) std.Io.File { return p.held; }
+        \\    pub fn opened(p: *Pending) std.Io.File { _ = p; return undefined; }
+        \\};
+    };
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const Pending = @import("pending.zig").Pending;
+        \\const Lock = struct {
+        \\    pending: Pending,
+        \\    pub fn file(l: *Lock) std.Io.File { return l.pending.file(); }
+        \\    pub fn open(l: *Lock) std.Io.File { return l.pending.opened(); }
+        \\};
+    , &(std_files ++ [_]sources.Extra{views}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "pending.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+    try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
+}
+
+test "A015 reads a switch over an owned-or-lent union as a view where each prong is one" {
+    // airlock's `Parent.directory`: an own.OwnedIo's borrow().*, the lent handle, no value.
+    // A prong that opens (`fresh`), and a `borrow` of no aegis owner (`faked`), are not views.
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(d: *std.Io.Dir, io: std.Io) void { _ = d; _ = io; }
+        \\fn opened() std.Io.Dir { return undefined; }
+        \\const Parent = union(enum) {
+        \\    owned: aegis.own.OwnedIo(std.Io.Dir, shut),
+        \\    lent: std.Io.Dir,
+        \\    closed,
+        \\    fn directory(p: *Parent) std.Io.Dir { return switch (p.*) { .owned => |*held| held.borrow().*, .lent => |lent| lent, .closed => unreachable }; }
+        \\    fn fresh(p: *Parent) std.Io.Dir { return switch (p.*) { .owned => opened(), .lent => |lent| lent, .closed => unreachable }; }
+        \\};
+        \\const Fake = struct { held: std.Io.Dir, fn borrow(f: *Fake) *const std.Io.Dir { _ = f; return undefined; } };
+        \\pub fn faked(f: *Fake) std.Io.Dir { return f.borrow().*; }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 10, 13 }, found.lines[0..found.findings]);
+}
+
+test "A015 judges a public type's resource field where the program writes or releases it" {
+    // a15_base: a public type's raw field says lent, and nothing here writes or releases it.
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\pub const S = struct { f: std.Io.File };
+    , 0);
+    // An importer writing an owner into it, closing it, or handing an owner to a keeper that
+    // stores it in a field the keeper releases, is flagged at its own line (`opened` returns an
+    // owner too), as is closing std's `File.Reader.file`; one it is lent (a parameter, one
+    // unwrapped `orelse return`, an `own.Lent`'s `get()`), an owner the caller releases itself,
+    // one a type that never releases its field is given (a reader, lent it), or one handed to
+    // std's `File.reader`, which std's keeps as a copy it is lent, is not.
+    const lib: sources.Extra = .{ .name = "lib.zig", .bytes =
+        \\const std = @import("std");
+        \\pub const S = struct { f: std.Io.File };
+        \\pub const Keeper = struct { held: std.Io.File, pub fn keep(k: *Keeper, f: std.Io.File) void { k.held = f; } pub fn deinit(k: *Keeper) void { k.held.close(); } };
+        \\pub const Reader = struct { file: std.Io.File, pub fn init(f: std.Io.File) Reader { return .{ .file = f }; } };
+    };
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "lib.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn write(s: *lib.S) void { s.f = opened(); }
+        \\pub fn close(s: *lib.S) void { s.f.close(); }
+        \\pub fn keep(k: *lib.Keeper) void { k.keep(opened()); }
+        \\pub fn lend(s: *lib.S, f: std.Io.File) void { s.f = f; }
+        \\pub fn borrowed(k: *lib.Keeper) void { const f = opened(); defer f.close(); k.keep(f); }
+        \\pub fn read() lib.Reader { return .init(opened()); }
+        \\pub fn maybe(k: *lib.Keeper, f: ?std.Io.File) void { const g = f orelse return; k.keep(g); }
+        \\pub fn lent(k: *lib.Keeper, l: aegis.own.Lent(std.Io.File)) void { k.keep(l.get()); }
+        \\pub fn stream() void { var r = opened().reader(undefined, &.{}); _ = &r; }
+        \\pub fn done(r: *std.Io.File.Reader) void { r.file.close(); }
+        \\const aegis = @import("aegis");
+    , &(std_files ++ [_]sources.Extra{lib}), imports);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 13 }, found.lines[0..found.findings]);
+    // Passed where nothing resolves, a release of it may be one: undecided, not flagged.
+    const passed = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\const ext = @import("missing");
+        \\pub fn pass(s: *lib.S) void { ext.release(s.f); }
+        \\pub fn sync(s: *lib.S) void { ext.sync(s.f.handle); }
+    , &(std_files ++ [_]sources.Extra{lib}), imports);
+    try std.testing.expectEqual(@as(usize, 0), passed.findings);
+    try std.testing.expectEqual(@as(usize, 2), passed.undecided);
+    // A keeper that does not resolve may keep it: undecided.
+    const doubted = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn keep(k: ext.Keeper, f: std.Io.File) void { k.keep(f); }
+        \\pub fn give(k: ext.Keeper) void { k.keep(opened()); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{3}, doubted.lines[0..doubted.findings]);
+    try std.testing.expectEqual(@as(usize, 1), doubted.undecided);
+    // A type no other file can name is judged at its field, as before.
+    const private = try run(pack.ownership,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\const S = struct { f: std.Io.File };
+        \\pub fn write(s: *S) void { s.f = opened(); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, private.lines[0..private.findings]);
+}
+
+test "A003 follows a std handle acquired raw to its release: a discard leaks it, a close or deferred close releases it, a call given a copy it does not release is lent it" {
+    const found = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn leak() void { const file = opened(); _ = file; }
+        \\pub fn closed() void { const file = opened(); defer file.close(); }
+        \\pub fn direct() void { const file = opened(); file.close(); }
+        \\pub fn lent(f: std.Io.File) void { const file = f; _ = file; }
+        \\pub fn standard() void { const out = std.Io.File.stdout(); _ = out; }
+        \\fn use(f: std.Io.File) void { _ = f; }
+        \\fn shut(f: std.Io.File) void { f.close(); }
+        \\pub fn handed() void { const file = opened(); defer file.close(); use(file); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    // A copy handed to a call that releases it is a release this walk does not follow: undecided.
+    const shut = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn shut(f: std.Io.File) void { f.close(); }
+        \\pub fn handed() void { const file = opened(); defer file.close(); shut(file); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), shut.findings);
+    try std.testing.expectEqual(@as(usize, 1), shut.undecided);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {

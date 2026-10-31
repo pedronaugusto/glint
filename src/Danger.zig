@@ -575,7 +575,8 @@ const Held = struct {
 /// a call's type argument (`allocator.create(dep.Lock)`) that resolves to one by value, past
 /// arrays, optionals and error unions. One the program names through its own alias is that
 /// alias's site; one that spells a governed name is judged by it. A field's or variable's type
-/// so named that does not resolve is undecided: it may be one. The held tokens, with `found`'s.
+/// so named that does not resolve is undecided: it may be one, but a variable given only enum
+/// literals, which holds a tag. The held tokens, with `found`'s.
 fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found: Held, comptime message: []const u8) Context.Error![]const Ast.TokenIndex {
     const tree = &c.project.at(c.file).file.tree;
     var held: std.ArrayList(Ast.TokenIndex) = .empty;
@@ -602,6 +603,9 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
             if (!try namedOutside(c, candidate.node)) continue;
             const value = try c.facts.resolve(c.file, candidate.node);
             if (candidate.kind and !heldKnown(value)) {
+                // A variable given only enum literals holds an enum's tag (or a union's with no
+                // payload): no synchronization (`const w: std.meta.Tag(V) = .a`).
+                if (tree.fullVarDecl(node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (enumLiterals(tree, init)) continue;
                 try c.undecided(rule, tree.tokenStart(token), .unresolved, "a type a declaration outside the program names does not resolve: it may hold std's synchronization");
                 continue;
             }
@@ -611,6 +615,25 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
         }
     }
     return held.items;
+}
+
+/// Whether every value an expression can give is an enum literal (`.a`, `if (x) .a else .b`, a
+/// `switch` each prong of which gives one).
+fn enumLiterals(tree: *const Ast, node: Ast.Node.Index) bool {
+    switch (tree.nodeTag(node)) {
+        .enum_literal => return true,
+        .grouped_expression => return enumLiterals(tree, tree.nodeData(node).node_and_token[0]),
+        .@"switch", .switch_comma => {
+            const full = tree.fullSwitch(node).?; // unreachable: tagged a switch
+            for (full.ast.cases) |case| if (!enumLiterals(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are cases
+            return full.ast.cases.len != 0;
+        },
+        else => {
+            const branch = tree.fullIf(node) orelse return false;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return enumLiterals(tree, branch.ast.then_expr) and enumLiterals(tree, otherwise);
+        },
+    }
 }
 
 /// Whether what a type holds by value is known, past arrays, optionals and error unions.

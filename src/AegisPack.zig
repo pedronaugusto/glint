@@ -585,6 +585,8 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
         .guard, .buffer, .slots, .table => &.{"deinit"},
         .reservation => &.{ "release", "consume", "moveInto" },
         .owned => &.{ "deinit", "take", "moveInto" },
+        // A std resource held raw: `close`, a child's `kill` or `wait`.
+        .std_handle => &.{ "close", "kill", "wait" },
         // A result obligation is discharged by taking it or acknowledging it with a reason;
         // its `deinit` checks that it was.
         .must_use => &.{ "take", "acknowledge" },
@@ -1648,6 +1650,8 @@ fn acquiredOwner(c: *Context, tree: *const Ast, model: *const Model, decl: Model
     const acquired = tree.fullCall(&call_buffer, acquisition) orelse return null;
     // By a function of the generic's type parameter: each binding's, checked at the binding.
     if (c.facts.madeByParameter(c.file, init) != null) return null;
+    // A std handle acquired raw (`dir.openFile`): released by its `close`.
+    if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
     const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
         const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
         break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
@@ -1930,6 +1934,11 @@ const Flow = struct {
                 if (f.mine(value) or try f.carried(value)) return ends;
             },
             .unreachable_literal => return ends,
+            // `_ = owner` discards it: no release, no transfer, so the owner goes on as it was.
+            .assign => {
+                const lhs, const rhs = f.tree.nodeData(stmt).node_and_node;
+                if (f.tree.nodeTag(lhs) == .identifier and std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(lhs)), "_") and f.mine(rhs)) return .{ .paths = .{ .falls = state } };
+            },
             else => {},
         }
         // `x = a catch |e| handler` and `const x = a orelse handler`: the handler is a branch
@@ -2547,6 +2556,12 @@ const Flow = struct {
                 continue;
             }
             if (fieldOf(f.tree, parent, candidate)) {
+                found = .members;
+                continue;
+            }
+            // A std handle is a value: a copy given to a call that does not release that
+            // parameter is lent to it.
+            if (f.kind == .std_handle and try Shapes.lentArgument(f.c, f.c.file, candidate)) {
                 found = .members;
                 continue;
             }

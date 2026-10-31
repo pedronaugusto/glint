@@ -27,6 +27,9 @@ pub const Kind = enum {
     reservation,
     /// `Owned` and `OwnedIo`.
     owned,
+    /// A std resource (`Io.File`, `Io.Dir`, `Io.net.Stream`, `Io.net.Server`, `process.Child`)
+    /// acquired raw by a call: no type of aegis's, its release std's `close` (A003).
+    std_handle,
     /// `own.Lent`: a copy of an owner's payload lent out, not the holder's to release.
     lent,
     must_use,
