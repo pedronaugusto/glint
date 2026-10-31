@@ -6511,6 +6511,57 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
+test "A020 takes a periodic point's counter only where it is declared before the loop: one made in the body starts again each pass" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        var i: u64 = 0;
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        var left: u64 = 5;
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 5;
+        \\            try io.checkCancel();
+        \\        }
+        \\        n +%= 1;
+        \\    }
+        \\}
+    , 2);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (true) {
+        \\        i += 1;
+        \\        if (i % 64 == 0) try io.checkCancel();
+        \\        n +%= 1;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    var left: u64 = 5;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 5;
+        \\            try io.checkCancel();
+        \\        }
+        \\        n +%= 1;
+        \\    }
+        \\}
+    , 0);
+}
+
 test "A020 takes a periodic point's counter only where the function alone writes it: never one written through its address or a container's" {
     // A helper given the counter's address sets it every pass, so `n % 64` never reaches 0; a
     // container's counter any other code may set; each a counting-down form too.

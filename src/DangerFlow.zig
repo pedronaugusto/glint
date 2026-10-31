@@ -920,15 +920,18 @@ fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.No
 /// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`) every pass of the loop whose body is
 /// `body`, by its continue expression or a statement on every pass, and nothing else in the
 /// loop assigns it but, where `reset` is given, a constant other than zero set on every path
-/// through that branch. The counter is a variable of the function whose address is never
-/// taken: one any other code may write (a container's, or one written through a pointer) is
-/// none.
+/// through that branch. The counter is a variable of the function, declared before the loop,
+/// whose address is never taken: one any other code may write (a container's, or one written
+/// through a pointer) is none, and so is one declared in the loop, made again each pass.
 fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast.Node.Index, step: Ast.Node.Tag, reset: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const declared = (model.reference(counter) orelse return false).declaration orelse return false;
     if (!localVariable(c, file, declared)) return false;
     const loop_node = model.parentOf(body) orelse return false;
+    // One declared in the loop starts again each pass: it counts no passes.
+    const at = model.declarations[@backingInt(declared)].token;
+    if (at >= tree.firstToken(loop_node) and at <= tree.lastToken(loop_node)) return false;
     const cont: ?Ast.Node.Index = if (tree.fullWhile(loop_node)) |loop| loop.ast.cont_expr.unwrap() else null;
     var steps = false;
     var resets = false;
