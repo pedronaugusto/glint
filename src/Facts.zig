@@ -1908,6 +1908,9 @@ fn isOf(container: Container, value: Value) bool {
     };
 }
 
+/// Files by their ids.
+const Files = std.AutoHashMapUnmanaged(Project.FileId, void);
+
 /// The files that may share a compilation with `file`: each a root that reaches it may build,
 /// so all its imports reach, by the program's import edges. A store in any other file is in
 /// another program, where no call of this one goes.
