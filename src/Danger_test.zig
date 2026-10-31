@@ -27,6 +27,8 @@ const std_files = [_]sources.Extra{
     \\pub const Random = @import("Random.zig");
     \\pub fn ArrayList(comptime T: type) type { return array_list.Aligned(T, null); }
     \\pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
+    \\pub const c = @import("c.zig");
+    \\pub const os = @import("os.zig");
     },
     .{ .name = "std/Io.zig", .bytes =
     \\pub const File = @import("Io/File.zig");
@@ -187,8 +189,27 @@ const std_files = [_]sources.Extra{
     \\pub const ChaCha = struct { state: [8]u32, pub fn fill(self: *ChaCha, buf: []u8) void { _ = self; for (buf) |*b| b.* = 0; } };
     \\pub fn bytes(r: @This(), buf: []u8) void { _ = r; for (buf) |*b| b.* = 0; }
     },
+    .{ .name = "std/c.zig", .bytes =
+    \\pub const pid_t = c_int;
+    \\pub const E = enum(u16) { SUCCESS = 0, AGAIN = 35, _ };
+    \\pub fn errno(rc: anytype) E { return if (rc == -1) .AGAIN else .SUCCESS; }
+    \\pub const posix_spawnattr_t = *anyopaque;
+    \\pub extern "c" fn posix_spawn(pid: *pid_t, path: [*:0]const u8, actions: ?*const anyopaque, attr: ?*const posix_spawnattr_t, argv: [*:null]const ?[*:0]const u8, env: [*:null]const ?[*:0]const u8) c_int;
+    \\pub extern "c" fn posix_spawnattr_init(attr: *posix_spawnattr_t) c_int;
+    \\pub const rlimit = extern struct { cur: u64, max: u64 };
+    \\pub const Stat = extern struct { dev: i32, ino: u64, size: i64 };
+    },
+    .{ .name = "std/os.zig", .bytes =
+    \\pub const windows = struct {
+    \\    pub const DWORD = u32;
+    \\    pub const HANDLE = *anyopaque;
+    \\    pub const IO_STATUS_BLOCK = extern struct { status: usize, information: usize };
+    \\};
+    },
 };
 const std_imports = [_]sources.ExtraImport{
+    .{ .from = 0, .spelling = "c.zig", .target = 24 },
+    .{ .from = 0, .spelling = "os.zig", .target = 25 },
     .{ .spelling = "std", .target = 0 },
     .{ .from = 0, .spelling = "Io.zig", .target = 1 },
     .{ .from = 0, .spelling = "atomic.zig", .target = 2 },
@@ -1434,6 +1455,60 @@ test "A019 reads a prefix a counter stepped past each element after setting it, 
     try std.testing.expectEqualSlices(u32, &.{ 8, 9, 12, 16 }, found.lines[0..found.findings]);
 }
 
+test "A019 reads the prefix a cursor writer counts, where its type steps the count only past what it wrote" {
+    // Clean: a writer's count over the local (15), a function building into what it is given
+    // through a writer it hands on, returning the prefix counted (23). Findings: past the count
+    // (16), a writer type that steps past what it wrote (17), a writer that starts at 4 (18), a
+    // writer a function points elsewhere (24), the local read with nothing written (25), and
+    // the other memory that writer is pointed at, handed on where nothing shows what is read
+    // of it (24).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const Writer = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *Writer, b: []const u8) error{Full}!void { if (b.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len; }
+        \\    fn byte(self: *Writer, v: u8) error{Full}!void { try self.put(&.{v}); }
+        \\    fn written(self: *const Writer) []const u8 { return self.bytes[0..self.pos]; }
+        \\};
+        \\const Loose = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    fn put(self: *Loose, b: []const u8) void { @memcpy(self.bytes[self.pos..][0..b.len], b); self.pos += b.len + 1; }
+        \\};
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn a1() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf }; try w.put("ab"); try w.byte(1); use(buf[0..w.pos]); }
+        \\pub fn a2() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf }; try w.put("ab"); use(buf[0 .. w.pos + 2]); }
+        \\pub fn a3() void { var buf: [16]u8 = undefined; var w: Loose = .{ .bytes = &buf }; w.put("ab"); use(buf[0..w.pos]); }
+        \\pub fn a4() !void { var buf: [16]u8 = undefined; var w: Writer = .{ .bytes = &buf, .pos = 4 }; try w.put("ab"); use(buf[0..w.pos]); }
+        \\fn build(out: []u8, v: u8) ![]u8 { var w: Writer = .{ .bytes = out }; try w.byte(v); try more(&w); return out[0..w.pos]; }
+        \\fn more(w: *Writer) !void { try w.put("x"); }
+        \\fn reset(w: *Writer, other: []u8) void { w.* = .{ .bytes = other }; }
+        \\fn swapped(out: []u8, other: []u8) []u8 { var w: Writer = .{ .bytes = out }; reset(&w, other); w.put("x") catch {}; return out[0..w.pos]; }
+        \\pub fn b1(v: u8) !void { var buf: [16]u8 = undefined; use(try build(&buf, v)); }
+        \\pub fn b2() void { var buf: [16]u8 = undefined; var other: [4]u8 = undefined; use(swapped(&buf, &other)); }
+        \\pub fn c1() void { var buf: [16]u8 = undefined; const w: Writer = .{ .bytes = &buf }; _ = w.written(); use(buf[0..1]); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 16, 17, 18, 24, 24, 25 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a local a range's passes wrote a stride at a time, all of it" {
+    // Clean: four eight-byte strides over 32 bytes, counting up (3) and down (4). Findings: 32
+    // of 40 bytes (5), strides of 4 that leave the tail (6), a pass that may skip its write
+    // (7), a pass that reads the local it writes (8).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn s1(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s2(words: [4]u64) void { var out: [32]u8 = undefined; inline for (0..4) |i| std.mem.writeInt(u64, out[8 * (4 - 1 - i) ..][0..8], words[i], .big); use(&out); }
+        \\pub fn s3(words: [4]u64) void { var out: [40]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s4(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| std.mem.writeInt(u64, out[4 * i ..][0..8], words[i], .little); use(&out); }
+        \\pub fn s5(words: [4]u64) void { var out: [32]u8 = undefined; for (0..4) |i| { if (words[i] == 0) continue; std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .little); } use(&out); }
+        \\pub fn s6() void { var out: [32]u8 = undefined; for (0..4) |i| @memcpy(out[8 * i ..][0..8], out[0..8]); use(&out); }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 7, 8 }, found.lines[0..found.findings]);
+}
+
 test "A019 reads a local a function outside the program writes only where its result shows it did" {
     // Clean: waitpid's status under `rc > 0` (10), getrlimit's under `== 0` in an `if`
     // expression and past `!= 0` that leaves (12, 13), read's count (15), proc_pidinfo's size
@@ -1449,38 +1524,96 @@ test "A019 reads a local a function outside the program writes only where its re
         \\const Status = enum(u32) { SUCCESS = 0, OTHER = 1, _ };
         \\const BOOL = enum(i32) { FALSE = 0, TRUE = 1 };
         \\extern "c" fn waitpid(pid: i32, status: *c_int, options: c_int) i32;
-        \\extern "c" fn getrlimit(resource: c_int, rlim: *[2]u64) c_int;
+        \\extern "c" fn getrlimit(resource: c_int, rlim: *std.c.rlimit) c_int;
         \\extern "c" fn read(fd: i32, buf: [*]u8, n: usize) isize;
         \\extern "c" fn proc_pidinfo(pid: i32, flavor: c_int, arg: u64, buffer: *anyopaque, size: c_int) c_int;
-        \\extern "kernel32" fn GetConsoleMode(h: usize, mode: *u32) BOOL;
-        \\extern "ntdll" fn NtOpenFile(h: *usize, access: u32, attributes: usize, io: *u64) Status;
+        \\extern "kernel32" fn GetConsoleMode(h: std.os.windows.HANDLE, mode: *std.os.windows.DWORD) BOOL;
+        \\extern "ntdll" fn NtOpenFile(h: *std.os.windows.HANDLE, access: u32, attributes: usize, io: *std.os.windows.IO_STATUS_BLOCK) Status;
         \\fn use(x: anytype) void { _ = x; }
         \\pub fn w1(pid: i32) ?c_int { var s: c_int = undefined; const rc = waitpid(pid, &s, 1); if (rc == 0) return null; if (rc > 0) return s; return null; }
         \\pub fn w2(pid: i32) c_int { var s: c_int = undefined; _ = waitpid(pid, &s, 1); return s; }
-        \\pub fn r1() u64 { var l: [2]u64 = undefined; return if (getrlimit(7, &l) == 0) l[0] else 0; }
-        \\pub fn r2() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) != 0) return 0; return l[0]; }
-        \\pub fn r3() u64 { var l: [2]u64 = undefined; if (getrlimit(7, &l) == 0) {} return l[0]; }
+        \\pub fn r1() u64 { var l: std.c.rlimit = undefined; return if (getrlimit(7, &l) == 0) l.cur else 0; }
+        \\pub fn r2() u64 { var l: std.c.rlimit = undefined; if (getrlimit(7, &l) != 0) return 0; return l.cur; }
+        \\pub fn r3() u64 { var l: std.c.rlimit = undefined; if (getrlimit(7, &l) == 0) {} return l.cur; }
         \\pub fn n1(fd: i32) void { var b: [8]u8 = undefined; const n = read(fd, &b, b.len); if (n <= 0) return; use(b[0..@intCast(n)]); }
         \\pub fn n2(fd: i32) void { var b: [8]u8 = undefined; _ = read(fd, &b, b.len); use(b[0..4]); }
         \\pub fn p1(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == @sizeOf([4]u64)) info[0] else 0; }
         \\pub fn p2(pid: i32) u64 { var info: [4]u64 = undefined; return if (proc_pidinfo(pid, 1, 0, &info, @sizeOf([4]u64)) == 8) info[0] else 0; }
-        \\pub fn g1(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) != .FALSE; }
-        \\pub fn g2(h: usize) u32 { var m: u32 = undefined; if (GetConsoleMode(h, &m) == .FALSE) return 0; return m; }
-        \\pub fn g3(h: usize) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) == .FALSE and m == 0; }
-        \\pub fn t1() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .SUCCESS => return h, else => return 0 } }
-        \\pub fn t2() usize { var h: usize = undefined; var io: u64 = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .OTHER => return h, else => return 0 } }
-        \\pub fn e1(pid: i32) u64 { var l: [2]u64 = undefined; const rc = getrlimit(pid, &l); if (rc != 0 and pid > 0) return 0; return l[0]; }
+        \\pub fn g1(h: std.os.windows.HANDLE) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) != .FALSE; }
+        \\pub fn g2(h: std.os.windows.HANDLE) u32 { var m: u32 = undefined; if (GetConsoleMode(h, &m) == .FALSE) return 0; return m; }
+        \\pub fn g3(h: std.os.windows.HANDLE) bool { var m: u32 = undefined; return GetConsoleMode(h, &m) == .FALSE and m == 0; }
+        \\pub fn t1() ?std.os.windows.HANDLE { var h: std.os.windows.HANDLE = undefined; var io: std.os.windows.IO_STATUS_BLOCK = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .SUCCESS => return h, else => return null } }
+        \\pub fn t2() ?std.os.windows.HANDLE { var h: std.os.windows.HANDLE = undefined; var io: std.os.windows.IO_STATUS_BLOCK = undefined; switch (NtOpenFile(&h, 0, 0, &io)) { .OTHER => return h, else => return null } }
+        \\pub fn e1(pid: i32) u64 { var l: std.c.rlimit = undefined; const rc = getrlimit(pid, &l); if (rc != 0 and pid > 0) return 0; return l.cur; }
         \\pub fn s1(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got != @sizeOf(@TypeOf(info))) return 0; return info[0]; }
         \\pub fn s2(pid: i32) u64 { var info: [4]u64 = undefined; const got = proc_pidinfo(pid, 1, 0, &info, @sizeOf(@TypeOf(info))); if (got == 0) return 0; return info[0]; }
         \\pub fn z1(fd: i32) void { var none: [0]u8 = undefined; _ = read(fd, &none, 0); use(&none); }
-        \\extern "c" fn fstat(fd: i32, buf: *[18]u64) c_int;
-        \\extern "c" fn @"fstat$INODE64"(fd: i32, buf: *[18]u64) c_int;
+        \\extern "c" fn fstat(fd: i32, buf: *std.c.Stat) c_int;
+        \\extern "c" fn @"fstat$INODE64"(fd: i32, buf: *std.c.Stat) c_int;
         \\const stat = if (@import("builtin").cpu.arch == .x86_64) @"fstat$INODE64" else fstat;
         \\const either = if (@import("builtin").cpu.arch == .x86_64) fstat else waitpid;
-        \\pub fn c1(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) != 0) return 0; return st[0]; }
-        \\pub fn c2(fd: i32) u64 { var st: [18]u64 = undefined; if (stat(fd, &st) == 0) {} return st[0]; }
+        \\pub fn c1(fd: i32) u64 { var st: std.c.Stat = undefined; if (stat(fd, &st) != 0) return 0; return st.ino; }
+        \\pub fn c2(fd: i32) u64 { var st: std.c.Stat = undefined; if (stat(fd, &st) == 0) {} return st.ino; }
+        \\const std = @import("std");
     );
     try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 7, 8, 11, 14, 16, 18, 21, 23, 24, 26, 28, 29, 33 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads what a parts writer wrote only where nothing between changes the part, and a counter only over the buffer it counts" {
+    // Clean: a part written before it is handed on (10), bounds a local constant and a
+    // container's spell (14), a counter and its buffer in one scope (16). Findings: a part handed
+    // on before the deferred write to it runs (9), bounds changed through a pointer (11) or a
+    // field (12) between the write and the return, a counter that outlives the buffer it counts,
+    // declared afresh each pass (15).
+    const found = try run(pack.unsafe_set,
+        \\fn sink(s: []const u8) u8 { return s[0]; }
+        \\const Cursor = struct { n: usize };
+        \\fn deferred(p: *[8]u8) u8 { defer p[0..4].* = .{ 1, 2, 3, 4 }; return sink(p[0..4]); }
+        \\fn first(p: *[8]u8) u8 { p[0..4].* = .{ 1, 2, 3, 4 }; return sink(p[0..4]); }
+        \\fn pointed(p: []u8, k: *usize, src: []const u8) []u8 { @memcpy(p[0..k.*], src[0..k.*]); k.* += 4; return p[0..k.*]; }
+        \\fn fielded(p: []u8, cur: *Cursor, src: []const u8) []u8 { @memcpy(p[0..cur.n], src[0..cur.n]); cur.n += 4; return p[0..cur.n]; }
+        \\fn fixed(p: []u8, k: usize, src: []const u8) []u8 { const n = k; @memcpy(p[0..n], src[0..n]); return p[0..n]; }
+        \\const Block = struct { pub const length = 4; };
+        \\pub fn a1() u8 { var buf: [8]u8 = undefined; return deferred(&buf); }
+        \\pub fn a2() u8 { var buf: [8]u8 = undefined; return first(&buf); }
+        \\pub fn a3(src: []const u8) u8 { var buf: [16]u8 = undefined; var k: usize = 4; return pointed(&buf, &k, src)[7]; }
+        \\pub fn a4(src: []const u8) u8 { var buf: [16]u8 = undefined; var cur: Cursor = .{ .n = 4 }; return fielded(&buf, &cur, src)[7]; }
+        \\fn named(p: []u8, src: []const u8) []u8 { @memcpy(p[0..Block.length], src[0..Block.length]); return p[0..Block.length]; }
+        \\pub fn a5(src: []const u8) u8 { var buf: [16]u8 = undefined; return fixed(&buf, 4, src)[0] + named(&buf, src)[0]; }
+        \\pub fn k1(rounds: usize) u8 { var n: usize = 0; var last: u8 = 0; for (0..rounds) |_| { var buf: [8]u8 = undefined; buf[n] = 7; n += 1; last = sink(buf[0..n]); } return last; }
+        \\pub fn k2(rounds: usize) u8 { var buf: [8]u8 = undefined; var n: usize = 0; var last: u8 = 0; for (0..rounds) |_| { if (n == buf.len) break; buf[n] = 7; n += 1; last = sink(buf[0..n]); } return last; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 9, 11, 12, 15 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads what a C call writes by its contract: the error number it answers, the size and type it writes, every alternative's failures" {
+    // Clean: posix_spawn's pid where its answer is 0 (5), the buffer's own size (9), a status
+    // of std's own type (13), a fill whose failure is returned (18). Findings: the externs
+    // (2, 10, 12), pid where `errno(rc)`, which reads only -1, says success (3, 4), the spawn
+    // attributes alike (6), a size short of the buffer (7), a size reassigned before the test
+    // (8), a buffer wider than the status written (11), a per-build choice of fills where the
+    // one this build takes can fail, its error dropped (17).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+        \\pub fn e1(argv: [*:null]const ?[*:0]const u8) std.c.pid_t { var pid: std.c.pid_t = undefined; const rc = std.c.posix_spawn(&pid, "/bin/true", null, null, argv, argv); if (std.c.errno(rc) != .SUCCESS) return -1; return pid; }
+        \\pub fn e2(argv: [*:null]const ?[*:0]const u8) std.c.pid_t { var pid: std.c.pid_t = undefined; const rc = std.c.posix_spawn(&pid, "/bin/true", null, null, argv, argv); switch (std.c.errno(rc)) { .SUCCESS => return pid, else => return -1 } }
+        \\pub fn e3(argv: [*:null]const ?[*:0]const u8) std.c.pid_t { var pid: std.c.pid_t = undefined; const rc = std.c.posix_spawn(&pid, "/bin/true", null, null, argv, argv); if (rc != 0) return -1; return pid; }
+        \\pub fn e4() ?std.c.posix_spawnattr_t { var a: std.c.posix_spawnattr_t = undefined; if (std.c.errno(std.c.posix_spawnattr_init(&a)) != .SUCCESS) return null; return a; }
+        \\pub fn z1(pid: c_int) u8 { var buf: [64]u8 = undefined; const rc = proc_pidinfo(pid, 3, 0, &buf, 8); if (rc != 8) return 0; return buf[63]; }
+        \\pub fn z2(pid: c_int) u8 { var buf: [64]u8 = undefined; var size: c_int = 64; const rc = proc_pidinfo(pid, 3, 0, &buf, size); size = 0; if (rc != size) return 0; return buf[63]; }
+        \\pub fn z3(pid: c_int) u8 { var buf: [64]u8 = undefined; const rc = proc_pidinfo(pid, 3, 0, &buf, 64); if (rc != 64) return 0; return buf[63]; }
+        \\extern "c" fn fstat(fd: c_int, buf: *[4096]u8) c_int;
+        \\pub fn t1(fd: c_int) u8 { var buf: [4096]u8 = undefined; if (fstat(fd, &buf) != 0) return 0; return buf[4095]; }
+        \\extern "c" fn @"fstat$INODE64"(fd: c_int, buf: *std.c.Stat) c_int;
+        \\pub fn t2(fd: c_int) u64 { var st: std.c.Stat = undefined; if (@"fstat$INODE64"(fd, &st) != 0) return 0; return st.ino; }
+        \\const builtin = @import("builtin");
+        \\const Src = if (builtin.os.tag == .windows) std.Io else *std.Io.Reader;
+        \\const fill = if (builtin.os.tag == .windows) std.Io.random else std.Io.Reader.readSliceAll;
+        \\pub fn c1(src: Src) u8 { var buf: [16]u8 = undefined; fill(src, &buf) catch {}; return buf[15]; }
+        \\pub fn c2(src: *std.Io.Reader) !u8 { var buf: [16]u8 = undefined; try std.Io.Reader.readSliceAll(src, &buf); return buf[15]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 6, 7, 8, 10, 11, 12, 17 }, found.lines[0..found.findings]);
 }
 
 test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
