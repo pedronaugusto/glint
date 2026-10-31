@@ -222,11 +222,13 @@ pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
 }
 
 /// The files a module's root is: each file a file outside the known library imports by the
-/// module's name, where it is the library's own or its package is not stated; and each, under
-/// any name and of any package, that publishes every member the module requires: the library's
-/// own file, its sources vendored into another package's tree, a manifest that names nothing,
-/// a module republishing it. Which files leave the program is the library's identity alone
-/// (`outside`): a module republishing it stays the program's. Found once per run.
+/// module's name, where it is the library's own or its package is not stated, or where it
+/// publishes any member the module requires or does not parse (the members it lacks are
+/// gaps the run reports); and each, under any name and of any package, that publishes every
+/// member the module requires: the library's own file, its sources vendored into another
+/// package's tree, a manifest that names nothing, a module republishing it. Which files leave
+/// the program is the library's identity alone (`outside`): a module republishing it stays
+/// the program's. Found once per run.
 pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
     const key = @intFromPtr(module.members.ptr);
     if (self.module_roots.get(key)) |found| return found;
@@ -241,10 +243,15 @@ pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.F
         const named = std.mem.eql(u8, mapping.spelling, module.name);
         const stated = !self.knownFile(mapping.target) and self.project.at(mapping.target).input.fingerprint != null;
         if (!named or stated) {
-            if (other.contains(@backingInt(mapping.target))) continue;
-            if (!(required and self.project.at(mapping.target).file.status == .parsed and try self.publishes(module, mapping.target))) {
-                try other.put(self.gpa, @backingInt(mapping.target), {});
-                continue;
+            const parsed = self.project.at(mapping.target).file.status == .parsed;
+            // Under its name, a module publishing some of it is it with members missing, and
+            // one that does not parse may be; publishing none, it is another.
+            if (!(named and (!parsed or try self.publishesAny(module, mapping.target)))) {
+                if (other.contains(@backingInt(mapping.target))) continue;
+                if (!(required and parsed and try self.publishes(module, mapping.target))) {
+                    try other.put(self.gpa, @backingInt(mapping.target), {});
+                    continue;
+                }
             }
         }
         try roots.append(self.gpa, mapping.target);
@@ -308,6 +315,15 @@ pub fn publishes(self: *Facts, module: anytype, root: Project.FileId) ResolveErr
         .gap => return false,
     };
     return true;
+}
+
+/// Whether the file `root` publishes any member `module` requires.
+pub fn publishesAny(self: *Facts, module: anytype, root: Project.FileId) ResolveError!bool {
+    for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
+        .found => return true,
+        .gap => {},
+    };
+    return false;
 }
 
 const Found = union(enum) { found: Target, gap: Unknown };

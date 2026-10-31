@@ -353,6 +353,24 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
         try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
         try std.testing.expect(std.mem.startsWith(u8, in_tree, "aegis pack: on (imported by "));
     }
+    // Vendored under aegis's name with a member it requires gone: aegis with that member
+    // missing, on, and the run says what it could not read.
+    try tmp.dir.createDirPath(std.testing.io, "part/libs");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "part/build.zig.zon", .data = ".{ .name = .part, .version = \"0.1.0\", .fingerprint = 0x2c0ffee5ca1ab1e, .paths = .{\"\"} }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "part/uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
+    var part = try tmp.dir.openDir(std.testing.io, "part/libs", .{});
+    defer part.close(std.testing.io);
+    try aegis_sources.writeTree(a, std.testing.io, part);
+    const root = try part.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
+    defer a.free(root);
+    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Removed =");
+    defer a.free(lacking);
+    try std.testing.expect(!std.mem.eql(u8, root, lacking));
+    try part.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });
+    const partial = try runOn(a, &tmp, &.{ "--module", "aegis=part/libs/src/root.zig" }, "part/uses.zig", &status);
+    defer a.free(partial);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "aegis pack: on (imported by "));
+    try std.testing.expect(std.mem.find(u8, partial, "published member Guarded of aegis does not resolve") != null);
     // A module named aegis that is not aegis: off.
     const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
     defer a.free(other);
