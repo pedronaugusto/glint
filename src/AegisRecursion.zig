@@ -23,6 +23,7 @@ const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
+const Program = @import("Program.zig");
 const Range = @import("Range.zig");
 const Taint = @import("Taint.zig");
 const Report = @import("Report.zig");
@@ -67,13 +68,9 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "parse")) continue;
         if (try c.role(Contract.library, try c.facts.resolve(c.file, data[0])) != .untrusted) continue;
         const parser = try c.facts.resolve(c.file, call.ast.params[1]);
-        if (parser != .function or !selected(c, parser.function.file)) continue;
+        if (parser != .function or !try Program.owns(c, parser.function.file)) continue;
         try entry(&walk, parser.function, tree.nodeMainToken(node));
     }
-}
-
-fn selected(c: *Context, file: @import("Project.zig").FileId) bool {
-    return c.project.at(file).input.selected;
 }
 
 /// Whether a function declares a parameter of an untrusted type.
@@ -127,7 +124,7 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
         };
         for (choices) |choice| {
             if (choice != .function) continue;
-            if (!selected(self.c, choice.function.file) or compileTime(self, choice.function)) continue;
+            if (!try Program.owns(self.c, choice.function.file) or compileTime(self, choice.function)) continue;
             try self.edges.append(self.c.allocator, .{ .at = function, .call = call_node });
             defer _ = self.edges.pop();
             for (self.stack.items, 0..) |on, i| {
@@ -172,7 +169,7 @@ fn cycle(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, toke
     if (looped.len == 0) return;
     const head = looped[0];
     if (self.reported.contains(head)) return;
-    for (edges) |edge| if (try bounds(self, edge)) return;
+    if (try carried(self, looped, edges)) return;
     try self.reported.put(self.c.allocator, head, {});
     var names: std.ArrayList(u8) = .empty;
     for (looped) |f| {
@@ -192,42 +189,360 @@ fn name(self: *Walk, f: Facts.Decl) []const u8 {
     return self.c.project.at(f.file).model.declarations[@backingInt(f.index)].name;
 }
 
-/// Whether the function making `edge`'s call bounds the depth there. The depth steps toward an
-/// end on each call: a parameter passed on as `p + k` or `p - k` (`k` a literal above zero, in
-/// any of their wrapping and saturating forms), or a field moved by `+=` or `-=` by such a `k`
-/// before the call, in the function itself or in a callee it `try`s before the call. And a
-/// comparison that leaves before the call holds the depth to a bound the input does not
-/// choose (Taint reads it clean), in the way it steps: at most the bound where it grows, at
-/// least it where it shrinks. A shrinking parameter starts where it is given, so the input must
-/// not choose that either. A step kept in a `defer` runs after the call, and moves nothing first.
-fn bounds(self: *Walk, edge: Walk.Edge) Context.Error!bool {
+/// Where a cycle keeps its depth in each function on it: a parameter by its position, or a
+/// field (by its declaration) of what a parameter points at.
+const Slot = union(enum) {
+    param: usize,
+    field: struct { param: usize, decl: Facts.Decl },
+};
+
+/// Whether a depth is carried around the cycle `looped` makes through `edges` and bounded on it:
+/// each call hands the next function the depth it was given, as it is or one step on, so the
+/// cycle comes back to the same depth; every step moves it one way; and a step on at least one
+/// call is held to a bound the input does not choose. A field depth is one object's: each call
+/// passes that object on, and nothing in the program moves its field the other way (`monotone`).
+/// A value only compared, a parameter passed on in another position, a fresh object's field, or
+/// a depth the cycle resets bounds nothing.
+fn carried(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge) Context.Error!bool {
+    const count = parameterCount(self, looped[0]);
+    for (0..count) |i| if (try around(self, looped, edges, 0, .{ .param = i }, .{ .param = i }, null, false) != null) return true;
+    var fields: std.ArrayList(Facts.Decl) = .empty;
+    for (edges) |edge| {
+        for (try movesBefore(self, edge.at.file, edge.call)) |move| if (try fieldOf(self.c, edge.at.file, move.depth)) |decl| try fields.append(self.c.allocator, decl);
+        for (try triedBefore(self, edge.at.file, edge.call)) |tried| for (try movesIn(self, tried.callee)) |move| if (try fieldOf(self.c, tried.callee.file, move.depth)) |decl| try fields.append(self.c.allocator, decl);
+    }
+    for (fields.items) |decl| for (0..count) |r| {
+        const start: Slot = .{ .field = .{ .param = r, .decl = decl } };
+        const grows = try around(self, looped, edges, 0, start, start, null, false) orelse continue;
+        if (try monotone(self, decl, grows)) return true;
+    };
+    return false;
+}
+
+/// Following `slot` from the call `edges[at]` on: the way the depth steps where it comes back
+/// to `start` with a held step on the way, or null.
+fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at: usize, start: Slot, slot: Slot, grows: ?bool, guarded: bool) Context.Error!?bool {
+    if (at == edges.len) return if (guarded and std.meta.eql(slot, start)) grows else null;
     const c = self.c;
-    const file = edge.at.file;
+    const edge = edges[at];
+    const from = edge.at;
+    const file = from.file;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const flow = try Taint.get(c, .input);
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, edge.call).?; // unreachable: an edge is a call
-    for (call.ast.params) |argument| if (stepped(tree, model, argument)) |step| {
-        const side: Range.Side = if (step.grows) .ceiling else .floor;
-        if (!step.grows and try Taint.levelAt(c, flow, file, step.depth) != .clean) continue;
-        if (try held(c, flow, file, step.depth, step.depth, side)) return true;
-    };
-    // A field the function moves before the call, held by a guard before the move or between
-    // it and the call.
-    for (try movesBefore(self, file, edge.call)) |move| {
-        const side: Range.Side = if (move.grows) .ceiling else .floor;
-        if (try held(c, flow, file, move.depth, move.depth, side) or try held(c, flow, file, edge.call, move.depth, side)) return true;
-    }
-    // A callee the function `try`s before the call, which moves a field of its receiver and
-    // fails unless a guard holds it: what it checked holds where it succeeded.
-    for (try triedBefore(self, file, edge.call)) |callee| {
-        for (try movesIn(self, callee)) |move| {
-            const side: Range.Side = if (move.grows) .ceiling else .floor;
-            if (try held(c, flow, file, edge.call, move.depth, side)) return true;
+    const receiver = try hasReceiver(c, file, call);
+    const positions = @min(call.ast.params.len + @intFromBool(receiver), parameterCount(self, looped[(at + 1) % looped.len]));
+    for (0..positions) |position| {
+        const argument = plain(tree, argumentAt(tree, call, receiver, position));
+        switch (slot) {
+            .param => |p| {
+                if (parameterPosition(self, from, argument) == p) {
+                    if (try around(self, looped, edges, at + 1, start, .{ .param = position }, grows, guarded)) |way| return way;
+                    continue;
+                }
+                const step = stepped(tree, model, argument) orelse continue;
+                if (parameterPosition(self, from, step.depth) != p) continue;
+                if (grows) |way| if (way != step.grows) continue;
+                // A shrinking depth starts where it is given: the input must not choose it.
+                const side: Range.Side = if (step.grows) .ceiling else .floor;
+                const holds = (step.grows or try Taint.levelAt(c, flow, file, step.depth) == .clean) and try held(c, flow, file, step.depth, step.depth, side);
+                if (try around(self, looped, edges, at + 1, start, .{ .param = position }, step.grows, guarded or holds)) |way| return way;
+            },
+            .field => |f| {
+                if (parameterPosition(self, from, argument) != f.param) continue;
+                var way = grows;
+                var holds = guarded;
+                // A field the function moves before the call, held by a guard before the move or
+                // between it and the call.
+                for (try movesBefore(self, file, edge.call)) |move| {
+                    if (!try movesSlot(self, from, file, move, f.param, f.decl)) continue;
+                    if (way) |w| if (w != move.grows) continue;
+                    way = move.grows;
+                    const side: Range.Side = if (move.grows) .ceiling else .floor;
+                    if (try held(c, flow, file, move.depth, move.depth, side) or try held(c, flow, file, edge.call, move.depth, side)) holds = true;
+                }
+                // A callee the function `try`s before the call on the same object, which moves
+                // the field of its parameter and fails unless a guard holds it: what it checked
+                // holds where it succeeded.
+                for (try triedBefore(self, file, edge.call)) |tried| {
+                    var tried_buffer: [1]Ast.Node.Index = undefined;
+                    const inner = tree.fullCall(&tried_buffer, tried.call).?; // unreachable: tried calls are calls
+                    const inner_receiver = try hasReceiver(c, file, inner);
+                    for (try movesIn(self, tried.callee)) |move| {
+                        const root = plain(tree, tree.nodeData(move.depth).node_and_token[0]);
+                        const q = parameterPosition(self, tried.callee, root) orelse continue;
+                        if (q >= inner.ast.params.len + @intFromBool(inner_receiver)) continue;
+                        if (parameterPosition(self, from, plain(tree, argumentAt(tree, inner, inner_receiver, q))) != f.param) continue;
+                        if (!std.meta.eql(try fieldOf(c, file, move.depth), f.decl)) continue;
+                        if (way) |w| if (w != move.grows) continue;
+                        way = move.grows;
+                        const side: Range.Side = if (move.grows) .ceiling else .floor;
+                        if (try held(c, flow, file, edge.call, move.depth, side)) holds = true;
+                    }
+                }
+                if (try around(self, looped, edges, at + 1, start, .{ .field = .{ .param = position, .decl = f.decl } }, way, holds)) |w| return w;
+            },
         }
     }
+    return null;
+}
+
+/// Whether `move` steps the field `decl` of what `from`'s parameter at `param` points at.
+fn movesSlot(self: *Walk, from: Facts.Decl, file: @import("Project.zig").FileId, move: Step, param: usize, decl: Facts.Decl) Context.Error!bool {
+    const tree = &self.c.project.at(file).file.tree;
+    if (parameterPosition(self, from, plain(tree, tree.nodeData(move.depth).node_and_token[0])) != param) return false;
+    return std.meta.eql(try fieldOf(self.c, file, move.depth), decl);
+}
+
+/// Whether nothing in the program moves the field `decl` against `grows`: every store that
+/// may reach it steps it that way by a literal (`d.depth += 1`), or is a `defer` undoing at
+/// most a step its block took before it on the same object (`p.depth += 1; defer p.depth -= 1;`),
+/// which runs once that block's calls are done. Any other store to it, by any name (`@field`,
+/// the whole struct, a struct holding it, memory a builtin writes, a function outside the
+/// program handed a pointer that reaches it, `asm`) may reset it, and a depth reset is no depth.
+fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
+    const c = self.c;
+    const program = try Program.get(c);
+    for (c.project.sources) |*each| {
+        if (each.input.classification == .@"test") continue;
+        const file = each.id;
+        if (!program.own(file)) continue;
+        const tree = &each.file.tree;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            switch (tag) {
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (!try keepsWay(self, file, node, decl, grows)) return false,
+                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |target| {
+                    if (tree.fullVarDecl(target) != null) continue;
+                    if (try reachesStore(c, file, target, decl)) return false;
+                },
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                    const name_ = tree.tokenSlice(tree.nodeMainToken(node));
+                    if (!Range.writesMemory(name_)) continue;
+                    var args_buffer: [2]Ast.Node.Index = undefined;
+                    for (Facts.builtinArgs(tree, node, &args_buffer)) |arg| if (try reaches(c, file, arg, decl)) return false;
+                },
+                .asm_simple, .@"asm" => return false,
+                .call_one, .call_one_comma, .call, .call_comma => {
+                    var call_buffer: [1]Ast.Node.Index = undefined;
+                    const call = tree.fullCall(&call_buffer, node).?; // unreachable: the tag is a call's
+                    // The program's own functions are read here as they are.
+                    const callee = try c.facts.resolve(file, call.ast.fn_expr);
+                    if (callee == .function and program.own(callee.function.file)) continue;
+                    if (tree.nodeTag(call.ast.fn_expr) == .field_access) if (try reaches(c, file, tree.nodeData(call.ast.fn_expr).node_and_token[0], decl)) return false;
+                    for (call.ast.params) |arg| if (try reaches(c, file, arg, decl)) return false;
+                },
+                else => {},
+            }
+        }
+    }
+    return true;
+}
+
+/// Whether the store `node` keeps the field `decl` moving only as `grows` says (`monotone`).
+fn keepsWay(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Index, decl: Facts.Decl, grows: bool) Context.Error!bool {
+    const c = self.c;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const target, const by = tree.nodeData(node).node_and_node;
+    const named = try storedField(c, file, target);
+    if (!std.meta.eql(named, decl)) return !try reachesStore(c, file, target, decl);
+    const step = fieldStep(tree, node) orelse return false;
+    if (step.grows == grows) return true;
+    // An undo: the whole of a `defer` in a block that stepped the same object at least as far
+    // before it.
+    const statement = model.parentOf(node) orelse return false;
+    if (tree.nodeTag(statement) != .@"defer" or tree.nodeData(statement).node != node) return false;
+    const block = model.parentOf(statement) orelse return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return false;
+    const root = rootDeclaration(c, file, target) orelse return false;
+    const undo = literalValue(tree, by) orelse return false;
+    for (statements) |earlier| {
+        if (earlier == statement) break;
+        const forward = fieldStep(tree, earlier) orelse continue;
+        if (forward.grows != grows) continue;
+        const moved = tree.nodeData(earlier).node_and_node[0];
+        if (!std.meta.eql(try storedField(c, file, moved), decl)) continue;
+        if (rootDeclaration(c, file, moved) != root) continue;
+        if ((literalValue(tree, tree.nodeData(earlier).node_and_node[1]) orelse continue) >= undo) return true;
+    }
     return false;
+}
+
+/// The field a store's target names by its declaration: `x.f`, or `@field(x, "f")`.
+fn storedField(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index) Context.Error!?Facts.Decl {
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(target)) {
+        .field_access => return fieldOf(c, file, target),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) return null;
+            const named = try Taint.namedFields(c, file, target);
+            return if (named.len == 1) named[0] else null;
+        },
+        else => return null,
+    }
+}
+
+/// The parameter or constant a field store's object is (`p` of `p.depth`), which names one
+/// object wherever it is read; null for any other.
+fn rootDeclaration(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index) ?Model.Declaration.Id {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const holder = switch (tree.nodeTag(target)) {
+        .field_access => tree.nodeData(target).node_and_token[0],
+        else => blk: {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, target, &buffer);
+            if (args.len != 2) return null;
+            break :blk args[0];
+        },
+    };
+    const at = plain(tree, holder);
+    if (tree.nodeTag(at) != .identifier) return null;
+    const d = (model.reference(at) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(d)];
+    if (record.kind == .parameter) return d;
+    if (record.kind != .variable) return null;
+    const local = tree.fullVarDecl(record.node) orelse return null;
+    return if (tree.tokenTag(local.ast.mut_token) == .keyword_const) d else null;
+}
+
+/// Whether a store to `target` may write the field `decl`: its memory holds the field by value
+/// (the struct, a struct or array holding it), or its type does not resolve. A local by its own
+/// name is the function's, and a pointer stored is no pointee written.
+fn reachesStore(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (tree.nodeTag(target) == .identifier) {
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return false;
+        const d = (model.reference(target) orelse return true).declaration orelse return true;
+        const record = model.declarations[@backingInt(d)];
+        if (record.kind == .parameter or record.kind == .capture) return false;
+        const scope = model.scopes[@backingInt(record.scope)].kind;
+        if (scope != .container and scope != .file) return false;
+    }
+    return byValue(c, try c.facts.resolve(file, target), decl, 0);
+}
+
+/// Whether a value's own memory holds the field `decl`: it is an instance of a container that
+/// declares it, or holds one by value in a field or element; true where the type does not
+/// resolve.
+fn byValue(c: *Context, value: Facts.Value, decl: Facts.Decl, depth: u8) Context.Error!bool {
+    if (depth >= 16) return true;
+    switch (value) {
+        .instance => |k| {
+            for (try Taint.fieldsOf(c, k)) |field| {
+                if (std.meta.eql(field, decl)) return true;
+                if (try byValue(c, try c.facts.declaration(field), decl, depth + 1)) return true;
+            }
+            return false;
+        },
+        .array, .optional, .error_union => |inner| return byValue(c, inner.*, decl, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (try byValue(c, one, decl, depth + 1)) return true;
+            return false;
+        },
+        .unknown, .reified, .literal => return true,
+        else => return false,
+    }
+}
+
+/// Whether memory `node` reaches, by value or through pointers, may hold the field `decl`.
+fn reaches(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
+    const fields = try Taint.wholeFields(c, try c.facts.resolve(file, node)) orelse return true;
+    for (fields) |field| if (std.meta.eql(field, decl)) return true;
+    return false;
+}
+
+/// The field `x.f` names by its declaration, where `x`'s type resolves.
+fn fieldOf(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
+    const tree = &c.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .field_access) return null;
+    const holder, const name_token = tree.nodeData(node).node_and_token;
+    var value = try c.facts.resolve(file, holder);
+    while (true) value = switch (value) {
+        .pointer, .optional => |inner| inner.*,
+        else => break,
+    };
+    const container = switch (value) {
+        .instance => |k| k,
+        else => return null,
+    };
+    const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(name_token))) orelse return null;
+    if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return null;
+    return decl;
+}
+
+/// Whether a call hands its callee a receiver as the first parameter: `x.f(…)` on a value.
+fn hasReceiver(c: *Context, file: @import("Project.zig").FileId, call: Ast.full.Call) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    return switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+        .instance, .pointer, .optional => true,
+        else => false,
+    };
+}
+
+/// What a call gives its callee's parameter at `position`.
+fn argumentAt(tree: *const Ast, call: Ast.full.Call, receiver: bool, position: usize) Ast.Node.Index {
+    if (receiver) return if (position == 0) tree.nodeData(call.ast.fn_expr).node_and_token[0] else call.ast.params[position - 1];
+    return call.ast.params[position];
+}
+
+/// An expression past what keeps its value: parentheses, `@as` and `@intCast`.
+fn plain(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .builtin_call_two, .builtin_call_two_comma => {
+            const name_ = tree.tokenSlice(tree.nodeMainToken(at));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, at, &buffer);
+            if (std.mem.eql(u8, name_, "@as") and args.len == 2) {
+                at = args[1];
+            } else if (std.mem.eql(u8, name_, "@intCast") and args.len == 1) {
+                at = args[0];
+            } else return at;
+        },
+        else => return at,
+    };
+}
+
+/// The position among `f`'s parameters of the one `node` names, if it names one.
+fn parameterPosition(self: *Walk, f: Facts.Decl, node: Ast.Node.Index) ?usize {
+    const model = &self.c.project.at(f.file).model;
+    const tree = &self.c.project.at(f.file).file.tree;
+    const d = parameterOf(tree, model, node) orelse return null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(f.index)].node) orelse return null;
+    var parameters = proto.iterate(tree);
+    var position: usize = 0;
+    while (parameters.next()) |parameter| : (position += 1) {
+        if (parameter.name_token == model.declarations[@backingInt(d)].token) return position;
+    }
+    return null;
+}
+
+fn parameterCount(self: *Walk, f: Facts.Decl) usize {
+    const tree = &self.c.project.at(f.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.c.project.at(f.file).model.declarations[@backingInt(f.index)].node) orelse return 0;
+    var parameters = proto.iterate(tree);
+    var count: usize = 0;
+    while (parameters.next()) |_| count += 1;
+    return count;
+}
+
+/// An integer literal's value.
+fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
+    if (tree.nodeTag(node) != .number_literal) return null;
+    return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+        .int => |n| n,
+        else => null,
+    };
 }
 
 /// Whether a comparison holding where `at` is evaluated holds `depth` to a clean bound on `side`.
@@ -328,11 +643,14 @@ fn movesIn(self: *Walk, f: Facts.Decl) Context.Error![]const Step {
     return out.items;
 }
 
+/// A call a statement before another `try`s, and the function it reaches.
+const Tried = struct { callee: Facts.Decl, call: Ast.Node.Index };
+
 /// The program's functions of `call`'s file that a statement before it calls with `try`, alone
 /// or as a local's value.
-fn triedBefore(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.Index) Context.Error![]const Facts.Decl {
+fn triedBefore(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.Index) Context.Error![]const Tried {
     const tree = &self.c.project.at(file).file.tree;
-    var out: std.ArrayList(Facts.Decl) = .empty;
+    var out: std.ArrayList(Tried) = .empty;
     for (try before(self, file, call)) |statement| {
         var tried = statement;
         if (tree.fullVarDecl(statement)) |local| tried = local.ast.init_node.unwrap() orelse continue;
@@ -341,7 +659,7 @@ fn triedBefore(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.
         const inner = tree.fullCall(&buffer, tree.nodeData(tried).node) orelse continue;
         const callee = try self.c.facts.resolve(file, inner.ast.fn_expr);
         if (callee != .function or callee.function.file != file) continue;
-        try out.append(self.c.allocator, callee.function);
+        try out.append(self.c.allocator, .{ .callee = callee.function, .call = tree.nodeData(tried).node });
     }
     return out.items;
 }

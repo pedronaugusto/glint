@@ -43,6 +43,7 @@ const Range = @import("Range.zig");
 const Project = @import("Project.zig");
 const Governed = @import("Governed.zig");
 const Contract = @import("AegisContract.zig");
+const Program = @import("Program.zig");
 const Ast = std.zig.Ast;
 
 /// How far a value is input's, each level holding the ones below it: clean; unknown, through a
@@ -174,10 +175,10 @@ pub const Flow = struct {
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
     /// The lengths of the memory they hold, by declaration (`Dep.length`).
     lengths: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
-    std_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The files that are the program (`Program`).
+    program: *const Program = undefined,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
     data_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    aegis_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
     reader: ?Facts.Container = null,
     file: ?Facts.Container = null,
     dir: ?Facts.Container = null,
@@ -191,11 +192,10 @@ pub const Flow = struct {
     links: std.ArrayList(Link) = .empty,
     changed: bool = false,
 
-    /// Whether a file is the program's: every loaded file but std's and aegis's, which the
-    /// fact knows by their declarations. A file of the package the run did not select, and a
-    /// dependency's, are read as the program's own: what they do with input is as much its.
-    fn own(flow: *const Flow, file: Project.FileId) bool {
-        return !flow.std_files.contains(@backingInt(file)) and !flow.aegis_files.contains(@backingInt(file));
+    /// Whether a file is the program's (`Program`): what a file of the package the run did not
+    /// select, or a dependency's, does with input is as much the program's.
+    pub fn own(flow: *const Flow, file: Project.FileId) bool {
+        return flow.program.own(file);
     }
 };
 
@@ -226,6 +226,7 @@ pub fn get(c: *Context, fact: Fact) Context.Error!*Flow {
 }
 
 fn solve(c: *Context, flow: *Flow) Context.Error!void {
+    flow.program = try Program.get(c);
     try known(c, flow);
     for (c.project.sources) |*each| {
         if (each.input.classification == .@"test") continue;
@@ -274,8 +275,7 @@ fn parsers(c: *Context, flow: *Flow) Context.Error!void {
     }
 }
 
-/// The declarations the fact starts from and stops at: std's reader, file, directory and stream,
-/// std's and aegis's files.
+/// The declarations the fact starts from and stops at: std's reader, file, directory and stream.
 fn known(c: *Context, flow: *Flow) Context.Error!void {
     const paths = [_][]const u8{ "Io.Reader", "Io.File", "Io.Dir", "Io.net.Stream" };
     var found: [paths.len]?Facts.Container = @splat(null);
@@ -294,7 +294,6 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
     for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
         for ((try Governed.declarations(c, "aegis", path)) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     }
-    for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try reach(c, &flow.std_files, mapping.target);
     for ([_][]const u8{ "mem", "fmt", "ascii", "unicode", "math", "base64" }) |namespace| {
         for ((try Governed.declarations(c, "std", namespace)) orelse &.{}) |decl| {
             const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
@@ -310,20 +309,6 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
             };
         }
     }
-    const aegis = try c.facts.publication(Contract.library);
-    for (aegis.files) |file| try flow.aegis_files.put(c.allocator, @backingInt(file), {});
-}
-
-/// Every file `root` reaches through its own imports.
-fn reach(c: *Context, set: *std.AutoHashMapUnmanaged(u32, void), root: Project.FileId) Context.Error!void {
-    if ((try set.getOrPut(c.allocator, @backingInt(root))).found_existing) return;
-    var stack: std.ArrayList(Project.FileId) = .empty;
-    try stack.append(c.allocator, root);
-    while (stack.pop()) |file| for (c.project.imports) |mapping| {
-        if (mapping.from != file) continue;
-        if ((try set.getOrPut(c.allocator, @backingInt(mapping.target))).found_existing) continue;
-        try stack.append(c.allocator, mapping.target);
-    };
 }
 
 /// The file's functions with a body, and each node's owner among them.
@@ -677,7 +662,7 @@ fn pointing(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 
 /// The fields `@field(holder, name)` names: the one a string literal spells, or each field of
 /// the holder's type for a name computed as the program compiles.
-fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Facts.Decl {
+pub fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Facts.Decl {
     const tree = &c.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
@@ -705,7 +690,7 @@ fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
 }
 
 /// The fields a container declares.
-fn fieldsOf(c: *Context, container: Facts.Container) Context.Error![]const Facts.Decl {
+pub fn fieldsOf(c: *Context, container: Facts.Container) Context.Error![]const Facts.Decl {
     var out: std.ArrayList(Facts.Decl) = .empty;
     for (c.project.at(container.file).model.declarations, 0..) |decl, d| {
         if (decl.kind != .field or decl.scope != container.scope) continue;
@@ -963,7 +948,7 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
         else => return out,
     };
     out.decl = decl;
-    if (flow.aegis_files.contains(@backingInt(decl.file))) {
+    if (flow.program.aegis_files.contains(@backingInt(decl.file))) {
         // aegis's whole-file reads give a file's bytes, as std's do.
         const origin = (try c.facts.origin(decl)) orelse decl;
         for (flow.reads.items) |read| if (std.meta.eql(read, origin)) {
@@ -1546,7 +1531,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             var out: Dep = .{};
             for (callee.args.items) |arg| out = out.join(try outsideArg(c, flow, function, arg));
             const decl = callee.decl orelse return out;
-            if (!flow.std_files.contains(@backingInt(decl.file))) return out;
+            if (!flow.program.std_files.contains(@backingInt(decl.file))) return out;
             // A std function that answers a `usize` (a container's `count`, a position it finds
             // in data) answers a count of memory the program holds: a peer's within it.
             if (returnsCount(c, decl)) return out.narrowed();
@@ -1614,7 +1599,7 @@ pub const Reached = struct { decl: ?Facts.Decl, args: []const Ast.Node.Index, sk
 pub fn reached(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!Reached {
     const callee = try resolveCall(c, flow, file, call);
     const decl = callee.decl;
-    const in_std = if (decl) |d| flow.std_files.contains(@backingInt(d.file)) else false;
+    const in_std = if (decl) |d| flow.program.std_files.contains(@backingInt(d.file)) else false;
     return .{ .decl = decl, .args = callee.args.items, .skip = callee.skip, .std = in_std, .method = callee.receiver != null };
 }
 
@@ -1664,7 +1649,7 @@ fn stdIs(c: *Context, decl: Facts.Decl, paths: []const []const u8) Context.Error
 
 /// Whether a function outside the program is one of std's.
 pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
-    return flow.std_files.contains(decl.file.raw());
+    return flow.program.std_files.contains(decl.file.raw());
 }
 
 /// The container a fact recognizes std's reader, file, directory and stream by.
@@ -2206,7 +2191,7 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
 /// null where the type does not resolve.
 const Wholes = struct { map: std.AutoHashMapUnmanaged(Facts.Container, []const Facts.Decl) = .empty };
 
-fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts.Decl {
+pub fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts.Decl {
     var roots: std.ArrayList(Facts.Container) = .empty;
     if (!try containersOf(c, value, &roots)) return null;
     if (roots.items.len == 0) return &.{};

@@ -19,6 +19,7 @@ const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const File = @import("File.zig");
 const Contract = @import("AegisContract.zig");
+const Program = @import("Program.zig");
 const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
 const Ast = std.zig.Ast;
@@ -466,7 +467,9 @@ fn firstRead(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
 /// (`@intFromPtr(p)`), an address moved from one (`p + i`, `p - i`), or a constant naming
 /// either (`const m = out.ptr + o_lit;`).
 fn pointerValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
-    if (depth > 4) return false;
+    // Past so many constants, what it is is unknown: read as an address, which the input
+    // that moves it is judged by.
+    if (depth > 4) return true;
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, node);
     switch (try c.facts.resolve(file, at)) {
@@ -634,8 +637,8 @@ fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     if (memo.map.get(key)) |known| return known;
     // A function that reaches itself is read as unbounded while it is being read.
     try memo.map.put(c.allocator, key, null);
-    // Only the program's own functions are read: a dependency's body is its to change.
-    if (!c.project.at(decl.file).input.selected) return null;
+    // The program's functions are read; std's and aegis's are known by their declarations.
+    if (!try Program.owns(c, decl.file)) return null;
     const tree = &c.project.at(decl.file).file.tree;
     const model = &c.project.at(decl.file).model;
     // A function is declared at its prototype; its body is the declaration around it.
@@ -794,8 +797,8 @@ fn stores(c: *Context) Context.Error!*Stores {
     if (memo.built) return memo;
     memo.built = true;
     for (c.project.sources) |*source| {
-        if (!source.input.selected) continue;
         const file = source.id;
+        if (!try Program.owns(c, file)) continue;
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -886,7 +889,7 @@ fn expose(c: *Context, memo: *Stores, file: Project.FileId, node: Ast.Node.Index
             const call = tree.fullCall(&buffer, node) orelse return;
             const callee = try c.facts.resolve(file, call.ast.fn_expr);
             const own = switch (callee) {
-                .function => |decl| c.project.at(decl.file).input.selected,
+                .function => |decl| try Program.owns(c, decl.file),
                 else => false,
             };
             // std's byte views write through the bytes they give.
@@ -960,8 +963,8 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     if (memo.map.get(key)) |known| return known;
     // A field given a value that reads itself is unknown while it is being read.
     try memo.map.put(c.allocator, key, null);
-    // Only the program's own files are read for stores: a field a dependency declares, it sets.
-    if (!c.project.at(decl.file).input.selected) return null;
+    // The program's files are read for stores; a field std or aegis declares, it sets.
+    if (!try Program.owns(c, decl.file)) return null;
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
@@ -1823,10 +1826,11 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, root: Ast.Nod
 /// (self.at < self.input.len) self.input[self.at] else error.SyntaxError; }`, `fn enter(self)
 /// !void { self.depth += 1; if (self.depth > max) return error.TooDeep; }`). A guard counts
 /// where no statement before it returns without failing, so a call that succeeded passed it, and
-/// none after it may change the receiver (`touches`), so what it saw still holds. The condition
-/// is read with the receiver for the first parameter, so only where the call spells its receiver
-/// as `f` names it and the condition names no other parameter; it holds from the call while
-/// nothing after it assigns what it compares.
+/// nothing that runs after it, its function's defers included, may write what the caller can
+/// see (`quiet`), so what it saw still holds. The condition is read with the receiver for the
+/// first parameter, so only where the call spells its receiver as `f` names it and the
+/// condition names nothing of `f`'s but it; it holds from the call while nothing after it
+/// assigns what it compares.
 fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value: Ast.Node.Index, use: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -1844,26 +1848,30 @@ fn succeeded(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
     const proto = tree.fullFnProto(&proto_buffer, proto_node) orelse return;
     var parameters = proto.iterate(tree);
     const first = parameters.next() orelse return;
-    const self_name = tree.tokenSlice(first.name_token orelse return);
+    const self_token = first.name_token orelse return;
+    const self_name = tree.tokenSlice(self_token);
     if (!std.mem.eql(u8, std.mem.trim(u8, tree.getNodeSource(receiver), " "), self_name)) return;
     const function = model.parentOf(proto_node) orelse return;
     if (tree.nodeTag(function) != .fn_decl) return;
     var statement_buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&statement_buffer, tree.nodeData(function).node_and_node[1]) orelse return;
+    // A `defer` runs as the function returns, after every guard: what it writes is written
+    // after them all. An `errdefer` runs only where the call failed.
+    for (statements) |statement| if (tree.nodeTag(statement) == .@"defer" and !try quiet(c, file, function, &.{statement})) return;
     for (statements, 0..) |statement, at| {
         if (tree.nodeTag(statement) == .@"return") {
             const result = tree.nodeData(statement).opt_node.unwrap() orelse return;
             const branch = tree.fullIf(bare(tree, result)) orelse return;
             const otherwise = branch.ast.else_expr.unwrap() orelse return;
-            if (!receiverOnly(tree, model, branch.ast.cond_expr, self_name)) return;
-            if (tree.nodeTag(bare(tree, otherwise)) == .error_value and !touches(tree, model, &.{branch.ast.then_expr}, self_name)) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
-            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value and !touches(tree, model, &.{otherwise}, self_name)) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
+            if (!receiverOnly(tree, model, branch.ast.cond_expr, function, self_token)) return;
+            if (tree.nodeTag(bare(tree, otherwise)) == .error_value and try quiet(c, file, function, &.{branch.ast.then_expr})) return holds(c, file, out, branch.ast.cond_expr, true, use, call_node);
+            if (tree.nodeTag(bare(tree, branch.ast.then_expr)) == .error_value and try quiet(c, file, function, &.{otherwise})) return holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
             return;
         }
         if (returnsQuietly(tree, statement)) return;
         const branch = tree.fullIf(statement) orelse continue;
-        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, self_name)) continue;
-        if (touches(tree, model, statements[at + 1 ..], self_name)) continue;
+        if (branch.ast.else_expr != .none or !failing(tree, branch.ast.then_expr) or !receiverOnly(tree, model, branch.ast.cond_expr, function, self_token)) continue;
+        if (!try quiet(c, file, function, statements[at + 1 ..])) continue;
         try holds(c, file, out, branch.ast.cond_expr, false, use, call_node);
     }
 }
@@ -1883,10 +1891,15 @@ fn returnsQuietly(tree: *const Ast, statement: Ast.Node.Index) bool {
     return false;
 }
 
-/// Whether `nodes`, in order, may change what the receiver `self_name` holds: an assignment to
-/// it or a part of it, its address or a part's taken, or it or a part handed to a call or a
-/// method of it called, any of which may write it.
-fn touches(tree: *const Ast, model: anytype, nodes: []const Ast.Node.Index, self_name: []const u8) bool {
+/// Whether `nodes`, run in `function`, write nothing its caller can see: each store is to a
+/// local of `function` by its own name, and nothing else stores. Any other store may reach
+/// what the caller compares, whatever its spelling (`other.at` with `other` the receiver,
+/// `@field(self, "at")`, `q.at` with `q = self`, a pointer read from a field, a global the
+/// receiver may be); so may a call that can write (all but `inert` ones), a builtin that
+/// writes memory, and `asm`.
+fn quiet(c: *Context, file: Project.FileId, function: Ast.Node.Index, nodes: []const Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     for (nodes) |whole| {
         const first = tree.firstToken(whole);
         const last = tree.lastToken(whole);
@@ -1895,42 +1908,36 @@ fn touches(tree: *const Ast, model: anytype, nodes: []const Ast.Node.Index, self
             const token = tree.nodeMainToken(node);
             if (token < first or token > last) continue;
             switch (tag) {
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (receiverRooted(tree, model, tree.nodeData(node).node_and_node[0], self_name)) return true,
-                .address_of => if (receiverRooted(tree, model, tree.nodeData(node).node, self_name)) return true,
-                .call_one, .call_one_comma, .call, .call_comma => {
-                    var buffer: [1]Ast.Node.Index = undefined;
-                    const call = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
-                    if (tree.nodeTag(call.ast.fn_expr) == .field_access and receiverRooted(tree, model, tree.nodeData(call.ast.fn_expr).node_and_token[0], self_name)) return true;
-                    for (call.ast.params) |param| if (receiverRooted(tree, model, param, self_name)) return true;
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (!ownLocal(tree, model, tree.nodeData(node).node_and_node[0], function)) return false,
+                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |target| {
+                    if (tree.nodeTag(target) == .identifier and !ownLocal(tree, model, target, function)) return false;
+                    // A declaration is a new local; anything else is a store.
+                    if (tree.nodeTag(target) != .identifier and tree.fullVarDecl(target) == null) return false;
                 },
+                .call_one, .call_one_comma, .call, .call_comma => if (!try inert(c, file, node)) return false,
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (writesMemory(tree.tokenSlice(token))) return false,
+                .asm_simple, .@"asm" => return false,
                 else => {},
             }
         }
     }
-    return false;
+    return true;
 }
 
-/// Whether `node` names the receiver `self_name` or a part of it, past fields, indexes, slices,
-/// unwraps, dereferences and addresses.
-fn receiverRooted(tree: *const Ast, model: anytype, node: Ast.Node.Index, self_name: []const u8) bool {
-    var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .identifier => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), self_name)) return false;
-            const d = (model.reference(at) orelse return false).declaration orelse return false;
-            return model.declarations[@backingInt(d)].kind == .parameter;
-        },
-        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-        .deref, .address_of => at = tree.nodeData(at).node,
-        .array_access => at = tree.nodeData(at).node_and_node[0],
-        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return false).ast.sliced,
-        else => return false,
-    };
+/// Whether a store's `target` is a local of `function` by its own name (`_` discards).
+fn ownLocal(tree: *const Ast, model: anytype, target: Ast.Node.Index, function: Ast.Node.Index) bool {
+    if (tree.nodeTag(target) != .identifier) return false;
+    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return true;
+    const d = (model.reference(target) orelse return false).declaration orelse return false;
+    const record = model.declarations[@backingInt(d)];
+    return record.kind == .variable and record.token >= tree.firstToken(function) and record.token <= tree.lastToken(function);
 }
 
-/// Whether a callee's condition names no parameter but its first: what it says of the receiver
-/// is what the caller's receiver holds.
-fn receiverOnly(tree: *const Ast, model: anytype, condition: Ast.Node.Index, self_name: []const u8) bool {
+/// Whether a callee's condition names nothing of its function's but its receiver (the first
+/// parameter, `self_token`): what it says of the receiver is what the caller's receiver holds.
+/// Another parameter, a local or a capture of the callee read in the caller would be whatever
+/// the caller's code spells that way.
+fn receiverOnly(tree: *const Ast, model: anytype, condition: Ast.Node.Index, function: Ast.Node.Index, self_token: Ast.TokenIndex) bool {
     const first = tree.firstToken(condition);
     const last = tree.lastToken(condition);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -1938,8 +1945,15 @@ fn receiverOnly(tree: *const Ast, model: anytype, condition: Ast.Node.Index, sel
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
-        const d = (model.reference(node) orelse continue).declaration orelse continue;
-        if (model.declarations[@backingInt(d)].kind == .parameter and !std.mem.eql(u8, model.declarations[@backingInt(d)].name, self_name)) return false;
+        const reference = model.reference(node) orelse continue;
+        const d = reference.declaration orelse {
+            // A name the model cannot place may be anything of the callee's.
+            if (reference.unknown == .primitive) continue;
+            return false;
+        };
+        const record = model.declarations[@backingInt(d)];
+        if (record.token == self_token) continue;
+        if (record.token >= tree.firstToken(function) and record.token <= tree.lastToken(function)) return false;
     }
     return true;
 }
@@ -2099,7 +2113,7 @@ fn readParam(c: *Context, decl: Facts.Decl, depth: u8) Context.Error!?usize {
     for (std_reads) |each| for ((try Governed.declarations(c, "std", each.path)) orelse &.{}) |found| {
         if (std.meta.eql((try c.facts.origin(found)) orelse found, decl)) return each.param;
     };
-    if (!c.project.at(decl.file).input.selected) return null;
+    if (!try Program.owns(c, decl.file)) return null;
     const tree = &c.project.at(decl.file).file.tree;
     const model = &c.project.at(decl.file).model;
     const function = model.parentOf(model.declarations[@backingInt(decl.index)].node) orelse return null;
@@ -2516,9 +2530,10 @@ const Region = struct {
     }
 };
 
-/// Whether a builtin writes memory a pointer it is given reaches.
-fn writesMemory(name: []const u8) bool {
-    for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |writer| {
+/// Whether a builtin writes memory a pointer it is given reaches, or calls (`@call`) a function
+/// that may write any.
+pub fn writesMemory(name: []const u8) bool {
+    for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong", "@call" }) |writer| {
         if (std.mem.eql(u8, name, writer)) return true;
     }
     return false;
@@ -2675,7 +2690,11 @@ fn reads(c: *Context, file: Project.FileId, compared: Ast.Node.Index, target: As
         const next = std.math.add(Ast.TokenIndex, end, 1) catch return true;
         if (tree.tokenTag(next) != .identifier) return true;
     } else return true;
-    if (depth < 4) if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| return reads(c, file, init, target, depth + 1);
+    if (constantOf(c, file, at)) |local| if (local.ast.init_node.unwrap()) |init| {
+        // Past so many constants, what it reads is unknown: read as the target.
+        if (depth >= 4) return true;
+        return reads(c, file, init, target, depth + 1);
+    };
     return false;
 }
 
@@ -2894,7 +2913,11 @@ const Places = struct {
     }
 
     fn gather(self: *Places, c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!void {
-        if (depth >= 4) return;
+        // Past so many parts, the places left out may be written by any name.
+        if (depth >= 4) {
+            self.over = true;
+            return;
+        }
         const tree = &c.project.at(file).file.tree;
         const at = bare(tree, node);
         if (try placeOf(c, file, at)) |place| {
@@ -3378,14 +3401,14 @@ fn entriesOf(c: *Context, file: Project.FileId, table: Ast.Node.Index, owner: Fa
     return entries.file == owner.file and entries.scope == owner.scope;
 }
 
-/// Whether a selected file declares a table's own id: where none does, a conversion whose
+/// Whether a file of the program declares a table's own id: where none does, a conversion whose
 /// type does not resolve makes none.
 pub fn declaresIds(c: *Context) Context.Error!bool {
     const memo = try c.facts.memo(DeclaresIds);
     if (memo.known) |known| return known;
     const out = found: for (c.project.sources) |*source| {
         const file = source.id;
-        if (!source.input.selected) continue;
+        if (!try Program.owns(c, file)) continue;
         for (source.model.scopes, 0..) |scope, s| {
             if (scope.kind != .container) continue;
             if (ownerOf(c, .{ .file = file, .scope = @fromBackingInt(@intCast(s)) }) != null) break :found true;
@@ -3442,13 +3465,34 @@ fn counted(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast
     return keptAcross(c, file, memory, loop.ast.inputs[loop.ast.inputs.len - 1], index, record.node);
 }
 
-/// Whether a slice's start is at most its end: `b[e - n .. e]` where the difference cannot
-/// underflow, or a comparison holding there puts the start at most the end (`if (at >= t.size)
-/// return null;` before `b[at..t.size]`). Such a start is within the memory wherever the end
-/// is, so the end is the bound to judge.
-pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: Ast.Node.Index) Context.Error!bool {
+/// Whether a slice's start is at most its end: a start of zero; an end that adds to the start
+/// (`b[i .. i + n]`, where the sum cannot wrap); an end at the memory's own length with the
+/// start within it; `b[e - n .. e]` where the difference cannot underflow; or a comparison
+/// holding there puts the start at most the end (`if (at >= t.size) return null;` before
+/// `b[at..t.size]`). Both bounds within the memory say nothing of their order (`b[i..n]` with
+/// `i <= b.len` and `n <= b.len`): a start past the end stops the program as surely as one
+/// past the memory.
+pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: Ast.Node.Index, memory: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const at = bare(tree, start);
+    const least = literal(tree, at);
+    if (least == 0) return true;
+    // An end a constant names is its value (`const id_end = 1 + @as(usize, n);`).
+    var last = bare(tree, end);
+    for (0..4) |_| {
+        const local = constantOf(c, file, last) orelse break;
+        last = bare(tree, local.ast.init_node.unwrap() orelse break);
+    }
+    switch (tree.nodeTag(last)) {
+        // An unsigned sum is at least each part: the start itself, or a constant at least it.
+        .add, .add_sat => {
+            const lhs, const rhs = tree.nodeData(last).node_and_node;
+            if (oneValue(c, file, lhs, start) or oneValue(c, file, rhs, start)) return true;
+            if (least) |k| if ((literal(tree, lhs) orelse literal(tree, rhs) orelse 0) >= k) return true;
+        },
+        else => {},
+    }
+    if (lengthOf(c, file, last, memory) and !try varies(c, file, memory) and try within(c, file, start, memory, true)) return true;
     if (tree.nodeTag(at) == .sub) {
         const lhs, const rhs = tree.nodeData(at).node_and_node;
         if (oneValue(c, file, lhs, end)) {
@@ -3457,6 +3501,8 @@ pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: A
         }
     }
     for (try facts(c, file, start)) |fact| {
+        // Two values that differ are in no order, and a read puts a position below a memory.
+        if (fact.differs or fact.read) continue;
         if (oneValue(c, file, fact.small, start) and oneValue(c, file, fact.large, end)) return true;
     }
     return false;

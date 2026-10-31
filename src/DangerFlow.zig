@@ -9,6 +9,7 @@ const Facts = @import("Facts.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Taint = @import("Taint.zig");
+const Program = @import("Program.zig");
 const Range = @import("Range.zig");
 const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
@@ -34,11 +35,19 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             },
             .slice_open, .slice, .slice_sentinel => {
                 const slice = tree.fullSlice(node) orelse continue;
-                // A bound the program checked against the memory's length is its own, and a
-                // start held at most the end is within the memory wherever the end is.
-                const before_end = if (slice.ast.end.unwrap()) |end| try Range.notAfter(c, c.file, slice.ast.start, end) else false;
-                if (!before_end and !try Range.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
-                if (slice.ast.end.unwrap()) |end| if (!try Range.within(c, c.file, end, slice.ast.sliced, true)) try sink(c, flow, rule, end, "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted");
+                // A bound the program checked against the memory's length is its own. With an
+                // end, the start must be at most it, which puts the start within the memory
+                // wherever the end is; two bounds each within the memory may still be out of
+                // order (`b[i..n]`), and a peer choosing either chooses that.
+                const extent = "input bounds a slice: a peer chooses its extent; parse it into a refined type with aegis input.Untrusted";
+                if (slice.ast.end.unwrap()) |end| {
+                    const end_within = try Range.within(c, c.file, end, slice.ast.sliced, true);
+                    if (!end_within) try sink(c, flow, rule, end, extent);
+                    if (!try Range.notAfter(c, c.file, slice.ast.start, end, slice.ast.sliced)) {
+                        try sink(c, flow, rule, slice.ast.start, extent);
+                        if (end_within) try sink(c, flow, rule, end, extent);
+                    }
+                } else if (!try Range.within(c, c.file, slice.ast.start, slice.ast.sliced, true)) try sink(c, flow, rule, slice.ast.start, extent);
             },
             // A pointer moved by input reaches the address a peer chooses: no length checks it,
             // unless its offset is shown within the memory it came from (`x.ptr + o`, `o < x.len`).
@@ -326,13 +335,13 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8) C
 
 const Cancels = struct { map: std.AutoHashMapUnmanaged(Facts.Decl, bool) = .empty };
 
-/// Whether a call of `callee` is a cancellation point: a function of the project where its body
+/// Whether a call of `callee` is a cancellation point: a function of the program where its body
 /// reaches one, whatever its error set declares (`error{Canceled}!void {}` cancels nothing);
 /// another where its declared error set holds `error.Canceled`.
 fn callCancels(c: *Context, callee: Facts.Decl, depth: u8) Context.Error!bool {
     const callee_tree = &c.project.at(callee.file).file.tree;
     const callee_model = &c.project.at(callee.file).model;
-    if (c.project.at(callee.file).input.selected) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
+    if (try Program.owns(c, callee.file)) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
         const memo = try c.facts.memo(Cancels);
         if (memo.map.get(callee)) |known| return known;
         // A function that reaches itself is no cancellation point while it is being read.

@@ -3619,8 +3619,9 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
     ;
     // `check` and `skip` move the position past what they checked; `peek` only reads it.
     try expect(pack.untrusted_input, program, 2);
-    // The checks with what follows them leaving the position where they saw it.
-    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        std.log.debug(\"checked\", .{});\n    }\n    fn peek"), "return self.advance();", "return std.log.debug(\"skipped\", .{});");
+    // The checks with what follows them leaving the position where they saw it: a store to a
+    // local of their own.
+    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        var seen: usize = 0;\n        seen += 1;\n    }\n    fn peek"), "return self.advance();", "return;");
     try expect(pack.untrusted_input, kept, 0);
     // A guard after the move holds where the call succeeded, unless a statement before it may
     // return without failing, so the call succeeded past it.
@@ -3642,6 +3643,64 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
     ;
     try expect(pack.untrusted_input, entered, 0);
     try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 1);
+}
+
+test "A009 reads a callee's check only where nothing after it, its defers included, may write what the caller sees, by any name" {
+    const program =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    me: *P,
+        \\    fn check(self: *P, other: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        _ = other;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.check(self);
+        \\        return self.table[self.at];
+        \\    }
+        \\};
+        \\pub var shared: P = undefined;
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // The receiver written through another parameter, `@field`, a local naming it, a pointer a
+    // field holds, a global it may be, in a `defer`, or by any call.
+    try expect(pack.untrusted_input, comptime edited(program, "_ = other;", "other.at = other.table.len;"), 1);
+    const writes = [_][]const u8{
+        "@field(self, \"at\") = self.table.len;",
+        "const q = self;\n        q.at = q.table.len;",
+        "const m = self.me;\n        m.at = m.table.len;",
+        "shared.at = shared.table.len;",
+        "std.log.debug(\"{d}\", .{self.at});",
+    };
+    inline for (writes) |write| try expect(pack.untrusted_input, comptime edited(program, "_ = other;", "_ = other;\n        " ++ write), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        defer self.at = self.table.len;\n        if (self.at >= self.table.len) return error.Range;\n"), 1);
+    // A condition naming a local of the callee says nothing of the caller's value of that name.
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        const at = self.at + 0;\n        if (at >= self.table.len) return error.Range;\n"), 1);
+}
+
+test "A009 judges a slice's bounds in order: each at most the length leaves the start past the end a peer may choose" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    _ = buf[i..n];
+        \\    _ = buf[i..@min(n, buf.len)];
+        \\    _ = buf[5..n];
+        \\    if (i != n) _ = buf[i..n];
+        \\    _ = buf[0..n];
+        \\    _ = buf[i..buf.len];
+        \\    if (i > n) return error.Bad;
+        \\    return buf[i..n];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 8, 8, 9, 10, 10 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
