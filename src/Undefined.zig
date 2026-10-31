@@ -248,8 +248,13 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
         // after its cleanup.
         if (calls.len != 0 and try follows(c, decl)) continue;
         for (calls) |call| {
+            const memo = try c.facts.memo(Calls);
+            const cuts = memo.cuts;
             const left = try walk.undoneBy(call);
             if (left == 0) continue;
+            // A reading cut short at the depth answered all of it without reading it: what the
+            // call leaves is not known, so a read after it is undecided, never a finding.
+            const cut = memo.cuts != cuts;
             const line = tree.tokenLocation(0, tree.nodeMainToken(call)).line + 1;
             if (try walk.aliasAfter(call, block)) |alias| {
                 try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unsupported, try c.allocator.print("'{s}' is given `undefined` here by the call, and an alias of it taken at line {d} may read it after: no read of it through that alias is followed", .{ decl.name, tree.tokenLocation(0, alias).line + 1 }));
@@ -260,6 +265,10 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
             _ = try from.onFrom(call, left, block);
             const token = from.read orelse continue;
             if (found == token) continue;
+            if (cut) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .budget_exhausted, try c.allocator.print("'{s}' is handed to a call here whose calls run deeper than {d} are read: whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, undefines_depth_limit, tree.tokenLocation(0, token).line + 1 }));
+                continue;
+            }
             found = token;
             try c.at(rule, token, if (from.handed)
                 try c.allocator.print("'{s}' is handed on here while undefined on a path from line {d}, whose call gives it `undefined` (as a `deinit` does), where nothing shows it written whole since: a read of undefined memory, which no build checks", .{ decl.name, line })
