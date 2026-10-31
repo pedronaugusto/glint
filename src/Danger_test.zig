@@ -1124,6 +1124,13 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     // A field named as the program compiles may be the interface's.
     const computed = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    inline for (.{\"interface\"}) |name| try @field(s, name).writeAll(\"y\");\n    return s.count + s.interface.end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, computed.lines[0..computed.findings]);
+    // Computed from a list of names, written in place or a constant's, it names only those.
+    const listed = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    inline for (.{\"count\"}) |name| _ = @field(s, name);\n    return s.count + s.interface.end;");
+    try std.testing.expectEqual(@as(usize, 0), listed.findings);
+    const constant = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    const names = [_][]const u8{\"count\"};\n    inline for (names) |name| _ = @field(s, name);\n    return s.count + s.interface.end;");
+    try std.testing.expectEqual(@as(usize, 0), constant.findings);
+    const named = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    const names = [_][]const u8{ \"count\", \"interface\" };\n    inline for (names) |name| _ = @field(s, name);\n    return s.count + s.interface.end;");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, named.lines[0..named.findings]);
 }
 
 const reflecting_dependency: sources.Extra = .{ .name = "reflect/root.zig", .bytes =

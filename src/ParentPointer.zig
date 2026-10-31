@@ -143,7 +143,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
                     // A member of it read, indexed or iterated: no function pointer.
                     if (notFunction(file_tree, &each.model, node)) continue;
                 } else if (tree.fullPtrType(declared) == null) continue;
-                if (try namedBy(c, file_tree, args[1], decl.name)) return false;
+                if (try namedBy(c, file_tree, &each.model, args[1], decl.name)) return false;
             }
         }
     }
@@ -408,7 +408,7 @@ fn namedOnlyInstalling(c: *Context, decl: Model.Declaration.Id, field: Field, th
             .unknown => {},
             else => continue,
         }
-        if (try namedBy(c, tree, args[1], record.name)) return false;
+        if (try namedBy(c, tree, model, args[1], record.name)) return false;
     }
     return named;
 }
@@ -520,7 +520,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
             if (receiver == .unknown and generic(tree, &source.model, node)) continue;
-            if (try namedBy(c, tree, args[1], field.name)) return false;
+            if (try namedBy(c, tree, &source.model, args[1], field.name)) return false;
         }
     }
     const model = &c.project.at(c.file).model;
@@ -535,14 +535,47 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
     return true;
 }
 
-/// Whether a `@field` name may be `name`: it is spelled so, or computed as the program compiles.
-fn namedBy(c: *Context, tree: *const Ast, spelling: Ast.Node.Index, name: []const u8) Context.Error!bool {
-    if (tree.nodeTag(spelling) != .string_literal) return true;
-    const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(spelling))) catch |err| switch (err) {
+/// Whether a `@field` name may be `name`: it is spelled so, or computed as the program compiles
+/// to what may be. A capture of a `for` over a list of string literals, written in place or a
+/// constant's, takes only those.
+fn namedBy(c: *Context, tree: *const Ast, model: *const Model, spelling: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    if (tree.nodeTag(spelling) == .string_literal) return spelledAs(c, tree, spelling, name);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const names = literalNames(tree, model, spelling, &buffer) orelse return true;
+    for (names) |each| if (try spelledAs(c, tree, each, name)) return true;
+    return false;
+}
+
+/// Whether the string literal `literal` spells `name`; one that does not parse may.
+fn spelledAs(c: *Context, tree: *const Ast, literal: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    const spelled = std.zig.string_literal.parseAlloc(c.allocator, tree.tokenSlice(tree.nodeMainToken(literal))) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return true,
     };
     return std.mem.eql(u8, spelled, name);
+}
+
+/// The string literals the capture `node` names may be: those of the list a `for` takes it
+/// from, written in place (`.{ "a", "b" }`) or a constant's (`const names = [_][]const u8{ … }`).
+fn literalNames(tree: *const Ast, model: *const Model, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) ?[]const Ast.Node.Index {
+    if (tree.nodeTag(node) != .identifier) return null;
+    const decl = model.declarations[@backingInt((model.reference(node) orelse return null).declaration orelse return null)];
+    if (decl.kind != .capture or tree.tokenTag(decl.token -| 1) == .asterisk) return null;
+    const loop = tree.fullFor(decl.node) orelse return null;
+    const position = Model.capturePosition(tree, loop, decl.token) orelse return null;
+    if (position >= loop.ast.inputs.len) return null;
+    var list = strip(tree, loop.ast.inputs[position]);
+    if (tree.nodeTag(list) == .address_of) list = strip(tree, tree.nodeData(list).node);
+    if (tree.nodeTag(list) == .identifier) {
+        const named = model.declarations[@backingInt((model.reference(list) orelse return null).declaration orelse return null)];
+        if (named.kind != .variable) return null;
+        const variable = tree.fullVarDecl(named.node) orelse return null;
+        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+        list = strip(tree, variable.ast.init_node.unwrap() orelse return null);
+    }
+    const literal = tree.fullArrayInit(buffer, list) orelse return null;
+    for (literal.ast.elements) |each| if (tree.nodeTag(each) != .string_literal) return null;
+    return literal.ast.elements;
 }
 
 /// A pointer to an interface of type `kind` followed to every place it goes: through the
@@ -1386,7 +1419,7 @@ fn namesFunction(c: *Context, kinds: []const Facts.Container, node: Ast.Node.Ind
     const receiver = try c.facts.resolve(c.file, args[0]);
     for (kinds) |kind| for (try functions(c, kind)) |slot| {
         if (!isParent(receiver, slot.holder)) continue;
-        if (try namedBy(c, tree, args[1], slot.name)) return true;
+        if (try namedBy(c, tree, &c.project.at(c.file).model, args[1], slot.name)) return true;
     };
     return false;
 }
@@ -1662,7 +1695,7 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
             if (args.len != 2) continue;
             if ((try receiverKind(c, each.id, args[0], list)) == null) continue;
             for (links ++ [_][]const u8{ "append", "prepend", "insertAfter", "insertBefore", "concatByMoving" }) |name| {
-                if (try namedBy(c, tree, args[1], name)) return false;
+                if (try namedBy(c, tree, &each.model, args[1], name)) return false;
             }
         }
     }
