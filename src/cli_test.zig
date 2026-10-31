@@ -299,6 +299,8 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     const cast = "pub fn f(p: *const u32) *const u8 {\n    return @ptrCast(p);\n}\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.zig", .data = cast });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "renamed.zig", .data = "const safety = @import(\"safety\");\ncomptime {\n    _ = safety;\n}\n" ++ cast });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "by_path.zig", .data = "const aegis = @import(\"aegis/src/root.zig\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake.zig", .data = "pub const x = 1;\n" });
     try tmp.dir.createDirPath(std.testing.io, "aegis");
     var tree = try tmp.dir.openDir(std.testing.io, "aegis", .{});
@@ -322,6 +324,16 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
     try std.testing.expect(std.mem.startsWith(u8, imported, "aegis pack: on (imported by "));
     try std.testing.expect(std.mem.find(u8, imported, "A019: ") != null);
+    // aegis imported under another module name, or by its path: aegis by what it publishes, on.
+    const renamed = try runOn(a, &tmp, &.{ "--module", "safety=aegis/src/root.zig" }, "renamed.zig", &status);
+    defer a.free(renamed);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
+    try std.testing.expect(std.mem.startsWith(u8, renamed, "aegis pack: on (imported by "));
+    try std.testing.expect(std.mem.find(u8, renamed, "A019: ") != null);
+    const by_path = try runOn(a, &tmp, &.{}, "by_path.zig", &status);
+    defer a.free(by_path);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
+    try std.testing.expect(std.mem.startsWith(u8, by_path, "aegis pack: on (imported by "));
     // A module named aegis that is not aegis: off.
     const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
     defer a.free(other);

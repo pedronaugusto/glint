@@ -9,9 +9,10 @@ const Facts = @This();
 
 project: *const Project,
 gpa: std.mem.Allocator,
-/// The module names of the libraries the analyses know by their declarations (aegis's), as a
-/// program imports them: their files, like std's, are not the program's (`program`).
-known: []const []const u8 = &.{},
+/// The modules of the libraries the analyses know by their declarations (aegis's): their
+/// files, like std's, are not the program's (`program`). A module is known by its root, under
+/// whatever name a program imports it (`moduleRoots`).
+known: []const KnownModule = &.{},
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
 /// The sets of comptime `bool` parameters' values that the paths read so far settle, each once.
@@ -31,6 +32,8 @@ cast_sites: std.AutoHashMapUnmanaged(Key, void) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
+/// Each module's roots, by the address of its members.
+module_roots: std.AutoHashMapUnmanaged(usize, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// What each generic parameter binds when the project's own calls are the only ones: the
 /// union of their arguments, or null when the function is reachable from outside or taken
@@ -197,6 +200,7 @@ pub fn deinit(self: *Facts) void {
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
+    self.module_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.callers.deinit(self.gpa);
     if (self.exported) |*set| set.deinit(self.gpa);
@@ -206,9 +210,45 @@ pub fn deinit(self: *Facts) void {
     self.* = undefined;
 }
 
-/// Finds what `library` publishes: each module's root is every file the project maps that
-/// module's name to, and each member is the declaration its path names from that root. Found
-/// once per run and shared by every rule.
+/// A module a library publishes, as `known` lists it: what the program imports it by, and the
+/// paths of its members, which name it by what its root publishes.
+pub const KnownModule = struct {
+    name: []const u8,
+    members: []const Member,
+
+    pub const Member = struct { path: []const u8, required: bool = true };
+};
+
+/// The files a module's root is: each the project maps the module's name to, and each other
+/// file an import reaches whose public declarations include every member the module requires.
+/// A library imported under another name, or by its path, is still that library; a module that
+/// requires nothing is known by its name alone. Found once per run.
+pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
+    const key = @intFromPtr(module.members.ptr);
+    if (self.module_roots.get(key)) |found| return found;
+    var required = false;
+    for (module.members) |listed| required = required or listed.required;
+    var roots: std.ArrayList(Project.FileId) = .empty;
+    var tried: FileSet = .empty;
+    defer tried.deinit(self.gpa);
+    for (self.project.imports) |mapping| {
+        if (std.mem.eql(u8, mapping.spelling, module.name)) {
+            if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) == null) try roots.append(self.gpa, mapping.target);
+            continue;
+        }
+        if (!required) continue;
+        if (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root")) continue;
+        if ((try tried.getOrPut(self.gpa, @backingInt(mapping.target))).found_existing) continue;
+        if (self.project.at(mapping.target).file.status != .parsed) continue;
+        if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
+        if (try self.publishes(module, mapping.target)) try roots.append(self.gpa, mapping.target);
+    }
+    try self.module_roots.put(self.gpa, key, roots.items);
+    return roots.items;
+}
+
+/// Finds what `library` publishes: each module's roots (`moduleRoots`), and each member the
+/// declaration its path names from a root. Found once per run and shared by every rule.
 pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
     const key = @intFromPtr(library.modules.ptr);
     if (self.publications.get(key)) |found| return found;
@@ -216,16 +256,9 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
     var gaps: std.ArrayList(Gap) = .empty;
     var reached: FileSet = .empty;
     for (library.modules) |module| {
-        for (self.project.imports, 0..) |mapping, index| {
-            if (!std.mem.eql(u8, mapping.spelling, module.name)) continue;
-            // Many files import one root; its members are found once.
-            var repeated = false;
-            for (self.project.imports[0..index]) |earlier| if (std.mem.eql(u8, earlier.spelling, module.name) and earlier.target == mapping.target) {
-                repeated = true;
-            };
-            if (repeated) continue;
-            try reached.put(self.gpa, @backingInt(mapping.target), {});
-            for (module.members) |listed| switch (try self.published(mapping.target, listed.path)) {
+        for (try self.moduleRoots(module)) |root| {
+            try reached.put(self.gpa, @backingInt(root), {});
+            for (module.members) |listed| switch (try self.published(root, listed.path)) {
                 .found => |target| {
                     const role_value: u32 = @intCast(@backingInt(listed.role));
                     try entries.append(self.gpa, .{ .role = role_value, .target = target });
@@ -628,9 +661,16 @@ pub fn outside(self: *Facts) ResolveError!*const Outside {
     found.project = self.project;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
     try self.reach(&found.std_files, .standard);
-    for (self.known) |name| for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, name)) {
-        try found.known_files.put(self.gpa, @backingInt(mapping.target), {});
-    };
+    // A root imported by its path may be the program's own file republishing the module: only
+    // one imported by a module name is the library's, its own and what it reaches.
+    for (self.known) |module| {
+        const roots = try self.moduleRoots(module);
+        for (self.project.imports) |mapping| {
+            if (std.mem.findScalar(Project.FileId, roots, mapping.target) == null) continue;
+            if (!std.mem.eql(u8, mapping.spelling, module.name) and std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
+            try found.known_files.put(self.gpa, @backingInt(mapping.target), {});
+        }
+    }
     try self.reach(&found.known_files, .library);
     return found;
 }

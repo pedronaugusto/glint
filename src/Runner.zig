@@ -67,7 +67,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         definitions[i].purpose = try a.dupe(u8, rule.definition.purpose);
     }
     try validateRules(config, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = &Contract.module_names, .remaining = config.fact_budget } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = &Contract.known, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
