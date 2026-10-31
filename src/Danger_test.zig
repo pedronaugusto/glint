@@ -1511,6 +1511,47 @@ test "A019 reads a carrier in the tuple an Io spawn is given as handed to the fu
     try std.testing.expectEqualSlices(u32, &.{ 19, 19 }, held.lines[0..held.findings]);
 }
 
+test "A019 follows a pointer an interface's file stores in a field past reads of that name on values of other types" {
+    // Clean: `init` stores the writer it is given in `out`; the only other `.out` read is of a
+    // union's payloads, each of another type. A finding at the conversion (13): an `.out` read
+    // on a receiver of no known type, which may be a Chunked's.
+    const chunked =
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\const Chunked = struct {
+        \\    out: *Io.Writer,
+        \\    interface: Io.Writer,
+        \\    pub fn init(out: *Io.Writer, buffer: []u8) Chunked {
+        \\        return .{ .out = out, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+        \\    }
+        \\    pub fn writer(c: *Chunked) *Io.Writer {
+        \\        return &c.interface;
+        \\    }
+        \\    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) anyerror!usize {
+        \\        const c: *Chunked = @alignCast(@fieldParentPtr("interface", w));
+        \\        try c.out.writeAll(w.buffered());
+        \\        return data.len + splat;
+        \\    }
+        \\};
+        \\const Pipe = struct { out: []const u8 };
+        \\const Wire = struct { in: []const u8, out: []u8 };
+        \\const Op = union(enum) { pipe: Pipe, wire: Wire };
+        \\pub fn size(op: Op) usize {
+        \\    return switch (op) {
+        \\        inline else => |o| o.out.len,
+        \\    };
+        \\}
+        \\pub fn run(dest: *Io.Writer, buffer: []u8) !void {
+        \\    var c: Chunked = .init(dest, buffer);
+        \\    try c.writer().writeAll("x");
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, chunked)).findings);
+    const any = try run(pack.unsafe_set, comptime edited(chunked, "pub fn size(op: Op) usize {\n    return switch (op) {\n        inline else => |o| o.out.len,\n    };\n}", "pub fn size(op: anytype) usize {\n    return op.out.len;\n}"));
+    try std.testing.expectEqualSlices(u32, &.{ 13, 13 }, any.lines[0..any.findings]);
+}
+
 /// `program`'s findings of `rule` at report level, the only file the project loads.
 fn runAlone(rule: glint.Rule, program: []const u8) !Run {
     const inputs = [_]glint.Project.Input{.{ .name = "alone.zig", .bytes = program }};

@@ -882,7 +882,10 @@ const Follow = struct {
         for (try c.facts.memberUses(record.name)) |use| {
             const found = (try c.facts.definition(use.file, use.node)) orelse {
                 const tree = &c.project.at(use.file).file.tree;
-                if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0])) continue;
+                const receiver = tree.nodeData(use.node).node_and_token[0];
+                if (try namesType(c, use.file, receiver)) continue;
+                // A part of a value of another type, whichever of its types it is, is not this field.
+                if (otherThan(try c.facts.resolve(use.file, receiver), .{ .file = decl.file, .scope = record.scope })) continue;
                 return false;
             };
             if (!std.meta.eql(found, decl)) continue;
@@ -2043,6 +2046,19 @@ fn same(a: Facts.Container, b: Facts.Container) bool {
 }
 
 /// Whether a value is a C, or a pointer to one.
+/// Whether `value` is known to be of a type other than `holder`: a container, an instance or a
+/// pointer to one that is not it, or alternatives each of which is.
+fn otherThan(value: Facts.Value, holder: Facts.Container) bool {
+    return switch (value) {
+        .container, .instance => |container| !same(container, holder),
+        .pointer, .optional => |to| otherThan(to.*, holder),
+        .alternatives => |each| for (each) |one| {
+            if (!otherThan(one, holder)) break false;
+        } else each.len != 0,
+        else => false,
+    };
+}
+
 fn isParent(value: Facts.Value, parent: Facts.Container) bool {
     return switch (value) {
         .container, .instance => |container| same(container, parent),
