@@ -89,8 +89,31 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
 
 /// The declarations `path` names from module `source`, without reporting: null when no root
 /// imports the module or the path does not resolve. For facts that recognize a declaration and
-/// leave its absence to the rules that read them.
+/// leave its absence to the rules that read them. The answer is the project's, read once per run
+/// for each source and path: a fact asks it at every place it reads, every round.
 pub fn declarations(self: *Context, source: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+    const memo = try self.facts.memo(Lookups);
+    memo.asked += 1;
+    if (memo.found.getPtr(source)) |paths| if (paths.get(path)) |known| return known;
+    const answer = try lookup(self, source, path);
+    // A walk the fact budget cut short may have missed a declaration: it is asked again.
+    if (self.facts.remaining == 0) return answer;
+    const paths = try memo.found.getOrPut(self.allocator, source);
+    if (!paths.found_existing) {
+        paths.key_ptr.* = try self.allocator.dupe(u8, source);
+        paths.value_ptr.* = .empty;
+    }
+    try paths.value_ptr.put(self.allocator, try self.allocator.dupe(u8, path), answer);
+    return answer;
+}
+
+/// Each `declarations` answer by its source, then its path, and how many times one was asked.
+pub const Lookups = struct {
+    found: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(?[]const Facts.Decl)) = .empty,
+    asked: usize = 0,
+};
+
+fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
         for (roots.items) |seen| {

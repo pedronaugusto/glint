@@ -190,6 +190,9 @@ pub const Flow = struct {
     reads: std.ArrayList(Facts.Decl) = .empty,
     /// Where each pointer the program makes may be kept (`Link`).
     links: std.ArrayList(Link) = .empty,
+    /// std's accessors of a Zig tree's text (`zig_text`) and its parser, resolved once.
+    zig_text: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
+    zig_parse: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     /// What decides how many passes each loop takes, read once per round (`passes`).
     loops: std.AutoHashMapUnmanaged(Facts.Key, Dep) = .empty,
     changed: bool = false,
@@ -294,6 +297,8 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
         for (found_writers) |decl| try flow.peer_writers.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     }
     for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+    for (zig_text) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| try flow.zig_text.put(c.allocator, decl, {});
+    for ((try Governed.declarations(c, "std", "zig.Ast.parse")) orelse &.{}) |decl| try flow.zig_parse.put(c.allocator, decl, {});
     for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
         for ((try Governed.declarations(c, "aegis", path)) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     }
@@ -1244,7 +1249,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     if (try c.facts.definition(f.file, node)) |decl| {
         if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
         if (flow.lengths.get(decl)) |length| out = out.join(.{ .length = length });
-        if (try stdIs(c, decl, &zig_text)) out = out.join(.{ .level = .data });
+        if (flow.zig_text.contains(decl)) out = out.join(.{ .level = .data });
         // A function or a type named through a value is no part of its data.
         const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
         if (kind == .function) return .{};
@@ -1565,8 +1570,8 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
                 // std's Zig parser, called by a parser the program hands to input.Untrusted.parse,
                 // is that parse's check: each node, token and extra index of the tree it gives
                 // indexes the tree's own tables. The text the tree carries stays input.
-                if (f.parser and try stdIs(c, decl, &.{"zig.Ast.parse"})) return .{};
-                if (try stdIs(c, decl, &zig_text)) return .{ .level = .data };
+                if (f.parser and flow.zig_parse.contains(decl)) return .{};
+                if (flow.zig_text.contains(decl)) return .{ .level = .data };
             }
             // A function outside the program gives what it is given, its receiver among it.
             var out: Dep = .{};
@@ -1751,13 +1756,6 @@ fn systemAnswer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
 const zig_text = [_][]const u8{ "zig.Ast.source", "zig.Ast.tokenSlice", "zig.Ast.getNodeSource", "zig.Zir.string_bytes", "zig.Zir.nullTerminatedString" };
 
 /// Whether `decl` is std's declaration at one of `paths`.
-fn stdIs(c: *Context, decl: Facts.Decl, paths: []const []const u8) Context.Error!bool {
-    for (paths) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |each| {
-        if (std.meta.eql(each, decl)) return true;
-    };
-    return false;
-}
-
 /// Whether a function outside the program is one of std's.
 pub fn inStd(flow: *const Flow, decl: Facts.Decl) bool {
     return flow.program.std_files.contains(@backingInt(decl.file));
@@ -2451,4 +2449,38 @@ fn operands(c: *Context, flow: *Flow, function: Function.Id, condition: Ast.Node
         },
         else => return (try dep(c, flow, function, condition)).held(),
     }
+}
+
+test "the input fact asks a governed name once per run, however many places read a field" {
+    // Every round reads every field, and each read asks whether the field is one of std's
+    // text accessors (`zig_text`). Those are resolved once, as the fact starts: the lookups
+    // asked are the same for 8 reads as for 64 (they grew with the reads times the rounds).
+    try std.testing.expectEqual(try lookupsFor(8), try lookupsFor(64));
+}
+
+/// The governed lookups the input fact asks over `n` functions that each read a field.
+fn lookupsFor(n: usize) !usize {
+    const gpa = std.testing.allocator;
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(gpa);
+    try program.appendSlice(gpa, "const S = struct { a: u8 };\n");
+    for (0..n) |i| try program.print(gpa, "pub fn read{d}(s: S) u8 {{ return s.a; }}\n", .{i});
+    var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = program.items }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").untrusted_input, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+    };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink };
+    _ = try get(&c, .input);
+    return (try facts.memo(Governed.Lookups)).asked;
 }
