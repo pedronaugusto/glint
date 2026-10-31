@@ -1809,6 +1809,12 @@ const Walk = struct {
 
     const step_limit = 4000;
 
+    /// The read at `node`, unless it is one already found.
+    fn read(w: *const Walk, file: Project.FileId, node: Ast.Node.Index) ?Origin {
+        for (w.excluded) |each| if (each.file == file and each.node == node) return null;
+        return .{ .file = file, .node = node };
+    }
+
     fn carries(w: *Walk, function: Function.Id, node: Ast.Node.Index) Context.Error!bool {
         return concrete(w.flow, function, try dep(w.c, w.flow, function, node)) != .clean;
     }
@@ -1846,18 +1852,16 @@ const Walk = struct {
         const f = w.flow.functions.items[@backingInt(function)];
         const callee = try resolveCall(w.c, w.flow, f.file, at);
         switch (callee.kind) {
-            .source => {
-                for (w.excluded) |each| if (each.file == f.file and each.node == node) return null;
-                return .{ .file = f.file, .node = node };
-            },
+            .source => return w.read(f.file, node),
             .aegis => if (try parserOf(w.c, w.flow, f.file, at, callee.decl.?) != null) return null,
             .program => |target| {
                 const g = w.flow.functions.items[@backingInt(target)];
                 const tree = &w.c.project.at(g.file).file.tree;
                 for (try children(w.c, g.file, g.node)) |part| if (try w.returned(target, tree, part, depth)) |found| {
-                    // The innermost call into the function that holds the read names it.
+                    // The innermost call into the function that holds the read names it; a read
+                    // the walk found back out through the function's callers is not in it.
                     var named = found;
-                    if (named.via == null) named.via = .{ .file = f.file, .node = node };
+                    if (named.via == null and owner(w.flow, named.file, named.node) == target) named.via = .{ .file = f.file, .node = node };
                     return named;
                 };
             },
@@ -1908,7 +1912,7 @@ const Walk = struct {
             const made = tree.fullCall(&buffer, node) orelse continue;
             for (made.ast.params) |arg| if (rootDecl(model, tree, arg) == d) {
                 const callee = try resolveCall(w.c, w.flow, f.file, made);
-                if (callee.kind == .source) return .{ .file = f.file, .node = node };
+                if (callee.kind == .source) if (w.read(f.file, node)) |found| return found;
             };
         }
         return null;
@@ -1920,7 +1924,10 @@ const Walk = struct {
         const stores = try storeSites(w.c, w.flow);
         for ((stores.map.get(decl) orelse return null).items) |site| {
             const f = w.flow.functions.items[@backingInt(site.function)];
-            if (site.read) return .{ .file = f.file, .node = site.node };
+            if (site.read) {
+                if (w.read(f.file, site.node)) |found| return found;
+                continue;
+            }
             if (!try w.carries(site.function, site.node)) continue;
             if (try w.from(site.function, site.node, depth + 1)) |found| return found;
         }
