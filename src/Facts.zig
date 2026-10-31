@@ -1616,6 +1616,8 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
             .alternatives => return self.map(p.*, name, memberValue),
             else => return sequence(lhs, name),
         },
+        // An array's one member is its length, a number.
+        .array => return if (std.mem.eql(u8, name, "len")) .scalar else .{ .unknown = .unresolved },
         .unknown => return lhs,
         else => return .{ .unknown = .unresolved },
     };
