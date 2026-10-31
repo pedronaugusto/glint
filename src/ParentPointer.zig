@@ -507,8 +507,12 @@ const Follow = struct {
             return f.stays(file, parent);
         }
         if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr == node) return false;
+            if (branch.ast.cond_expr == node) return f.tested(file, parent, branch.payload_token, branch.error_token);
             return f.stays(file, parent);
+        }
+        if (tree.fullWhile(parent)) |loop| {
+            if (loop.ast.cond_expr == node) return f.tested(file, parent, loop.payload_token, loop.error_token);
+            return false;
         }
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| {
@@ -556,6 +560,20 @@ const Follow = struct {
             const container = (if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, parent)) orelse return false;
             const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(first - 2))) orelse return false;
             return f.field(decl);
+        }
+        return false;
+    }
+
+    /// An optional pointer an `if` or `while` tests (`while (it) |n|`): compared with null, and
+    /// its capture holds the pointer, followed as a local. A capture of its address (`|*n|`) or
+    /// an error union's shows nothing.
+    fn tested(f: *Follow, file: Project.FileId, owner: Ast.Node.Index, payload: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex) Context.Error!bool {
+        if (error_token != null) return false;
+        const token = payload orelse return true;
+        const tree = &f.c.project.at(file).file.tree;
+        if (tree.tokenTag(token) != .identifier) return false;
+        for (f.c.project.at(file).model.declarations, 0..) |each, d| {
+            if (each.kind == .capture and each.node == owner and each.token == token) return f.local(file, @fromBackingInt(@intCast(d)));
         }
         return false;
     }
@@ -788,8 +806,14 @@ fn nodeSource(c: *Context, file: Project.FileId, node: Ast.Node.Index, field: Fi
             const variable = tree.fullVarDecl(decl.node) orelse return null;
             var found: ?Source = null;
             if (variable.ast.init_node.unwrap()) |init| found = (try nodeSource(c, file, init, field, list, index, depth + 1)) orelse return null;
-            // Every later value put in it, out of the same list.
+            // Every later value put in it, out of the same list; its address writes it
+            // wherever that goes.
             for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag == .address_of) {
+                    const operand = strip(tree, tree.nodeData(@fromBackingInt(@intCast(i))).node);
+                    if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |ref| if (ref.declaration == index) return null;
+                    continue;
+                }
                 if (tag != .assign) continue;
                 const target, const value = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
                 if (tree.nodeTag(target) != .identifier) continue;
@@ -831,7 +855,8 @@ fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: Lis
 /// Whether every way the package puts a node into a list that may be `source`'s puts `&c.F`
 /// of a C: std's insertions (`append`, `prepend`, `insertAfter`, `insertBefore`, a node's
 /// `insertAfter`), each reached by its declaration and called there on a list or a node, and
-/// a store to a list's or node's links. A list moved into another (`concatByMoving`) is shown
+/// a store to a list's or node's links, which may carry a node out of that same list and no
+/// other (`p.free.first = p.busy.first` mixes them). A list moved into another (`concatByMoving`) is shown
 /// nothing of. An insertion named any other way (`@call`, `const add = L.append`, a type's
 /// member read out), a link's address, or a `@field` that may name either, shows nothing.
 fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Context.Error!bool {
@@ -878,7 +903,12 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
         const value = strip(tree, tree.nodeData(parent).node_and_node[1]);
         if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
         const stored = (try nodeSource(c, use.file, value, field, list, null, 0)) orelse return false;
-        if (stored == .same) return false;
+        // A C's own node anywhere; a node out of a list only into that same list's links.
+        if (stored == .any) continue;
+        if (stored != .list) return false;
+        const receiver = tree.nodeData(use.node).node_and_token[0];
+        const into: Source = (try listOf(c, use.file, receiver, list)) orelse (try nodeSource(c, use.file, receiver, field, list, null, 0)) orelse return false;
+        if (into != .list or !std.meta.eql(into.list, stored.list)) return false;
     };
     // `@field(l, "first")`, `@field(L, "append")`: named so, a link or an insertion.
     for (c.project.sources) |*each| {

@@ -166,6 +166,7 @@ const std_files = [_]sources.Extra{
     \\pub fn append(list: *DoublyLinkedList, new_node: *Node) void { list.last = new_node; }
     \\pub fn prepend(list: *DoublyLinkedList, new_node: *Node) void { list.first = new_node; }
     \\pub fn popFirst(list: *DoublyLinkedList) ?*Node { return list.first; }
+    \\pub fn concatByMoving(list1: *DoublyLinkedList, list2: *DoublyLinkedList) void { list1.last = list2.last; list2.* = .{}; }
     },
     .{ .name = "std/ascii.zig", .bytes =
     \\pub fn lowerString(output: []u8, ascii_string: []const u8) []u8 { for (ascii_string, 0..) |c, i| output[i] = c; return output[0..ascii_string.len]; }
@@ -1320,6 +1321,36 @@ test "A019 clears a parent pointer an intrusive list's node shows, where every i
     try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, copied.lines[0..copied.findings]);
     const wrong = try runEdited(pack.unsafe_set, list_program, "            const c: *Conn = @fieldParentPtr(\"node\", n);\n            total += c.id;", "            const c: *Other = @fieldParentPtr(\"node\", n);\n            total += c.tag;");
     try std.testing.expectEqualSlices(u32, &.{15}, wrong.lines[0..wrong.findings]);
+}
+
+test "A019 clears a list's nodes walked through an optional's capture, and nothing a list is given another way" {
+    // Clean: walked back from `last`, the capture read through `prev`.
+    const back = try runEdited(pack.unsafe_set, list_program, "        var it = p.free.first;\n        while (it) |n| : (it = n.next) {", "        var it = p.free.last;\n        while (it) |n| : (it = n.prev) {");
+    try std.testing.expectEqual(@as(usize, 0), back.findings);
+    // Findings: another type's node put in through `@call`, a function value, a link named by
+    // `@field`, a literal, a node literal linked in, a list built elsewhere moved in or
+    // concatenated, a link of another list stored in this one's or in a node's.
+    const at_call = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    @call(.auto, std.DoublyLinkedList.append, .{ &p.free, &o.node });");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, at_call.lines[0..at_call.findings]);
+    const value = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    const add = std.DoublyLinkedList.append;\n    add(&p.free, &o.node);");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, value.lines[0..value.findings]);
+    const named = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    @field(p.free, \"first\") = &o.node;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, named.lines[0..named.findings]);
+    const literal = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    p.free = .{ .first = &o.node, .last = &o.node };");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, literal.lines[0..literal.findings]);
+    const node_literal = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    c.node = .{ .next = &o.node, .prev = null };\n    p.free.last = &c.node;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, node_literal.lines[0..node_literal.findings]);
+    const moved = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    var b: std.DoublyLinkedList = .{};\n    b.append(&o.node);\n    p.free = b;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, moved.lines[0..moved.findings]);
+    const concatenated = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    var b: std.DoublyLinkedList = .{};\n    b.append(&o.node);\n    std.DoublyLinkedList.concatByMoving(&p.free, &b);");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, concatenated.lines[0..concatenated.findings]);
+    const other_list = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    var b: std.DoublyLinkedList = .{};\n    b.append(&o.node);\n    p.free.first = b.first;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, other_list.lines[0..other_list.findings]);
+    const other_node = try runEdited(pack.unsafe_set, list_program, "    o.tag = 1;", "    var b: std.DoublyLinkedList = .{};\n    b.append(&o.node);\n    c.node.next = b.first;");
+    try std.testing.expectEqualSlices(u32, &.{ 9, 15 }, other_node.lines[0..other_node.findings]);
+    // Finding: the walked local written through its address, which no list shows.
+    const through = try runEdited(pack.unsafe_set, list_program, "        var it = p.free.first;", "        var it = p.free.first;\n        const alias = &it;\n        alias.* = null;");
+    try std.testing.expectEqualSlices(u32, &.{17}, through.lines[0..through.findings]);
 }
 
 test "A019 reads a buffer a std count filled where its count is all of it, a limited reader's buffer, and a generator's bytes" {
