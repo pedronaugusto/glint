@@ -6511,6 +6511,50 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
+test "A020 and A009 read a flag given only literals by the conditions it is given them under" {
+    // `if (total == seed) more = false`: `while (more)` runs as long as the peer's seed says.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const seed = try r.takeInt(u64, 0);
+        \\    var more = true;
+        \\    var total: u64 = 0;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        if (total == seed) more = false;
+        \\    }
+        \\    return total;
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, 0);
+        \\    var i: u64 = 0;
+        \\    var more = true;
+        \\    while (more) : (i += 1) {
+        \\        out.* +%= i;
+        \\        if (i == n) more = false;
+        \\    }
+        \\}
+    , 1);
+    // Under a condition the program sets, the same flag is bounded by the program.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io) u64 {
+        \\    _ = io;
+        \\    var more = true;
+        \\    var total: u64 = 0;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        if (total == 64) more = false;
+        \\    }
+        \\    return total;
+        \\}
+    , 0);
+}
+
 test "A020 takes a periodic point's counter only where it is declared before the loop and written by `=` and the compound operators alone: one made in the body starts again each pass, one destructured is set" {
     try expect(pack.cancellation,
         \\const std = @import("std");

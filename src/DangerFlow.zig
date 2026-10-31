@@ -69,7 +69,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                var decided: Decided = .{};
+                var decided: Decided = .{ .loop = node };
                 try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 for (decided.compared.items) |condition| {
                     if (clears(c, condition, loop.ast.then_expr)) continue;
@@ -326,7 +326,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             }
             // A `while` by what decides its condition (`decides`), or as `while (true)` where
             // nothing in it can change that (`invariant`); a `for` by each range's end.
-            var decided: Decided = .{};
+            var decided: Decided = .{ .loop = node };
             var unbounded = false;
             const body = if (tree.fullWhile(node)) |loop| body: {
                 unbounded = forever(tree, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
@@ -1199,6 +1199,8 @@ fn callSite(c: *Context, at: Taint.Site) Context.Error![]const u8 {
 /// What decides how long a `while` runs, read by meaning, not spelling (`decides`): A009 and
 /// A020 read a condition through it alike.
 const Decided = struct {
+    /// The loop judged: a condition at or around it does not decide its passes (`controls`).
+    loop: ?Ast.Node.Index = null,
     /// Each comparison the condition joins by `and`, `or` and `!`: its operands bound the loop.
     compared: std.ArrayList(Ast.Node.Index) = .empty,
     /// Any other leaf of a loop that takes a payload (`while (left) |n|`): a bound itself.
@@ -1237,18 +1239,59 @@ fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided
             if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |value| try decides(c, value, payload, into, depth + 1);
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 if (!assigns(tag)) continue;
-                const written, const value = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const written, const value = tree.nodeData(assignment).node_and_node;
                 const target = rootOf(tree, written);
                 if (tree.nodeTag(target) != .identifier) continue;
                 if (((model.reference(target) orelse continue).declaration orelse continue) != declared) continue;
                 // `left -= 1`, `left.? = n`: what it holds is its own arithmetic, read as itself.
                 if (tag != .assign or target != written) break;
                 try decides(c, value, payload, into, depth + 1);
+                // What decides whether it is given that value decides it too (`if (total ==
+                // seed) more = false`).
+                try controls(c, assignment, declared, payload, into, depth + 1);
             } else return;
         },
         else => if (comparison(tree.nodeTag(condition))) return into.compared.append(c.allocator, condition),
     }
     try (if (payload) &into.leaves else &into.truths).append(c.allocator, condition);
+}
+
+/// The conditions an assignment to `declared` runs under, up to that variable's block or the loop
+/// judged, each read as `decides` reads a loop's: an `if` or `while` condition, a `for`'s inputs, a `switch`'s
+/// operand, and the left of a `catch`, `orelse`, `and` or `or` whose right side holds it. A
+/// jump (a `break` or `return` before it) is not read here.
+fn controls(c: *Context, assignment: Ast.Node.Index, declared: Model.Declaration.Id, payload: bool, into: *Decided, depth: u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const block = model.scopes[@backingInt(model.declarations[@backingInt(declared)].scope)].node;
+    var at = assignment;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (parent == block or tree.nodeTag(parent) == .fn_decl or parent == into.loop) return;
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr != at) try controlled(c, branch.ast.cond_expr, declared, payload, into, depth);
+        } else if (tree.fullWhile(parent)) |loop| {
+            if (loop.ast.cond_expr != at) try controlled(c, loop.ast.cond_expr, declared, payload, into, depth);
+        } else if (tree.fullFor(parent)) |loop| {
+            if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) for (loop.ast.inputs) |each| try controlled(c, each, declared, payload, into, depth);
+        } else if (tree.fullSwitch(parent)) |choice| {
+            if (choice.ast.condition != at) try controlled(c, choice.ast.condition, declared, payload, into, depth);
+        } else switch (tree.nodeTag(parent)) {
+            .@"catch", .@"orelse", .bool_and, .bool_or => {
+                const lhs, _ = tree.nodeData(parent).node_and_node;
+                if (lhs != at) try controlled(c, lhs, declared, payload, into, depth);
+            },
+            else => {},
+        }
+    }
+}
+
+/// `decides` of a condition an assignment runs under, but the variable itself (`while (more)`
+/// around `more = false`), which its values already decide.
+fn controlled(c: *Context, condition: Ast.Node.Index, declared: Model.Declaration.Id, payload: bool, into: *Decided, depth: u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    if (tree.nodeTag(condition) == .identifier) if (c.project.at(c.file).model.reference(condition)) |reference| if (reference.declaration == declared) return;
+    try decides(c, condition, payload, into, depth);
 }
 
 /// Whether nothing a loop does can change its condition, so once true it is `while (true)`:
