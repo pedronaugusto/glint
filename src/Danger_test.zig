@@ -2064,6 +2064,61 @@ test "A010 reads a call's bound from what its function returns, a conversion's d
     , 1);
 }
 
+test "A009 reads a while condition by what decides it, as A020 does: a variable by each value it is given, a payload as a number, in a helper given no Io" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn task(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    try io.checkCancel();
+        \\    return try laundered(r) +% try payload(r);
+        \\}
+        \\fn laundered(r: *std.Io.Reader) !u64 {
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    var total: u64 = 0;
+        \\    var more = true;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        more = total != seed;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn payload(r: *std.Io.Reader) !u64 {
+        \\    var left: ?u32 = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    while (left) |n| {
+        \\        total +%= n;
+        \\        left = if (n == 0) null else n - 1;
+        \\    }
+        \\    return total;
+        \\}
+    , 3);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn task(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    try io.checkCancel();
+        \\    return try laundered(r) +% try payload(r);
+        \\}
+        \\fn laundered(r: *std.Io.Reader) !u64 {
+        \\    const seed = try r.takeInt(u16, .little);
+        \\    var total: u64 = 0;
+        \\    var more = true;
+        \\    while (more) {
+        \\        total +%= 1;
+        \\        more = total != seed;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn payload(r: *std.Io.Reader) !u64 {
+        \\    var left: ?u16 = try r.takeInt(u16, .little);
+        \\    var total: u64 = 0;
+        \\    while (left) |n| {
+        \\        total +%= n;
+        \\        left = if (n == 0) null else n - 1;
+        \\    }
+        \\    return total;
+        \\}
+    , 0);
+}
+
 test "A009 leaves a position the program checked against the memory's length, and an index a fixed array's length holds" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
