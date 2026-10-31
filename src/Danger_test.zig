@@ -41,6 +41,10 @@ const std_files = [_]sources.Extra{
     \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub fn recancel(io: @This()) void { _ = io; }
+    \\pub fn futexWait(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) error{Canceled}!void { _ = io; _ = ptr; _ = expected; }
+    \\pub fn futexWaitTimeout(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T, timeout: u64) error{Canceled}!void { _ = io; _ = ptr; _ = expected; _ = timeout; }
+    \\pub fn futexWaitUncancelable(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) void { _ = io; _ = ptr; _ = expected; }
+    \\pub fn futexWake(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, max_waiters: u32) void { _ = io; _ = ptr; _ = max_waiters; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Handle = @import("root").Handle;
@@ -5440,6 +5444,188 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
+test "A020 takes a periodic point's counter only where the function alone writes it: never one written through its address or a container's" {
+    // A helper given the counter's address sets it every pass, so `n % 64` never reaches 0; a
+    // container's counter any other code may set; each a counting-down form too.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\fn hold(n: *u32) void {
+        \\    n.* = 1;
+        \\}
+        \\pub fn byAddress(io: std.Io, flag: *bool) !void {
+        \\    var n: u32 = 0;
+        \\    while (true) {
+        \\        n += 1;
+        \\        hold(&n);
+        \\        if (n % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\pub fn downByAddress(io: std.Io, flag: *bool) !void {
+        \\    var left: u32 = 64;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        hold(&(left));
+        \\        if (left == 0) {
+        \\            left = 64;
+        \\            try io.checkCancel();
+        \\        }
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\var shared: u32 = 0;
+        \\pub fn byContainer(io: std.Io, flag: *bool) !void {
+        \\    while (true) {
+        \\        shared += 1;
+        \\        if (shared % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+    , 3);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn local(io: std.Io, flag: *bool) !void {
+        \\    var n: u32 = 0;
+        \\    while (true) {
+        \\        n += 1;
+        \\        if (n % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io, flag: *bool) !void {
+        \\    var left: u32 = 64;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 64;
+        \\            try io.checkCancel();
+        \\        }
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+    , 0);
+}
+
+test "A020 reads a loop bound by input by what bounds it: a for range's end, each comparison a while condition joins" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn ranged(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    for (0..n) |i| total +%= i;
+        \\    return total;
+        \\}
+        \\pub fn joined(io: std.Io, r: *std.Io.Reader, stop: *const bool) !u64 {
+        \\    _ = io;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n and !stop.*) : (i += 1) total +%= i;
+        \\    return total;
+        \\}
+    , 2);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn ranged(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    for (0..n) |i| {
+        \\        try io.checkCancel();
+        \\        total +%= i;
+        \\    }
+        \\    for (0..16) |i| total +%= i;
+        \\    return total;
+        \\}
+        \\pub fn joined(io: std.Io, r: *std.Io.Reader, stop: *const bool) !u64 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n and !stop.*) : (i += 1) {
+        \\        try io.checkCancel();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+    , 0);
+}
+
+test "A020 reads what decides how long a while runs by meaning: a variable by each value it is given, a payload or a call's truth from input, a condition nothing in the loop changes as while (true)" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var more = (try r.takeByte()) != 0;
+        \\    var total: u64 = 0;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    while (more) {
+        \\        total +%= seed;
+        \\        more = total != seed *% 7;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn count(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var left: ?u32 = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    while (left) |n| {
+        \\        total +%= n;
+        \\        left = if (n == 0) null else n - 1;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn stuck(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const go = (try r.takeByte()) & 1 != 0;
+        \\    var total: u64 = 0;
+        \\    while (go) total +%= 1;
+        \\    return total;
+        \\}
+        \\pub fn asked(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    var total: u64 = 0;
+        \\    while (notYet(total, seed)) total +%= 3;
+        \\    return total;
+        \\}
+        \\fn notYet(total: u64, seed: u64) bool {
+        \\    return total != seed;
+        \\}
+    , 4);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn churn(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    var more = (try r.takeByte()) != 0;
+        \\    var total: u64 = 0;
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    while (more) {
+        \\        try io.checkCancel();
+        \\        total +%= seed;
+        \\        more = total != seed *% 7;
+        \\    }
+        \\    return total;
+        \\}
+        \\pub fn varint(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    var more = true;
+        \\    var value: u64 = 0;
+        \\    while (more) {
+        \\        const b = try r.takeByte();
+        \\        value = value << 7 | (b & 0x7f);
+        \\        more = b & 0x80 != 0;
+        \\    }
+        \\    return value;
+        \\}
+        \\pub fn small(io: std.Io) u64 {
+        \\    _ = io;
+        \\    var i: u32 = 0;
+        \\    var total: u64 = 0;
+        \\    while (i != 16) : (i += 1) total +%= i;
+        \\    return total;
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");
@@ -5833,6 +6019,48 @@ test "A007 reads only aegis's guards as holding a container var's state, and a s
         \\const aegis = @import("aegis");
         \\var cell: aegis.Atomic(u32) = .init(0);
     , 0);
+}
+
+test "A007 finds std's synchronization a dependency names under its own name, held by the program, and a futex on a raw word" {
+    const dependency =
+        \\const std = @import("std");
+        \\pub const Lock = std.Io.Mutex;
+        \\pub fn Cell(comptime T: type) type {
+        \\    return std.atomic.Value(T);
+        \\}
+        \\pub const Plain = struct { n: u32 };
+        \\pub const Elsewhere = @import("missing.zig").Lock;
+    ;
+    // A field, an array of optionals, a cell a function makes, the program's alias (its one
+    // site), a type argument and a `return`'s value; a futex wake on a plain word.
+    const found = try runWithDependency(pack.shared_state,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\const Shared = struct { lock: dep.Lock = .init, many: [2]?dep.Lock, hits: dep.Cell(u32) };
+        \\const Lock = dep.Lock;
+        \\const Again = struct { lock: Lock };
+        \\pub fn make(a: anytype) !*dep.Lock { return a.create(dep.Lock); }
+        \\pub fn Made() type { return dep.Lock; }
+        \\pub fn open(io: std.Io, word: *u32) void { io.futexWake(u32, word, 1); }
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 7), found.findings);
+    // Borrowed, a type the dependency makes that holds no lock, test code.
+    const clean = try runWithDependency(pack.shared_state,
+        \\const dep = @import("dep");
+        \\const Borrow = struct { lock: *dep.Lock, cell: ?*const dep.Cell(u32), plain: dep.Plain };
+        \\pub fn f(l: *dep.Lock) *dep.Lock { return l; }
+        \\test { var lock: dep.Lock = .init; lock.lock(); }
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 0), clean.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 0), clean.findings);
+    // A type the dependency names that does not resolve may be one: undecided, never clean.
+    const unknown = try runWithDependency(pack.shared_state,
+        \\const dep = @import("dep");
+        \\const Held = struct { lock: [2]dep.Elsewhere };
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 1), unknown.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }
 
 test "A013 reads std's assert called through any alias the program declares, public too, and leaves one taken as a value undecided" {

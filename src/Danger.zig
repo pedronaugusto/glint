@@ -26,7 +26,11 @@ const Ast = std.zig.Ast;
 /// guards no data of its own (what it announces is judged where it is held).
 pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "atomic.Value", "atomic.Mutex" };
-    const held = try governedHeld(c, rule, &sync, "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards");
+    const message = "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards";
+    const held = try heldUnderOtherNames(c, rule, &sync, try governedHeld(c, rule, &sync, message), message);
+    // A futex is a lock or a signal made by hand on a word the program writes as it likes.
+    const futex = [_][]const u8{ "Io.futexWait", "Io.futexWaitTimeout", "Io.futexWaitUncancelable", "Io.futexWake" };
+    try governed(c, rule, &futex, true, "{s}: a wait or wake on a word the program synchronizes by hand; aegis Atomic, Condition or Once holds the state it signals, Io.Event a signal alone");
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -524,8 +528,9 @@ pub fn lifetimes(c: *Context, rule: Rule) Context.Error!void {
 
 /// A007's synchronization types: each place the program holds one (a field, a variable, a
 /// value it makes), never a pointer that borrows one held elsewhere or a member named through
-/// the type (`Io.Event.Error`). The sites' tokens, for the variables they type.
-fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime message: []const u8) Context.Error![]const Ast.TokenIndex {
+/// the type (`Io.Event.Error`). The held sites' tokens, for the variables they type, with every
+/// site's token and the declarations, for the types named under other names.
+fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime message: []const u8) Context.Error!Held {
     const targets = try c.allocator.alloc(Governed.Target, paths.len);
     const indexes = try c.allocator.alloc(usize, paths.len);
     for (paths, targets, indexes, 0..) |path, *target, *index, i| {
@@ -536,13 +541,126 @@ fn governedHeld(c: *Context, rule: Rule, paths: []const []const u8, comptime mes
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
     var held: std.ArrayList(Ast.TokenIndex) = .empty;
+    var named: std.ArrayList(Ast.TokenIndex) = .empty;
     for (sites.items) |site| {
+        try named.append(c.allocator, site.token);
         if (site.through_alias or c.inTest(site.token)) continue;
         if (try borrowed(c, site.node)) continue;
         try held.append(c.allocator, site.token);
         try c.at(rule, site.token, try c.allocator.print(message, .{paths[site.index]}));
     }
+    return .{ .tokens = held.items, .named = named.items, .found = found };
+}
+
+const Held = struct {
+    tokens: []const Ast.TokenIndex,
+    /// Every site spelling a governed name, held or not: each is judged by that name.
+    named: []const Ast.TokenIndex,
+    found: []const Governed.Governed,
+};
+
+/// A synchronization type a declaration outside the program names under its own name (a
+/// dependency's `pub const Lock = std.Io.Mutex`, a function returning `std.atomic.Value(T)`),
+/// held by the program: a field's or variable's type, a constant's or a `return`'s value, or
+/// a call's type argument (`allocator.create(dep.Lock)`) that resolves to one by value, past
+/// arrays, optionals and error unions. One the program names through its own alias is that
+/// alias's site; one that spells a governed name is judged by it. A field's or variable's type
+/// so named that does not resolve is undecided: it may be one. The held tokens, with `found`'s.
+fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found: Held, comptime message: []const u8) Context.Error![]const Ast.TokenIndex {
+    const tree = &c.project.at(c.file).file.tree;
+    var held: std.ArrayList(Ast.TokenIndex) = .empty;
+    try held.appendSlice(c.allocator, found.tokens);
+    const Candidate = struct { node: Ast.Node.Index, kind: bool };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        candidates.clearRetainingCapacity();
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullContainerField(node)) |field| {
+            if (field.ast.type_expr.unwrap()) |kind| try candidates.append(c.allocator, .{ .node = kind, .kind = true });
+        } else if (tree.fullVarDecl(node)) |variable| {
+            if (variable.ast.type_node.unwrap()) |kind| try candidates.append(c.allocator, .{ .node = kind, .kind = true });
+            if (variable.ast.init_node.unwrap()) |value| try candidates.append(c.allocator, .{ .node = value, .kind = false });
+        } else if (tree.fullCall(&buffer, node)) |call| {
+            for (call.ast.params) |param| try candidates.append(c.allocator, .{ .node = param, .kind = false });
+        } else if (tag == .@"return") {
+            if (tree.nodeData(node).opt_node.unwrap()) |value| try candidates.append(c.allocator, .{ .node = value, .kind = false });
+        }
+        for (candidates.items) |candidate| {
+            const token = tree.firstToken(candidate.node);
+            if (c.inTest(token) or within(tree, found.named, candidate.node)) continue;
+            if (!try namedOutside(c, candidate.node)) continue;
+            const value = try c.facts.resolve(c.file, candidate.node);
+            if (candidate.kind and !heldKnown(value)) {
+                try c.undecided(rule, tree.tokenStart(token), .unresolved, "a type a declaration outside the program names does not resolve: it may hold std's synchronization");
+                continue;
+            }
+            const index = (try syncType(c, found.found, value)) orelse continue;
+            try held.append(c.allocator, token);
+            try c.at(rule, token, try c.allocator.print(message, .{paths[index]}));
+        }
+    }
     return held.items;
+}
+
+/// Whether what a type holds by value is known, past arrays, optionals and error unions.
+fn heldKnown(value: Facts.Value) bool {
+    return switch (value) {
+        .array, .optional, .error_union => |inner| heldKnown(inner.*),
+        else => value.known(),
+    };
+}
+
+/// Whether a type expression reaches its type through a declaration outside the program's
+/// files, read past arrays, optionals, error unions and the function a call makes it with.
+fn namedOutside(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    var at = node;
+    while (true) {
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullArrayType(at)) |array| {
+            at = array.ast.elem_type;
+        } else if (tree.fullCall(&buffer, at)) |call| {
+            at = call.ast.fn_expr;
+        } else switch (tree.nodeTag(at)) {
+            .optional_type => at = tree.nodeData(at).node,
+            .error_union => at = tree.nodeData(at).node_and_node[1],
+            .identifier, .field_access => {
+                const decl = (try c.facts.definition(c.file, at)) orelse return false;
+                return !c.project.at(decl.file).input.selected;
+            },
+            else => return false,
+        }
+    }
+}
+
+/// The index of the governed synchronization type `value` is, a type by value: a container
+/// one of `found` declares, or one a governed function makes (its scope lies in the
+/// function's body), past arrays, optionals and error unions, or any alternative that is one.
+fn syncType(c: *Context, found: []const Governed.Governed, value: Facts.Value) Context.Error!?usize {
+    switch (value) {
+        .array, .optional, .error_union => |inner| return syncType(c, found, inner.*),
+        .alternatives => |each| {
+            for (each) |one| if (try syncType(c, found, one)) |index| return index;
+        },
+        .container => |held| for (found) |g| for (g.decls) |decl| {
+            const model = &c.project.at(decl.file).model;
+            const record = model.declarations[@backingInt(decl.index)];
+            if (record.kind == .function) {
+                if (held.file != decl.file) continue;
+                // The declaration's node is its prototype; its body ends the `fn` around it.
+                const tree = &c.project.at(decl.file).file.tree;
+                const whole = model.parentOf(record.node) orelse record.node;
+                const scope = model.scopes[@backingInt(held.scope)];
+                if (scope.first >= tree.firstToken(whole) and scope.last <= tree.lastToken(whole)) return g.index;
+            } else switch (try c.facts.declaration((try c.facts.origin(decl)) orelse decl)) {
+                .container => |sync| if (sync.file == held.file and sync.scope == held.scope) return g.index,
+                else => {},
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 /// Whether a type named at `node` stands behind a pointer, names a member of the type that is

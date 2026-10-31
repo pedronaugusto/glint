@@ -277,17 +277,39 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         if (held.file != io_type.file or held.scope != io_type.scope) continue;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const loop = tree.fullWhile(node) orelse continue;
+            // A `while` by what decides its condition (`decides`), or as `while (true)` where
+            // nothing in it can change that (`invariant`); a `for` by each range's end.
+            var bounds: std.ArrayList(Ast.Node.Index) = .empty;
+            var truths: std.ArrayList(Ast.Node.Index) = .empty;
+            var unbounded = false;
+            const body = if (tree.fullWhile(node)) |loop| body: {
+                unbounded = forever(tree, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
+                if (!unbounded) try decides(c, loop.ast.cond_expr, loop.payload_token != null, &bounds, &truths, 0);
+                break :body loop.ast.then_expr;
+            } else if (tree.fullFor(node)) |loop| body: {
+                for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try bounds.append(c.allocator, end);
+                break :body loop.ast.then_expr;
+            } else continue;
             if (!within(c, node, decl.node) or !site(c, node)) continue;
-            const cond = loop.ast.cond_expr;
-            const unbounded = forever(tree, cond);
             var by_input = false;
-            if (!unbounded and comparison(tree.nodeTag(cond))) {
-                const lhs, const rhs = tree.nodeData(cond).node_and_node;
-                by_input = (try ranged(c, flow, lhs)).join(try ranged(c, flow, rhs)).reaches(.number);
+            var unknown = false;
+            for (bounds.items) |bound| {
+                const level = try ranged(c, flow, bound);
+                by_input = by_input or level.reaches(.number);
+                unknown = unknown or level == .unknown;
             }
-            if (!unbounded and !by_input) continue;
-            if (try cancels(c, c.file, loop.ast.then_expr, 0, false)) continue;
+            for (truths.items) |truth| {
+                const level = try Taint.levelAt(c, flow, c.file, truth);
+                by_input = by_input or level.reaches(.data);
+                unknown = unknown or level == .unknown;
+            }
+            if (!unbounded and !by_input and !unknown) continue;
+            if (try cancels(c, c.file, body, 0, false)) continue;
+            // A bound the input fact cannot read may be one a peer sets: never cleared.
+            if (!unbounded and !by_input) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a loop bounded by a value that passed through a call that does not resolve, which may be input, with no cancellation point");
+                continue;
+            }
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
         }
     }
@@ -745,26 +767,28 @@ fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.No
 /// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`) every pass of the loop whose body is
 /// `body`, by its continue expression or a statement on every pass, and nothing else in the
 /// loop assigns it but, where `reset` is given, a constant other than zero set on every path
-/// through that branch.
+/// through that branch. The counter is a variable of the function whose address is never
+/// taken: one any other code may write (a container's, or one written through a pointer) is
+/// none.
 fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast.Node.Index, step: Ast.Node.Tag, reset: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const declared = (model.reference(counter) orelse return false).declaration orelse return false;
+    if (!localVariable(c, file, declared)) return false;
     const loop_node = model.parentOf(body) orelse return false;
     const cont: ?Ast.Node.Index = if (tree.fullWhile(loop_node)) |loop| loop.ast.cont_expr.unwrap() else null;
     var steps = false;
     var resets = false;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
-            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {},
-            else => continue,
-        }
+        if (!assigns(tag)) continue;
         const token = tree.nodeMainToken(node);
         if (token < tree.firstToken(loop_node) or token > tree.lastToken(loop_node)) continue;
-        const target, const value = tree.nodeData(node).node_and_node;
+        const written, const value = tree.nodeData(node).node_and_node;
+        const target = rootOf(tree, written);
         if (tree.nodeTag(target) != .identifier) continue;
         if ((model.reference(target) orelse continue).declaration != declared) continue;
+        if (target != written) return false;
         const one = tree.nodeTag(value) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "1");
         if (tag == step and one and (node == cont or try always(c, file, node, body, .{}))) {
             if (steps) return false;
@@ -965,6 +989,125 @@ fn comparisons(c: *Context, condition: Ast.Node.Index, out: *std.ArrayList(Ast.N
         .grouped_expression => try comparisons(c, tree.nodeData(condition).node_and_token[0], out),
         else => if (comparison(tree.nodeTag(condition))) try out.append(c.allocator, condition),
     }
+}
+
+/// What decides how long a `while` runs, read by meaning, not spelling: each operand of a
+/// comparison its condition joins by `and`, `or` and `!` is a bound (`bounds`); a variable of
+/// the function whose address it never takes is each value it is given, read the same way
+/// (`more = n != 0` bounds `while (more)` by `n`); any other leaf is a bound where the loop
+/// takes a payload (`while (left) |n|`), else a truth (`truths`) input may decide every pass
+/// (`while (self.more())`). Past `depth` a variable is a leaf.
+fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, bounds: *std.ArrayList(Ast.Node.Index), truths: *std.ArrayList(Ast.Node.Index), depth: u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    switch (tree.nodeTag(condition)) {
+        .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(condition).node_and_node;
+            try decides(c, lhs, payload, bounds, truths, depth);
+            return decides(c, rhs, payload, bounds, truths, depth);
+        },
+        .bool_not => return decides(c, tree.nodeData(condition).node, payload, bounds, truths, depth),
+        .grouped_expression => return decides(c, tree.nodeData(condition).node_and_token[0], payload, bounds, truths, depth),
+        .identifier => if (depth < 8) if (model.reference(condition)) |reference| if (reference.declaration) |declared| if (localVariable(c, c.file, declared)) {
+            const record = model.declarations[@backingInt(declared)];
+            if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.init_node.unwrap()) |value| try decides(c, value, payload, bounds, truths, depth + 1);
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (!assigns(tag)) continue;
+                const written, const value = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                const target = rootOf(tree, written);
+                if (tree.nodeTag(target) != .identifier) continue;
+                if (((model.reference(target) orelse continue).declaration orelse continue) != declared) continue;
+                // `left -= 1`, `left.? = n`: what it holds is its own arithmetic, read as itself.
+                if (tag != .assign or target != written) break;
+                try decides(c, value, payload, bounds, truths, depth + 1);
+            } else return;
+        },
+        else => if (comparison(tree.nodeTag(condition))) return bounds.appendSlice(c.allocator, &tree.nodeData(condition).node_and_node),
+    }
+    try (if (payload) bounds else truths).append(c.allocator, condition);
+}
+
+/// Whether nothing a loop does can change its condition, so once true it is `while (true)`:
+/// the condition is names, literals and the operators between them, and each name is a
+/// constant, a parameter, a capture, or a variable of the function (`localVariable`) that the loop never
+/// assigns. A call, a field or an element read may change with every pass.
+fn invariant(c: *Context, condition: Ast.Node.Index, loop: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    for (tree.firstToken(condition)..tree.lastToken(condition) + 1) |token| switch (tree.tokenTag(@intCast(token))) {
+        .identifier => {},
+        .number_literal, .char_literal, .l_paren, .r_paren, .bang, .keyword_and, .keyword_or, .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_left_equal, .angle_bracket_right, .angle_bracket_right_equal, .plus, .minus, .asterisk, .slash, .percent, .ampersand, .pipe, .caret, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .plus_percent, .minus_percent, .asterisk_percent => {},
+        else => return false,
+    };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < tree.firstToken(condition) or token > tree.lastToken(condition)) continue;
+        const reference = model.reference(node) orelse return false;
+        const declared = reference.declaration orelse {
+            if (reference.unknown == .primitive) continue;
+            return false;
+        };
+        const record = model.declarations[@backingInt(declared)];
+        switch (record.kind) {
+            .parameter, .capture => continue,
+            .variable => {},
+            else => return false,
+        }
+        const variable = tree.fullVarDecl(record.node) orelse return false;
+        if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) continue;
+        if (!localVariable(c, c.file, declared)) return false;
+        for (tree.nodes.items(.tag), 0..) |each, j| {
+            if (!assigns(each)) continue;
+            const at: Ast.Node.Index = @fromBackingInt(@intCast(j));
+            const written = tree.nodeMainToken(at);
+            if (written < tree.firstToken(loop) or written > tree.lastToken(loop)) continue;
+            const target = rootOf(tree, tree.nodeData(at).node_and_node[0]);
+            if (tree.nodeTag(target) != .identifier) continue;
+            if ((model.reference(target) orelse continue).declaration == declared) return false;
+        }
+    }
+    return true;
+}
+
+/// Whether a declaration is a variable of a function whose address it never takes: only the
+/// function's own assignments write it.
+fn localVariable(c: *Context, file: Project.FileId, declared: Model.Declaration.Id) bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const record = model.declarations[@backingInt(declared)];
+    if (record.kind != .variable) return false;
+    switch (model.scopes[@backingInt(record.scope)].kind) {
+        .file, .container => return false,
+        else => {},
+    }
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .address_of) continue;
+        var operand = tree.nodeData(@fromBackingInt(@intCast(i))).node;
+        while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
+        if (tree.nodeTag(operand) != .identifier) continue;
+        if ((model.reference(operand) orelse continue).declaration == declared) return false;
+    }
+    return true;
+}
+
+/// The name an assignment writes through: `x` of `x`, `x.?`, `x.f`, `x[i]`.
+fn rootOf(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .unwrap_optional, .field_access => at = tree.nodeData(at).node_and_token[0],
+        .array_access => at = tree.nodeData(at).node_and_node[0],
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        else => return at,
+    };
+}
+
+fn assigns(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => true,
+        else => false,
+    };
 }
 
 /// Whether every pass of a loop's body consumes input or lets its task be canceled, so a peer's
