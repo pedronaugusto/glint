@@ -1361,6 +1361,20 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
     try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { var text = try Bytes.init(gpa, 0); var w = Bytes.Writer.init(&text, gpa); w.interface.end = 0; }", pack.cleanup, true, 1);
 }
 
+test "an adoption of an allocation freed, changed or kept elsewhere before it is reported" {
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize, keep: *[]u8) !Bytes { const buffer = try gpa.alloc(u8, n); keep.* = buffer; return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // Two owners of one allocation: the second adoption is reported, the first is not handed
+    // over alone.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) ![2]Bytes { const buffer = try gpa.alloc(u8, n); return .{ try Bytes.adopt(buffer, n), try Bytes.adopt(buffer, n) }; }", pack.capacity, false, 1);
+    // Its elements written and its length read leave it whole.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (buffer.len != n) return error.Short; buffer[0] = 1; @memset(buffer[1..], 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+}
+
 test "an adoption of a whole byte allocation, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
