@@ -1134,7 +1134,7 @@ test "A019 reads every file a path import joins to the program, selected or not:
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
 }
 
-const dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
+const generic_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
     \\pub fn grab(x: anytype) usize { const copy = @field(x, "interface"); return copy.end; }
     \\pub fn named(x: anytype, comptime name: []const u8) usize { const copy = @field(x, name); return copy.end; }
     \\pub fn print(args: anytype) usize { inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |f| { const v = @field(args, f.name); _ = v; } return 0; }
@@ -1146,7 +1146,7 @@ const dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
 /// `interface_program` returning `value`, with the dependency imported and `extra` declared.
 fn handed(comptime value: []const u8, comptime extra: []const u8) !Run {
     const program = comptime edited(edited(interface_program, "    return s.count + s.interface.end;", "    return " ++ value ++ ";"), "pub fn use() !usize {", "const dep = @import(\"dep\");\n" ++ extra ++ "pub fn use() !usize {");
-    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
+    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{generic_dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
 }
 
 test "A019 follows a parent handed to a generic outside the program into its body, where a copy of the field by its name or a computed one leaves the conversion a finding" {
