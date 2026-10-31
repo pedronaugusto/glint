@@ -808,7 +808,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             const site = &c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.nodeMainToken(copy.site.node))) + 1;
             switch (try perBuild(c, try instanceOf(c, value))) {
-                .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), try c.allocator.print("this binding makes the integer {s}:{d} casts by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{ c.project.at(copy.site.file).input.name, line })),
+                .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), try c.allocator.print("this binding makes the integer {s}:{d} makes or reads by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
                 .unknown => if (!bindingTyped(value)) try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve"),
             }
@@ -3094,6 +3094,8 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
+    // Of a value a generic parameter gives: each binding's, checked there.
+    if (try c.facts.castAtBinding(c.file, node)) return false;
     return rawCall(c, call.ast.fn_expr, call.ast.params, tree.nodeMainToken(node));
 }
 
@@ -3153,6 +3155,7 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             }
             // `@call(modifier, Index.raw, .{s})`.
             if (std.mem.eql(u8, name, "@call") and args.len == 3) {
+                if (try c.facts.castAtBinding(c.file, node)) return false;
                 var tuple_buffer: [2]Ast.Node.Index = undefined;
                 const tuple = tree.fullArrayInit(&tuple_buffer, args[2]) orelse return false;
                 return rawCall(c, args[1], tuple.ast.elements, tree.nodeMainToken(node));
