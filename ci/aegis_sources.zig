@@ -165,7 +165,7 @@ fn imports() [62]Project.Import {
 pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     var inputs: [sources.len + 1]Project.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
-    for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
     return Project.init(gpa, &inputs, &imports(), .{});
 }
 
@@ -183,7 +183,7 @@ pub fn projectWithDependency(gpa: std.mem.Allocator, consumer: []const u8, lib: 
 fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, selected: bool) !glint.Project {
     var inputs: [sources.len + 2]Project.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
-    for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
     inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib, .selected = selected };
     const lib_file = sources.len + 1;
     const mapped = imports();
@@ -198,10 +198,13 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
 /// package `package` names (none where empty).
 pub const Extra = struct { name: []const u8, bytes: []const u8, package: []const u8 = "" };
 /// An import among the extra sources, by their index in what the caller gives; a null `from` is
-/// the consumer's, and a `target` of `consumer_file` the consumer itself.
+/// the consumer's, a `target` of `consumer_file` the consumer itself and of `aegis_file` aegis's
+/// root.
 pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target: u32 };
 /// The consumer, as an `ExtraImport`'s target.
 pub const consumer_file: u32 = std.math.maxInt(u32);
+/// Aegis's root, as an `ExtraImport`'s target.
+pub const aegis_file: u32 = std.math.maxInt(u32) - 1;
 
 /// Writes the pinned files under `dir` as aegis lays them out, and each `.zig` file one of
 /// them imports that is not among them as an empty file: a tree glint loads from disk, whose
@@ -240,7 +243,8 @@ pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []cons
     for (sources, 1..) |source, i| {
         const replaced = std.mem.eql(u8, source.name, name);
         revised = revised or replaced;
-        inputs[i] = .{ .name = source.name, .bytes = if (replaced) bytes else source.bytes, .selected = false };
+        inputs[i] = aegisInput(source);
+        if (replaced) inputs[i].bytes = bytes;
     }
     if (!revised) return error.FileNotFound;
     const mapped = imports();
@@ -257,13 +261,22 @@ pub fn projectInPackage(gpa: std.mem.Allocator, consumer: []const u8, package: [
     const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);
     defer gpa.free(inputs);
     inputs[0] = .{ .name = "consumer", .bytes = consumer, .package = package };
-    for (sources, 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false };
+    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
     for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = source.package };
     const mapped = imports();
     const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len);
     defer gpa.free(all);
     @memcpy(all[0..mapped.len], &mapped);
     const first: u32 = sources.len + 1;
-    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = if (entry.target == consumer_file) 0 else first + entry.target };
+    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = switch (entry.target) {
+        consumer_file => 0,
+        aegis_file => root,
+        else => first + entry.target,
+    } };
     return Project.init(gpa, inputs, all, .{});
+}
+
+/// An aegis source as a caller states it: not selected, a file of aegis's package.
+fn aegisInput(source: anytype) Project.Input {
+    return .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = glint.AegisPack.package.name, .fingerprint = glint.AegisPack.package.fingerprint };
 }

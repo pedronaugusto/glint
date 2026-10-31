@@ -51,6 +51,10 @@ pub const Input = struct {
     /// the caller states it. Empty when unknown. A policy names packages by it (an owner of a
     /// disallowed declaration).
     package: []const u8 = "",
+    /// That package's identity: the fingerprint its `build.zig.zon` gives, as the caller states
+    /// it. Null when unknown. A library the analyses know (aegis) is known by its name and
+    /// this, under whatever name a program imports it.
+    fingerprint: ?u64 = null,
 };
 /// A module edge selected and resolved by the caller, never by a path hash: `from` and `target`
 /// are positions in the inputs given to `init`.

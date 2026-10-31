@@ -306,6 +306,10 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     var tree = try tmp.dir.openDir(std.testing.io, "aegis", .{});
     defer tree.close(std.testing.io);
     try aegis_sources.writeTree(a, std.testing.io, tree);
+    // Aegis's package, by the manifest a dependency's tree holds: its name and fingerprint.
+    const manifest = try std.fmt.allocPrint(a, ".{{ .name = .aegis, .version = \"0.2.1\", .fingerprint = 0x{x}, .paths = .{{\"\"}} }}\n", .{glint.AegisPack.package.fingerprint});
+    defer a.free(manifest);
+    try tree.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = manifest });
     var status: u8 = undefined;
     // No aegis: off, and no line.
     const off = try runOn(a, &tmp, &.{}, "plain.zig", &status);

@@ -38,18 +38,19 @@ pub const diagnostics = Ids.diagnostics;
 pub const unsafe_set = Ids.unsafe_set;
 pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
+/// Aegis's package, as its `build.zig.zon` names it: a caller states it for aegis's files.
+pub const package = Contract.package;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
-/// The first file outside aegis whose import resolves to an aegis module, by what the module's
-/// root publishes: the pack is on for a program that imports aegis, whatever it names it after.
-/// A module of aegis's name that publishes something else is not aegis.
+/// The first file outside aegis whose import resolves to an aegis module: a file of aegis's
+/// package (`Facts.moduleRoots`), whatever the program names it after, that publishes what
+/// the module does. A module of aegis's name that publishes something else is not aegis.
 pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveError!?Project.FileId {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    var facts: Facts = .{ .project = project, .gpa = arena.allocator(), .known = &Contract.known };
-    const aegis_files = &(try facts.outside()).known_files;
+    var facts: Facts = .{ .project = project, .gpa = arena.allocator(), .known = Contract.package };
     for (project.imports) |mapping| {
-        if (aegis_files.contains(@backingInt(mapping.from))) continue;
+        if (facts.knownFile(mapping.from)) continue;
         for (Contract.library.modules) |module| {
             if (std.mem.findScalar(Project.FileId, try facts.moduleRoots(module), mapping.target) == null) continue;
             if (try facts.publishes(module, mapping.target)) return mapping.from;

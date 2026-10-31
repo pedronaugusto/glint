@@ -9,10 +9,10 @@ const Facts = @This();
 
 project: *const Project,
 gpa: std.mem.Allocator,
-/// The modules of the libraries the analyses know by their declarations (aegis's): their
-/// files, like std's, are not the program's (`program`). A module is known by its root, under
-/// whatever name a program imports it (`moduleRoots`).
-known: []const KnownModule = &.{},
+/// The library the analyses know by its declarations (aegis): its package's own files, like
+/// std's, are not the program's (`program`), under whatever name a program imports it. Only
+/// files the caller states are that package's: a module republishing it stays the program's.
+known: ?Package = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
 /// The sets of comptime `bool` parameters' values that the paths read so far settle, each once.
@@ -210,38 +210,37 @@ pub fn deinit(self: *Facts) void {
     self.* = undefined;
 }
 
-/// A module a library publishes, as `known` lists it: what the program imports it by, and the
-/// paths of its members, which name it by what its root publishes.
-pub const KnownModule = struct {
-    name: []const u8,
-    members: []const Member,
+/// A package by its identity: the name and fingerprint its `build.zig.zon` gives.
+pub const Package = struct { name: []const u8, fingerprint: u64 };
 
-    pub const Member = struct { path: []const u8, required: bool = true };
-};
+/// Whether `file` is one of the known library's own (`known`): its package is the library's,
+/// as the caller states it. A file whose package the caller does not state is not.
+pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
+    const library = self.known orelse return false;
+    const input = self.project.at(file).input;
+    return input.fingerprint == library.fingerprint and std.mem.eql(u8, input.package, library.name);
+}
 
-/// The files a module's root is: each the project maps the module's name to, and each other
-/// file an import reaches whose public declarations include every member the module requires.
-/// A library imported under another name, or by its path, is still that library; a module that
-/// requires nothing is known by its name alone. Found once per run.
+/// The files a module's root is: each file of the known library a file outside it imports,
+/// by the module's name or under another name where it publishes every member the module
+/// requires; and, where the caller states no package for the file, each the project maps the
+/// module's name to. A file of another stated package is not one, whatever it is named or
+/// republishes. Found once per run.
 pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
     const key = @intFromPtr(module.members.ptr);
     if (self.module_roots.get(key)) |found| return found;
     var required = false;
     for (module.members) |listed| required = required or listed.required;
     var roots: std.ArrayList(Project.FileId) = .empty;
-    var tried: FileSet = .empty;
-    defer tried.deinit(self.gpa);
     for (self.project.imports) |mapping| {
-        if (std.mem.eql(u8, mapping.spelling, module.name)) {
-            if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) == null) try roots.append(self.gpa, mapping.target);
-            continue;
-        }
-        if (!required) continue;
-        if (std.mem.eql(u8, mapping.spelling, "std") or std.mem.eql(u8, mapping.spelling, "builtin") or std.mem.eql(u8, mapping.spelling, "root")) continue;
-        if ((try tried.getOrPut(self.gpa, @backingInt(mapping.target))).found_existing) continue;
-        if (self.project.at(mapping.target).file.status != .parsed) continue;
         if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
-        if (try self.publishes(module, mapping.target)) try roots.append(self.gpa, mapping.target);
+        const named = std.mem.eql(u8, mapping.spelling, module.name);
+        if (self.knownFile(mapping.target)) {
+            // The library's own import of its parts is no program's import of a module.
+            if (self.knownFile(mapping.from)) continue;
+            if (!named and !(required and self.project.at(mapping.target).file.status == .parsed and try self.publishes(module, mapping.target))) continue;
+        } else if (!named or self.project.at(mapping.target).input.fingerprint != null) continue;
+        try roots.append(self.gpa, mapping.target);
     }
     try self.module_roots.put(self.gpa, key, roots.items);
     return roots.items;
@@ -661,17 +660,7 @@ pub fn outside(self: *Facts) ResolveError!*const Outside {
     found.project = self.project;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) try found.std_files.put(self.gpa, @backingInt(mapping.target), {});
     try self.reach(&found.std_files, .standard);
-    // A root imported by its path may be the program's own file republishing the module: only
-    // one imported by a module name is the library's, its own and what it reaches.
-    for (self.known) |module| {
-        const roots = try self.moduleRoots(module);
-        for (self.project.imports) |mapping| {
-            if (std.mem.findScalar(Project.FileId, roots, mapping.target) == null) continue;
-            if (!std.mem.eql(u8, mapping.spelling, module.name) and std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
-            try found.known_files.put(self.gpa, @backingInt(mapping.target), {});
-        }
-    }
-    try self.reach(&found.known_files, .library);
+    for (self.project.sources) |*source| if (self.knownFile(source.id)) try found.known_files.put(self.gpa, @backingInt(source.id), {});
     return found;
 }
 pub const Outside = struct {

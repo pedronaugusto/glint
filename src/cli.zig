@@ -43,6 +43,8 @@ const Loader = struct {
     roots: std.ArrayList([]const u8) = .empty,
     /// Package directories, canonical.
     packages: std.ArrayList(Module) = .empty,
+    /// Each directory's package as its nearest `build.zig.zon` names it, found once.
+    manifests: std.StringHashMapUnmanaged(?Manifest) = .empty,
     bytes: usize = 0,
 
     fn load(self: *Loader, path: []const u8, selected: bool) !usize {
@@ -67,7 +69,8 @@ const Loader = struct {
         const position = self.inputs.items.len;
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
-        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = self.packageOf(canonical) });
+        const package = try self.packageOf(canonical);
+        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = package.name, .fingerprint = package.fingerprint });
         try self.canonical_paths.append(self.a, canonical);
         try self.paths.put(self.a, canonical, position);
         return position;
@@ -81,13 +84,36 @@ const Loader = struct {
         return .{ .bytes = bytes };
     }
 
-    /// The package of the innermost directory holding `canonical`; empty when none does.
-    fn packageOf(self: *const Loader, canonical: []const u8) []const u8 {
+    /// The package of the innermost directory holding `canonical`: one `--package` names, or
+    /// the one the nearest `build.zig.zon` names, with its fingerprint; none where neither is.
+    fn packageOf(self: *Loader, canonical: []const u8) !Manifest {
         var best: ?Module = null;
         for (self.packages.items) |package| if (within(package.path, canonical)) {
             if (best == null or package.path.len > best.?.path.len) best = package;
         };
-        return if (best) |package| package.name else "";
+        var dir = std.Io.Dir.path.dirname(canonical);
+        while (dir) |at| : (dir = std.Io.Dir.path.dirname(at)) {
+            // A named package deeper than any manifest above it: its name, no identity.
+            if (best) |explicit| if (explicit.path.len > at.len) return .{ .name = explicit.name };
+            const found = (try self.manifest(at)) orelse continue;
+            if (best) |explicit| if (explicit.path.len == at.len) return .{ .name = explicit.name, .fingerprint = found.fingerprint };
+            return found;
+        }
+        return .{ .name = if (best) |explicit| explicit.name else "" };
+    }
+
+    /// The package `dir/build.zig.zon` names, with its fingerprint; null where there is none.
+    fn manifest(self: *Loader, dir: []const u8) !?Manifest {
+        if (self.manifests.get(dir)) |known| return known;
+        const path = try std.Io.Dir.path.join(self.a, &.{ dir, "build.zig.zon" });
+        const found: ?Manifest = if (aegis.own.readFileSentinel(self.io, std.Io.Dir.cwd(), path, self.a, .fromRaw(1024 * 1024), 0)) |bytes|
+            try Manifest.parse(self.a, bytes)
+        else |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+        try self.manifests.put(self.a, try self.a.dupe(u8, dir), found);
+        return found;
     }
 
     fn imports(self: *Loader) !void {
@@ -140,6 +166,36 @@ const Loader = struct {
         const path = try std.Io.Dir.path.resolveAlloc(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[spelling.from]) orelse ".", spelling.text });
         for (self.roots.items) |root| if (within(root, path)) return path;
         return error.ImportOutsideRoots;
+    }
+};
+
+/// A package as its `build.zig.zon` names it: `.name` and `.fingerprint`, each where written.
+const Manifest = struct {
+    name: []const u8 = "",
+    fingerprint: ?u64 = null,
+
+    fn parse(a: std.mem.Allocator, bytes: [:0]const u8) !Manifest {
+        var tree = try std.zig.Ast.parse(a, bytes, .{ .mode = .zon });
+        defer tree.deinit(a);
+        var result: Manifest = .{};
+        if (tree.errors.len != 0) return result;
+        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const root = tree.fullStructInit(&buffer, tree.rootDecls()[0]) orelse return result;
+        for (root.ast.fields) |field| {
+            const name_token = tree.firstToken(field) - 2;
+            const key = tree.tokenSlice(name_token);
+            const value = tree.tokenSlice(tree.nodeMainToken(field));
+            if (std.mem.eql(u8, key, "name")) {
+                result.name = try a.dupe(u8, switch (tree.nodeTag(field)) {
+                    .enum_literal => value,
+                    .string_literal => std.mem.trim(u8, value, "\""),
+                    else => continue,
+                });
+            } else if (std.mem.eql(u8, key, "fingerprint") and tree.nodeTag(field) == .number_literal) {
+                result.fingerprint = std.fmt.parseInt(u64, value, 0) catch null;
+            }
+        }
+        return result;
     }
 };
 

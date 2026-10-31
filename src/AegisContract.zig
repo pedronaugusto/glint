@@ -61,18 +61,10 @@ pub const Kind = enum {
 /// reports one that drops them (Context.drift). The same members are listed once per way aegis
 /// is imported: the root, and each namespace module a program may depend on alone.
 pub const library: Lib = .{ .modules = &modules };
-/// Aegis's modules, as `Facts.known` lists them: the files they reach are not the program's,
-/// as the analyses know aegis by its declarations, under whatever name it is imported.
-pub const known: [modules.len]Facts.KnownModule = blk: {
-    var list: [modules.len]Facts.KnownModule = undefined;
-    for (modules, &list) |module, *entry| {
-        var members: [module.members.len]Facts.KnownModule.Member = undefined;
-        for (module.members, &members) |listed, *member| member.* = .{ .path = listed.path, .required = listed.required };
-        const frozen = members;
-        entry.* = .{ .name = module.name, .members = &frozen };
-    }
-    break :blk list;
-};
+/// Aegis's package, as its `build.zig.zon` names it (`Facts.known`): its own files are not the
+/// program's, as the analyses know aegis by its declarations, under whatever name it is
+/// imported. Its fingerprint stays the same in every revision.
+pub const package: Facts.Package = .{ .name = "aegis", .fingerprint = 0x5e23831cba68ccae };
 const Lib = Library(Kind);
 const modules = [_]Lib.Module{
     .{ .name = "aegis", .members = &root_members },

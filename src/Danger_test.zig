@@ -1149,6 +1149,48 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, of_value.lines[0..of_value.findings]);
 }
 
+test "A019 reads a module republishing aegis beside code of its own as the program's: only aegis's own package leaves it" {
+    // `wrap` republishes all of aegis's root and names a field of what it cannot resolve as
+    // `interface`: the program's code, whose use of the field leaves the conversion a finding.
+    const wrap: sources.Extra = .{ .name = "wrap/root.zig", .package = "wrap", .bytes =
+        \\const aegis = @import("aegis");
+        \\pub const Atomic = aegis.Atomic;
+        \\pub const BlockingGuarded = aegis.BlockingGuarded;
+        \\pub const bounded = aegis.bounded;
+        \\pub const Condition = aegis.Condition;
+        \\pub const Confined = aegis.Confined;
+        \\pub const err = aegis.err;
+        \\pub const Guarded = aegis.Guarded;
+        \\pub const handle = aegis.handle;
+        \\pub const id = aegis.id;
+        \\pub const InitContext = aegis.InitContext;
+        \\pub const input = aegis.input;
+        \\pub const int = aegis.int;
+        \\pub const Lazy = aegis.Lazy;
+        \\pub const Once = aegis.Once;
+        \\pub const Order = aegis.Order;
+        \\pub const own = aegis.own;
+        \\pub const RwGuarded = aegis.RwGuarded;
+        \\pub const scope = aegis.scope;
+        \\pub const secret = aegis.secret;
+        \\pub const Secret = aegis.Secret;
+        \\pub const SecretBytes = aegis.SecretBytes;
+        \\pub const Shared = aegis.Shared;
+        \\pub const SpinRwGuarded = aegis.SpinRwGuarded;
+        \\pub const state = aegis.state;
+        \\pub const units = aegis.units;
+        \\pub fn peek() usize {
+        \\    const s = @import("hidden").get();
+        \\    return @field(s, "interface").end;
+        \\}
+        \\
+    };
+    const extra = &(std_files ++ [_]sources.Extra{wrap});
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wrap", .target = std_files.len }, .{ .from = std_files.len, .spelling = "aegis", .target = sources.aegis_file }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
+    const found = try runWith(pack.unsafe_set, comptime edited(interface_program, "const std = @import(\"std\");\n", "const std = @import(\"std\");\nconst wrap = @import(\"wrap\");\n"), extra, imports);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 12 }, found.lines[0..found.findings]);
+}
+
 const reflecting_dependency: sources.Extra = .{ .name = "reflect/root.zig", .bytes =
     \\pub fn count(value: anytype) usize {
     \\    var n: usize = 0;
