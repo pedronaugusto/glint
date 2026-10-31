@@ -119,7 +119,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn total(items: anytype) usize { return items.count(); }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -1124,6 +1124,44 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     // A field named as the program compiles may be the interface's.
     const computed = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    inline for (.{\"interface\"}) |name| try @field(s, name).writeAll(\"y\");\n    return s.count + s.interface.end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, computed.lines[0..computed.findings]);
+}
+
+const reflecting_dependency: sources.Extra = .{ .name = "reflect/root.zig", .bytes =
+    \\pub fn count(value: anytype) usize {
+    \\    var n: usize = 0;
+    \\    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |f| n += @field(value, f.name).len;
+    \\    return n;
+    \\}
+    \\pub fn fill(comptime T: type, value: T) T {
+    \\    var out: T = undefined;
+    \\    inline for (@typeInfo(T).@"struct".field_names) |name| @field(out, name) = @field(value, name);
+    \\    return out;
+    \\}
+    \\pub const Rule = struct { sets: struct { a: ?u8 = null } = .{} };
+    \\pub fn describe(comptime rules: []const Rule) usize {
+    \\    var n: usize = 0;
+    \\    inline for (rules) |rule| inline for (@typeInfo(@TypeOf(rule.sets)).@"struct".field_names) |name| {
+    \\        const v = @field(rule.sets, name) orelse continue;
+    \\        n += v;
+    \\    };
+    \\    return n;
+    \\}
+};
+
+test "A019 leaves to the follows what a dependency's generic reads by a computed name on what it is handed: one never handed the parent is no use of its interface" {
+    // Clean: generics reading, writing and testing each field by a computed name, and a function
+    // of comptime data doing so, given only what holds no interface; `count` is a name std calls
+    // on what it is given (mem.total), so its parameter is not bound by the program's calls.
+    const extra = &(std_files ++ [_]sources.Extra{reflecting_dependency});
+    const imports = &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "reflect", .target = std_files.len }});
+    const given = comptime edited(interface_program, "pub fn use() !usize {", "const reflect = @import(\"reflect\");\npub fn use() !usize {\n    _ = reflect.count(.{ .a = \"x\" }) + reflect.describe(&.{.{}});\n    _ = reflect.fill(struct { a: u8 }, .{ .a = 1 });");
+    const clean = try runWith(pack.unsafe_set, given, extra, imports);
+    try std.testing.expectEqual(@as(usize, 0), clean.findings);
+    try std.testing.expectEqual(@as(usize, 0), clean.undecided);
+    // Findings (11, the conversion and its alignment): the parent handed to one, which the follow
+    // takes into its body, where a computed name may be the interface's.
+    const parent = try runWith(pack.unsafe_set, comptime edited(given, "    _ = reflect.fill(struct { a: u8 }, .{ .a = 1 });", "    var t: Sink = .init();\n    _ = reflect.count(&t);"), extra, imports);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, parent.lines[0..parent.findings]);
 }
 
 test "A019 follows each pointer to an interface field to every place it goes: a copy of what it points at, a place of another type, or its functions read out leave the conversion a finding" {

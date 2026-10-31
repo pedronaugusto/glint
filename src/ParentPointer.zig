@@ -121,22 +121,28 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
         // to another interface: each read must take a function of it, or compare it.
         if (!try tableReadInPlace(c, decl.name, kind)) return false;
     }
-    // `@field(x, "vtable")` or `@field(x, "f")` of an interface names its functions too.
+    // `@field(x, "vtable")` or `@field(x, "f")` of an interface names its functions too. One
+    // written (`@field(out, name) = d`) installs, which the conversion it reaches judges.
     for (c.project.sources) |*each| {
         if (!try c.facts.program(each.id)) continue;
         const file_tree = &each.file.tree;
         for (file_tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!isBuiltin(file_tree, node, "@field")) continue;
+            if (each.model.parentOf(node)) |parent| if (file_tree.nodeTag(parent) == .assign and file_tree.nodeData(parent).node_and_node[0] == node) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(file_tree, node, &buffer);
             if (args.len != 2) continue;
             const receiver = try c.facts.resolve(each.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, kind)) continue;
+            if (receiver == .unknown and generic(file_tree, &each.model, node)) continue;
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
                 const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-                if (functionPointer(tree, declared) == null and tree.fullPtrType(declared) == null) continue;
+                if (functionPointer(tree, declared)) |_| {
+                    // A member of it read, indexed or iterated: no function pointer.
+                    if (notFunction(file_tree, &each.model, node)) continue;
+                } else if (tree.fullPtrType(declared) == null) continue;
                 if (try namedBy(c, file_tree, args[1], decl.name)) return false;
             }
         }
@@ -153,7 +159,7 @@ fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Contex
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (namespace(tree, model, receiver)) continue;
+            if (namespace(tree, model, receiver) or generic(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, kind)) continue;
@@ -203,7 +209,7 @@ fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, thr
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (namespace(tree, model, receiver) or notFunction(tree, model, use.node)) continue;
+            if (namespace(tree, model, receiver) or notFunction(tree, model, use.node) or generic(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
@@ -488,7 +494,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
         const receiver = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
         if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
         if (receiver == .unknown) {
-            if (namespace(tree, model, tree.nodeData(use.node).node_and_token[0])) continue;
+            if (namespace(tree, model, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
             return false;
         }
         const parent = model.parentOf(use.node) orelse return false;
@@ -499,19 +505,21 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             else => return false,
         }
     }
-    // `@field(x, "F")` names it too.
+    // `@field(x, "F")` names it too; written whole, as `x.F = v`, it stays in place.
     for (c.project.sources) |*source| {
         if (!try c.facts.program(source.id)) continue;
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!isBuiltin(tree, node, "@field")) continue;
+            if (source.model.parentOf(node)) |parent| if (tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == node) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 2) continue;
             // Of another type, it names none of C's fields.
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
+            if (receiver == .unknown and generic(tree, &source.model, node)) continue;
             if (try namedBy(c, tree, args[1], field.name)) return false;
         }
     }
@@ -1872,6 +1880,31 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
     var up = model.parentOf(node);
     while (up) |parent| : (up = model.parentOf(parent)) if (tree.nodeTag(parent) == .fn_decl) return tree.nodeData(parent).node_and_node[0];
     return null;
+}
+
+/// Whether `node` is in a generic function's body: one taking `anytype`, a type or any
+/// `comptime` parameter, or within a function returning a type. A member read there on what does not resolve is of what its
+/// parameters hold, which a caller hands it: an interface by pointer, followed into the body
+/// (`Follow.handed`), or a struct holding one (`Carry`). The program-wide scans leave it to them.
+fn generic(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) {
+        if (tree.nodeTag(parent) != .fn_decl) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse continue;
+        if (proto.ast.return_type.unwrap()) |returned| if (typeKeyword(tree, returned)) return true;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            if (param.anytype_ellipsis3 != null) return true;
+            if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
+            if (param.type_expr) |declared| if (typeKeyword(tree, declared)) return true;
+        }
+    }
+    return false;
+}
+
+fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// Whether the parameter named at `token` is one of the prototype `function`'s own.
