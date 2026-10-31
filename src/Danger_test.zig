@@ -572,9 +572,9 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
-test "A015 finds std resources held by value in a field, released or not, or returned by value, not borrowed by pointer, owned or lent" {
-    // Options' `cwd` and `out` are released nowhere: an owner that leaks or a borrow, which
-    // own.Lent names; either way a finding.
+test "A015 finds std resources held by value in a field the program releases, or returned by value, not borrowed by pointer" {
+    // Conn's stream and log and Log's file are released, as Options' `cwd` is through a local;
+    // Options' `out`, written and released nowhere, holds what its caller gives it.
     try expect(pack.ownership,
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -586,7 +586,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn borrowed(f: *std.Io.File) *std.Io.File { return f; }
         \\fn shut(d: *std.Io.Dir) void { _ = d; }
         \\pub fn lent(o: *aegis.own.Owned(std.Io.Dir, shut)) aegis.own.Lent(std.Io.Dir) { return o.lend(); }
-    , 7);
+    , 6);
     // A function each of whose returns reads what is already held hands over no owner:
     // shakedown's simulated working directory and standard streams, std's own stdio, a pipe end
     // named by the handle it is given.
@@ -615,7 +615,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn pipeFile(handle: std.Io.File.Handle) std.Io.File {
         \\    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
         \\}
-    , 3); // Fields held by value and released nowhere (Slot.file, Process.cwd, Context.cwd): no function.
+    , 0); // Nor the fields (Slot.file, Process.cwd, Context.cwd): written and released nowhere.
     // Only std's own stdio and a std handle's literal: a method of the program's that is named
     // `stdout` but returns what it opened (and its callers, and the open itself), and a literal
     // of the program's type with a `handle` field, are owners handed over.
@@ -639,7 +639,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\    const w: Wrapped = .{ .handle = f.opened() };
         \\    return w.handle;
         \\}
-    , 6); // And the fields Proc.dir and Wrapped.handle.
+    , 5); // And the field Wrapped.handle, given what `opened` made; Proc.dir is given nothing.
     // A field moved out through a variable, a field of what was just opened, and an open are
     // owners handed over.
     try expect(pack.ownership,
@@ -660,7 +660,7 @@ test "A015 finds std resources held by value in a field, released or not, or ret
         \\pub fn open(dir: std.Io.Dir, io: std.Io) !std.Io.File {
         \\    return dir.openFile(io, "x", .{});
         \\}
-    , 4); // And the field Conn.stream.
+    , 3); // Conn.stream, moved out but never written or released, holds what it is given.
 }
 
 test "A016 finds identifying integers of one type meeting, not other integers" {
@@ -6754,6 +6754,96 @@ test "A013 reads std's assert called through any alias the program declares, pub
         \\}
     );
     try std.testing.expectEqual(@as(usize, 1), result.undecided);
+}
+
+test "A015 flags a field the program releases or writes an owner into, and a borrow it is only given as none" {
+    // Lent's fields hold what they are given: an own.OwnedIo's borrow().*, a handle made from a
+    // parameter's, a parameter. An opened file stored and never released is a leak (Leak,
+    // Stored); a borrow released by mistake (Mistake) is an owner by hand, as is one released
+    // by a call, through a capture, or through a getter's return (`opened` returns an owner too).
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(f: *std.Io.File, io: std.Io) void { _ = io; f.close(); }
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn release(f: std.Io.File) void { f.close(); }
+        \\const Lent = struct { file: std.Io.File, dir: std.Io.Dir, out: std.Io.File };
+        \\pub fn lend(dir: std.Io.Dir, out: std.Io.File, owner: *aegis.own.OwnedIo(std.Io.File, shut)) Lent { return .{ .file = owner.borrow().*, .dir = .{ .handle = dir.handle }, .out = out }; }
+        \\const Leak = struct { file: std.Io.File };
+        \\pub fn leak() Leak { return .{ .file = opened() }; }
+        \\const Mistake = struct { file: std.Io.File };
+        \\pub fn mistake(file: std.Io.File) void { const m: Mistake = .{ .file = file }; m.file.close(); }
+        \\const ByCall = struct { file: std.Io.File };
+        \\pub fn byCall(b: *ByCall) void { release(b.file); }
+        \\const ByCapture = struct { file: ?std.Io.File };
+        \\pub fn byCapture(b: *ByCapture) void { if (b.file) |f| f.close(); }
+        \\const ByGetter = struct { file: std.Io.File, fn get(b: *ByGetter) std.Io.File { return b.file; } };
+        \\pub fn byGetter(b: *ByGetter) void { b.get().close(); }
+        \\const Stored = struct { file: std.Io.File };
+        \\pub fn store(s: *Stored) void { s.file = opened(); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 8, 10, 12, 14, 16, 18 }, found.lines[0..found.findings]);
+    // A release through a receiver that does not resolve may be this field's: undecided, not
+    // cleared; one that releases nothing decides nothing.
+    const doubted = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\const Held = struct { file: std.Io.File };
+        \\pub fn f(x: ext.T) void { x.file.close(); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), doubted.findings);
+    try std.testing.expectEqual(@as(usize, 1), doubted.undecided);
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\const Held = struct { file: std.Io.File };
+        \\pub fn f(x: ext.T) i32 { return x.file.handle; }
+    , 0);
+}
+
+test "A015 reads a function returning a call of a view, in any file, as a view" {
+    // airlock's `Lock.file`, returning `l.pending.file()`, Pending's view of its field.
+    const views: sources.Extra = .{ .name = "pending.zig", .bytes =
+        \\const std = @import("std");
+        \\pub const Pending = struct {
+        \\    held: std.Io.File,
+        \\    pub fn file(p: *Pending) std.Io.File { return p.held; }
+        \\    pub fn opened(p: *Pending) std.Io.File { _ = p; return undefined; }
+        \\};
+    };
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const Pending = @import("pending.zig").Pending;
+        \\const Lock = struct {
+        \\    pending: Pending,
+        \\    pub fn file(l: *Lock) std.Io.File { return l.pending.file(); }
+        \\    pub fn open(l: *Lock) std.Io.File { return l.pending.opened(); }
+        \\};
+    , &(std_files ++ [_]sources.Extra{views}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "pending.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+    try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
+}
+
+test "A015 reads a switch over an owned-or-lent union as a view where each prong is one" {
+    // airlock's `Parent.directory`: an own.OwnedIo's borrow().*, the lent handle, no value.
+    // A prong that opens (`fresh`), and a `borrow` of no aegis owner (`faked`), are not views.
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(d: *std.Io.Dir, io: std.Io) void { _ = d; _ = io; }
+        \\fn opened() std.Io.Dir { return undefined; }
+        \\const Parent = union(enum) {
+        \\    owned: aegis.own.OwnedIo(std.Io.Dir, shut),
+        \\    lent: std.Io.Dir,
+        \\    closed,
+        \\    fn directory(p: *Parent) std.Io.Dir { return switch (p.*) { .owned => |*held| held.borrow().*, .lent => |lent| lent, .closed => unreachable }; }
+        \\    fn fresh(p: *Parent) std.Io.Dir { return switch (p.*) { .owned => opened(), .lent => |lent| lent, .closed => unreachable }; }
+        \\};
+        \\const Fake = struct { held: std.Io.Dir, fn borrow(f: *Fake) *const std.Io.Dir { _ = f; return undefined; } };
+        \\pub fn faked(f: *Fake) std.Io.Dir { return f.borrow().*; }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 10, 13 }, found.lines[0..found.findings]);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {
