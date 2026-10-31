@@ -517,6 +517,14 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
+test "A015 reads a tuple's fields, named by position only, as fields" {
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\pub const S = struct { pair: struct { std.Io.File, u32 } };
+        \\pub const T = struct { std.Io.Dir, *std.Io.File };
+    , 2);
+}
+
 test "A015 finds std resources held by value in a field, released or not, or returned by value, not borrowed by pointer, owned or lent" {
     // Options' `cwd` and `out` are released nowhere: an owner that leaks or a borrow, which
     // own.Lent names; either way a finding.

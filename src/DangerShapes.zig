@@ -14,8 +14,8 @@ const Danger = @import("Danger.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
-/// A015: a std resource held by value in a field, or returned by the program's own function,
-/// outside aegis's `own.Owned` and `own.Lent`. A field, released or not, is its owner or a
+/// A015: a std resource held by value in a field, a tuple's among them, or returned by the
+/// program's own function, outside aegis's `own.Owned` and `own.Lent`. A field, released or not, is its owner or a
 /// borrow, which `own.Lent` names; a function each of whose returns reads what is already held
 /// hands over no owner (`views`).
 pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
@@ -49,6 +49,19 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         const what = if (decl.kind == .field) "field" else "function";
         const how = if (decl.kind == .field) "holds" else "returns";
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ what, decl.name, how, paths[which] }));
+    }
+    // A tuple's fields, named by position only, are no declarations: each is read where it is
+    // written, as a field is.
+    for (tree.nodes.items(.tag), 0..) |_, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const field = tree.fullContainerField(node) orelse continue;
+        if (!field.ast.tuple_like) continue;
+        const first = tree.firstToken(node);
+        if (c.inTest(first)) continue;
+        const written = field.ast.type_expr.unwrap() orelse continue;
+        const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
+        const which = find(resources, held) orelse continue;
+        try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{paths[which]}));
     }
 }
 
