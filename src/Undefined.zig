@@ -153,7 +153,8 @@ const std_holders = [_]Named{
     .{ .path = "Io.File.MultiReader.Buffer.toStreams", .param = 0 },
 };
 
-/// std's functions that hand back a writer's memory past what it wrote: its room, to be written.
+/// std's functions that hand back a writer's or a reader's memory past what it holds: its room,
+/// to be written.
 const std_room = [_][]const u8{
     "Io.Writer.unusedCapacitySlice",
     "Io.Writer.writableArray",
@@ -161,6 +162,9 @@ const std_room = [_][]const u8{
     "Io.Writer.writableSliceGreedy",
     "Io.Writer.writableSliceGreedyPreserve",
     "Io.Writer.writableSlicePreserve",
+    "Io.Reader.writableVector",
+    "Io.Reader.writableVectorPosix",
+    "Io.Reader.writableVectorWsa",
 };
 
 /// std's calls that, succeeding, write the memory at `param` from the front for half the length
