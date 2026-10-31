@@ -31,7 +31,7 @@
       }
     ],
     "escapes": {
-      "no-danger": 2,
+      "no-danger": 3,
       "internal": 1,
       "design": 2
     }
