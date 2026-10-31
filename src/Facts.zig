@@ -3752,16 +3752,28 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
         .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
         .@"break" => {
-            const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap() orelse return .{ .unknown = .unsupported };
+            // A `break` with no label leaves the nearest loop; one with a label, the block or
+            // loop it names. Each gives that its value.
+            const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap();
             var at: ?Ast.Node.Index = model.parentOf(parent);
             while (at) |candidate| : (at = model.parentOf(candidate)) {
+                const loop = tree.fullWhile(candidate) != null or tree.fullFor(candidate) != null;
+                const name = label orelse {
+                    if (loop) return self.placeType(file, candidate, depth + 1);
+                    continue;
+                };
                 const tag = tree.nodeTag(candidate);
-                if (tag != .block and tag != .block_semicolon and tag != .block_two and tag != .block_two_semicolon) continue;
-                // A labeled block's brace follows its label and a colon.
-                const brace = tree.nodeMainToken(candidate);
-                if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(brace - 2), tree.tokenSlice(label))) return self.placeType(file, candidate, depth + 1);
+                // A labeled block's brace follows its label and a colon, as a labeled loop's
+                // first token does.
+                const start = if (loop) tree.firstToken(candidate) else if (tag == .block or tag == .block_semicolon or tag == .block_two or tag == .block_two_semicolon) tree.nodeMainToken(candidate) else continue;
+                if (start >= 2 and tree.tokenTag(start - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(start - 2), tree.tokenSlice(name))) return self.placeType(file, candidate, depth + 1);
             }
             return .{ .unknown = .unsupported };
+        },
+        // A loop's `else` gives the loop's value.
+        .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
+            const otherwise = if (tree.fullFor(parent)) |loop| loop.ast.else_expr else tree.fullWhile(parent).?.ast.else_expr; // unreachable: the tag is a loop's
+            return if (otherwise.unwrap() == node) self.placeType(file, parent, depth + 1) else .{ .unknown = .unsupported };
         },
         .@"return" => {
             var at: ?Ast.Node.Index = model.parentOf(parent);
