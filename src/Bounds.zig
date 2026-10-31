@@ -447,6 +447,9 @@ const Key = union(enum) {
     passes: Ast.Node.Index,
     /// A variable a loop steps, as it was when the loop was entered.
     entry: struct { loop: Ast.Node.Index, d: Model.Declaration.Id },
+    /// A `for` loop's count of passes, as its inputs gave it when the loop was entered: an input
+    /// the body shrinks (`s = s[1..]`) does not change how many passes run.
+    count: Ast.Node.Index,
 };
 
 /// What an expression gives: its integer value and the length of its memory, where they are
@@ -1686,6 +1689,7 @@ const Frame = struct {
             const fixed = switch (key) {
                 .value, .length => |d| !assigned.contains(d) and outside(f.model.declarations[@backingInt(d)].token, first, last),
                 .entry => |e| e.loop == node,
+                .count => |counted_loop| counted_loop == node,
                 else => false,
             };
             if (!fixed) kept = try forget(f.a, kept, v);
@@ -1901,8 +1905,11 @@ const Frame = struct {
                 if (count) |n| out = try f.same(out, n, l) else count = l;
             }
         }
-        const counter = try f.variable(.{ .temp = .{ .node = node, .part = 6 } });
-        _ = counter;
+        if (count) |n| {
+            const at_entry = try f.variable(.{ .count = node });
+            out = try f.assign(out, at_entry, n, null);
+            count = try single(f.a, at_entry);
+        }
         try f.for_counts.put(f.a, node, count);
         const result = try f.loop(out, node, label, &.{}, .@"for");
         // Its `else` runs where the passes ran out.

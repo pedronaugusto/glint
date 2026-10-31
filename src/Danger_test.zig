@@ -2688,6 +2688,28 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A009 reads a for loop's count as its inputs gave it at entry: a position below it is within an input the body leaves alone, not one it shrinks" {
+    // `n` equal to the counter is below `big.len` (7); `s` shrinks each pass, and the count
+    // its entry length gave says nothing of what is left of it (10).
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, big: []const u8) !u8 {
+        \\    var s = big;
+        \\    var acc: u8 = 0;
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    for (big, 0..) |_, i| {
+        \\        if (n == i) acc +%= big[n];
+        \\    }
+        \\    for (s, 0..) |_, i| {
+        \\        if (n == i) acc +%= s[n];
+        \\        s = s[1..];
+        \\    }
+        \\    return acc;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{10}, found.lines[0..found.findings]);
+}
+
 test "A010 reads a callee's summary on its failure paths only where its error union is written in place: a named or made error union may fail as well" {
     // `check` and `verify` return an error union through a name (`R`) and a type function
     // (`Result(u64)`); a failure the caller drops leaves the input unbounded (19, 20). Taken
