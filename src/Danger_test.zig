@@ -1411,6 +1411,15 @@ test "A019 clears a parent pointer whose interface is any parameter of the insta
     try std.testing.expectEqualSlices(u32, &.{ 6, 6, 11 }, other.lines[0..other.findings]);
     const read_out = try runEdited(pack.unsafe_set, lookup_program, "pub fn use(s: *Static) u32 {", "pub fn use(s: *Static, x: *Lookup) u32 {\n    const f = s.resolving.lookup_fn.?;\n    _ = f(2, x);");
     try std.testing.expectEqualSlices(u32, &.{ 6, 6, 11 }, read_out.lines[0..read_out.findings]);
+    // Captured from its optional and called only on the interface it was read from: clean. On
+    // another, or on a `var` pointed elsewhere in between: findings (6, and the read at 12).
+    const body = "pub fn use(s: *Static) u32 {\n    const l = &s.resolving;\n    return l.lookup_fn.?(1, l);";
+    const captured = try runEdited(pack.unsafe_set, lookup_program, body, "pub fn use(s: *Static) u32 {\n    const l = &s.resolving;\n    if (l.lookup_fn) |f| return f(1, l);\n    return 0;");
+    try std.testing.expectEqual(@as(usize, 0), captured.findings);
+    const captured_other = try runEdited(pack.unsafe_set, lookup_program, body, "pub fn use(s: *Static, x: *Lookup) u32 {\n    const l = &s.resolving;\n    if (l.lookup_fn) |f| return f(1, x);\n    return 0;");
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 12 }, captured_other.lines[0..captured_other.findings]);
+    const moved = try runEdited(pack.unsafe_set, lookup_program, body, "pub fn use(s: *Static, x: *Lookup) u32 {\n    var l = &s.resolving;\n    if (l.lookup_fn) |f| {\n        l = x;\n        return f(1, l);\n    }\n    return 0;");
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 12 }, moved.lines[0..moved.findings]);
 }
 
 const list_program =

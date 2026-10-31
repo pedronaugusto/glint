@@ -236,6 +236,19 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
     return result;
 }
 
+/// A declaration literal called (`.init(...)`): the function its result location's container
+/// declares. Any other enum literal's meaning is its result location's, which is not known here.
+fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    const parent = self.project.at(file).model.parentOf(node) orelse return .{ .unknown = .comptime_dependent };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return .{ .unknown = .comptime_dependent };
+    if (call.ast.fn_expr != node) return .{ .unknown = .comptime_dependent };
+    const container = (try self.resultContainer(file, parent)) orelse return .{ .unknown = .comptime_dependent };
+    const found = self.member(container, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)))) orelse return .{ .unknown = .unsupported };
+    return self.declaration(found);
+}
+
 const Found = union(enum) { found: Target, gap: Unknown };
 /// Walks public namespaces from a module root, the way a program names the declaration.
 fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!Found {
@@ -1093,16 +1106,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             };
         },
         .error_set_decl, .merge_error_sets => return .error_set,
-        .enum_literal => {
-            // `.init(...)`: a declaration literal called names its result location's function.
-            const parent = self.project.at(file).model.parentOf(node) orelse return .{ .unknown = .comptime_dependent };
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, parent) orelse return .{ .unknown = .comptime_dependent };
-            if (call.ast.fn_expr != node) return .{ .unknown = .comptime_dependent };
-            const container = (try self.resultContainer(file, parent)) orelse return .{ .unknown = .comptime_dependent };
-            const found = self.member(container, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)))) orelse return .{ .unknown = .unsupported };
-            return self.declaration(found);
-        },
+        .enum_literal => return self.declarationLiteral(file, node),
         .number_literal, .string_literal, .char_literal => return .scalar,
         else => {},
     }

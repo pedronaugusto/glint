@@ -226,11 +226,38 @@ fn notFunction(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool 
 }
 
 /// Whether the function read `use` (`x.f`, `x.vtable.f` where `through`) is called at once,
-/// `.?` unwrapping it at most, with the interface it was read from at each position `given`.
+/// `.?` unwrapping it at most, with the interface it was read from at each position `given`;
+/// or captured from its optional (`if (x.f) |f|`) and the capture only called so, on an
+/// interface a parameter, a capture or a constant names, which nothing changes in between.
 fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, through: bool, given: u64) bool {
     const receiver = tree.nodeData(use).node_and_token[0];
+    // The interface: the receiver, or what the vtable was read from.
+    var interface = receiver;
+    if (through) {
+        if (tree.nodeTag(receiver) != .field_access) return false;
+        interface = tree.nodeData(receiver).node_and_token[0];
+    }
     var callee = use;
     var outer = model.parentOf(use) orelse return false;
+    if (tree.fullIf(outer)) |branch| {
+        if (branch.ast.cond_expr != use or !fixed(tree, model, interface)) return false;
+        const payload = branch.payload_token orelse return false;
+        if (tree.tokenTag(payload) == .asterisk) return false;
+        for (model.declarations, 0..) |decl, d| {
+            if (decl.kind != .capture or decl.node != outer or decl.token != payload) continue;
+            const index: Model.Declaration.Id = @fromBackingInt(@intCast(d));
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .identifier) continue;
+                const reference: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if ((model.reference(reference) orelse continue).declaration != index) continue;
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, model.parentOf(reference) orelse return false) orelse return false;
+                if (call.ast.fn_expr != reference or !givenSelf(tree, call, interface, given)) return false;
+            }
+            return true;
+        }
+        return false;
+    }
     if (tree.nodeTag(outer) == .unwrap_optional) {
         callee = outer;
         outer = model.parentOf(outer) orelse return false;
@@ -238,12 +265,11 @@ fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, thro
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, outer) orelse return false;
     if (call.ast.fn_expr != callee) return false;
-    // The interface: the receiver, or what the vtable was read from.
-    var interface = receiver;
-    if (through) {
-        if (tree.nodeTag(receiver) != .field_access) return false;
-        interface = tree.nodeData(receiver).node_and_token[0];
-    }
+    return givenSelf(tree, call, interface, given);
+}
+
+/// Whether `call` is given `interface` at each position `given`, by value or by address.
+fn givenSelf(tree: *const Ast, call: Ast.full.Call, interface: Ast.Node.Index, given: u64) bool {
     for (call.ast.params, 0..) |param, position| {
         if (position >= 64 or given & (@as(u64, 1) << @intCast(position)) == 0) continue;
         var argument = strip(tree, param);
@@ -251,6 +277,29 @@ fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, thro
         if (!sameTokens(tree, argument, interface)) return false;
     }
     return call.ast.params.len >= 64 or given >> @intCast(call.ast.params.len) == 0;
+}
+
+/// The member read an `if` captured, where `node` names that capture (`if (x.f) |f|`).
+fn capturedRead(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    if (tree.nodeTag(node) != .identifier) return null;
+    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const decl = model.declarations[@backingInt(index)];
+    if (decl.kind != .capture) return null;
+    const branch = tree.fullIf(decl.node) orelse return null;
+    if (branch.payload_token != decl.token or tree.nodeTag(branch.ast.cond_expr) != .field_access) return null;
+    return branch.ast.cond_expr;
+}
+
+/// Whether `node` names a parameter, a capture or a constant: what it holds cannot change.
+fn fixed(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    if (tree.nodeTag(node) != .identifier) return false;
+    const index = (model.reference(node) orelse return false).declaration orelse return false;
+    const decl = model.declarations[@backingInt(index)];
+    return switch (decl.kind) {
+        .parameter, .capture => true,
+        .variable => if (tree.fullVarDecl(decl.node)) |variable| tree.tokenTag(variable.ast.mut_token) == .keyword_const else false,
+        .function, .field => false,
+    };
 }
 
 /// The function type a pointer to a function, or an optional one, points at.
@@ -560,6 +609,7 @@ const Follow = struct {
             // functions are handed, each installed one's parameter followed with its file's.
             var callee = call.ast.fn_expr;
             if (tree.nodeTag(callee) == .unwrap_optional) callee = tree.nodeData(callee).node_and_token[0];
+            if (capturedRead(tree, model, callee)) |read| callee = read;
             if (tree.nodeTag(callee) == .field_access) if (try c.facts.definition(file, callee)) |slot| {
                 const record = c.project.at(slot.file).model.declarations[@backingInt(slot.index)];
                 if (record.kind == .field) {
@@ -1205,8 +1255,8 @@ fn interfaces(c: *Context) Context.Error![]const Facts.Container {
             if (interfaceOf(kinds.items, kind) == null) try kinds.append(c.allocator, kind);
         }
     }
-    known.kinds = kinds.items;
-    return kinds.items;
+    known.kinds = try kinds.toOwnedSlice(c.allocator);
+    return known.kinds.?;
 }
 
 fn interfaceOf(kinds: []const Facts.Container, container: Facts.Container) ?Facts.Container {
