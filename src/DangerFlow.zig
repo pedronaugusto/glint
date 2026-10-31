@@ -1073,13 +1073,20 @@ fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, lev
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;
     const fact = flow orelse return c.at(rule, tree.nodeMainToken(node), message);
-    const from = (try Taint.sourceOf(c, fact, c.file, node)) orelse return c.at(rule, tree.nodeMainToken(node), message);
-    const read = try callSite(c, .{ .file = from.file, .node = from.node });
-    const text = if (from.via) |via|
-        try c.allocator.print("{s} (input from {s} via {s})", .{ message, read, try callSite(c, via) })
-    else
-        try c.allocator.print("{s} (input from {s})", .{ message, read });
-    try c.at(rule, tree.nodeMainToken(node), text);
+    // One read past the ones named shows there are more.
+    const shown = 3;
+    const sources = try Taint.sourcesOf(c, fact, c.file, node, shown + 1);
+    if (sources.len == 0) return c.at(rule, tree.nodeMainToken(node), message);
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(c.allocator, "{s} (input from ", .{message});
+    for (sources[0..@min(sources.len, shown)], 0..) |from, i| {
+        if (i != 0) try text.appendSlice(c.allocator, if (i + 1 == sources.len) " and " else ", ");
+        try text.appendSlice(c.allocator, try callSite(c, .{ .file = from.file, .node = from.node }));
+        if (from.via) |via| try text.print(c.allocator, " via {s}", .{try callSite(c, via)});
+    }
+    if (sources.len > shown) try text.appendSlice(c.allocator, ", and more");
+    try text.append(c.allocator, ')');
+    try c.at(rule, tree.nodeMainToken(node), text.items);
 }
 
 /// A call as `file:line `callee``, the callee as written on one line: a chain split over lines

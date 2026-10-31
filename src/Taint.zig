@@ -1788,11 +1788,26 @@ pub fn sourceOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.I
     return walk.from(function, node, 0);
 }
 
+/// The reads input reaching `node` comes from, at most `most` of them, each found as
+/// `sourceOf` finds one with those already found left out: where several reads reach it, a
+/// finding names more than the first, so no reader takes one source for the only one.
+pub fn sourcesOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, most: usize) Context.Error![]const Origin {
+    const function = owner(flow, file, node) orelse return &.{};
+    var found: std.ArrayList(Origin) = .empty;
+    while (found.items.len < most) {
+        var walk: Walk = .{ .c = c, .flow = flow, .excluded = found.items };
+        try found.append(c.allocator, (try walk.from(function, node, 0)) orelse break);
+    }
+    return found.items;
+}
+
 const Walk = struct {
     c: *Context,
     flow: *Flow,
     seen: std.AutoHashMapUnmanaged(struct { Function.Id, Ast.Node.Index }, void) = .empty,
     steps: u32 = 0,
+    /// Reads already found: the walk looks past them for another.
+    excluded: []const Origin = &.{},
 
     const step_limit = 4000;
 
@@ -1833,7 +1848,10 @@ const Walk = struct {
         const f = w.flow.functions.items[@backingInt(function)];
         const callee = try resolveCall(w.c, w.flow, f.file, at);
         switch (callee.kind) {
-            .source => return .{ .file = f.file, .node = node },
+            .source => {
+                for (w.excluded) |each| if (each.file == f.file and each.node == node) return null;
+                return .{ .file = f.file, .node = node };
+            },
             .aegis => if (try parserOf(w.c, w.flow, f.file, at, callee.decl.?) != null) return null,
             .program => |target| {
                 const g = w.flow.functions.items[@backingInt(target)];

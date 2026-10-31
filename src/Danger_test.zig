@@ -3739,6 +3739,37 @@ test "a flow finding names the read that filled the field its input is held in, 
     try std.testing.expectEqual(@as(usize, 1), named);
 }
 
+test "a flow finding names every read that fills the field its input is held in, not the first alone" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Graph = struct { count: u32 = 0 };
+        \\fn load(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    graph.count = try r.takeInt(u32, 0);
+        \\}
+        \\fn reload(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    graph.count = try r.takeByte();
+        \\}
+        \\fn lookup(graph: *const Graph, table: []const u8) u8 {
+        \\    return table[graph.count];
+        \\}
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var graph: Graph = .{};
+        \\    try load(&graph, r);
+        \\    try reload(&graph, r);
+        \\    return lookup(&graph, table);
+        \\}
+    , &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var named: usize = 0;
+    for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
+        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:4 `r.takeInt` and consumer:7 `r.takeByte`)"));
+        named += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), named);
+}
+
 test "A009 leaves a loop each pass of which consumes input, advances past what it took, checks for cancelation or clears a bit of its count" {
     try expect(pack.untrusted_input,
         \\const std = @import("std");
