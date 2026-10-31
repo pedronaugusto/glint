@@ -34,7 +34,7 @@ const std_files = [_]sources.Extra{
     \\pub const File = @import("Io/File.zig");
     \\pub const Reader = @import("Io/Reader.zig");
     \\pub const Dir = struct { handle: i32, pub fn openFile(dir: Dir, io: anytype, sub_path: []const u8, options: anytype) !void { _ = dir; _ = io; _ = sub_path; _ = options; } pub fn readFileAlloc(dir: Dir, io: anytype, sub_path: []const u8, gpa: anytype, limit: usize) ![]u8 { _ = dir; _ = io; _ = sub_path; _ = gpa; _ = limit; return &.{}; } pub fn statFile(dir: Dir, io: anytype, sub_path: []const u8) !u64 { _ = dir; _ = io; _ = sub_path; return 0; } pub fn readLink(dir: Dir, io: anytype, sub_path: []const u8, buffer: []u8) !usize { _ = dir; _ = io; _ = sub_path; _ = buffer; return 0; } };
-    \\pub const Writer = struct { end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { _ = buffer; return .{}; } };
+    \\pub const Writer = struct { buffer: []u8 = &.{}, end: usize = 0, vtable: *const Writer.VTable = undefined, pub const VTable = struct { drain: *const fn (*Writer, []const []const u8, usize) anyerror!usize }; pub fn writeAll(w: *Writer, bytes: []const u8) !void { _ = w; _ = bytes; } pub fn print(w: *Writer, comptime format: []const u8, args: anytype) !void { _ = w; _ = format; _ = args; } pub fn fixed(buffer: []u8) Writer { return .{ .buffer = buffer }; } pub fn buffered(w: *const Writer) []u8 { return w.buffer[0..w.end]; } pub fn unusedCapacitySlice(w: *const Writer) []u8 { return w.buffer[w.end..]; } };
     \\pub fn random(io: @This(), buffer: []u8) void { _ = io; _ = buffer; }
     \\pub fn protocolWriter(buffer: []u8) Writer { _ = buffer; return .{}; }
     \\pub const net = struct { pub const Stream = struct { handle: i32, pub fn writer(s: Stream, buffer: []u8) Writer { _ = s; _ = buffer; return .{}; } }; pub const Server = struct { stream: Stream }; };
@@ -1418,6 +1418,79 @@ test "A019 reads what a C call writes by its contract: the error number it answe
         \\pub fn c2(src: *std.Io.Reader) !u8 { var buf: [16]u8 = undefined; try std.Io.Reader.readSliceAll(src, &buf); return buf[15]; }
     );
     try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 6, 7, 8, 10, 11, 12, 17 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads `undefined` given to a local as no write: whole, a part, a literal's field, @memset's, again after a write and on a loop's next pass; and nothing in @TypeOf runs" {
+    // Findings: given `undefined` after a write on some paths (5), after a write on all (6), a
+    // part given it (8), a literal's field (10), @memset's (12), init(*Self)'s literal leaving a
+    // field undefined (14), a fill only @TypeOf names (15), a loop's next pass reading what the
+    // last gave `undefined` (18). Clean: written again after (7), only the other part read (9,
+    // 11), written after @memset's (13), @TypeOf of the local (16), a deferred one at the scope's
+    // end (17), written on each pass first (19).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const S = struct { a: u32, b: u32 };
+        \\const T = struct { n: u32, buf: [8]u8, fn init(self: *T) void { self.* = .{ .n = 0, .buf = undefined }; } };
+        \\fn fill(p: *[4]u8) void { p.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn w1(c: bool) u32 { var x: u32 = undefined; if (c) x = 1; x = undefined; return x + 1; }
+        \\pub fn w2() u32 { var x: u32 = undefined; x = 1; x = undefined; return x; }
+        \\pub fn w3() u32 { var x: u32 = undefined; x = 1; x = undefined; x = 2; return x; }
+        \\pub fn p1() u32 { var s: S = undefined; s.a = 1; s.b = undefined; return s.a + s.b; }
+        \\pub fn p2() u32 { var s: S = undefined; s.a = 1; s.b = undefined; return s.a; }
+        \\pub fn l1() u32 { var s: S = .{ .a = 1, .b = undefined }; s.a += 1; return s.b; }
+        \\pub fn l2() u32 { var s: S = .{ .a = 1, .b = undefined }; s.a += 1; return s.a; }
+        \\pub fn m1(c: bool) u8 { var buf: [4]u8 = undefined; if (c) buf[0] = 1; @memset(&buf, undefined); return buf[3]; }
+        \\pub fn m2() u8 { var buf: [4]u8 = undefined; @memset(&buf, undefined); @memset(&buf, 0); return buf[3]; }
+        \\pub fn n1() u8 { var t: T = undefined; t.init(); return t.buf[3]; }
+        \\pub fn t1() u8 { var buf: [4]u8 = undefined; const K = @TypeOf(fill(&buf)); if (K != void) return 0; return buf[3]; }
+        \\pub fn t2() u8 { var buf: [4]u8 = undefined; const K = @TypeOf(buf); _ = K; fill(&buf); return buf[3]; }
+        \\pub fn d1() u8 { var buf: [4]u8 = undefined; fill(&buf); defer buf = undefined; return buf[0]; }
+        \\pub fn r1(n: usize) void { var x: u32 = undefined; x = 0; var i: usize = 0; while (i < n) : (i += 1) { const y = x; x = undefined; _ = y; } }
+        \\pub fn r2(n: usize) void { var x: u32 = undefined; var i: usize = 0; while (i < n) : (i += 1) { x = 1; const y = x; x = undefined; _ = y; } }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, 8, 10, 12, 14, 15, 18 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a fill that may stop early as none: a `for` setting each element that may leave, an error set's error returned as a value, a labeled switch dispatching again into the prong its check guards" {
+    // Findings: the extern (2), a `for` setting each element that may `break` (5) or `continue`
+    // an outer loop (7), a function answering an error set returning before its write (8), a
+    // `continue :sw .SUCCESS` from a failure into the success prong (10). Clean: a `continue` of
+    // the setting loop itself (6), an error union's error left by `try` (9), the prongs entered
+    // only by the errno's value (11).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\extern "c" fn @"fstat$INODE64"(fd: c_int, buf: *std.c.Stat) c_int;
+        \\fn early(p: *[4]u8, c: bool) anyerror { if (c) return error.Skipped; p.* = .{ 1, 2, 3, 4 }; return error.Done; }
+        \\fn failing(p: *[4]u8, c: bool) !void { if (c) return error.Skipped; p.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn f1(stop: bool) u8 { var buf: [4]u8 = undefined; for (&buf) |*b| { b.* = 0; if (stop) break; } return buf[3]; }
+        \\pub fn f2(stop: bool) u8 { var buf: [4]u8 = undefined; for (&buf) |*b| { b.* = 0; if (stop) continue; } return buf[3]; }
+        \\pub fn f3(stop: bool) u8 { var buf: [4]u8 = undefined; outer: for (0..2) |_| { for (&buf) |*b| { b.* = 0; if (stop) continue :outer; } } return buf[3]; }
+        \\pub fn e1(c: bool) u8 { var buf: [4]u8 = undefined; if (early(&buf, c) == error.Never) return 0; return buf[3]; }
+        \\pub fn e2(c: bool) !u8 { var buf: [4]u8 = undefined; try failing(&buf, c); return buf[3]; }
+        \\pub fn s1(fd: c_int) u64 { var st: std.c.Stat = undefined; const rc = @"fstat$INODE64"(fd, &st); sw: switch (std.c.errno(rc)) { .SUCCESS => return st.ino, .AGAIN => continue :sw .SUCCESS, else => return 0 } }
+        \\pub fn s2(fd: c_int) u64 { var st: std.c.Stat = undefined; const rc = @"fstat$INODE64"(fd, &st); switch (std.c.errno(rc)) { .SUCCESS => return st.ino, .AGAIN => return 1, else => return 0 } }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7, 8, 10 }, found.lines[0..found.findings]);
+}
+
+test "A019 keeps what a holder keeps only where nothing hands it back unwritten: its memory field, its room, a function returning either" {
+    // Findings: the writer's buffer read past what it wrote (5), its room (7), a function
+    // returning the writer's buffer (8), one returning its room (10). Clean: what it wrote
+    // (6), the writer handed to a function that only writes through it, then its count read
+    // (9).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\fn view(p: *[16]u8) []u8 { const w: std.Io.Writer = .fixed(p); return w.buffer; }
+        \\fn emit(w: *std.Io.Writer) !void { try w.writeAll("ab"); }
+        \\fn room(w: *std.Io.Writer) []u8 { return w.unusedCapacitySlice(); }
+        \\pub fn h1() !u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.buffer[10]; }
+        \\pub fn h2() !usize { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.buffered().len; }
+        \\pub fn h3() !u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try w.writeAll("ab"); return w.unusedCapacitySlice()[0]; }
+        \\pub fn h4() u8 { var buf: [16]u8 = undefined; const s = view(&buf); return s[10]; }
+        \\pub fn h5() !usize { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); try emit(&w); return w.end; }
+        \\pub fn h6() u8 { var buf: [16]u8 = undefined; var w: std.Io.Writer = .fixed(&buf); return room(&w)[0]; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7, 8, 10 }, found.lines[0..found.findings]);
 }
 
 test "A019 clears std's prefix keeps, an HMAC's fills, a count a call returns in place, and the program's functions that return only parts they wrote" {
