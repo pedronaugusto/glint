@@ -1895,3 +1895,40 @@ test "A006 names each call that untrusted input reaches and that does not resolv
     };
     try std.testing.expect(named);
 }
+
+/// A003's and A019's findings and undecided sites over `source`, with A003 on beside A019 or
+/// A019 alone.
+fn cleanupAndUndefined(source: []const u8, with_cleanup: bool) !struct { cleanup: usize, cleanup_undecided: usize, undefined_read: usize, undefined_undecided: usize } {
+    var project = try fixture(source);
+    defer project.deinit();
+    const both: glint.Config = .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.cleanup, .level = .gate }, .{ .rule = pack.unsafe_set, .level = .gate } } };
+    const alone: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.unsafe_set, .level = .gate }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, if (with_cleanup) both else alone, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var undecided: [2]usize = .{ 0, 0 };
+    for (report.coverage) |item| if (item.rule) |rule| {
+        if (rule == pack.cleanup) undecided[0] += 1;
+        if (rule == pack.unsafe_set) undecided[1] += 1;
+    };
+    return .{ .cleanup = count(report, pack.cleanup), .cleanup_undecided = undecided[0], .undefined_read = count(report, pack.unsafe_set), .undefined_undecided = undecided[1] };
+}
+
+test "A019 leaves a use after cleanup of a local A003 follows to A003 where it runs, and reads it itself where A003 is off" {
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
+    // Read after its deinit (whose `self.* = undefined` leaves it undefined): A003's alone.
+    const after = head ++ "pub fn f(gpa: std.mem.Allocator) !usize { var b = try Bytes.init(gpa, 4); b.deinit(gpa); return b.len(); }";
+    const shared = try cleanupAndUndefined(after, true);
+    try std.testing.expectEqual(@as(usize, 1), shared.cleanup);
+    try std.testing.expectEqual(@as(usize, 0), shared.undefined_read + shared.undefined_undecided);
+    const own = try cleanupAndUndefined(after, false);
+    try std.testing.expectEqual(@as(usize, 1), own.undefined_read);
+    // Read through an alias taken before its deinit: undecided by whichever rule has it, cleared
+    // by neither.
+    const alias = head ++ "pub fn f(gpa: std.mem.Allocator) !usize { var b = try Bytes.init(gpa, 4); const p = &b; b.deinit(gpa); return p.len(); }";
+    const shared_alias = try cleanupAndUndefined(alias, true);
+    try std.testing.expect(shared_alias.cleanup + shared_alias.cleanup_undecided != 0);
+    try std.testing.expectEqual(@as(usize, 0), shared_alias.undefined_read + shared_alias.undefined_undecided);
+    const own_alias = try cleanupAndUndefined(alias, false);
+    try std.testing.expectEqual(@as(usize, 0), own_alias.undefined_read);
+    try std.testing.expectEqual(@as(usize, 1), own_alias.undefined_undecided);
+}

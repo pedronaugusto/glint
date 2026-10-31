@@ -97,7 +97,7 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/debug.zig", .bytes = "pub fn assert(ok: bool) void { if (!ok) unreachable; }\npub fn lockStderr(buffer: []u8) void { _ = buffer; }" },
     .{ .name = "std/Io/File.zig", .bytes = "handle: i32,\npub const Handle = i32;\npub fn stdin() @This() { return .{ .handle = 0 }; }\npub fn stdout() @This() { return .{ .handle = 1 }; }\npub fn stderr() @This() { return .{ .handle = 2 }; }\npub fn close(f: @This()) void { _ = f; }\npub const Reader = struct { io: ?*anyopaque = null, interface: @import(\"Reader.zig\") };\npub fn reader(f: @This(), io: anytype, buffer: []u8) Reader { _ = f; _ = io; _ = buffer; return .{ .interface = .{} }; }\npub fn writer(f: @This(), io: anytype, buffer: []u8) void { _ = f; _ = io; _ = buffer; }\npub fn readStreaming(f: @This(), io: anytype, buffer: []const []u8) !usize { _ = f; _ = io; _ = buffer; return 0; }\npub fn readPositional(f: @This(), io: anytype, buffer: []const []u8, offset: u64) !usize { _ = f; _ = io; _ = buffer; _ = offset; return 0; }" },
     .{ .name = "std/process.zig", .bytes = "pub const Child = struct { id: i32 };\npub const RunResult = struct { stdout: []u8 = &.{}, stderr: []u8 = &.{} };\npub fn run(gpa: anytype, io: anytype, options: anytype) !RunResult { _ = gpa; _ = io; _ = options; return .{}; }" },
-    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } }; }" },
+    .{ .name = "std/array_list.zig", .bytes = "pub fn Aligned(comptime T: type, comptime a: ?u8) type { _ = a; return struct { items: []T = &.{}, capacity: usize = 0, pub fn append(self: *@This(), x: T) void { _ = self; _ = x; } pub fn deinit(self: *@This(), gpa: anytype) void { _ = gpa; self.* = undefined; } }; }" },
     .{ .name = "std/hash_map.zig", .bytes = "pub fn AutoHashMapUnmanaged(comptime K: type, comptime V: type) type { return struct { k: K, v: V, pub fn getPtr(self: *@This(), key: K) ?*V { _ = key; return &self.v; } }; }" },
     .{ .name = "std/array_hash_map.zig", .bytes = "pub const Nothing = struct {};" },
     .{ .name = "std/Io/Reader.zig", .bytes =
@@ -1831,6 +1831,31 @@ test "A019 reads `undefined` given to a local as no write: whole, a part, a lite
         \\pub fn r2(n: usize) void { var x: u32 = undefined; var i: usize = 0; while (i < n) : (i += 1) { x = 1; const y = x; x = undefined; _ = y; } }
     );
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 8, 10, 12, 14, 15, 18 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a local after a call that gives it `undefined`: a deinit's, std's, a field's through the program's own, on some path, on a loop's next pass" {
+    // Findings: read after its deinit (4), std's list read after its deinit (7), a field a
+    // wrapper's deinit leaves undefined (8), deinit on one path (11), std's deinit twice (12),
+    // the next pass reading what the last gave `undefined` (13). Clean: read before (5), written
+    // whole again after (6), a part the deinit leaves written (9), a reset that writes it again
+    // (10), a deferred deinit (14).
+    const found = try run(pack.unsafe_set,
+        \\const std = @import("std");
+        \\const S = struct { n: u32, fn deinit(self: *S) void { self.* = undefined; } };
+        \\const L = struct { a: std.ArrayList(u8) = .{}, b: u32 = 0, fn deinit(self: *L) void { self.a.deinit(0); } fn reset(self: *L) void { self.deinit(); self.* = .{}; } };
+        \\pub fn k1() u32 { var s: S = undefined; s.n = 1; s.deinit(); return s.n; }
+        \\pub fn k2() u32 { var s: S = undefined; s.n = 1; const n = s.n; s.deinit(); return n; }
+        \\pub fn k3() u32 { var s: S = .{ .n = 1 }; s.deinit(); s = .{ .n = 2 }; return s.n; }
+        \\pub fn k4() usize { var l: std.ArrayList(u8) = .{}; l.deinit(0); return l.items.len; }
+        \\pub fn k5() usize { var l: L = .{}; l.deinit(); return l.a.items.len; }
+        \\pub fn k6() u32 { var l: L = .{}; l.deinit(); return l.b; }
+        \\pub fn k7() usize { var l: L = .{}; l.reset(); return l.a.items.len; }
+        \\pub fn k8(c: bool) u32 { var s: S = .{ .n = 1 }; if (c) s.deinit(); return s.n; }
+        \\pub fn k9() void { var l: std.ArrayList(u8) = .{}; l.deinit(0); l.deinit(0); }
+        \\pub fn k10(n: usize) void { var s: S = .{ .n = 1 }; for (0..n) |_| { s.n += 1; s.deinit(); } }
+        \\pub fn k11() u32 { var s: S = .{ .n = 1 }; defer s.deinit(); return s.n; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 4, 7, 8, 11, 12, 13 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads a fill that may stop early as none: a `for` setting each element that may leave, an error set's error returned as a value, a labeled switch dispatching again into the prong its check guards" {
