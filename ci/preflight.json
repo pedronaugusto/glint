@@ -31,7 +31,7 @@
       }
     ],
     "escapes": {
-      "no-danger": 2,
+      "no-danger": 3,
       "internal": 1,
       "design": 2
     }
@@ -47,8 +47,6 @@
   ],
   "glint_paths": [
     "src",
-    "examples/project.zig",
-    "examples/report.zig",
     "ci",
     "bench",
     "build.zig"

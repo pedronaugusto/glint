@@ -3710,9 +3710,46 @@ fn absent(value: Value) bool {
     };
 }
 
-/// The arguments every call of `function` in the project passes at `position`, or null when
-/// the function is used other than by a call, or when a consumer can call it by name.
+/// The arguments every call of `function` in the project passes at `position`, or null where
+/// code outside the program may call it (`escapes`), or a call passes fewer.
 fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]const Value {
+    const sites = (try self.callSites(function)) orelse return null;
+    var values: std.ArrayList(Value) = .empty;
+    for (sites) |site| {
+        if (position < site.receiver) {
+            try values.append(self.gpa, try self.resolve(site.file, site.holder));
+            continue;
+        }
+        if (position - site.receiver >= site.params.len) return null;
+        try values.append(self.gpa, try self.resolve(site.file, site.params[position - site.receiver]));
+    }
+    return values.items;
+}
+
+/// Whether code outside the program's own calls may call `function`, with values no call of
+/// the program's shows: a consumer by its exported name, std's or a known library's code
+/// through a member of a value the program hands it (a context's `hash`), or anyone given the
+/// function itself as a value (`std.mem.sort(T, items, {}, less)`, `Thread.spawn(.{}, worker,
+/// …)`). Each of the function's parameters may then hold anything.
+pub fn escapes(self: *Facts, function: Decl) ResolveError!bool {
+    return (try self.callSites(function)) == null;
+}
+
+/// One call of a function the program makes: its arguments, after the receiver a method call
+/// on a value passes first (`holder`).
+const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
+const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
+
+/// Every call of `function` the program makes, or null where it `escapes`. Read once.
+fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
+    const read = try self.memo(CallSites);
+    if (read.map.get(function)) |known_sites| return known_sites;
+    const found = try self.scanCallSites(function);
+    try read.map.put(self.gpa, function, found);
+    return found;
+}
+
+fn scanCallSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
     if (record.public and try self.exportedFunction(function)) return null;
@@ -3721,7 +3758,7 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
     // std's or aegis's code may call it on a value the program hands it: callers no scan of the
     // program sees.
     if (record.public and try self.calledOutside(name)) return null;
-    var values: std.ArrayList(Value) = .empty;
+    var sites: std.ArrayList(CallSite) = .empty;
     for (self.project.sources) |*source| {
         const file = &source.file;
         const file_model = &source.model;
@@ -3791,15 +3828,11 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
                 if (!calls_it) continue;
             }
             const params = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) orelse return null;
-            if (position < receiver) {
-                try values.append(self.gpa, try self.resolve(id, tree.nodeData(node).node_and_token[0]));
-                continue;
-            }
-            if (position - receiver >= params.len) return null;
-            try values.append(self.gpa, try self.resolve(id, params[position - receiver]));
+            const holder = if (tag == .field_access) tree.nodeData(node).node_and_token[0] else node;
+            try sites.append(self.gpa, .{ .file = id, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = receiver, .holder = holder });
         }
     }
-    return values.items;
+    return sites.items;
 }
 
 /// Whether code outside the program (std's or a known library's) may call a function named
@@ -4551,4 +4584,29 @@ test "a call through a function-pointer field reaches the functions stored there
     // any other name, it may be.
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
+}
+
+test "a function handed to code outside the program as a value escapes: its callers are not all the program's" {
+    // `less` is handed to a known library's `sort`, which may call it with anything; `twice`
+    // is only called, and every call the program makes shows what it is given.
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\nfn less(a: u8, b: u8) bool {\n    return a < b;\n}\nfn twice(a: u8) u8 {\n    return a *% 2;\n}\npub fn f(x: u8) u8 {\n    lib.sort(less);\n    return twice(x);\n}" },
+        .{ .name = "lib", .bytes = "pub fn sort(comptime order: anytype) void {\n    _ = order;\n}", .selected = false },
+    }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const known = [_]KnownModule{.{ .name = "lib", .members = &.{.{ .path = "sort" }} }};
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = &known };
+    defer facts.deinit();
+    const model = &project.sources[0].model;
+    var less: ?Decl = null;
+    var twice: ?Decl = null;
+    for (model.declarations, 0..) |decl, i| {
+        const id: Decl = .{ .file = project.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+        if (std.mem.eql(u8, decl.name, "less")) less = id;
+        if (std.mem.eql(u8, decl.name, "twice")) twice = id;
+    }
+    try std.testing.expect(try facts.escapes(less.?));
+    try std.testing.expect(!try facts.escapes(twice.?));
 }
