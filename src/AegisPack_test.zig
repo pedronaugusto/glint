@@ -574,6 +574,61 @@ test "a scalar receiver is known through an unwrapped optional" {
     try std.testing.expectEqual(@as(usize, 1), try scalarFindings(&project)); // safe: one raw comparison, decided.
 }
 
+/// A std of its reinterpreting reads: bytes of a value, a value or an integer out of bytes, an
+/// enum out of an integer.
+const reinterpreting_std = [_]aegis_sources.Extra{
+    .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\npub const enums = @import(\"enums.zig\");" },
+    .{ .name = "std/mem.zig", .bytes = "pub const Endian = enum { little, big };\npub fn asBytes(ptr: anytype) []const u8 { _ = ptr; return &.{}; }\npub fn toBytes(value: anytype) [8]u8 { _ = value; return undefined; }\npub fn readInt(comptime T: type, buffer: []const u8, endian: Endian) T { _ = buffer; _ = endian; return undefined; }\npub fn bytesToValue(comptime T: type, bytes: anytype) T { _ = bytes; return undefined; }" },
+    .{ .name = "std/enums.zig", .bytes = "pub fn fromInt(comptime E: type, integer: anytype) ?E { _ = integer; return null; }" },
+};
+const reinterpreting_imports = [_]aegis_sources.ExtraImport{
+    .{ .spelling = "std", .target = 0 },
+    .{ .from = 0, .spelling = "mem.zig", .target = 1 },
+    .{ .from = 0, .spelling = "enums.zig", .target = 2 },
+};
+fn expectReinterpreted(source: []const u8, findings: usize) !void {
+    try expectWithBytes(source, pack.scalar, true, findings);
+}
+fn expectWithBytes(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &reinterpreting_std, &reinterpreting_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "A001 reads a public source rewritten by a destructure, or through its whole address handed where it is written" {
+    const head = "const std = @import(\"std\");\nconst err = @import(\"aegis\").err;\n";
+    const made = "var p = err.PublicSource.classify(\"fixed label\", \"ok\");\n";
+    try expectWithBytes(head ++ "pub fn f(secret: []const u8) err.PublicSource {\n" ++ made ++ "var n: usize = 0;\np.bytes, n = .{ secret, 1 };\n_ = &n;\nreturn p;\n}", pack.access, true, 1);
+    try expectWithBytes(head ++ "pub fn f(secret: []const u8) err.PublicSource {\n" ++ made ++ "@memcpy(std.mem.asBytes(&p)[0..16], std.mem.asBytes(&secret)[0..16]);\nreturn p;\n}", pack.access, true, 1);
+    // A function that may write through what it is given: undecided; one given a `*const`
+    // pointer, and a `const` source's bytes, read only.
+    try expectWithBytes(head ++ "fn fill(s: *err.PublicSource) void { _ = s; }\npub fn f() err.PublicSource {\n" ++ made ++ "fill(&p);\nreturn p;\n}", pack.access, false, 0);
+    try expectWithBytes(head ++ "fn show(s: *const err.PublicSource) void { _ = s; }\npub fn f() err.PublicSource {\n" ++ made ++ "show(&p);\nreturn p;\n}", pack.access, true, 0);
+    try expectWithBytes(head ++ "pub fn f() usize {\nconst p = err.PublicSource.classify(\"fixed label\", \"ok\");\nreturn std.mem.asBytes(&p).len;\n}", pack.access, true, 0);
+}
+
+test "A004 reads a scalar's bits reinterpreted by the language or std as its raw integer, and a scalar made so" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u16);\n";
+    // Its bits read as an integer, or through a pointer to them, or as bytes read back.
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { const v: u16 = @bitCast(i); return v + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { return @as(u16, @bitCast(i)) + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { const p: *const u16 = @ptrCast(&i); return p.* + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { return std.mem.readInt(u16, std.mem.asBytes(&i), .little) + 1; }", 1);
+    // A scalar made of an integer's bits, out of bytes, or by std's enum reading.
+    try expectReinterpreted(head ++ "pub fn f(v: u16) Index { return @bitCast(v); }", 1);
+    try expectReinterpreted(head ++ "pub fn f(v: *const u16) Index { const p: *const Index = @ptrCast(v); return p.*; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(b: [2]u8) Index { return std.mem.bytesToValue(Index, &b); }", 1);
+    try expectReinterpreted(head ++ "pub fn f(v: u16) !Index { return std.enums.fromInt(Index, v) orelse error.Bad; }", 1);
+    // A number's bits, bytes and values out of them are no scalar's.
+    try expectReinterpreted(head ++ "pub fn f(n: i16) u16 { const v: u16 = @bitCast(n); return v + 1; }", 0);
+    try expectReinterpreted(head ++ "pub fn f(n: u16) u16 { return std.mem.readInt(u16, std.mem.asBytes(&n), .little) + 1; }", 0);
+    try expectReinterpreted(head ++ "pub fn f(b: [2]u8) u16 { return std.mem.bytesToValue(u16, &b) + 1; }", 0);
+    try expectReinterpreted(head ++ "const E = enum(u8) { a, b };\npub fn f(v: u8) ?E { return std.enums.fromInt(E, v); }", 0);
+}
+
 test "A004 strict: every operator, compound assignment and cast on a raw value, and one carried through a local or a branch" {
     const head = "const Index = @import(\"aegis\").id.Id(struct {}, u16);\nfn use(v: u16) void { _ = v; }\npub fn f(i: Index, maybe: ?u16, limit: u16) !u16 {\n    _ = .{ i, maybe, limit };\n";
     // Each unsafe probe computes with the raw value once; its safe twin hands it on or checks it.
@@ -1462,6 +1517,15 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
 test "an adoption of an allocation freed, changed or kept elsewhere before it is reported" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // A function it is handed to, whatever it returns: one that keeps it, frees it, or frees
+    // it by its pointer; and its address kept as a number.
+    try expectJudgedStd(head ++ "var kept: []u8 = &.{};\nfn stash(p: []u8) void { kept = p; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); stash(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "fn drop(gpa: std.mem.Allocator, p: []u8) void { gpa.free(p); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); drop(gpa, buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "fn release(gpa: std.mem.Allocator, p: [*]u8, len: usize) usize { gpa.free(p[0..len]); return len; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); _ = release(gpa, buffer.ptr, buffer.len); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "var where: usize = 0;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); where = @intFromPtr(buffer.ptr); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // One that only fills it and gives back nothing, and its address compared, leave it whole.
+    try expectJudgedStd(head ++ "fn fill(p: []u8) void { @memset(p, 0); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); fill(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (@intFromPtr(buffer.ptr) == 0) unreachable; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);

@@ -817,7 +817,8 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
 
 /// The integers made into a type, or read out of a value, by the type of `function`'s generic
 /// parameter: `@enumFromInt` and `@fromBackingInt` into a type its result place writes in terms
-/// of one (`@as(@TypeOf(library).Role, ...)`); `@intFromEnum`, `@backingInt` and a call of
+/// of one (`@as(@TypeOf(library).Role, ...)`); `@bitCast` and `@ptrCast` into one, or of a value
+/// one gives; `@intFromEnum`, `@backingInt` and a call of
 /// `raw` (`x.raw()`, `T.raw(x)`, `@call(.auto, T.raw, .{x})`) of a value one gives. Each is
 /// the binding's: its type is the bound one's (`kind = .cast`, `source` the type written, or
 /// the value read).
@@ -837,6 +838,12 @@ fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy))
                 const args = builtinArgs(t, node, &buffer);
                 if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) break :blk self.writtenType(function.file, node, 0) orelse continue;
                 if ((std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@backingInt")) and args.len == 1) break :blk args[0];
+                // Bits reinterpreted: a value one gives read as another type, or a type written
+                // in terms of one made out of another's bits.
+                if ((std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@ptrCast")) and args.len == 1) {
+                    if (self.derivedParameter(function, args[0], 0) != null) break :blk args[0];
+                    break :blk self.writtenType(function.file, node, 0) orelse continue;
+                }
                 // `@call(modifier, T.raw, .{x})`: the value it is given.
                 if (std.mem.eql(u8, name, "@call") and args.len == 3) {
                     var tuple_buffer: [2]Ast.Node.Index = undefined;
