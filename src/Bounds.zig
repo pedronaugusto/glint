@@ -34,6 +34,7 @@ const Context = @import("RuleContext.zig");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
+const Program = @import("Program.zig");
 
 const Error = Context.Error;
 
@@ -475,6 +476,12 @@ const Target = struct {
     value: ?Var = null,
 };
 
+/// What evaluating an expression leaves and gives.
+const Eval = struct { s: State, v: Value = .{} };
+
+/// A loop pass's body: the state its body ends in, and the one its loop exits in.
+const Ran = struct { body: State, exit: State };
+
 const Deferred = struct { body: Ast.Node.Index, on_error: bool };
 
 const Exit = struct { state: State, failed: bool };
@@ -489,7 +496,14 @@ const Frame = struct {
     function: Ast.Node.Index,
     vars: std.AutoArrayHashMapUnmanaged(Key, Var) = .empty,
     addressed: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty,
-    captures: std.AutoHashMapUnmanaged(Ast.TokenIndex, Model.Declaration.Id) = .empty,
+    /// Each declaration of the function by its name's token.
+    decls: std.AutoHashMapUnmanaged(Ast.TokenIndex, Model.Declaration.Id) = .empty,
+    /// The variables whose type's range a state was given since last assigned.
+    typed_vars: std.AutoHashMapUnmanaged(Var, void) = .empty,
+    /// Whether the function returns an integer, or an error union or optional of one.
+    returns_int: bool = false,
+    /// Each `for` loop's count of passes, read once before them.
+    for_counts: std.AutoHashMapUnmanaged(Ast.Node.Index, ?Lin) = .empty,
     verdicts: std.AutoHashMapUnmanaged(Site, bool) = .empty,
     targets: std.ArrayList(Target) = .empty,
     defers: std.ArrayList(Deferred) = .empty,
@@ -508,19 +522,19 @@ const Frame = struct {
             const last = f.tree.lastToken(f.function);
             if (last - first > function_nodes) return error.Unsupported;
         }
-        try f.index();
+        try f.indexDeclarations();
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = f.tree.fullFnProto(&proto_buffer, f.tree.nodeData(f.function).node_and_node[0]) orelse return error.Unsupported;
         var params: std.ArrayList(?Model.Declaration.Id) = .empty;
         var s: State = .{};
         var it = proto.iterate(f.tree);
         while (it.next()) |param| {
-            const name = param.name_token orelse {
+            const name_token = param.name_token orelse {
                 try params.append(f.a, null);
                 continue;
             };
             var found: ?Model.Declaration.Id = null;
-            for (f.model.declarations, 0..) |decl, d| if (decl.kind == .parameter and decl.token == name) {
+            for (f.model.declarations, 0..) |decl, d| if (decl.kind == .parameter and decl.token == name_token) {
                 found = @fromBackingInt(@intCast(d));
                 break;
             };
@@ -531,14 +545,20 @@ const Frame = struct {
             };
         }
         f.params = params.items;
+        if (proto.ast.return_type.unwrap()) |result| {
+            var t = result;
+            if (f.tree.nodeTag(t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
+            if (f.tree.nodeTag(t) == .optional_type) t = f.tree.nodeData(t).node;
+            f.returns_int = try Range.intNamed(f.c, f.file, t, f.width) != null;
+        }
         const body = f.tree.nodeData(f.function).node_and_node[1];
         const out = try f.exec(s, body);
         if (!out.dead) try f.exits.append(f.a, .{ .state = out, .failed = false });
         try f.summarize();
     }
 
-    /// The locals whose address is taken, and each capture's declaration by its name.
-    fn index(f: *Frame) Error!void {
+    /// The locals whose address is taken, and each declaration by its name's token.
+    fn indexDeclarations(f: *Frame) Error!void {
         const first = f.tree.firstToken(f.function);
         const last = f.tree.lastToken(f.function);
         for (f.tree.nodes.items(.tag), 0..) |tag, i| {
@@ -556,8 +576,11 @@ const Frame = struct {
             if (ref.declaration) |d| try f.addressed.put(f.a, d, {});
         }
         for (f.model.declarations, 0..) |decl, d| {
-            if (decl.kind != .capture or decl.token < first or decl.token > last) continue;
-            try f.captures.put(f.a, decl.token, @fromBackingInt(@intCast(d)));
+            if (decl.token < first or decl.token > last) continue;
+            switch (decl.kind) {
+                .variable, .capture, .parameter => try f.decls.put(f.a, decl.token, @fromBackingInt(@intCast(d))),
+                else => {},
+            }
         }
     }
 
@@ -622,6 +645,8 @@ const Frame = struct {
     /// The state with `v` given `value` (unknown where null), in its type's range where known.
     fn assign(f: *Frame, s: State, v: Var, value: ?Lin, int: ?Range.Int) Error!State {
         if (s.dead) return s;
+        // Its type's range is given again where it is next read, or here.
+        _ = f.typed_vars.remove(v);
         var out = s;
         if (value) |given| {
             const k = given.coefficient(v);
@@ -653,7 +678,10 @@ const Frame = struct {
             return f.equal(out, v, given);
         }
         out = try forget(f.a, out, v);
-        if (int) |known_int| out = try f.typed(out, v, known_int);
+        if (int) |known_int| {
+            out = try f.typed(out, v, known_int);
+            try f.typed_vars.put(f.a, v, {});
+        }
         return out;
     }
 
@@ -740,4 +768,1007 @@ const Frame = struct {
         }
         return .{ .rows = try canonical(f.a, rows.items) };
     }
+
+    //------------------------------------------------------------------
+    // Statements.
+    //------------------------------------------------------------------
+
+    /// The state after `node` runs from `s`.
+    fn exec(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        if (s.dead) return s;
+        switch (f.tree.nodeTag(node)) {
+            .simple_var_decl, .local_var_decl, .aligned_var_decl, .global_var_decl => return f.declare(s, node),
+            .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => return f.assignment(s, node),
+            .assign_destructure => return f.destructure(s, node),
+            .@"defer", .@"errdefer" => {
+                try f.defers.append(f.a, .{ .body = f.tree.nodeData(node).node, .on_error = f.tree.nodeTag(node) == .@"errdefer" });
+                return s;
+            },
+            else => return (try f.eval(s, node)).s,
+        }
+    }
+
+    /// A block's statements in order, its defers run as it ends; a labeled block's `break`s
+    /// join where it ends, with the value each gives.
+    fn block(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = f.tree.blockStatements(&buffer, node).?; // unreachable: the tag is a block's
+        const mark = f.defers.items.len;
+        const label = blockLabel(f.tree, node);
+        var out = s;
+        var result: ?Var = null;
+        if (label != null) {
+            const t = try f.temp(out, node, 0);
+            out = t[0];
+            result = t[1];
+            try f.targets.append(f.a, .{ .kind = .block, .label = label, .defers = mark, .trial = f.trial, .value = result });
+        }
+        for (statements) |statement| out = try f.exec(out, statement);
+        out = try f.runDefers(out, mark, false);
+        f.defers.shrinkRetainingCapacity(mark);
+        if (label == null) return .{ .s = out };
+        const target = f.targets.pop().?; // unreachable: pushed above
+        for (target.breaks.items) |state| out = try join(f.a, out, state);
+        return .{ .s = out, .v = .{ .lin = try single(f.a, result.?) } };
+    }
+
+    fn declare(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        const local = f.tree.fullVarDecl(node).?; // unreachable: the tag is a declaration's
+        const init = local.ast.init_node.unwrap() orelse return s;
+        const e = try f.eval(s, init);
+        const d = f.decls.get(local.ast.mut_token + 1) orelse return e.s;
+        if (!f.tracked(d)) return e.s;
+        const int = if (local.ast.type_node.unwrap()) |t| try Range.intNamed(f.c, f.file, t, f.width) else try f.intOf(init);
+        return f.bind(e.s, d, e.v, int);
+    }
+
+    /// The state with a tracked declaration given a value: its integer where its type is one,
+    /// and the length of its memory.
+    fn bind(f: *Frame, s: State, d: Model.Declaration.Id, value: Value, int: ?Range.Int) Error!State {
+        var out = try f.assign(s, try f.variable(.{ .value = d }), if (int != null) value.lin else null, int);
+        const length = try f.variable(.{ .length = d });
+        out = try f.assign(out, length, value.length, null);
+        if (value.length == null) out = try f.lengthy(out, length);
+        return out;
+    }
+
+    fn assignment(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        const tag = f.tree.nodeTag(node);
+        const target, const rhs = f.tree.nodeData(node).node_and_node;
+        const d = f.trackedName(target) orelse {
+            // A store to memory: what it reads is evaluated, and no tracked variable changes.
+            const place = try f.eval(s, target);
+            return (try f.eval(place.s, rhs)).s;
+        };
+        const e = try f.eval(s, rhs);
+        const int = try f.intOf(target);
+        if (tag == .assign) return f.bind(e.s, d, e.v, int);
+        const v = try f.variable(.{ .value = d });
+        const current = try f.name(e.s, target);
+        const op: Ast.Node.Tag = switch (tag) {
+            .assign_add => .add,
+            .assign_add_wrap => .add_wrap,
+            .assign_add_sat => .add_sat,
+            .assign_sub => .sub,
+            .assign_sub_wrap => .sub_wrap,
+            .assign_sub_sat => .sub_sat,
+            .assign_mul => .mul,
+            .assign_mul_wrap => .mul_wrap,
+            .assign_mul_sat => .mul_sat,
+            .assign_div => .div,
+            .assign_mod => .mod,
+            .assign_shl => .shl,
+            .assign_shl_sat => .shl_sat,
+            .assign_shr => .shr,
+            .assign_bit_and => .bit_and,
+            .assign_bit_or => .bit_or,
+            else => .bit_xor,
+        };
+        const result = try f.arith(current.s, node, op, current.v.lin, e.v.lin, rhs, int);
+        return f.assign(result.s, v, result.v.lin, int);
+    }
+
+    fn destructure(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        const full = f.tree.assignDestructure(node);
+        var out = (try f.eval(s, full.ast.value_expr)).s;
+        for (full.ast.variables) |target| {
+            if (f.tree.fullVarDecl(target)) |local| {
+                const d = f.decls.get(local.ast.mut_token + 1) orelse continue;
+                if (f.tracked(d)) out = try f.bind(out, d, .{}, null);
+                continue;
+            }
+            if (f.trackedName(target)) |d| {
+                out = try f.bind(out, d, .{}, null);
+                continue;
+            }
+            out = (try f.eval(out, target)).s;
+        }
+        return out;
+    }
+
+    /// The tracked declaration an identifier names, where it names one.
+    fn trackedName(f: *Frame, node: Ast.Node.Index) ?Model.Declaration.Id {
+        if (f.tree.nodeTag(node) != .identifier) return null;
+        const d = (f.model.reference(node) orelse return null).declaration orelse return null;
+        return if (f.tracked(d)) d else null;
+    }
+
+    //------------------------------------------------------------------
+    // Expressions.
+    //------------------------------------------------------------------
+
+    /// What evaluating `node` from `s` leaves and gives.
+    fn eval(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        if (s.dead) return .{ .s = s };
+        const tree = f.tree;
+        switch (tree.nodeTag(node)) {
+            .number_literal => return .{ .s = s, .v = .{ .lin = switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+                .int => |n| constant(n),
+                else => null,
+            } } },
+            .identifier => return f.name(s, node),
+            .grouped_expression => return f.eval(s, tree.nodeData(node).node_and_token[0]),
+            .@"nosuspend" => return f.eval(s, tree.nodeData(node).node),
+            .field_access => return f.field(s, node),
+            .array_access => return f.element(s, node),
+            .slice_open, .slice, .slice_sentinel => return f.slice(s, node),
+            .add, .sub, .mul, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const left = try f.eval(s, lhs);
+                const right = try f.eval(left.s, rhs);
+                return f.arith(right.s, node, tree.nodeTag(node), left.v.lin, right.v.lin, rhs, try f.intOf(node));
+            },
+            .negation => {
+                const operand = try f.eval(s, tree.nodeData(node).node);
+                return f.arith(operand.s, node, .sub, constant(0), operand.v.lin, tree.nodeData(node).node, try f.intOf(node));
+            },
+            .negation_wrap, .bit_not, .deref, .address_of, .unwrap_optional => {
+                const operand: Ast.Node.Index = switch (tree.nodeTag(node)) {
+                    .unwrap_optional => tree.nodeData(node).node_and_token[0],
+                    else => tree.nodeData(node).node,
+                };
+                const e = try f.eval(s, operand);
+                return f.fresh(e.s, node, 0);
+            },
+            .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or, .bool_not => {
+                const split = try f.cond(s, node);
+                return .{ .s = try join(f.a, split.yes, split.no) };
+            },
+            .@"try" => return f.tried(s, node),
+            .@"catch", .@"orelse" => return f.otherwise(s, node),
+            .@"if", .if_simple => return f.branch(s, node),
+            .@"while", .while_simple, .while_cont => return f.whileLoop(s, node),
+            .@"for", .for_simple => return f.forLoop(s, node),
+            .@"switch", .switch_comma => return f.switchOn(s, node),
+            .@"return" => return f.returned(s, node),
+            .@"break" => return f.jump(s, node, true),
+            .@"continue" => return f.jump(s, node, false),
+            .unreachable_literal => return .{ .s = State.unreachable_state },
+            .block, .block_semicolon, .block_two, .block_two_semicolon => return f.block(s, node),
+            .call_one, .call_one_comma, .call, .call_comma => return f.call(s, node),
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.builtin(s, node),
+            .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const full = tree.fullStructInit(&buffer, node).?; // unreachable: the tag is a struct literal's
+                var out = s;
+                for (full.ast.fields) |each| out = (try f.eval(out, each)).s;
+                return .{ .s = out };
+            },
+            .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const full = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
+                var out = s;
+                for (full.ast.elements) |each| out = (try f.eval(out, each)).s;
+                return .{ .s = out, .v = .{ .length = constant(@intCast(full.ast.elements.len)) } };
+            },
+            .@"asm", .asm_simple, .@"suspend", .@"resume" => return error.Unsupported,
+            // Evaluated as the program compiles, or a type: nothing at run time.
+            .@"comptime", .string_literal, .multiline_string_literal, .char_literal, .enum_literal, .error_value, .error_set_decl, .anyframe_literal, .anyframe_type, .optional_type, .array_type, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .error_union, .merge_error_sets, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing, .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto => return .{ .s = s },
+            else => return f.opaqueExpr(s, node),
+        }
+    }
+
+    /// An expression Bounds does not read: its sites get no verdict, and the state goes on
+    /// unchanged where nothing in it may change a tracked variable or jump; otherwise the
+    /// function is unsupported.
+    fn opaqueExpr(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const tree = f.tree;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(inner);
+            if (token < first or token > last) continue;
+            switch (tag) {
+                .@"return", .@"break", .@"continue" => if (functionOf(f.c, f.file, inner) == f.function) return error.Unsupported,
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (f.trackedName(tree.nodeData(inner).node_and_node[0]) != null) return error.Unsupported,
+                .assign_destructure, .simple_var_decl, .local_var_decl, .aligned_var_decl => if (functionOf(f.c, f.file, inner) == f.function) return error.Unsupported,
+                .@"asm", .asm_simple => return error.Unsupported,
+                else => {},
+            }
+        }
+        return f.fresh(s, node, 0);
+    }
+
+    /// A fresh variable for what `node` gives, within its integer type where it has one.
+    fn fresh(f: *Frame, s: State, node: Ast.Node.Index, part: u8) Error!Eval {
+        const int = try f.intOf(node);
+        if (int == null) return .{ .s = s };
+        const t = try f.temp(s, node, part);
+        return .{ .s = try f.typed(t[0], t[1], int.?), .v = .{ .lin = try single(f.a, t[1]) } };
+    }
+
+    /// An identifier: a tracked variable's value, within its type; a constant's value; or
+    /// nothing known.
+    fn name(f: *Frame, s: State, node: Ast.Node.Index) Error!Eval {
+        const reference = f.model.reference(node) orelse return .{ .s = s };
+        const d = reference.declaration orelse return .{ .s = s };
+        if (f.tracked(d)) {
+            const int = (try f.intOf(node)) orelse return .{ .s = s };
+            const v = try f.variable(.{ .value = d });
+            var out = s;
+            if (!f.typed_vars.contains(v)) {
+                out = try f.typed(out, v, int);
+                try f.typed_vars.put(f.a, v, {});
+            }
+            return .{ .s = out, .v = .{ .lin = try single(f.a, v) } };
+        }
+        if (try Range.constantValue(f.c, f.file, node)) |value| if (value <= std.math.maxInt(Coef)) return .{ .s = s, .v = .{ .lin = constant(@intCast(value)) } };
+        return .{ .s = s };
+    }
+
+    /// `x.len`: the length of `x`'s memory; any other field: nothing known.
+    fn field(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const holder, const field_token = f.tree.nodeData(node).node_and_token;
+        const e = try f.eval(s, holder);
+        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len")) return f.fresh(e.s, node, 0);
+        const measured = try f.lengthOf(e.s, holder, e.v);
+        return .{ .s = measured[0], .v = .{ .lin = measured[1] } };
+    }
+
+    /// The length of `memory`'s memory: what evaluating it gave, an array's fixed length, or a
+    /// tracked slice's length variable.
+    fn lengthOf(f: *Frame, s: State, memory: Ast.Node.Index, value: Value) Error!struct { State, ?Lin } {
+        if (value.length) |known_length| return .{ s, known_length };
+        if (try Range.memoryLength(f.c, f.file, memory)) |fixed| if (fixed <= std.math.maxInt(Coef)) return .{ s, constant(@intCast(fixed)) };
+        const d = f.trackedName(memory) orelse return .{ s, null };
+        const key: Key = .{ .length = d };
+        const made = f.known(key) == null;
+        const v = try f.variable(key);
+        return .{ if (made) try f.lengthy(s, v) else s, try single(f.a, v) };
+    }
+
+    /// `m[i]`: the index below the memory's length, checked by a safe build and so held past it.
+    fn element(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const memory, const at = f.tree.nodeData(node).node_and_node;
+        const m = try f.eval(s, memory);
+        const i = try f.eval(m.s, at);
+        const measured = try f.lengthOf(i.s, memory, m.v);
+        var out = measured[0];
+        if (i.v.lin) |position| if (measured[1]) |length| {
+            const low = try atLeast(f.a, position, constant(0));
+            const high = try above(f.a, length, position);
+            try f.record(at, .index, (low != null and try entails(f.a, out, low.?)) and (high != null and try entails(f.a, out, high.?)));
+            out = try assume(f.a, out, low);
+            out = try assume(f.a, out, high);
+            return f.fresh(out, node, 0);
+        };
+        try f.record(at, .index, false);
+        return f.fresh(out, node, 0);
+    }
+
+    /// `m[a..b]`: its bounds in order and its end within the memory, checked by a safe build
+    /// and so held past it; its length the difference.
+    fn slice(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const full = f.tree.fullSlice(node).?; // unreachable: the tag is a slice's
+        const m = try f.eval(s, full.ast.sliced);
+        const start = try f.eval(m.s, full.ast.start);
+        var out = start.s;
+        var end: ?Lin = null;
+        if (full.ast.end.unwrap()) |end_node| {
+            const e = try f.eval(out, end_node);
+            out = e.s;
+            end = e.v.lin;
+        }
+        if (full.ast.sentinel.unwrap()) |sentinel| out = (try f.eval(out, sentinel)).s;
+        const measured = try f.lengthOf(out, full.ast.sliced, m.v);
+        out = measured[0];
+        const length = measured[1];
+        // A sentinel's slice reads the element at its end too.
+        const room: ?Lin = if (length) |l| (if (full.ast.sentinel != .none) shiftedBy(l, -1) else l) else null;
+        const last = end orelse length;
+        if (full.ast.end.unwrap()) |end_node| {
+            const fits_end = if (last != null and room != null) try atLeast(f.a, room.?, last.?) else null;
+            try f.record(end_node, .end, fits_end != null and try entails(f.a, out, fits_end.?));
+            out = try assume(f.a, out, fits_end);
+            const ordered_bounds = if (start.v.lin != null and last != null) try atLeast(f.a, last.?, start.v.lin.?) else null;
+            try f.record(full.ast.start, .order, ordered_bounds != null and try entails(f.a, out, ordered_bounds.?));
+            out = try assume(f.a, out, ordered_bounds);
+        }
+        const fits_start = if (start.v.lin != null and room != null) try atLeast(f.a, room.?, start.v.lin.?) else null;
+        try f.record(full.ast.start, .start, fits_start != null and try entails(f.a, out, fits_start.?));
+        out = try assume(f.a, out, fits_start);
+        const size: ?Lin = if (last != null and start.v.lin != null) try minus(f.a, last.?, start.v.lin.?) else null;
+        return .{ .s = out, .v = .{ .length = size } };
+    }
+
+    /// Arithmetic `op` of `x` and `y` in `int`, at `node`: a checked operation's verdict, and its
+    /// result exact where it is shown within its type (a checked one past its check).
+    fn arith(f: *Frame, s: State, node: Ast.Node.Index, op: Ast.Node.Tag, x: ?Lin, y: ?Lin, divisor: Ast.Node.Index, int: ?Range.Int) Error!Eval {
+        var out = s;
+        switch (op) {
+            .add, .sub, .mul => {
+                const exact: ?Lin = if (x == null or y == null) null else switch (op) {
+                    .add => try plus(f.a, x.?, y.?),
+                    .sub => try minus(f.a, x.?, y.?),
+                    else => if (y.?.terms.len == 0) try scaled(f.a, x.?, y.?.c) else if (x.?.terms.len == 0) try scaled(f.a, y.?, x.?.c) else null,
+                };
+                const known_int = int orelse {
+                    // Comptime arithmetic is exact.
+                    return .{ .s = out, .v = .{ .lin = exact } };
+                };
+                const bounds = try f.range(known_int, false);
+                const result = exact orelse {
+                    try f.record(node, .arith, false);
+                    return f.fresh(out, node, 0);
+                };
+                const low = if (bounds.low) |l| try atLeast(f.a, result, constant(l)) else null;
+                const high = if (bounds.high) |h| try atLeast(f.a, constant(h), result) else null;
+                try f.record(node, .arith, low != null and high != null and try entails(f.a, out, low.?) and try entails(f.a, out, high.?));
+                out = try assume(f.a, out, low);
+                out = try assume(f.a, out, high);
+                return .{ .s = out, .v = .{ .lin = result } };
+            },
+            .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shl_sat => {
+                // Exact only where shown within the type; otherwise anything in it.
+                const exact: ?Lin = if (x == null or y == null) null else switch (op) {
+                    .add_wrap, .add_sat => try plus(f.a, x.?, y.?),
+                    .sub_wrap, .sub_sat => try minus(f.a, x.?, y.?),
+                    .shl, .shl_sat => if (y.?.terms.len == 0 and y.?.c >= 0 and y.?.c < 120) try scaled(f.a, x.?, @as(Coef, 1) << @intCast(y.?.c)) else null,
+                    else => if (y.?.terms.len == 0) try scaled(f.a, x.?, y.?.c) else if (x.?.terms.len == 0) try scaled(f.a, y.?, x.?.c) else null,
+                };
+                if (exact != null and int != null) {
+                    const bounds = try f.range(int.?, false);
+                    if (bounds.low != null and bounds.high != null and
+                        try entails(f.a, out, (try atLeast(f.a, exact.?, constant(bounds.low.?))) orelse return f.fresh(out, node, 0)) and
+                        try entails(f.a, out, (try atLeast(f.a, constant(bounds.high.?), exact.?)) orelse return f.fresh(out, node, 0)))
+                        return .{ .s = out, .v = .{ .lin = exact } };
+                }
+                return f.fresh(out, node, 0);
+            },
+            .div, .mod => {
+                if (y) |d| {
+                    const positive = try atLeast(f.a, d, constant(1));
+                    const negative = try atLeast(f.a, constant(-1), d);
+                    try f.record(divisor, .divisor, (positive != null and try entails(f.a, out, positive.?)) or (negative != null and try entails(f.a, out, negative.?)));
+                    // An unsigned divisor other than zero is one or more.
+                    if (try entails(f.a, out, (try atLeast(f.a, d, constant(0))).?)) out = try assume(f.a, out, positive);
+                } else try f.record(divisor, .divisor, false);
+                const made = try f.fresh(out, node, 0);
+                out = made.s;
+                const t = made.v.lin orelse return made;
+                const left = x orelse return made;
+                const d = y orelse return made;
+                const left_natural = try entails(f.a, out, (try atLeast(f.a, left, constant(0))).?);
+                const d_positive = try entails(f.a, out, (try atLeast(f.a, d, constant(1))).?);
+                if (!left_natural or !d_positive) return made;
+                if (op == .mod) {
+                    // `0 <= x % d < d`, and at most `x`.
+                    out = try assume(f.a, out, try atLeast(f.a, t, constant(0)));
+                    out = try assume(f.a, out, try above(f.a, d, t));
+                    out = try assume(f.a, out, try atLeast(f.a, left, t));
+                } else if (d.terms.len == 0) {
+                    // `k·(x / k) <= x < k·(x / k) + k`.
+                    const kt = (try scaled(f.a, t, d.c)) orelse return .{ .s = out, .v = made.v };
+                    out = try assume(f.a, out, try atLeast(f.a, kt, constant(0)));
+                    out = try assume(f.a, out, try atLeast(f.a, left, kt));
+                    out = try assume(f.a, out, try above(f.a, (try plus(f.a, kt, d)) orelse return .{ .s = out, .v = made.v }, left));
+                } else {
+                    out = try assume(f.a, out, try atLeast(f.a, t, constant(0)));
+                    out = try assume(f.a, out, try atLeast(f.a, left, t));
+                }
+                return .{ .s = out, .v = made.v };
+            },
+            .shr, .bit_and => {
+                const made = try f.fresh(out, node, 0);
+                out = made.s;
+                const t = made.v.lin orelse return made;
+                const left = x orelse return made;
+                if (!try entails(f.a, out, (try atLeast(f.a, left, constant(0))).?)) return made;
+                // An unsigned shift right or mask is at most what it takes from.
+                out = try assume(f.a, out, try atLeast(f.a, t, constant(0)));
+                out = try assume(f.a, out, try atLeast(f.a, left, t));
+                if (op == .bit_and) if (y) |mask| if (try entails(f.a, out, (try atLeast(f.a, mask, constant(0))).?)) {
+                    out = try assume(f.a, out, try atLeast(f.a, mask, t));
+                };
+                return .{ .s = out, .v = made.v };
+            },
+            else => return f.fresh(out, node, 0),
+        }
+    }
+
+    /// An integer type's least and greatest values on every target, where they fit a `Coef`.
+    fn range(f: *Frame, int: Range.Int, widest: bool) Error!struct { low: ?Coef, high: ?Coef } {
+        _ = f;
+        const bits = if (widest) int.wide orelse int.bits else int.bits;
+        if (int.signed and !(widest and int.either)) {
+            if (bits == 0 or bits > 127) return .{ .low = null, .high = null };
+            const half = @as(Coef, 1) << @intCast(bits - 1);
+            return .{ .low = -half, .high = half - 1 };
+        }
+        if (bits > 126) return .{ .low = 0, .high = null };
+        return .{ .low = 0, .high = (@as(Coef, 1) << @intCast(bits)) - 1 };
+    }
+
+    fn builtin(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const tree = f.tree;
+        const which = tree.tokenSlice(tree.nodeMainToken(node));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = tree.builtinCallParams(&buffer, node) orelse &.{};
+        const is = struct {
+            fn named(spelled: []const u8, wanted: []const u8) bool {
+                return std.mem.eql(u8, spelled, wanted);
+            }
+        }.named;
+        // Read as the program compiles: nothing at run time.
+        for ([_][]const u8{ "@import", "@This", "@TypeOf", "@typeInfo", "@typeName", "@sizeOf", "@alignOf", "@bitSizeOf", "@offsetOf", "@bitOffsetOf", "@hasDecl", "@hasField", "@compileError", "@compileLog", "@Type", "@Int", "@Struct", "@Union", "@Enum", "@Tuple", "@Pointer", "@Fn", "@EnumLiteral", "@field", "@src", "@inComptime", "@setEvalBranchQuota", "@setRuntimeSafety", "@setFloatMode", "@branchHint", "@embedFile" }) |compiled| if (is(which, compiled)) {
+            if (is(which, "@compileError")) return .{ .s = State.unreachable_state };
+            if (is(which, "@field") and args.len == 2) return f.fresh((try f.eval(s, args[0])).s, node, 0);
+            return f.fresh(s, node, 0);
+        };
+        if (is(which, "@panic") or is(which, "@trap")) {
+            if (args.len == 1) _ = try f.eval(s, args[0]);
+            return .{ .s = State.unreachable_state };
+        }
+        var out = s;
+        var values: [2]Value = .{ .{}, .{} };
+        var all: std.ArrayList(Value) = .empty;
+        for (args, 0..) |arg, i| {
+            const e = try f.eval(out, arg);
+            out = e.s;
+            if (i < 2) values[i] = e.v;
+            try all.append(f.a, e.v);
+        }
+        if (is(which, "@as") and args.len == 2) return .{ .s = out, .v = values[1] };
+        if ((is(which, "@intCast") or is(which, "@truncate")) and args.len == 1) {
+            const into = (try f.intOf(node)) orelse {
+                if (is(which, "@intCast")) try f.record(node, .cast, false);
+                return .{ .s = out };
+            };
+            const bounds = try f.range(into, false);
+            const x = values[0].lin;
+            const low = if (x != null and bounds.low != null) try atLeast(f.a, x.?, constant(bounds.low.?)) else null;
+            const high = if (x != null and bounds.high != null) try atLeast(f.a, constant(bounds.high.?), x.?) else null;
+            const within_type = low != null and high != null and try entails(f.a, out, low.?) and try entails(f.a, out, high.?);
+            if (is(which, "@intCast")) {
+                try f.record(node, .cast, within_type);
+                // A safe build checks the conversion: past it the value is within.
+                out = try assume(f.a, out, low);
+                out = try assume(f.a, out, high);
+                if (x != null) return .{ .s = out, .v = .{ .lin = x } };
+                return f.fresh(out, node, 0);
+            }
+            if (within_type) return .{ .s = out, .v = .{ .lin = x } };
+            return f.fresh(out, node, 0);
+        }
+        if (is(which, "@intFromBool")) {
+            const made = try f.fresh(out, node, 0);
+            const t = made.v.lin orelse return made;
+            var bounded = try assume(f.a, made.s, try atLeast(f.a, t, constant(0)));
+            bounded = try assume(f.a, bounded, try atLeast(f.a, constant(1), t));
+            return .{ .s = bounded, .v = made.v };
+        }
+        if (is(which, "@min") or is(which, "@max")) {
+            const made = try f.fresh(out, node, 0);
+            out = made.s;
+            const t = made.v.lin orelse return made;
+            for (all.items) |each| if (each.lin) |x| {
+                out = try assume(f.a, out, if (is(which, "@min")) try atLeast(f.a, x, t) else try atLeast(f.a, t, x));
+            };
+            return .{ .s = out, .v = made.v };
+        }
+        return f.fresh(out, node, 0);
+    }
+
+    //------------------------------------------------------------------
+    // Conditions and branches.
+    //------------------------------------------------------------------
+
+    const Split = struct { yes: State, no: State };
+
+    /// The states where a condition holds and where it fails.
+    fn cond(f: *Frame, s: State, node: Ast.Node.Index) RunError!Split {
+        if (s.dead) return .{ .yes = s, .no = s };
+        const tree = f.tree;
+        switch (tree.nodeTag(node)) {
+            .grouped_expression => return f.cond(s, tree.nodeData(node).node_and_token[0]),
+            .bool_not => {
+                const inner = try f.cond(s, tree.nodeData(node).node);
+                return .{ .yes = inner.no, .no = inner.yes };
+            },
+            .bool_and => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const left = try f.cond(s, lhs);
+                const right = try f.cond(left.yes, rhs);
+                return .{ .yes = right.yes, .no = try join(f.a, left.no, right.no) };
+            },
+            .bool_or => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const left = try f.cond(s, lhs);
+                const right = try f.cond(left.no, rhs);
+                return .{ .yes = try join(f.a, left.yes, right.yes), .no = right.no };
+            },
+            .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const left = try f.eval(s, lhs);
+                const right = try f.eval(left.s, rhs);
+                const base = right.s;
+                const x = left.v.lin orelse return .{ .yes = base, .no = base };
+                const y = right.v.lin orelse return .{ .yes = base, .no = base };
+                return switch (tree.nodeTag(node)) {
+                    .less_than => .{ .yes = try assume(f.a, base, try above(f.a, y, x)), .no = try assume(f.a, base, try atLeast(f.a, x, y)) },
+                    .less_or_equal => .{ .yes = try assume(f.a, base, try atLeast(f.a, y, x)), .no = try assume(f.a, base, try above(f.a, x, y)) },
+                    .greater_than => .{ .yes = try assume(f.a, base, try above(f.a, x, y)), .no = try assume(f.a, base, try atLeast(f.a, y, x)) },
+                    .greater_or_equal => .{ .yes = try assume(f.a, base, try atLeast(f.a, x, y)), .no = try assume(f.a, base, try above(f.a, y, x)) },
+                    .equal_equal => .{ .yes = try f.same(base, x, y), .no = base },
+                    else => .{ .yes = base, .no = try f.same(base, x, y) },
+                };
+            },
+            .identifier => {
+                const spelled = tree.tokenSlice(tree.nodeMainToken(node));
+                if (std.mem.eql(u8, spelled, "true")) return .{ .yes = s, .no = State.unreachable_state };
+                if (std.mem.eql(u8, spelled, "false")) return .{ .yes = State.unreachable_state, .no = s };
+            },
+            else => {},
+        }
+        const e = try f.eval(s, node);
+        return .{ .yes = e.s, .no = e.s };
+    }
+
+    fn same(f: *Frame, s: State, x: Lin, y: Lin) Error!State {
+        const out = try assume(f.a, s, try atLeast(f.a, x, y));
+        return assume(f.a, out, try atLeast(f.a, y, x));
+    }
+
+    /// Binds a capture's declaration to what it captures, from the token its name is at.
+    fn capture(f: *Frame, s: State, token: ?Ast.TokenIndex, value: Value) Error!State {
+        var at = token orelse return s;
+        if (f.tree.tokenTag(at) == .asterisk) at += 1;
+        const d = f.decls.get(at) orelse return s;
+        if (!f.tracked(d)) return s;
+        return f.bind(s, d, value, null);
+    }
+
+    fn branch(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const full = f.tree.fullIf(node).?; // unreachable: the tag is an if's
+        var split: Split = undefined;
+        var payload: Value = .{};
+        if (full.payload_token != null) {
+            // An optional or error union: whether it holds a value says nothing linear.
+            const e = try f.eval(s, full.ast.cond_expr);
+            split = .{ .yes = try f.unwrap(e.s, e.v), .no = e.s };
+            payload = .{ .lin = e.v.lin, .length = e.v.length };
+        } else split = try f.cond(s, full.ast.cond_expr);
+        const t = try f.temp(split.yes, node, 0);
+        const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
+        var yes = try forget(f.a, try forget(f.a, split.no, t[1]), tl);
+        _ = &yes;
+        var then_state = try forget(f.a, t[0], tl);
+        then_state = try f.capture(then_state, full.payload_token, payload);
+        const then_value = try f.eval(then_state, full.ast.then_expr);
+        var then_out = try f.assign(then_value.s, t[1], then_value.v.lin, null);
+        then_out = try f.assign(then_out, tl, then_value.v.length, null);
+        var else_out = yes;
+        if (full.ast.else_expr.unwrap()) |else_expr| {
+            else_out = try f.capture(else_out, full.error_token, .{});
+            const else_value = try f.eval(else_out, else_expr);
+            else_out = try f.assign(else_value.s, t[1], else_value.v.lin, null);
+            else_out = try f.assign(else_out, tl, else_value.v.length, null);
+        }
+        return .{ .s = try join(f.a, then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+    }
+
+    /// The state where an optional or error union held its payload: what the expression's
+    /// summary gives there.
+    fn unwrap(f: *Frame, s: State, value: Value) Error!State {
+        var out = s;
+        for (value.unwrapped) |row| out = try assume(f.a, out, row);
+        return out;
+    }
+
+    fn tried(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const e = try f.eval(s, f.tree.nodeData(node).node);
+        // The error leaves the function.
+        try f.leave(e.s, true);
+        return .{ .s = try f.unwrap(e.s, e.v), .v = .{ .lin = e.v.lin, .length = e.v.length } };
+    }
+
+    /// `x catch y`, `x orelse y`: `x`'s payload where it held one, `y` where it did not.
+    fn otherwise(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const lhs, const rhs = f.tree.nodeData(node).node_and_node;
+        const e = try f.eval(s, lhs);
+        const t = try f.temp(e.s, node, 0);
+        const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
+        const base = try forget(f.a, t[0], tl);
+        var held = try f.unwrap(base, e.v);
+        held = try f.assign(held, t[1], e.v.lin, null);
+        held = try f.assign(held, tl, e.v.length, null);
+        var missing = base;
+        if (f.tree.nodeTag(node) == .@"catch") {
+            const after = f.tree.nodeMainToken(node) + 1;
+            if (f.tree.tokenTag(after) == .pipe) missing = try f.capture(missing, after + 1, .{});
+        }
+        const fallback = try f.eval(missing, rhs);
+        missing = try f.assign(fallback.s, t[1], fallback.v.lin, null);
+        missing = try f.assign(missing, tl, fallback.v.length, null);
+        return .{ .s = try join(f.a, held, missing), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+    }
+
+    fn switchOn(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const full = f.tree.fullSwitch(node).?; // unreachable: the tag is a switch's
+        // A labeled switch's `continue` re-enters it: not modelled.
+        if (full.label_token != null) return error.Unsupported;
+        const subject = try f.eval(s, full.ast.condition);
+        const t = try f.temp(subject.s, node, 0);
+        const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
+        const base = try forget(f.a, t[0], tl);
+        var joined: State = State.unreachable_state;
+        for (full.ast.cases) |case_node| {
+            const case = f.tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases
+            var arm = base;
+            // One literal or range a numeric subject matches: it holds in the prong.
+            if (subject.v.lin) |x| if (case.ast.values.len == 1) {
+                const item = case.ast.values[0];
+                if (f.tree.nodeTag(item) == .switch_range) {
+                    const lo, const hi = f.tree.nodeData(item).node_and_node;
+                    const low = try f.eval(arm, lo);
+                    const high = try f.eval(low.s, hi);
+                    arm = high.s;
+                    if (low.v.lin) |l| arm = try assume(f.a, arm, try atLeast(f.a, x, l));
+                    if (high.v.lin) |h| arm = try assume(f.a, arm, try atLeast(f.a, h, x));
+                } else {
+                    const value = try f.eval(arm, item);
+                    arm = value.s;
+                    if (value.v.lin) |k| arm = try f.same(arm, x, k);
+                }
+            };
+            arm = try f.capture(arm, case.payload_token, .{});
+            const e = try f.eval(arm, case.ast.target_expr);
+            var done = try f.assign(e.s, t[1], e.v.lin, null);
+            done = try f.assign(done, tl, e.v.length, null);
+            joined = try join(f.a, joined, done);
+        }
+        return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+    }
+
+    //------------------------------------------------------------------
+    // Jumps.
+    //------------------------------------------------------------------
+
+    fn returned(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        var out = s;
+        var failed = false;
+        if (f.tree.nodeData(node).opt_node.unwrap()) |operand| {
+            const e = try f.eval(out, operand);
+            out = e.s;
+            failed = f.tree.nodeTag(operand) == .error_value;
+            const result = try f.variable(.result);
+            out = try f.assign(out, result, if (f.returns_int) e.v.lin else null, null);
+            const result_length = try f.variable(.result_length);
+            out = try f.assign(out, result_length, e.v.length, null);
+        }
+        try f.leave(out, failed);
+        return .{ .s = State.unreachable_state };
+    }
+
+    fn jump(f: *Frame, s: State, node: Ast.Node.Index, breaks: bool) RunError!Eval {
+        const label_token, const operand = f.tree.nodeData(node).opt_token_and_opt_node;
+        var out = s;
+        var value: Value = .{};
+        if (operand.unwrap()) |given| {
+            const e = try f.eval(out, given);
+            out = e.s;
+            value = e.v;
+        }
+        if (out.dead) return .{ .s = out };
+        const label: ?[]const u8 = if (label_token.unwrap()) |t| f.tree.tokenSlice(t) else null;
+        var i = f.targets.items.len;
+        const found = while (i > 0) {
+            i -= 1;
+            const target = &f.targets.items[i];
+            if (label) |wanted| {
+                if (target.label) |has| if (std.mem.eql(u8, wanted, has)) break target;
+            } else if (target.kind == .loop) break target;
+        } else return error.Unsupported;
+        if (!breaks and found.kind != .loop) return error.Unsupported;
+        out = try f.runDefers(out, found.defers, false);
+        if (breaks) if (found.value) |v| {
+            out = try f.assign(out, v, value.lin, null);
+        };
+        // A jump from a pass being tried for the target's own invariant counts; one from a pass
+        // tried deeper does not.
+        if (found.trial == f.trial) {
+            if (breaks) try found.breaks.append(f.a, out) else try found.continues.append(f.a, out);
+        }
+        return .{ .s = State.unreachable_state };
+    }
+
+    //------------------------------------------------------------------
+    // Loops.
+    //------------------------------------------------------------------
+
+    const Pass = struct { back: State, exit: State, breaks: []const State };
+
+    /// What a loop gives: the invariant its passes preserve, from the state it is entered in
+    /// and the conditions' non-strict forms the entry already holds, read once more for the
+    /// verdicts; then its exits joined.
+    fn loop(f: *Frame, entry: State, node: Ast.Node.Index, label: ?[]const u8, candidates: []const Lin, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: ?fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Eval {
+        if (entry.dead) return .{ .s = entry };
+        var invariant = entry;
+        for (candidates) |row| if (try entails(f.a, entry, row)) {
+            invariant = try assume(f.a, invariant, row);
+        };
+        const t = try f.temp(invariant, node, 7);
+        invariant = t[0];
+        var passes: usize = 0;
+        while (true) : (passes += 1) {
+            if (passes > loop_passes) return error.Unsupported;
+            f.trial += 1;
+            const pass = try f.passOf(invariant, node, label, t[1], body, after);
+            f.trial -= 1;
+            const next = try preserved(f.a, invariant, pass.back);
+            if (next.rows.len == invariant.rows.len) break;
+            invariant = next;
+        }
+        const final = try f.passOf(invariant, node, label, t[1], body, after);
+        var out = final.exit;
+        for (final.breaks) |state| out = try join(f.a, out, state);
+        return .{ .s = out, .v = .{ .lin = try single(f.a, t[1]) } };
+    }
+
+    fn passOf(f: *Frame, invariant: State, node: Ast.Node.Index, label: ?[]const u8, value: Var, comptime body: fn (*Frame, State, Ast.Node.Index) RunError!Ran, comptime after: ?fn (*Frame, State, Ast.Node.Index) RunError!State) RunError!Pass {
+        try f.targets.append(f.a, .{ .kind = .loop, .label = label, .defers = f.defers.items.len, .trial = f.trial, .value = value });
+        const ran = body(f, invariant, node) catch |err| {
+            _ = f.targets.pop();
+            return err;
+        };
+        const target = f.targets.pop().?; // unreachable: pushed above
+        var back = ran.body;
+        for (target.continues.items) |state| back = try join(f.a, back, state);
+        if (after) |step| back = try step(f, back, node);
+        return .{ .back = back, .exit = ran.exit, .breaks = target.breaks.items };
+    }
+
+    fn whileLoop(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const full = f.tree.fullWhile(node).?; // unreachable: the tag is a while's
+        const label: ?[]const u8 = if (full.label_token) |t| f.tree.tokenSlice(t) else null;
+        var candidates: std.ArrayList(Lin) = .empty;
+        if (full.payload_token == null) try f.candidatesOf(s, full.ast.cond_expr, &candidates);
+        return f.loop(s, node, label, candidates.items, whileBody, whileContinue);
+    }
+
+    fn whileBody(f: *Frame, s: State, node: Ast.Node.Index) RunError!Ran {
+        const full = f.tree.fullWhile(node).?; // unreachable: the tag is a while's
+        var split: Split = undefined;
+        var payload: Value = .{};
+        if (full.payload_token != null) {
+            const e = try f.eval(s, full.ast.cond_expr);
+            split = .{ .yes = try f.unwrap(e.s, e.v), .no = e.s };
+            payload = .{ .lin = e.v.lin, .length = e.v.length };
+        } else split = try f.cond(s, full.ast.cond_expr);
+        const entered = try f.capture(split.yes, full.payload_token, payload);
+        const ran = try f.exec(entered, full.ast.then_expr);
+        var exit = split.no;
+        if (full.ast.else_expr.unwrap()) |else_expr| exit = (try f.eval(try f.capture(exit, full.error_token, .{}), else_expr)).s;
+        return .{ .body = ran, .exit = exit };
+    }
+
+    fn whileContinue(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
+        const full = f.tree.fullWhile(node).?; // unreachable: the tag is a while's
+        const step = full.ast.cont_expr.unwrap() orelse return s;
+        return f.exec(s, step);
+    }
+
+    /// A loop condition's comparisons in their non-strict forms (`i < n` gives `i <= n`):
+    /// what a counter stepping toward its bound keeps on every pass.
+    fn candidatesOf(f: *Frame, s: State, node: Ast.Node.Index, out: *std.ArrayList(Lin)) RunError!void {
+        const tree = f.tree;
+        switch (tree.nodeTag(node)) {
+            .grouped_expression => return f.candidatesOf(s, tree.nodeData(node).node_and_token[0], out),
+            .bool_and => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                try f.candidatesOf(s, lhs, out);
+                try f.candidatesOf(s, rhs, out);
+            },
+            .less_than, .less_or_equal, .greater_than, .greater_or_equal => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const was_trial = f.trial;
+                // Read for their forms alone: no verdicts.
+                f.trial += 1;
+                defer f.trial = was_trial;
+                const left = f.eval(s, lhs) catch return;
+                const right = f.eval(left.s, rhs) catch return;
+                const x = left.v.lin orelse return;
+                const y = right.v.lin orelse return;
+                const row = switch (tree.nodeTag(node)) {
+                    .less_than, .less_or_equal => try atLeast(f.a, y, x),
+                    else => try atLeast(f.a, x, y),
+                };
+                if (row) |r| try out.append(f.a, r);
+            },
+            else => {},
+        }
+    }
+
+    fn forLoop(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const full = f.tree.fullFor(node).?; // unreachable: the tag is a for's
+        const label: ?[]const u8 = if (full.label_token) |t| f.tree.tokenSlice(t) else null;
+        // The inputs are read once, before the passes: their lengths are equal, which a safe
+        // build checks.
+        var out = s;
+        var count: ?Lin = null;
+        for (full.ast.inputs) |input| {
+            var length: ?Lin = null;
+            if (f.tree.nodeTag(input) == .for_range) {
+                const start_node, const end_node = f.tree.nodeData(input).node_and_opt_node;
+                const start = try f.eval(out, start_node);
+                out = start.s;
+                if (end_node.unwrap()) |e_node| {
+                    const end = try f.eval(out, e_node);
+                    out = end.s;
+                    if (start.v.lin != null and end.v.lin != null) {
+                        length = try minus(f.a, end.v.lin.?, start.v.lin.?);
+                        // A range's end is at least its start, which a safe build checks.
+                        out = try assume(f.a, out, try atLeast(f.a, end.v.lin.?, start.v.lin.?));
+                    }
+                }
+            } else {
+                const m = try f.eval(out, input);
+                const measured = try f.lengthOf(m.s, input, m.v);
+                out = measured[0];
+                length = measured[1];
+            }
+            if (length) |l| {
+                if (count) |n| out = try f.same(out, n, l) else count = l;
+            }
+        }
+        const counter = try f.variable(.{ .temp = .{ .node = node, .part = 6 } });
+        _ = counter;
+        try f.for_counts.put(f.a, node, count);
+        const result = try f.loop(out, node, label, &.{}, forBody, null);
+        // Its `else` runs where the passes ran out.
+        return result;
+    }
+
+    fn forBody(f: *Frame, s: State, node: Ast.Node.Index) RunError!Ran {
+        const full = f.tree.fullFor(node).?; // unreachable: the tag is a for's
+        // The counter read again at its own place; `count` and the counter were set by the loop.
+        const count = f.for_counts.get(node) orelse null;
+        const counter = try f.variable(.{ .temp = .{ .node = node, .part = 6 } });
+        var entered = try forget(f.a, s, counter);
+        const k = try single(f.a, counter);
+        entered = try assume(f.a, entered, try atLeast(f.a, k, constant(0)));
+        if (count) |n| entered = try assume(f.a, entered, try above(f.a, n, k));
+        // Captures: a range's is its start plus the counter; an element's, nothing known.
+        var token = full.payload_token;
+        for (full.ast.inputs) |input| {
+            if (f.tree.tokenTag(token) == .asterisk) token += 1;
+            var value: Value = .{};
+            if (f.tree.nodeTag(input) == .for_range) {
+                const start_node, _ = f.tree.nodeData(input).node_and_opt_node;
+                const was_trial = f.trial;
+                f.trial += 1;
+                const start = f.eval(entered, start_node) catch |err| {
+                    f.trial = was_trial;
+                    return err;
+                };
+                f.trial = was_trial;
+                if (start.v.lin) |first| value.lin = try plus(f.a, first, k);
+            }
+            entered = try f.capture(entered, token, value);
+            token += 1;
+            if (f.tree.tokenTag(token) == .comma) token += 1;
+        }
+        const ran = try f.exec(entered, full.ast.then_expr);
+        // Out of passes: every pass ran, or none did.
+        var exit = s;
+        if (full.ast.else_expr.unwrap()) |else_expr| exit = (try f.eval(exit, else_expr)).s;
+        return .{ .body = ran, .exit = exit };
+    }
+
+    //------------------------------------------------------------------
+    // Calls.
+    //------------------------------------------------------------------
+
+    /// A call: its arguments evaluated in order, and where it reaches one function of the
+    /// program, that function's summary on the path where it returns a value.
+    fn call(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const full = f.tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+        var out = s;
+        var receiver: ?Value = null;
+        if (f.tree.nodeTag(full.ast.fn_expr) == .field_access) {
+            const holder = f.tree.nodeData(full.ast.fn_expr).node_and_token[0];
+            const e = try f.eval(out, holder);
+            out = e.s;
+            switch (try f.c.facts.resolve(f.file, holder)) {
+                .instance, .pointer, .optional => {
+                    const measured = try f.lengthOf(out, holder, e.v);
+                    out = measured[0];
+                    receiver = .{ .lin = e.v.lin, .length = measured[1] };
+                },
+                else => {},
+            }
+        }
+        var args: std.ArrayList(Value) = .empty;
+        if (receiver) |r| try args.append(f.a, r);
+        for (full.ast.params) |param| {
+            const e = try f.eval(out, param);
+            out = e.s;
+            if (e.v.lin != null) {
+                try args.append(f.a, .{ .lin = e.v.lin });
+                continue;
+            }
+            const measured = try f.lengthOf(out, param, e.v);
+            out = measured[0];
+            try args.append(f.a, .{ .length = measured[1] });
+        }
+        const made = try f.fresh(out, node, 0);
+        out = made.s;
+        const t = made.v.lin;
+        const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
+        out = try forget(f.a, out, tl);
+        const summary = try f.summaryOf(full.ast.fn_expr) orelse return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        var rows: std.ArrayList(Lin) = .empty;
+        each: for (summary.rows) |row| {
+            var applied: Lin = constant(row.c);
+            for (row.terms) |term| {
+                const param = term.v / 2;
+                const length = term.v % 2 == 1;
+                const given: ?Lin = if (param == summary.params)
+                    (if (length) try single(f.a, tl) else t)
+                else if (param < args.items.len)
+                    (if (length) args.items[param].length else args.items[param].lin)
+                else
+                    null;
+                const lin = given orelse continue :each;
+                applied = (try combine(f.a, applied, 1, lin, term.k)) orelse continue :each;
+            }
+            try rows.append(f.a, applied);
+        }
+        const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows.items };
+        if (summary.fails) return .{ .s = out, .v = value };
+        // A callee that cannot fail returns where it succeeds.
+        return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
+    }
+
+    /// The summary of the one function of the program a call reaches, at this pointer width.
+    fn summaryOf(f: *Frame, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, params: usize, fails: bool } {
+        const decl = switch (try f.c.facts.resolve(f.file, callee)) {
+            .function => |d| d,
+            else => return null,
+        };
+        if (!try Program.owns(f.c, decl.file)) return null;
+        const callee_tree = &f.c.project.at(decl.file).file.tree;
+        const callee_model = &f.c.project.at(decl.file).model;
+        const proto = callee_model.declarations[@backingInt(decl.index)].node;
+        const function = callee_model.parentOf(proto) orelse return null;
+        if (callee_tree.nodeTag(function) != .fn_decl) return null;
+        const read = try analysis(f.c, decl.file, function, f.width);
+        if (!read.supported) return null;
+        const summary = read.summary orelse return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const full = callee_tree.fullFnProto(&proto_buffer, proto) orelse return null;
+        const result = full.ast.return_type.unwrap() orelse return null;
+        const fails = callee_tree.nodeTag(result) == .error_union or
+            (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang);
+        return .{ .rows = summary.rows, .params = summary.params, .fails = fails };
+    }
 };
+
+/// A labeled block's label: `blk: { … }`.
+fn blockLabel(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    const brace = tree.nodeMainToken(node);
+    if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return null;
+    return tree.tokenSlice(brace - 2);
+}

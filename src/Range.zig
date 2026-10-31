@@ -20,6 +20,7 @@ const Model = @import("Model.zig");
 const File = @import("File.zig");
 const Contract = @import("AegisContract.zig");
 const Program = @import("Program.zig");
+const Bounds = @import("Bounds.zig");
 const Governed = @import("Governed.zig");
 const Metrics = @import("Metrics.zig");
 const Ast = std.zig.Ast;
@@ -94,6 +95,8 @@ const expression_tokens = @as(File.Limits, .{}).expression_tokens;
 /// whatever its operands' ranges hold, at every pointer width, and an unsigned difference
 /// cannot underflow.
 pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    // Every path to it shows it within its type.
+    if (try Bounds.cleared(c, file, node, .arith)) return true;
     const tree = &c.project.at(file).file.tree;
     const tag = tree.nodeTag(node);
     const assigns = switch (tag) {
@@ -144,6 +147,7 @@ pub fn fits(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
 /// Whether the conversion `node` (`@intCast(x)`) cannot fail: its destination holds every
 /// value the operand's range does, at every pointer width.
 pub fn converts(c: *Context, file: Project.FileId, node: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!bool {
+    if (try Bounds.cleared(c, file, node, .cast)) return true;
     for (widths(c)) |pointer| {
         const into = (try destination(c, file, node, pointer)) orelse return false;
         const from = switch (try typeOf(c, file, operand, pointer, 0)) {
@@ -1179,6 +1183,8 @@ fn prong(c: *Context, decl: Facts.Decl) ?Reach {
 /// value a comparison holding where it is read puts above zero (`if (n == 0) return`, `if (x >=
 /// 1)`, or above another value that cannot be negative: the `else` of `if (a >= len)`).
 pub fn nonzero(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    // A divisor every path to it shows other than zero.
+    if (try Bounds.cleared(c, file, node, .divisor)) return true;
     return nonzeroAt(c, file, node, node, 0);
 }
 
@@ -3222,7 +3228,7 @@ pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: 
     if (nesting.level >= 16) return false;
     nesting.level += 1;
     defer nesting.level -= 1;
-    return withinOnce(c, file, index, memory, end);
+    return (try withinOnce(c, file, index, memory, end)) or try Bounds.within(c, file, index, memory, end);
 }
 
 /// How deep `within` is in reading itself.
@@ -3505,7 +3511,7 @@ pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: A
         if (fact.differs or fact.read) continue;
         if (oneValue(c, file, fact.small, start) and oneValue(c, file, fact.large, end)) return true;
     }
-    return false;
+    return Bounds.notAfter(c, file, start, end);
 }
 
 /// Whether the facts keep `index` within `memory`'s length (at most it, for a slice's end), in
@@ -4028,6 +4034,11 @@ pub fn intOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
 /// The integer type a type expression names at a pointer width (Bounds).
 pub fn intNamed(c: *Context, file: Project.FileId, type_node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
     return named(c, file, type_node, pointer);
+}
+
+/// The value of a constant expression, where the program fixes one (Bounds).
+pub fn constantValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?u64 {
+    return valueOf(c, file, node, 0);
 }
 
 /// The length an array's type fixes for memory, where it is one (Bounds).
