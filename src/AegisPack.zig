@@ -40,6 +40,21 @@ pub const cancellation = Ids.cancellation;
 pub const lock_order = Ids.lock_order;
 /// The danger rules: each finds where a danger exists and aegis's type is the answer.
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
+/// The first file whose import of an aegis module resolves to it, by what the module's root
+/// publishes: the pack is on for a program that imports aegis, whatever it names it after.
+/// A module of aegis's name that publishes something else is not aegis.
+pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveError!?Project.FileId {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = project, .gpa = arena.allocator() };
+    for (project.imports) |mapping| for (Contract.library.modules) |module| {
+        if (!std.mem.eql(u8, mapping.spelling, module.name)) continue;
+        if (project.at(mapping.target).file.status != .parsed) continue;
+        if (try facts.publishes(module, mapping.target)) return mapping.from;
+    };
+    return null;
+}
+
 pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = access, .name = "A001", .group = .family_policy, .purpose = "secret disclosure or shared-state access without a live capability", .version = 2, .exception = .aegis }, .check = checkAccess },
     .{ .definition = .{ .id = copies, .name = "A002", .group = .family_policy, .purpose = "duplicated secret owner or lock capability; borrowed storage escapes", .version = 2, .exception = .aegis }, .check = checkCopies },

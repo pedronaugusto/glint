@@ -6,6 +6,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Breaking
 
+- `--family` is `--aegis`, and the `family` profile of a `--config` file is `aegis`: each selects every retained rule and the aegis pack at report level, whatever the files import. `Config.family()` is gone (it was `Config.reviewed()`). The pack is also on by itself, in the CLI, wherever a file's `@import("aegis")` resolves to aegis, and the text report's first line says which file imports it; `--only` still selects exactly the rules it names.
 - An aegis escape names the pack rules it covers, `// aegis: <reason>(<rule>, ...): <why>` (`// aegis: boundary(A019): zlib's C contract`), and covers only their findings on its line: one escape silenced every pack rule there, findings added later too. An escape in the older form, naming none, still covers its line's pack findings but makes the run incomplete; `zig build fix` writes into it the rules it covers then, for its author to check.
 - An escape never makes a read the program's own: it covers its rules' findings on its own line, and what the read gives is input in every function it reaches. An escape on a read's line made the read no source at all, which cleared every flow rule downstream, in other functions too, whatever rules it named. A program that trusts what it reads parses it.
 - `--files-from` reads its list as input: each path is relative with no `..` part, a file under the directory glint runs in; another is `error.FileListPathOutside`, before any file opens. A list is a file, which a repository may hold.

@@ -26,6 +26,9 @@ const Options = struct {
     fix: bool = false,
     /// The escapes of a run before, by which the fix names an escape in the older form.
     escapes_before: []const Fix.Escaped = &.{},
+    /// Whether the aegis pack runs: on by itself where a file imports aegis, on whatever the
+    /// files import (`--aegis`, the `aegis` profile), or as `--only` selects its rules.
+    aegis: enum { imported, forced, selected } = .imported,
 };
 
 const Loader = struct {
@@ -166,7 +169,7 @@ pub const Arguments = struct {
     files: []const []const u8 = &.{},
     only: []const []const u8 = &.{},
     reviewed: bool = false,
-    family: bool = false,
+    aegis: bool = false,
     config: ?[]const u8 = null,
     report: []const []const u8 = &.{},
     gate: []const []const u8 = &.{},
@@ -189,12 +192,12 @@ pub const Arguments = struct {
         .name = "glint",
         .version = release.version,
         .about = "A linter for Zig on Zig's own parser and semantic form",
-        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed, --family or --config; --report, --gate and --disable then set a rule's level. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
+        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed, --aegis or --config; --report, --gate and --disable then set a rule's level. The aegis pack is on wherever a file's import of aegis resolves to it. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
         .options = .{
             .files = .{ .positional = true, .value_name = "FILE", .hint = .file, .help = "A file to check" },
             .only = .{ .value_name = "ID", .section = "Rules", .help = "Check only this rule, repeated, at report level" },
             .reviewed = .{ .negatable = false, .section = "Rules", .help = "Every retained rule, at report level" },
-            .family = .{ .negatable = false, .section = "Rules", .help = "The family's reporting profile" },
+            .aegis = .{ .negatable = false, .section = "Rules", .help = "Every retained rule and the aegis pack, at report level, whatever the files import" },
             .config = .{ .value_name = "FILE", .hint = .file, .section = "Rules", .help = "A JSON policy: its profile, rule levels and code options" },
             .report = .{ .value_name = "ID", .section = "Rules", .help = "Report this rule, repeated" },
             .gate = .{ .value_name = "ID", .section = "Rules", .help = "Gate on this rule, repeated: a finding fails the run" },
@@ -215,7 +218,7 @@ pub const Arguments = struct {
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
-        .conflicts = &.{ &.{ .only, .reviewed, .family, .config }, &.{ .only, .escapes_before } },
+        .conflicts = &.{ &.{ .only, .reviewed, .aegis, .config }, &.{ .only, .escapes_before } },
     };
 };
 
@@ -225,12 +228,17 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.config) |path| {
         const bytes = try aegis.own.readFile(io, std.Io.Dir.cwd(), path, a, .fromRaw(4 * 1024 * 1024));
         // A configuration file is the checked repository's content: input until parsed.
-        result.config = try aegis.input.Untrusted([]const u8).init(bytes).parse(Configuring{ .a = a, .definitions = definitions }, configure);
+        const configured = try aegis.input.Untrusted([]const u8).init(bytes).parse(Configuring{ .a = a, .definitions = definitions }, configure);
+        result.config = configured.config;
+        if (configured.aegis) result.aegis = .forced;
     } else if (arguments.reviewed) {
         result.config = Rule.Config.reviewed();
-    } else if (arguments.family) {
-        result.config = Rule.Config.family();
+    } else if (arguments.aegis) {
+        result.config = Rule.Config.reviewed();
+        try packOn(a, &result.config, definitions);
+        result.aegis = .forced;
     } else if (arguments.only.len != 0) {
+        result.aegis = .selected;
         result.config = Rule.Config.none();
         for (arguments.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
     }
@@ -363,10 +371,18 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .tool_failure;
     var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io });
     defer project.deinit();
-    var report = try Runner.runConfigured(gpa, &project, configured.config, .{ .project_rules = project_rules, .io = io });
+    var config = configured.config;
+    const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;
+    if (importer != null) try packOn(a, &config, definitions);
+    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);
+    if (configured.format == .text) switch (configured.aegis) {
+        .imported => if (importer) |file| try rendered.writer.print("aegis pack: on (imported by {s})\n", .{project.at(file).input.name}),
+        .forced => try rendered.writer.writeAll("aegis pack: on\n"),
+        .selected => {},
+    };
     try report.write(&rendered.writer, &project, configured.format);
     const bytes = rendered.written();
     try writer.writeAll(bytes);
@@ -426,7 +442,7 @@ test "CLI invalid selections and unknown formats fail" {
 
 /// Strict JSON policy, containing code options only. Callers own file selection.
 pub const Configuration = struct {
-    profile: enum { core, none, reviewed, family } = .core,
+    profile: enum { core, none, reviewed, aegis } = .core,
     rules: []const Setting = &.{},
     max_line_length: u32 = 100,
     max_function_lines: u32 = 120,
@@ -452,16 +468,17 @@ fn select(a: std.mem.Allocator, config: *Rule.Config, id: Rule.Rule, level: Rule
 }
 const Configuring = struct { a: std.mem.Allocator, definitions: []const Rule.Definition };
 const ConfigureError = std.json.ParseError(std.json.Scanner) || error{ InvalidSelection, UnknownRule };
-fn configure(context: Configuring, bytes: []const u8) ConfigureError!Rule.Config {
+const Configured = struct { config: Rule.Config, aegis: bool };
+fn configure(context: Configuring, bytes: []const u8) ConfigureError!Configured {
     const a = context.a;
     const definitions = context.definitions;
     const document = try std.json.parseFromSliceLeaky(Configuration, a, bytes, .{});
     var config: Rule.Config = switch (document.profile) {
         .core => .{},
         .none => Rule.Config.none(),
-        .reviewed => Rule.Config.reviewed(),
-        .family => Rule.Config.family(),
+        .reviewed, .aegis => Rule.Config.reviewed(),
     };
+    if (document.profile == .aegis) try packOn(a, &config, definitions);
     config.max_line_length = document.max_line_length;
     config.max_function_lines = document.max_function_lines;
     config.function_exceptions = document.function_exceptions;
@@ -477,5 +494,19 @@ fn configure(context: Configuring, bytes: []const u8) ConfigureError!Rule.Config
         try select(a, &config, id, setting.level);
     }
     try config.validate();
-    return config;
+    return .{ .config = config, .aegis = document.profile == .aegis };
+}
+
+/// Every rule of the aegis pack among `definitions` that nothing set yet, at report level.
+fn packOn(a: std.mem.Allocator, config: *Rule.Config, definitions: []const Rule.Definition) error{OutOfMemory}!void {
+    for (AegisPack.rules) |rule| {
+        const id = rule.definition.id;
+        const defined = for (definitions) |definition| {
+            if (definition.id == id) break true;
+        } else false;
+        const set = for (config.selections) |selection| {
+            if (selection.rule == id) break true;
+        } else false;
+        if (defined and !set and !config.has(id)) try select(a, config, id, .report);
+    }
 }

@@ -152,11 +152,11 @@ fn g2Rows(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, project: *
         if (!report.complete or report.diagnostics.len != 0) return error.UnexpectedProjectRuleResult;
     }
     try row(writer, "warm_project_rule", elapsed(io, start, small), rounds, 1);
-    const family_start = now(io, small);
+    const reviewed_start = now(io, small);
     for (0..rounds) |_| {
-        var report = try glint.run(gpa, project, glint.Config.family());
+        var report = try glint.run(gpa, project, glint.Config.reviewed());
         defer report.deinit();
-        if (!report.complete) return error.IncompleteFamilyScan;
+        if (!report.complete) return error.IncompleteReviewedScan;
     }
-    try row(writer, "warm_family", elapsed(io, family_start, small), rounds, 20);
+    try row(writer, "warm_reviewed", elapsed(io, reviewed_start, small), rounds, 20);
 }

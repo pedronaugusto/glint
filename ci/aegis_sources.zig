@@ -202,6 +202,29 @@ pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target
 /// The consumer, as an `ExtraImport`'s target.
 pub const consumer_file: u32 = std.math.maxInt(u32);
 
+/// Writes the pinned files under `dir` as aegis lays them out, and each `.zig` file one of
+/// them imports that is not among them as an empty file: a tree glint loads from disk, whose
+/// root publishes what the pinned revision does.
+pub fn writeTree(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
+    for (sources) |source| {
+        if (std.fs.path.dirnamePosix(source.name)) |parent| try dir.createDirPath(io, parent);
+        try dir.writeFile(io, .{ .sub_path = source.name, .data = source.bytes });
+    }
+    for (sources) |source| {
+        var rest = source.bytes;
+        while (std.mem.find(u8, rest, "@import(\"")) |at| {
+            rest = rest[at + "@import(\"".len ..];
+            const end = std.mem.findScalar(u8, rest, '"') orelse break;
+            if (!std.mem.endsWith(u8, rest[0..end], ".zig")) continue;
+            const path = try std.fs.path.resolveAllocPosix(gpa, &.{ std.fs.path.dirnamePosix(source.name) orelse ".", rest[0..end] });
+            defer gpa.free(path);
+            if (pinned(path) != null) continue;
+            if (std.fs.path.dirnamePosix(path)) |parent| try dir.createDirPath(io, parent);
+            try dir.writeFile(io, .{ .sub_path = path, .data = "" });
+        }
+    }
+}
+
 /// The pinned revision's source `name`.
 pub fn pinned(name: []const u8) ?[]const u8 {
     for (sources) |each| if (std.mem.eql(u8, each.name, name)) return each.bytes;

@@ -151,9 +151,6 @@ pub const Config = struct {
         return if (self.has(rule)) .report else .off;
     }
     /// Explicit family reporting profile. Adoption and gating belong to the caller.
-    pub fn family() Config {
-        return reviewed();
-    }
     /// Whether a rule was selected.
     pub fn has(self: Config, rule: Rule) bool {
         for (self.selections) |selection| if (selection.rule == rule) return selection.level != .off;

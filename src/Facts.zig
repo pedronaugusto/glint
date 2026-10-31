@@ -250,6 +250,16 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
     return self.declaration(found);
 }
 
+/// Whether the file `root` publishes every member `module` requires: that module, not another
+/// of its name.
+pub fn publishes(self: *Facts, module: anytype, root: Project.FileId) ResolveError!bool {
+    for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
+        .found => {},
+        .gap => return false,
+    };
+    return true;
+}
+
 const Found = union(enum) { found: Target, gap: Unknown };
 /// Walks public namespaces from a module root, the way a program names the declaration.
 fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!Found {

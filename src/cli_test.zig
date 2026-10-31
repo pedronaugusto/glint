@@ -2,6 +2,7 @@
 const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
+const aegis_sources = @import("aegis_sources");
 
 /// Where a refused line's message goes in tests that only read the error.
 var quiet_buffer: [256]u8 = undefined;
@@ -260,4 +261,75 @@ test "a package directory names its files' package, the innermost one winning" {
     try std.testing.expect(std.mem.find(u8, output.written(), "b.zig:2") != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "c.zig:2") != null);
     try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer, &quiet.writer));
+}
+
+/// The run's output on `file` under `tmp`, with `options` before it; its status in `status`.
+fn runOn(a: std.mem.Allocator, tmp: *std.testing.TmpDir, options: []const []const u8, file: []const u8, status: *u8) ![]u8 {
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(a);
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (owned.items) |each| a.free(each);
+        owned.deinit(a);
+    }
+    try args.append(a, "glint");
+    for (options) |option| {
+        // `NAME=path`: the path under `tmp`.
+        if (std.mem.findScalar(u8, option, '=')) |equals| {
+            const joined = try std.mem.concat(a, u8, &.{ option[0 .. equals + 1], root, "/", option[equals + 1 ..] });
+            try owned.append(a, joined);
+            try args.append(a, joined);
+        } else try args.append(a, option);
+    }
+    const path = try std.Io.Dir.path.join(a, &.{ root, file });
+    try owned.append(a, path);
+    try args.append(a, path);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    status.* = try cli.execute(a, std.testing.io, args.items, &output.writer, &quiet.writer);
+    return a.dupe(u8, output.written());
+}
+
+test "the aegis pack is on where a file's import of aegis resolves to aegis, and on whatever the files import with --aegis" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cast = "pub fn f(p: *const u32) *const u8 {\n    return @ptrCast(p);\n}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.zig", .data = cast });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake.zig", .data = "pub const x = 1;\n" });
+    try tmp.dir.createDirPath(std.testing.io, "aegis");
+    var tree = try tmp.dir.openDir(std.testing.io, "aegis", .{});
+    defer tree.close(std.testing.io);
+    try aegis_sources.writeTree(a, std.testing.io, tree);
+    var status: u8 = undefined;
+    // No aegis: off, and no line.
+    const off = try runOn(a, &tmp, &.{}, "plain.zig", &status);
+    defer a.free(off);
+    try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
+    try std.testing.expect(std.mem.find(u8, off, "aegis pack") == null);
+    // --aegis: on, whatever the file imports.
+    const forced = try runOn(a, &tmp, &.{"--aegis"}, "plain.zig", &status);
+    defer a.free(forced);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
+    try std.testing.expect(std.mem.startsWith(u8, forced, "aegis pack: on\n"));
+    try std.testing.expect(std.mem.find(u8, forced, "A019: ") != null);
+    // aegis imported: on, with the file that imports it.
+    const imported = try runOn(a, &tmp, &.{ "--module", "aegis=aegis/src/root.zig" }, "uses.zig", &status);
+    defer a.free(imported);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
+    try std.testing.expect(std.mem.startsWith(u8, imported, "aegis pack: on (imported by "));
+    try std.testing.expect(std.mem.find(u8, imported, "A019: ") != null);
+    // A module named aegis that is not aegis: off.
+    const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
+    defer a.free(other);
+    try std.testing.expectEqual(@as(u8, 0), status); // safe: a clean exit.
+    try std.testing.expect(std.mem.find(u8, other, "aegis pack") == null);
+    // --only selects the pack's rules as it selects any: no line.
+    const only = try runOn(a, &tmp, &.{ "--only", "A019", "--module", "aegis=aegis/src/root.zig" }, "uses.zig", &status);
+    defer a.free(only);
+    try std.testing.expect(std.mem.find(u8, only, "aegis pack") == null);
+    try std.testing.expect(std.mem.find(u8, only, "A019: ") != null);
 }
