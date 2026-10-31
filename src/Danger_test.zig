@@ -2485,6 +2485,23 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A010 reads a position in a table std names by a u32 index as one: a node's position converts to u32" {
+    // std's `Ast.nodes` holds at most `maxInt(u32) + 1` nodes, so a position in it converts
+    // (6); the source the tree holds, in a length the peer chose, has no such bound (7).
+    const found = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !u32 {
+        \\    const text = try r.take(64);
+        \\    const tree = try std.zig.Ast.parse(gpa, text[0..try r.takeInt(u64, 0)], .zig);
+        \\    var sum: u32 = 0;
+        \\    for (tree.nodes, 0..) |_, i| sum +%= @as(u32, @intCast(i));
+        \\    for (tree.source, 0..) |_, i| sum +%= @as(u32, @intCast(i));
+        \\    return sum;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{7}, found.lines[0..found.findings]);
+}
+
 test "A018 finds an error's name written to a peer, not to another writer" {
     try expect(pack.diagnostics,
         \\const std = @import("std");
