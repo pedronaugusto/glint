@@ -1232,13 +1232,13 @@ test "A019 reads a parent handed to a dependency's generic: its body is the prog
     // part of the interface.
     try std.testing.expectEqual(@as(usize, 0), (try handedTo(total_dependency, "dep.total(&s) + dep.total(s)", "")).findings);
     try std.testing.expectEqual(@as(usize, 0), (try handedTo(part_dependency, "dep.part(&s)", "")).findings);
-    // Findings (11, the conversion and its alignment): a dependency's generic that copies the
-    // field leaves the conversion a finding whether or not it is handed the parent (`grab`
-    // beside `total`); the field copied by name, by pointer and by value; by a name the caller
-    // gives; each field of a tuple holding a C copied, as std.fmt's `{any}` does, from the
-    // program or through a generic of its own.
+    // A generic that copies the field, never handed the parent (`grab` beside `total`): what it
+    // reads is what it is given, which the follow takes into it.
+    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.total(&s)", "")).findings);
+    // Findings (11, the conversion and its alignment): the field copied by name, by pointer
+    // and by value; by a name the caller gives; each field of a tuple holding a C copied, as
+    // std.fmt's `{any}` does, from the program or through a generic of its own.
     for ([_]Run{
-        try handed("dep.total(&s)", ""),
         try handed("dep.grab(&s)", ""),
         try handed("dep.grab(s)", ""),
         try handed("dep.named(&s, \"interface\")", ""),
@@ -1443,8 +1443,10 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     // Clear: a union's payload built in place, a pointer's target assigned whole, through a
     // vtable constant in a struct and a constant naming it. Findings (8, the conversion and
     // its alignment): that vtable installed into another type's field, the function stored
-    // into C's other field or another struct's, the constant made `pub`, a read of the
-    // vtable's function through a receiver that does not resolve.
+    // into C's other field or another struct's, the constant made `pub`, the interface handed
+    // to a generic that reads the vtable's function (and the contract's sites: the read, 26, and
+    // the handing, 30). The same generic handed nothing of it is clean: what it reads is what it
+    // is given, which the follow takes into it.
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, file_program)).findings);
     const other = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "fn wrong(buffer: []u8) Other { return .{ .interface = .{ .vtable = &data_vtable, .buffer = buffer } }; }\npub fn use(buffer: []u8) !usize {");
     try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, other.lines[0..other.findings]);
@@ -1456,8 +1458,10 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, public.lines[0..public.findings]);
     const nested = try runEdited(pack.unsafe_set, file_program, "    const data: std.Io.Writer.VTable", "    pub const data: std.Io.Writer.VTable");
     try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, nested.lines[0..nested.findings]);
-    const unknown = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "pub fn peek(t: anytype) void { _ = t.drain; }\npub fn use(buffer: []u8) !usize {");
-    try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, unknown.lines[0..unknown.findings]);
+    const peek = comptime edited(file_program, "pub fn use(buffer: []u8) !usize {", "pub fn peek(t: anytype) void { _ = t.vtable.drain; }\npub fn use(buffer: []u8) !usize {");
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, peek)).findings);
+    const peeked = try runEdited(pack.unsafe_set, peek, "    reset(&o.body.data, buffer);", "    reset(&o.body.data, buffer);\n    peek(&o.body.data.interface);");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 26, 30 }, peeked.lines[0..peeked.findings]);
 }
 
 const lookup_program =
