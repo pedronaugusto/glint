@@ -528,21 +528,39 @@ fn findCopies(self: *Facts) ResolveError!void {
             if (direct.items.len != 0) try found.put(self.gpa, decl, direct.items);
         }
     }
-    // Through calls that pass a parameter on, until nothing more is found.
-    var changed = true;
-    var rounds: usize = 0;
-    while (changed and rounds < 16) : (rounds += 1) {
-        changed = false;
-        for (functions.items) |decl| {
-            var more: std.ArrayList(ParameterCopy) = .empty;
-            try more.appendSlice(self.gpa, found.get(decl) orelse &.{});
-            const before = more.items.len;
-            self.copies = found;
-            try self.passedCopies(decl, &more);
-            if (more.items.len != before) {
-                try found.put(self.gpa, decl, more.items);
-                changed = true;
-            }
+    // Through calls that pass a parameter on, to a fixed point: a function whose copies grow
+    // is read again in each generic that calls it. Copies only grow, each route at most once
+    // and at most `routes` routes to a source, so it ends.
+    var calls: std.AutoHashMapUnmanaged(Decl, []const Passing) = .empty;
+    var callers: std.AutoHashMapUnmanaged(Decl, std.ArrayList(Decl)) = .empty;
+    for (functions.items) |decl| {
+        const passing = try self.passings(decl);
+        try calls.put(self.gpa, decl, passing);
+        for (passing) |each| {
+            const entry = try callers.getOrPut(self.gpa, each.target);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(self.gpa, decl);
+        }
+    }
+    var queue: std.ArrayList(Decl) = .empty;
+    var queued: std.AutoHashMapUnmanaged(Decl, void) = .empty;
+    for (functions.items) |decl| {
+        try queue.append(self.gpa, decl);
+        try queued.put(self.gpa, decl, {});
+    }
+    var next: usize = 0;
+    while (next < queue.items.len) : (next += 1) {
+        const decl = queue.items[next];
+        _ = queued.remove(decl);
+        var more: std.ArrayList(ParameterCopy) = .empty;
+        // Each held copy its own, as a route found crowded is marked in place.
+        for (found.get(decl) orelse &.{}) |copy| try more.append(self.gpa, copy);
+        self.copies = found;
+        if (!try self.passedCopies(decl, calls.get(decl).?, &more)) continue; // unreachable: every function's calls are read above
+        try found.put(self.gpa, decl, more.items);
+        for (if (callers.get(decl)) |list| list.items else &.{}) |caller| {
+            if ((try queued.getOrPut(self.gpa, caller)).found_existing) continue;
+            try queue.append(self.gpa, caller);
         }
     }
     self.copies = found;
@@ -892,20 +910,23 @@ pub fn madeByParameter(self: *const Facts, file: Project.FileId, value: Ast.Node
     return self.genericPosition(function, index);
 }
 
-/// A call in `function`'s body passing a generic parameter on (or a part of it) where the
-/// callee copies the parameter it takes: `function` copies its own.
-fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+/// A call in a generic's body passing one of its generic parameters on, or a part of one, and
+/// the function it calls.
+const Passing = struct { node: Ast.Node.Index, target: Decl };
+
+/// The calls in `function`'s body that pass a generic parameter on, or a part of one.
+fn passings(self: *Facts, function: Decl) ResolveError![]const Passing {
     const t = self.syntaxOf(function.file);
     const whole = self.scopeNode(function);
     const first = t.firstToken(whole);
     const last = t.lastToken(whole);
+    var found: std.ArrayList(Passing) = .empty;
     for (t.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = t.fullCall(&call_buffer, node) orelse continue;
         const at = t.nodeMainToken(node);
         if (at < first or at > last) continue;
-        // Only a call passing something a generic parameter gives is read.
         var passes = false;
         for (call.ast.params) |arg| if (self.derivedParameter(function, arg, 0) != null) {
             passes = true;
@@ -914,6 +935,22 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         const callee = (try self.definition(function.file, call.ast.fn_expr)) orelse continue;
         const target = (try self.origin(callee)) orelse continue;
         if (std.meta.eql(target, function)) continue;
+        try found.append(self.gpa, .{ .node = node, .target = target });
+    }
+    return found.items;
+}
+
+/// Each call of `passing` passing a generic parameter on where the callee copies the parameter
+/// it takes: `function` copies its own, added to `out`. Whether `out` grew, or a route in it
+/// was found crowded.
+fn passedCopies(self: *Facts, function: Decl, passing: []const Passing, out: *std.ArrayList(ParameterCopy)) ResolveError!bool {
+    const t = self.syntaxOf(function.file);
+    var changed = false;
+    for (passing) |each| {
+        const node = each.node;
+        const target = each.target;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = t.fullCall(&call_buffer, node).?; // unreachable: a passing is a call
         const theirs = self.copies.?.get(target) orelse continue;
         const receiver: usize = if (self.methodCall(function.file, call, target)) 1 else 0;
         for (theirs) |copy| {
@@ -922,28 +959,41 @@ fn passedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             const mine = self.derivedParameter(function, argument, 0) orelse continue;
             // A path through this call again is a cycle of generics passing it round.
             if (copy.source != null and onPath(copy.path, .{ .file = function.file, .node = node })) continue;
+            // A route past those read stays past them for each caller.
             const passed: ParameterCopy = if (copy.source) |source| .{
                 .position = mine,
                 .site = copy.site,
                 .kind = copy.kind,
                 .source = source,
                 .path = try std.mem.concat(self.gpa, Key, &.{ &.{.{ .file = function.file, .node = node }}, copy.path }),
+                .crowded = copy.crowded,
             } else if (self.readThrough(function, argument, 0))
-                .{ .position = mine, .site = copy.site, .kind = copy.kind, .source = .{ .file = function.file, .node = argument } }
+                .{ .position = mine, .site = copy.site, .kind = copy.kind, .source = .{ .file = function.file, .node = argument }, .crowded = copy.crowded }
             else
-                .{ .position = mine, .site = copy.site, .kind = copy.kind };
+                .{ .position = mine, .site = copy.site, .kind = copy.kind, .crowded = copy.crowded };
             var seen: usize = 0;
             for (out.items) |*held| {
                 if (held.position != passed.position or !std.meta.eql(held.site, passed.site) or !std.meta.eql(held.source, passed.source)) continue;
-                if (samePath(held.path, passed.path)) break;
+                if (samePath(held.path, passed.path)) {
+                    if (passed.crowded and !held.crowded) {
+                        held.crowded = true;
+                        changed = true;
+                    }
+                    break;
+                }
                 seen += 1;
                 if (seen == routes) {
+                    if (!held.crowded) changed = true;
                     held.crowded = true;
                     break;
                 }
-            } else try out.append(self.gpa, passed);
+            } else {
+                try out.append(self.gpa, passed);
+                changed = true;
+            }
         }
     }
+    return changed;
 }
 
 fn onPath(path: []const Key, step: Key) bool {
