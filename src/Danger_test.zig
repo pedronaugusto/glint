@@ -4003,6 +4003,48 @@ test "Bounds clears arithmetic and a conversion the relations along every path k
     try std.testing.expectEqualSlices(u32, &.{ 5, 12, 24, 36, 46 }, result.lines[0..result.findings]);
 }
 
+test "Bounds bounds what a loop steps by how far each pass steps it and how many passes run: a sum of a table's days, a count of matches" {
+    // Each twin's counter can pass its type: a u8 count over a slice of any length (line 21), a
+    // u32 count over a slice past 2^32 items on a 64-bit target (line 30).
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        \\pub fn table(r: *std.Io.Reader) !u64 {
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    var total: u64 = 0;
+        \\    for (days[0..@min(n, days.len)]) |d| total += d;
+        \\    return total;
+        \\}
+        \\pub fn count(r: *std.Io.Reader, items: []const u8) !usize {
+        \\    const m = try r.takeByte();
+        \\    var found: usize = 0;
+        \\    for (items) |b| {
+        \\        if (b == m) found += 1;
+        \\    }
+        \\    return found;
+        \\}
+        \\pub fn twice(r: *std.Io.Reader, items: []const u8) !u8 {
+        \\    const m = try r.takeByte();
+        \\    var found: u8 = 0;
+        \\    for (items) |b| {
+        \\        if (b == m) found += 1;
+        \\    }
+        \\    return found;
+        \\}
+        \\pub fn walk(r: *std.Io.Reader, items: []const u8) !u32 {
+        \\    const m = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    var seen: u32 = 0;
+        \\    while (i < items.len) : (i += 1) {
+        \\        if (items[i] == m) seen += 1;
+        \\    }
+        \\    return seen;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 21, 30 }, result.lines[0..result.findings]);
+}
+
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
     try expect(pack.bounded_work,
         \\const std = @import("std");
@@ -5725,10 +5767,9 @@ test "A010 reads a slice's length as its bounds set it, apart from what it holds
         \\    return total;
         \\}
     );
-    // Each difference. Line 40: the sum of the table's own days runs as many passes as the
-    // peer chose, which Bounds does not yet read as at most 12 days (counter steps).
+    // Each difference, and no sum of the table's own days: at most 12 passes of a byte each.
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 4, 16, 20, 28, 32, 35, 40 }, result.lines[0..result.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 16, 20, 28, 32, 35 }, result.lines[0..result.findings]);
 }
 
 test "A010 reads what a function stores through a parameter in its callers' memory: a value through a pointer, a slice through a pointer to it, and on through a caller that passes its own parameter" {
