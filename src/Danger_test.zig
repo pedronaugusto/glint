@@ -2307,6 +2307,54 @@ test "A009 trusts a table's own id by its type, and reports each id made from an
     try std.testing.expectEqualSlices(u32, &.{ 18, 19, 21, 25, 26, 27, 28, 29, 31 }, result.lines[0..result.findings]);
 }
 
+/// `run` with `other.zig`, a file of the program the selection leaves out, imported by path.
+fn runWithOther(rule: glint.Rule, program: []const u8, other: []const u8) !Run {
+    const file: sources.Extra = .{ .name = "other.zig", .bytes = other };
+    return runWith(rule, program, &(std_files ++ [_]sources.Extra{file}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "other.zig", .target = std_files.len }}));
+}
+
+test "A009 and A010 read every file of the program, selected or not: a table's own id another file declares, a store another file makes" {
+    // A conversion to a type that does not resolve may make a table's own id only where some
+    // file of the program declares one: `other.zig` does, outside the selection.
+    const made =
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+        \\const gone = @import("gone");
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    const id: gone.Id = @fromBackingInt(try r.takeInt(u32, 0));
+        \\    _ = other;
+        \\    return @backingInt(id);
+        \\}
+    ;
+    const declared = try runWithOther(pack.untrusted_input, made,
+        \\pub const Entry = struct { name: u8, pub const Id = enum(u32) { _ }; };
+        \\pub const Table = struct {
+        \\    entries: []Entry,
+        \\    pub fn at(t: *const Table, id: Entry.Id) u8 { return t.entries[@backingInt(id)].name; }
+        \\};
+    );
+    try std.testing.expectEqual(@as(usize, 1), declared.undecided);
+    const none = try runWithOther(pack.untrusted_input, made, "pub const Entry = struct { name: u8 };");
+    try std.testing.expectEqual(@as(usize, 0), none.undecided);
+    // A field holds at most what every store in the program gives it: 100 in the selected
+    // file, so a decoded u32 and it fit a u64, and a u64 from input `other.zig` stores (line 6).
+    const stored =
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+        \\pub const Config = struct { limit: u64 = 0 };
+        \\pub fn f(r: *std.Io.Reader, c: *Config) !u64 {
+        \\    c.limit = 100;
+        \\    other.touch(c);
+        \\    const n: u64 = try r.takeInt(u32, 0);
+        \\    return n + c.limit;
+        \\}
+    ;
+    const kept = try runWithOther(pack.integers, stored, "pub fn touch(c: anytype) void { c.limit = 7; }");
+    try std.testing.expectEqual(@as(usize, 0), kept.findings);
+    const widened = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.limit = r.takeInt(u64, 0) catch 0; }");
+    try std.testing.expectEqualSlices(u32, &.{8}, widened.lines[0..widened.findings]);
+}
+
 test "A009 reads a for capture as the input at its own position, a discarded capture counted" {
     // The counter beside the peer's bytes indexes the buffer (line 5); what the peer's bytes
     // give does not, though the capture before it is discarded (line 6): it is no counter, and
