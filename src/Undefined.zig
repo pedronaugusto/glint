@@ -3387,8 +3387,8 @@ fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
 
 /// What the program's functions were found to do with a parameter, kept once per function,
 /// parameter and question. A reading cut short (a cycle back to a function being read, or one
-/// past the depth) shows nothing, and what was read while one was is not kept: it depends on
-/// where the reading began, and another reading may show more.
+/// past the depth) shows nothing, and what was read while one was is kept only for the pass of
+/// the outermost reading: it depends on where the reading began, and another may show more.
 const Calls = struct {
     const Key = struct { decl: Facts.Decl, index: usize, question: enum { writes, keeps, parts, needs, holds, undefines } };
     found: std.AutoHashMapUnmanaged(Key, bool) = .empty,
@@ -3403,6 +3403,12 @@ const Calls = struct {
     provisional: std.AutoHashMapUnmanaged(Key, struct { left: Left, head: usize }) = .empty,
     /// How many functions' parameters `undefines` has read, for the test that keeps it linear.
     reads: usize = 0,
+    /// What readings cut short (a cycle back to a function being read, or one past the depth)
+    /// showed, kept for the outermost reading's pass so each is read once a pass, not once a
+    /// path; and how many readings `remembered` made, for the test that keeps it linear.
+    found_this_pass: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+    needed_this_pass: std.AutoHashMapUnmanaged(Key, ?Needs) = .empty,
+    remembered_reads: usize = 0,
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,
 };
@@ -3415,16 +3421,28 @@ const Owner = union(enum) { container: struct { file: Project.FileId, scope: Mod
 fn remembered(comptime T: type, c: *Context, key: Calls.Key, depth: u8, comptime read: fn (*Context, Facts.Decl, usize, u8) Context.Error!T, comptime cut: T) Context.Error!T {
     const memo = try c.facts.memo(Calls);
     const map = if (T == bool) &memo.found else &memo.needed;
+    const pass = if (T == bool) &memo.found_this_pass else &memo.needed_this_pass;
     if (map.get(key)) |known| return known;
+    // Shown by a reading cut short in this pass: as cut for the one asking.
+    if (pass.get(key)) |kept| {
+        memo.cuts += 1;
+        return kept;
+    }
     if (depth > depth_limit or memo.active.contains(key)) {
         memo.cuts += 1;
         return cut;
     }
     try memo.active.put(c.allocator, key, {});
     defer _ = memo.active.remove(key);
+    memo.remembered_reads += 1;
     const cuts = memo.cuts;
     const shown = try read(c, key.decl, key.index, depth);
-    if (memo.cuts == cuts) try map.put(c.allocator, key, shown);
+    try (if (memo.cuts == cuts) map else pass).put(c.allocator, key, shown);
+    // The outermost reading ends its pass: what a cut shaped is read again in the next.
+    if (memo.active.count() == 1) {
+        memo.found_this_pass.clearRetainingCapacity();
+        memo.needed_this_pass.clearRetainingCapacity();
+    }
     return shown;
 }
 
@@ -3904,7 +3922,26 @@ fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
     };
 }
 
-test "use-after-deinit summaries are read a bounded number of times per function, through nested recursion and past the depth" {
+/// A ring of diamonds deeper than the depths the summaries follow: each level reaches the next
+/// by two paths, and the last goes back to the first. Read once per function a pass, a count
+/// stays near the functions'; read again on each path, it doubles per level. `main` hands the
+/// ring `local`, declared `S` as `declared` spells. Returns how many functions it holds.
+fn diamonds(gpa: std.mem.Allocator, source: *std.ArrayList(u8), declared: []const u8) !usize {
+    const n = 12;
+    try source.print(gpa, "const S = struct {{ a: u32 }};\n", .{});
+    for (0..n) |i| try source.print(gpa,
+        \\fn g{d}(p: *S, k: u32) void {{ if (k == 0) return; l{d}(p, k - 1); r{d}(p, k - 1); }}
+        \\fn l{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+        \\fn r{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+        \\
+    , .{ i, i, i, i, i + 1, i, i + 1 });
+    try source.print(gpa, "fn g{d}(p: *S, k: u32) void {{ g0(p, k); }}\n", .{n});
+    try source.print(gpa, "pub fn main() u32 {{ var local: {s}; g0(&local, 3); return local.a; }}\n", .{declared});
+    return 3 * n + 1;
+}
+
+/// Runs A019's reads over `source`, the program alone, and gives its summaries' memo.
+fn readSummaries(gpa: std.mem.Allocator, source: []const u8) !Calls {
     const Report = @import("Report.zig");
     const Probe = struct {
         const id: Rule = @fromBackingInt(1000); // safe: an extension identity the test owns.
@@ -3918,25 +3955,7 @@ test "use-after-deinit summaries are read a bounded number of times per function
             return config;
         }
     };
-    const gpa = std.testing.allocator;
-    // Each level reaches the next by two paths, and the last goes back to the first: a cycle
-    // whose every function a reading reaches many ways, longer than the depth `undefines` follows.
-    // Read once per function, the count stays near the functions'; read again on each path, it
-    // doubles per level.
-    const n = 12;
-    const functions = 3 * n + 1;
-    var source: std.ArrayList(u8) = .empty;
-    defer source.deinit(gpa);
-    try source.appendSlice(gpa, "const S = struct { a: u32 };\n");
-    for (0..n) |i| try source.print(gpa,
-        \\fn g{d}(p: *S, k: u32) void {{ if (k == 0) return; l{d}(p, k - 1); r{d}(p, k - 1); }}
-        \\fn l{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
-        \\fn r{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
-        \\
-    , .{ i, i, i, i, i + 1, i, i + 1 });
-    try source.print(gpa, "fn g{d}(p: *S, k: u32) void {{ g0(p, k); }}\n", .{n});
-    try source.appendSlice(gpa, "pub fn main() u32 { var s: S = .{ .a = 1 }; g0(&s, 3); return s.a; }\n");
-    var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = source.items }}, &.{}, .{});
+    var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
     defer project.deinit();
     // A program std's AstGen refuses is never read: it would pass with no summary read.
     try std.testing.expectEqual(.parsed, project.sources[0].file.status);
@@ -3945,10 +3964,29 @@ test "use-after-deinit summaries are read a bounded number of times per function
     var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
     defer facts.deinit();
     var sink: Context.Sink = .{ .diagnostic = Probe.diagnostic, .coverage = Probe.coverage, .config = Probe.configOf };
-    const definitions = [_]@import("Rule.zig").Definition{.{ .id = Probe.id, .name = "SUMMARIES", .group = .family_policy, .purpose = "counts use-after-deinit summaries", .version = 1 }};
+    const definitions = [_]@import("Rule.zig").Definition{.{ .id = Probe.id, .name = "SUMMARIES", .group = .family_policy, .purpose = "counts summaries", .version = 1 }};
     var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Probe.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
     try reads(&c, Probe.id, Probe.never);
-    const counted = (try facts.memo(Calls)).reads;
-    try std.testing.expect(counted >= functions);
-    try std.testing.expect(counted <= 3 * functions);
+    const memo = try facts.memo(Calls);
+    return .{ .reads = memo.reads, .remembered_reads = memo.remembered_reads };
+}
+
+test "summaries are read a bounded number of times per function, through nested recursion and past the depth" {
+    const gpa = std.testing.allocator;
+    // What a call leaves undefined (`undefines`), for a local the ring is given.
+    var deinit_ring: std.ArrayList(u8) = .empty;
+    defer deinit_ring.deinit(gpa);
+    const deinit_functions = try diamonds(gpa, &deinit_ring, "S = .{ .a = 1 }");
+    const deinit_read = try readSummaries(gpa, deinit_ring.items);
+    try std.testing.expect(deinit_read.reads >= deinit_functions);
+    try std.testing.expect(deinit_read.reads <= 3 * deinit_functions);
+    // What a call writes, keeps, reads or needs (`remembered`), for a local declared undefined:
+    // each of its questions about each function, once for each the walk asks first (a pass of
+    // its own), some twenty a function; read again on each path, thousands.
+    var write_ring: std.ArrayList(u8) = .empty;
+    defer write_ring.deinit(gpa);
+    const write_functions = try diamonds(gpa, &write_ring, "S = undefined");
+    const write_read = try readSummaries(gpa, write_ring.items);
+    try std.testing.expect(write_read.remembered_reads >= write_functions);
+    try std.testing.expect(write_read.remembered_reads <= 40 * write_functions);
 }
