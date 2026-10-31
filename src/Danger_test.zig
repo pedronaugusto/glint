@@ -4823,6 +4823,29 @@ test "Bounds clears arithmetic and a conversion the relations along every path k
     try std.testing.expectEqualSlices(u32, &.{ 5, 12, 24, 36, 46 }, result.lines[0..result.findings]);
 }
 
+test "Bounds joins a summary's exits over its parameters' slots, a length's range read for a slot that is one: a callee's result named by a later parameter's length" {
+    // `third` returns the third slice's length on both paths: its summary names slots past
+    // the variables its own frame holds, and the caller's index below that length clears.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn third(a: []const u8, b: []const u8, c: []const u8, d: []const u8, pick: bool) usize {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = d;
+        \\    if (pick) return c.len;
+        \\    return c.len;
+        \\}
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator, buf: []const u8) !u8 {
+        \\    const x = try r.allocRemaining(gpa, .unlimited);
+        \\    const n = third(buf, buf, x, buf, buf.len > 3);
+        \\    if (n == 0) return 0;
+        \\    return x[n - 1];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 0), result.findings);
+}
+
 test "Bounds keeps a function's other facts where a loop's are past its budget: an encoder's fixed writes clear beside a loop stepping by input lengths" {
     // The second loop steps `at` by lengths the peer chose (lines 20, 21); every write before
     // and after it at a place the facts bound stays clear, however many facts the loop holds.
