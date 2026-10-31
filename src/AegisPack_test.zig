@@ -952,6 +952,34 @@ fn expectJudgedWithFile(source: []const u8, other: []const u8, rule: glint.Rule,
     try std.testing.expectEqual(findings, count(report, rule));
 }
 
+fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWith(std.testing.allocator, source, lib);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "a public generic's parameters are each binding's, a consumer's among them; a private one's are its callers'" {
+    // A raw integer read in a public generic, bound inside its package only to a plain type:
+    // the read is each binding's, so the package alone is clean and a consumer's binding of an
+    // aegis id is the finding, whether the package is linted with it or not.
+    const lib = "pub fn bump(x: anytype) u32 { return x.raw() + 1; }\nconst Plain = struct { pub fn raw(_: Plain) u32 { return 1; } };\npub fn use() u32 { return bump(Plain{}); }\n";
+    const consumer = "const lib = @import(\"lib\");\nconst Index = @import(\"aegis\").id.Id(struct {}, u32);\npub fn f() u32 { return lib.bump(Index.fromRaw(3)); }";
+    try expectJudged(lib, pack.scalar, true, 0);
+    try expectJudgedWithDependency(consumer, lib, pack.scalar, true, 1);
+    try expectJudgedWithLib(consumer, lib, pack.scalar, true, 1);
+    try expectJudged("const Index = @import(\"aegis\").id.Id(struct {}, u32);\n" ++ lib ++ "pub fn f() u32 { return bump(Index.fromRaw(3)); }", pack.scalar, true, 1);
+    // A judgment of a generic's body not recorded per binding reads its parameters from its
+    // callers only where they are all known: a private generic, not a public one, which a
+    // consumer may call with anything.
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32 };\n";
+    try expectJudged(head ++ "fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *Plain) u32 { return peek(p); }", pack.access, true, 0);
+    try expectJudged(head ++ "fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *G(u32)) u32 { return peek(p); }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *Plain) u32 { return peek(p); }", pack.access, false, 0);
+}
+
 test "an owner given by value to a function of the program's own, a dependency's or one in a file the run did not select, is undecided" {
     // The program is every loaded file but std's and aegis's: a function there is not walked
     // for what it does with the owner, and `keep` drops it.

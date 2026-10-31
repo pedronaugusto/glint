@@ -572,6 +572,33 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
+test "A015 judges a public generic at each binding, a consumer's among them, and leaves a type that does not resolve undecided" {
+    // The package alone binds its type function and its generic only to a number: nothing.
+    const lib =
+        \\pub fn Box(comptime T: type) type { return struct { v: T }; }
+        \\pub const Plain = Box(u32);
+        \\pub fn make(comptime T: type) T { return undefined; }
+        \\pub fn use() u32 { return make(u32); }
+    ;
+    try expect(pack.ownership, lib, 0);
+    // A consumer binding them to a file: a field and a result each hold it by value.
+    const result = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const S = struct { b: dep.Box(std.Io.File) };
+        \\pub fn f() void { _ = dep.make(std.Io.File); }
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 2), result.findings);
+    // A field whose type does not resolve may hold one: undecided, never clear.
+    const missing = try run(pack.ownership,
+        \\const ext = @import("missing");
+        \\pub const S = struct { f: ext.Handle };
+    );
+    try std.testing.expectEqual(@as(usize, 1), missing.undecided);
+    try std.testing.expectEqual(@as(usize, 0), missing.findings);
+}
+
 test "A015 reads a tuple's fields, named by position only, as fields" {
     try expect(pack.ownership,
         \\const std = @import("std");
