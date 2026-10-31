@@ -110,16 +110,19 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
         const pointer = tree.fullPtrType(declared) orelse continue;
         const table = held(try c.facts.resolve(kind.file, pointer.ast.child_type)) orelse continue;
         const inner = c.project.at(table.file);
+        var any = false;
         for (inner.model.declarations) |entry| {
             if (entry.kind != .field or entry.scope != table.scope) continue;
             const entry_type = (inner.file.tree.fullContainerField(entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
             const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
             const given = (try interfaceParameters(c, table.file, proto, kind)) orelse return false;
             if (!try readsCalledOnSelf(c, entry.name, table, true, given)) return false;
+            any = true;
         }
         // The vtable itself read out (`w.vtable = s.interface.vtable`) carries its functions
-        // to another interface: each read must take a function of it, or compare it.
-        if (!try tableReadInPlace(c, decl.name, kind)) return false;
+        // to another interface: each read must take a function of it, or compare it. A pointer
+        // to a struct with no function of its own (`reader: *Io.Reader`) is no vtable.
+        if (any and !try tableReadInPlace(c, decl.name, kind)) return false;
     }
     // `@field(x, "vtable")` or `@field(x, "f")` of an interface names its functions too. One
     // written (`@field(out, name) = d`) installs, which the conversion it reaches judges.
@@ -233,8 +236,9 @@ fn notFunction(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool 
 
 /// Whether the function read `use` (`x.f`, `x.vtable.f` where `through`) is called at once,
 /// `.?` unwrapping it at most, with the interface it was read from at each position `given`;
-/// or captured from its optional (`if (x.f) |f|`) and the capture only called so, on an
-/// interface a parameter, a capture or a constant names, which nothing changes in between.
+/// or captured from its optional (`if (x.f) |f|`) or bound to a constant (`const f = x.f orelse
+/// return e;`) and only called so, on an interface a parameter, a capture or a constant names,
+/// which nothing changes in between. A read compared (`x.f != null`) calls nothing.
 fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, through: bool, given: u64) bool {
     const receiver = tree.nodeData(use).node_and_token[0];
     // The interface: the receiver, or what the vtable was read from.
@@ -245,22 +249,17 @@ fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, thro
     }
     var callee = use;
     var outer = model.parentOf(use) orelse return false;
+    switch (tree.nodeTag(outer)) {
+        .equal_equal, .bang_equal => return true,
+        else => {},
+    }
     if (tree.fullIf(outer)) |branch| {
         if (branch.ast.cond_expr != use or !fixed(tree, model, interface)) return false;
         const payload = branch.payload_token orelse return false;
         if (tree.tokenTag(payload) == .asterisk) return false;
         for (model.declarations, 0..) |decl, d| {
             if (decl.kind != .capture or decl.node != outer or decl.token != payload) continue;
-            const index: Model.Declaration.Id = @fromBackingInt(@intCast(d));
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                if (tag != .identifier) continue;
-                const reference: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                if ((model.reference(reference) orelse continue).declaration != index) continue;
-                var call_buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&call_buffer, model.parentOf(reference) orelse return false) orelse return false;
-                if (call.ast.fn_expr != reference or !givenSelf(tree, call, interface, given)) return false;
-            }
-            return true;
+            return onlyCalledOnSelf(tree, model, @fromBackingInt(@intCast(d)), interface, given);
         }
         return false;
     }
@@ -268,6 +267,7 @@ fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, thro
         callee = outer;
         outer = model.parentOf(outer) orelse return false;
     }
+    if (boundConstant(tree, model, callee)) |index| return fixed(tree, model, interface) and onlyCalledOnSelf(tree, model, index, interface, given);
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, outer) orelse return false;
     if (call.ast.fn_expr != callee) return false;
@@ -285,15 +285,76 @@ fn givenSelf(tree: *const Ast, call: Ast.full.Call, interface: Ast.Node.Index, g
     return call.ast.params.len >= 64 or given >> @intCast(call.ast.params.len) == 0;
 }
 
-/// The member read an `if` captured, where `node` names that capture (`if (x.f) |f|`).
+/// Whether each reference to the capture or constant `index` calls it, `.?` unwrapping it at
+/// most, given `interface` at each position `given`.
+fn onlyCalledOnSelf(tree: *const Ast, model: *const Model, index: Model.Declaration.Id, interface: Ast.Node.Index, given: u64) bool {
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const reference: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if ((model.reference(reference) orelse continue).declaration != index) continue;
+        var callee = reference;
+        var outer = model.parentOf(reference) orelse return false;
+        if (tree.nodeTag(outer) == .unwrap_optional) {
+            callee = outer;
+            outer = model.parentOf(outer) orelse return false;
+        }
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, outer) orelse return false;
+        if (call.ast.fn_expr != callee or !givenSelf(tree, call, interface, given)) return false;
+    }
+    return true;
+}
+
+/// The constant the function read `node` (`x.f`, `x.f.?`) is bound to, alone or by an `orelse`
+/// that leaves (`const f = x.f orelse return e;`): it holds what the read gave.
+fn boundConstant(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
+    var init = node;
+    const parent = model.parentOf(node) orelse return null;
+    if (tree.nodeTag(parent) == .@"orelse") {
+        const value, const otherwise = tree.nodeData(parent).node_and_node;
+        if (value != node or !leaves(tree, otherwise)) return null;
+        init = parent;
+    }
+    const holder = model.parentOf(init) orelse return null;
+    const variable = tree.fullVarDecl(holder) orelse return null;
+    if (variable.ast.init_node.unwrap() != init or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    for (model.declarations, 0..) |decl, d| {
+        if (decl.kind == .variable and decl.node == holder) return @fromBackingInt(@intCast(d));
+    }
+    return null;
+}
+
+/// Whether evaluating `node` leaves the expression: it gives no value in its place.
+fn leaves(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .@"return", .@"break", .@"continue", .unreachable_literal => true,
+        else => false,
+    };
+}
+
+/// The member read a capture or constant `node` names holds: an `if`'s (`if (x.f) |f|`), or
+/// one `boundConstant` reads (`const f = x.f orelse return e;`).
 fn capturedRead(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
     if (tree.nodeTag(node) != .identifier) return null;
     const index = (model.reference(node) orelse return null).declaration orelse return null;
     const decl = model.declarations[@backingInt(index)];
-    if (decl.kind != .capture) return null;
-    const branch = tree.fullIf(decl.node) orelse return null;
-    if (branch.payload_token != decl.token or tree.nodeTag(branch.ast.cond_expr) != .field_access) return null;
-    return branch.ast.cond_expr;
+    switch (decl.kind) {
+        .capture => {
+            const branch = tree.fullIf(decl.node) orelse return null;
+            if (branch.payload_token != decl.token or tree.nodeTag(branch.ast.cond_expr) != .field_access) return null;
+            return branch.ast.cond_expr;
+        },
+        .variable => {
+            const variable = tree.fullVarDecl(decl.node) orelse return null;
+            var bound = variable.ast.init_node.unwrap() orelse return null;
+            if (tree.nodeTag(bound) == .@"orelse") bound = tree.nodeData(bound).node_and_node[0];
+            const read = if (tree.nodeTag(bound) == .unwrap_optional) tree.nodeData(bound).node_and_token[0] else bound;
+            if (tree.nodeTag(read) != .field_access) return null;
+            const found = boundConstant(tree, model, bound) orelse return null;
+            return if (found == index) read else null;
+        },
+        else => return null,
+    }
 }
 
 /// Whether `node` names a parameter, a capture or a constant: what it holds cannot change.

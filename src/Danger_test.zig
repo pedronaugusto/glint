@@ -1351,6 +1351,110 @@ test "A019 reads a call through an interface's function field as the read it is,
     try std.testing.expectEqualSlices(u32, &.{ 5, 13, 13 }, found.lines[0..found.findings]);
 }
 
+test "A019 reads a function field compared, or bound to a constant only called on its own interface, as no read out" {
+    // Clean: `i.serviceFn != null` calls nothing (10); `const answer = i.serviceFn orelse return
+    // 0;` binds what the read gave, and the constant is called on `i` alone (14).
+    const bound =
+        \\const Resolver = struct {
+        \\    interface: ?*Interface = null,
+        \\    spare: ?*Interface = null,
+        \\    pub const Interface = struct {
+        \\        lookupFn: *const fn (u32, *Interface) u32,
+        \\        serviceFn: ?*const fn (u32, *Interface) u32 = null,
+        \\    };
+        \\    pub fn readsServices(r: Resolver) bool {
+        \\        const i = r.interface orelse return false;
+        \\        return i.serviceFn != null;
+        \\    }
+        \\    pub fn service(r: Resolver, io: u32) u32 {
+        \\        const i = r.interface orelse return 0;
+        \\        const answer = i.serviceFn orelse return 0;
+        \\        return answer(io, i);
+        \\    }
+        \\    pub fn lookup(r: Resolver, io: u32) u32 {
+        \\        const i = r.interface orelse return 0;
+        \\        return i.lookupFn(io, i);
+        \\    }
+        \\    fn none(io: u32, interface: *Interface) u32 {
+        \\        _ = interface;
+        \\        return io;
+        \\    }
+        \\};
+        \\const Dns = struct {
+        \\    n: u32 = 0,
+        \\    resolving: Resolver.Interface = .{ .lookupFn = lookupFn, .serviceFn = serviceFn },
+        \\    pub fn resolver(d: *Dns) Resolver {
+        \\        return .{ .interface = &d.resolving };
+        \\    }
+        \\    fn lookupFn(io: u32, interface: *Resolver.Interface) u32 {
+        \\        const d: *Dns = @alignCast(@fieldParentPtr("resolving", interface));
+        \\        return d.n +% io;
+        \\    }
+        \\    fn serviceFn(io: u32, interface: *Resolver.Interface) u32 {
+        \\        const d: *Dns = @alignCast(@fieldParentPtr("resolving", interface));
+        \\        return d.n +% io;
+        \\    }
+        \\};
+        \\pub fn run() u32 {
+        \\    var d: Dns = .{};
+        \\    const r = d.resolver();
+        \\    if (!r.readsServices()) return 0;
+        \\    return r.lookup(1) +% r.service(2);
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try runAlone(pack.unsafe_set, bound)).findings);
+    // Findings: the constant called on another interface, an `orelse` giving another function,
+    // the interface a variable changed in between; each read (14) and the conversions it reaches.
+    const other = try runAlone(pack.unsafe_set, comptime edited(bound, "        return answer(io, i);", "        return answer(io, r.spare orelse return 0);"));
+    try std.testing.expectEqualSlices(u32, &.{ 14, 33, 33, 37, 37 }, other.lines[0..other.findings]);
+    const fallback = try runAlone(pack.unsafe_set, comptime edited(bound, "orelse return 0;\n        return answer", "orelse &none;\n        return answer"));
+    try std.testing.expectEqualSlices(u32, &.{ 14, 33, 33, 37, 37 }, fallback.lines[0..fallback.findings]);
+    const changed = try runAlone(pack.unsafe_set, comptime edited(bound, "        const i = r.interface orelse return 0;\n        const answer = i.serviceFn orelse return 0;\n        return answer(io, i);", "        var i = r.interface orelse return 0;\n        const answer = i.serviceFn orelse return 0;\n        i = r.spare orelse return 0;\n        return answer(io, i);"));
+    try std.testing.expectEqualSlices(u32, &.{ 14, 34, 34, 38, 38 }, changed.lines[0..changed.findings]);
+}
+
+test "A019 reads an interface's pointer to a struct with no function of its own as no vtable" {
+    // Clean: `reader` points at a reader, not a table of the transport's functions, so reading
+    // it out (7) carries none of them. A finding: the vtable `ops` read out (7), and the
+    // conversion (21) its function reaches.
+    const table =
+        \\const std = @import("std");
+        \\const Ops = struct { flush: *const fn (*Transport) void };
+        \\const Transport = struct {
+        \\    reader: *std.Io.Reader,
+        \\    ops: *const Ops,
+        \\    pub fn buffered(t: *Transport) usize {
+        \\        const in = t.reader;
+        \\        return in.bufferedLen();
+        \\    }
+        \\    pub fn flush(t: *Transport) void {
+        \\        t.ops.flush(t);
+        \\    }
+        \\};
+        \\const Opened = struct {
+        \\    transport: Transport,
+        \\    in: std.Io.Reader,
+        \\    flushed: usize = 0,
+        \\    const ops: Ops = .{ .flush = flushOpened };
+        \\};
+        \\fn flushOpened(t: *Transport) void {
+        \\    const o: *Opened = @alignCast(@fieldParentPtr("transport", t));
+        \\    o.flushed += 1;
+        \\}
+        \\pub fn run() usize {
+        \\    var o: Opened = .{ .transport = undefined, .in = .fixed("abc") };
+        \\    o.transport = .{ .reader = &o.in, .ops = &Opened.ops };
+        \\    o.transport.flush();
+        \\    return o.transport.buffered();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, table)).findings);
+    const out = try run(pack.unsafe_set, comptime edited(table, "        const in = t.reader;\n        return in.bufferedLen();", "        const in = t.ops;\n        return @intFromPtr(in);"));
+    try std.testing.expectEqualSlices(u32, &.{ 7, 21, 21 }, out.lines[0..out.findings]);
+}
+
 /// `program`'s findings of `rule` at report level, the only file the project loads.
 fn runAlone(rule: glint.Rule, program: []const u8) !Run {
     const inputs = [_]glint.Project.Input{.{ .name = "alone.zig", .bytes = program }};
