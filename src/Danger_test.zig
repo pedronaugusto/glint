@@ -7437,6 +7437,73 @@ test "A020 judges a function whose Io a field's field holds, and leaves undecide
     try std.testing.expectEqual(@as(usize, 0), none.undecided);
 }
 
+test "A020 judges a function that reaches an Io outside its parameters: a global, a global's field, a call" {
+    // Each names the Io it is given where its message says to cancel.
+    const found = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\var g_io: std.Io = undefined;
+        \\const App = struct { io: std.Io, n: u64 };
+        \\var app: App = undefined;
+        \\fn current() std.Io {
+        \\    return g_io;
+        \\}
+        \\pub fn global() void {
+        \\    _ = g_io;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+        \\pub fn field() !void {
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\    try app.io.checkCancel();
+        \\}
+        \\pub fn called() !void {
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\    try current().checkCancel();
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), found.findings);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    // One that may be an Io by how it is written, and does not resolve, is undecided.
+    const doubt = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\var maybe: ?std.Io = null;
+        \\pub fn spin() void {
+        \\    _ = maybe;
+        \\    var n: u64 = 0;
+        \\    while (true) n +%= 1;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), doubt.findings);
+    try std.testing.expectEqual(@as(usize, 1), doubt.undecided);
+    // A type's name, a namespace and a call whose result holds no Io give none.
+    const none = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\const limit: u64 = 16;
+        \\fn Index(comptime T: type) type {
+        \\    _ = T;
+        \\    return u8;
+        \\}
+        \\fn first(v: anytype) ?Index(@TypeOf(v)) {
+        \\    return null;
+        \\}
+        \\pub fn spin(r: *Io.Reader) Io.Reader.Error!void {
+        \\    _ = r;
+        \\    var v: @Vector(4, bool) = @splat(false);
+        \\    var n: u64 = 0;
+        \\    while (true) {
+        \\        n +%= limit;
+        \\        _ = first(v);
+        \\        v = @splat(true);
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), none.findings);
+    try std.testing.expectEqual(@as(usize, 0), none.undecided);
+}
+
 test "A020 and A009 read a call inside @TypeOf, never evaluated, as no cancellation point and no read" {
     // `@TypeOf(try io.checkCancel())` checks nothing, in the loop, a callee, or a labeled switch.
     try expect(pack.cancellation,

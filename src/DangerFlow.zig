@@ -282,30 +282,36 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     // Each function once, by the first parameter that holds its `Io` where it is read, else by
     // the first that may hold one in a form it is not (`Held.unread`): that function's loops
-    // are undecided, never cleared.
+    // are undecided, never cleared. A function no parameter gives one may reach one through
+    // what it names outside itself (`containerIo`): a global, a global's field, a call.
     var given: std.AutoHashMapUnmanaged(Ast.Node.Index, usize) = .empty;
-    var holders: std.ArrayList(struct { decl: Model.Declaration, held: Held }) = .empty;
+    var holders: std.ArrayList(Holding) = .empty;
     for (model.declarations) |decl| {
         if (decl.kind != .parameter or c.inTest(decl.token)) continue;
-        const held = try parameterIo(c, decl, io_type);
-        if (held == .none) continue;
-        const entry = try given.getOrPut(c.allocator, functionOf(c, decl.node) orelse continue);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = holders.items.len;
-            try holders.append(c.allocator, .{ .decl = decl, .held = held });
-        } else if (holders.items[entry.value_ptr.*].held == .unread and held == .at) holders.items[entry.value_ptr.*] = .{ .decl = decl, .held = held };
+        try hold(c, &given, &holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = try parameterIo(c, decl, io_type) });
+    }
+    for (model.references) |ref| {
+        const id = ref.declaration orelse continue;
+        if (tree.nodeTag(ref.node) != .identifier or c.inTest(ref.token) or !containerLevel(c, model.declarations[@backingInt(id)])) continue;
+        // A prototype names types; the body reads values.
+        const function = functionOf(c, ref.node) orelse continue;
+        const body = tree.nodeData(function).node_and_node[1];
+        if (ref.token < tree.firstToken(body) or ref.token > tree.lastToken(body)) continue;
+        const entry = given.get(function);
+        if (entry != null and holders.items[entry.?].held == .at) continue;
+        const reached = try containerIo(c, ref.node, io_type);
+        try hold(c, &given, &holders, ref.node, .{ .at = ref.node, .name = tree.getNodeSource(reached.node), .held = reached.held });
     }
     for (holders.items) |holding| {
-        const decl = holding.decl;
         const unread = holding.held == .unread;
         const holder = switch (holding.held) {
-            .at => |through| if (through.len == 0) decl.name else try c.allocator.print("{s}.{s}", .{ decl.name, through }),
-            else => decl.name,
+            .at => |through| if (through.len == 0) holding.name else try c.allocator.print("{s}.{s}", .{ holding.name, through }),
+            else => holding.name,
         };
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (tree.fullSwitch(node)) |choice| {
-                if (choice.label_token == null or !within(c, node, decl.node) or !site(c, node)) continue;
+                if (choice.label_token == null or !within(c, node, holding.at) or !site(c, node)) continue;
                 // A labeled switch that continues itself is a loop with no bound, each prong that
                 // goes on with it a pass: its point must come before every way on, read as a
                 // function's body is (no periodic form; a callee leaves before its point by no error).
@@ -336,7 +342,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try decided.leaves.append(c.allocator, end);
                 break :body loop.ast.then_expr;
             } else continue;
-            if (!within(c, node, decl.node) or !site(c, node)) continue;
+            if (!within(c, node, holding.at) or !site(c, node)) continue;
             var by_input = false;
             var unknown = false;
             for (try decided.bounds(c)) |bound| {
@@ -362,6 +368,62 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             }
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", holder }));
         }
+    }
+}
+
+/// What gives a judged function its `Io`: a node inside it (a parameter, or the reference to
+/// what it names outside itself), the name its message gives the holder, and where it holds it.
+const Holding = struct { at: Ast.Node.Index, name: []const u8, held: Held };
+
+/// `holding` for the function `node` is in, where it has none yet, or has only one it does not
+/// read (`Held.unread`) and this one is read.
+fn hold(c: *Context, given: *std.AutoHashMapUnmanaged(Ast.Node.Index, usize), holders: *std.ArrayList(Holding), node: Ast.Node.Index, holding: Holding) Context.Error!void {
+    if (holding.held == .none) return;
+    const entry = try given.getOrPut(c.allocator, functionOf(c, node) orelse return);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = holders.items.len;
+        try holders.append(c.allocator, holding);
+    } else if (holders.items[entry.value_ptr.*].held == .unread and holding.held == .at) holders.items[entry.value_ptr.*] = holding;
+}
+
+/// Whether a declaration is a container's member (a global, a function, a namespace), not a
+/// function's local.
+fn containerLevel(c: *Context, decl: Model.Declaration) bool {
+    if (decl.kind == .function) return true;
+    if (decl.kind != .variable) return false;
+    const tree = &c.project.at(c.file).file.tree;
+    const parent = c.project.at(c.file).model.parentOf(decl.node) orelse return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.nodeTag(parent) == .root or tree.fullContainerDecl(&buffer, parent) != null;
+}
+
+/// Where the expression a reference to a container's member begins holds an `Io`: read
+/// through field accesses and calls while it is a type, a namespace or a function (`other.g_io`,
+/// `io()`, `App.current().io`), then as a parameter's value is (`heldIo`): `g_io`, `app` of
+/// `app.io`. One that does not resolve, whole or in part (`?VectorIndex(@TypeOf(v))`), is read
+/// by how it is written, as a field is (`spelledIo`).
+fn containerIo(c: *Context, reference: Ast.Node.Index, io_type: Facts.Container) Context.Error!struct { node: Ast.Node.Index, held: Held } {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = reference;
+    while (true) {
+        const value = try c.facts.resolve(c.file, at);
+        const climbs = switch (value) {
+            .container, .function => true,
+            else => false,
+        };
+        if (!climbs) {
+            const held = if (value == .unknown) .unread else try heldIo(c, value, io_type, 0);
+            return .{ .node = at, .held = if (held == .unread and !try spelledIo(c, at, io_type)) .none else held };
+        }
+        const parent = model.parentOf(at) orelse return .{ .node = at, .held = .none };
+        var buffer: [1]Ast.Node.Index = undefined;
+        const on = switch (tree.nodeTag(parent)) {
+            .field_access => tree.nodeData(parent).node_and_token[0] == at,
+            else => if (tree.fullCall(&buffer, parent)) |call| call.ast.fn_expr == at else false,
+        };
+        if (!on) return .{ .node = at, .held = .none };
+        at = parent;
     }
 }
 
@@ -429,6 +491,47 @@ fn mentionsIo(value: Facts.Value, io_type: Facts.Container, unresolved: bool, de
         .unknown, .reified => unresolved,
         else => false,
     };
+}
+
+/// Whether a container's member that does not resolve may hold an `Io` by how it is written:
+/// a global by its type, or its value where it has none; a call by its callee's result type,
+/// or by an argument that holds or names one (a generic result is made from its arguments).
+fn spelledIo(c: *Context, node: Ast.Node.Index, io_type: Facts.Container) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, node)) |call| {
+        for (call.ast.params) |argument| {
+            if (try heldIo(c, try c.facts.resolve(c.file, argument), io_type, 1) != .none) return true;
+            if (try spellsIo(c, c.file, argument, io_type)) return true;
+        }
+        const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
+            .function => |decl| decl,
+            else => return true,
+        };
+        const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = c.project.at(callee.file).file.tree.fullFnProto(&proto_buffer, record.node) orelse return true;
+        return spellsIo(c, callee.file, proto.ast.return_type.unwrap() orelse return true, io_type);
+    }
+    const decl: Facts.Decl = switch (tree.nodeTag(node)) {
+        .identifier => .{ .file = c.file, .index = ((c.project.at(c.file).model.reference(node) orelse return true).declaration orelse return true) },
+        .field_access => decl: {
+            const lhs, const name = tree.nodeData(node).node_and_token;
+            const holder = switch (try c.facts.resolve(c.file, lhs)) {
+                .container => |k| k,
+                else => return true,
+            };
+            break :decl c.facts.member(holder, tree.tokenSlice(name)) orelse return true;
+        },
+        else => return true,
+    };
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const variable = c.project.at(decl.file).file.tree.fullVarDecl(record.node) orelse return true;
+    if (variable.ast.type_node.unwrap()) |written| return spellsIo(c, decl.file, written, io_type);
+    const value = variable.ast.init_node.unwrap() orelse return true;
+    // A type's name (`const Io = std.Io`) holds no value.
+    if (try c.facts.resolve(decl.file, value) == .container) return false;
+    return spellsIo(c, decl.file, value, io_type);
 }
 
 /// Whether a type expression names `Io` anywhere in it (`?std.Io`, `struct { std.Io, u8 }`,
