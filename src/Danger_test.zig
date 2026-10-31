@@ -4991,6 +4991,68 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     return result;
 }
 
+test "A020 takes a periodic point's counter only where the function alone writes it: never one written through its address or a container's" {
+    // A helper given the counter's address sets it every pass, so `n % 64` never reaches 0; a
+    // container's counter any other code may set; each a counting-down form too.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\fn hold(n: *u32) void {
+        \\    n.* = 1;
+        \\}
+        \\pub fn byAddress(io: std.Io, flag: *bool) !void {
+        \\    var n: u32 = 0;
+        \\    while (true) {
+        \\        n += 1;
+        \\        hold(&n);
+        \\        if (n % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\pub fn downByAddress(io: std.Io, flag: *bool) !void {
+        \\    var left: u32 = 64;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        hold(&(left));
+        \\        if (left == 0) {
+        \\            left = 64;
+        \\            try io.checkCancel();
+        \\        }
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\var shared: u32 = 0;
+        \\pub fn byContainer(io: std.Io, flag: *bool) !void {
+        \\    while (true) {
+        \\        shared += 1;
+        \\        if (shared % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+    , 3);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn local(io: std.Io, flag: *bool) !void {
+        \\    var n: u32 = 0;
+        \\    while (true) {
+        \\        n += 1;
+        \\        if (n % 64 == 0) try io.checkCancel();
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+        \\pub fn down(io: std.Io, flag: *bool) !void {
+        \\    var left: u32 = 64;
+        \\    while (true) {
+        \\        left -= 1;
+        \\        if (left == 0) {
+        \\            left = 64;
+        \\            try io.checkCancel();
+        \\        }
+        \\        if (flag.*) break;
+        \\    }
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");

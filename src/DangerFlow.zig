@@ -745,11 +745,26 @@ fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.No
 /// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`) every pass of the loop whose body is
 /// `body`, by its continue expression or a statement on every pass, and nothing else in the
 /// loop assigns it but, where `reset` is given, a constant other than zero set on every path
-/// through that branch.
+/// through that branch. The counter is a variable of the function whose address is never
+/// taken: one any other code may write (a container's, or one written through a pointer) is
+/// none.
 fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast.Node.Index, step: Ast.Node.Tag, reset: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const declared = (model.reference(counter) orelse return false).declaration orelse return false;
+    const record = model.declarations[@backingInt(declared)];
+    if (record.kind != .variable) return false;
+    switch (model.scopes[@backingInt(record.scope)].kind) {
+        .file, .container => return false,
+        else => {},
+    }
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .address_of) continue;
+        var operand = tree.nodeData(@fromBackingInt(@intCast(i))).node;
+        while (tree.nodeTag(operand) == .grouped_expression) operand = tree.nodeData(operand).node_and_token[0];
+        if (tree.nodeTag(operand) != .identifier) continue;
+        if ((model.reference(operand) orelse continue).declaration == declared) return false;
+    }
     const loop_node = model.parentOf(body) orelse return false;
     const cont: ?Ast.Node.Index = if (tree.fullWhile(loop_node)) |loop| loop.ast.cont_expr.unwrap() else null;
     var steps = false;
