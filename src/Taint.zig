@@ -1130,40 +1130,9 @@ fn isLen(tree: *const Ast, node: Ast.Node.Index) bool {
 fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
-    const model = &c.project.at(f.file).model;
     switch (tree.nodeTag(node)) {
-        .identifier => {
-            const ref = model.reference(node) orelse return .{};
-            const d = ref.declaration orelse return .{};
-            if (f.position(d)) |index| return .{ .params = bit(index), .lengths = bit(lengthSlot(index)) };
-            const decl = model.declarations[@backingInt(d)];
-            if (decl.kind == .variable or decl.kind == .capture) {
-                const scope = model.scopes[@backingInt(decl.scope)].kind;
-                if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .length = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
-                return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
-            }
-            return .{};
-        },
-        .field_access => {
-            const receiver, const name = tree.nodeData(node).node_and_token;
-            // An address is no number a peer chooses; a length is one within the memory the
-            // program holds: data, which a sink judges against what it reaches.
-            if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
-            if (std.mem.eql(u8, tree.tokenSlice(name), "len")) {
-                const memory = try dep(c, flow, function, receiver);
-                return memory.held().narrowed().join(memory.measured());
-            }
-            var out = try dep(c, flow, function, receiver);
-            if (try c.facts.definition(f.file, node)) |decl| {
-                if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
-                if (flow.lengths.get(decl)) |length| out = out.join(.{ .length = length });
-                if (try stdIs(c, decl, &zig_text)) out = out.join(.{ .level = .data });
-                // A function or a type named through a value is no part of its data.
-                const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
-                if (kind == .function) return .{};
-            } else out = out.join(.{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
-            return out;
-        },
+        .identifier => return declaredDep(c, flow, function, node),
+        .field_access => return fieldDep(c, flow, function, node),
         .array_access => return dep(c, flow, function, tree.nodeData(node).node_and_node[0]),
         // A slice holds what it slices, in a length its bounds set: past its start to its end,
         // or to the end of what it slices.
@@ -1231,6 +1200,57 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
         .bool_not => return (try dep(c, flow, function, tree.nodeData(node).node)).narrowed(),
         else => {},
     }
+    if (try literalDep(c, flow, function, node)) |out| return out;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&call_buffer, node)) |call| return result(c, flow, function, call);
+    return composed(c, flow, function, node);
+}
+
+/// What a name holds: a parameter's own slots, a global's facts, a local's.
+fn declaredDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const model = &c.project.at(f.file).model;
+    const ref = model.reference(node) orelse return .{};
+    const d = ref.declaration orelse return .{};
+    if (f.position(d)) |index| return .{ .params = bit(index), .lengths = bit(lengthSlot(index)) };
+    const decl = model.declarations[@backingInt(d)];
+    if (decl.kind == .variable or decl.kind == .capture) {
+        const scope = model.scopes[@backingInt(decl.scope)].kind;
+        if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .length = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
+        return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
+    }
+    return .{};
+}
+
+/// What a field holds: its receiver's facts and its declaration's.
+fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const receiver, const name = tree.nodeData(node).node_and_token;
+    // An address is no number a peer chooses; a length is one within the memory the program
+    // holds: data, which a sink judges against what it reaches.
+    if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
+    if (std.mem.eql(u8, tree.tokenSlice(name), "len")) {
+        const memory = try dep(c, flow, function, receiver);
+        return memory.held().narrowed().join(memory.measured());
+    }
+    var out = try dep(c, flow, function, receiver);
+    if (try c.facts.definition(f.file, node)) |decl| {
+        if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
+        if (flow.lengths.get(decl)) |length| out = out.join(.{ .length = length });
+        if (try stdIs(c, decl, &zig_text)) out = out.join(.{ .level = .data });
+        // A function or a type named through a value is no part of its data.
+        const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
+        if (kind == .function) return .{};
+    } else out = out.join(.{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
+    return out;
+}
+
+/// What a struct or an array literal holds, or null where `node` is neither.
+fn literalDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!?Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const model = &c.project.at(f.file).model;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, node)) |literal| {
         // A literal of a known type holds its fields' facts by their declarations; a tuple or
@@ -1253,9 +1273,7 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
         for (literal.ast.elements) |element| out = out.join(try dep(c, flow, function, element));
         return out;
     }
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&call_buffer, node)) |call| return result(c, flow, function, call);
-    return composed(c, flow, function, node);
+    return null;
 }
 
 /// What a builtin's result holds: nothing for one the program fixes as it compiles (a size, a
