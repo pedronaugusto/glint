@@ -20,6 +20,9 @@ assumed: ?Assumptions.Id = null,
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
 /// The names those functions are declared under, for a quick look before a callee is resolved.
 copier_names: std.StringHashMapUnmanaged(void) = .empty,
+/// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
+/// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
+bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, void) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
@@ -177,6 +180,7 @@ pub fn deinit(self: *Facts) void {
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
     self.copier_names.deinit(self.gpa);
+    self.bound_places.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
@@ -650,11 +654,172 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node }, .kind = .made });
             continue;
         }
-        if (t.nodeTag(init) != .identifier) continue;
-        const named = (model.reference(init) orelse continue).declaration orelse continue;
-        const position = self.valueOfParameter(function, named) orelse continue;
-        try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node } });
+        if (t.nodeTag(init) == .identifier) {
+            const named = (model.reference(init) orelse continue).declaration orelse continue;
+            const position = self.valueOfParameter(function, named) orelse continue;
+            try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node } });
+            continue;
+        }
+        // A value chosen or wrapped (`out catch |e| return e`, `if (c) v.a else v.b`): each
+        // place it reads that a generic parameter gives, read with the binding's arguments.
+        const parts = try self.copiedParts(function.file, init);
+        for (parts.places) |place| {
+            const position = self.runtimeParameter(function, place, 0) orelse continue;
+            const site: Key = .{ .file = function.file, .node = d.node };
+            // The parameter itself is its argument, read as written where it is bound.
+            const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
+            try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
+            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, {});
+        }
     }
+}
+
+/// What a copy of the value written `node` copies: the places it reads (a name, a field,
+/// `@field`, what a pointer points at, an element, an optional's payload), followed through
+/// every way a value is chosen or wrapped (a branch, a prong, a `break`, `orelse`, `catch`,
+/// `try`, `@as`, `@bitCast`, `@unionInit`, `++`, a literal's parts); and the values of other
+/// shapes, decided by their type. A call's result, a literal of plain data, a pointer and a
+/// branch that leaves are no copy of a place. `deep` is a value nested past what is followed.
+pub const Copied = struct { places: []const Ast.Node.Index, rest: []const Ast.Node.Index, deep: ?Ast.Node.Index };
+
+pub fn copiedParts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Copied {
+    var places: std.ArrayList(Ast.Node.Index) = .empty;
+    var rest: std.ArrayList(Ast.Node.Index) = .empty;
+    var deep: ?Ast.Node.Index = null;
+    try self.copiedWalk(file, node, 0, &places, &rest, &deep);
+    return .{ .places = places.items, .rest = rest.items, .deep = deep };
+}
+
+fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize, places: *std.ArrayList(Ast.Node.Index), rest: *std.ArrayList(Ast.Node.Index), deep: *?Ast.Node.Index) ResolveError!void {
+    if (depth == 64) {
+        if (deep.* == null) deep.* = node;
+        return;
+    }
+    const t = self.syntaxOf(file);
+    switch (t.nodeTag(node)) {
+        .identifier, .field_access, .deref, .array_access, .unwrap_optional => return places.append(self.gpa, node),
+        .grouped_expression => return self.copiedWalk(file, t.nodeData(node).node_and_token[0], depth + 1, places, rest, deep),
+        .@"try", .@"comptime", .@"nosuspend" => return self.copiedWalk(file, t.nodeData(node).node, depth + 1, places, rest, deep),
+        .@"orelse", .@"catch", .array_cat => {
+            const sides = t.nodeData(node).node_and_node;
+            try self.copiedWalk(file, sides[0], depth + 1, places, rest, deep);
+            return self.copiedWalk(file, sides[1], depth + 1, places, rest, deep);
+        },
+        .@"if", .if_simple => {
+            const branch = t.fullIf(node).?; // unreachable: the tag is an `if`'s
+            try self.copiedWalk(file, branch.ast.then_expr, depth + 1, places, rest, deep);
+            if (branch.ast.else_expr.unwrap()) |otherwise| try self.copiedWalk(file, otherwise, depth + 1, places, rest, deep);
+            return;
+        },
+        .@"switch", .switch_comma => {
+            for (t.fullSwitch(node).?.ast.cases) |case| try self.copiedWalk(file, t.fullSwitchCase(case).?.ast.target_expr, depth + 1, places, rest, deep); // unreachable: the tag is a switch's, its cases are cases
+            return;
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            // A block with no label gives `void`.
+            const brace = t.nodeMainToken(node);
+            if (brace < 2 or t.tokenTag(brace - 1) != .colon or t.tokenTag(brace - 2) != .identifier) return;
+            for (try self.blockBreaks(file, node, t.tokenSlice(brace - 2))) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            return;
+        },
+        // A loop's value: each `break` out of it, and its `else`.
+        .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
+            const start = t.firstToken(node);
+            const label: ?[]const u8 = if (start >= 2 and t.tokenTag(start) != .identifier and t.tokenTag(start - 1) == .colon and t.tokenTag(start - 2) == .identifier) t.tokenSlice(start - 2) else null;
+            for (try self.loopBreaks(file, node, label)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            const otherwise = if (t.fullFor(node)) |loop| loop.ast.else_expr else t.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
+            if (otherwise.unwrap()) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            return;
+        },
+        // What a call returns is the callee's, its `return` checked there.
+        .call_one, .call_one_comma, .call, .call_comma => return,
+        // No value: control leaves.
+        .@"return", .@"break", .@"continue", .unreachable_literal => return,
+        // A pointer, or a slice of what it points at: an alias.
+        .address_of, .slice, .slice_open, .slice_sentinel => return,
+        // A number, text, an error, or an enum's tag; or a declaration literal (`.empty`),
+        // which names a container's `const`, known as the program compiles.
+        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .error_value, .enum_literal => return,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = t.tokenSlice(t.nodeMainToken(node));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(t, node, &buffer);
+            if (std.mem.eql(u8, name, "@field")) return places.append(self.gpa, node);
+            if (args.len != 0 and (std.mem.eql(u8, name, "@as") or std.mem.eql(u8, name, "@bitCast"))) return self.copiedWalk(file, args[args.len - 1], depth + 1, places, rest, deep);
+            if (args.len == 3 and std.mem.eql(u8, name, "@unionInit")) return self.copiedWalk(file, args[2], depth + 1, places, rest, deep);
+            // Every other builtin gives no owner's copy: a number, an enum, a pointer, a
+            // vector, a type, text, an error or nothing (`@intCast`, `@fromBackingInt`,
+            // `@ptrCast`, `@splat`, `@This`, `@tagName`, `@memcpy`); `@call` calls.
+            return;
+        },
+        else => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (t.fullStructInit(&buffer, node)) |literal| {
+                for (literal.ast.fields) |field| try self.copiedWalk(file, field, depth + 1, places, rest, deep);
+                return;
+            }
+            if (t.fullArrayInit(&buffer, node)) |literal| {
+                for (literal.ast.elements) |item| try self.copiedWalk(file, item, depth + 1, places, rest, deep);
+                return;
+            }
+            return rest.append(self.gpa, node);
+        },
+    }
+}
+
+/// The values each `break :label` out of the labeled block `node` gives (Zig refuses a label
+/// that shadows another, so each names this block).
+fn blockBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: []const u8) ResolveError![]const Ast.Node.Index {
+    const t = self.syntaxOf(file);
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    const first = t.firstToken(node);
+    const last = t.lastToken(node);
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(brk);
+        if (at < first or at > last) continue;
+        const target, const value = t.nodeData(brk).opt_token_and_opt_node;
+        if (!std.mem.eql(u8, t.tokenSlice(target.unwrap() orelse continue), label)) continue;
+        try found.append(self.gpa, value.unwrap() orelse continue);
+    }
+    return found.items;
+}
+
+/// The values each `break` out of the loop `node` gives: one naming its `label`, or one with
+/// none whose nearest loop it is.
+fn loopBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: ?[]const u8) ResolveError![]const Ast.Node.Index {
+    const t = self.syntaxOf(file);
+    const model = &self.project.at(file).model;
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    const first = t.firstToken(node);
+    const last = t.lastToken(node);
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break") continue;
+        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(brk);
+        if (at < first or at > last) continue;
+        const target, const value = t.nodeData(brk).opt_token_and_opt_node;
+        if (target.unwrap()) |name| {
+            if (label == null or !std.mem.eql(u8, t.tokenSlice(name), label.?)) continue;
+        } else {
+            // The nearest loop the `break` is in.
+            var up = model.parentOf(brk);
+            const nearest = while (up) |parent| : (up = model.parentOf(parent)) {
+                if (t.fullFor(parent) != null or t.fullWhile(parent) != null) break parent;
+            } else continue;
+            if (nearest != node) continue;
+        }
+        try found.append(self.gpa, value.unwrap() orelse continue);
+    }
+    return found.items;
+}
+
+/// Whether the declaration `site` is a copy a generic function makes of its parameters'
+/// values that its bindings decide (`parameterCopies`), reading `place`.
+pub fn boundAtBinding(self: *Facts, file: Project.FileId, site: Ast.Node.Index, place: Ast.Node.Index) ResolveError!bool {
+    if (self.copies == null) try self.findCopies();
+    return self.bound_places.contains(.{ .site = .{ .file = file, .node = site }, .place = place });
 }
 
 /// The position of the type parameter whose function `value` calls (`T.init(...)`, through
@@ -874,6 +1039,38 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         };
         if (source == node) continue;
         if (self.derivedParameter(function, source, depth + 1)) |position| return position;
+    }
+    return null;
+}
+
+/// The generic parameter of `function` whose value at run time `node` reads, itself or
+/// through a local: a value of one (`value: T`, `anytype`), or what calling one returns
+/// (`handler()`, `T.init()`). A type parameter's declarations, a `comptime` parameter's parts
+/// and what `@typeInfo` tells of them are known as the program compiles: none.
+fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) ?usize {
+    if (depth == 8) return null;
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const last = t.lastToken(node);
+    for (t.firstToken(node)..last + 1) |raw| {
+        const token: Ast.TokenIndex = @intCast(raw);
+        if (t.tokenTag(token) != .identifier) continue;
+        const index = self.lexical(function.file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
+        const record = model.declarations[@backingInt(index)];
+        if (self.valueOfParameter(function, index)) |position| return position;
+        if (self.genericPosition(function, index)) |position| {
+            // `p(...)`, `p.f(...)`.
+            var next = token + 1;
+            while (next + 1 <= last and t.tokenTag(next) == .period and t.tokenTag(next + 1) == .identifier) next += 2;
+            if (next <= last and t.tokenTag(next) == .l_paren) return position;
+            continue;
+        }
+        if (record.kind != .variable or !self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
+        const v = t.fullVarDecl(record.node) orelse continue;
+        if (v.comptime_token != null) continue;
+        const init = v.ast.init_node.unwrap() orelse continue;
+        if (init == node) continue;
+        if (self.runtimeParameter(function, init, depth + 1)) |position| return position;
     }
     return null;
 }
@@ -1668,6 +1865,13 @@ fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
             if (value == .container) value.container.symbolic = function.ast.params.len != 0;
             return value;
         }
+        return self.instance(result);
+    }
+    // A value of a function type (`comptime read: fn (u8) T`): what the type declares it
+    // returns, whichever function is passed.
+    if (callee == .fn_type) {
+        const result = try self.resultOf(callee.fn_type);
+        if (result == .unknown or (result == .primitive and std.mem.eql(u8, result.primitive, "type"))) return .{ .unknown = .comptime_dependent };
         return self.instance(result);
     }
     return .{ .unknown = .unresolved };
