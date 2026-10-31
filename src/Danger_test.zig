@@ -4407,6 +4407,39 @@ test "A009 judges a slice's bounds in order: each at most the length leaves the 
     try std.testing.expectEqualSlices(u32, &.{ 7, 7, 14, 14, 21, 28, 28 }, result.lines[0..result.findings]);
 }
 
+test "A009 bounds a constant of each type a peer's choice may give by the widest alternative: a digest's length per suite within memory of the longest, not within shorter" {
+    // The peer picks the suite, so the length is its choice among 32 and 48: memory of 48
+    // holds either (line 14's `out`), memory of 40 not the second (line 22's `buf`).
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn Hasher(comptime digest_bits: comptime_int) type {
+        \\    return struct { pub const digest_length = @divCeil(digest_bits, 8); };
+        \\}
+        \\const Tag = enum { short, long };
+        \\fn Type(comptime tag: Tag) type {
+        \\    return switch (tag) { .short => Hasher(256), .long => Hasher(384) };
+        \\}
+        \\pub fn digest(r: *std.Io.Reader, out: *[48]u8) !void {
+        \\    const tag: Tag = if (try r.takeByte() == 0) .short else .long;
+        \\    var buf: [48]u8 = undefined;
+        \\    try r.readSliceAll(&buf);
+        \\    switch (tag) {
+        \\        inline else => |t| @memcpy(out[0..Type(t).digest_length], buf[0..Type(t).digest_length]),
+        \\    }
+        \\}
+        \\pub fn wider(r: *std.Io.Reader, out: *[48]u8) !void {
+        \\    const tag: Tag = if (try r.takeByte() == 0) .short else .long;
+        \\    var buf: [40]u8 = undefined;
+        \\    try r.readSliceAll(&buf);
+        \\    switch (tag) {
+        \\        inline else => |t| @memcpy(out[0..Type(t).digest_length], buf[0..Type(t).digest_length]),
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{22}, result.lines[0..result.findings]);
+}
+
 test "A009 reads what a branch or a loop a peer decides assigns as the peer's: a counter its number steps and a value its flag picks, within memory only where the program shows it" {
     // Lines 7 and 14: counters stepped up to a number checked against 1000, not the memory.
     // Line 29: a value a peer's flag picks indexes a fixed table that holds it (clean) and a

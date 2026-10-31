@@ -509,7 +509,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
             const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
             // A length of memory the program holds: below half the address space.
             if (std.mem.eql(u8, name, "len")) return length(pointer);
-            const decl = (try c.facts.definition(file, node)) orelse return null;
+            const decl = (try c.facts.definition(file, node)) orelse return chosen(c, file, node, pointer, next);
             return constant(c, decl, pointer, next);
         },
         .grouped_expression, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
@@ -718,6 +718,102 @@ fn builtin(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16
 /// What a declaration's value is bounded by: a constant's by its initializer (and its type,
 /// where it spells one); a function's local variable by every value it is given; a
 /// parameter, a field or a capture by its type alone.
+/// A member of a per-build choice of types (`Hash.digest_length`, `Hash` one of a suite's
+/// hashers by an `inline else` prong): the widest of what each alternative's member holds at
+/// most, and nothing where one alternative is no container or lacks it.
+fn chosen(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?Magnitude {
+    const tree = &c.project.at(file).file.tree;
+    const holder, const name = tree.nodeData(node).node_and_token;
+    const value = try c.facts.resolve(file, holder);
+    if (value != .alternatives) return null;
+    const member = try Model.identifier(c.allocator, tree.tokenSlice(name));
+    var out: Magnitude = 0;
+    for (value.alternatives) |one| {
+        if (one != .container) return null;
+        const decl = c.facts.member(one.container, member) orelse return null;
+        const most: ?Magnitude = if (one.container.made_by) |made| (if (try madeConstant(c, decl, made)) |k| k else null) else try constant(c, decl, pointer, depth);
+        out = @max(out, most orelse return null);
+    }
+    return out;
+}
+
+/// A constant of a container a type function made: its initializer read with the function's
+/// parameters bound to the arguments of the call that made it (`digest_bits / 8` in
+/// `Sha2x32(iv256, 256)`).
+fn madeConstant(c: *Context, decl: Facts.Decl, made: *const Facts.Made) Context.Error!?u64 {
+    const tree = &c.project.at(decl.file).file.tree;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return null;
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    return madeValue(c, decl.file, variable.ast.init_node.unwrap() orelse return null, made, 0);
+}
+
+fn madeValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, made: *const Facts.Made, depth: u8) Context.Error!?u64 {
+    if (depth > 4) return null;
+    const tree = &c.project.at(file).file.tree;
+    const at = bare(tree, node);
+    if (literal(tree, at)) |k| return k;
+    switch (tree.nodeTag(at)) {
+        .add, .sub, .mul, .div => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const a = (try madeValue(c, file, lhs, made, depth + 1)) orelse return null;
+            const b = (try madeValue(c, file, rhs, made, depth + 1)) orelse return null;
+            return switch (tree.nodeTag(at)) {
+                .add => std.math.add(u64, a, b) catch null,
+                .sub => std.math.sub(u64, a, b) catch null,
+                .mul => std.math.mul(u64, a, b) catch null,
+                else => if (b == 0) null else a / b,
+            };
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            const lhs, const rhs = tree.nodeData(at).opt_node_and_opt_node;
+            const a = (try madeValue(c, file, lhs.unwrap() orelse return null, made, depth + 1)) orelse return null;
+            const b = (try madeValue(c, file, rhs.unwrap() orelse return null, made, depth + 1)) orelse return null;
+            if (b == 0) return null;
+            if (std.mem.eql(u8, name, "@divFloor") or std.mem.eql(u8, name, "@divTrunc")) return a / b;
+            if (std.mem.eql(u8, name, "@divCeil")) return std.math.divCeil(u64, a, b) catch null;
+            if (std.mem.eql(u8, name, "@divExact")) return if (a % b == 0) a / b else null;
+            return null;
+        },
+        .identifier => {
+            const model = &c.project.at(file).model;
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const record = model.declarations[@backingInt(d)];
+            switch (record.kind) {
+                .parameter => {
+                    const given = (try madeArgument(c, .{ .file = file, .index = d }, made)) orelse return null;
+                    return valueOf(c, made.file, given, depth + 1);
+                },
+                .variable => return madeConstant(c, .{ .file = file, .index = d }, made),
+                else => return null,
+            }
+        },
+        else => return null,
+    }
+}
+
+/// The argument the call that made a container gives the type function's parameter `decl`,
+/// where `decl` is one of that function's parameters.
+fn madeArgument(c: *Context, decl: Facts.Decl, made: *const Facts.Made) Context.Error!?Ast.Node.Index {
+    if (decl.file != made.function.file) return null;
+    const tree = &c.project.at(decl.file).file.tree;
+    const model = &c.project.at(decl.file).model;
+    const token = model.declarations[@backingInt(decl.index)].token;
+    const function = model.declarations[@backingInt(made.function.index)].node;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, function) orelse return null;
+    var it = proto.iterate(tree);
+    var index: usize = 0;
+    const at = while (it.next()) |param| : (index += 1) {
+        if (param.name_token == token) break index;
+    } else return null;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = c.project.at(made.file).file.tree.fullCall(&call_buffer, made.call) orelse return null;
+    return if (at < call.ast.params.len) call.ast.params[at] else null;
+}
+
 fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
