@@ -506,6 +506,8 @@ const Frame = struct {
     claimed: std.AutoHashMapUnmanaged(Var, void) = .empty,
     /// Whether the function returns an integer, or an error union or optional of one.
     returns_int: bool = false,
+    /// Whether the memory the function returns holds elements that take room.
+    result_sized: bool = false,
     /// Each `for` loop's count of passes, read once before them.
     for_counts: std.AutoHashMapUnmanaged(Ast.Node.Index, ?Lin) = .empty,
     verdicts: std.AutoHashMapUnmanaged(Site, bool) = .empty,
@@ -550,6 +552,7 @@ const Frame = struct {
         }
         f.params = params.items;
         if (proto.ast.return_type.unwrap()) |result| {
+            f.result_sized = try f.c.facts.sizedMemory(try f.c.facts.resolve(f.file, result));
             var t = result;
             if (f.tree.nodeTag(t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
             if (f.tree.nodeTag(t) == .optional_type) t = f.tree.nodeData(t).node;
@@ -616,8 +619,8 @@ const Frame = struct {
     }
 
     /// `s` with what holds of every length it or `goal` reads: one object's length is at zero
-    /// or above and below half the address space (a claimed one, `Value.claimed`, only the
-    /// first). A length's range holds everywhere, so no
+    /// or above, and below half the address space where its elements take room (a claimed
+    /// one, `Value.claimed`, only the first). A length's range holds everywhere, so no
     /// state keeps it: it takes no room a state's limit would give another fact, and a length
     /// first read inside a loop holds at the loop's entry as well.
     fn axioms(f: *Frame, space: Space, s: State, goal: ?Lin) Error!State {
@@ -634,6 +637,7 @@ const Frame = struct {
             // A claimed length (`s.len = n`, a many-item pointer's slice) is no object's: any
             // `usize`.
             if (space == .frame and f.claimed.contains(term.v)) continue;
+            if (!try f.sizedLength(space, term.v)) continue;
             if (most <= std.math.maxInt(Coef)) if (try atLeast(f.a, constant(@intCast(most)), x)) |row_most| try rows.append(f.a, row_most);
         };
         return .{ .rows = rows.items };
@@ -642,6 +646,19 @@ const Frame = struct {
     /// Which variables a state is written over: the frame's own, or a summary's slots
     /// (`slot`), which name a parameter or the result and whether it is the length.
     const Space = enum { frame, slots };
+
+    /// Whether a length's memory holds elements that take room (`Facts.sizedMemory`).
+    fn sizedLength(f: *Frame, space: Space, v: Var) Error!bool {
+        const d = switch (space) {
+            .slots => if (v / 2 < f.params.len) f.params[v / 2] orelse return false else return f.result_sized,
+            .frame => switch (f.vars.keys()[v]) {
+                .length => |d| d,
+                .result_length => return f.result_sized,
+                else => return false,
+            },
+        };
+        return f.c.facts.sizedMemory(try f.c.facts.declaration(.{ .file = f.file, .index = d }));
+    }
 
     fn isLength(f: *Frame, space: Space, v: Var) bool {
         return switch (space) {
@@ -1171,12 +1188,12 @@ const Frame = struct {
         return .{ .s = s };
     }
 
-    /// `x.len`: the length of `x`'s memory; any other field: nothing known.
+    /// `x.len` of memory: the length of `x`'s memory; any other field: nothing known.
     fn field(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         const holder, const field_token = f.tree.nodeData(node).node_and_token;
         const e = try f.eval(s, holder);
         // `len` is a slice's or an array's length; a struct's own field of that name is a field.
-        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder)) return f.fresh(e.s, node, 0);
+        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder) or try f.c.facts.memoryField(f.file, node) == .field) return f.fresh(e.s, node, 0);
         const measured = try f.lengthOf(e.s, holder, e.v);
         return .{ .s = measured[0], .v = .{ .lin = measured[1] } };
     }

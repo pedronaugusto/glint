@@ -150,10 +150,18 @@ const std_files = [_]sources.Extra{
     .{ .name = "std/zig.zig", .bytes =
     \\pub const Ast = struct {
     \\    source: []const u8,
-    \\    nodes: []const u32,
-    \\    pub fn parse(gpa: anytype, source: []const u8, mode: anytype) error{OutOfMemory}!Ast { _ = gpa; _ = mode; return .{ .source = source, .nodes = &.{} }; }
-    \\    pub fn nodeData(tree: Ast, node: u32) u32 { return tree.nodes[node]; }
-    \\    pub fn tokenSlice(tree: Ast, token: u32) []const u8 { return tree.source[token..]; }
+    \\    nodes: []const Node.Index,
+    \\    starts: []const u32,
+    \\    pub const TokenIndex = u32;
+    \\    pub const Node = struct { pub const Index = enum(u32) { root = 0, _ }; };
+    \\    pub const Location = struct { line: usize, column: usize };
+    \\    pub fn parse(gpa: anytype, source: []const u8, mode: anytype) error{OutOfMemory}!Ast { _ = gpa; _ = mode; return .{ .source = source, .nodes = &.{}, .starts = &.{} }; }
+    \\    pub fn nodeData(tree: Ast, node: Node.Index) Node.Index { return tree.nodes[@intFromEnum(node)]; }
+    \\    pub fn firstToken(tree: Ast, node: Node.Index) TokenIndex { return @intFromEnum(tree.nodes[@intFromEnum(node)]); }
+    \\    pub fn tokenSlice(tree: Ast, token: TokenIndex) []const u8 { return tree.source[token..]; }
+    \\    pub fn tokenStart(tree: Ast, token: TokenIndex) u32 { return tree.starts[token]; }
+    \\    pub fn tokenLocation(tree: Ast, start: usize, token: TokenIndex) Location { return .{ .line = tree.starts[token] + start, .column = 0 }; }
+    \\    pub fn rootDecls(tree: Ast) []const Node.Index { return tree.nodes; }
     \\};
     },
     .{ .name = "std/crypto/sha2.zig", .bytes =
@@ -7617,7 +7625,7 @@ test "A020 reads a check a function body may return before as no cancellation po
     , 1);
 }
 
-test "A009 reads std's Zig tree as its parse's check where a parser handed to input.Untrusted.parse makes it, and the text it carries as input" {
+test "A009 reads std's Zig tree as its parse's check of the indices into its own tables, and all else it gives as input" {
     const head =
         \\const std = @import("std");
         \\const aegis = @import("aegis");
@@ -7625,19 +7633,31 @@ test "A009 reads std's Zig tree as its parse's check where a parser handed to in
         \\fn parseZig(_: void, source: []const u8) error{OutOfMemory}!Front {
         \\    return .{ .tree = try std.zig.Ast.parse({}, source, .{}) };
         \\}
+        \\const Line = struct { line: usize };
+        \\fn parseLine(_: void, source: []const u8) error{OutOfMemory}!Line {
+        \\    const tree = try std.zig.Ast.parse({}, source, .{});
+        \\    return .{ .line = tree.tokenLocation(0, 3).line };
+        \\}
         \\
     ;
-    try expect(pack.untrusted_input, head ++
-        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
-        \\    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);
-        \\    return table[front.tree.nodes[front.tree.nodeData(3)]];
-        \\}
-    , 0);
-    // A tree std's parser makes outside a parse, and the tree's text: its source and a token's.
+    // A node's or a token's index, by the type std declares it with.
     inline for (.{
-        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const tree = try std.zig.Ast.parse({}, try r.take(16), .{});\n    return table[tree.nodeData(3)];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[@intFromEnum(front.tree.nodes[@intFromEnum(front.tree.nodeData(.root))])];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.firstToken(front.tree.rootDecls()[0])];\n}\n",
+    }) |body| expect(pack.untrusted_input, head ++ body, 0) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // The tree's text (its source, a token's), a token's byte offset, its line, how many
+    // declarations it holds, and a parser's line read off the tree it made.
+    inline for (.{
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const tree = try std.zig.Ast.parse({}, try r.take(16), .{});\n    return table[tree.tokenStart(3)];\n}\n",
         "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.source[0]];\n}\n",
         "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.tokenSlice(0)[0]];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.tokenStart(3)];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.tokenLocation(0, 3).line];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseZig);\n    return table[front.tree.rootDecls().len];\n}\n",
+        "pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {\n    const front = try aegis.input.Untrusted([]const u8).init(try r.take(16)).parse({}, parseLine);\n    return table[front.line];\n}\n",
     }) |body| expect(pack.untrusted_input, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
@@ -8227,4 +8247,96 @@ test "a flow finding names each read once, and names a call it went through only
     );
     defer std.testing.allocator.free(back);
     try std.testing.expect(std.mem.endsWith(u8, back, "(input from consumer:4 `std.process.run`)"));
+}
+
+test "A009 and A010 read a field named len by its declaration: a struct's own field holds what it is given, and one object's count is below half the address space only where its elements take room" {
+    // A header's `len` from input indexes a table, bounds a loop, and is added to; a slice of
+    // values that take no room holds up to maxInt(usize) of them.
+    inline for (.{
+        .{ pack.untrusted_input, "const Header = struct { len: u32 };\nconst table = [4]u8{ 1, 2, 3, 4 };\npub fn f(r: *std.Io.Reader) !u8 {\n    const h: Header = .{ .len = try r.takeInt(u32, 0) };\n    return table[h.len];\n}\n" },
+        .{ pack.untrusted_input, "const Header = struct { len: u32 };\npub fn f(r: *std.Io.Reader, out: *u32) !void {\n    const h: Header = .{ .len = try r.takeInt(u32, 0) };\n    var i: u32 = 0;\n    while (i < h.len) : (i += 1) out.* +%= 1;\n}\n" },
+        .{ pack.integers, "const Header = struct { len: u64 };\npub fn f(r: *std.Io.Reader) !u64 {\n    const h: Header = .{ .len = try r.takeInt(u64, 0) };\n    return h.len + 1;\n}\n" },
+        .{ pack.integers, "pub fn f(r: *std.Io.Reader, units: []const void) !usize {\n    const n: usize = try r.takeInt(u64, 0);\n    if (n > units.len) return error.Bad;\n    return n + 1;\n}\n" },
+        // A length written from input is no object's: any `usize`.
+        .{ pack.integers, "pub fn grown(r: *std.Io.Reader) !usize {\n    var memory: [512]u8 = @splat(0);\n    var s: []u8 = memory[0..];\n    s.len = try r.takeInt(u64, 0);\n    return s.len + 1;\n}\n" },
+    }) |case| expect(case[0], "const std = @import(\"std\");\n" ++ case[1], 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{case[1]});
+        return err;
+    };
+    // A slice of bytes: its length is below half the address space, so one more fits.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, units: []const u8) !usize {
+        \\    const n: usize = try r.takeInt(u64, 0);
+        \\    if (n > units.len) return error.Bad;
+        \\    return n + 1;
+        \\}
+    , 0);
+}
+
+test "A009 reads a slice's length written from input as input: no build checks it against the memory" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\var s: []u8 = &.{};
+        \\pub fn f(r: *std.Io.Reader, out: *u8) !void {
+        \\    const n: usize = try r.takeInt(u32, 0);
+        \\    s.len = n;
+        \\    var i: usize = 0;
+        \\    while (i < s.len) : (i += 1) out.* +%= 1;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{7}, result.lines[0..result.findings]);
+}
+
+test "A009 and A010 read a destructure and a pointer capture as writes of what they bind" {
+    inline for (.{
+        .{ pack.integers, "pub fn f(r: *std.Io.Reader) !u64 {\n    var v: u64 = 5;\n    v, _ = .{ try r.takeInt(u64, 0), 0 };\n    return v * 1000;\n}\n" },
+        .{ pack.integers, "pub fn f(r: *std.Io.Reader) !u64 {\n    var o: ?u64 = 5;\n    const n: u64 = try r.takeInt(u64, 0);\n    if (o) |*p| p.* = n;\n    return o.? * 1000;\n}\n" },
+        .{ pack.untrusted_input, "pub fn f(r: *std.Io.Reader, out: *u8) !void {\n    var n: usize = 5;\n    n, _ = .{ try r.takeInt(u32, 0), 0 };\n    var i: usize = 0;\n    while (i < n) : (i += 1) out.* +%= 1;\n}\n" },
+    }) |case| expect(case[0], "const std = @import(\"std\");\n" ++ case[1], 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{case[1]});
+        return err;
+    };
+    // The same destructure of the program's own values stays clear.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f() u64 {
+        \\    var v: u64 = 5;
+        \\    v, _ = .{ 7, 0 };
+        \\    return v * 1000;
+        \\}
+    , 0);
+}
+
+test "A009 reads what input decides through a jump, a call's or a builtin's write, the right side of and, a deferred write, and a labeled switch's dispatch" {
+    // Each writes the program's own 1000 where the peer's byte decides whether it does.
+    inline for (.{
+        "pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: usize = 0;\n    blk: {\n        if (flag == 1) break :blk;\n        i = 1000;\n    }\n    return buf[i];\n}\n",
+        "fn pick(flag: u8) ?u8 {\n    return if (flag == 1) null else flag;\n}\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: usize = 0;\n    blk: {\n        _ = pick(flag) orelse break :blk;\n        i = 1000;\n    }\n    return buf[i];\n}\n",
+        "pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: usize = 0;\n    _ = flag == 1 and blk: {\n        i = 1000;\n        break :blk true;\n    };\n    return buf[i];\n}\n",
+        "var state: usize = 0;\nfn g(flag: u8) void {\n    if (flag == 1) return;\n    state = 1000;\n}\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    g(try r.takeByte());\n    return buf[state];\n}\n",
+        "fn g(flag: u8, out: *usize) !void {\n    errdefer out.* = 1000;\n    if (flag == 1) return error.Bad;\n}\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    var i: usize = 0;\n    g(try r.takeByte(), &i) catch {};\n    return buf[i];\n}\n",
+        "fn g(flag: u8, out: *usize) void {\n    var v: usize = 0;\n    defer out.* = v;\n    if (flag == 1) return;\n    v = 1000;\n}\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    var i: usize = 0;\n    g(try r.takeByte(), &i);\n    return buf[i];\n}\n",
+        "fn set(p: *usize) void {\n    p.* = 1000;\n}\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: usize = 0;\n    if (flag == 1) set(&i);\n    return buf[i];\n}\n",
+        "pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: [1]usize = .{0};\n    const k: [1]usize = .{1000};\n    if (flag == 1) @memcpy(&i, &k);\n    return buf[i[0]];\n}\n",
+        "pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const flag = try r.takeByte();\n    var i: [1]usize = .{0};\n    if (flag == 1) @memset(&i, 1000);\n    return buf[i[0]];\n}\n",
+        "pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    var i: usize = 0;\n    sw: switch (@as(u8, 0)) {\n        0 => {\n            i += 1;\n            continue :sw try r.takeByte();\n        },\n        else => {},\n    }\n    return buf[i];\n}\n",
+    }) |body| expect(pack.untrusted_input, "const std = @import(\"std\");\n" ++ body, 1) catch |err| {
+        std.debug.print("VARIANT<<{s}>>\n", .{body});
+        return err;
+    };
+    // A local the jump leaves behind is never read again: a write after an early return
+    // decides nothing of what the caller sees.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn g(flag: u8, buf: []const u8) u8 {
+        \\    if (flag == 1) return 0;
+        \\    var i: usize = 0;
+        \\    i = 3;
+        \\    return buf[i];
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    return g(try r.takeByte(), "abcd");
+        \\}
+    , 0);
 }

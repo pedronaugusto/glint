@@ -80,24 +80,41 @@ pub const Dep = struct {
     maybe: u64 = 0,
     length: Level = .clean,
     lengths: u64 = 0,
+    /// A length no build holds to the memory: written in place (`s.len = n`), or one a
+    /// measure already gave (a global's, a parameter's own); its level, and the parameters
+    /// whose value it was written from, as the callers give them.
+    unchecked: Level = .clean,
+    bare: u64 = 0,
 
     pub fn join(a: Dep, b: Dep) Dep {
-        return .{ .level = a.level.join(b.level), .params = a.params | b.params, .numbers = a.numbers | b.numbers, .ranged = a.ranged | b.ranged, .maybe = a.maybe | b.maybe, .length = a.length.join(b.length), .lengths = a.lengths | b.lengths };
+        return .{ .level = a.level.join(b.level), .params = a.params | b.params, .numbers = a.numbers | b.numbers, .ranged = a.ranged | b.ranged, .maybe = a.maybe | b.maybe, .length = a.length.join(b.length), .lengths = a.lengths | b.lengths, .unchecked = a.unchecked.join(b.unchecked), .bare = a.bare | b.bare };
     }
     fn lowered(a: Dep) Dep {
-        return .{ .level = if (a.level == .clean) .clean else .unknown, .maybe = a.params | a.numbers | a.ranged | a.maybe, .length = a.length, .lengths = a.lengths };
+        return .{ .level = if (a.level == .clean) .clean else .unknown, .maybe = a.params | a.numbers | a.ranged | a.maybe, .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
     /// Data made a number: a shift or a product of it, or what std decodes from it.
     fn widened(a: Dep) Dep {
-        return .{ .level = if (a.level == .data) .number else a.level, .params = a.params, .numbers = a.numbers | a.params | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths };
+        return .{ .level = if (a.level == .data) .number else a.level, .params = a.params, .numbers = a.numbers | a.params | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
     /// A value kept to a range the program chose: a number is data there.
     fn narrowed(a: Dep) Dep {
-        return .{ .level = if (a.level == .number) .data else a.level, .ranged = a.params | a.numbers | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths };
+        return .{ .level = if (a.level == .number) .data else a.level, .ranged = a.params | a.numbers | a.ranged, .maybe = a.maybe, .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
-    /// Its length read as a value (`.len`): within the memory, so data at most.
+    /// Its length read as a value (`.len`): within the memory, so data at most, unless no
+    /// build holds it there (`unchecked`). A parameter's own length (a slot past the 32
+    /// values') is what its callers measured; a parameter's value bounding a slice is data.
     fn measured(a: Dep) Dep {
-        return .{ .level = if (a.length == .number) .data else a.length, .ranged = a.lengths };
+        return .{ .level = @as(Level, if (a.length == .number) .data else a.length).join(a.unchecked), .params = a.bare, .ranged = a.lengths };
+    }
+    /// Memory whose length is this value written in place (`s.len = n`), which no build
+    /// checks against the memory: the value's level, and a parameter's as its callers give it
+    /// (a number where it was made one).
+    fn written(a: Dep) Dep {
+        return .{ .unchecked = a.level.join(if (a.numbers != 0) .number else .clean), .bare = a.params, .lengths = a.ranged | a.maybe };
+    }
+    /// Memory whose length a measure gave (`concreteLength`), read back.
+    fn measuredLength(level: Level) Dep {
+        return .{ .unchecked = level };
     }
     /// Memory whose length is this value (a slice's bound): data at most.
     fn sizing(a: Dep) Dep {
@@ -108,10 +125,10 @@ pub const Dep = struct {
         return .{ .level = a.level, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe };
     }
     fn clean(a: Dep) bool {
-        return a.level == .clean and a.params == 0 and a.numbers == 0 and a.ranged == 0 and a.maybe == 0 and a.length == .clean and a.lengths == 0;
+        return a.level == .clean and a.params == 0 and a.numbers == 0 and a.ranged == 0 and a.maybe == 0 and a.length == .clean and a.lengths == 0 and a.unchecked == .clean and a.bare == 0;
     }
     fn eql(a: Dep, b: Dep) bool {
-        return a.level == b.level and a.params == b.params and a.numbers == b.numbers and a.ranged == b.ranged and a.maybe == b.maybe and a.length == b.length and a.lengths == b.lengths;
+        return a.level == b.level and a.params == b.params and a.numbers == b.numbers and a.ranged == b.ranged and a.maybe == b.maybe and a.length == b.length and a.lengths == b.lengths and a.unchecked == b.unchecked and a.bare == b.bare;
     }
 };
 
@@ -170,6 +187,9 @@ pub const Flow = struct {
     /// Per file, each node's nearest enclosing function, by its index in `functions`.
     owners: std.AutoHashMapUnmanaged(Project.FileId, []const ?Function.Id) = .empty,
     by_node: std.AutoHashMapUnmanaged(Facts.Key, Function.Id) = .empty,
+    /// Per file, its jumps (`return`, `try`, `break`, `continue`) in source order: what `leaves`
+    /// reads of a statement.
+    jumps: std.AutoHashMapUnmanaged(Project.FileId, []const Ast.Node.Index) = .empty,
     locals: std.AutoHashMapUnmanaged(Facts.Decl, Dep) = .empty,
     /// Fields and container-level variables, by declaration.
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
@@ -193,8 +213,15 @@ pub const Flow = struct {
     /// std's accessors of a Zig tree's text (`zig_text`) and its parser, resolved once.
     zig_text: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     zig_parse: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
+    /// std's Zig tree's file, and the types of an index into its own tables (`treeValue`).
+    zig_ast: ?Project.FileId = null,
+    zig_index: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     /// What decides how many passes each loop takes, read once per round (`passes`).
     loops: std.AutoHashMapUnmanaged(Facts.Key, Dep) = .empty,
+    /// What decides that each statement jumps past what follows it (`leaves`), read once per
+    /// round, by the statement and the declaration a store's target is (none: one outliving
+    /// the function).
+    leaving: std.AutoHashMapUnmanaged(struct { Facts.Key, ?Ast.TokenIndex }, Dep) = .empty,
     changed: bool = false,
 
     /// Whether a file is the program's (`Program`): what a file of the package the run did not
@@ -249,6 +276,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     while (true) {
         flow.changed = false;
         flow.loops.clearRetainingCapacity();
+        flow.leaving.clearRetainingCapacity();
         for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @fromBackingInt(@intCast(i)));
         try takeHeld(c, flow);
         if (!flow.changed) break;
@@ -298,7 +326,11 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
     }
     for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     for (zig_text) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| try flow.zig_text.put(c.allocator, decl, {});
-    for ((try Governed.declarations(c, "std", "zig.Ast.parse")) orelse &.{}) |decl| try flow.zig_parse.put(c.allocator, decl, {});
+    for ((try Governed.declarations(c, "std", "zig.Ast.parse")) orelse &.{}) |decl| {
+        try flow.zig_parse.put(c.allocator, decl, {});
+        flow.zig_ast = decl.file;
+    }
+    for (zig_index) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| try flow.zig_index.put(c.allocator, decl, {});
     for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
         for ((try Governed.declarations(c, "aegis", path)) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
     }
@@ -393,15 +425,24 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
             },
             .assign, .assign_add, .assign_sub, .assign_div, .assign_mod, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_add_sat, .assign_sub_sat => {
                 const target, const value = tree.nodeData(node).node_and_node;
-                var held = (try dep(c, flow, function, value)).join(try control(c, flow, function, node, target));
+                var given = try dep(c, flow, function, value);
+                const ruled = try control(c, flow, function, node, target);
                 // A sum or a product that feeds its own target accumulates a number past any
                 // range what it adds holds (`n = n * 10 + d`, `total += b`).
                 switch (tree.nodeTag(node)) {
                     .assign => if (accumulates(tree, model, target, value)) {
-                        held = held.widened();
+                        given = given.widened();
                     },
-                    .assign_add, .assign_add_wrap, .assign_add_sat => held = held.widened(),
+                    .assign_add, .assign_add_wrap, .assign_add_sat => given = given.widened(),
                     else => {},
+                }
+                var held = given.join(ruled);
+                // A slice's length written (`s.len = n`): the memory's length is the value. What
+                // decides whether it is written chooses between it and the length it had, which
+                // was within the memory; one taken from (`s.len -= k`, which a safe build checks)
+                // stays within it.
+                if (std.mem.eql(u8, tree.tokenSlice(tree.lastToken(target)), "len") and try c.facts.memoryField(f.file, target) != .field) {
+                    held = if (tree.nodeTag(node) == .assign_sub) ruled.sizing() else given.written().join(ruled.sizing());
                 }
                 try store(c, flow, function, target, held);
             },
@@ -431,7 +472,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
             },
             else => {
                 var buffer: [1]Ast.Node.Index = undefined;
-                if (tree.fullCall(&buffer, node)) |call| try effects(c, flow, function, call);
+                if (tree.fullCall(&buffer, node)) |call| try effects(c, flow, function, node, call);
                 var literal_buffer: [2]Ast.Node.Index = undefined;
                 if (tree.fullStructInit(&literal_buffer, node)) |literal| if (try literalFields(c, f.file, node, literal)) |fields| {
                     // A parser's result holds its numbers as its own value (`dep`): the parse
@@ -446,10 +487,18 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                         try raiseGlobal(c, flow, field, level, concreteLength(flow, function, given));
                     }
                 };
-                if (isMemcpy(tree, node)) {
+                // A copy gives its destination the source's elements, a fill the value; under
+                // its site's control either way.
+                if (filler(tree, node)) |kind| {
                     var args_buffer: [2]Ast.Node.Index = undefined;
                     const args = Facts.builtinArgs(tree, node, &args_buffer);
-                    if (args.len == 2) try store(c, flow, function, args[0], try whole(c, flow, function, args[1]));
+                    if (args.len == 2) {
+                        const value = switch (kind) {
+                            .copy => try whole(c, flow, function, args[1]),
+                            .fill => try dep(c, flow, function, args[1]),
+                        };
+                        try store(c, flow, function, args[0], value.join(try control(c, flow, function, node, args[0])));
+                    }
                 }
             },
         }
@@ -463,11 +512,17 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
     }
 }
 
-fn isMemcpy(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@memcpy") or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@memmove"),
-        else => false,
-    };
+/// Which builtin writes memory it is given: `@memcpy` and `@memmove` copy, `@memset` fills.
+fn filler(tree: *const Ast, node: Ast.Node.Index) ?enum { copy, fill } {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memmove")) return .copy;
+            if (std.mem.eql(u8, name, "@memset")) return .fill;
+            return null;
+        },
+        else => return null,
+    }
 }
 
 /// What a capture binds: an `if`'s or `while`'s payload its condition, a `switch` prong's the
@@ -486,7 +541,7 @@ fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declara
         const choice = tree.fullSwitch(parent) orelse return .{};
         var out = try dep(c, flow, function, choice.ast.condition);
         for (try prongFields(c, f.file, choice.ast.condition, node)) |field| {
-            out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .length = flow.lengths.get(field) orelse .clean });
+            out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
         }
         return out;
     }
@@ -764,7 +819,7 @@ fn capturedFrom(c: *Context, file: Project.FileId, decl: Model.Declaration) Cont
 
 /// A call's effects beyond its result: what it gives the program's own callee's parameters,
 /// what a read fills, what a local receiver takes from what it is given.
-fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!void {
+fn effects(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, call: Ast.full.Call) Context.Error!void {
     const f = flow.functions.items[@backingInt(function)];
     const callee = try resolveCall(c, flow, f.file, call);
     switch (callee.kind) {
@@ -783,7 +838,10 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call)
                         flow.changed = true;
                     }
                 }
-                if (!g.writes[index].clean()) try store(c, flow, function, arg, try summarized(c, flow, function, callee, g.writes[index]));
+                // What it writes through the argument, under the call's control: a write of the
+                // program's own value made where input decides is input's.
+                const ruled = try control(c, flow, function, node, arg);
+                if (!g.writes[index].clean()) try store(c, flow, function, arg, (try summarized(c, flow, function, callee, g.writes[index])).join(ruled)) else if (!ruled.clean() and try pointing(c, f.file, arg)) try store(c, flow, function, arg, ruled);
             }
         },
         .source => {
@@ -798,9 +856,11 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call)
             const decl = callee.decl orelse return;
             var given: Dep = .{};
             for (callee.args.items) |arg| given = given.join(try whole(c, flow, function, arg));
-            if (given.clean()) return;
             const writes = mutableParams(c, decl);
-            for (callee.args.items, 0..) |arg, position| if (writes & bit(position) != 0) try store(c, flow, function, arg, given);
+            for (callee.args.items, 0..) |arg, position| if (writes & bit(position) != 0) {
+                const value = given.join(try control(c, flow, function, node, arg));
+                if (!value.clean()) try store(c, flow, function, arg, value);
+            };
         },
         .aegis => try parsed(c, flow, f.file, call, callee.decl.?),
         // A call that does not resolve may write anything into the memory it is given.
@@ -1132,11 +1192,6 @@ fn accumulates(tree: *const Ast, model: *const Model, target: Ast.Node.Index, va
     return false;
 }
 
-/// Whether a node is a slice's or an array's `.len`.
-fn isLen(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "len");
-}
-
 /// What an expression holds, read in `function`.
 fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
@@ -1153,7 +1208,7 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             var out = memory.held().join((try dep(c, flow, function, slice.ast.start)).sizing());
             if (slice.ast.end.unwrap()) |end| {
                 out = out.join((try dep(c, flow, function, end)).sizing());
-            } else out = out.join(.{ .length = memory.length, .lengths = memory.lengths });
+            } else out = out.join(.{ .length = memory.length, .lengths = memory.lengths, .unchecked = memory.unchecked, .bare = memory.bare });
             return out;
         },
         .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
@@ -1163,7 +1218,7 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
         .sub, .sub_sat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const out = (try dep(c, flow, function, lhs)).join(try dep(c, flow, function, rhs));
-            return if (isLen(tree, lhs)) out.narrowed() else out;
+            return if (try c.facts.memoryField(f.file, lhs) != .field) out.narrowed() else out;
         },
         .bit_and, .mod => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -1223,11 +1278,12 @@ fn declaredDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
     const model = &c.project.at(f.file).model;
     const ref = model.reference(node) orelse return .{};
     const d = ref.declaration orelse return .{};
-    if (f.position(d)) |index| return .{ .params = bit(index), .lengths = bit(lengthSlot(index)) };
+    // A parameter's own length is what its callers measured (`concreteLength`).
+    if (f.position(d)) |index| return .{ .params = bit(index), .bare = bit(lengthSlot(index)) };
     const decl = model.declarations[@backingInt(d)];
     if (decl.kind == .variable or decl.kind == .capture) {
         const scope = model.scopes[@backingInt(decl.scope)].kind;
-        if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .length = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
+        if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .unchecked = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
         return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
     }
     return .{};
@@ -1240,15 +1296,19 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     const receiver, const name = tree.nodeData(node).node_and_token;
     // An address is no number a peer chooses; a length is one within the memory the program
     // holds: data, which a sink judges against what it reaches.
-    if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
-    if (std.mem.eql(u8, tree.tokenSlice(name), "len")) {
+    if (try c.facts.memoryField(f.file, node) != .field) {
+        if (std.mem.eql(u8, tree.tokenSlice(name), "ptr")) return .{};
         const memory = try dep(c, flow, function, receiver);
         return memory.held().narrowed().join(memory.measured());
     }
     var out = try dep(c, flow, function, receiver);
     if (try c.facts.definition(f.file, node)) |decl| {
+        if (decl.file == flow.zig_ast) if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) {
+            const field = c.project.at(decl.file).file.tree.fullContainerField(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
+            return treeDep(c, flow, decl.file, field.ast.type_expr.unwrap());
+        };
         if (flow.globals.get(decl)) |level| out = out.join(.{ .level = level });
-        if (flow.lengths.get(decl)) |length| out = out.join(.{ .length = length });
+        if (flow.lengths.get(decl)) |length| out = out.join(Dep.measuredLength(length));
         if (flow.zig_text.contains(decl)) out = out.join(.{ .level = .data });
         // A function or a type named through a value is no part of its data.
         const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
@@ -1299,7 +1359,7 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     if (std.mem.eql(u8, name, "@field") and args.len == 2) {
         var out = try dep(c, flow, function, args[0]);
         for (try namedFields(c, flow.functions.items[@backingInt(function)].file, node)) |field| {
-            out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .length = flow.lengths.get(field) orelse .clean });
+            out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
         }
         return out;
     }
@@ -1501,7 +1561,7 @@ fn labeled(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
 /// length's, each as the summary holds it, as a value or as a length. Past 32 parameters the
 /// two slots are one, which holds both.
 fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, summary: Dep) Context.Error!Dep {
-    var out: Dep = .{ .level = summary.level, .length = summary.length };
+    var out: Dep = .{ .level = summary.level, .length = summary.length, .unchecked = summary.unchecked };
     for (callee.args.items, 0..) |arg, position| {
         const index = position + callee.skip;
         const given = try dep(c, flow, function, arg);
@@ -1513,6 +1573,7 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
             if (summary.ranged & there != 0) out = out.join(held_there.narrowed());
             if (summary.maybe & there != 0) out = out.join(held_there.lowered());
             if (summary.lengths & there != 0) out = out.join(held_there.sizing());
+            if (summary.bare & there != 0) out = out.join(held_there.written());
         }
     }
     return out;
@@ -1569,7 +1630,8 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             if (callee.decl) |decl| {
                 // std's Zig parser, called by a parser the program hands to input.Untrusted.parse,
                 // is that parse's check: each node, token and extra index of the tree it gives
-                // indexes the tree's own tables. The text the tree carries stays input.
+                // indexes the tree's own tables. What else is read of the tree (`treeValue`)
+                // stays input.
                 if (f.parser and flow.zig_parse.contains(decl)) return .{};
                 if (flow.zig_text.contains(decl)) return .{ .level = .data };
             }
@@ -1578,6 +1640,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             for (callee.args.items) |arg| out = out.join(try outsideArg(c, flow, function, arg));
             const decl = callee.decl orelse return out;
             if (!flow.program.std_files.contains(@backingInt(decl.file))) return out;
+            if (decl.file == flow.zig_ast) return treeDep(c, flow, decl.file, returnType(c, decl));
             // A std function that answers a `usize` (a container's `count`, a position it finds
             // in data) answers a count of memory the program holds: a peer's within it.
             if (returnsCount(c, decl)) return out.narrowed();
@@ -1602,6 +1665,14 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
 
 /// Whether a function's result is a count or a position: its declared result is `usize`, or
 /// an optional or error union of one.
+/// The type a function's declaration says it returns.
+fn returnType(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
+    return proto.ast.return_type.unwrap();
+}
+
 fn returnsCount(c: *Context, decl: Facts.Decl) bool {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -1751,9 +1822,57 @@ fn systemAnswer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
     return false;
 }
 
-/// What std's Zig tree and its lowering give of the file's text: a peer's bytes, wherever the
-/// tree's structure is the parse's.
-const zig_text = [_][]const u8{ "zig.Ast.source", "zig.Ast.tokenSlice", "zig.Ast.getNodeSource", "zig.Zir.string_bytes", "zig.Zir.nullTerminatedString" };
+/// The types of an index into std's Zig tree's own tables: a token's, a node's, an extra datum's.
+const zig_index = [_][]const u8{ "zig.Ast.TokenIndex", "zig.Ast.OptionalTokenIndex", "zig.Ast.ExtraIndex", "zig.Ast.Node.Index", "zig.Ast.Node.OptionalIndex" };
+
+/// What std's Zig lowering gives of the file's text: a peer's bytes, wherever its structure
+/// is the lowering's.
+const zig_text = [_][]const u8{ "zig.Zir.string_bytes", "zig.Zir.nullTerminatedString" };
+
+/// What a value std's Zig tree gives holds, by the type std declares it with: `index`, an
+/// index into the tree's own tables (or an optional, slice or pointer of them), which std's
+/// parse makes only within them; `container`, a struct or union the tree declares (a node's
+/// `Data`, a `full` view), each field of it read by its own type; `data`, anything else (the
+/// text, a byte offset, a line, a count, a tag), the peer's within the memory the tree holds.
+const TreeValue = enum { index, container, data };
+
+fn treeValue(c: *Context, flow: *const Flow, file: Project.FileId, type_node: Ast.Node.Index) Context.Error!TreeValue {
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(type_node)) {
+        .optional_type => return treeValue(c, flow, file, tree.nodeData(type_node).node),
+        .error_union => return treeValue(c, flow, file, tree.nodeData(type_node).node_and_node[1]),
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return treeValue(c, flow, file, tree.fullPtrType(type_node).?.ast.child_type),
+        .identifier, .field_access => {
+            const decl = (try c.facts.definition(file, type_node)) orelse return .data;
+            if (flow.zig_index.contains(decl)) return .index;
+            if (decl.file != flow.zig_ast) return .data;
+            const model = &c.project.at(decl.file).model;
+            const declaring = &c.project.at(decl.file).file.tree;
+            const variable = declaring.fullVarDecl(model.declarations[@backingInt(decl.index)].node) orelse return .data;
+            const init = variable.ast.init_node.unwrap() orelse return .data;
+            return treeValue(c, flow, decl.file, init);
+        },
+        else => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const container = tree.fullContainerDecl(&buffer, type_node) orelse return .data;
+            return switch (tree.tokenTag(container.ast.main_token)) {
+                .keyword_struct, .keyword_union => .container,
+                else => .data,
+            };
+        },
+    }
+}
+
+/// What a value of std's Zig tree of type `type_node` holds: an index or a container of them
+/// is the parse's, its length (of a slice) the peer's; anything else is the peer's, within
+/// the source the tree holds, whatever it was given.
+fn treeDep(c: *Context, flow: *const Flow, file: Project.FileId, type_node: ?Ast.Node.Index) Context.Error!Dep {
+    const t = type_node orelse return .{ .level = .data, .length = .data };
+    return switch (try treeValue(c, flow, file, t)) {
+        .index, .container => .{ .length = .data },
+        .data => .{ .level = .data, .length = .data },
+    };
+}
 
 /// Whether `decl` is std's declaration at one of `paths`.
 /// Whether a function outside the program is one of std's.
@@ -2297,7 +2416,7 @@ fn takeHeld(c: *Context, flow: *Flow) Context.Error!void {
         const f = flow.functions.items[@backingInt(each.function)];
         const value: Dep = switch (each.holder) {
             .local => |d| flow.locals.get(.{ .file = f.file, .index = d }) orelse continue,
-            .global => |decl| .{ .level = flow.globals.get(decl) orelse .clean, .length = flow.lengths.get(decl) orelse .clean },
+            .global => |decl| .{ .level = flow.globals.get(decl) orelse .clean, .unchecked = flow.lengths.get(decl) orelse .clean },
             .param, .unknown => .{ .level = .unknown },
         };
         // What a store through the holder writes is what the owner holds, not its length.
@@ -2317,7 +2436,7 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
         if (try Range.intOf(c, file, node, 64) != null) return out;
         return out.join(.{ .level = .unknown });
     };
-    for (fields) |field| out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .length = flow.lengths.get(field) orelse .clean });
+    for (fields) |field| out = out.join(.{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
     return out;
 }
 
@@ -2404,6 +2523,22 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
         if (bound) |token| if (token >= tree.firstToken(parent) and token <= tree.lastToken(parent)) break;
         switch (tree.nodeTag(parent)) {
             .fn_decl => break,
+            // A statement before it that may jump past it (`leaves`) decides whether it runs.
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.blockStatements(&buffer, parent) orelse &.{}) |statement| {
+                    if (statement == at) break;
+                    out = out.join(try leaves(c, flow, function, statement, bound));
+                }
+            },
+            // A deferred write runs on whichever exit is taken: what decides each exit after it
+            // decides what it reads.
+            .@"defer", .@"errdefer" => out = out.join(try exitsAfter(c, flow, function, parent)),
+            // The right side of `and` and `or` runs as the left decides.
+            .bool_and, .bool_or => {
+                const lhs, const rhs = tree.nodeData(parent).node_and_node;
+                if (at == rhs) out = out.join((try dep(c, flow, function, lhs)).held().narrowed());
+            },
             .@"if", .if_simple => {
                 const branch = tree.fullIf(parent).?; // unreachable: the tag is an if's
                 if (at != branch.ast.cond_expr) out = out.join((try dep(c, flow, function, branch.ast.cond_expr)).held().narrowed());
@@ -2411,6 +2546,8 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
             .@"switch", .switch_comma => {
                 const choice = tree.fullSwitch(parent).?; // unreachable: the tag is a switch's
                 if (at != choice.ast.condition) out = out.join((try dep(c, flow, function, choice.ast.condition)).held().narrowed());
+                // A labeled switch is a loop: `continue :label value` dispatches again.
+                if (choice.label_token != null) out = out.join(try passes(c, flow, function, parent));
             },
             .@"catch", .@"orelse" => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
@@ -2435,6 +2572,7 @@ fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index)
     const tree = &c.project.at(f.file).file.tree;
     var out: Dep = .{};
     if (tree.fullWhile(loop)) |w| out = out.join(try operands(c, flow, function, w.ast.cond_expr));
+    if (tree.fullSwitch(loop)) |choice| out = out.join((try dep(c, flow, function, choice.ast.condition)).held());
     if (tree.fullFor(loop)) |l| for (l.ast.inputs) |input| {
         if (tree.nodeTag(input) == .for_range) {
             const start, const end = tree.nodeData(input).node_and_opt_node;
@@ -2455,11 +2593,113 @@ fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index)
             .@"while", .while_simple, .while_cont => out = out.join(try operands(c, flow, function, tree.fullWhile(node).?.ast.cond_expr)),
             .@"switch", .switch_comma => out = out.join((try dep(c, flow, function, tree.fullSwitch(node).?.ast.condition)).held()),
             .@"catch", .@"orelse" => out = out.join((try dep(c, flow, function, tree.nodeData(node).node_and_node[0])).held().narrowed()),
+            // `continue :label value` of a labeled switch: the value it dispatches on next.
+            .@"continue" => if (tree.nodeData(node).opt_token_and_opt_node[1].unwrap()) |value| {
+                out = out.join((try dep(c, flow, function, value)).held());
+            },
             else => {},
         }
     }
     try flow.loops.put(c.allocator, key, out);
     return out;
+}
+
+/// What decides whether `statement` jumps past what follows it, for a store to what `bound`
+/// declares (none: what outlives the function): each jump in it that leaves it and is seen
+/// there (a `return` or a `try`'s error, where the store outlives the function; a `break` or
+/// `continue` to a block or loop around it that does not hold the declaration), what decides
+/// that the jump is taken (`controlUpTo` within the statement), and whether a `try`'s operand
+/// is an error. Read once per round.
+fn leaves(c: *Context, flow: *Flow, function: Function.Id, statement: Ast.Node.Index, bound: ?Ast.TokenIndex) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const key = .{ Facts.Key{ .file = f.file, .node = statement }, bound };
+    if (flow.leaving.get(key)) |known_dep| return known_dep;
+    // A statement read while it is being read gives what is known so far; the rounds settle it.
+    try flow.leaving.put(c.allocator, key, .{});
+    const tree = &c.project.at(f.file).file.tree;
+    const model = &c.project.at(f.file).model;
+    const first = tree.firstToken(statement);
+    const last = tree.lastToken(statement);
+    const owners = flow.owners.get(f.file).?; // unreachable: the function's file is read
+    const jumps = try jumpsOf(c, flow, f.file);
+    var out: Dep = .{};
+    // The first jump at or after the statement's first token.
+    var low: usize = 0;
+    var high: usize = jumps.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (tree.nodeMainToken(jumps[middle]) < first) low = middle + 1 else high = middle;
+    }
+    for (jumps[low..]) |node| {
+        if (tree.nodeMainToken(node) > last) break;
+        if (owners[@backingInt(node)] != function) continue;
+        const seen = switch (tree.nodeTag(node)) {
+            .@"return", .@"try" => bound == null,
+            .@"break", .@"continue" => if (jumpTarget(tree, model, node)) |target| tree.firstToken(target) < first and (bound == null or bound.? < tree.firstToken(target)) else true,
+            else => false,
+        };
+        if (!seen) continue;
+        if (tree.nodeTag(node) == .@"try") out = out.join((try dep(c, flow, function, tree.nodeData(node).node)).held().narrowed());
+        out = out.join(try controlUpTo(c, flow, function, node, first - 1));
+    }
+    try flow.leaving.put(c.allocator, key, out);
+    return out;
+}
+
+/// A file's jumps in source order, found once.
+fn jumpsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error![]const Ast.Node.Index {
+    if (flow.jumps.get(file)) |found_before| return found_before;
+    const tree = &c.project.at(file).file.tree;
+    var found: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .@"return", .@"try", .@"break", .@"continue" => try found.append(c.allocator, @fromBackingInt(@intCast(i))),
+        else => {},
+    };
+    std.mem.sort(Ast.Node.Index, found.items, tree, struct {
+        fn before(t: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+            return t.nodeMainToken(a) < t.nodeMainToken(b);
+        }
+    }.before);
+    try flow.jumps.put(c.allocator, file, found.items);
+    return found.items;
+}
+
+/// What decides each exit after a deferred write (`defer`, `errdefer`): every jump of the
+/// statements after it, in each block around it.
+fn exitsAfter(c: *Context, flow: *Flow, function: Function.Id, deferred: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const model = &c.project.at(f.file).model;
+    var out: Dep = .{};
+    var at = deferred;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) break;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, parent) orelse continue;
+        var after = false;
+        for (statements) |statement| {
+            if (after) out = out.join(try leaves(c, flow, function, statement, null));
+            if (statement == at) after = true;
+        }
+    }
+    return out;
+}
+
+/// The block, loop or labeled switch a `break` or `continue` goes to: the one its label names,
+/// or the innermost loop.
+fn jumpTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
+    const label = tree.nodeData(jump).opt_token_and_opt_node[0].unwrap();
+    var at = jump;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        const named: ?Ast.TokenIndex = if (tree.fullWhile(parent)) |loop| loop.label_token else if (tree.fullFor(parent)) |loop| loop.label_token else if (tree.fullSwitch(parent)) |choice| choice.label_token else switch (tree.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => if (tree.tokenTag(tree.nodeMainToken(parent) -| 1) == .colon) tree.nodeMainToken(parent) - 2 else null,
+            else => null,
+        };
+        if (label) |wanted| {
+            if (named) |name| if (std.mem.eql(u8, tree.tokenSlice(name), tree.tokenSlice(wanted))) return parent;
+        } else if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return parent;
+    }
+    return null;
 }
 
 /// A condition's operands as they are: a counter compared with a bound runs as far as the bound.
