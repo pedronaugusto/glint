@@ -5173,6 +5173,85 @@ test "A020 reads what decides how long a while runs by meaning: a variable by ea
     , 0);
 }
 
+test "A020 reads a labeled switch that continues itself as a loop, each prong that goes on as a pass, and a function given an Io by its receiver's field" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) void {
+        \\    _ = io;
+        \\    var n: u64 = 0;
+        \\    state: switch (@as(u8, 0)) {
+        \\        0 => {
+        \\            n +%= 1;
+        \\            continue :state 1;
+        \\        },
+        \\        else => continue :state 0,
+        \\    }
+        \\}
+        \\pub fn half(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    state: switch (@as(u8, 0)) {
+        \\        0 => {
+        \\            try io.checkCancel();
+        \\            continue :state 1;
+        \\        },
+        \\        1 => {
+        \\            n +%= 1;
+        \\            continue :state 0;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\const Worker = struct {
+        \\    io: std.Io,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) void {
+        \\        while (true) self.count +%= 1;
+        \\    }
+        \\};
+        \\pub fn start(w: *Worker) void {
+        \\    w.run();
+        \\}
+    , 3);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn spin(io: std.Io) !void {
+        \\    var n: u64 = 0;
+        \\    state: switch (@as(u8, 0)) {
+        \\        0 => {
+        \\            try io.checkCancel();
+        \\            n +%= 1;
+        \\            continue :state 1;
+        \\        },
+        \\        1 => {
+        \\            try io.checkCancel();
+        \\            continue :state 0;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\pub fn once(io: std.Io, x: u8) u8 {
+        \\    _ = io;
+        \\    return blk: switch (x) {
+        \\        0 => break :blk 1,
+        \\        else => break :blk 2,
+        \\    };
+        \\}
+        \\const Worker = struct {
+        \\    io: std.Io,
+        \\    count: u64 = 0,
+        \\    pub fn run(self: *Worker) !void {
+        \\        while (true) {
+        \\            try self.io.checkCancel();
+        \\            self.count +%= 1;
+        \\        }
+        \\    }
+        \\};
+        \\pub fn start(w: *Worker) !void {
+        \\    try w.run();
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");

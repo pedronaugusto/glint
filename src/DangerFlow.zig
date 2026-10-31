@@ -253,9 +253,10 @@ fn errorName(tree: *const Ast, node: Ast.Node.Index) bool {
     return false;
 }
 
-/// A020: a function given an `Io` whose loop runs unbounded (`while (true)`) or as long as input
-/// says, and whose body gives that `Io` to nothing: no `checkCancel`, no cancelable call, no
-/// read through a reader (whose refill is one), so the task cannot be canceled while it runs.
+/// A020: a function given an `Io`, by a parameter or a field of one (`self.io`), whose loop runs
+/// unbounded (`while (true)`, a labeled switch that continues itself) or as long as input says,
+/// and whose body gives that `Io` to nothing: no `checkCancel`, no cancelable call, no read
+/// through a reader (whose refill is one), so the task cannot be canceled while it runs.
 pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
     const io = (try Governed.declarations(c, "std", "Io")) orelse return;
     var container: ?Facts.Container = null;
@@ -267,16 +268,31 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, .input);
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
+    // Each function once, by the first parameter that holds its `Io`.
+    var given: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
     for (model.declarations) |decl| {
         if (decl.kind != .parameter or c.inTest(decl.token)) continue;
-        const value = try c.facts.resolve(c.file, decl.node);
-        const held = switch (value) {
-            .instance, .container => |k| k,
-            else => continue,
-        };
-        if (held.file != io_type.file or held.scope != io_type.scope) continue;
+        const through = (try heldIo(c, try c.facts.resolve(c.file, decl.node), io_type)) orelse continue;
+        if ((try given.getOrPut(c.allocator, functionOf(c, decl.node) orelse continue)).found_existing) continue;
+        const holder = if (through.len == 0) decl.name else try c.allocator.print("{s}.{s}", .{ decl.name, through });
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (tree.fullSwitch(node)) |choice| {
+                if (choice.label_token == null or !within(c, node, decl.node) or !site(c, node)) continue;
+                // A labeled switch that continues itself is a loop with no bound, each prong that
+                // goes on with it a pass: its point must come before every way on, read as a
+                // function's body is (no periodic form; a callee leaves before its point by no error).
+                var goes_on = false;
+                const every = for (choice.ast.cases) |case_node| {
+                    const prong = tree.fullSwitchCase(case_node).?.ast.target_expr; // unreachable: a switch's cases are cases
+                    if (!continuesTo(c, prong, node)) continue;
+                    goes_on = true;
+                    if (!try cancels(c, c.file, prong, 1, false)) break false;
+                } else true;
+                if (!goes_on or every) continue;
+                try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a labeled switch that continues itself with no cancellation point on a prong that goes on: nothing it calls returns error.Canceled to it, so its task runs until the switch ends; call {s}.checkCancel() or a cancelable operation in each such prong and pass the error on", .{holder}));
+                continue;
+            }
             // A `while` by what decides its condition (`decides`), or as `while (true)` where
             // nothing in it can change that (`invariant`); a `for` by each range's end.
             var bounds: std.ArrayList(Ast.Node.Index) = .empty;
@@ -310,9 +326,44 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a loop bounded by a value that passed through a call that does not resolve, which may be input, with no cancellation point");
                 continue;
             }
-            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
+            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", holder }));
         }
     }
+}
+
+/// Where a parameter holds an `Io`: itself, or through a pointer (`""`), or as a field of the
+/// struct it is or points to (`self.io`, the field's name), one level down. Null where it holds
+/// none.
+fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container) Context.Error!?[]const u8 {
+    const held = switch (if (value == .pointer) value.pointer.* else value) {
+        .instance, .container => |k| k,
+        else => return null,
+    };
+    if (held.file == io_type.file and held.scope == io_type.scope) return "";
+    const model = &c.project.at(held.file).model;
+    for (model.declarations, 0..) |field, i| {
+        if (field.kind != .field or field.scope != held.scope) continue;
+        const typed = try c.facts.declaration(.{ .file = held.file, .index = @fromBackingInt(@intCast(i)) });
+        switch (if (typed == .pointer) typed.pointer.* else typed) {
+            .instance, .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) return field.name,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Whether a `continue` in `prong` goes to the labeled switch `choice`.
+fn continuesTo(c: *Context, prong: Ast.Node.Index, choice: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"continue") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < tree.firstToken(prong) or token > tree.lastToken(prong)) continue;
+        if (jumpTarget(tree, model, node) == choice) return true;
+    }
+    return false;
 }
 
 /// Whether a body reaches a cancellation point on every pass: a call that can return
