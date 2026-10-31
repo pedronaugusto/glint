@@ -3817,9 +3817,27 @@ test "A009 bounds a loop by a number the program checked against the memory it h
         \\    while (i <= n) : (i += 1) total +%= buf[i];
         \\    return total;
         \\}
+        \\pub fn down(r: *std.Io.Reader) !void {
+        \\    var i: usize = try r.takeInt(u32, .little);
+        \\    while (i > 0) : (i -= 1) {}
+        \\}
+        \\pub fn rounds(r: *std.Io.Reader) !void {
+        \\    const m: usize = try r.takeInt(u32, .little);
+        \\    var n: usize = 0;
+        \\    while (n < 10_000) : (n += 1) {
+        \\        if (m == n) break;
+        \\    }
+        \\}
+        \\pub fn stride(r: *std.Io.Reader) !void {
+        \\    const step: usize = try r.takeInt(u32, .little);
+        \\    var i: usize = 0;
+        \\    while (i < 1000) : (i += step) {}
+        \\}
     );
+    // A counter is judged by what it enters with and steps by: one a peer's number starts
+    // (line 19) or strides (line 31), never one a peer's number only stops early (line 24).
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 14, 14 }, result.lines[0..result.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 14, 14, 19, 31 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {

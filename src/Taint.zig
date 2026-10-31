@@ -1610,6 +1610,76 @@ pub fn levelAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.In
     return concrete(flow, function, try dep(c, flow, function, node));
 }
 
+/// The level of a counter `loop` steps, as it decides how many passes the loop takes: what it
+/// holds on entry (each assignment outside the loop, under its own conditions) and what each
+/// pass steps it by. Whether a pass steps it is the loop's to decide, which its bound answers.
+/// Null where `operand` names no local the loop assigns.
+pub fn counterLevel(c: *Context, flow: *Flow, file: Project.FileId, loop: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!?Level {
+    const function = owner(flow, file, operand) orelse return null;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (tree.nodeTag(operand) != .identifier) return null;
+    const d = (model.reference(operand) orelse return null).declaration orelse return null;
+    const decl = model.declarations[@backingInt(d)];
+    if (decl.kind != .variable) return null;
+    switch (model.scopes[@backingInt(decl.scope)].kind) {
+        .file, .container => return null,
+        else => {},
+    }
+    const first = tree.firstToken(loop);
+    const last = tree.lastToken(loop);
+    var out: Dep = .{};
+    var stepped = false;
+    if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| {
+        out = out.join(try dep(c, flow, function, init)).join(try control(c, flow, function, decl.node, null));
+    };
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const target, const value = tree.nodeData(node).node_and_node;
+        if (tree.nodeTag(target) != .identifier) continue;
+        const ref = model.reference(target) orelse continue;
+        if (ref.declaration != d) continue;
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) {
+            out = out.join(try dep(c, flow, function, value)).join(try control(c, flow, function, node, target));
+            continue;
+        }
+        stepped = true;
+        out = out.join(try dep(c, flow, function, stepOf(tree, model, d, tag, value)));
+    }
+    if (!stepped) return null;
+    return concrete(flow, function, out);
+}
+
+/// What an assignment in a loop steps a counter by: a compound assignment's operand, the other
+/// side of a sum or a difference with the counter itself (`i = i + 2`), or else all it assigns.
+fn stepOf(tree: *const Ast, model: *const Model, counter: Model.Declaration.Id, tag: Ast.Node.Tag, value: Ast.Node.Index) Ast.Node.Index {
+    if (tag != .assign) return value;
+    switch (tree.nodeTag(value)) {
+        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            if (namesDeclaration(tree, model, lhs, counter)) return rhs;
+            const sum = switch (tree.nodeTag(value)) {
+                .add, .add_wrap, .add_sat => true,
+                else => false,
+            };
+            if (sum and namesDeclaration(tree, model, rhs, counter)) return lhs;
+        },
+        else => {},
+    }
+    return value;
+}
+
+fn namesDeclaration(tree: *const Ast, model: *const Model, node: Ast.Node.Index, d: Model.Declaration.Id) bool {
+    if (tree.nodeTag(node) != .identifier) return false;
+    const ref = model.reference(node) orelse return false;
+    return ref.declaration == d;
+}
+
 /// The program's call or the function outside it that a call reaches, for a sink reading its
 /// arguments by the callee's parameters.
 pub const Reached = struct { decl: ?Facts.Decl, args: []const Ast.Node.Index, skip: usize, std: bool, method: bool };

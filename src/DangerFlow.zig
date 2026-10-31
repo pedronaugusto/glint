@@ -61,7 +61,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const parent = c.project.at(c.file).model.parentOf(node) orelse continue;
                 const loop = tree.fullFor(parent) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                try judged(c, flow, rule, end, try passesBy(c, flow, end), .number, loop_message);
+                try judged(c, flow, rule, end, try loopOperand(c, flow, parent, end), .number, loop_message);
             },
             // Each comparison of the condition, joined by `and`, `or` and `!` as it may be.
             .@"while", .while_simple, .while_cont => {
@@ -72,14 +72,8 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 for (compared.items) |condition| {
                     if (clears(c, condition, loop.ast.then_expr)) continue;
                     const lhs, const rhs = tree.nodeData(condition).node_and_node;
-                    const left = try passesBy(c, flow, lhs);
-                    const right = try passesBy(c, flow, rhs);
-                    // A counter the loop steps toward a peer's bound is the peer's by that bound
-                    // alone: the bound is the finding.
-                    const skip_left = right.reaches(.number) and assignedIn(c, node, lhs);
-                    const skip_right = !skip_left and left.reaches(.number) and assignedIn(c, node, rhs);
-                    if (!skip_left) try judged(c, flow, rule, lhs, left, .number, loop_message);
-                    if (!skip_right) try judged(c, flow, rule, rhs, right, .number, loop_message);
+                    try judged(c, flow, rule, lhs, try loopOperand(c, flow, node, lhs), .number, loop_message);
+                    try judged(c, flow, rule, rhs, try loopOperand(c, flow, node, rhs), .number, loop_message);
                 }
             },
             // A table trusts its own ids to name its entries (Range.ownId): one made from an
@@ -299,7 +293,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             var by_input = false;
             if (!unbounded and comparison(tree.nodeTag(cond))) {
                 const lhs, const rhs = tree.nodeData(cond).node_and_node;
-                by_input = (try passesBy(c, flow, lhs)).join(try passesBy(c, flow, rhs)).reaches(.number);
+                by_input = (try loopOperand(c, flow, node, lhs)).join(try loopOperand(c, flow, node, rhs)).reaches(.number);
             }
             if (!unbounded and !by_input) continue;
             if (try cancels(c, c.file, loop.ast.then_expr, 0)) continue;
@@ -732,10 +726,11 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
     return level;
 }
 
-/// A loop bound's level: data where it counts no more passes than a short or the memory the
+/// A loop bound's level: a counter the loop steps by what it enters with and steps by
+/// (Taint.counterLevel); data where it counts no more passes than a short or the memory the
 /// function holds (Range.counts).
-fn passesBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
-    const level = try Taint.levelAt(c, flow, c.file, node);
+fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+    const level = (try Taint.counterLevel(c, flow, c.file, loop, node)) orelse try Taint.levelAt(c, flow, c.file, node);
     if (level == .number and try Range.counts(c, c.file, node)) return .data;
     return level;
 }
@@ -871,30 +866,6 @@ fn clears(c: *Context, condition: Ast.Node.Index, body: Ast.Node.Index) bool {
         if (tree.nodeTag(operand) != .sub) continue;
         const minuend, const one = tree.nodeData(operand).node_and_node;
         if (std.mem.eql(u8, tree.getNodeSource(minuend), name) and std.mem.eql(u8, tree.getNodeSource(one), "1")) return true;
-    }
-    return false;
-}
-
-/// Whether `operand` names a local the loop `loop` assigns: a counter it steps.
-fn assignedIn(c: *Context, loop: Ast.Node.Index, operand: Ast.Node.Index) bool {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    if (tree.nodeTag(operand) != .identifier) return false;
-    const d = (model.reference(operand) orelse return false).declaration orelse return false;
-    const first = tree.firstToken(loop);
-    const last = tree.lastToken(loop);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(inner);
-        if (token < first or token > last) continue;
-        switch (tag) {
-            .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {},
-            else => continue,
-        }
-        const target = tree.nodeData(inner).node_and_node[0];
-        if (tree.nodeTag(target) != .identifier) continue;
-        const reference = model.reference(target) orelse continue;
-        if (reference.declaration == d) return true;
     }
     return false;
 }
