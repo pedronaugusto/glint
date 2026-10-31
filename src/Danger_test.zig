@@ -1275,6 +1275,55 @@ test "A019 reads a parent handed to a dependency's generic: its body is the prog
     try std.testing.expect(unread.undecided > baseline.undecided);
 }
 
+test "A019 reads a call through an interface's function field as the read it is, called on that interface, not as a method handing the interface on" {
+    // Clean: the interface dispatching through its own vtable, given itself. A finding: the
+    // function read and called on another interface (5), which its conversion (13) then trusts.
+    const observer =
+        \\const Observer = struct {
+        \\    vtable: *const VTable,
+        \\    pub const VTable = struct { see: *const fn (*Observer, u32) void };
+        \\    pub fn see(o: *Observer, n: u32) void {
+        \\        o.vtable.see(o, n);
+        \\    }
+        \\};
+        \\const Counter = struct {
+        \\    total: u32 = 0,
+        \\    observer: Observer = .{ .vtable = &vtable },
+        \\    const vtable: Observer.VTable = .{ .see = see };
+        \\    fn see(o: *Observer, n: u32) void {
+        \\        const self: *Counter = @alignCast(@fieldParentPtr("observer", o));
+        \\        self.total += n;
+        \\    }
+        \\};
+        \\pub fn run() u32 {
+        \\    var c: Counter = .{};
+        \\    c.observer.see(3);
+        \\    return c.total;
+        \\}
+        \\
+    ;
+    // Alone, as a program with nothing else loaded reads every store of the function field.
+    try std.testing.expectEqual(@as(usize, 0), (try runAlone(pack.unsafe_set, observer)).findings);
+    const other = comptime edited(observer, "    pub fn see(o: *Observer, n: u32) void {\n        o.vtable.see(o, n);", "    pub fn see(o: *Observer, n: u32, to: *Observer) void {\n        o.vtable.see(to, n);");
+    const found = try runAlone(pack.unsafe_set, other);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 13, 13 }, found.lines[0..found.findings]);
+}
+
+/// `program`'s findings of `rule` at report level, the only file the project loads.
+fn runAlone(rule: glint.Rule, program: []const u8) !Run {
+    const inputs = [_]glint.Project.Input{.{ .name = "alone.zig", .bytes = program }};
+    var project = try glint.Project.init(std.testing.allocator, &inputs, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var result: Run = .{ .findings = 0, .undecided = 0 };
+    for (report.diagnostics) |d| if (d.rule == rule) {
+        if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
+        result.findings += 1;
+    };
+    return result;
+}
+
 test "A019 holds an interface to its contract where it is used: a pub accessor returning it clears, and a copy, a function read out or a value passed is flagged where it is made" {
     const tail = "    return s.count + s.interface.end;\n}\n";
     // Clean: an accessor returning the interface's address, and its user writing through it.

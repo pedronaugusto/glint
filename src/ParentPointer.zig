@@ -1466,11 +1466,17 @@ fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Cont
         const call = tree.fullCall(&buffer, parent) orelse return true;
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return true;
         index = position;
+        // Through a function field (`o.vtable.see(o, n)`, `h.f.?(h)`): no receiver is passed,
+        // and the read is judged where it is, by `readInPlace`, whatever the field may hold.
+        const callee = strip(tree, call.ast.fn_expr);
+        const read = if (tree.nodeTag(callee) == .unwrap_optional) strip(tree, tree.nodeData(callee).node_and_token[0]) else callee;
+        if (tree.nodeTag(read) == .field_access) if (try c.facts.definition(c.file, read)) |member| {
+            if (c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field) return true;
+        };
         if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
             .instance, .pointer, .optional => index += 1,
             else => {},
         };
-        // Through a function field: read where it is, by `readInPlace`.
         decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
             .function => |function| (try c.facts.origin(function)) orelse function,
             else => return true,
