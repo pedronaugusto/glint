@@ -4569,6 +4569,30 @@ test "Bounds clears an index or a slice the relations along every path keep with
     try std.testing.expectEqualSlices(u32, &.{ 14, 18, 34, 47 }, result.lines[0..result.findings]);
 }
 
+test "A010 reads one object's length as at most maxInt(isize): two lengths and 1 fit a usize; two lengths and 2, or three lengths, may not" {
+    const result = try run(pack.integers,
+        \\const std = @import("std");
+        \\pub fn two(r: *std.Io.Reader, gpa: std.mem.Allocator) !usize {
+        \\    const a = try r.allocRemaining(gpa, .unlimited);
+        \\    const b = try r.allocRemaining(gpa, .unlimited);
+        \\    return a.len + b.len + 1;
+        \\}
+        \\pub fn past(r: *std.Io.Reader, gpa: std.mem.Allocator) !usize {
+        \\    const a = try r.allocRemaining(gpa, .unlimited);
+        \\    const b = try r.allocRemaining(gpa, .unlimited);
+        \\    return a.len + b.len + 2;
+        \\}
+        \\pub fn three(r: *std.Io.Reader, gpa: std.mem.Allocator) !usize {
+        \\    const a = try r.allocRemaining(gpa, .unlimited);
+        \\    const b = try r.allocRemaining(gpa, .unlimited);
+        \\    const c = try r.allocRemaining(gpa, .unlimited);
+        \\    return a.len + b.len + c.len;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 16 }, result.lines[0..result.findings]);
+}
+
 test "Bounds clears arithmetic and a conversion the relations along every path keep within its type: a difference past its check, a switch prong's range" {
     // Line 5: a sum of a decoded u32 and 2 overflows a 32-bit usize. Each twin's check leaves
     // the operation open: a difference one short (line 12), a prong from zero (line 24), a
