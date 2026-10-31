@@ -115,7 +115,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -840,7 +840,8 @@ test "A019 reads the program's function that only hands a buffer to std's keeps 
     // Kept (no finding): writerOver returns `.fixed(buf)` by its result type (line 11), hold
     // sets a field's `.fixed(buf)` (12), passOn hands it to writerOver (13), and a `for` sets
     // each element from another input (15). Findings: peeks reads it first (14), and a `for`
-    // that may leave a pass before setting it (16, the read).
+    // that may leave a pass before setting it (16, the read). The contract: each writer handed by
+    // value to the generic `use`, whose body is not read for it (11, 13, 14).
     const found = try run(pack.unsafe_set,
         \\const std = @import("std");
         \\const Holder = struct { w: std.Io.Writer };
@@ -859,7 +860,7 @@ test "A019 reads the program's function that only hands a buffer to std's keeps 
         \\pub fn f1(src: [4]u8) u8 { var dst: [4]u8 = undefined; for (src, &dst) |v, *d| d.* = v; return dst[0]; }
         \\pub fn f2(src: [4]u8) u8 { var dst: [4]u8 = undefined; for (src, &dst) |v, *d| { if (v == 0) continue; d.* = v; } return dst[0]; }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 14, 16 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 13, 14, 14, 16 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads std's hashers as filling their output by declaration, and keeps as neither a fill nor a read: a buffer kept is still undefined to a direct read" {
@@ -867,7 +868,8 @@ test "A019 reads std's hashers as filling their output by declaration, and keeps
     // Sha256's final (11), and a read through what bufPrint returns (16). Findings: a fixed
     // writer's buffer read directly (12), a wrapper that keeps the buffer and also reads it (13),
     // a same-named `fixed` that is not std's (14), a read past what bufPrint printed (15), and a
-    // program hasher's same-named `final` (17).
+    // program hasher's same-named `final` (17). The contract: each writer handed by value to the
+    // generic `use` (12, 13).
     const found = try run(pack.unsafe_set,
         \\const std = @import("std");
         \\const W = struct { n: usize = 0 };
@@ -887,12 +889,13 @@ test "A019 reads std's hashers as filling their output by declaration, and keeps
         \\pub fn p5(n: u8) !u8 { var buf: [8]u8 = undefined; const s = try std.fmt.bufPrint(&buf, "{d}", .{n}); return s[0]; }
         \\pub fn p6() u8 { var out: [32]u8 = undefined; var d = Sha.init(); d.final(&out); return out[0]; }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 12, 13, 14, 15, 17 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 12, 13, 13, 14, 15, 17 }, found.lines[0..found.findings]);
 }
 
 test "A019 keeps nothing it read past its depth: a keeper first reached at the end of a long chain is still one where it is called directly" {
     // k0 hands the buffer through nine of the program's keepers, past how deep they are read
-    // (line 13: handed on); a call of the last of them reads it as a keeper (14).
+    // (line 13: handed on); a call of the last of them reads it as a keeper (14). The contract:
+    // each writer handed by value to the generic `use` (13, 14).
     const found = try run(pack.unsafe_set,
         \\const std = @import("std");
         \\fn k8(buf: []u8) std.Io.Writer { return .fixed(buf); }
@@ -909,7 +912,7 @@ test "A019 keeps nothing it read past its depth: a keeper first reached at the e
         \\pub fn deep() void { var b: [8]u8 = undefined; use(k0(&b)); }
         \\pub fn direct() void { var b: [8]u8 = undefined; use(k8(&b)); }
     );
-    try std.testing.expectEqualSlices(u32, &.{13}, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 13, 13, 14 }, found.lines[0..found.findings]);
 }
 
 test "A019 takes what a break or continue holds to where it goes, and a write on some paths through an expression writes nothing" {
@@ -1088,7 +1091,7 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, interface_program)).findings);
     // A copy of the field carries the function to a pointer that is no Sink's field.
     const copied = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    const w = s.interface;\n    return s.count + w.end;");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, copied.lines[0..copied.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 19 }, copied.lines[0..copied.findings]);
     // A vtable others can name, installed into another field, or a field of another type.
     const public = try runEdited(pack.unsafe_set, interface_program, "    const vtable:", "    pub const vtable:");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, public.lines[0..public.findings]);
@@ -1102,20 +1105,21 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
 }
 
 test "A019 follows each pointer to an interface field to every place it goes: a copy of what it points at, a place of another type, or its functions read out leave the conversion a finding" {
-    // Findings (11, the conversion and its alignment).
+    // Findings (11, the conversion and its alignment), and where the contract holds the
+    // interface (19 or 20): the copy, the address handed to what may copy it.
     const use = "    return s.count + s.interface.end;";
     const deref = try runEdited(pack.unsafe_set, interface_program, use, "    const copy = (&s.interface).*;\n    return s.count + copy.end;");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, deref.lines[0..deref.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 19 }, deref.lines[0..deref.findings]);
     const local = try runEdited(pack.unsafe_set, interface_program, use, "    const p = &s.interface;\n    const copy = p.*;\n    return s.count + copy.end;");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, local.lines[0..local.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 20 }, local.lines[0..local.findings]);
     const helper = try runEdited(pack.unsafe_set, interface_program, "pub fn use() !usize {", "fn dup(w: *std.Io.Writer) std.Io.Writer { return w.*; }\npub fn use() !usize {\n    var t: Sink = .init();\n    _ = dup(&t.interface);");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, helper.lines[0..helper.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 16 }, helper.lines[0..helper.findings]);
     const bytes = try runEdited(pack.unsafe_set, interface_program, use, "    _ = std.mem.asBytes(&s.interface);\n    return s.count + s.interface.end;");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, bytes.lines[0..bytes.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 19 }, bytes.lines[0..bytes.findings]);
     const array = try runEdited(pack.unsafe_set, interface_program, use, "    const many: *[1]std.Io.Writer = &s.interface;\n    return s.count + many[0].end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, array.lines[0..array.findings]);
     const table = try runEdited(pack.unsafe_set, interface_program, use, "    s.other.vtable = s.interface.vtable;\n    return s.count + s.interface.end;");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, table.lines[0..table.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 19 }, table.lines[0..table.findings]);
     const named = try runEdited(pack.unsafe_set, interface_program, use, "    const vt: std.Io.Writer.VTable = .{ .drain = @field(Sink, \"drain\") };\n    _ = vt;\n    return s.count + s.interface.end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, named.lines[0..named.findings]);
     const held = try runEdited(pack.unsafe_set, interface_program, use, "    const vt = &@field(Sink, \"vtable\");\n    _ = vt;\n    return s.count + s.interface.end;");
@@ -1170,6 +1174,72 @@ test "A019 follows a parent handed to a generic outside the program into its bod
     try std.testing.expect(unread.undecided > baseline.undecided);
 }
 
+test "A019 holds an interface to its contract where it is used: a pub accessor returning it clears, and a copy, a function read out or a value passed is flagged where it is made" {
+    const tail = "    return s.count + s.interface.end;\n}\n";
+    // Clean: an accessor returning the interface's address, and its user writing through it.
+    const accessor = comptime edited(interface_program, tail, "    return s.count + s.interface.end;\n}\npub fn writer(s: *Sink) *std.Io.Writer {\n    return &s.interface;\n}\npub fn put(s: *Sink) !void {\n    try writer(s).writeAll(\"y\");\n}\n");
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, accessor)).findings);
+    // Findings where they are made: a copy of what the accessor points at (26); the vtable read
+    // out into another writer (26, and the conversion: 11); the interface passed by value (26),
+    // where the parameter's own copy of it is no further site.
+    const copied = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    const copy = w.*;\n    _ = copy;\n"));
+    try std.testing.expectEqualSlices(u32, &.{26}, copied.lines[0..copied.findings]);
+    const table = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    var other: std.Io.Writer = .{ .vtable = w.vtable };\n    _ = &other;\n"));
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 26 }, table.lines[0..table.findings]);
+    const passed = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    keep(w.*);\n}\nfn keep(w: std.Io.Writer) void {\n    const again = w;\n    _ = again;\n"));
+    try std.testing.expectEqualSlices(u32, &.{26}, passed.lines[0..passed.findings]);
+    // A function taking its address in a file this run does not check is followed, not taken
+    // as checked there: one copying what it is given is the finding at the handing (25).
+    const unchecked: sources.Extra = .{ .name = "other.zig", .bytes = "const std = @import(\"std\");\npub fn keep(w: *std.Io.Writer) void { const copy = w.*; _ = copy; }\npub fn put(w: *std.Io.Writer) !void { try w.writeAll(\"z\"); }" };
+    const extra = &(std_files ++ [_]sources.Extra{unchecked});
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "other.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
+    const given = comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n}\n", "    other.keep(writer(s));\n}\nconst other = @import(\"other.zig\");\n");
+    const kept = try runWith(pack.unsafe_set, given, extra, imports);
+    try std.testing.expectEqualSlices(u32, &.{25}, kept.lines[0..kept.findings]);
+    const writes = try runWith(pack.unsafe_set, comptime edited(given, "other.keep(", "try other.put("), extra, imports);
+    try std.testing.expectEqual(@as(usize, 0), writes.findings);
+}
+
+const made_program =
+    \\const std = @import("std");
+    \\const Sink = struct {
+    \\    count: usize = 0,
+    \\    interface: std.Io.Writer,
+    \\    next: *std.Io.Writer,
+    \\    fn init(start: usize, next: *std.Io.Writer) Sink { return .{ .count = start, .interface = .{ .vtable = &.{ .drain = drain } }, .next = next }; }
+    \\    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) anyerror!usize {
+    \\        const s: *Sink = @alignCast(@fieldParentPtr("interface", w));
+    \\        s.count += data.len + splat;
+    \\        return 0;
+    \\    }
+    \\};
+    \\pub fn onStack(next: *std.Io.Writer) !usize {
+    \\    var s: Sink = .init(1, next);
+    \\    try s.interface.writeAll("x");
+    \\    return s.count;
+    \\}
+    \\pub fn allocated(gpa: std.mem.Allocator, next: *std.Io.Writer) !usize {
+    \\    const s = try gpa.create(Sink);
+    \\    defer gpa.destroy(s);
+    \\    s.* = .init(2, next);
+    \\    try s.interface.writeAll("y");
+    \\    return s.count;
+    \\}
+    \\
+;
+
+test "A019 clears a parent pointer whose parent is made in place by a declaration literal, on the stack or in memory std's allocator gives and frees, and not one a function of the program reads as bytes" {
+    // Clean: `.init(...)` read by its result location as Sink.init, which keeps the interface
+    // pointer it is given in place, and std's `mem.Allocator` freeing the parent whole, by its
+    // contract.
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, made_program)).findings);
+    // Findings (8, the conversion and its alignment): the parent handed to the program's own
+    // function that casts it to bytes (13, its casts, are sites of their own).
+    const released = comptime edited(made_program, "pub fn onStack(", "fn release(ptr: anytype) void { const raw: [*]u8 = @ptrCast(@constCast(ptr)); _ = raw; }\npub fn onStack(");
+    const bytes = try runEdited(pack.unsafe_set, released, "    defer gpa.destroy(s);", "    defer release(s);");
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 13, 13 }, bytes.lines[0..bytes.findings]);
+}
+
 const observer_program =
     \\const Observer = struct {
     \\    vtable: *const VTable,
@@ -1196,7 +1266,7 @@ const observer_program =
 test "A019 clears a parent pointer the program's own interface field shows, installed by the field's default, until a copy of the field" {
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, observer_program)).findings);
     const copied = try runEdited(pack.unsafe_set, observer_program, "    c.observer.see(3);", "    c.total = 1;\n    var copy = c.observer;\n    copy.see(3);");
-    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, copied.lines[0..copied.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 18 }, copied.lines[0..copied.findings]);
 }
 
 const helper_program =
@@ -1225,7 +1295,7 @@ test "A019 clears a parent pointer a helper converts for the installed functions
     // pointer, `of` public, a helper called on a value, a choice whose value goes elsewhere.
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, helper_program)).findings);
     const other = try runEdited(pack.unsafe_set, helper_program, "fn issue(h: *Host) u32 { return of(h).n; }", "fn issue(h: *Host) u32 { var copy = h.*; copy.issue_fn = issue; return of(&copy).n; }");
-    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, other.lines[0..other.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 11 }, other.lines[0..other.findings]);
     const public = try runEdited(pack.unsafe_set, helper_program, "        fn of(h: *Host) *W {", "        pub fn of(h: *Host) *W {");
     try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, public.lines[0..public.findings]);
     const stray = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 {", "pub fn stray(h: *Host) *W { return W.Hooks.twice(h); }\npub fn use(w: *W) u32 {");
@@ -1234,7 +1304,7 @@ test "A019 clears a parent pointer a helper converts for the installed functions
     try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, chosen.lines[0..chosen.findings]);
     // The function read out of C.F and called on another interface converts that one.
     const elsewhere = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { return w.host.issue_fn(other); }");
-    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, elsewhere.lines[0..elsewhere.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 16 }, elsewhere.lines[0..elsewhere.findings]);
     const direct =
         \\const Host = struct { issue_fn: *const fn (*Host) u32 };
         \\const W = struct {
@@ -1250,9 +1320,9 @@ test "A019 clears a parent pointer a helper converts for the installed functions
     ;
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, direct)).findings);
     const read_out = try runEdited(pack.unsafe_set, direct, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { const f = w.host.issue_fn; return f(other); }");
-    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, read_out.lines[0..read_out.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 10 }, read_out.lines[0..read_out.findings]);
     const kept = try runEdited(pack.unsafe_set, helper_program, "pub fn use(w: *W) u32 { return w.host.issue_fn(&w.host); }", "pub fn use(w: *W, other: *Host) u32 { const f = w.host.issue_fn; return f(other); }");
-    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, kept.lines[0..kept.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 16 }, kept.lines[0..kept.findings]);
 }
 
 const file_program =
@@ -1334,9 +1404,9 @@ test "A019 clears a parent pointer whose interface is any parameter of the insta
     // function read out of its optional and called on another.
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, lookup_program)).findings);
     const other = try runEdited(pack.unsafe_set, lookup_program, "pub fn use(s: *Static) u32 {", "pub fn use(s: *Static, x: *Lookup) u32 {\n    _ = s.resolving.lookup_fn.?(2, x);");
-    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, other.lines[0..other.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 11 }, other.lines[0..other.findings]);
     const read_out = try runEdited(pack.unsafe_set, lookup_program, "pub fn use(s: *Static) u32 {", "pub fn use(s: *Static, x: *Lookup) u32 {\n    const f = s.resolving.lookup_fn.?;\n    _ = f(2, x);");
-    try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, read_out.lines[0..read_out.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 6, 11 }, read_out.lines[0..read_out.findings]);
 }
 
 const list_program =

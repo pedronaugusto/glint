@@ -556,6 +556,13 @@ fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError
 }
 const Standard = struct { reached: ?Files = null };
 
+/// Whether `file` is one of std's: a file std's module reaches.
+pub fn standard(self: *Facts, file: Project.FileId) ResolveError!bool {
+    const known = try self.memo(Standard);
+    if (known.reached == null) known.reached = try self.standardFiles();
+    return known.reached.?.contains(file);
+}
+
 /// Whether a scan of "every use in the program" reads `file`: a file selected, or any file a
 /// path import (`@import("other.zig")`) joins to one, either way: a use in a file of the package
 /// left out of the selection is still a use. A module imported by name (std, a dependency) is
@@ -1086,7 +1093,16 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             };
         },
         .error_set_decl, .merge_error_sets => return .error_set,
-        .enum_literal => return .{ .unknown = .comptime_dependent },
+        .enum_literal => {
+            // `.init(...)`: a declaration literal called names its result location's function.
+            const parent = self.project.at(file).model.parentOf(node) orelse return .{ .unknown = .comptime_dependent };
+            var buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, parent) orelse return .{ .unknown = .comptime_dependent };
+            if (call.ast.fn_expr != node) return .{ .unknown = .comptime_dependent };
+            const container = (try self.resultContainer(file, parent)) orelse return .{ .unknown = .comptime_dependent };
+            const found = self.member(container, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)))) orelse return .{ .unknown = .unsupported };
+            return self.declaration(found);
+        },
         .number_literal, .string_literal, .char_literal => return .scalar,
         else => {},
     }

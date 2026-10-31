@@ -78,6 +78,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         for (options.files) |setting| if (setting.file == runner.file) {
             runner.config = setting.config;
         };
+        // Each file's analysis has its own budget: work a scan of the program did for an
+        // earlier file is kept, and charged to that file.
+        runner.facts.remaining = runner.config.fact_budget;
         try runner.config.validate();
         try validateRules(runner.config, definitions);
         const file = &source.file;
@@ -144,10 +147,10 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.stale.append(a, .{ .name = (rules.definition(rule, definitions) orelse return error.InvalidSelection).name, .span = span });
         }
         runner.covered.clearRetainingCapacity();
-    }
-    if (runner.facts.remaining == 0) {
-        runner.complete = false;
-        try runner.coverage.append(a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
+        if (runner.facts.remaining == 0) {
+            runner.complete = false;
+            try runner.coverage.append(a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
+        }
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);

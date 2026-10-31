@@ -107,6 +107,34 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     try std.testing.expect(!exhausted.complete);
 }
 
+test "each file's analysis has its own fact budget" {
+    // A019 follows the pointer a parent is recovered from: facts each file's analysis spends.
+    const source = "const W = struct { x: u32 };\nconst H = struct { n: u32, w: W };\nfn of(w: *W) *H {\n    return @fieldParentPtr(\"w\", w);\n}\npub fn run(h: *H) u32 {\n    return of(&h.w).n;\n}\n";
+    const pack = glint.AegisPack;
+    const selected: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.unsafe_set, .level = .report }} };
+    var one = try glint.Project.init(std.testing.allocator, &.{.{ .name = "one", .bytes = source }}, &.{}, .{});
+    defer one.deinit();
+    // The least budget one file completes in.
+    var config = selected;
+    config.fact_budget = 1;
+    while (config.fact_budget < 100_000) : (config.fact_budget += 1) {
+        var report = try glint.runConfigured(std.testing.allocator, &one, config, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        if (report.complete) break;
+    }
+    try std.testing.expect(config.fact_budget > 1);
+    // In a program of three such files, the first file's analysis pays for the scans of the
+    // program it makes, which the later files' analyses reuse. A budget the run shared would
+    // leave nothing for them; each has its own and completes in it.
+    var three = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "one", .bytes = source }, .{ .name = "two", .bytes = source }, .{ .name = "three", .bytes = source } }, &.{}, .{});
+    defer three.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &three, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    for (report.coverage) |item| if (item.reason == .budget_exhausted) {
+        try std.testing.expectEqual(three.sources[0].id, item.file);
+    };
+}
+
 test "compatibility suppression rejects multiple distinct binding sites" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
     defer project.deinit();
