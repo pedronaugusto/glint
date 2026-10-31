@@ -38,6 +38,10 @@ const std_files = [_]sources.Extra{
     \\pub const Cancelable = error{Canceled};
     \\pub fn checkCancel(io: @This()) error{Canceled}!void { _ = io; }
     \\pub fn recancel(io: @This()) void { _ = io; }
+    \\pub fn futexWait(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) error{Canceled}!void { _ = io; _ = ptr; _ = expected; }
+    \\pub fn futexWaitTimeout(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T, timeout: u64) error{Canceled}!void { _ = io; _ = ptr; _ = expected; _ = timeout; }
+    \\pub fn futexWaitUncancelable(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, expected: T) void { _ = io; _ = ptr; _ = expected; }
+    \\pub fn futexWake(io: @This(), comptime T: type, ptr: *align(@alignOf(u32)) const T, max_waiters: u32) void { _ = io; _ = ptr; _ = max_waiters; }
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Handle = @import("root").Handle;
@@ -5380,6 +5384,48 @@ test "A007 reads only aegis's guards as holding a container var's state, and a s
         \\const aegis = @import("aegis");
         \\var cell: aegis.Atomic(u32) = .init(0);
     , 0);
+}
+
+test "A007 finds std's synchronization a dependency names under its own name, held by the program, and a futex on a raw word" {
+    const dependency =
+        \\const std = @import("std");
+        \\pub const Lock = std.Io.Mutex;
+        \\pub fn Cell(comptime T: type) type {
+        \\    return std.atomic.Value(T);
+        \\}
+        \\pub const Plain = struct { n: u32 };
+        \\pub const Elsewhere = @import("missing.zig").Lock;
+    ;
+    // A field, an array of optionals, a cell a function makes, the program's alias (its one
+    // site), a type argument and a `return`'s value; a futex wake on a plain word.
+    const found = try runWithDependency(pack.shared_state,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\const Shared = struct { lock: dep.Lock = .init, many: [2]?dep.Lock, hits: dep.Cell(u32) };
+        \\const Lock = dep.Lock;
+        \\const Again = struct { lock: Lock };
+        \\pub fn make(a: anytype) !*dep.Lock { return a.create(dep.Lock); }
+        \\pub fn Made() type { return dep.Lock; }
+        \\pub fn open(io: std.Io, word: *u32) void { io.futexWake(u32, word, 1); }
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 7), found.findings);
+    // Borrowed, a type the dependency makes that holds no lock, test code.
+    const clean = try runWithDependency(pack.shared_state,
+        \\const dep = @import("dep");
+        \\const Borrow = struct { lock: *dep.Lock, cell: ?*const dep.Cell(u32), plain: dep.Plain };
+        \\pub fn f(l: *dep.Lock) *dep.Lock { return l; }
+        \\test { var lock: dep.Lock = .init; lock.lock(); }
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 0), clean.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 0), clean.findings);
+    // A type the dependency names that does not resolve may be one: undecided, never clean.
+    const unknown = try runWithDependency(pack.shared_state,
+        \\const dep = @import("dep");
+        \\const Held = struct { lock: [2]dep.Elsewhere };
+    , dependency);
+    try std.testing.expectEqual(@as(usize, 1), unknown.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }
 
 test "A013 reads std's assert called through any alias the program declares, public too, and leaves one taken as a value undecided" {
