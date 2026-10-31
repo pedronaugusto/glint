@@ -8228,3 +8228,49 @@ test "a flow finding names each read once, and names a call it went through only
     defer std.testing.allocator.free(back);
     try std.testing.expect(std.mem.endsWith(u8, back, "(input from consumer:4 `std.process.run`)"));
 }
+
+test "A009 reads a field of a struct the function holds as it stores it: a cursor stepped past its check stays within it, unless another pointer or a call may store to it" {
+    // A position checked two short of the end and stepped once indexes within (6). Another
+    // pointer that may be the same cursor steps it again (12), and a call given the cursor
+    // may store anything in it (18), as may a store of the whole struct (24) and one to a
+    // field of a value of any type (30): each stays a finding.
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Cursor = struct { buf: []const u8, at: usize };
+        \\fn stepped(c: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    c.at += 1;
+        \\    return c.buf[c.at];
+        \\}
+        \\fn moved(c: *Cursor, d: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    c.at += 1;
+        \\    d.at += 1;
+        \\    return c.buf[c.at];
+        \\}
+        \\fn called(c: *Cursor, r: *std.Io.Reader) !u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    c.at += 1;
+        \\    try skip(c, r);
+        \\    return c.buf[c.at];
+        \\}
+        \\fn whole(c: *Cursor, d: Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    c.at += 1;
+        \\    c.* = d;
+        \\    return c.buf[c.at];
+        \\}
+        \\fn generic(c: *Cursor, p: anytype) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    c.at += 1;
+        \\    p.at = 9;
+        \\    return c.buf[c.at];
+        \\}
+        \\fn skip(c: *Cursor, r: *std.Io.Reader) !void { c.at = try r.takeInt(u32, 0); }
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    var c: Cursor = .{ .buf = buf, .at = try r.takeInt(u32, 0) };
+        \\    return stepped(&c) +% moved(&c, &c) +% try called(&c, r) +% whole(&c, c) +% generic(&c, &c);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 12, 18, 24, 30 }, found.lines[0..found.findings]);
+}

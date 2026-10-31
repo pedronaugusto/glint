@@ -1054,27 +1054,54 @@ fn add(c: *Context, memo: *Stores, name: []const u8, site: Stores.Site) Context.
 /// a reinterpretation (`@bitCast`, a reader's `takeStruct`) sets with no store to read.
 const Stored = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
+/// Whether every write of a field is a store the program's own files show (`Stores.sites`): a
+/// field of a plain struct of the program's (std and aegis set theirs), no value of which is
+/// viewed as bytes, reinterpreted or handed where its writes are not read (`Stores.exposed`),
+/// nor named as a call's argument, which may fill it by reflection.
+pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    if (!try Program.owns(c, decl.file)) return false;
+    const model = &c.project.at(decl.file).model;
+    const tree = &c.project.at(decl.file).file.tree;
+    const record = model.declarations[@backingInt(decl.index)];
+    _ = tree.fullContainerField(record.node) orelse return false;
+    const container_node = model.scopes[@backingInt(record.scope)].node;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const holder = tree.fullContainerDecl(&buffer, container_node) orelse return false;
+    if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
+    const found = try stores(c);
+    const type_name = containerName(c, decl.file, container_node) orelse return false;
+    if (found.arguments.contains(type_name)) return false;
+    return !found.exposed.contains(.{ decl.file, record.scope });
+}
+
+/// Whether a field changes only by stores through its name (`x.field = v`, `x.field += v`): its
+/// writes are all shown (`storesShown`) and its address is never taken, so no pointer reaches it.
+pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    if (!try storesShown(c, decl)) return false;
+    const found = try stores(c);
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const sites = found.sites.get(record.name) orelse return true;
+    for (sites.items) |site| {
+        const site_tree = &c.project.at(site.file).file.tree;
+        if (site.kind != .changes or site_tree.nodeTag(site.node) != .address_of) continue;
+        const reached = (try c.facts.definition(site.file, site_tree.nodeData(site.node).node)) orelse return false;
+        if (std.meta.eql(reached, decl)) return false;
+    }
+    return true;
+}
+
 fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const memo = try c.facts.memo(Stored);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
     // A field given a value that reads itself is unknown while it is being read.
     try memo.map.put(c.allocator, key, null);
-    // The program's files are read for stores; a field std or aegis declares, it sets.
-    if (!try Program.owns(c, decl.file)) return null;
+    if (!try storesShown(c, decl)) return null;
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
-    const field_decl = tree.fullContainerField(record.node) orelse return null;
-    const container_node = model.scopes[@backingInt(record.scope)].node;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const holder = tree.fullContainerDecl(&buffer, container_node) orelse return null;
-    if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return null;
-    // A struct named as a call's argument may be filled by reflection.
+    const field_decl = tree.fullContainerField(record.node).?; // unreachable: `storesShown` holds only for a field
     const found = try stores(c);
-    const type_name = containerName(c, decl.file, container_node) orelse return null;
-    if (found.arguments.contains(type_name)) return null;
-    if (found.exposed.contains(.{ decl.file, record.scope })) return null;
     var out: ?Magnitude = 0;
     if (field_decl.ast.value_expr.unwrap()) |default| if (!empty(tree, default)) {
         out = try bound(c, decl.file, default, pointer, depth);
@@ -2671,7 +2698,7 @@ fn varies(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
 /// can carry none it could write through: a type, a value of a primitive type, or a `const`
 /// pointer or slice of one (a type parameter's where the call gives it a primitive type). A
 /// function parameter, `anytype`, a struct by value or a mutable pointer may reach anything.
-fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+pub fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
