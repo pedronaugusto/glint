@@ -1900,6 +1900,15 @@ fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
 fn never(tree: *const Ast, node: Ast.Node.Index) bool {
     return switch (tree.nodeTag(node)) {
         .unreachable_literal, .@"return", .@"break", .@"continue" => true,
+        .grouped_expression => never(tree, tree.nodeData(node).node_and_token[0]),
+        // Every branch leaves: an `if` with an `else`, a `switch`.
+        .@"if", .if_simple => blk: {
+            const branch = tree.fullIf(node).?; // unreachable: the tag is an `if`'s
+            break :blk never(tree, branch.ast.then_expr) and never(tree, branch.ast.else_expr.unwrap() orelse break :blk false);
+        },
+        .@"switch", .switch_comma => for (tree.fullSwitch(node).?.ast.cases) |case| { // unreachable: the tag is a switch's
+            if (!never(tree, tree.fullSwitchCase(case).?.ast.target_expr)) break false; // unreachable: a switch's cases are cases
+        } else true,
         // `undefined` takes the type of the other branches.
         .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined"),
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => for ([_][]const u8{ "@compileError", "@panic", "@trap" }) |name| {
@@ -1978,7 +1987,10 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         else => return .{ .unknown = .unsupported },
     };
     if (!self.isUnion(container)) return .{ .instance = container };
-    // The fields the prong takes: those its items name, or for `else` those no other prong names.
+    // A union's `else` prong captures the union itself; an `inline else` prong each payload.
+    if (full.ast.values.len == 0 and full.inline_token == null) return .{ .instance = container };
+    // The fields the prong takes: those its items name, or for `inline else` those no other
+    // prong names.
     var fields: std.ArrayList(Decl) = .empty;
     if (full.ast.values.len == 0) {
         const model = &self.project.at(container.file).model;
@@ -2001,7 +2013,8 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
         // A field with no type holds `void`.
         const record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
         const typed = self.project.at(field.file).file.tree.fullContainerField(record.node).?.ast.type_expr != .none;
-        value.* = if (typed) try self.declaration(field) else .scalar;
+        // Of a union a type function made, read with its call's bindings (`parsed: T`).
+        value.* = if (typed) try self.memberOf(container, field) else .scalar;
         if (value.* == .unknown) return value.*;
     }
     // An `inline` prong is analysed once per field, its capture each one's payload in turn;
@@ -2026,7 +2039,36 @@ fn element(self: *Facts, env: ?*const Env, file: Project.FileId, loop: Ast.full.
     if (position >= loop.ast.inputs.len) return .{ .unknown = .unsupported };
     const input = loop.ast.inputs[position];
     if (tree.nodeTag(input) == .for_range) return .scalar;
-    // An `inline for` over a tuple written in place (`.{ a, b }`): each element in turn.
+    return self.forElement(env, file, input, 0);
+}
+
+/// An element of what a `for` takes: of an `if`'s branches each (`if (c) list else &.{one}`),
+/// of a literal written in place, its elements (an `inline for` over a tuple each in turn, a
+/// pointer to one a slice of them), else of the resolved input.
+fn forElement(self: *Facts, env: ?*const Env, file: Project.FileId, input: Ast.Node.Index, depth: usize) ResolveError!Value {
+    if (depth == 16) return .{ .unknown = .budget };
+    const tree = &self.project.at(file).file.tree;
+    switch (tree.nodeTag(input)) {
+        .grouped_expression => return self.forElement(env, file, tree.nodeData(input).node_and_token[0], depth + 1),
+        .address_of => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const pointed = tree.nodeData(input).node;
+            if (tree.fullArrayInit(&buffer, pointed) != null) return self.forElement(env, file, pointed, depth + 1);
+        },
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(input).?; // unreachable: the tag is an `if`'s
+            if (branch.payload_token == null and branch.error_token == null) if (branch.ast.else_expr.unwrap()) |otherwise| {
+                var each: std.ArrayList(Value) = .empty;
+                for ([_]Ast.Node.Index{ branch.ast.then_expr, otherwise }) |taken| {
+                    if (never(tree, taken)) continue;
+                    try each.append(self.gpa, try self.forElement(env, file, taken, depth + 1));
+                }
+                return self.choose(each.items);
+            };
+        },
+        else => {},
+    }
+    // A tuple or array written in place, of no type of its own: each element in turn.
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullArrayInit(&buffer, input)) |list| if (list.ast.type_expr == .none) {
         const each = try self.gpa.alloc(Value, list.ast.elements.len);
