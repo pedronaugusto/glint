@@ -723,6 +723,74 @@ test "A002 reads a copy from any place an owner is read through, an assignment's
     try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { var r = try b.reserve(1); const p = &r; var kept = r; defer kept.release(); _ = p; }", pack.copies, true, 1);
 }
 
+test "A002 follows a copy's value through every shape it is written in to the places it reads" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst H = struct { s: S(u32), t: S(u32) };\n";
+    // Each branch, prong, `break`, operand and wrapper gives the copy one of its places.
+    try expectJudged(head ++ "pub fn f(h: *H, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(h: *H, k: u8) void { var copy = switch (k) { 0 => h.s, else => h.t }; copy.deinit(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(h: *H) void { var copy = blk: { break :blk h.s; }; copy.deinit(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(h: *H) void { var copy = @as(S(u32), h.s); copy.deinit(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(o: *?S(u32), h: *H) void { var copy = o.* orelse h.s; copy.deinit(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(e: *anyerror!S(u32), h: *H) void { var copy = e.* catch h.s; copy.deinit(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(e: *anyerror!S(u32)) !void { var copy = try e.*; copy.deinit(); }", pack.copies, true, 1);
+    // A literal's fields, typed or not, and a whole struct holding owners.
+    try expectJudged(head ++ "pub fn f(h: *H, out: *H) void { out.* = .{ .s = h.s, .t = h.t }; }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(h: *H) H { const copy = H{ .s = h.s, .t = h.t }; return copy; }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(h: *H) void { var copy = h.*; copy.s.deinit(); }", pack.copies, true, 1);
+    // A `return` copies what it reads, as a declaration does; the function's own local moves.
+    try expectJudged(head ++ "pub fn f(h: *H) S(u32) { return h.s; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f() S(u32) { const s = S(u32).init(1); return s; }", pack.copies, true, 0);
+    // A part of a generic's value, chosen or wrapped, is each binding's copy: decided where
+    // it is bound, the binding's argument read through the part.
+    try expectJudged(head ++ "pub fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, true, 0);
+    try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 1);
+    try expectJudged(head ++ "const P = struct { s: u32, t: u32 };\nfn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; _ = &copy; }\npub fn g(h: *P) void { f(h, true); }", pack.copies, true, 0);
+    // Plain data written any of these ways is decided.
+    try expectJudged(head ++ "pub fn f(c: bool, k: u8, n: u32) u32 { const a = if (c) n else 1; const b = switch (k) { 0 => a, else => blk: { break :blk @as(u32, 2); } }; return b; }", pack.copies, true, 0);
+    // A value of a `comptime` function parameter's result type is that type's, whichever
+    // function is passed.
+    try expectJudged("fn keep(comptime T: type, comptime read: fn (u32) T) T { const shown = read(1); return shown; }\nfn one(x: u32) bool { return x == 1; }\npub fn f() bool { return keep(bool, one); }", pack.copies, true, 0);
+}
+
+test "A002 follows a returned or stored borrow through every shape that keeps it" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst R = struct { v: *const u32 };\n";
+    // A prong, a labeled block, a cast, a slice, a local's field written later, an address of a
+    // part read through it, a capture: each returns the borrow.
+    try expectJudged(head ++ "pub fn f(s: *S(u32), k: u8) *const u32 { return switch (k) { 0 => s.expose(), else => s.expose() }; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { return blk: { break :blk s.expose(); }; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { return @as(*const u32, s.expose()); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const [4]u8 { return @ptrCast(s.expose()); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) []const u32 { return s.expose()[0..1]; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) R { var r: R = undefined; r.v = s.expose(); return r; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { const p = &s.expose().*; return p; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(o: ?*S(u32)) ?*const u32 { if (o) |p| return p.expose(); return null; }", pack.copies, true, 1);
+    // Stored where the caller reaches it, in a parameter's memory or a container's variable.
+    try expectJudged(head ++ "pub fn f(s: *S(u32), out: **const u32) void { out.* = s.expose(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "var kept: ?*const u32 = null;\npub fn f(s: *S(u32)) void { kept = s.expose(); }", pack.copies, true, 1);
+    // A call given the borrow may hand it back: undecided.
+    try expectJudged(head ++ "fn id(p: *const u32) *const u32 { return p; }\npub fn f(s: *S(u32)) *const u32 { return id(s.expose()); }", pack.copies, false, 0);
+    // The value read through it, a number a call or builtin makes of it, and a local's own
+    // storage hold no borrow.
+    try expectJudged(head ++ "fn sum(p: *const u32) u32 { return p.*; }\npub fn f(s: *S(u32), k: u8, out: *u32) u32 { var buf: u32 = 0; const p = &buf; p.* = s.expose().*; out.* = buf; const n = switch (k) { 0 => s.expose().*, else => sum(s.expose()) }; return n + @sizeOf(@TypeOf(s.expose())); }", pack.copies, true, 0);
+}
+
+test "A002 clears a move only of the function's own local or a value captured in place, with no copy or address of it before" {
+    const head = "const bounded = @import(\"aegis\").bounded;\nconst R = bounded.Budget(u32).Reservation;\nconst Hold = struct { maybe: ?R, list: [2]R };\n";
+    // A capture of a place another still holds is a copy of it.
+    try expectJudged(head ++ "pub fn f(h: *Hold) void { if (h.maybe) |r| { var kept = r; kept.release(); } h.maybe.?.release(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(h: *Hold) void { for (h.list) |r| { var kept = r; kept.release(); } h.list[0].release(); }", pack.copies, true, 1);
+    // A copy before the move, by value to a call, into storage or twice, leaves two owners
+    // (`keep` storing its own parameter is a copy as well).
+    try expectJudged(head ++ "fn keep(r: R, into: *Hold) void { into.list[0] = r; }\npub fn f(b: *bounded.Budget(u32), h: *Hold) !void { const r = try b.reserve(1); keep(r, h); var kept = r; kept.release(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(b: *bounded.Budget(u32), h: *Hold) !void { const r = try b.reserve(1); h.list[0] = r; var kept = r; kept.release(); }", pack.copies, true, 2);
+    try expectJudged(head ++ "pub fn f(b: *bounded.Budget(u32)) !void { const r = try b.reserve(1); var one = r; var two = r; one.release(); two.release(); }", pack.copies, true, 2);
+    // An address of a part taken before the move still reaches the old owner.
+    try expectJudged(head ++ "pub fn f(b: *bounded.Budget(u32), out: **const u32) !void { var r = try b.reserve(1); out.* = &r.amount; var kept = r; kept.release(); }", pack.copies, true, 1);
+    // A capture of a value made in place, and the last read of a local, move it.
+    try expectJudged(head ++ "fn get(b: *bounded.Budget(u32)) ?R { return b.reserve(1) catch null; }\npub fn f(b: *bounded.Budget(u32)) void { if (get(b)) |r| { var kept = r; kept.release(); } }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(b: *bounded.Budget(u32)) !void { const r = try b.reserve(1); var kept = r; kept.release(); }", pack.copies, true, 0);
+}
+
 test "cleanup paths through branches, deferred releases and loops are decided" {
     const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn hand(_: anytype) void {}\n";
     // Released in a branch that returns, and at the end of the fallthrough.
