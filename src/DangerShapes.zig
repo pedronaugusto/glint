@@ -514,6 +514,17 @@ fn releasesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, pos
     return .no;
 }
 
+/// Whether `node` in `file` is an argument of a call that does not release it (`released`): a
+/// copy of a std handle that call is lent.
+pub fn lentArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const parent = c.project.at(file).model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    for (call.ast.params) |argument| if (argument == node) return try released(c, file, node, 0) == .no;
+    return false;
+}
+
 /// Whether `node`, a call, acquires a std resource (`resource_paths`) by value: one it is not
 /// lent (`viewed`), as `dir.openFile` gives, for A003 to follow to its release.
 pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Error!bool {

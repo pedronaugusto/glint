@@ -7373,7 +7373,7 @@ test "A015 judges a public type's resource field where the program writes or rel
         \\pub const Keeper = struct { held: std.Io.File, pub fn keep(k: *Keeper, f: std.Io.File) void { k.held = f; } pub fn deinit(k: *Keeper) void { k.held.close(); } };
         \\pub const Reader = struct { file: std.Io.File, pub fn init(f: std.Io.File) Reader { return .{ .file = f }; } };
     };
-    const imports = std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "lib.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } };
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "lib.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
     const found = try runWith(pack.ownership,
         \\const std = @import("std");
         \\const lib = @import("lib.zig");
@@ -7389,7 +7389,7 @@ test "A015 judges a public type's resource field where the program writes or rel
         \\pub fn stream() void { var r = opened().reader(undefined, &.{}); _ = &r; }
         \\pub fn done(r: *std.Io.File.Reader) void { r.file.close(); }
         \\const aegis = @import("aegis");
-    , &(std_files ++ [_]sources.Extra{lib}), &imports);
+    , &(std_files ++ [_]sources.Extra{lib}), imports);
     try std.testing.expectEqual(@as(usize, 0), found.undecided);
     try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6, 13 }, found.lines[0..found.findings]);
     // Passed where nothing resolves, a release of it may be one: undecided, not flagged.
@@ -7399,7 +7399,7 @@ test "A015 judges a public type's resource field where the program writes or rel
         \\const ext = @import("missing");
         \\pub fn pass(s: *lib.S) void { ext.release(s.f); }
         \\pub fn sync(s: *lib.S) void { ext.sync(s.f.handle); }
-    , &(std_files ++ [_]sources.Extra{lib}), &imports);
+    , &(std_files ++ [_]sources.Extra{lib}), imports);
     try std.testing.expectEqual(@as(usize, 0), passed.findings);
     try std.testing.expectEqual(@as(usize, 2), passed.undecided);
     // A keeper that does not resolve may keep it: undecided.
@@ -7422,7 +7422,7 @@ test "A015 judges a public type's resource field where the program writes or rel
     try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, private.lines[0..private.findings]);
 }
 
-test "A003 follows a std handle acquired raw to its release: a discard leaks it, a close or deferred close releases it" {
+test "A003 follows a std handle acquired raw to its release: a discard leaks it, a close or deferred close releases it, a call given a copy it does not release is lent it" {
     const found = try run(pack.cleanup,
         \\const std = @import("std");
         \\fn opened() std.Io.File { return undefined; }
@@ -7431,8 +7431,21 @@ test "A003 follows a std handle acquired raw to its release: a discard leaks it,
         \\pub fn direct() void { const file = opened(); file.close(); }
         \\pub fn lent(f: std.Io.File) void { const file = f; _ = file; }
         \\pub fn standard() void { const out = std.Io.File.stdout(); _ = out; }
+        \\fn use(f: std.Io.File) void { _ = f; }
+        \\fn shut(f: std.Io.File) void { f.close(); }
+        \\pub fn handed() void { const file = opened(); defer file.close(); use(file); }
     );
     try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    // A copy handed to a call that releases it is a release this walk does not follow: undecided.
+    const shut = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn shut(f: std.Io.File) void { f.close(); }
+        \\pub fn handed() void { const file = opened(); defer file.close(); shut(file); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), shut.findings);
+    try std.testing.expectEqual(@as(usize, 1), shut.undecided);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {

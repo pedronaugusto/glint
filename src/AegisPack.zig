@@ -2558,6 +2558,12 @@ const Flow = struct {
                 found = .members;
                 continue;
             }
+            // A std handle is a value: a copy given to a call that does not release that
+            // parameter is lent to it.
+            if (f.kind == .std_handle and try Shapes.lentArgument(f.c, f.c.file, candidate)) {
+                found = .members;
+                continue;
+            }
             if (f.tree.nodeTag(parent) != .field_access or f.tree.nodeData(parent).node_and_token[0] != candidate) return .other;
             const member = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(parent).node_and_token[1]));
             // A move hands the owner on, as a release ends it (`kept`).
