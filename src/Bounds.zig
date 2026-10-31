@@ -1074,19 +1074,24 @@ const Frame = struct {
     /// The length of `memory`'s memory: what evaluating it gave, an array's fixed length, or a
     /// tracked slice's length variable.
     fn lengthOf(f: *Frame, s: State, memory: Ast.Node.Index, value: Value) Error!struct { State, ?Lin } {
-        if (try table(f.c, f.file, memory)) |most| {
-            // A table std names by a u32 index: whatever else is known of its length, at most
-            // the indexes there are.
-            var out = s;
-            const l = value.length orelse made: {
-                const t = try f.temp(s, memory, 5);
-                out = t[0];
-                break :made try single(f.a, t[1]);
-            };
-            out = try assume(f.a, out, try atLeast(f.a, l, constant(0)));
-            out = try assume(f.a, out, try atLeast(f.a, constant(most), l));
-            return .{ out, l };
-        }
+        const given = try f.knownLength(s, memory, value);
+        // A table std names by a u32 index: whatever else is known of its length, at most the
+        // indexes there are.
+        const most = (try table(f.c, f.file, memory)) orelse return given;
+        var out = given[0];
+        const l = given[1] orelse made: {
+            const t = try f.temp(out, memory, 5);
+            out = t[0];
+            break :made try single(f.a, t[1]);
+        };
+        out = try assume(f.a, out, try atLeast(f.a, l, constant(0)));
+        out = try assume(f.a, out, try atLeast(f.a, constant(most), l));
+        return .{ out, l };
+    }
+
+    /// What evaluating `memory` gave of its length, an array's fixed length, or a tracked
+    /// slice's length variable.
+    fn knownLength(f: *Frame, s: State, memory: Ast.Node.Index, value: Value) Error!struct { State, ?Lin } {
         if (value.length) |known_length| return .{ s, known_length };
         if (try Range.memoryLength(f.c, f.file, memory)) |fixed| if (fixed <= std.math.maxInt(Coef)) return .{ s, constant(@intCast(fixed)) };
         const d = f.trackedName(memory) orelse return .{ s, null };
