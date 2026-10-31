@@ -3261,6 +3261,18 @@ fn checkCapacity(c: *Context) Context.Error!void {
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
         if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") or call.ast.params.len != 2) continue;
         if (try requiredOwner(c, data[0], capacity, data[1]) != .bytes) continue;
+        // What was done with the allocation's local before it is adopted.
+        if (allocationLocal(c, call.ast.params[0])) |local| switch (try beforeAdoption(c, local.index, local.read, tree.firstToken(node))) {
+            .whole => {},
+            .spoiled => |found| {
+                try c.at(capacity, tree.nodeMainToken(node), try c.allocator.print("SecretBytes.adopt receives an allocation {s} before it (line {d}): the owner must take the whole allocation alone", .{ found.what, c.project.at(c.file).file.line(tree.tokenStart(tree.nodeMainToken(found.at))) + 1 }));
+                continue;
+            },
+            .unknown => |at| {
+                try c.undecided(capacity, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "what this does with an allocation adopted after it is not known: it may free, change or keep it");
+                continue;
+            },
+        };
         if (try wholeAllocation(c, node, call.ast.params[0])) continue;
         if (tree.fullSlice(call.ast.params[0])) |slice| {
             if (slice.ast.end.unwrap() != null) try c.at(capacity, tree.nodeMainToken(node), "SecretBytes.adopt receives an explicitly bounded slice: full allocator capacity/exclusive ownership must be retained; extent is undecided");
@@ -3452,6 +3464,116 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
         gives = true;
     }
     return gives;
+}
+
+/// The local an adoption's argument names (through `try` and a grouping), and that reading.
+fn allocationLocal(c: *Context, node: Ast.Node.Index) ?struct { index: Model.Declaration.Id, read: Ast.Node.Index } {
+    const tree = &c.project.at(c.file).file.tree;
+    var current = node;
+    while (true) current = switch (tree.nodeTag(current)) {
+        .grouped_expression => tree.nodeData(current).node_and_token[0],
+        .@"try" => tree.nodeData(current).node,
+        .identifier => break,
+        else => return null,
+    };
+    const index = Contract.local(c, current) orelse return null;
+    const decl = c.project.at(c.file).model.declarations[@backingInt(index)];
+    if (decl.kind != .variable and decl.kind != .capture) return null;
+    return .{ .index = index, .read = current };
+}
+
+const Before = union(enum) { whole, spoiled: struct { at: Ast.Node.Index, what: []const u8 }, unknown: Ast.Node.Index };
+
+/// What each use of the local `index` before `until`, apart from `read`, does with the
+/// allocation it holds: an element read or written, its length, a comparison, a builtin that
+/// copies into or out of it, or a call that gives back no pointer leave it whole; a free,
+/// a write of the slice itself (`buf = ...`, `buf.len = 1`, `buf.ptr += 1`), or a copy of it
+/// kept elsewhere (stored, put in a local, a literal or another adoption) spoil it. Any other
+/// use is not known. Deferred uses are left to `heldAlone`.
+fn beforeAdoption(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex) Context.Error!Before {
+    const tree = try c.project.syntax(try c.source());
+    const model = &c.project.at(c.file).model;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const use: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (use == read or tree.nodeMainToken(use) >= until) continue;
+        const ref = model.reference(use) orelse continue;
+        if (ref.declaration != index) continue;
+        // Deferred code runs at the scope's end: `heldAlone` reads it.
+        var deferred = false;
+        var up = model.parentOf(use);
+        while (up) |parent| : (up = model.parentOf(parent)) switch (tree.nodeTag(parent)) {
+            .@"defer", .@"errdefer" => deferred = true,
+            else => {},
+        };
+        if (deferred) continue;
+        const found = try allocationUse(c, tree, model, use);
+        if (found != .whole) return found;
+    }
+    return .whole;
+}
+
+fn allocationUse(c: *Context, tree: *const Ast, model: *const Model, use: Ast.Node.Index) Context.Error!Before {
+    // `view` is what holds the allocation's memory: the local, a slice of it, its `.ptr`.
+    var view = use;
+    while (model.parentOf(view)) |parent| {
+        switch (tree.nodeTag(parent)) {
+            .grouped_expression, .@"try" => view = parent,
+            .slice, .slice_open, .slice_sentinel => {
+                if (tree.fullSlice(parent).?.ast.sliced != view) return .whole; // unreachable: the tag is a slice's
+                view = parent;
+            },
+            .field_access => {
+                const name = tree.tokenSlice(tree.nodeData(parent).node_and_token[1]);
+                const written = if (model.parentOf(parent)) |above| assigning(tree.nodeTag(above)) and tree.nodeData(above).node_and_node[0] == parent else false;
+                if (written) return .{ .spoiled = .{ .at = parent, .what = "changed" } };
+                if (std.mem.eql(u8, name, "len")) return .whole;
+                if (!std.mem.eql(u8, name, "ptr")) return .{ .unknown = parent };
+                view = parent;
+            },
+            // An element, read or written.
+            .array_access => return .whole,
+            else => break,
+        }
+    }
+    const parent = model.parentOf(view) orelse return .{ .unknown = view };
+    const tag = tree.nodeTag(parent);
+    if (assigning(tag)) {
+        const sides = tree.nodeData(parent).node_and_node;
+        return if (sides[0] == view) .{ .spoiled = .{ .at = parent, .what = "changed" } } else .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
+    }
+    switch (tag) {
+        // A comparison, or a pass that leaves without it.
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .@"return" => return .whole,
+        else => {},
+    }
+    if (tree.fullVarDecl(parent) != null) return .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, parent) != null or tree.fullArrayInit(&buffer, parent) != null) return .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
+    switch (tag) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(parent));
+            const kept = [_][]const u8{ "@memset", "@memcpy", "@memmove", "@intFromPtr", "@sizeOf", "@TypeOf" };
+            for (kept) |each| if (std.mem.eql(u8, name, each)) return .whole;
+            return .{ .unknown = parent };
+        },
+        else => {},
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, parent) orelse return .{ .unknown = parent };
+    if (call.ast.fn_expr == view) return .{ .unknown = parent };
+    const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return .{ .unknown = parent };
+    const function = (try c.facts.origin(callee)) orelse return .{ .unknown = parent };
+    // Given back to its allocator, or to another owner.
+    const frees = [_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy", "mem.Allocator.realloc", "mem.Allocator.resize", "mem.Allocator.remap" };
+    for (frees) |path| if (try allocates(c, function, path)) return .{ .spoiled = .{ .at = parent, .what = "freed or resized" } };
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const data = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") and try requiredOwner(c, data[0], capacity, data[1]) == .bytes) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
+    }
+    // A call that gives back no pointer cannot hand the memory on.
+    if (scalarShaped(c, try c.facts.resolve(c.file, parent))) return .whole;
+    return .{ .unknown = parent };
 }
 
 /// Whether `function` is std's declaration at `path`.
