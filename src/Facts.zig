@@ -4591,13 +4591,12 @@ test "a function handed to code outside the program as a value escapes: its call
     // is only called, and every call the program makes shows what it is given.
     var project = try Project.init(std.testing.allocator, &.{
         .{ .name = "root", .bytes = "const lib = @import(\"lib\");\nfn less(a: u8, b: u8) bool {\n    return a < b;\n}\nfn twice(a: u8) u8 {\n    return a *% 2;\n}\npub fn f(x: u8) u8 {\n    lib.sort(less);\n    return twice(x);\n}" },
-        .{ .name = "lib", .bytes = "pub fn sort(comptime order: anytype) void {\n    _ = order;\n}", .selected = false },
+        .{ .name = "lib", .bytes = "pub fn sort(comptime order: anytype) void {\n    _ = order;\n}", .selected = false, .package = "lib", .fingerprint = 1 },
     }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const known = [_]KnownModule{.{ .name = "lib", .members = &.{.{ .path = "sort" }} }};
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = &known };
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = .{ .name = "lib", .fingerprint = 1 } };
     defer facts.deinit();
     const model = &project.sources[0].model;
     var less: ?Decl = null;
