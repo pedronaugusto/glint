@@ -752,6 +752,28 @@ test "A002 follows a copy's value through every shape it is written in to the pl
     try expectJudged("fn keep(comptime T: type, comptime read: fn (u32) T) T { const shown = read(1); return shown; }\nfn one(x: u32) bool { return x == 1; }\npub fn f() bool { return keep(bool, one); }", pack.copies, true, 0);
 }
 
+test "A002 follows a returned or stored borrow through every shape that keeps it" {
+    const head = "const S = @import(\"aegis\").Secret;\nconst R = struct { v: *const u32 };\n";
+    // A prong, a labeled block, a cast, a slice, a local's field written later, an address of a
+    // part read through it, a capture: each returns the borrow.
+    try expectJudged(head ++ "pub fn f(s: *S(u32), k: u8) *const u32 { return switch (k) { 0 => s.expose(), else => s.expose() }; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { return blk: { break :blk s.expose(); }; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { return @as(*const u32, s.expose()); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const [4]u8 { return @ptrCast(s.expose()); }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) []const u32 { return s.expose()[0..1]; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) R { var r: R = undefined; r.v = s.expose(); return r; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(s: *S(u32)) *const u32 { const p = &s.expose().*; return p; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(o: ?*S(u32)) ?*const u32 { if (o) |p| return p.expose(); return null; }", pack.copies, true, 1);
+    // Stored where the caller reaches it, in a parameter's memory or a container's variable.
+    try expectJudged(head ++ "pub fn f(s: *S(u32), out: **const u32) void { out.* = s.expose(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "var kept: ?*const u32 = null;\npub fn f(s: *S(u32)) void { kept = s.expose(); }", pack.copies, true, 1);
+    // A call given the borrow may hand it back: undecided.
+    try expectJudged(head ++ "fn id(p: *const u32) *const u32 { return p; }\npub fn f(s: *S(u32)) *const u32 { return id(s.expose()); }", pack.copies, false, 0);
+    // The value read through it, a number a call or builtin makes of it, and a local's own
+    // storage hold no borrow.
+    try expectJudged(head ++ "fn sum(p: *const u32) u32 { return p.*; }\npub fn f(s: *S(u32), k: u8, out: *u32) u32 { var buf: u32 = 0; const p = &buf; p.* = s.expose().*; out.* = buf; const n = switch (k) { 0 => s.expose().*, else => sum(s.expose()) }; return n + @sizeOf(@TypeOf(s.expose())); }", pack.copies, true, 0);
+}
+
 test "A002 clears a move only of the function's own local or a value captured in place, with no copy or address of it before" {
     const head = "const bounded = @import(\"aegis\").bounded;\nconst R = bounded.Budget(u32).Reservation;\nconst Hold = struct { maybe: ?R, list: [2]R };\n";
     // A capture of a place another still holds is a copy of it.

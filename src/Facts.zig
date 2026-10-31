@@ -769,7 +769,7 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
 
 /// The values each `break :label` out of the labeled block `node` gives (Zig refuses a label
 /// that shadows another, so each names this block).
-fn blockBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: []const u8) ResolveError![]const Ast.Node.Index {
+pub fn blockBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: []const u8) ResolveError![]const Ast.Node.Index {
     const t = self.syntaxOf(file);
     var found: std.ArrayList(Ast.Node.Index) = .empty;
     const first = t.firstToken(node);
@@ -788,7 +788,7 @@ fn blockBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: 
 
 /// The values each `break` out of the loop `node` gives: one naming its `label`, or one with
 /// none whose nearest loop it is.
-fn loopBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: ?[]const u8) ResolveError![]const Ast.Node.Index {
+pub fn loopBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: ?[]const u8) ResolveError![]const Ast.Node.Index {
     const t = self.syntaxOf(file);
     const model = &self.project.at(file).model;
     var found: std.ArrayList(Ast.Node.Index) = .empty;
@@ -1084,7 +1084,7 @@ fn lexical(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id, name
 }
 
 /// What a capture is read from: a switch's subject, a loop's inputs, an `if`'s condition.
-fn captureSource(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
+pub fn captureSource(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
     const t = self.syntaxOf(file);
     if (t.fullSwitchCase(node) != null) {
         const parent = self.project.at(file).model.parentOf(node) orelse return null;

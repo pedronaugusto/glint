@@ -799,6 +799,7 @@ fn checkCopies(c: *Context) Context.Error!void {
             // `_ = x` discards the value: no second holder.
             if (tree.nodeTag(sides[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(sides[0])), "_")) continue;
             try checkCopy(c, tree, node, sides[1], null);
+            try checkStoredBorrow(c, tree, node, sides[0], sides[1]);
         }
         if (tag == .@"return") {
             const expr = tree.nodeData(node).opt_node.unwrap() orelse continue;
@@ -810,7 +811,9 @@ fn checkCopies(c: *Context) Context.Error!void {
             var walk: Exposure = .{ .c = c };
             if (try walk.carries(expr, 0)) {
                 try c.at(copies, tree.nodeMainToken(node), "returned secret/guard borrow can outlive its capability; caller lifetime is undecided");
-            } else if (walk.cut) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "what this returns is nested past the depth A002 follows: a borrow it carries is not ruled out");
+            } else if (walk.cut) {
+                try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "what this returns is nested past the depth A002 follows: a borrow it carries is not ruled out");
+            } else if (walk.unknown) |at| try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "a call or builtin given a secret/guard borrow may give it back: a borrow this returns is not ruled out");
         }
     }
 }
@@ -988,14 +991,41 @@ fn heldAs(value: Facts.Value) Held {
     };
 }
 
-/// Whether what a `return` gives carries a borrow of a secret or a guard's value: the borrow
-/// itself, a local it was put in, or a branch, field or element of what is returned. Each local
-/// is read once: a search for any borrow learns nothing more from a local already followed
-/// (`head = head orelse x`). Past the depth it follows, `cut` says so, and nothing is cleared.
+/// A borrow stored where it outlives the function: in memory a parameter or a container's
+/// variable reaches, or through a pointer a local holds. A local's own value, whole or in a
+/// part, is followed where it is returned.
+fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Context.Error!void {
+    const root = placeRoot(tree, target) orelse return;
+    const model = &c.project.at(c.file).model;
+    const index = (model.reference(root) orelse return).declaration orelse return;
+    const decl = model.declarations[@backingInt(index)];
+    const outer = decl.kind == .parameter or (decl.kind == .variable and containerLevel(c, tree, decl.node));
+    // A local's own storage, unless it holds a pointer the store goes through.
+    if (!outer and (root == target or !pointerShaped(try c.facts.resolve(c.file, root)))) return;
+    var walk: Exposure = .{ .c = c };
+    if (try walk.carries(value, 0)) {
+        if (outer) return c.at(copies, tree.nodeMainToken(store), "stored secret/guard borrow can outlive its capability; caller lifetime is undecided");
+        return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unsupported, "a secret/guard borrow stored through a pointer a local holds may outlive its capability");
+    }
+    if (walk.cut) return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unsupported, "what this stores is nested past the depth A002 follows: a borrow it carries is not ruled out");
+    if (walk.unknown) |at| return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(at)), .unsupported, "a call or builtin given a secret/guard borrow may give it back: a borrow this stores is not ruled out");
+}
+
+/// Whether a value carries a borrow of a secret or a guard's value: the borrow itself; a
+/// branch, prong, `break` or `else` that gives the value; a builtin that keeps its operand's
+/// address (`@as`, `@ptrCast`, `@alignCast`, `@constCast`, `@bitCast`, `@field`,
+/// `@unionInit`); a slice of it, or an address of a part read through it; a part (a field, an
+/// element, a payload, what it points at) that may itself be a pointer; a field or element of a
+/// literal; a capture of it; or a local it was put in, whole or in a part. Each local is read
+/// once: a search for any borrow learns nothing more from a local already followed (`head =
+/// head orelse x`). A call given a borrow may return it: `unknown` names one whose result may be
+/// a pointer, as it does a shape not followed; past the depth it follows, `cut` says so. Neither
+/// is cleared.
 const Exposure = struct {
     c: *Context,
     seen: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty,
     cut: bool = false,
+    unknown: ?Ast.Node.Index = null,
 
     fn carries(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
         const c = e.c;
@@ -1007,7 +1037,7 @@ const Exposure = struct {
         const model = &c.project.at(c.file).model;
         switch (tree.nodeTag(node)) {
             .grouped_expression => return e.carries(tree.nodeData(node).node_and_token[0], depth + 1),
-            .@"try" => return e.carries(tree.nodeData(node).node, depth + 1),
+            .@"try", .@"comptime", .@"nosuspend" => return e.carries(tree.nodeData(node).node, depth + 1),
             .@"orelse", .@"catch" => {
                 const sides = tree.nodeData(node).node_and_node;
                 return try e.carries(sides[0], depth + 1) or try e.carries(sides[1], depth + 1);
@@ -1018,22 +1048,69 @@ const Exposure = struct {
                 const otherwise = branch.ast.else_expr.unwrap() orelse return false;
                 return e.carries(otherwise, depth + 1);
             },
+            .@"switch", .switch_comma => {
+                for (tree.fullSwitch(node).?.ast.cases) |case| if (try e.carries(tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return true; // unreachable: the tag is a switch's, its cases are cases
+                return false;
+            },
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                // A block with no label gives `void`.
+                const brace = tree.nodeMainToken(node);
+                if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return false;
+                for (try c.facts.blockBreaks(c.file, node, tree.tokenSlice(brace - 2))) |value| if (try e.carries(value, depth + 1)) return true;
+                return false;
+            },
+            .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
+                const start = tree.firstToken(node);
+                const label: ?[]const u8 = if (start >= 2 and tree.tokenTag(start) != .identifier and tree.tokenTag(start - 1) == .colon and tree.tokenTag(start - 2) == .identifier) tree.tokenSlice(start - 2) else null;
+                for (try c.facts.loopBreaks(c.file, node, label)) |value| if (try e.carries(value, depth + 1)) return true;
+                const otherwise = if (tree.fullFor(node)) |loop| loop.ast.else_expr else tree.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
+                return if (otherwise.unwrap()) |value| e.carries(value, depth + 1) else false;
+            },
+            // A slice of a borrow borrows the same memory.
+            .slice, .slice_open, .slice_sentinel => return e.carries(tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the tag is a slice's
+            // An address of a part read through a borrow points into what it borrows.
+            .address_of => {
+                var place = tree.nodeData(node).node;
+                while (true) place = switch (tree.nodeTag(place)) {
+                    .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(place).node_and_token[0],
+                    .deref => tree.nodeData(place).node,
+                    .array_access => tree.nodeData(place).node_and_node[0],
+                    else => break,
+                };
+                return e.carries(place, depth + 1);
+            },
+            // A part of what carries a borrow carries it where the part may be a pointer, or a
+            // value holding one; a number, a truth value or an enum's tag holds none.
+            .field_access, .unwrap_optional, .deref, .array_access => {
+                const whole = switch (tree.nodeTag(node)) {
+                    .field_access, .unwrap_optional => tree.nodeData(node).node_and_token[0],
+                    .deref => tree.nodeData(node).node,
+                    else => tree.nodeData(node).node_and_node[0],
+                };
+                if (try plainValue(c, c.file, node, 0)) return false;
+                if (scalarShaped(c, try c.facts.resolve(c.file, node))) return false;
+                return e.carries(whole, depth + 1);
+            },
             .identifier => {
                 const index = Contract.local(c, node) orelse return false;
                 const decl = model.declarations[@backingInt(index)];
-                if (decl.kind != .variable) return false;
                 if ((try e.seen.getOrPut(c.allocator, index)).found_existing) return false;
+                // A capture: of what the `if`, loop or `switch` reads.
+                if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl.node)) |source| e.carries(source, depth + 1) else false;
+                if (decl.kind != .variable) return false;
                 const v = tree.fullVarDecl(decl.node) orelse return false;
                 if (v.ast.init_node.unwrap()) |init| if (try e.carries(init, depth + 1)) return true;
-                // Anything put in it later.
+                // Anything put in it later, whole or in a part (`r.v = s.expose()`).
                 for (tree.nodes.items(.tag), 0..) |tag, i| {
                     if (tag != .assign) continue;
                     const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-                    if (tree.nodeTag(sides[0]) != .identifier or Contract.local(c, sides[0]) != index) continue;
+                    const root = placeRoot(tree, sides[0]) orelse continue;
+                    if (Contract.local(c, root) != index) continue;
                     if (try e.carries(sides[1], depth + 1)) return true;
                 }
                 return false;
             },
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return e.builtin(node, depth),
             else => {},
         }
         var buffer: [2]Ast.Node.Index = undefined;
@@ -1045,9 +1122,54 @@ const Exposure = struct {
             for (literal.ast.elements) |element| if (try e.carries(element, depth + 1)) return true;
             return false;
         }
-        return exposure(c, node);
+        if (try exposure(c, node)) return true;
+        // A call given a borrow may return it, where what it returns may be a pointer.
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, node)) |call| {
+            var given = false;
+            if (tree.nodeTag(call.ast.fn_expr) == .field_access) given = try e.carries(tree.nodeData(call.ast.fn_expr).node_and_token[0], depth + 1);
+            for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
+            if (given and !scalarShaped(c, try c.facts.resolve(c.file, node))) e.unknown = e.unknown orelse node;
+        }
+        return false;
+    }
+    /// A builtin's value: what keeps its operand's address carries what the operand does.
+    fn builtin(e: *Exposure, node: Ast.Node.Index, depth: usize) Context.Error!bool {
+        const c = e.c;
+        const tree = try c.project.syntax(try c.source());
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        const kept = [_][]const u8{ "@as", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast", "@bitCast" };
+        for (kept) |each| if (std.mem.eql(u8, name, each)) return args.len != 0 and try e.carries(args[args.len - 1], depth + 1);
+        if (std.mem.eql(u8, name, "@field")) return args.len != 0 and try e.carries(args[0], depth + 1);
+        if (std.mem.eql(u8, name, "@unionInit")) return args.len == 3 and try e.carries(args[2], depth + 1);
+        // A number, a type, text, a truth value or nothing: no pointer.
+        const none = [_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@offsetOf", "@bitOffsetOf", "@typeName", "@tagName", "@errorName", "@typeInfo", "@intFromPtr", "@intFromBool", "@intFromEnum", "@intFromError", "@intFromFloat", "@hasDecl", "@hasField", "@memcpy", "@memset", "@memmove", "@prefetch", "@compileError", "@panic", "@popCount", "@clz", "@ctz", "@byteSwap", "@bitReverse", "@truncate", "@intCast", "@floatCast", "@floatFromInt", "@divExact", "@divFloor", "@divTrunc", "@mod", "@rem", "@min", "@max", "@abs", "@sqrt", "@atomicStore" };
+        for (none) |each| if (std.mem.eql(u8, name, each)) return false;
+        // Any other builtin given a borrow gives a value this does not follow.
+        for (args) |arg| if (try e.carries(arg, depth + 1)) {
+            if (!scalarShaped(c, try c.facts.resolve(c.file, node))) e.unknown = e.unknown orelse node;
+            return false;
+        };
+        return false;
     }
 };
+
+/// Whether a value is a number, a truth value, an enum's tag or nothing: no pointer in it.
+fn scalarShaped(c: *Context, value: Facts.Value) bool {
+    return switch (value) {
+        .primitive => |name| !std.mem.eql(u8, name, "anyopaque"),
+        .error_union => |inner| scalarShaped(c, inner.*),
+        .instance => |container| blk: {
+            const node = c.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
+            if (node == .root) break :blk false;
+            const tree = &c.project.at(container.file).file.tree;
+            break :blk tree.tokenTag(tree.nodeMainToken(node)) == .keyword_enum;
+        },
+        else => false,
+    };
+}
 
 /// Whether an owner of kind `k` may move by assignment: no erasure owed to the bytes left
 /// behind (secrets), no address an owner or its borrowers keep (guarded values, a budget its
