@@ -277,17 +277,35 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         if (held.file != io_type.file or held.scope != io_type.scope) continue;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const loop = tree.fullWhile(node) orelse continue;
+            // A `while` by each comparison its condition joins (`and`, `or`, `!`), a `for` by
+            // each range's end: the same loop either way.
+            var bounds: std.ArrayList(Ast.Node.Index) = .empty;
+            var unbounded = false;
+            const body = if (tree.fullWhile(node)) |loop| body: {
+                unbounded = forever(tree, loop.ast.cond_expr);
+                var compared: std.ArrayList(Ast.Node.Index) = .empty;
+                if (!unbounded) try comparisons(c, loop.ast.cond_expr, &compared);
+                for (compared.items) |condition| try bounds.appendSlice(c.allocator, &tree.nodeData(condition).node_and_node);
+                break :body loop.ast.then_expr;
+            } else if (tree.fullFor(node)) |loop| body: {
+                for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try bounds.append(c.allocator, end);
+                break :body loop.ast.then_expr;
+            } else continue;
             if (!within(c, node, decl.node) or !site(c, node)) continue;
-            const cond = loop.ast.cond_expr;
-            const unbounded = forever(tree, cond);
             var by_input = false;
-            if (!unbounded and comparison(tree.nodeTag(cond))) {
-                const lhs, const rhs = tree.nodeData(cond).node_and_node;
-                by_input = (try ranged(c, flow, lhs)).join(try ranged(c, flow, rhs)).reaches(.number);
+            var unknown = false;
+            for (bounds.items) |bound| {
+                const level = try ranged(c, flow, bound);
+                by_input = by_input or level.reaches(.number);
+                unknown = unknown or level == .unknown;
             }
-            if (!unbounded and !by_input) continue;
-            if (try cancels(c, c.file, loop.ast.then_expr, 0, false)) continue;
+            if (!unbounded and !by_input and !unknown) continue;
+            if (try cancels(c, c.file, body, 0, false)) continue;
+            // A bound the input fact cannot read may be one a peer sets: never cleared.
+            if (!unbounded and !by_input) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a loop bounded by a value that passed through a call that does not resolve, which may be input, with no cancellation point");
+                continue;
+            }
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", decl.name }));
         }
     }

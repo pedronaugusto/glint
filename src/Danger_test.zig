@@ -5053,6 +5053,50 @@ test "A020 takes a periodic point's counter only where the function alone writes
     , 0);
 }
 
+test "A020 reads a loop bound by input by what bounds it: a for range's end, each comparison a while condition joins" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn ranged(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    _ = io;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    for (0..n) |i| total +%= i;
+        \\    return total;
+        \\}
+        \\pub fn joined(io: std.Io, r: *std.Io.Reader, stop: *const bool) !u64 {
+        \\    _ = io;
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n and !stop.*) : (i += 1) total +%= i;
+        \\    return total;
+        \\}
+    , 2);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn ranged(io: std.Io, r: *std.Io.Reader) !u64 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    for (0..n) |i| {
+        \\        try io.checkCancel();
+        \\        total +%= i;
+        \\    }
+        \\    for (0..16) |i| total +%= i;
+        \\    return total;
+        \\}
+        \\pub fn joined(io: std.Io, r: *std.Io.Reader, stop: *const bool) !u64 {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n and !stop.*) : (i += 1) {
+        \\        try io.checkCancel();
+        \\        total +%= i;
+        \\    }
+        \\    return total;
+        \\}
+    , 0);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");
