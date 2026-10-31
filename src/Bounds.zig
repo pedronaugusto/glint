@@ -524,8 +524,6 @@ const Frame = struct {
     targets: std.ArrayList(Target) = .empty,
     defers: std.ArrayList(Deferred) = .empty,
     exits: std.ArrayList(Exit) = .empty,
-    /// Whether a `while` condition is being read: its comparisons' operands get a count verdict.
-    looping: bool = false,
     /// How many loop passes being tried enclose the reading: their verdicts and jumps out
     /// count for nothing.
     trial: u32 = 0,
@@ -560,6 +558,11 @@ const Frame = struct {
             const d = found orelse continue;
             if (param.type_expr) |type_node| if (try Range.intNamed(f.c, f.file, type_node, f.width)) |int| {
                 s = try f.typed(s, try f.variable(.{ .value = d }), int);
+            };
+            // A slice's length is one from the start: a fact first read inside a loop then
+            // holds at its entry too.
+            if (param.type_expr) |type_node| if (f.tree.fullPtrType(type_node)) |pointer| if (pointer.size == .slice) {
+                s = try f.lengthy(s, try f.variable(.{ .length = d }));
             };
         }
         f.params = params.items;
@@ -644,8 +647,12 @@ const Frame = struct {
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* and proven else proven;
     }
 
-    /// A loop's bound `node`, valued `value` in `s`: within a short's count either way, or
-    /// between zero and the length of some memory the function holds.
+    /// Whether `node`, valued `value` in `s`, counts no more than the work the function holds:
+    /// within a short's count either way, or between zero and the length of some memory it
+    /// holds. Recorded at every node that may decide a loop's passes, as DangerFlow's `decides`
+    /// reads a condition: each comparison's operands, a payload loop's condition, and each value
+    /// a variable is given. DangerFlow asks only at the loops' own; a node never recorded here
+    /// is never cleared.
     fn counted(f: *Frame, s: State, node: Ast.Node.Index, value: ?Lin) Error!void {
         if (f.trial > 0) return;
         const x = value orelse return f.record(node, .count, false);
@@ -859,6 +866,7 @@ const Frame = struct {
         const e = try f.eval(s, init);
         const d = f.decls.get(local.ast.mut_token + 1) orelse return e.s;
         if (!f.tracked(d)) return e.s;
+        try f.counted(e.s, init, e.v.lin);
         const int = if (local.ast.type_node.unwrap()) |t| try Range.intNamed(f.c, f.file, t, f.width) else try f.intOf(init);
         return f.bind(e.s, d, e.v, int);
     }
@@ -883,7 +891,10 @@ const Frame = struct {
         };
         const e = try f.eval(s, rhs);
         const int = try f.intOf(target);
-        if (tag == .assign) return f.bind(e.s, d, e.v, int);
+        if (tag == .assign) {
+            try f.counted(e.s, rhs, e.v.lin);
+            return f.bind(e.s, d, e.v, int);
+        }
         const v = try f.variable(.{ .value = d });
         const current = try f.name(e.s, target);
         const op: Ast.Node.Tag = switch (tag) {
@@ -1347,10 +1358,8 @@ const Frame = struct {
                 const left = try f.eval(s, lhs);
                 const right = try f.eval(left.s, rhs);
                 const base = right.s;
-                if (f.looping) {
-                    try f.counted(base, lhs, left.v.lin);
-                    try f.counted(base, rhs, right.v.lin);
-                }
+                try f.counted(base, lhs, left.v.lin);
+                try f.counted(base, rhs, right.v.lin);
                 const x = left.v.lin orelse return .{ .yes = base, .no = base };
                 const y = right.v.lin orelse return .{ .yes = base, .no = base };
                 return switch (tree.nodeTag(node)) {
@@ -1633,7 +1642,7 @@ const Frame = struct {
     /// `0 <= v - v0 <= D·p` (or the same downward) over the passes `p`. A candidate a pass
     /// does not keep (two steps in one pass) is dropped like any other.
     fn stepCandidates(f: *Frame, s: State, node: Ast.Node.Index, p: Var, out: *std.ArrayList(Lin)) Error!State {
-        const Step = struct { d: Model.Declaration.Id, up: bool, most: Coef, mixed: bool = false };
+        const Step = struct { d: Model.Declaration.Id, up: bool, most: Coef, least: ?Coef = null, mixed: bool = false };
         var steps: std.ArrayList(Step) = .empty;
         const first = f.tree.firstToken(node);
         const last = f.tree.lastToken(node);
@@ -1659,6 +1668,7 @@ const Frame = struct {
             if (found.most != 0 and found.up != way.up) found.mixed = true;
             found.up = way.up;
             found.most = @max(found.most, way.most);
+            found.least = @min(found.least orelse way.least, way.least);
         }
         var entry = s;
         for (steps.items) |step| {
@@ -1676,13 +1686,23 @@ const Frame = struct {
                 if (try atLeast(f.a, v0, v)) |row| try out.append(f.a, row);
                 if (try plus(f.a, v, reach)) |bottom| if (try atLeast(f.a, bottom, v0)) |row| try out.append(f.a, row);
             }
+            // A step of at least `k` on each path through a pass (`: (i += 1)`) goes at least
+            // `k·p`: the count of passes is then bounded by how far the variable may go.
+            const least = step.least orelse 0;
+            if (least == 0) continue;
+            const gone = (try scaled(f.a, try single(f.a, p), least)) orelse continue;
+            if (step.up) {
+                if (try plus(f.a, v0, gone)) |bottom| if (try atLeast(f.a, v, bottom)) |row| try out.append(f.a, row);
+            } else {
+                if (try plus(f.a, v, gone)) |top| if (try atLeast(f.a, v0, top)) |row| try out.append(f.a, row);
+            }
         }
         return entry;
     }
 
     /// An assignment to `d` as a step: which way and by at most how much, or null where it is
     /// no step (a wrapping one, a product, a value of its own).
-    fn stepOf(f: *Frame, d: Model.Declaration.Id, tag: Ast.Node.Tag, value: Ast.Node.Index) Error!?struct { up: bool, most: Coef } {
+    fn stepOf(f: *Frame, d: Model.Declaration.Id, tag: Ast.Node.Tag, value: Ast.Node.Index) Error!?struct { up: bool, most: Coef, least: Coef } {
         const up, const amount = switch (tag) {
             .assign_add, .assign_add_sat => .{ true, value },
             .assign_sub, .assign_sub_sat => .{ false, value },
@@ -1700,13 +1720,13 @@ const Frame = struct {
         };
         if (f.trackedName(amount) == d) return null;
         if (f.tree.nodeTag(amount) == .number_literal) switch (std.zig.parseNumberLiteral(f.tree.tokenSlice(f.tree.nodeMainToken(amount)))) {
-            .int => |k| return .{ .up = up, .most = k },
+            .int => |k| return .{ .up = up, .most = k, .least = k },
             else => return null,
         };
         const int = (try f.intOf(amount)) orelse return null;
         if (int.signed) return null;
         const most = (try f.range(int, true)).high orelse return null;
-        return .{ .up = up, .most = most };
+        return .{ .up = up, .most = most, .least = 0 };
     }
 
     fn passOf(f: *Frame, invariant: State, node: Ast.Node.Index, label: ?[]const u8, value: Var, form: Form) RunError!Pass {
@@ -1744,12 +1764,8 @@ const Frame = struct {
             const e = try f.eval(s, full.ast.cond_expr);
             split = .{ .yes = try f.unwrap(e.s, e.v), .no = e.s };
             payload = .{ .lin = e.v.lin, .length = e.v.length };
-        } else {
-            const was_looping = f.looping;
-            f.looping = true;
-            defer f.looping = was_looping;
-            split = try f.cond(s, full.ast.cond_expr);
-        }
+            try f.counted(e.s, full.ast.cond_expr, e.v.lin);
+        } else split = try f.cond(s, full.ast.cond_expr);
         const entered = try f.capture(split.yes, full.payload_token, payload, try f.intOf(full.ast.cond_expr));
         const ran = try f.exec(entered, full.ast.then_expr);
         var exit = split.no;

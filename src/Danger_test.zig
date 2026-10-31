@@ -4628,7 +4628,10 @@ test "Bounds clears arithmetic and a conversion the relations along every path k
 
 test "Bounds bounds what a loop steps by how far each pass steps it and how many passes run: a sum of a table's days, a count of matches" {
     // Each twin's counter can pass its type: a u8 count over a slice of any length (line 21), a
-    // u32 count over a slice past 2^32 items on a 64-bit target (line 30).
+    // u32 count over a slice past 2^32 items on a 64-bit target (line 30), a count whose loop
+    // need not step its counter on every pass (line 48). A counter stepped on every pass
+    // (`: (i += 1)`) bounds the passes by how far it may go, so a count under it is bounded
+    // by the length it walks (`walked`).
     const result = try run(pack.integers,
         \\const std = @import("std");
         \\const days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
@@ -4663,9 +4666,28 @@ test "Bounds bounds what a loop steps by how far each pass steps it and how many
         \\    }
         \\    return seen;
         \\}
+        \\pub fn walked(r: *std.Io.Reader, items: []const u8) !usize {
+        \\    const m = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    var seen: usize = 0;
+        \\    while (i < items.len) : (i += 1) {
+        \\        if (items[i] == m) seen += 1;
+        \\    }
+        \\    return seen;
+        \\}
+        \\pub fn lingers(r: *std.Io.Reader, items: []const u8) !usize {
+        \\    const m = try r.takeByte();
+        \\    var i: usize = 0;
+        \\    var seen: usize = 0;
+        \\    while (i < items.len) {
+        \\        seen += 1;
+        \\        if (items[i] == m) i += 1;
+        \\    }
+        \\    return seen;
+        \\}
     );
     try std.testing.expectEqual(@as(usize, 0), result.undecided);
-    try std.testing.expectEqualSlices(u32, &.{ 21, 30 }, result.lines[0..result.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 21, 30, 48 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
@@ -6213,6 +6235,40 @@ test "A020 reads what decides how long a while runs by meaning: a variable by ea
         \\    var i: u32 = 0;
         \\    var total: u64 = 0;
         \\    while (i != 16) : (i += 1) total +%= i;
+        \\    return total;
+        \\}
+    , 0);
+}
+
+test "A020 bounds a while by what decides it where the program checked that against the memory it holds, each value a variable is given; not where it did not" {
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn drain(io: std.Io, r: *std.Io.Reader, buf: []const u8) !u64 {
+        \\    _ = io;
+        \\    var n: usize = try r.takeInt(u32, .little);
+        \\    var total: u64 = 0;
+        \\    var more = n != 0;
+        \\    while (more) {
+        \\        total +%= n;
+        \\        n -= 1;
+        \\        more = n != 0;
+        \\    }
+        \\    return total +% buf.len;
+        \\}
+    , 1);
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn drain(io: std.Io, r: *std.Io.Reader, buf: []const u8) !u64 {
+        \\    _ = io;
+        \\    var n: usize = try r.takeInt(u32, .little);
+        \\    if (n > buf.len) return error.TooLong;
+        \\    var total: u64 = 0;
+        \\    var more = n != 0;
+        \\    while (more) {
+        \\        total +%= n;
+        \\        n -= 1;
+        \\        more = n != 0;
+        \\    }
         \\    return total;
         \\}
     , 0);
