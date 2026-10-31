@@ -1833,7 +1833,10 @@ fn storesOf(self: *Facts, container: Container, field: Decl, name: []const u8) R
                             else => false,
                         };
                         // `@field` of a type names a declaration of it (`&@field(cpus, name)` with
-                        // `comptime cpus: type`), no field of a value.
+                        // `comptime cpus: type`), no field of a value; a name that ranges over
+                        // another struct's fields (`for (@typeInfo(T).@"struct".field_names)`)
+                        // names this field only where that struct has one so named.
+                        if (try self.fieldNamesOf(file, args[1])) |other| if (!self.hasField(other, name)) continue;
                         if (set and !try self.isType(file, args[0]) and mayHold(container, try self.resolve(file, args[0]))) return null;
                     } else if (std.mem.eql(u8, builtin_name, "@ptrCast") or std.mem.eql(u8, builtin_name, "@bitCast")) {
                         if (isOf(container, try self.literalType(file, node))) return null;
@@ -1860,6 +1863,47 @@ fn storesOf(self: *Facts, container: Container, field: Decl, name: []const u8) R
         1 => targets.items[0],
         else => .{ .alternatives = targets.items },
     };
+}
+
+/// The struct whose field names `node` ranges over: a `for`'s only capture over
+/// `@typeInfo(T).@"struct".field_names`, `T` a struct the program declares.
+fn fieldNamesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    if (tree.nodeTag(node) != .identifier) return null;
+    const decl = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(decl)];
+    if (record.kind != .capture) return null;
+    var at = record.node;
+    const loop = while (true) {
+        if (tree.fullFor(at)) |found| break found;
+        at = model.parentOf(at) orelse return null;
+    };
+    if (loop.ast.inputs.len != 1 or loop.payload_token != record.token) return null;
+    const names = loop.ast.inputs[0];
+    if (tree.nodeTag(names) != .field_access) return null;
+    const info, const names_member = tree.nodeData(names).node_and_token;
+    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(names_member)), "field_names")) return null;
+    if (tree.nodeTag(info) != .field_access) return null;
+    const call, const kind_member = tree.nodeData(info).node_and_token;
+    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(kind_member)), "struct")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, call, &buffer);
+    switch (tree.nodeTag(call)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call)), "@typeInfo") or args.len != 1) return null;
+    return switch (try self.resolve(file, args[0])) {
+        .container => |found| found,
+        else => null,
+    };
+}
+
+/// Whether `container` declares a field `name`.
+fn hasField(self: *const Facts, container: Container, name: []const u8) bool {
+    const found = self.member(container, name) orelse return false;
+    return self.project.at(found.file).model.declarations[@backingInt(found.index)].kind == .field;
 }
 
 /// Whether `node` is a type: one that resolves to a container, or a parameter declared `type`.
@@ -4315,4 +4359,8 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run = run; }\n", true));
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops) *const *const fn (u32) u32 { return &o.run; }\n", true));
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "const missing = @import(\"missing\");\npub fn g() void { _ = missing; }\n", true));
+    // A reflective write: by a name that ranges over another struct's fields, not this one's; by
+    // any other name, it may be.
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
 }
