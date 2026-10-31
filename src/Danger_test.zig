@@ -599,12 +599,64 @@ test "A015 judges a public generic at each binding, a consumer's among them, and
     try std.testing.expectEqual(@as(usize, 0), missing.findings);
 }
 
+test "A015 reads a container a type function makes inside another's with the outer call's arguments, and a type function's every return" {
+    // `Outer(T)` holds a `Box(T)`: the consumer's `Outer(std.Io.File)` holds the file through
+    // it, and `Opt(std.Io.Dir)` through an optional; aegis's own owner holds it as the answer.
+    const lib =
+        \\pub fn Box(comptime T: type) type { return struct { f: T }; }
+        \\pub fn Outer(comptime T: type) type { return struct { b: Box(T) }; }
+        \\pub fn Opt(comptime T: type) type { return struct { b: ?Box(T) }; }
+        \\pub fn Bits(comptime n: usize) type { if (n <= 64) return Narrow(n); return Wide(n); }
+        \\fn Narrow(comptime n: usize) type { return struct { mask: @Int(.unsigned, n) }; }
+        \\fn Wide(comptime n: usize) type { return struct { masks: [(n + 63) / 64]u64 }; }
+        \\pub fn Set(comptime E: type) type { return struct { bits: Bits(@typeInfo(E).@"enum".fields.len) }; }
+        \\pub fn Pick(comptime T: type, comptime n: usize) type { if (n > 3) return Box(T); return struct { g: T }; }
+    ;
+    const nested = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const S = dep.Outer(std.Io.File);
+        \\pub const O = dep.Opt(std.Io.Dir);
+        \\pub const W = struct { s: dep.Outer(std.Io.File) };
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), nested.undecided);
+    try std.testing.expectEqual(@as(usize, 3), nested.findings);
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(f: *std.Io.File) void { _ = f; }
+        \\pub fn Outer(comptime T: type) type { return struct { o: aegis.own.Owned(T, shut) }; }
+        \\pub const S = Outer(std.Io.File);
+    , 0);
+    // A set over an enum, whose bits are one of two containers by its size, each a number's:
+    // decided, nothing held. One of whose returns is a container the function declares, which
+    // only its template reads: undecided, never clear.
+    const chosen = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const E = enum { a, b };
+        \\pub const Flags = dep.Set(E);
+        \\pub const P = dep.Pick(std.Io.File, 1);
+    , lib);
+    try std.testing.expectEqual(@as(usize, 1), chosen.undecided);
+    try std.testing.expectEqual(@as(usize, 0), chosen.findings);
+}
+
 test "A015 reads a tuple's fields, named by position only, as fields" {
     try expect(pack.ownership,
         \\const std = @import("std");
         \\pub const S = struct { pair: struct { std.Io.File, u32 } };
         \\pub const T = struct { std.Io.Dir, *std.Io.File };
     , 2);
+    // An enum's or a union's field written without a type parses as a tuple's does: a name,
+    // neither held nor undecided.
+    const names = try run(pack.ownership,
+        \\pub const Kind = enum { secret, bytes, scalar };
+        \\pub const Tag = union(enum) { none, some: u8 };
+        \\pub const Raw = struct { u8, u32 };
+    );
+    try std.testing.expectEqual(@as(usize, 0), names.undecided);
+    try std.testing.expectEqual(@as(usize, 0), names.findings);
 }
 
 test "A015 finds std resources held by value in a field, released or not, or returned by value, not borrowed by pointer, owned or lent" {

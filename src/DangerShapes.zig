@@ -61,23 +61,28 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ what, decl.name, how, paths[which] }));
     }
     // A tuple's fields, named by position only, are no declarations: each is read where it is
-    // written, as a field is.
+    // written, as a field is. An enum's or a union's field written without a type parses the
+    // same, and is a name.
+    var buffer: [2]Ast.Node.Index = undefined;
     for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const field = tree.fullContainerField(node) orelse continue;
-        if (!field.ast.tuple_like) continue;
-        const first = tree.firstToken(node);
-        if (c.inTest(first)) continue;
-        const written = field.ast.type_expr.unwrap() orelse continue;
-        const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
-            .resource => |which| which,
-            .other, .generic => continue,
-            .unknown => {
-                try c.undecided(rule, tree.tokenStart(first), .unresolved, "a tuple's field whose type does not resolve may hold a std resource by value");
-                continue;
-            },
-        };
-        try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{paths[which]}));
+        const container = tree.fullContainerDecl(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
+        if (tree.tokenTag(container.ast.main_token) != .keyword_struct) continue;
+        for (container.ast.members) |node| {
+            const field = tree.fullContainerField(node) orelse continue;
+            if (!field.ast.tuple_like) continue;
+            const first = tree.firstToken(node);
+            if (c.inTest(first)) continue;
+            const written = field.ast.type_expr.unwrap() orelse continue;
+            const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
+                .resource => |which| which,
+                .other, .generic => continue,
+                .unknown => {
+                    try c.undecided(rule, tree.tokenStart(first), .unresolved, "a tuple's field whose type does not resolve may hold a std resource by value");
+                    continue;
+                },
+            };
+            try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{paths[which]}));
+        }
     }
     try bindings(c, rule, resources, &paths);
 }
@@ -85,29 +90,41 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
 /// What a value holds by value of the std resources: one of them (`resource`, its index);
 /// none; a type a generic's binding gives (`generic`); or a type that does not resolve. A
 /// pointer borrows; an optional, an error union and an array hold what they wrap; a choice of
-/// types per build holds what any of them holds.
+/// types per build holds what any of them holds; a container a type function made holds what
+/// its fields hold with the call's arguments (`Box(T)` inside `Outer(T)`), one declared once
+/// being judged at its declaration, and aegis's own (`own.Owned`) being the answer.
 const Holding = union(enum) { resource: usize, other, generic, unknown };
 
 fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, depth: usize) Context.Error!Holding {
     if (depth == 16) return .unknown;
     return switch (value) {
-        .container, .instance => |k| if (find(resources, k)) |which| .{ .resource = which } else .other,
+        .container, .instance => |k| blk: {
+            if (find(resources, k)) |which| break :blk .{ .resource = which };
+            const made = k.made_by orelse break :blk .other;
+            if (try c.inLibrary(Contract.library, made.function.file)) break :blk .other;
+            var found: Holding = .other;
+            for (try Taint.fieldsOf(c, k)) |field| found = join(found, try heldBy(c, resources, try c.facts.fieldValue(k, field), depth + 1));
+            break :blk found;
+        },
         .optional, .error_union, .array => |inner| heldBy(c, resources, inner.*, depth + 1),
         .alternatives => |each| blk: {
             var found: Holding = .other;
-            for (each) |one| switch (try heldBy(c, resources, one, depth + 1)) {
-                .resource => |which| break :blk .{ .resource = which },
-                .unknown => found = .unknown,
-                .generic => if (found == .other) {
-                    found = .generic;
-                },
-                .other => {},
-            };
+            for (each) |one| found = join(found, try heldBy(c, resources, one, depth + 1));
             break :blk found;
         },
         .unknown => |why| if (why == .generic) .generic else .unknown,
         else => .other,
     };
+}
+
+/// What two parts together hold: a resource either holds, else a type that does not resolve,
+/// else a binding's type.
+fn join(a: Holding, b: Holding) Holding {
+    if (a == .resource) return a;
+    if (b == .resource) return b;
+    if (a == .unknown or b == .unknown) return .unknown;
+    if (a == .generic or b == .generic) return .generic;
+    return .other;
 }
 
 /// A015 at each binding of a public generic, the consumer's among them: a container a type
@@ -122,6 +139,7 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buffer, node) orelse continue;
         if (c.inTest(tree.nodeMainToken(node))) continue;
+        if (declaredType(c, node)) continue;
         const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
         const function = (try c.facts.origin(callee)) orelse continue;
         const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
@@ -129,34 +147,50 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
         // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
         if (try c.inLibrary(Contract.library, function.file)) continue;
         const made = try c.facts.resolve(c.file, node);
-        switch (made) {
-            // A type function's container: what each field holds with these arguments.
-            .container => |container| {
-                if (container.made_by == null) continue;
-                for (try Taint.fieldsOf(c, container)) |field| {
-                    const name = c.project.at(field.file).model.declarations[@backingInt(field.index)].name;
-                    switch (try heldBy(c, resources, try c.facts.fieldValue(container, field), 0)) {
-                        .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes field '{s}' of '{s}' hold a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ name, record.name, paths[which] })),
-                        .other, .generic => {},
-                        .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a field this binding makes has a type that does not resolve: it may hold a std resource by value"),
+        const written_tree = &c.project.at(function.file).file.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = written_tree.fullFnProto(&proto_buffer, record.node) orelse continue;
+        const result = proto.ast.return_type.unwrap() orelse continue;
+        if (written_tree.nodeTag(result) == .identifier and std.mem.eql(u8, written_tree.tokenSlice(written_tree.nodeMainToken(result)), "type")) {
+            // A type function's container: what each field holds with these arguments; one of
+            // a choice of them, each; a type that does not resolve may be one.
+            const each: []const Facts.Value = if (made == .alternatives) made.alternatives else &.{made};
+            for (each) |one| switch (one) {
+                .container => |container| {
+                    if (container.made_by == null) continue;
+                    for (try Taint.fieldsOf(c, container)) |field| {
+                        const name = c.project.at(field.file).model.declarations[@backingInt(field.index)].name;
+                        switch (try heldBy(c, resources, try c.facts.fieldValue(container, field), 0)) {
+                            .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes field '{s}' of '{s}' hold a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ name, record.name, paths[which] })),
+                            .other, .generic => {},
+                            .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a field this binding makes has a type that does not resolve: it may hold a std resource by value"),
+                        }
                     }
-                }
-            },
-            // A generic function's result, where its declared type is a parameter's.
-            else => {
-                const written_tree = &c.project.at(function.file).file.tree;
-                var proto_buffer: [1]Ast.Node.Index = undefined;
-                const proto = written_tree.fullFnProto(&proto_buffer, record.node) orelse continue;
-                const result = proto.ast.return_type.unwrap() orelse continue;
-                if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
-                switch (try heldBy(c, resources, made, 0)) {
-                    .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ record.name, paths[which] })),
-                    .other, .generic => {},
-                    .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
-                }
-            },
+                },
+                .unknown => |why| if (why != .generic) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "the type this binding makes does not resolve: it may hold a std resource by value"),
+                else => {},
+            };
+            continue;
+        }
+        // A generic function's result, where its declared type is a parameter's.
+        if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
+        switch (try heldBy(c, resources, made, 0)) {
+            .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ record.name, paths[which] })),
+            .other, .generic => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
         }
     }
+}
+
+/// Whether a call is the whole type a field or a function's result is written as: `ownership`
+/// judges what it holds there, at the declaration.
+fn declaredType(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const parent = c.project.at(c.file).model.parentOf(node) orelse return false;
+    if (tree.fullContainerField(parent)) |field| return field.ast.type_expr == node.toOptional();
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullFnProto(&buffer, parent)) |proto| return proto.ast.return_type == node.toOptional();
+    return false;
 }
 
 /// Whether every return of a function reads a resource someone already holds, so it hands over

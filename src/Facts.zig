@@ -32,6 +32,8 @@ cast_sites: std.AutoHashMapUnmanaged(Key, void) = .empty,
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
+/// The values a type function's own `return`s give, by function, found once (`everyReturn`).
+type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
 /// What each generic parameter binds when the project's own calls are the only ones: the
 /// union of their arguments, or null when the function is reachable from outside or taken
 /// other than by a call.
@@ -187,6 +189,7 @@ pub fn deinit(self: *Facts) void {
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
+    self.type_returns.deinit(self.gpa);
     self.callers.deinit(self.gpa);
     if (self.comptime_fields) |*names| names.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
@@ -1642,6 +1645,9 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
     if (std.mem.eql(u8, name, "@Vector") and args.len == 2) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[1])) };
+    // An integer type of a signedness and width computed at compile time: a number, whose width
+    // nothing here reads.
+    if (std.mem.eql(u8, name, "@Int")) return .{ .primitive = "@Int" };
     if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(file, try self.resolveIn(env, file, args[0]), args[1]);
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
@@ -3149,7 +3155,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     bound.* = .{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items };
     const result_tree = target_tree;
     if (returns_type) {
-        const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return null;
+        const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
         // A container is the template's, which the call makes: read by the existing means.
         var container_buffer: [2]Ast.Node.Index = undefined;
         if (result_tree.fullContainerDecl(&container_buffer, returned) != null) return null;
@@ -3224,6 +3230,45 @@ fn finalReturn(tree: *const Ast, model: *const Model, record: Model.Declaration)
         if (tree.tokenTag(@intCast(token)) == .keyword_return) return null;
     }
     return tree.nodeData(last).opt_node.unwrap();
+}
+
+/// What a type function returns where more than its final statement returns: the choice of
+/// every type one of its own `return`s gives with the call's bindings (`bit_set.Static`'s
+/// `Integer(size)` or `Array(usize, size)`), a superset of the one a build takes. Null where
+/// one is a container it declares, which only the template reads, or one does not resolve.
+fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declaration) ResolveError!?Value {
+    const tree = &self.project.at(decl.file).file.tree;
+    const model = &self.project.at(decl.file).model;
+    const returns = self.type_returns.get(decl) orelse found: {
+        var fn_node = record.node;
+        if (tree.nodeTag(fn_node) != .fn_decl) fn_node = model.parentOf(fn_node) orelse return null;
+        if (tree.nodeTag(fn_node) != .fn_decl) return null;
+        const body = tree.nodeData(fn_node).node_and_node[1];
+        var list: std.ArrayList(Ast.Node.Index) = .empty;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"return") continue;
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = tree.nodeMainToken(node);
+            if (token < tree.firstToken(body) or token > tree.lastToken(body)) continue;
+            // A method's of a container the function returns is the method's own.
+            var parent = model.parentOf(node);
+            while (parent) |p| : (parent = model.parentOf(p)) if (tree.nodeTag(p) == .fn_decl) break;
+            if (parent != fn_node) continue;
+            // A bare `return` gives no type: only a type function that does not compile.
+            try list.append(self.gpa, tree.nodeData(node).opt_node.unwrap() orelse return null);
+        }
+        try self.type_returns.put(self.gpa, decl, list.items);
+        break :found list.items;
+    };
+    if (returns.len == 0) return null;
+    const values = try self.gpa.alloc(Value, returns.len);
+    for (returns, values) |returned, *value| {
+        var container_buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&container_buffer, returned) != null) return null;
+        value.* = try self.resolveIn(bound, decl.file, returned);
+        if (value.* == .unknown) return null;
+    }
+    return try self.choose(values);
 }
 
 /// `node` read with `env`'s bindings: a parameter of the function being read is its argument,
