@@ -107,6 +107,26 @@ test "compatibility strict stale suppressions and exhausted facts are incomplete
     try std.testing.expect(!exhausted.complete);
 }
 
+test "each file's analysis has its own fact budget" {
+    const source = "const S = struct { a: u32, b: u32 };\npub fn f(s: S) u32 { const t = s; return t.a + t.b; }\n";
+    var one = try glint.Project.init(std.testing.allocator, &.{.{ .name = "one", .bytes = source }}, &.{}, .{});
+    defer one.deinit();
+    // The least budget one file completes in.
+    var budget: usize = 1;
+    while (budget < 100_000) : (budget += 1) {
+        var report = try glint.run(std.testing.allocator, &one, .{ .fact_budget = budget });
+        defer report.deinit();
+        if (report.complete) break;
+    }
+    try std.testing.expect(budget > 1);
+    // Three such files each complete within it: no file is charged another's work.
+    var three = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "one", .bytes = source }, .{ .name = "two", .bytes = source }, .{ .name = "three", .bytes = source } }, &.{}, .{});
+    defer three.deinit();
+    var report = try glint.run(std.testing.allocator, &three, .{ .fact_budget = budget });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+}
+
 test "compatibility suppression rejects multiple distinct binding sites" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
     defer project.deinit();

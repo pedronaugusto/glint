@@ -643,7 +643,7 @@ const Walk = struct {
             if (tree.nodeTag(kind) != .array_type) return false;
             const length = literalValue(tree, tree.nodeData(kind).node_and_node[0]) orelse return false;
             // An array past half of what a u64 counts has no length twice its own here.
-            return value == std.math.mul(u64, 2, length) catch return false;
+            return value == (std.math.mul(u64, 2, length) catch return false);
         }
         if (tree.nodeTag(node) != .mul) return false;
         const lhs, const rhs = tree.nodeData(node).node_and_node;

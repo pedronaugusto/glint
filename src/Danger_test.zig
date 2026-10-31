@@ -1170,6 +1170,21 @@ test "A019 follows a parent handed to a generic outside the program into its bod
     try std.testing.expect(unread.undecided > baseline.undecided);
 }
 
+test "A019 holds an interface to its contract where it is used: a pub accessor returning it clears, and a copy, a function read out or a value passed is flagged where it is made" {
+    const tail = "    return s.count + s.interface.end;\n}\n";
+    // Clean: an accessor returning the interface's address, and its user writing through it.
+    const accessor = comptime edited(interface_program, tail, "    return s.count + s.interface.end;\n}\npub fn writer(s: *Sink) *std.Io.Writer {\n    return &s.interface;\n}\npub fn put(s: *Sink) !void {\n    try writer(s).writeAll(\"y\");\n}\n");
+    try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, accessor)).findings);
+    // Findings where they are made: a copy of what the accessor points at (26); the vtable read
+    // out into another writer (26, and the conversion: 11); the interface passed by value (26).
+    const copied = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    const copy = w.*;\n    _ = copy;\n"));
+    try std.testing.expectEqualSlices(u32, &.{26}, copied.lines[0..copied.findings]);
+    const table = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    var other: std.Io.Writer = .{ .vtable = w.vtable };\n    _ = &other;\n"));
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 26 }, table.lines[0..table.findings]);
+    const passed = try run(pack.unsafe_set, comptime edited(accessor, "    try writer(s).writeAll(\"y\");\n", "    const w = writer(s);\n    keep(w.*);\n}\nfn keep(w: std.Io.Writer) void {\n    _ = w;\n"));
+    try std.testing.expectEqualSlices(u32, &.{26}, passed.lines[0..passed.findings]);
+}
+
 const observer_program =
     \\const Observer = struct {
     \\    vtable: *const VTable,

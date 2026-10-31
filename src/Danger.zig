@@ -483,10 +483,13 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         // ReleaseFast, where nothing checks either.
         // Where the program shows the pointer is that field's (an interface's own field, a
         // node of an intrusive list), the parent is shown and its alignment with it.
-        // A C handed to a generic whose body could not be read leaves it undecided.
-        const verdict: ParentPointer.Verdict = if (std.mem.eql(u8, name, "@fieldParentPtr"))
+        // A C handed to a generic whose body could not be read leaves it undecided; so does a
+        // judgement the fact budget ran out in.
+        const before = c.facts.remaining;
+        var verdict: ParentPointer.Verdict = if (std.mem.eql(u8, name, "@fieldParentPtr"))
             try ParentPointer.cleared(c, node)
         else if (std.mem.eql(u8, name, "@alignCast")) try ParentPointer.clearedAlignment(c, node) else .open;
+        if (verdict == .open and before != 0 and c.facts.remaining == 0) verdict = .undecided;
         switch (verdict) {
             .shown => continue,
             .undecided => {
@@ -499,6 +502,8 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, token, try c.allocator.print("{s}: a pointer conversion no build checks", .{name}));
         };
     }
+    // The interface contract: what may break a parent pointer an interface recovers.
+    try ParentPointer.contract(c, rule);
     const model = &c.project.at(c.file).model;
     for (model.declarations) |decl| {
         if (decl.kind != .variable and decl.kind != .function) continue;

@@ -556,6 +556,13 @@ fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError
 }
 const Standard = struct { reached: ?Files = null };
 
+/// Whether `file` is one of std's: a file std's module reaches.
+pub fn standard(self: *Facts, file: Project.FileId) ResolveError!bool {
+    const known = try self.memo(Standard);
+    if (known.reached == null) known.reached = try self.standardFiles();
+    return known.reached.?.contains(file);
+}
+
 /// Whether a scan of "every use in the program" reads `file`: a file selected, or any file a
 /// path import (`@import("other.zig")`) joins to one, either way: a use in a file of the package
 /// left out of the selection is still a use. A module imported by name (std, a dependency) is

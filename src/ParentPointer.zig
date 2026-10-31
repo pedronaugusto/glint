@@ -23,17 +23,18 @@ const Facts = @import("Facts.zig");
 const Governed = @import("Governed.zig");
 const Model = @import("Model.zig");
 const Project = @import("Project.zig");
+const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
 /// Whether the `@fieldParentPtr` call `node` in the checked file is one of the two shapes,
 /// with every generic a C is handed to read: shown, or undecided where one could not be.
 pub fn cleared(c: *Context, node: Ast.Node.Index) Context.Error!Verdict {
-    const field, const kind = (try shown(c, node)) orelse return .open;
-    return generics(c, field, kind);
+    const field, const kind, const interface = (try shown(c, node)) orelse return .open;
+    return generics(c, field, kind, interface);
 }
 
 /// The field a conversion is of, and its type, where it is one of the two shapes.
-fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts.Container } {
+fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts.Container, bool } {
     const tree = &c.project.at(c.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
@@ -51,8 +52,8 @@ fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts
     const kind = held(try c.facts.resolve(field.file, declared)) orelse return null;
     const field_of: Field = .{ .parent = parent, .name = name };
     const pointer = strip(tree, args[1]);
-    if (try interfaceField(c, node, pointer, field_of, kind)) return .{ field_of, kind };
-    if (try listNode(c, pointer, field_of, kind)) return .{ field_of, kind };
+    if (try interfaceField(c, node, pointer, field_of, kind)) return .{ field_of, kind, true };
+    if (try listNode(c, pointer, field_of, kind)) return .{ field_of, kind, false };
     return null;
 }
 
@@ -85,7 +86,7 @@ fn interfaceField(c: *Context, node: Ast.Node.Index, pointer: Ast.Node.Index, fi
     if (!same(interface, kind)) return false;
     if (!try reachedOnlyInstalled(c, function, param.token, field, kind, 0)) return false;
     if (!try calledOnlyOnItself(c, kind)) return false;
-    return addressedOnly(c, field, kind);
+    return addressedOnly(c, field, kind, true);
 }
 
 /// Whether every read in the package of a function an interface of type `kind` holds (a
@@ -156,14 +157,19 @@ fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Contex
             return false;
         }
         if (!isParent(value, kind)) continue;
-        const parent = model.parentOf(use.node) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .field_access, .equal_equal, .bang_equal => {},
-            .assign => if (tree.nodeData(parent).node_and_node[0] != use.node) return false,
-            else => return false,
-        }
+        if (!tableInPlace(tree, model, use.node)) return false;
     }
     return true;
+}
+
+/// Whether the vtable read `use` reads a function of the table, is written, or is compared.
+fn tableInPlace(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool {
+    const parent = model.parentOf(use) orelse return false;
+    return switch (tree.nodeTag(parent)) {
+        .field_access, .equal_equal, .bang_equal => true,
+        .assign => tree.nodeData(parent).node_and_node[0] == use,
+        else => false,
+    };
 }
 
 /// The positions of the parameters of the function type `proto` that are pointers to `kind`,
@@ -197,34 +203,54 @@ fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, thr
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (namespace(tree, model, receiver)) continue;
+            if (namespace(tree, model, receiver) or notFunction(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
-        var callee = use.node;
-        var outer = model.parentOf(use.node) orelse return false;
-        if (tree.nodeTag(outer) == .unwrap_optional) {
-            callee = outer;
-            outer = model.parentOf(outer) orelse return false;
-        }
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, outer) orelse return false;
-        if (call.ast.fn_expr != callee) return false;
-        // The interface: the receiver, or what the vtable was read from.
-        var interface = receiver;
-        if (through) {
-            if (tree.nodeTag(receiver) != .field_access) return false;
-            interface = tree.nodeData(receiver).node_and_token[0];
-        }
-        for (call.ast.params, 0..) |param, position| {
-            if (position >= 64 or given & (@as(u64, 1) << @intCast(position)) == 0) continue;
-            var argument = strip(tree, param);
-            if (tree.nodeTag(argument) == .address_of) argument = strip(tree, tree.nodeData(argument).node);
-            if (!sameTokens(tree, argument, interface)) return false;
-        }
-        if (call.ast.params.len < 64 and given >> @intCast(call.ast.params.len) != 0) return false;
+        if (!calledOnSelf(tree, model, use.node, through, given)) return false;
     }
     return true;
+}
+
+/// Whether the member read `use` is no function pointer: something reads a member of it,
+/// indexes, slices or iterates it, which Zig allows no function pointer.
+fn notFunction(tree: *const Ast, model: *const Model, use: Ast.Node.Index) bool {
+    const parent = model.parentOf(use) orelse return false;
+    if (tree.fullFor(parent)) |loop| return std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, use) != null;
+    return switch (tree.nodeTag(parent)) {
+        .field_access => tree.nodeData(parent).node_and_token[0] == use,
+        .array_access => tree.nodeData(parent).node_and_node[0] == use,
+        .slice, .slice_open, .slice_sentinel => true,
+        else => false,
+    };
+}
+
+/// Whether the function read `use` (`x.f`, `x.vtable.f` where `through`) is called at once,
+/// `.?` unwrapping it at most, with the interface it was read from at each position `given`.
+fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, through: bool, given: u64) bool {
+    const receiver = tree.nodeData(use).node_and_token[0];
+    var callee = use;
+    var outer = model.parentOf(use) orelse return false;
+    if (tree.nodeTag(outer) == .unwrap_optional) {
+        callee = outer;
+        outer = model.parentOf(outer) orelse return false;
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, outer) orelse return false;
+    if (call.ast.fn_expr != callee) return false;
+    // The interface: the receiver, or what the vtable was read from.
+    var interface = receiver;
+    if (through) {
+        if (tree.nodeTag(receiver) != .field_access) return false;
+        interface = tree.nodeData(receiver).node_and_token[0];
+    }
+    for (call.ast.params, 0..) |param, position| {
+        if (position >= 64 or given & (@as(u64, 1) << @intCast(position)) == 0) continue;
+        var argument = strip(tree, param);
+        if (tree.nodeTag(argument) == .address_of) argument = strip(tree, tree.nodeData(argument).node);
+        if (!sameTokens(tree, argument, interface)) return false;
+    }
+    return call.ast.params.len >= 64 or given >> @intCast(call.ast.params.len) == 0;
 }
 
 /// The function type a pointer to a function, or an optional one, points at.
@@ -405,8 +431,8 @@ fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: u8) C
 /// place it goes, stays one: none copies it. A use whose receiver does not resolve may be C's,
 /// and shows nothing, unless it is an import's name. So do the interface parameters of every
 /// function of C's file, which a vtable may hand C.F.
-fn addressedOnly(c: *Context, field: Field, kind: Facts.Container) Context.Error!bool {
-    var follow: Follow = .{ .c = c, .kind = kind };
+fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bool) Context.Error!bool {
+    var follow: Follow = .{ .c = c, .kind = kind, .contract = interface };
     for (try c.facts.memberUses(field.name)) |use| {
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
@@ -474,6 +500,8 @@ fn namedBy(c: *Context, tree: *const Ast, spelling: Ast.Node.Index, name: []cons
 const Follow = struct {
     c: *Context,
     kind: Facts.Container,
+    /// An interface's: a `pub` function may return it, its callers held to `contract`.
+    contract: bool = false,
     seen: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     steps: usize = 0,
 
@@ -504,6 +532,9 @@ const Follow = struct {
                 return f.stored(file, target);
             },
             .@"return" => return f.returned(file, parent),
+            // A switch prong's value, a labeled block's: what the switch or block is.
+            .switch_case_one, .switch_case, .switch_case_inline_one, .switch_case_inline => return f.stays(file, model.parentOf(parent) orelse return false),
+            .@"break" => return f.stays(file, labeled(tree, model, parent) orelse return false),
             else => {},
         }
         if (isBuiltin(tree, parent, "@fieldParentPtr")) return true;
@@ -617,6 +648,9 @@ const Follow = struct {
         const c = f.c;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind != .function) return false;
+        // std's own `Io.Writer` and `Io.Reader` methods keep the interface in place: Io's
+        // contract, which every implementation's vtable is written to.
+        if (f.contract and decl.file == f.kind.file and record.scope == f.kind.scope and try c.facts.standard(decl.file)) return true;
         const tree = &c.project.at(decl.file).file.tree;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
@@ -700,7 +734,7 @@ const Follow = struct {
         const function = enclosingFunction(tree, model, node) orelse return false;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, function) orelse return false;
-        if (proto.visib_token != null) return false;
+        if (proto.visib_token != null) return f.contract;
         if (!f.pointer(try c.facts.resolve(file, proto.ast.return_type.unwrap() orelse return false))) {
             const result = try c.facts.resolve(file, proto.ast.return_type.unwrap() orelse return false);
             if (result != .error_union or !f.pointer(result.error_union.*)) return false;
@@ -731,11 +765,11 @@ pub const Verdict = enum { shown, open, undecided };
 /// Whether a C handed to a generic (an `anytype` parameter, or one whose type the program
 /// does not fix) keeps C.F in a C there, read in the callee's body wherever it is: the
 /// program's, std's or a dependency's. Memoized per field: every conversion of C.F shares it.
-fn generics(c: *Context, field: Field, kind: Facts.Container) Context.Error!Verdict {
+fn generics(c: *Context, field: Field, kind: Facts.Container, interface: bool) Context.Error!Verdict {
     const decl = c.facts.member(field.parent, field.name) orelse return .open;
     const known = try c.facts.memo(Generics);
     if (known.verdicts.get(decl)) |verdict| return verdict;
-    var carry: Carry = .{ .c = c, .field = field, .follow = .{ .c = c, .kind = kind } };
+    var carry: Carry = .{ .c = c, .field = field, .follow = .{ .c = c, .kind = kind, .contract = interface } };
     const verdict = try carry.program();
     try known.verdicts.put(c.allocator, decl, verdict);
     return verdict;
@@ -789,7 +823,7 @@ const Carry = struct {
 
     /// Whether the expression `node` is a carrier, and how.
     fn carries(k: *Carry, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!?Shape {
-        if (depth == 8) return .held;
+        if (depth == 32) return .held;
         const c = k.c;
         const tree = &c.project.at(file).file.tree;
         const at = strip(tree, node);
@@ -810,7 +844,7 @@ const Carry = struct {
 
     /// Whether a value is a C, a pointer to one, or holds them.
     fn holds(k: *Carry, value: Facts.Value, depth: u8) Context.Error!?Shape {
-        if (depth == 8) return .held;
+        if (depth == 32) return .held;
         return switch (value) {
             .instance => |container| if (same(container, k.field.parent)) .whole else null,
             .pointer, .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
@@ -1065,6 +1099,263 @@ fn opaqueType(c: *Context, container: Facts.Container) bool {
     return tree.nodeTag(node) == .container_decl and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "opaque");
 }
 
+/// The interface contract. An interface is a type whose functions take a pointer to it and
+/// recover the struct around it by `@fieldParentPtr`: std's `Io.Writer` and `Io.Reader`, and
+/// every type a loaded file converts its own parameter from so. It works only where it was
+/// installed, so in every file glint checks it is used in place: never copied by value (`w.*`,
+/// a value passed, returned, put in a local, a field or a literal), its functions and vtable
+/// never read out or called on another interface, and a pointer to it handed only where the
+/// function given it is read and keeps it in place. A pointer to one may then go anywhere,
+/// a `pub` function's result included: what could break it is flagged where it is done. A
+/// consumer glint does not check is not covered (std's own rule: an interface is not copied).
+pub fn contract(c: *Context, rule: Rule) Context.Error!void {
+    const kinds = try interfaces(c);
+    if (kinds.len == 0) return;
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        switch (tag) {
+            .identifier, .field_access, .deref, .array_access, .unwrap_optional, .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const token = tree.nodeMainToken(node);
+        if (c.inTest(token)) continue;
+        if (isBuiltin(tree, node, "@field")) if (try namesFunction(c, kinds, node)) {
+            try c.at(rule, token, "@field naming an interface's function or vtable: a function its implementation installed, read out, recovers its parent by @fieldParentPtr from whatever it is then given");
+            continue;
+        };
+        const value = try c.facts.resolve(c.file, node);
+        if (held(value)) |container| if (value == .instance and interfaceOf(kinds, container) != null and copied(tree, model, node)) {
+            try c.at(rule, token, "a copy of an interface: its functions recover the struct around it by @fieldParentPtr, which a copy is not in; keep it where it was installed and pass its address");
+            continue;
+        };
+        if (tag == .field_access and !try readInPlace(c, kinds, node)) {
+            try c.at(rule, token, "an interface's function or vtable read out, or called on another interface: it recovers its parent by @fieldParentPtr from the interface it is given");
+            continue;
+        }
+        const target = if (value == .instance) value.instance else pointee(value) orelse continue;
+        const kind = interfaceOf(kinds, target) orelse continue;
+        if (!try handedInPlace(c, kind, node)) {
+            try c.at(rule, token, "an interface handed to a function that may copy it or read its functions out: its functions recover the struct around it by @fieldParentPtr");
+        }
+    }
+}
+
+const Interfaces = struct { kinds: ?[]const Facts.Container = null, handed: std.AutoHashMapUnmanaged(struct { Facts.Container, Facts.Decl, usize }, bool) = .empty };
+
+/// std's `Io.Writer` and `Io.Reader`, and each type a loaded file outside std converts its own
+/// parameter from by `@fieldParentPtr`.
+fn interfaces(c: *Context) Context.Error![]const Facts.Container {
+    const known = try c.facts.memo(Interfaces);
+    if (known.kinds) |kinds| return kinds;
+    var kinds: std.ArrayList(Facts.Container) = .empty;
+    for ([_][]const u8{ "Io.Writer", "Io.Reader" }) |path| {
+        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |found| {
+            if (held(try c.facts.declaration(found))) |kind| if (interfaceOf(kinds.items, kind) == null) try kinds.append(c.allocator, kind);
+        }
+    }
+    for (c.project.sources) |*source| {
+        if (source.file.status != .parsed or try c.facts.standard(source.id)) continue;
+        const tree = &source.file.tree;
+        for (tree.nodes.items(.tag), 0..) |_, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!isBuiltin(tree, node, "@fieldParentPtr")) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 2) continue;
+            const pointer = strip(tree, args[1]);
+            if (tree.nodeTag(pointer) != .identifier) continue;
+            const index = (source.model.reference(pointer) orelse continue).declaration orelse continue;
+            const param = source.model.declarations[@backingInt(index)];
+            if (param.kind != .parameter) continue;
+            const declared = tree.fullPtrType(param.node) orelse continue;
+            const kind = held(try c.facts.resolve(source.id, declared.ast.child_type)) orelse continue;
+            if (interfaceOf(kinds.items, kind) == null) try kinds.append(c.allocator, kind);
+        }
+    }
+    known.kinds = kinds.items;
+    return kinds.items;
+}
+
+fn interfaceOf(kinds: []const Facts.Container, container: Facts.Container) ?Facts.Container {
+    for (kinds) |kind| if (same(kind, container)) return kind;
+    return null;
+}
+
+/// Whether the value `node` is copied where it is: put in a local, a place, a literal, given
+/// by value, returned, captured by value. A part read, an address taken, a type asked, a write
+/// to it, are not.
+fn copied(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (true) {
+        const parent = model.parentOf(at) orelse return false;
+        switch (tree.nodeTag(parent)) {
+            .grouped_expression, .@"try", .@"orelse", .@"catch" => {
+                at = parent;
+                continue;
+            },
+            .field_access, .address_of, .unwrap_optional, .deref, .equal_equal, .bang_equal => return false,
+            .assign => {
+                const target, _ = tree.nodeData(parent).node_and_node;
+                if (target == at) return false;
+                return !(tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_"));
+            },
+            .switch_case_one, .switch_case, .switch_case_inline_one, .switch_case_inline => {
+                at = model.parentOf(parent) orelse return true;
+                continue;
+            },
+            else => {},
+        }
+        if (tree.fullVarDecl(parent)) |variable| return variable.ast.init_node.unwrap() == at;
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr == at) return branch.payload_token != null and tree.tokenTag(branch.payload_token.?) != .asterisk;
+            at = parent;
+            continue;
+        }
+        if (tree.fullWhile(parent)) |loop| return loop.ast.cond_expr == at and loop.payload_token != null and tree.tokenTag(loop.payload_token.?) != .asterisk;
+        switch (tree.nodeTag(parent)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(parent));
+                for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf", "@bitSizeOf", "@hasField", "@hasDecl", "@field" }) |typed| {
+                    if (std.mem.eql(u8, name, typed)) return false;
+                }
+                if (std.mem.eql(u8, name, "@as")) {
+                    at = parent;
+                    continue;
+                }
+                return true;
+            },
+            else => return true,
+        }
+    }
+}
+
+/// Whether the member read `access` of an interface (or of its vtable) is in place: a function
+/// called then and there on the interface it was read from, a vtable read for a function of it,
+/// compared or written. Another member, or another type's, is not one of these.
+fn readInPlace(c: *Context, kinds: []const Facts.Container, access: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const receiver = try c.facts.resolve(c.file, tree.nodeData(access).node_and_token[0]);
+    const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(access).node_and_token[1]));
+    for (kinds) |kind| {
+        for (try functions(c, kind)) |slot| {
+            if (!std.mem.eql(u8, slot.name, name) or !isParent(receiver, slot.holder)) continue;
+            if (slot.table) return tableInPlace(tree, model, access);
+            const given = slot.given orelse return false;
+            if (!calledOnSelf(tree, model, access, slot.through, given)) return false;
+        }
+    }
+    return true;
+}
+
+/// A function an interface holds: a function pointer field of it (`holder` the interface), a
+/// vtable field (`table`), or a function of the vtable (`through`, `holder` the table); with
+/// the positions of its parameters that take the interface, null where they do not resolve.
+const Slot = struct { holder: Facts.Container, name: []const u8, table: bool = false, through: bool = false, given: ?u64 = null };
+const Slots = struct { found: std.AutoHashMapUnmanaged(Facts.Container, []const Slot) = .empty };
+
+fn functions(c: *Context, kind: Facts.Container) Context.Error![]const Slot {
+    const known = try c.facts.memo(Slots);
+    if (known.found.get(kind)) |slots| return slots;
+    var slots: std.ArrayList(Slot) = .empty;
+    const source = c.project.at(kind.file);
+    const tree = &source.file.tree;
+    for (source.model.declarations) |decl| {
+        if (decl.kind != .field or decl.scope != kind.scope) continue;
+        const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+        if (functionPointer(tree, declared)) |proto| {
+            try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .given = try interfaceParameters(c, kind.file, proto, kind) });
+            continue;
+        }
+        const pointer = tree.fullPtrType(declared) orelse continue;
+        const table = held(try c.facts.resolve(kind.file, pointer.ast.child_type)) orelse continue;
+        const inner = c.project.at(table.file);
+        var any = false;
+        for (inner.model.declarations) |entry| {
+            if (entry.kind != .field or entry.scope != table.scope) continue;
+            const entry_type = (inner.file.tree.fullContainerField(entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+            const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
+            try slots.append(c.allocator, .{ .holder = table, .name = entry.name, .through = true, .given = try interfaceParameters(c, table.file, proto, kind) });
+            any = true;
+        }
+        if (any) try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .table = true });
+    }
+    try known.found.put(c.allocator, kind, slots.items);
+    return slots.items;
+}
+
+/// Whether `@field(x, name)` names a function or the vtable of an interface `x` is, or may be.
+fn namesFunction(c: *Context, kinds: []const Facts.Container, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return false;
+    const receiver = try c.facts.resolve(c.file, args[0]);
+    for (kinds) |kind| for (try functions(c, kind)) |slot| {
+        if (!isParent(receiver, slot.holder)) continue;
+        if (try namedBy(c, tree, args[1], slot.name)) return true;
+    };
+    return false;
+}
+
+/// Whether an interface (or a pointer to one) `node` is handed only where it stays in place:
+/// to a function of the checked program whose parameter is a pointer to it, read where that
+/// function is checked; to any other function (std's, a dependency's) whose body is followed
+/// and keeps it so. A part read, a function of it called on itself, is no handing.
+fn handedInPlace(c: *Context, kind: Facts.Container, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const parent = model.parentOf(node) orelse return true;
+    var decl: Facts.Decl = undefined;
+    var index: usize = 0;
+    if (tree.nodeTag(parent) == .field_access) {
+        if (tree.nodeData(parent).node_and_token[0] != node) return true;
+        const found = (try c.facts.definition(c.file, parent)) orelse return true;
+        if (c.project.at(found.file).model.declarations[@backingInt(found.index)].kind != .function) return true;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, model.parentOf(parent) orelse return true) orelse return true;
+        if (call.ast.fn_expr != parent) return true;
+        decl = (try c.facts.origin(found)) orelse found;
+    } else {
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse return true;
+        const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return true;
+        index = position;
+        if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+            .instance, .pointer, .optional => index += 1,
+            else => {},
+        };
+        // Through a function field: read where it is, by `readInPlace`.
+        decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
+            .function => |function| (try c.facts.origin(function)) orelse function,
+            else => return true,
+        };
+    }
+    var follow: Follow = .{ .c = c, .kind = kind, .contract = true };
+    // A function of the checked program taking a pointer to it: its body is checked as this is.
+    if (try c.facts.program(decl.file)) {
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        const callee = &c.project.at(decl.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (callee.fullFnProto(&buffer, record.node)) |proto| {
+            var it = proto.iterate(callee);
+            var at: usize = 0;
+            while (it.next()) |param| : (at += 1) if (at == index) {
+                if (param.type_expr) |declared| if (follow.pointer(try c.facts.resolve(decl.file, declared))) return true;
+                break;
+            };
+        }
+    }
+    const known = try c.facts.memo(Interfaces);
+    const key = .{ kind, decl, index };
+    if (known.handed.get(key)) |kept| return kept;
+    const kept = try follow.handed(decl, index);
+    try known.handed.put(c.allocator, key, kept);
+    return kept;
+}
+
 const List = enum { doubly, singly };
 
 fn listNode(c: *Context, pointer: Ast.Node.Index, field: Field, kind: Facts.Container) Context.Error!bool {
@@ -1073,7 +1364,7 @@ fn listNode(c: *Context, pointer: Ast.Node.Index, field: Field, kind: Facts.Cont
     if (source == .same) return false;
     if (!try insertsOnlyParents(c, field, list, source)) return false;
     if (!try listsInPlace(c, list)) return false;
-    return addressedOnly(c, field, kind);
+    return addressedOnly(c, field, kind, false);
 }
 
 /// Which of std's lists `container` is the `member` of (`Node`), or the list type itself
@@ -1521,6 +1812,23 @@ fn namespace(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, init, &buffer);
     return args.len == 1 and tree.nodeTag(args[0]) == .string_literal;
+}
+
+/// The labeled block a `break :label value` gives its value to.
+fn labeled(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
+    const label = tree.tokenSlice(tree.nodeData(jump).opt_token_and_opt_node[0].unwrap() orelse return null);
+    var at = jump;
+    while (model.parentOf(at)) |up| : (at = up) {
+        switch (tree.nodeTag(up)) {
+            .fn_decl => return null,
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                const brace = tree.nodeMainToken(up);
+                if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(brace - 2), label)) return up;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn strip(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
