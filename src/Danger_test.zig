@@ -2325,6 +2325,24 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A010 reads a position in a table std names by a u32 index as one: a node's position converts to u32" {
+    // std's `Ast.nodes` (6); a field of the program's own that holds the same memory is no
+    // table std makes, and its positions stay unbounded (8).
+    const found = try run(pack.integers,
+        \\const std = @import("std");
+        \\const Mine = struct { nodes: []const u32 };
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !u32 {
+        \\    const tree = try std.zig.Ast.parse(gpa, try r.take(64), .zig);
+        \\    var sum: u32 = 0;
+        \\    for (tree.nodes, 0..) |_, i| { const at: u32 = @intCast(i); sum +%= at; }
+        \\    const mine: Mine = .{ .nodes = tree.nodes };
+        \\    for (mine.nodes, 0..) |_, i| { const at: u32 = @intCast(i); sum +%= at; }
+        \\    return sum;
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{8}, found.lines[0..found.findings]);
+}
+
 test "A018 finds an error's name written to a peer, not to another writer" {
     try expect(pack.diagnostics,
         \\const std = @import("std");
