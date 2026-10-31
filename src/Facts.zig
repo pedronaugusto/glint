@@ -3852,6 +3852,47 @@ fn writtenElements(self: *Facts, env: ?*const Env, file: Project.FileId, index: 
     return .{ .array = try self.boxed(try self.choose(elements.items)) };
 }
 
+/// The reading of `function` at one `call` in `file`: its parameters bound to the call's
+/// arguments, a method called on a value given that value first, each read under `outer`,
+/// the reading the call is itself in. A rule walking down a chain of calls binds each in turn
+/// and reads what the callee does under it (`resolveBound`): `value.format(w)` in a generic
+/// std calls with what the program handed it.
+pub fn bind(self: *Facts, file: Project.FileId, call: Ast.full.Call, function: Decl, outer: ?*const Env) ResolveError!*const Env {
+    const tree = &self.project.at(file).file.tree;
+    var args: std.ArrayList(Value) = .empty;
+    var truths: std.ArrayList(?bool) = .empty;
+    var sources: std.ArrayList(?Source) = .empty;
+    var reading = outer;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const receiver = try self.resolveIn(outer, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        const holder: ?Container = switch (receiver) {
+            .instance => |c| c,
+            .pointer => |p| if (p.* == .instance) p.instance else null,
+            else => null,
+        };
+        if (holder) |h| {
+            try args.append(self.gpa, receiver);
+            try truths.append(self.gpa, null);
+            try sources.append(self.gpa, null);
+            if (h.made_by) |made| reading = try self.madeEnv(made);
+        }
+    }
+    for (call.ast.params) |arg| {
+        try args.append(self.gpa, try self.resolveIn(outer, file, arg));
+        try truths.append(self.gpa, self.truth(outer, file, arg));
+        try sources.append(self.gpa, .{ .file = file, .node = arg, .env = outer });
+    }
+    const env = try self.gpa.create(Env);
+    env.* = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .truths = truths.items, .outer = reading, .sources = sources.items };
+    return env;
+}
+
+/// `node` in `file` read under `env`, a reading `bind` made: a parameter is its argument, a
+/// constant what initializes it, and what is built of them built again.
+pub fn resolveBound(self: *Facts, env: *const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    return self.resolveIn(env, file, node);
+}
+
 /// What a type function returns where more than its final statement returns: the choice of
 /// every type one of its own `return`s gives with the call's bindings (`bit_set.Static`'s
 /// `Integer(size)` or `Array(usize, size)`), a superset of the one a build takes. Null where
@@ -4873,6 +4914,53 @@ test "a call through a function-pointer field reaches the functions stored there
     // any other name, it may be.
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
+}
+
+test "a reading bound call by call reads a generic's value as the chain of calls passes it" {
+    const source = "const S = struct { pub fn format(_: S) void {} };\npub fn print(value: anytype) void { show(value); }\npub fn show(v: anytype) void { v.format(); }\npub fn main() void { print(S{}); }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const model = &project.sources[0].model;
+    const file = project.sources[0].id;
+    const named = struct {
+        fn function(m: *const Model, name: []const u8) Decl {
+            for (m.declarations, 0..) |d, i| if (d.kind == .function and std.mem.eql(u8, d.name, name)) return .{ .file = @fromBackingInt(0), .index = @fromBackingInt(@intCast(i)) };
+            unreachable;
+        }
+        fn call(t: *const Ast, callee: []const u8) Ast.Node.Index {
+            for (t.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+                .call_one, .call_one_comma => {
+                    const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                    const f = t.nodeData(node).node_and_opt_node[0];
+                    if (t.nodeTag(f) == .identifier and std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(f)), callee)) return node;
+                },
+                else => {},
+            };
+            unreachable;
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const outer = try facts.bind(file, tree.fullCall(&buffer, named.call(tree, "print")).?, named.function(model, "print"), null);
+    const inner = try facts.bind(file, tree.fullCall(&buffer, named.call(tree, "show")).?, named.function(model, "show"), outer);
+    // `v` in `show`, as `main` → `print` → `show` passes it: an `S`, whose `format` is found.
+    const v = for (model.declarations) |d| {
+        if (d.kind == .parameter and std.mem.eql(u8, d.name, "v")) break d;
+    } else unreachable;
+    var use: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| if (tag == .identifier) {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "v") and tree.nodeMainToken(node) != v.token) use = node;
+    };
+    const value = try facts.resolveBound(inner, file, use.?);
+    try std.testing.expect(value == .instance);
+    try std.testing.expect(facts.member(value.instance, "format") != null);
+    // Unbound, the same `v` of a public generic is each binding's.
+    try std.testing.expectEqual(Unknown.generic, (try facts.resolve(file, use.?)).unknown);
 }
 
 test "a function handed to code outside the program as a value escapes: its callers are not all the program's" {
