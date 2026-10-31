@@ -920,7 +920,7 @@ fn copiedValue(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
 /// A copy of the value read from a place: a name, a field, `@field`, what a pointer points at,
 /// an element or an optional's payload.
 fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.Node.Index, node: Ast.Node.Index) Context.Error!void {
-    const root = placeRoot(tree, node) orelse return;
+    const root = placeRoot(tree, node) orelse try sharedReturn(c, tree, node) orelse return;
     const model = &c.project.at(c.file).model;
     // `undefined`, `true`, `false` and `null` are values, not references to an owner.
     if (root == node and model.reference(node) == null) return;
@@ -1040,6 +1040,50 @@ fn placeRoot(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
         },
         else => return null,
     };
+}
+
+/// What a place read off a call's result is read through, where the call gives a pointer
+/// another holder shares (`it.next().?.*`, `map.getPtr(k).?.owner`): the call, standing for
+/// the place's root. Null where every step reads the value the call makes, which no other
+/// holder shares; a step whose operand does not resolve may be through a pointer.
+fn sharedReturn(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    var shared = false;
+    var current = node;
+    while (true) {
+        const operand = switch (tree.nodeTag(current)) {
+            .deref => {
+                shared = true;
+                current = tree.nodeData(current).node;
+                continue;
+            },
+            .unwrap_optional, .grouped_expression, .field_access => tree.nodeData(current).node_and_token[0],
+            .array_access, .slice_open => tree.nodeData(current).node_and_node[0],
+            .slice, .slice_sentinel => tree.nodeData(current).node_and_extra[0],
+            // A type's member (`@TypeOf(x).Role`): no value is read.
+            else => return if (shared and !typeBuiltin(tree, current)) current else null,
+        };
+        // A field or an element read through a pointer dereferences it.
+        switch (tree.nodeTag(current)) {
+            .field_access, .array_access, .slice_open, .slice, .slice_sentinel => switch (try c.facts.resolve(c.file, operand)) {
+                .pointer, .unknown => shared = true,
+                else => {},
+            },
+            else => {},
+        }
+        current = operand;
+    }
+}
+
+/// Whether `node` is a builtin call that gives a type.
+fn typeBuiltin(tree: *const Ast, node: Ast.Node.Index) bool {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+        else => return false,
+    }
+    for ([_][]const u8{ "@TypeOf", "@This", "@import", "@typeInfo", "@Type", "@FieldType" }) |name| {
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name)) return true;
+    }
+    return false;
 }
 
 const Held = enum { value, type, unknown };

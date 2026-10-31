@@ -120,6 +120,10 @@ pub const Env = struct {
     depth: usize,
     /// Each argument's value as a condition, where it is a comptime-known `bool`.
     truths: []const ?bool = &.{},
+    /// The reading this call is made in, whose function encloses this one: a type function
+    /// declared in a type function's container (std's `FieldIterator(V)` in a hash map),
+    /// whose parameters it reads as that reading binds them.
+    outer: ?*const Env = null,
 };
 /// A type seen through `@typeInfo`, and how far into its information a chain of fields has
 /// gone: `.pointer.child`, `.optional.child`, `.array.child`, `.error_union.payload`,
@@ -2361,14 +2365,23 @@ fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Dec
 /// call as `outer`.
 fn madeWithin(self: *Facts, value: Value, outer: Container, made: *const Made) ResolveError!Value {
     return switch (value) {
-        .container => |inner| if (self.within(inner, outer)) .{ .container = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
-        .instance => |inner| if (self.within(inner, outer)) .{ .instance = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
+        .container => |inner| if (self.within(inner, outer) and !try self.madeInside(inner, outer)) .{ .container = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
+        .instance => |inner| if (self.within(inner, outer) and !try self.madeInside(inner, outer)) .{ .instance = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
         .pointer => |to| .{ .pointer = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .optional => |to| .{ .optional = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .error_union => |to| .{ .error_union = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .array => |to| .{ .array = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         else => value,
     };
+}
+
+/// Whether a container inside `outer` was made by a call of a type function declared inside
+/// it (`FieldIterator(V)`), whose own bindings it keeps, the outer ones read through them.
+fn madeInside(self: *Facts, inner: Container, outer: Container) ResolveError!bool {
+    const made = inner.made_by orelse return false;
+    const record = self.project.at(made.function.file).model.declarations[@backingInt(made.function.index)];
+    if (made.function.file != outer.file) return false;
+    return self.within(.{ .file = outer.file, .scope = record.scope }, outer);
 }
 
 /// The outermost container around `container` that a type function returns: the one its
@@ -2456,7 +2469,7 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
     const env = try self.gpa.create(Env);
-    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths };
+    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = outer_env };
     return env;
 }
 
@@ -2697,10 +2710,11 @@ fn breaks(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
 fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
-    const body: Ast.Node.Index, const otherwise: Ast.Node.Index, const label: ?[]const u8 = if (tree.fullFor(node)) |loop|
+    // `while (true)` ends only by a break: it has no `else` to give a value.
+    const body: Ast.Node.Index, const otherwise: ?Ast.Node.Index, const label: ?[]const u8 = if (tree.fullFor(node)) |loop|
         .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
     else if (tree.fullWhile(node)) |loop|
-        .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
+        .{ loop.ast.then_expr, loop.ast.else_expr.unwrap() orelse if (isTrue(tree, loop.ast.cond_expr)) null else return null, if (loop.label_token) |t| tree.tokenSlice(t) else null }
     else
         return null;
     var values: std.ArrayList(Value) = .empty;
@@ -2731,7 +2745,7 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
         if (peers.literal(tree, operand)) continue;
         try values.append(self.gpa, try self.resolve(file, operand));
     }
-    if (!peers.literal(tree, otherwise) and !never(tree, otherwise)) try values.append(self.gpa, try self.resolve(file, otherwise));
+    if (otherwise) |value| if (!peers.literal(tree, value) and !never(tree, value)) try values.append(self.gpa, try self.resolve(file, value));
     if (values.items.len == 0) return null;
     return try self.peered(try self.choose(values.items), peers);
 }
@@ -2782,6 +2796,14 @@ fn never(tree: *const Ast, node: Ast.Node.Index) bool {
         .@"switch", .switch_comma => for (tree.fullSwitch(node).?.ast.cases) |case| { // unreachable: the tag is a switch's
             if (!never(tree, tree.fullSwitchCase(case).?.ast.target_expr)) break false; // unreachable: a switch's cases are cases
         } else true,
+        // A block no `break` names, whose last statement leaves (`{ shared = true; continue; }`).
+        .block, .block_semicolon, .block_two, .block_two_semicolon => blk: {
+            const brace = tree.nodeMainToken(node);
+            if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and tree.tokenTag(brace - 2) == .identifier) break :blk false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, node) orelse break :blk false;
+            break :blk statements.len != 0 and never(tree, statements[statements.len - 1]);
+        },
         // `undefined` takes the type of the other branches.
         .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined"),
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => for ([_][]const u8{ "@compileError", "@panic", "@trap" }) |name| {
@@ -3684,6 +3706,11 @@ fn finalReturn(tree: *const Ast, model: *const Model, record: Model.Declaration)
     return tree.nodeData(last).opt_node.unwrap();
 }
 
+/// Whether `node` is `true`.
+fn isTrue(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "true");
+}
+
 /// Whether `node` is `undefined`.
 fn isUndefined(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
@@ -3816,11 +3843,16 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             const index = ref.declaration orelse return self.resolve(file, node);
             const record = model.declarations[@backingInt(index)];
             const function_scope = self.scopeNode(e.function);
-            if (record.kind == .parameter and model.scopes[@backingInt(record.scope)].node == function_scope) {
-                if (self.parameterPosition(file, e.function, record.token)) |position| {
-                    if (position < e.args.len) return e.args[position];
+            if (record.kind == .parameter) {
+                // This call's parameter, or one of a reading it is made in.
+                var at: ?*const Env = e;
+                while (at) |reading| : (at = reading.outer) {
+                    if (reading.function.file != file or model.scopes[@backingInt(record.scope)].node != self.scopeNode(reading.function)) continue;
+                    if (self.parameterPosition(file, reading.function, record.token)) |position| {
+                        if (position < reading.args.len) return reading.args[position];
+                    }
+                    return .{ .unknown = .comptime_dependent };
                 }
-                return .{ .unknown = .comptime_dependent };
             }
             if (record.kind == .variable and self.enclosed(file, record.scope, function_scope)) {
                 const variable = tree.fullVarDecl(record.node) orelse return self.resolve(file, node);

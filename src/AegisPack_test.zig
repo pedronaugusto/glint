@@ -754,6 +754,37 @@ test "A002 reads a copy from any place an owner is read through, an assignment's
     try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { var r = try b.reserve(1); const p = &r; var kept = r; defer kept.release(); _ = p; }", pack.copies, true, 1);
 }
 
+test "A002 reads a copy through a pointer a call returns, and an iterator a type function declared in another's container makes" {
+    // A map's iterator is made by `Iterator(V)`, declared in `Map(K, V)`'s container: its
+    // `next` gives a pointer to a stored owner, whatever path reads through it.
+    const head =
+        \\const S = @import("aegis").Secret;
+        \\fn Map(comptime K: type, comptime V: type) type {
+        \\    return struct {
+        \\        keys: []K, values: []V,
+        \\        pub const ValueIterator = Iterator(V);
+        \\        fn Iterator(comptime T: type) type { return struct { items: []T, i: usize = 0, pub fn next(it: *@This()) ?*T { if (it.i == it.items.len) return null; it.i += 1; return &it.items[it.i - 1]; } }; }
+        \\        pub fn valueIterator(m: *@This()) ValueIterator { return .{ .items = m.values }; }
+        \\        pub fn getPtr(m: *@This(), i: usize) ?*V { return &m.values[i]; }
+        \\    };
+        \\}
+        \\const Pair = struct { s: S(u32), n: u32 };
+        \\fn make() Pair { return undefined; }
+        \\
+    ;
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); const copy = it.next().?.*; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); const p = it.next(); const copy = p.?.*; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); while (it.next()) |p| { const copy = p.*; _ = copy; } }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { const copy = m.getPtr(0).?.s; _ = copy; }", pack.copies, true, 1);
+    // A number read through the same pointer, and an owner read off a value a call makes,
+    // which no other holder shares, copy none.
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { const n = m.getPtr(0).?.n; _ = n; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, u32)) void { var it = m.valueIterator(); while (it.next()) |p| { const n = p.*; _ = n; } }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f() void { const s = make().s; _ = s; }", pack.copies, true, 0);
+    // A `while (true)` gives what its breaks give.
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { var i: usize = 0; const p = while (true) { if (m.getPtr(i)) |found| break found; i += 1; }; const n = p.n; const copy = p.s; _ = .{ n, copy }; }", pack.copies, true, 1);
+}
+
 test "A002 follows a copy's value through every shape it is written in to the places it reads" {
     const head = "const S = @import(\"aegis\").Secret;\nconst H = struct { s: S(u32), t: S(u32) };\n";
     // Each branch, prong, `break`, operand and wrapper gives the copy one of its places.
