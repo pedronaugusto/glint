@@ -138,12 +138,6 @@ fn above(a: std.mem.Allocator, x: Lin, y: Lin) Error!?Lin {
     return shiftedBy(d, -1);
 }
 
-fn sameTerms(x: Lin, y: Lin) bool {
-    if (x.terms.len != y.terms.len) return false;
-    for (x.terms, y.terms) |p, q| if (p.v != q.v or p.k != q.k) return false;
-    return true;
-}
-
 fn termOrder(_: void, x: Lin, y: Lin) bool {
     const n = @min(x.terms.len, y.terms.len);
     for (x.terms[0..n], y.terms[0..n]) |p, q| {
@@ -239,8 +233,17 @@ const State = struct {
     const unreachable_state: State = .{ .dead = true };
 };
 
+fn sameTerms(x: Lin, y: Lin) bool {
+    if (x.terms.len != y.terms.len) return false;
+    for (x.terms, y.terms) |p, q| if (p.v != q.v or p.k != q.k) return false;
+    return true;
+}
+
 fn entails(a: std.mem.Allocator, s: State, goal: Lin) Error!bool {
     if (s.dead) return true;
+    // A row of the state with the goal's terms and a constant no larger shows it alone,
+    // however large an elimination would grow.
+    for (s.rows) |row| if (row.c <= goal.c and sameTerms(row, goal)) return true;
     // Its negation, `-goal - 1 ≥ 0`, with the state: no solution shows the goal.
     const negated = shiftedBy((try scaled(a, goal, -1)) orelse return false, -1) orelse return false;
     const rows = try a.alloc(Lin, s.rows.len + 1);
@@ -1584,7 +1587,16 @@ const Frame = struct {
         invariant = t[0];
         var passes: usize = 0;
         while (true) : (passes += 1) {
-            if (passes > loop_passes) return error.Unsupported;
+            // Past its budget, the loop keeps only what no pass changes: the entry's facts among
+            // the variables no pass assigns, where a pass keeps them, else nothing.
+            if (passes > loop_passes) {
+                invariant = try f.fixedOver(entry, node);
+                f.trial += 1;
+                const pass = try f.passOf(invariant, node, label, t[1], form);
+                f.trial -= 1;
+                if (!try implies(f.a, pass.back, invariant)) invariant = .{};
+                break;
+            }
             f.trial += 1;
             const pass = try f.passOf(invariant, node, label, t[1], form);
             f.trial -= 1;

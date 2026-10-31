@@ -4731,6 +4731,40 @@ test "Bounds clears arithmetic and a conversion the relations along every path k
     try std.testing.expectEqualSlices(u32, &.{ 5, 12, 24, 36, 46 }, result.lines[0..result.findings]);
 }
 
+test "Bounds keeps a function's other facts where a loop's are past its budget: an encoder's fixed writes clear beside a loop stepping by input lengths" {
+    // The second loop steps `at` by lengths the peer chose (lines 20, 21); every write before
+    // and after it at a place the facts bound stays clear, however many facts the loop holds.
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn encode(r: *std.Io.Reader, gpa: std.mem.Allocator, out: *[400]u8) ![]const u8 {
+        \\    try r.readSliceAll(out);
+        \\    const secret = try r.allocRemaining(gpa, .unlimited);
+        \\    if (secret.len > 48) return error.Long;
+        \\    const a = try r.allocRemaining(gpa, .unlimited);
+        \\    const b = try r.allocRemaining(gpa, .unlimited);
+        \\    if (a.len > 255 or b.len > 255) return error.Long;
+        \\    var at: usize = 0;
+        \\    out[at..][0..2].* = .{ 0, 7 };
+        \\    at += 2;
+        \\    out[at] = @intCast(secret.len);
+        \\    @memcpy(out[at + 1 ..][0..secret.len], secret);
+        \\    at += 1 + secret.len;
+        \\    for ([_]u8{ 1, 2 }) |t| {
+        \\        out[at..][0..8].* = @splat(t);
+        \\        at += 8;
+        \\    }
+        \\    for ([_][]const u8{ a, b }) |name| {
+        \\        out[at] = @intCast(name.len);
+        \\        @memcpy(out[at + 1 ..][0..name.len], name);
+        \\        at += 1 + name.len;
+        \\    }
+        \\    return out[0..2];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 21 }, result.lines[0..result.findings]);
+}
+
 test "Bounds bounds what a loop steps by how far each pass steps it and how many passes run: a sum of a table's days, a count of matches" {
     // Each twin's counter can pass its type: a u8 count over a slice of any length (line 21), a
     // u32 count over a slice past 2^32 items on a 64-bit target (line 30), a count whose loop
