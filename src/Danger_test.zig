@@ -2447,6 +2447,29 @@ test "A012 leaves a size std only moves a position by, and finds one it passes o
     , 1);
 }
 
+test "A012 reads a length that views a slice std holds as no work: what is done over the view is sized by memory already there" {
+    // std's `slice` views its declared slice (clean); `raw` views a many-item pointer, which
+    // no length check bounds (6).
+    const held: sources.Extra = .{ .name = "std/held.zig", .bytes =
+        \\pub const Held = struct {
+        \\    extra: []u32,
+        \\    many: [*]u32,
+        \\    pub fn slice(h: Held, start: usize, len: usize) []u32 { return h.extra[start..][0..len]; }
+        \\    pub fn raw(h: Held, len: usize) []u32 { return h.many[0..][0..len]; }
+        \\};
+    };
+    const found = try runWith(pack.bounded_work,
+        \\const std = @import("std");
+        \\const held = @import("held.zig");
+        \\pub fn f(r: *std.Io.Reader, h: held.Held) !usize {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    const viewed = h.slice(0, n).len;
+        \\    return viewed + h.raw(n).len;
+        \\}
+    , &(std_files ++ [_]sources.Extra{held}), &(std_imports ++ [_]sources.ExtraImport{ .{ .from = 0, .spelling = "held.zig", .target = std_files.len }, .{ .spelling = "held.zig", .target = std_files.len } }));
+    try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
+}
+
 test "A018 finds an error's name written to a peer, not to another writer" {
     try expect(pack.diagnostics,
         \\const std = @import("std");
@@ -3759,6 +3782,37 @@ test "a flow finding names the read that filled the field its input is held in, 
     for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
         try std.testing.expectEqual(@as(u32, 7), d.span.line);
         try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:4 `r.takeInt`)"));
+        named += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), named);
+}
+
+test "a flow finding names every read that fills the field its input is held in, not the first alone" {
+    var project = try sources.projectWithSources(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Graph = struct { count: u32 = 0 };
+        \\fn load(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    graph.count = try r.takeInt(u32, 0);
+        \\}
+        \\fn reload(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    graph.count = try r.takeByte();
+        \\}
+        \\fn lookup(graph: *const Graph, table: []const u8) u8 {
+        \\    return table[graph.count];
+        \\}
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var graph: Graph = .{};
+        \\    try load(&graph, r);
+        \\    try reload(&graph, r);
+        \\    return lookup(&graph, table);
+        \\}
+    , &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var named: usize = 0;
+    for (report.diagnostics) |d| if (d.rule == pack.untrusted_input) {
+        try std.testing.expect(std.mem.endsWith(u8, d.message, "(input from consumer:4 `r.takeInt` and consumer:7 `r.takeByte`)"));
         named += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), named);

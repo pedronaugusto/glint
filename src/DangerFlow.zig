@@ -955,7 +955,7 @@ fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const token = tree.nodeMainToken(node);
             if (token < first or token > last or !std.mem.eql(u8, tree.tokenSlice(token), names[position])) continue;
-            if (grows(tree, model, node, body)) break :done false;
+            if (try grows(c, decl.file, node, body)) break :done false;
         }
         break :done true;
     };
@@ -966,7 +966,9 @@ fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
 /// Whether the use `node` of a parameter can size work before the walk up reaches `body`: an
 /// argument of a call (not `assert`'s) or a builtin, a loop's bound, a local's value or what
 /// the function returns.
-fn grows(tree: *const Ast, model: *const Model, node: Ast.Node.Index, body: Ast.Node.Index) bool {
+fn grows(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (at == body) return false;
@@ -977,6 +979,9 @@ fn grows(tree: *const Ast, model: *const Model, node: Ast.Node.Index, body: Ast.
             const name = if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.tokenSlice(callee + 1) else tree.tokenSlice(callee);
             return !std.mem.eql(u8, name, "assert");
         }
+        // A length that slices a slice (`s[a..][0..len]`) views no more than the slice holds:
+        // what is done over the view is sized by memory already there.
+        if (tree.fullSlice(parent)) |slice| if (slice.ast.end.unwrap() == at and try declaredSlice(c, file, slice.ast.sliced)) return false;
         if (tree.fullWhile(parent)) |loop| if (at == loop.ast.cond_expr) return true;
         if (tree.fullFor(parent)) |loop| for (loop.ast.inputs) |each| if (at == each) return true;
         if (tree.fullVarDecl(parent)) |local| if (local.ast.init_node.unwrap() == at) return true;
@@ -990,6 +995,29 @@ fn grows(tree: *const Ast, model: *const Model, node: Ast.Node.Index, body: Ast.
         }
     }
     return false;
+}
+
+/// Whether `node`, peeled of the slices taken of it, is a field, local or parameter declared a
+/// slice (`[]T`): what it views is checked against the memory it holds, where a many-item
+/// pointer's is not.
+fn declaredSlice(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    var base = node;
+    while (tree.fullSlice(base)) |slice| base = slice.ast.sliced;
+    switch (tree.nodeTag(base)) {
+        .identifier, .field_access => {},
+        else => return false,
+    }
+    const decl = (try c.facts.definition(file, base)) orelse return false;
+    const written = &c.project.at(decl.file).file.tree;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const type_node = switch (record.kind) {
+        .field => (written.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap(),
+        .variable => (written.fullVarDecl(record.node) orelse return false).ast.type_node.unwrap(),
+        else => null,
+    } orelse return false;
+    const pointer = written.fullPtrType(type_node) orelse return false;
+    return pointer.size == .slice;
 }
 
 /// Whether a comparison holding where `node` is read puts it at most a clean value.
@@ -1045,13 +1073,20 @@ fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, lev
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;
     const fact = flow orelse return c.at(rule, tree.nodeMainToken(node), message);
-    const from = (try Taint.sourceOf(c, fact, c.file, node)) orelse return c.at(rule, tree.nodeMainToken(node), message);
-    const read = try callSite(c, .{ .file = from.file, .node = from.node });
-    const text = if (from.via) |via|
-        try c.allocator.print("{s} (input from {s} via {s})", .{ message, read, try callSite(c, via) })
-    else
-        try c.allocator.print("{s} (input from {s})", .{ message, read });
-    try c.at(rule, tree.nodeMainToken(node), text);
+    // One read past the ones named shows there are more.
+    const shown = 3;
+    const sources = try Taint.sourcesOf(c, fact, c.file, node, shown + 1);
+    if (sources.len == 0) return c.at(rule, tree.nodeMainToken(node), message);
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(c.allocator, "{s} (input from ", .{message});
+    for (sources[0..@min(sources.len, shown)], 0..) |from, i| {
+        if (i != 0) try text.appendSlice(c.allocator, if (i + 1 == sources.len) " and " else ", ");
+        try text.appendSlice(c.allocator, try callSite(c, .{ .file = from.file, .node = from.node }));
+        if (from.via) |via| try text.print(c.allocator, " via {s}", .{try callSite(c, via)});
+    }
+    if (sources.len > shown) try text.appendSlice(c.allocator, ", and more");
+    try text.append(c.allocator, ')');
+    try c.at(rule, tree.nodeMainToken(node), text.items);
 }
 
 /// A call as `file:line `callee``, the callee as written on one line: a chain split over lines
