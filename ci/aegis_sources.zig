@@ -200,6 +200,27 @@ pub const Extra = struct { name: []const u8, bytes: []const u8 };
 /// the consumer's.
 pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target: u32 };
 
+/// The pinned revision's source `name`.
+pub fn pinned(name: []const u8) ?[]const u8 {
+    for (sources) |each| if (std.mem.eql(u8, each.name, name)) return each.bytes;
+    return null;
+}
+
+/// `project`, with aegis's source `name` read as `bytes`: a revision that publishes other names.
+pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []const u8, bytes: []const u8) !glint.Project {
+    var inputs: [sources.len + 1]Project.Input = undefined;
+    inputs[0] = .{ .name = "consumer", .bytes = consumer };
+    var revised = false;
+    for (sources, 1..) |source, i| {
+        const replaced = std.mem.eql(u8, source.name, name);
+        revised = revised or replaced;
+        inputs[i] = .{ .name = source.name, .bytes = if (replaced) bytes else source.bytes, .selected = false };
+    }
+    if (!revised) return error.FileNotFound;
+    const mapped = imports();
+    return Project.init(gpa, &inputs, &mapped, .{});
+}
+
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
 pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
     const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);

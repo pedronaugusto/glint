@@ -1097,6 +1097,41 @@ test "every published type after the guards is recognized where aegis is importe
     , pack.access, true, 0);
 }
 
+test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is recognized in full; one without a name every revision publishes drifts" {
+    const gpa = std.testing.allocator;
+    const pinned = aegis_sources.pinned("src/bounded.zig").?;
+    const no_queue = try std.mem.replaceOwned(u8, gpa, pinned, "pub const Queue = Ring;\n", "");
+    defer gpa.free(no_queue);
+    const one_name = try std.mem.replaceOwned(u8, gpa, no_queue, "pub const QueueBuffer = RingBuffer;\n", "");
+    defer gpa.free(one_name);
+    try std.testing.expect(one_name.len < pinned.len);
+    const program = "const bounded = @import(\"aegis\").bounded;\npub fn f(r: *bounded.Ring(u8, 4), b: *bounded.RingBuffer(u8)) void { _ = r.head; _ = b.used; }";
+    // Clean of drift: both backing reads found through the one name each.
+    {
+        var project = try aegis_sources.projectRevised(gpa, program, "src/bounded.zig", one_name);
+        defer project.deinit();
+        var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(@as(usize, 2), count(report, pack.access));
+    }
+    // `Ring` itself gone: drift, where aegis is imported.
+    const no_ring = try std.mem.replaceOwned(u8, gpa, one_name, "pub fn Ring(", "pub fn Circle(");
+    defer gpa.free(no_ring);
+    {
+        var project = try aegis_sources.projectRevised(gpa, program, "src/bounded.zig", no_ring);
+        defer project.deinit();
+        var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expect(!report.complete);
+        var drifted = false;
+        for (report.coverage) |entry| if (entry.rule != null) {
+            drifted = drifted or std.mem.eql(u8, entry.detail, "published member bounded.Ring of aegis does not resolve (unresolved); its operations are not recognized in this file");
+        };
+        try std.testing.expect(drifted);
+    }
+}
+
 test "bounded storage, budgets and reservations keep their state behind their operations" {
     const head = "const aegis = @import(\"aegis\");\nconst bounded = aegis.bounded;\n";
     // The initialized prefix and its cursors, the buffer's extent and owner, a limit's maximum.

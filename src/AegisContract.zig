@@ -139,10 +139,11 @@ const root_members = [_]Lib.Member{
     .{ .path = "Order.Ordered", .role = .guarded },
     .{ .path = "bounded.Array", .role = .inline_store },
     .{ .path = "bounded.Ring", .role = .inline_store },
-    .{ .path = "bounded.Queue", .role = .inline_store },
+    // `Queue` and `QueueBuffer` name `Ring` and `RingBuffer` through 0.2; 0.3 keeps one name each.
+    .{ .path = "bounded.Queue", .role = .inline_store, .required = false },
     .{ .path = "bounded.Buffer", .role = .buffer },
     .{ .path = "bounded.RingBuffer", .role = .buffer },
-    .{ .path = "bounded.QueueBuffer", .role = .buffer },
+    .{ .path = "bounded.QueueBuffer", .role = .buffer, .required = false },
     .{ .path = "bounded.Limit", .role = .limit },
     .{ .path = "bounded.Budget", .role = .budget },
     .{ .path = "bounded.Budget.Reservation", .role = .reservation },
