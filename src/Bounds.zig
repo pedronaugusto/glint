@@ -2315,7 +2315,14 @@ fn memoryKind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8
     const tree = &c.project.at(file).file.tree;
     switch (tree.nodeTag(node)) {
         .string_literal, .multiline_string_literal => return .sentinel,
-        .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => return .checked,
+        // A literal is memory of the type it names (`[_:0]u8{…}` has a sentinel); one that names
+        // none (`.{…}`) is a tuple's, which has none.
+        .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma => return .checked,
+        .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullArrayInit(&buffer, node).?; // unreachable: the tag is an array literal's
+            return typeKind(c, .{ .file = file, .node = literal.ast.type_expr.unwrap() orelse return .unknown }, depth + 1);
+        },
         .grouped_expression => return memoryKind(c, file, tree.nodeData(node).node_and_token[0], depth + 1),
         .@"try", .@"comptime", .@"nosuspend", .address_of => return memoryKind(c, file, tree.nodeData(node).node, depth + 1),
         .slice_open, .slice, .slice_sentinel => {

@@ -2924,6 +2924,44 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
     try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
 }
 
+test "A009 reads an array literal's memory by the type it names: one with a sentinel reads it at its length, as a typed one does" {
+    // `z[z.len]` reads the sentinel of a literal whose type has one, written there (8) or by
+    // its name (15), as of a typed declaration (22): the path is live, and `i` unchecked on it.
+    // A literal with none checks its index, and the checked `i` indexes within (28).
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Z = [3:0]u8;
+        \\pub fn literal(r: *std.Io.Reader, c: bool, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const z = [_:0]u8{ 1, 2, 3 };
+        \\    var acc: u8 = 0;
+        \\    if (c) acc = z[z.len] else if (i >= 16) return 0;
+        \\    return acc +% table[i];
+        \\}
+        \\pub fn named(r: *std.Io.Reader, c: bool, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const z = Z{ 1, 2, 3 };
+        \\    var acc: u8 = 0;
+        \\    if (c) acc = z[z.len] else if (i >= 16) return 0;
+        \\    return acc +% table[i];
+        \\}
+        \\pub fn typed(r: *std.Io.Reader, c: bool, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const z: [3:0]u8 = .{ 1, 2, 3 };
+        \\    var acc: u8 = 0;
+        \\    if (c) acc = z[z.len] else if (i >= 16) return 0;
+        \\    return acc +% table[i];
+        \\}
+        \\pub fn plain(r: *std.Io.Reader, table: *const [16]u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const z = [_]u8{ 1, 2, 3 };
+        \\    if (i >= 16) return z[0];
+        \\    return table[i];
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 8, 15, 22 }, found.lines[0..found.findings]);
+}
+
 test "A009 reads what an access checks by the memory's type: a sentinel's end is read, a many-item pointer checks nothing and holds no length" {
     // `z[z.len]` reads the sentinel, so that branch still leaves `i` unbounded (10); a slice of
     // a many-item pointer checks nothing (19), and its length is the program's claim, so the
