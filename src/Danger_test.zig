@@ -7437,6 +7437,110 @@ test "A020 judges a function whose Io a field's field holds, and leaves undecide
     try std.testing.expectEqual(@as(usize, 0), none.undecided);
 }
 
+test "A009 takes a loop's progress by meaning: an unsigned shift of the condition's own variable, written by nothing else, and a slice that outlives the pass" {
+    // A signed shift stays at -1, a value set again after the shift may never clear, and a
+    // slice made afresh each pass bounds nothing: each loop is input's.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn signed(r: *std.Io.Reader) !u64 {
+        \\    var x: i64 = try r.takeInt(i64, .little);
+        \\    var t: u64 = 0;
+        \\    while (x != 0) {
+        \\        t +%= 1;
+        \\        x >>= 1;
+        \\    }
+        \\    return t;
+        \\}
+        \\pub fn reset(r: *std.Io.Reader) !u64 {
+        \\    const seed = try r.takeInt(u64, .little);
+        \\    var x: u64 = seed;
+        \\    var t: u64 = 0;
+        \\    while (x != 0) {
+        \\        t +%= 1;
+        \\        x >>= 1;
+        \\        x |= seed;
+        \\    }
+        \\    return t;
+        \\}
+        \\pub fn fresh(r: *std.Io.Reader, whole: []const u8) !u64 {
+        \\    const n = try r.takeInt(u64, .little);
+        \\    var t: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        var cp = whole;
+        \\        cp = cp[1..];
+        \\        t +%= cp.len;
+        \\    }
+        \\    return t;
+        \\}
+    , 3);
+    // The twins: an unsigned shift and a slice declared before the loop end it.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn unsigned(r: *std.Io.Reader) !u64 {
+        \\    var x: u64 = try r.takeInt(u64, .little);
+        \\    var t: u64 = 0;
+        \\    while (x != 0) {
+        \\        t +%= 1;
+        \\        x >>= 1;
+        \\    }
+        \\    return t;
+        \\}
+        \\pub fn advances(r: *std.Io.Reader, whole: []const u8) !usize {
+        \\    const n = try r.takeInt(u64, .little);
+        \\    var cp = whole;
+        \\    var i: u64 = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        cp = cp[1..];
+        \\    }
+        \\    return cp.len;
+        \\}
+    , 0);
+}
+
+test "A009 reads a loop condition that calls a program predicate by what it returns, its parameters bound to the call's arguments" {
+    // `below(i, n)` compares `n`, input: the loop is input's. A predicate on a constant is not.
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn below(i: u64, n: u64) bool {
+        \\    return i < n;
+        \\}
+        \\fn small(i: u64) bool {
+        \\    return i < 16;
+        \\}
+        \\pub fn helper(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, .little);
+        \\    var i: u64 = 0;
+        \\    while (below(i, n)) : (i += 1) out.* +%= i;
+        \\}
+        \\pub fn constant(out: *u64) void {
+        \\    var i: u64 = 0;
+        \\    while (small(i)) : (i += 1) out.* +%= i;
+        \\}
+    , 1);
+    // One that does not resolve, or whose return is no comparison it reads, is undecided.
+    const doubt = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const ext = @import("missing");
+        \\fn opaqueTest(i: u64, n: u64) bool {
+        \\    const done = i >= n;
+        \\    return !done;
+        \\}
+        \\pub fn unresolved(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, .little);
+        \\    var i: u64 = 0;
+        \\    while (ext.more(i, n)) : (i += 1) out.* +%= i;
+        \\}
+        \\pub fn local(r: *std.Io.Reader, out: *u64) !void {
+        \\    const n = try r.takeInt(u64, .little);
+        \\    var i: u64 = 0;
+        \\    while (opaqueTest(i, n)) : (i += 1) out.* +%= i;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), doubt.findings);
+    try std.testing.expectEqual(@as(usize, 2), doubt.undecided);
+}
+
 test "A020 judges a function that reaches an Io outside its parameters: a global, a global's field, a call" {
     // Each names the Io it is given where its message says to cancel.
     const found = try run(pack.cancellation,
@@ -8342,6 +8446,88 @@ test "A003 follows a std handle acquired raw to its release: a discard leaks it,
     );
     try std.testing.expectEqual(@as(usize, 0), shut.findings);
     try std.testing.expectEqual(@as(usize, 1), shut.undecided);
+}
+
+test "A015 reads a field by meaning: @field with its name, a destructure's place and a pointer capture write it as `=` does" {
+    // Each writes an owner into its field, or releases it, in the field's own file; one given a
+    // parameter by a destructure is lent it.
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\const ByField = struct { file: std.Io.File };
+        \\pub fn byField(s: *ByField) void { @field(s, "file") = opened(); }
+        \\const ByDestructure = struct { file: std.Io.File, n: u32 };
+        \\pub fn byDestructure(s: *ByDestructure) void { s.file, s.n = .{ opened(), 1 }; }
+        \\const ByCapture = struct { file: ?std.Io.File };
+        \\pub fn byCapture(s: *ByCapture) void { if (s.file) |*p| p.* = opened(); }
+        \\const ByRelease = struct { file: std.Io.File };
+        \\pub fn byRelease(s: *ByRelease, f: std.Io.File) void { s.file = f; @field(s, "file").close(); }
+        \\const Lent = struct { file: std.Io.File, n: u32 };
+        \\pub fn lent(s: *Lent, f: std.Io.File) void { s.file, s.n = .{ f, 1 }; }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 5, 7, 9 }, found.lines[0..found.findings]);
+    // `@field` by a name it computes may be the field: undecided.
+    const computed = try run(pack.ownership,
+        \\const std = @import("std");
+        \\const ByName = struct { file: std.Io.File };
+        \\pub fn byName(s: *ByName, comptime name: []const u8) void { @field(s, name).close(); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), computed.findings);
+    try std.testing.expectEqual(@as(usize, 1), computed.undecided);
+    // At another file's type, the same writes and release are flagged where this file does them.
+    const lib: sources.Extra = .{ .name = "lib.zig", .bytes =
+        \\const std = @import("std");
+        \\pub const S = struct { f: std.Io.File };
+    };
+    const imports = &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "lib.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } });
+    const foreign = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\fn opened() std.Io.File { return undefined; }
+        \\pub fn field(s: *lib.S) void { @field(s, "f") = opened(); }
+        \\pub fn destructure(s: *lib.S, n: *u32) void { s.f, n.* = .{ opened(), 1 }; }
+        \\pub fn release(s: *lib.S) void { @field(s, "f").close(); }
+        \\pub fn lend(s: *lib.S, f: std.Io.File, n: *u32) void { s.f, n.* = .{ f, 1 }; }
+    , &(std_files ++ [_]sources.Extra{lib}), imports);
+    try std.testing.expectEqual(@as(usize, 0), foreign.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5, 6 }, foreign.lines[0..foreign.findings]);
+}
+
+test "A015 reads a call of a function returning its parameter as the argument it is handed" {
+    // `pass(opened())` is the owner `opened` made; `pass(f)` of a parameter stays a view.
+    const found = try run(pack.ownership,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn pass(f: std.Io.File) std.Io.File { return f; }
+        \\const Stored = struct { file: std.Io.File };
+        \\pub fn store(s: *Stored) void { s.file = pass(opened()); }
+        \\const Lent = struct { file: std.Io.File };
+        \\pub fn lend(s: *Lent, f: std.Io.File) void { s.file = pass(f); }
+        \\const Method = struct { file: std.Io.File, fn keep(m: *Method, f: std.Io.File) std.Io.File { _ = m; return f; } };
+        \\pub fn method(m: *Method) void { m.file = m.keep(opened()); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 4, 8 }, found.lines[0..found.findings]);
+}
+
+test "A003 leaves a copy handed to a function pointer, or put in a literal a callee releases, undecided" {
+    // Each callee may close the copy, which the caller's deferred close closes again: neither lent
+    // nor a release this walk follows. A literal's field only read is lent.
+    const found = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\fn closer(f: std.Io.File) void { f.close(); }
+        \\fn viaPointer(f: std.Io.File, how: *const fn (std.Io.File) void) void { how(f); }
+        \\pub fn pointer() void { const file = opened(); defer file.close(); viaPointer(file, closer); }
+        \\const Box = struct { f: std.Io.File };
+        \\fn viaLiteral(f: std.Io.File) void { const b: Box = .{ .f = f }; b.f.close(); }
+        \\pub fn literal() void { const file = opened(); defer file.close(); viaLiteral(file); }
+        \\fn readsLiteral(f: std.Io.File) i32 { const b: Box = .{ .f = f }; return b.f.handle; }
+        \\pub fn read() void { const file = opened(); defer file.close(); _ = readsLiteral(file); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.findings);
+    try std.testing.expectEqual(@as(usize, 2), found.undecided);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {

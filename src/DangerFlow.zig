@@ -72,12 +72,14 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 var decided: Decided = .{ .loop = node };
                 try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 for (decided.compared.items) |condition| {
-                    if (clears(c, condition, loop.ast.then_expr)) continue;
+                    if (clears(c, condition, loop)) continue;
                     const lhs, const rhs = tree.nodeData(condition).node_and_node;
                     try judged(c, flow, rule, lhs, try loopOperand(c, flow, node, lhs), .number, loop_message);
                     try judged(c, flow, rule, rhs, try loopOperand(c, flow, node, rhs), .number, loop_message);
                 }
+                for (decided.operands.items) |operand| try judged(c, flow, rule, operand, try loopOperand(c, flow, node, operand), .number, loop_message);
                 for (decided.leaves.items) |leaf| try judged(c, flow, rule, leaf, try loopOperand(c, flow, node, leaf), .number, loop_message);
+                if (decided.unknown) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a loop whose condition calls a function whose returns this rule does not follow, which may compare input");
             },
             // A table trusts its own ids to name its entries (Range.ownId): one made from an
             // integer is a finding unless it counts the table's entries, whatever the
@@ -1498,16 +1500,148 @@ const Decided = struct {
     /// Any other leaf of one that takes none (`while (self.more())`): a truth input may decide
     /// every pass.
     truths: std.ArrayList(Ast.Node.Index) = .empty,
+    /// The operands a program predicate the condition calls compares (`while (below(i, n))`),
+    /// each the call's argument its parameter is bound to (`predicate`).
+    operands: std.ArrayList(Ast.Node.Index) = .empty,
+    /// A predicate whose returns the reading does not follow decides it too.
+    unknown: bool = false,
 
-    /// The comparisons' operands and the payload's leaves: what a number from input bounds.
+    /// The comparisons' operands, a predicate's and the payload's leaves: what a number from
+    /// input bounds.
     fn bounds(d: *const Decided, c: *Context) Context.Error![]const Ast.Node.Index {
         const tree = &c.project.at(c.file).file.tree;
         var out: std.ArrayList(Ast.Node.Index) = .empty;
         for (d.compared.items) |condition| try out.appendSlice(c.allocator, &tree.nodeData(condition).node_and_node);
+        try out.appendSlice(c.allocator, d.operands.items);
         try out.appendSlice(c.allocator, d.leaves.items);
         return out.items;
     }
 };
+
+/// A call of a program predicate `decides` reads: its callee's parameters are the arguments the
+/// call passes, read where the call is (`outer` the binding in force there).
+const Predicate = struct { call: Ast.full.Call, callee: Facts.Decl, outer: ?*const Predicate };
+
+/// `decides` of a condition that calls a function of the program in the checked file: each
+/// `return`'s value read as the condition is (its comparisons' operands, `and`, `or`, `!`), each
+/// parameter it compares bound to the call's argument (`argumentOf`), through calls of the
+/// program again up to `depth`. A literal bounds nothing; any other leaf is a truth. A call
+/// outside the file or program, one that does not resolve, recursion past the depth, or a body
+/// the reading cannot follow leaves the loop undecided (`Decided.unknown`).
+fn predicate(c: *Context, call: Ast.full.Call, bound: ?*const Predicate, into: *Decided, depth: u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    if (depth >= 8) return unfollowed(into);
+    const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
+        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        else => return unfollowed(into),
+    };
+    if (callee.file != c.file) return unfollowed(into);
+    const proto = model.declarations[@backingInt(callee.index)].node;
+    const function = model.parentOf(proto) orelse return unfollowed(into);
+    if (tree.nodeTag(function) != .fn_decl) return unfollowed(into);
+    const body = tree.nodeData(function).node_and_node[1];
+    const here: Predicate = .{ .call = call, .callee = callee, .outer = bound };
+    var returns: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < tree.firstToken(body) or token > tree.lastToken(body)) continue;
+        // A function declared inside reads its own parameters.
+        if (tag == .fn_decl) return unfollowed(into);
+        if (tag != .@"return") continue;
+        returns += 1;
+        try predicateValue(c, tree.nodeData(node).opt_node.unwrap() orelse return unfollowed(into), &here, into, depth + 1);
+    }
+    if (returns == 0) into.unknown = true;
+}
+
+/// Marks a predicate the reading does not follow (`Decided.unknown`).
+fn unfollowed(into: *Decided) void {
+    into.unknown = true;
+}
+
+fn predicateValue(c: *Context, value: Ast.Node.Index, bound: *const Predicate, into: *Decided, depth: u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    switch (tree.nodeTag(value)) {
+        .bool_and, .bool_or => {
+            const lhs, const rhs = tree.nodeData(value).node_and_node;
+            try predicateValue(c, lhs, bound, into, depth);
+            return predicateValue(c, rhs, bound, into, depth);
+        },
+        .bool_not => return predicateValue(c, tree.nodeData(value).node, bound, into, depth),
+        .grouped_expression => return predicateValue(c, tree.nodeData(value).node_and_token[0], bound, into, depth),
+        else => {},
+    }
+    if (comparison(tree.nodeTag(value))) {
+        const sides = tree.nodeData(value).node_and_node;
+        for ([_]Ast.Node.Index{ sides[0], sides[1] }) |operand| if (try argumentOf(c, operand, bound)) |at| try into.operands.append(c.allocator, at);
+        return;
+    }
+    // A predicate's predicate is read in turn. A parameter is what the call passes, read as the
+    // condition; a local of the predicate holds what the reading does not follow here. Any
+    // other leaf is a truth, as it is written in the condition itself.
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, value)) |call| return predicate(c, call, bound, into, depth);
+    if (tree.nodeTag(value) != .identifier) return;
+    const model = &c.project.at(c.file).model;
+    const declared = (model.reference(value) orelse return).declaration orelse return;
+    switch (model.declarations[@backingInt(declared)].kind) {
+        .parameter => {
+            const passed = try argumentOf(c, value, bound) orelse return;
+            if (passed != value) try decides(c, passed, false, into, depth);
+        },
+        .capture => unfollowed(into),
+        .variable => switch (model.scopes[@backingInt(model.declarations[@backingInt(declared)].scope)].kind) {
+            .file, .container => {},
+            else => unfollowed(into),
+        },
+        else => {},
+    }
+}
+
+/// What a predicate's comparison `operand` bounds, as a node of the checked file: a parameter
+/// of the callee `bound` names is the argument its call passes (a method's receiver first),
+/// followed through the bindings around it; a literal bounds nothing (null); anything else is
+/// read where it is written, the input fact reading a parameter by every call of it.
+fn argumentOf(c: *Context, operand: Ast.Node.Index, bound: ?*const Predicate) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = operand;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    switch (tree.nodeTag(at)) {
+        .number_literal, .char_literal, .string_literal, .enum_literal => return null,
+        .identifier => for ([_][]const u8{ "true", "false", "null", "undefined" }) |literal| {
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), literal)) return null;
+        },
+        else => return at,
+    }
+    const binding = bound orelse return at;
+    const declared = (model.reference(at) orelse return at).declaration orelse return at;
+    const record = model.declarations[@backingInt(declared)];
+    if (record.kind != .parameter) return at;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, model.declarations[@backingInt(binding.callee.index)].node) orelse return at;
+    var params = proto.iterate(tree);
+    var position: usize = 0;
+    while (params.next()) |param| : (position += 1) {
+        if (param.name_token == record.token) break;
+    } else return at;
+    const call = binding.call;
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+        switch (try c.facts.resolve(c.file, receiver)) {
+            .container => {},
+            else => {
+                if (position == 0) return argumentOf(c, receiver, binding.outer);
+                position -= 1;
+            },
+        }
+    }
+    // A variadic or comptime-sized call the prototype does not line up with is read as written.
+    if (position >= call.ast.params.len) return at;
+    return argumentOf(c, call.ast.params[position], binding.outer);
+}
 
 /// Gathers into `into` what decides a `while` condition: its comparisons, and a variable of the
 /// function whose address it never takes as each value it is given, read the same way (`more =
@@ -1542,7 +1676,13 @@ fn decides(c: *Context, condition: Ast.Node.Index, payload: bool, into: *Decided
                 try controls(c, assignment, declared, payload, into, depth + 1);
             } else return;
         },
-        else => if (comparison(tree.nodeTag(condition))) return into.compared.append(c.allocator, condition),
+        else => {
+            if (comparison(tree.nodeTag(condition))) return into.compared.append(c.allocator, condition);
+            // A program predicate decides it by what it returns; it stays a truth for what
+            // else reads one.
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (!payload) if (tree.fullCall(&buffer, condition)) |call| try predicate(c, call, null, into, depth);
+        },
     }
     try (if (payload) &into.leaves else &into.truths).append(c.allocator, condition);
 }
@@ -1681,11 +1821,12 @@ fn assigns(tag: Ast.Node.Tag) bool {
 /// Whether every pass of a loop's body consumes input or lets its task be canceled, so a peer's
 /// count runs it no longer than the data it sent or the caller allows: on every pass (`always`)
 /// the body takes at least a byte from a reader (`takeByte`, `takeInt`, or a take, discard or
-/// read of a count shown above zero), advances a slice past a part shown above zero (`cp =
-/// cp[slash + 1 ..]`), or checks for cancelation and passes it on (`try io.checkCancel()`). A
+/// read of a count shown above zero), advances a slice declared outside it past a part shown
+/// above zero (`cp = cp[slash + 1 ..]`), or checks for cancelation and passes it on (`try io.checkCancel()`). A
 /// peek, a read whose count may be zero, and one on a branch some pass skips consume nothing.
 fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -1696,7 +1837,12 @@ fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!
             const target, const value = tree.nodeData(node).node_and_node;
             if (tree.nodeTag(value) != .slice_open) continue;
             const slice = tree.fullSlice(value).?;
-            if (!std.mem.eql(u8, tree.getNodeSource(slice.ast.sliced), tree.getNodeSource(target))) continue;
+            // The slice itself, by declaration, and one that outlives the pass: a local made
+            // afresh in the body bounds nothing.
+            const declared = declaredBy(tree, model, target) orelse continue;
+            if (declaredBy(tree, model, slice.ast.sliced) != declared) continue;
+            const made = model.declarations[@backingInt(declared)].token;
+            if (made >= first and made <= last) continue;
             if (try Proof.nonzero(c, c.file, slice.ast.start) and try always(c, c.file, node, body, .{})) return true;
             continue;
         }
@@ -1738,32 +1884,69 @@ fn skipsIn(tree: *const Ast, statement: Ast.Node.Index) bool {
 }
 
 /// Whether `while (x != 0)` clears a bit of `x` (`x &= x - 1`) or shifts it right (`x >>= k`,
-/// `k` above zero) on every pass: it runs at most `x`'s width of times.
-fn clears(c: *Context, condition: Ast.Node.Index, body: Ast.Node.Index) bool {
+/// `k` above zero, `x` unsigned: a negative number shifts to -1, never 0) on every pass, with
+/// nothing else in the loop writing it: it runs at most `x`'s width of times. `x` is the
+/// condition's own local, by declaration, not spelling.
+fn clears(c: *Context, condition: Ast.Node.Index, loop: Ast.full.While) bool {
     const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
     if (tree.nodeTag(condition) != .bang_equal) return false;
     const value, const zero = tree.nodeData(condition).node_and_node;
     if (tree.nodeTag(zero) != .number_literal or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(zero)), "0")) return false;
-    const name = tree.getNodeSource(value);
+    const declared = declaredBy(tree, model, value) orelse return false;
+    const record = model.declarations[@backingInt(declared)];
     var buffer: [2]Ast.Node.Index = undefined;
-    const statements = tree.blockStatements(&buffer, body) orelse return false;
-    for (statements) |statement| {
+    const statements = tree.blockStatements(&buffer, loop.ast.then_expr) orelse return false;
+    const step = for (statements) |statement| {
         // A statement before that may end the pass leaves the bit set.
         if (skipsIn(tree, statement)) return false;
         const target, const operand = switch (tree.nodeTag(statement)) {
             .assign_bit_and, .assign_shr => tree.nodeData(statement).node_and_node,
             else => continue,
         };
-        if (!std.mem.eql(u8, tree.getNodeSource(target), name)) continue;
+        if (declaredBy(tree, model, target) != declared) continue;
         if (tree.nodeTag(statement) == .assign_shr) {
             if (tree.nodeTag(operand) != .number_literal or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operand)), "0")) continue;
-            return true;
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            const written = variable.ast.type_node.unwrap() orelse return false;
+            if (tree.nodeTag(written) != .identifier or !unsignedName(tree.tokenSlice(tree.nodeMainToken(written)))) return false;
+            break statement;
         }
         if (tree.nodeTag(operand) != .sub) continue;
         const minuend, const one = tree.nodeData(operand).node_and_node;
-        if (std.mem.eql(u8, tree.getNodeSource(minuend), name) and std.mem.eql(u8, tree.getNodeSource(one), "1")) return true;
+        if (declaredBy(tree, model, minuend) == declared and tree.nodeTag(one) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(one)), "1")) break statement;
+    } else return false;
+    // Any other write of it in the loop, or its address taken there, may undo the step.
+    const first = tree.firstToken(loop.ast.cond_expr);
+    const last = tree.lastToken(loop.ast.then_expr);
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (node == step) continue;
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        if (tag == .address_of and declaredBy(tree, model, rootOf(tree, tree.nodeData(node).node)) == declared) return false;
+        if (tag == .assign_destructure) {
+            for (tree.assignDestructure(node).ast.variables) |target| if (declaredBy(tree, model, rootOf(tree, target)) == declared) return false;
+            continue;
+        }
+        if (!assigns(tag)) continue;
+        if (declaredBy(tree, model, rootOf(tree, tree.nodeData(node).node_and_node[0])) == declared) return false;
     }
-    return false;
+    return true;
+}
+
+/// The declaration an identifier names, or null for anything else.
+fn declaredBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
+    if (tree.nodeTag(node) != .identifier) return null;
+    return (model.reference(node) orelse return null).declaration;
+}
+
+/// Whether a primitive type's name is an unsigned integer's (`u8`, `u64`, `usize`).
+fn unsignedName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "usize")) return true;
+    if (name.len < 2 or name[0] != 'u') return false;
+    for (name[1..]) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return true;
 }
 
 fn site(c: *Context, node: Ast.Node.Index) bool {
