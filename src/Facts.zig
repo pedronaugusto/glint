@@ -1540,28 +1540,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
     var buffer: [2]Ast.Node.Index = undefined;
     switch (tag) {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(null, file, node),
-        .call_one, .call_one_comma, .call, .call_comma => {
-            var call_buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&call_buffer, node).?;
-            const callee = try self.resolve(file, call.ast.fn_expr);
-            if (callee == .alternatives) return self.map(callee, {}, callResult);
-            if (callee == .function) {
-                if (try self.typeArgument(file, call, callee.function)) |result| return result;
-                // A made container's method read with the container's bindings; where its own
-                // generic parameters leave the result unknown, the call's reading of them.
-                const made = try self.madeResult(file, call, callee.function);
-                if (made) |value| if (!unknownWithin(value)) return value;
-                if (try self.evaluateCall(null, file, call, callee.function)) |value| return value;
-                if (made) |value| return value;
-                var result = try self.callResult(callee, {});
-                if (result == .container and result.container.symbolic) {
-                    result.container.made_by = try self.making(.{ .function = callee.function, .file = file, .call = node, .assumed = self.assumed });
-                }
-                return result;
-            }
-            if (try self.throughPointer(file, call.ast.fn_expr)) |value| return value;
-            return self.callResult(callee, {});
-        },
+        .call_one, .call_one_comma, .call, .call_comma => return self.callValue(file, node),
         .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma => {
             const value = tree.fullStructInit(&buffer, node).?;
             if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
@@ -1579,6 +1558,33 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),
         else => return .{ .unknown = .unsupported },
     }
+}
+
+/// What the call `node` gives: its callee's result, read with the call's arguments where the
+/// callee is a function (a type it is given, a made container's bindings, its body evaluated);
+/// each alternative's where it may be several; a function pointer's through what it holds.
+fn callValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node).?;
+    const callee = try self.resolve(file, call.ast.fn_expr);
+    if (callee == .alternatives) return self.map(callee, {}, callResult);
+    if (callee == .function) {
+        if (try self.typeArgument(file, call, callee.function)) |result| return result;
+        // A made container's method read with the container's bindings; where its own
+        // generic parameters leave the result unknown, the call's reading of them.
+        const made = try self.madeResult(file, call, callee.function);
+        if (made) |value| if (!unknownWithin(value)) return value;
+        if (try self.evaluateCall(null, file, call, callee.function)) |value| return value;
+        if (made) |value| return value;
+        var result = try self.callResult(callee, {});
+        if (result == .container and result.container.symbolic) {
+            result.container.made_by = try self.making(.{ .function = callee.function, .file = file, .call = node, .assumed = self.assumed });
+        }
+        return result;
+    }
+    if (try self.throughPointer(file, call.ast.fn_expr)) |value| return value;
+    return self.callResult(callee, {});
 }
 
 /// A type written in place: a pointer, an array, a function type, a container.
