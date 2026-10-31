@@ -270,6 +270,7 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
                 left = try walk.undoneBy(call);
             }
             memo.deferred.clearRetainingCapacity();
+            memo.seen.clearRetainingCapacity();
             const unknown = walk.unknown;
             if (left == 0) continue;
             const cut = memo.cuts != cuts;
@@ -3796,25 +3797,43 @@ const Calls = struct {
     cuts: usize = 0,
     /// The `undefines` readings cut at the depth, unread, deepest last (`readDeferred`).
     deferred: std.ArrayList(Key) = .empty,
+    /// What the call's own walk read, whether a reading from the top is under way, and whether
+    /// one came back to what the walk read without keeping it: a cycle longer than the depth,
+    /// which no reading from the top settles.
+    seen: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    topping: bool = false,
+    wrapped: bool = false,
 };
 
 /// Reads each function a reading cut at the depth left unread, from the top, deepest first:
 /// what a function leaves undefined does not depend on who asks, so its answer, kept, settles
 /// the readings above it the next time they ask, and a chain of any length is read a stretch
-/// at a time. False where `budget` readings did not settle them.
+/// at a time. A function is read again only where an answer was kept since its last reading,
+/// all it leans on; a reading that comes back to what the call's walk read is in a cycle longer
+/// than the depth, and ends them. False where no answer was kept, the readings came back, or
+/// `budget` readings did not settle them.
 fn readDeferred(c: *Context) Context.Error!bool {
     const memo = try c.facts.memo(Calls);
+    const before = memo.left.count();
+    var tried: std.AutoHashMapUnmanaged(Calls.Key, usize) = .empty;
+    defer tried.deinit(c.allocator);
     var budget: usize = 1024;
+    memo.topping = true;
+    memo.wrapped = false;
+    defer memo.topping = false;
     while (memo.deferred.pop()) |key| {
         if (memo.left.contains(key)) continue;
+        if (tried.get(key)) |kept| if (kept == memo.left.count()) continue;
         if (budget == 0) return false;
         budget -= 1;
+        try tried.put(c.allocator, key, memo.left.count());
         const mark = memo.deferred.items.len;
         _ = try undefines(c, key.decl, key.index, 0);
+        if (memo.wrapped) return false;
         // Cut again below it: the deeper ones first, then it once more.
         if (!memo.left.contains(key)) try memo.deferred.insert(c.allocator, mark, key);
     }
-    return true;
+    return memo.left.count() != before;
 }
 
 /// What of a parameter's memory a function may read before writing it: the parts in `mask`, of
@@ -3872,11 +3891,19 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
         memo.lowest = @min(memo.lowest, at);
         return each.sofar;
     };
+    const cut: Left = .{ .mask = std.math.maxInt(u64), .owner = null, .failing = std.math.maxInt(u64) };
+    // Once one comes back, the rest of the reading from the top is cut with it.
+    if (memo.topping and (memo.wrapped or memo.seen.contains(key))) {
+        memo.cuts += 1;
+        memo.wrapped = true;
+        return cut;
+    }
     if (depth > undefines_depth_limit) {
         memo.cuts += 1;
         try memo.deferred.append(c.allocator, key);
-        return .{ .mask = std.math.maxInt(u64), .owner = null, .failing = std.math.maxInt(u64) };
+        return cut;
     }
+    if (!memo.topping) try memo.seen.put(c.allocator, key, {});
     const at = memo.reading.items.len;
     const lowest = memo.lowest;
     try memo.reading.append(c.allocator, .{ .key = key, .sofar = .{ .mask = 0, .owner = null } });
