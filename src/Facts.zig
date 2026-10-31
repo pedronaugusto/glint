@@ -46,6 +46,14 @@ dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
 memos: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
 /// Every member access in the program's files, by the member's name, found once (`memberUses`).
 member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
+/// For each field that holds a function pointer, the functions the program stores in it
+/// (`storedFunctions`), or null where a store may not be seen; and those being read.
+stored: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
+storing: std.AutoHashMapUnmanaged(Decl, void) = .empty,
+/// Per file, whether every `@import` it makes names a file the program holds (`importsRead`);
+/// and per file, the files that may share a compilation with it (`compiledWith`).
+imports_read: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
+compiled_with: std.AutoHashMapUnmanaged(Project.FileId, Files) = .empty,
 remaining: usize = 100_000,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -1315,12 +1323,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             if (Model.primitive(name)) return .{ .primitive = name };
             return .{ .unknown = .unresolved };
         },
-        .field_access => {
-            const data = tree.nodeData(node).node_and_token;
-            const lhs = try self.resolve(file, data[0]);
-            const name = try self.memberName(tree.tokenSlice(data[1]));
-            return self.memberValue(lhs, name);
-        },
+        .field_access => return self.fieldValue(file, node),
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         // A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the
         // payload's type (Zig requires the other side to coerce to it), as `x.?` has.
@@ -1712,6 +1715,254 @@ fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
         return if (template_value == .alternatives) value else template_value;
     }
     return self.valueOf(try self.madeWithin(value, container, made));
+}
+
+/// A member read through a value (`x.name`). Called through a field that holds a function
+/// pointer (`p.writeUsage(w)`, `w.vtable.drain(…)`), the functions stored there, where every
+/// store is seen.
+fn fieldValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    const data = tree.nodeData(node).node_and_token;
+    const lhs = try self.resolve(file, data[0]);
+    const name = try self.memberName(tree.tokenSlice(data[1]));
+    const value = try self.memberValue(lhs, name);
+    if (called(tree, &self.project.at(file).model, node) and functionPointer(value)) if (fieldOwner(lhs)) |container| {
+        if (try self.storedFunctions(container, name)) |stored| return stored;
+    };
+    return value;
+}
+
+/// Whether `node` is what a call calls.
+fn called(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    const parent = model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    return call.ast.fn_expr == node;
+}
+
+/// Whether a field's value is a pointer to a function, its type written in place.
+fn functionPointer(value: Value) bool {
+    return switch (value) {
+        .pointer => |to| to.* == .fn_type,
+        else => false,
+    };
+}
+
+/// The struct whose field a value read through `lhs` is: a value of it, or a pointer to one.
+fn fieldOwner(lhs: Value) ?Container {
+    return switch (lhs) {
+        .instance => |c| c,
+        .pointer => |to| switch (to.*) {
+            .instance => |c| c,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// The functions the program stores in `container`'s field `name`, a function pointer: one, or a
+/// choice of them, each a call through the field may reach. A store is the field's default
+/// value, a struct literal's value for it, or an assignment to it, in every file the program
+/// holds, dependencies and std among them; a literal or an object whose type does not resolve
+/// counts as one of the field's where it names it. Null, the call left unresolved, where a
+/// store may go unseen: a value that is not a function the program declares (a parameter, a
+/// field's, a cast's, `undefined`), the field's address taken or written through `@field`, a
+/// value of the struct made by a cast or declared `extern`, a file the front end refused, or an
+/// `@import` of a file the program does not hold. Only the files that may share a compilation
+/// with the struct's (`compiledWith`) are read: another program's stores reach no call here.
+fn storedFunctions(self: *Facts, container: Container, name: []const u8) ResolveError!?Value {
+    const field = self.member(container, name) orelse return null;
+    if (self.project.at(field.file).model.declarations[@backingInt(field.index)].kind != .field) return null;
+    if (self.stored.get(field)) |known| return known;
+    if (self.storing.contains(field)) return null;
+    try self.storing.put(self.gpa, field, {});
+    defer _ = self.storing.remove(field);
+    const found = try self.storesOf(container, field, name);
+    try self.stored.put(self.gpa, field, found);
+    return found;
+}
+
+fn storesOf(self: *Facts, container: Container, field: Decl, name: []const u8) ResolveError!?Value {
+    var targets: std.ArrayList(Value) = .empty;
+    {
+        const tree = &self.project.at(field.file).file.tree;
+        const declared = tree.fullContainerField(self.project.at(field.file).model.declarations[@backingInt(field.index)].node) orelse return null;
+        if (declared.ast.value_expr.unwrap()) |default| if (!try self.stores(&targets, field.file, default)) return null;
+    }
+    const files = try self.compiledWith(container.file);
+    var each = files.keyIterator();
+    while (each.next()) |key| {
+        const file = key.*;
+        if (self.project.at(file).file.status != .parsed or !try self.importsRead(file)) return null;
+        const tree = &self.project.at(file).file.tree;
+        const model = &self.project.at(file).model;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            switch (tag) {
+                .field_access => {
+                    const object, const spelled = tree.nodeData(node).node_and_token;
+                    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(spelled)), name)) continue;
+                    const parent = model.parentOf(node) orelse continue;
+                    switch (tree.nodeTag(parent)) {
+                        .assign => if (tree.nodeData(parent).node_and_node[0] != node) continue,
+                        .address_of => {},
+                        else => continue,
+                    }
+                    if (!mayHold(container, try self.resolve(file, object))) continue;
+                    if (tree.nodeTag(parent) == .address_of) return null;
+                    if (!try self.stores(&targets, file, tree.nodeData(parent).node_and_node[1])) return null;
+                },
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                    const builtin_name = tree.tokenSlice(tree.nodeMainToken(node));
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const args = builtinArgs(tree, node, &buffer);
+                    if (std.mem.eql(u8, builtin_name, "@field")) {
+                        if (args.len != 2) continue;
+                        // A name spelled out names this field or another; any other may be it.
+                        if (tree.nodeTag(args[1]) == .string_literal) {
+                            const spelled = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => name,
+                            };
+                            if (!std.mem.eql(u8, spelled, name)) continue;
+                        }
+                        const parent = model.parentOf(node) orelse continue;
+                        const set = switch (tree.nodeTag(parent)) {
+                            .assign => tree.nodeData(parent).node_and_node[0] == node,
+                            .address_of => true,
+                            else => false,
+                        };
+                        // `@field` of a type names a declaration of it (`&@field(cpus, name)` with
+                        // `comptime cpus: type`), no field of a value.
+                        if (set and !try self.isType(file, args[0]) and mayHold(container, try self.resolve(file, args[0]))) return null;
+                    } else if (std.mem.eql(u8, builtin_name, "@ptrCast") or std.mem.eql(u8, builtin_name, "@bitCast")) {
+                        if (isOf(container, try self.literalType(file, node))) return null;
+                    }
+                },
+                else => {
+                    if (tree.fullVarDecl(node)) |variable| if (variable.extern_export_token) |token| if (tree.tokenTag(token) == .keyword_extern) {
+                        if (variable.ast.type_node.unwrap()) |kind| if (isOf(container, try self.resolve(file, kind))) return null;
+                    };
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const literal = tree.fullStructInit(&buffer, node) orelse continue;
+                    for (literal.ast.fields) |value| {
+                        const label = try self.memberName(tree.tokenSlice(Model.initName(tree, value) orelse continue));
+                        if (!std.mem.eql(u8, label, name)) continue;
+                        if (!mayHold(container, try self.literalType(file, node))) continue;
+                        if (!try self.stores(&targets, file, value)) return null;
+                    }
+                },
+            }
+        }
+    }
+    return switch (targets.items.len) {
+        0 => null,
+        1 => targets.items[0],
+        else => .{ .alternatives = targets.items },
+    };
+}
+
+/// Whether `node` is a type: one that resolves to a container, or a parameter declared `type`.
+fn isType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (try self.resolve(file, node) == .container) return true;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    if (tree.nodeTag(node) != .identifier) return false;
+    const decl = (model.reference(node) orelse return false).declaration orelse return false;
+    if (model.declarations[@backingInt(decl)].kind != .parameter) return false;
+    const kind = self.parameterTypeNode(.{ .file = file, .index = decl }) orelse return false;
+    return tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type");
+}
+
+/// Adds what `node`, stored in a function-pointer field, may call: the function it names
+/// (`f`, `&f`), or each a per-build choice names; false where it is anything else.
+fn stores(self: *Facts, targets: *std.ArrayList(Value), file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    var value = try self.resolve(file, node);
+    if (value == .pointer and value.pointer.* == .function) value = value.pointer.*;
+    const each: []const Value = switch (value) {
+        .function => &.{value},
+        .alternatives => |choices| choices,
+        else => return false,
+    };
+    for (each) |one| {
+        if (one != .function) return false;
+        for (targets.items) |known| {
+            if (std.meta.eql(known.function, one.function)) break;
+        } else try targets.append(self.gpa, one);
+    }
+    return true;
+}
+
+/// Whether a value of type `value` (or a type) may be `container`'s, or a pointer to one: it is,
+/// or it does not resolve.
+fn mayHold(container: Container, value: Value) bool {
+    return value == .unknown or isOf(container, value);
+}
+
+/// Whether `value` is `container`, a value of it, or a pointer to one.
+fn isOf(container: Container, value: Value) bool {
+    return switch (value) {
+        .container, .instance => |c| c.file == container.file and c.scope == container.scope,
+        .pointer => |to| isOf(container, to.*),
+        else => false,
+    };
+}
+
+/// The files that may share a compilation with `file`: each a root that reaches it may build,
+/// so all its imports reach, by the program's import edges. A store in any other file is in
+/// another program, where no call of this one goes.
+fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
+    if (self.compiled_with.getPtr(file)) |known| return known;
+    var roots: Files = .empty;
+    try roots.put(self.gpa, file, {});
+    var growing = true;
+    while (growing) {
+        growing = false;
+        for (self.project.imports) |edge| if (roots.contains(edge.target) and !roots.contains(edge.from)) {
+            try roots.put(self.gpa, edge.from, {});
+            growing = true;
+        };
+    }
+    var reached: Files = .empty;
+    var it = roots.keyIterator();
+    while (it.next()) |root| try reached.put(self.gpa, root.*, {});
+    growing = true;
+    while (growing) {
+        growing = false;
+        for (self.project.imports) |edge| if (reached.contains(edge.from) and !reached.contains(edge.target)) {
+            try reached.put(self.gpa, edge.target, {});
+            growing = true;
+        };
+    }
+    const kept = try self.compiled_with.getOrPut(self.gpa, file);
+    kept.value_ptr.* = reached;
+    return kept.value_ptr;
+}
+
+/// Whether every `@import` `file` makes names a file the program holds: one of a computed name,
+/// or a name no mapping gives (the compiler's `builtin`, std's own internals and names the
+/// build declares absent aside), may hold a store the program does not show.
+fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
+    if (self.imports_read.get(file)) |known| return known;
+    const tree = &self.project.at(file).file.tree;
+    const read = for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .builtin_call_two, .builtin_call_two_comma => {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
+            // The compiler's `builtin` holds the target and build options, never a store.
+            if (std.mem.eql(u8, tree.getNodeSource(node), "@import(\"builtin\")")) continue;
+            switch (try self.resolve(file, node)) {
+                .unknown => |why| switch (why) {
+                    .absent, .std_internal => {},
+                    else => break false,
+                },
+                else => {},
+            }
+        },
+        else => {},
+    } else true;
+    try self.imports_read.put(self.gpa, file, read);
+    return read;
 }
 
 /// A pointer's `len` or `ptr` where what it points at has no such member: a slice's or an
@@ -4021,4 +4272,44 @@ test "a made container's method whose result names its own generic parameter is 
     try std.testing.expect(found[0] == .instance);
     try std.testing.expect(found[1] == .instance);
     try std.testing.expect(found[0].instance.scope != found[1].instance.scope);
+}
+
+/// What `o.run` in `source` resolves to, where a call calls it (`called`) or is read as a value:
+/// the program `source` alone.
+fn fieldRead(source: []const u8, called_there: bool) !std.meta.Tag(Value) {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (tree.nodeTag(node) != .field_access or !std.mem.eql(u8, tree.getNodeSource(node), "o.run")) continue;
+        if (called(tree, &project.sources[0].model, node) != called_there) continue;
+        return std.meta.activeTag(try facts.resolve(project.sources[0].id, node));
+    }
+    unreachable; // unreachable: each source spells `o.run` both ways
+}
+
+test "a call through a function-pointer field reaches the functions stored there, only where every store is seen" {
+    const head =
+        \\const Ops = struct { run: *const fn (u32) u32 };
+        \\fn a(x: u32) u32 { return x; }
+        \\fn b(x: u32) u32 { return x + 1; }
+        \\pub const one: Ops = .{ .run = a };
+        \\pub fn f(o: *const Ops) u32 { return o.run(1); }
+        \\pub fn h(o: *const Ops) usize { return @intFromPtr(o.run); }
+        \\
+    ;
+    // Stored by a literal and an assignment, each a function: one, or a choice of them; read as
+    // a value, still the pointer the field holds.
+    try std.testing.expectEqual(.function, try fieldRead(head, true));
+    try std.testing.expectEqual(.alternatives, try fieldRead(head ++ "pub fn g(o: *Ops) void { o.run = &b; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head, false));
+    // Unresolved: a value chosen at run time, the field's address taken, a file not read.
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run = run; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops) *const *const fn (u32) u32 { return &o.run; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "const missing = @import(\"missing\");\npub fn g() void { _ = missing; }\n", true));
 }

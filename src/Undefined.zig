@@ -2701,12 +2701,21 @@ fn holderKeptBy(c: *Context, file: Project.FileId, id: Model.Declaration.Id, dep
 
 /// Whether a call handed a holder (a method's receiver, `position` null, or the argument at
 /// `position`) keeps what it holds: std's, but those that hand back its room, or the
-/// program's, or a dependency's, whose parameter keeps it.
+/// program's, or a dependency's, whose parameter keeps it. A call that may reach several (a
+/// per-build choice, a function-pointer field's stored functions) keeps it where each does.
 fn holderKeptThrough(c: *Context, file: Project.FileId, call: Ast.full.Call, position: ?usize, depth: u8) Context.Error!bool {
-    const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |function| function,
-        else => return false,
-    };
+    const value = try c.facts.resolve(file, call.ast.fn_expr);
+    for (if (value == .alternatives) value.alternatives else &.{value}) |each| {
+        const decl = switch (each) {
+            .function => |function| function,
+            else => return false,
+        };
+        if (!try holderKeptIn(c, file, call, decl, position, depth)) return false;
+    }
+    return true;
+}
+
+fn holderKeptIn(c: *Context, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl, position: ?usize, depth: u8) Context.Error!bool {
     const origin = (try c.facts.origin(decl)) orelse decl;
     for (std_room) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |found| {
         if (std.meta.eql((try c.facts.origin(found)) orelse found, origin)) return false;
@@ -3389,6 +3398,11 @@ const Calls = struct {
     /// and the outermost of them a reading under way leaned on.
     reading: std.ArrayList(struct { key: Key, sofar: Left }) = .empty,
     lowest: usize = std.math.maxInt(usize),
+    /// What a reading that leaned on one above it showed, kept for that one's pass (`head`, its
+    /// place in `reading`): read again only when that one is.
+    provisional: std.AutoHashMapUnmanaged(Key, struct { left: Left, head: usize }) = .empty,
+    /// How many functions' parameters `undefines` has read, for the test that keeps it linear.
+    reads: usize = 0,
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,
 };
@@ -3428,6 +3442,10 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
     const memo = try c.facts.memo(Calls);
     const key: Calls.Key = .{ .decl = decl, .index = index, .question = .undefines };
     if (memo.left.get(key)) |known| return known;
+    if (memo.provisional.get(key)) |kept| {
+        memo.lowest = @min(memo.lowest, kept.head);
+        return kept.left;
+    }
     for (memo.reading.items, 0..) |each, at| if (std.meta.eql(each.key, key)) {
         memo.lowest = @min(memo.lowest, at);
         return each.sofar;
@@ -3445,20 +3463,46 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
         memo.lowest = std.math.maxInt(usize);
         const shown = try undefinesRead(c, decl, index, depth);
         const sofar = &memo.reading.items[at].sofar;
-        const recursed = memo.lowest <= at;
-        if (!recursed or (shown.mask | sofar.mask) == sofar.mask) {
-            // Settled: kept where it leaned on no reading above it and nothing was cut.
-            const settled: Left = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
+        const settled: Left = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
+        if (memo.lowest > at or settled.mask == sofar.mask) {
             const above = memo.lowest < at;
-            if (!above and memo.cuts == cuts) try memo.left.put(c.allocator, key, settled);
+            // Leaning on a reading above it, it is kept for that one's pass; cut short, for the
+            // outermost reading's: read once a pass either way, and never kept past it.
+            const head: ?usize = if (above) memo.lowest else if (memo.cuts != cuts and at > 0) 0 else null;
+            if (head) |outer| {
+                var each = memo.provisional.iterator();
+                while (each.next()) |entry| if (entry.value_ptr.head >= at) {
+                    entry.value_ptr.head = outer;
+                };
+                try memo.provisional.put(c.allocator, key, .{ .left = settled, .head = outer });
+            } else {
+                try settle(c.allocator, memo, at, memo.cuts == cuts);
+                if (memo.cuts == cuts) try memo.left.put(c.allocator, key, settled);
+            }
             memo.lowest = @min(lowest, if (above) memo.lowest else std.math.maxInt(usize));
             return settled;
         }
-        sofar.* = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
+        // Read again from what it has shown: what leaned on the last pass leans on nothing now.
+        try settle(c.allocator, memo, at, false);
+        sofar.* = settled;
     }
 }
 
+/// Ends the pass of the reading at `head` in `reading`: what leaned on it is kept where `keep`,
+/// and dropped either way from what is provisional.
+fn settle(gpa: std.mem.Allocator, memo: *Calls, head: usize, keep: bool) Context.Error!void {
+    var done: std.ArrayList(Calls.Key) = .empty;
+    defer done.deinit(gpa);
+    var each = memo.provisional.iterator();
+    while (each.next()) |entry| if (entry.value_ptr.head >= head) {
+        try done.append(gpa, entry.key_ptr.*);
+        if (keep) try memo.left.put(gpa, entry.key_ptr.*, entry.value_ptr.left);
+    };
+    for (done.items) |key| _ = memo.provisional.remove(key);
+}
+
 fn undefinesRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
+    (try c.facts.memo(Calls)).reads += 1;
     const found = (try parameter(c, decl, index, true)) orelse return .{ .mask = 0, .owner = null };
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
@@ -3858,4 +3902,53 @@ fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
         .int => |value| value,
         else => null,
     };
+}
+
+test "use-after-deinit summaries are read a bounded number of times per function, through nested recursion and past the depth" {
+    const Report = @import("Report.zig");
+    const Probe = struct {
+        const id: Rule = @fromBackingInt(1000); // safe: an extension identity the test owns.
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = id, .level = .report }} };
+        fn never(_: *Context, _: Model.Declaration) Context.Error!bool {
+            return false;
+        }
+        fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const Report.Span, _: []const Report.Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: Report.Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+    };
+    const gpa = std.testing.allocator;
+    // Each level reaches the next by two paths, and the last goes back to the first: a cycle
+    // whose every function a reading reaches many ways, longer than the depth `undefines` follows.
+    // Read once per function, the count stays near the functions'; read again on each path, it
+    // doubles per level.
+    const n = 12;
+    const functions = 3 * n + 1;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(gpa);
+    try source.appendSlice(gpa, "const S = struct { a: u32 };\n");
+    for (0..n) |i| try source.print(gpa,
+        \\fn g{d}(p: *S, k: u32) void {{ if (k == 0) return; l{d}(p, k - 1); r{d}(p, k - 1); }}
+        \\fn l{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+        \\fn r{d}(p: *S, k: u32) void {{ g{d}(p, k); }}
+        \\
+    , .{ i, i, i, i, i + 1, i, i + 1 });
+    try source.print(gpa, "fn g{d}(p: *S, k: u32) void {{ g0(p, k); }}\n", .{n});
+    try source.appendSlice(gpa, "pub fn main() u32 { var s: S = .{ .a = 1 }; g0(&s, 3); return s.a; }\n");
+    var project = try Project.init(gpa, &.{.{ .name = "root", .bytes = source.items }}, &.{}, .{});
+    defer project.deinit();
+    // A program std's AstGen refuses is never read: it would pass with no summary read.
+    try std.testing.expectEqual(.parsed, project.sources[0].file.status);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    var sink: Context.Sink = .{ .diagnostic = Probe.diagnostic, .coverage = Probe.coverage, .config = Probe.configOf };
+    const definitions = [_]@import("Rule.zig").Definition{.{ .id = Probe.id, .name = "SUMMARIES", .group = .family_policy, .purpose = "counts use-after-deinit summaries", .version = 1 }};
+    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Probe.config, .facts = &facts, .definitions = &definitions, .sink = &sink };
+    try reads(&c, Probe.id, Probe.never);
+    const counted = (try facts.memo(Calls)).reads;
+    try std.testing.expect(counted >= functions);
+    try std.testing.expect(counted <= 3 * functions);
 }
