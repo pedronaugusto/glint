@@ -94,7 +94,7 @@ fn interfaceField(c: *Context, node: Ast.Node.Index, pointer: Ast.Node.Index, fi
 /// interface it was read from (`h.f(h)`, `x.F.f(&x.F)`, `w.vtable.drain(w, …)`, `i.f.?(io, i)`):
 /// each parameter the function takes as a pointer to `kind` is given that interface. A function
 /// read out and called on another pointer converts that pointer as though it were C.F's. A
-/// read whose receiver does not resolve may be one, unless it is an import's name.
+/// read whose receiver does not resolve may be one, unless it names a type.
 fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
     const source = c.project.at(kind.file);
     const tree = &source.file.tree;
@@ -135,7 +135,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
             if (args.len != 2) continue;
             const receiver = try c.facts.resolve(each.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, kind)) continue;
-            if (receiver == .unknown and generic(file_tree, &each.model, node)) continue;
+            if (receiver == .unknown and (generic(file_tree, &each.model, node) or try namesType(c, each.id, args[0]))) continue;
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
                 const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
@@ -159,7 +159,7 @@ fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Contex
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (namespace(tree, model, receiver) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or generic(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, kind)) continue;
@@ -209,7 +209,7 @@ fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, thr
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (namespace(tree, model, receiver) or notFunction(tree, model, use.node) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or notFunction(tree, model, use.node) or generic(tree, model, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
@@ -484,7 +484,7 @@ fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: u8) C
 /// Whether every use of C.F in the package takes its address, reads a part of it, or calls a
 /// method of it that takes it by pointer, and each pointer to it so made, followed to every
 /// place it goes, stays one: none copies it. A use whose receiver does not resolve may be C's,
-/// and shows nothing, unless it is an import's name. So do the interface parameters of every
+/// and shows nothing, unless it names a type. So do the interface parameters of every
 /// function of C's file, which a vtable may hand C.F.
 fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bool) Context.Error!bool {
     var follow: Follow = .{ .c = c, .kind = kind, .contract = interface };
@@ -494,7 +494,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
         const receiver = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
         if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
         if (receiver == .unknown) {
-            if (namespace(tree, model, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
             return false;
         }
         const parent = model.parentOf(use.node) orelse return false;
@@ -519,7 +519,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             // Of another type, it names none of C's fields.
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
-            if (receiver == .unknown and generic(tree, &source.model, node)) continue;
+            if (receiver == .unknown and (generic(tree, &source.model, node) or try namesType(c, source.id, args[0]))) continue;
             if (try namedBy(c, tree, &source.model, args[1], field.name)) return false;
         }
     }
@@ -808,7 +808,7 @@ const Follow = struct {
         for (try c.facts.memberUses(record.name)) |use| {
             const found = (try c.facts.definition(use.file, use.node)) orelse {
                 const tree = &c.project.at(use.file).file.tree;
-                if (namespace(tree, &c.project.at(use.file).model, tree.nodeData(use.node).node_and_token[0])) continue;
+                if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0])) continue;
                 return false;
             };
             if (!std.meta.eql(found, decl)) continue;
@@ -1956,22 +1956,50 @@ fn functionDecl(model: *const Model, proto: Ast.Node.Index) ?Model.Declaration.I
     return null;
 }
 
-/// Whether `node` names an `@import` directly (`const options = @import("options")`): a
-/// member of it is a declaration of that file or module, never a field of a value, whether or
-/// not the import resolves.
-fn namespace(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    const at = strip(tree, node);
-    if (tree.nodeTag(at) != .identifier) return false;
-    const index = (model.reference(at) orelse return false).declaration orelse return false;
-    const record = model.declarations[@backingInt(index)];
-    if (record.kind != .variable) return false;
-    const variable = tree.fullVarDecl(record.node) orelse return false;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-    const init = strip(tree, variable.ast.init_node.unwrap() orelse return false);
-    if (!isBuiltin(tree, init, "@import")) return false;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, init, &buffer);
-    return args.len == 1 and tree.nodeTag(args[0]) == .string_literal;
+/// Whether `node` names a type, not a value: a constant an `@import` of a file makes, a
+/// builtin that makes a type (`@Enum`, `@Struct`, …), or a call of a function declared to
+/// return `type`, or one naming such a constant (`const T = mod.T`). A member of a type, read
+/// by name or `@field`, is its declaration, never a field of a value.
+fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    var at_file = file;
+    var at = strip(&c.project.at(file).file.tree, node);
+    for (0..8) |_| {
+        const tree = &c.project.at(at_file).file.tree;
+        const decl = switch (tree.nodeTag(at)) {
+            .identifier, .field_access => (try c.facts.definition(at_file, at)) orelse return false,
+            else => return false,
+        };
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .variable) return false;
+        const written = &c.project.at(decl.file).file.tree;
+        const variable = written.fullVarDecl(record.node) orelse return false;
+        if (written.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+        const init = strip(written, variable.ast.init_node.unwrap() orelse return false);
+        if (isBuiltin(written, init, "@import")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(written, init, &buffer);
+            return args.len == 1 and written.nodeTag(args[0]) == .string_literal;
+        }
+        for ([_][]const u8{ "@This", "@TypeOf", "@Type", "@Int", "@Float", "@Vector", "@Pointer", "@Fn", "@Tuple", "@Struct", "@Union", "@Enum", "@EnumLiteral" }) |name| {
+            if (isBuiltin(written, init, name)) return true;
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (written.fullCall(&buffer, init)) |call| return typeFunction(c, decl.file, call.ast.fn_expr);
+        at_file = decl.file;
+        at = init;
+    }
+    return false;
+}
+
+/// Whether `callee` names a function declared to return `type`.
+fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Context.Error!bool {
+    const found = (try c.facts.definition(file, callee)) orelse return false;
+    const function = c.project.at(found.file).model.declarations[@backingInt(found.index)];
+    if (function.kind != .function) return false;
+    const tree = &c.project.at(found.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, function.node) orelse return false;
+    return typeKeyword(tree, proto.ast.return_type.unwrap() orelse return false);
 }
 
 /// The labeled block a `break :label value` gives its value to.

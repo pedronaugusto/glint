@@ -1131,6 +1131,14 @@ test "A019 clears a parent pointer an interface's own field shows, and its align
     try std.testing.expectEqual(@as(usize, 0), constant.findings);
     const named = try runEdited(pack.unsafe_set, interface_program, "    return s.count + s.interface.end;", "    const names = [_][]const u8{ \"count\", \"interface\" };\n    inline for (names) |name| _ = @field(s, name);\n    return s.count + s.interface.end;");
     try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, named.lines[0..named.findings]);
+    // In another file, of a type a function returning `type` makes, it names a declaration, no
+    // value's field; of a value whose type does not resolve, it may name the interface.
+    const of_type = try runWithFile(pack.unsafe_set, interface_program, "const Tags = TagsOf();\nfn TagsOf() type { return @Enum(u8, .exhaustive, &.{\"interface\"}, &.{0}); }\nconst Names = struct { interface: u8 };\npub fn names() void { inline for (@typeInfo(Names).@\"struct\".fields) |f| _ = @field(Tags, f.name); }\n");
+    try std.testing.expectEqual(@as(usize, 0), of_type.findings);
+    const aliased = try runWithFile(pack.unsafe_set, interface_program, "const Holder = struct { const Made = TagsOf(); };\nconst Tags = Holder.Made;\nfn TagsOf() type { return @Enum(u8, .exhaustive, &.{\"interface\"}, &.{0}); }\nconst Names = struct { interface: u8 };\npub fn names() void { inline for (@typeInfo(Names).@\"struct\".fields) |f| _ = @field(Tags, f.name); }\n");
+    try std.testing.expectEqual(@as(usize, 0), aliased.findings);
+    const of_value = try runWithFile(pack.unsafe_set, interface_program, "const tags = tagsOf();\nfn tagsOf() @import(\"missing.zig\").T { return undefined; }\nconst Names = struct { interface: u8 };\npub fn names() void { inline for (@typeInfo(Names).@\"struct\".fields) |f| _ = @field(tags, f.name); }\n");
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, of_value.lines[0..of_value.findings]);
 }
 
 const reflecting_dependency: sources.Extra = .{ .name = "reflect/root.zig", .bytes =
