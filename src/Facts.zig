@@ -26,6 +26,8 @@ copier_names: std.StringHashMapUnmanaged(void) = .empty,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
 bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, void) = .empty,
+/// The builtins `scalarCasts` finds: casts each binding decides (`castAtBinding`).
+cast_sites: std.AutoHashMapUnmanaged(Key, void) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
@@ -184,6 +186,7 @@ pub fn deinit(self: *Facts) void {
     if (self.copies) |*found| found.deinit(self.gpa);
     self.copier_names.deinit(self.gpa);
     self.bound_places.deinit(self.gpa);
+    self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
@@ -500,7 +503,7 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 pub const ParameterCopy = struct {
     position: usize,
     site: Key,
-    kind: enum { copy, made } = .copy,
+    kind: enum { copy, made, cast } = .copy,
     source: ?Key = null,
     path: []const Key = &.{},
     crowded: bool = false,
@@ -726,6 +729,8 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         if (d.kind != .variable or model.scopes[@backingInt(d.scope)].kind != .block or !self.enclosed(function.file, d.scope, whole)) continue;
         const v = t.fullVarDecl(d.node) orelse continue;
         if (v.comptime_token != null) continue;
+        // A `comptime` block runs as the program compiles: its locals copy nothing at run time.
+        if (inComptime(t, model, d.node)) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
         if (self.madeByParameter(function.file, init)) |position| {
             try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node }, .kind = .made });
@@ -739,9 +744,15 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         }
         // A value chosen or wrapped (`out catch |e| return e`, `if (c) v.a else v.b`): each
         // place it reads that a generic parameter gives, read with the binding's arguments.
+        // Into a type written apart from the parameters (`const kind: Kind = ...`) it is the
+        // same copy in every binding, decided where it is written.
+        if (v.ast.type_node.unwrap()) |declared| if (self.derivedParameter(function, declared, 0) == null) continue;
         const parts = try self.copiedParts(function.file, init);
         for (parts.places) |place| {
             const position = self.runtimeParameter(function, place, 0) orelse continue;
+            // A place whose value resolves where it is written is the same copy in every
+            // binding, decided there; only what the binding settles is read with it.
+            if (try self.resolve(function.file, place) != .unknown) continue;
             const site: Key = .{ .file = function.file, .node = d.node };
             // The parameter itself is its argument, read as written where it is bound.
             const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
@@ -749,6 +760,78 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, {});
         }
     }
+    try self.scalarCasts(function, out);
+}
+
+/// The integers the language makes into a type, or reads out of a value, by the type of
+/// `function`'s generic parameter: `@enumFromInt` and `@fromBackingInt` into a type its result
+/// place writes in terms of one (`@as(@TypeOf(library).Role, ...)`), `@intFromEnum` and
+/// `@backingInt` of a value one gives. Each is the binding's: its type is the bound one's
+/// (`kind = .cast`, `source` the type written, or the value read).
+fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const whole = self.scopeNode(function);
+    const first = t.firstToken(whole);
+    const last = t.lastToken(whole);
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const name = t.tokenSlice(at);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = builtinArgs(t, node, &buffer);
+        const source: Ast.Node.Index = if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt"))
+            self.writtenType(function.file, node, 0) orelse continue
+        else if ((std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@backingInt")) and args.len == 1)
+            args[0]
+        else
+            continue;
+        const position = self.derivedParameter(function, source, 0) orelse continue;
+        const site: Key = .{ .file = function.file, .node = node };
+        try out.append(self.gpa, .{ .position = position, .site = site, .kind = .cast, .source = .{ .file = function.file, .node = source } });
+        try self.cast_sites.put(self.gpa, site, {});
+    }
+}
+
+/// The type written for the place `node`'s value goes to: `@as`'s, a declaration's, the
+/// function's result for a `return`, through a grouping, `try`, either side of `orelse` or
+/// `catch`, a branch or a prong. Null where none is written there.
+fn writtenType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ?Ast.Node.Index {
+    if (depth == 16) return null;
+    const t = self.syntaxOf(file);
+    const model = &self.project.at(file).model;
+    const parent = model.parentOf(node) orelse return null;
+    if (t.fullVarDecl(parent)) |variable| return if (variable.ast.init_node.unwrap() == node) variable.ast.type_node.unwrap() else null;
+    switch (t.nodeTag(parent)) {
+        .grouped_expression, .@"try", .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.writtenType(file, parent, depth + 1),
+        .@"return" => {
+            var at: ?Ast.Node.Index = model.parentOf(parent);
+            while (at) |candidate| : (at = model.parentOf(candidate)) {
+                if (t.nodeTag(candidate) != .fn_decl) continue;
+                var fn_buffer: [1]Ast.Node.Index = undefined;
+                return (t.fullFnProto(&fn_buffer, t.nodeData(candidate).node_and_node[0]) orelse return null).ast.return_type.unwrap();
+            }
+            return null;
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(parent)), "@as")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(t, parent, &buffer);
+            return if (args.len == 2 and args[1] == node) args[0] else null;
+        },
+        else => return null,
+    }
+}
+
+/// Whether the builtin `node` makes or reads an integer by the type of a generic parameter,
+/// which each binding of the generic decides (`scalarCasts`).
+pub fn castAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (self.copies == null) try self.findCopies();
+    return self.cast_sites.contains(.{ .file = file, .node = node });
 }
 
 /// What a copy of the value written `node` copies: the places it reads (a name, a field,
@@ -1161,8 +1244,15 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
     const last = t.lastToken(node);
+    var skip_to: Ast.TokenIndex = 0;
     for (t.firstToken(node)..last + 1) |raw| {
         const token: Ast.TokenIndex = @intCast(raw);
+        if (token < skip_to) continue;
+        // What a type query is given is never evaluated: `@TypeOf(x)`, `@sizeOf(T)`.
+        if (t.tokenTag(token) == .builtin and unevaluated(t.tokenSlice(token)) and token < last and t.tokenTag(token + 1) == .l_paren) {
+            skip_to = closing(t, token + 1, last) + 1;
+            continue;
+        }
         if (t.tokenTag(token) != .identifier) continue;
         const index = self.lexical(function.file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
         const record = model.declarations[@backingInt(index)];
@@ -1182,6 +1272,39 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         if (self.runtimeParameter(function, init, depth + 1)) |position| return position;
     }
     return null;
+}
+
+/// Whether `node` is inside a `comptime` block or expression.
+fn inComptime(t: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) switch (t.nodeTag(parent)) {
+        .@"comptime" => return true,
+        .fn_decl => return false,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether a builtin only asks what its operands' types are, never evaluating them.
+fn unevaluated(name: []const u8) bool {
+    const queries = [_][]const u8{ "@TypeOf", "@typeInfo", "@sizeOf", "@alignOf", "@bitSizeOf", "@typeName", "@hasDecl", "@hasField", "@FieldType" };
+    for (queries) |each| if (std.mem.eql(u8, name, each)) return true;
+    return false;
+}
+
+/// The token closing the parenthesis that opens at `open`, at most `last`.
+fn closing(t: *const Ast, open: Ast.TokenIndex, last: Ast.TokenIndex) Ast.TokenIndex {
+    var depth: usize = 0;
+    var token = open;
+    while (token <= last) : (token += 1) switch (t.tokenTag(token)) {
+        .l_paren => depth += 1,
+        .r_paren => {
+            depth -= 1;
+            if (depth == 0) return token;
+        },
+        else => {},
+    };
+    return last;
 }
 
 /// The declaration `name` reaches from `scope`, looking outward.
@@ -1323,9 +1446,20 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
         // A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the
-        // payload's type (Zig requires the other side to coerce to it), as `x.?` has.
-        .@"catch" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .error_union),
-        .@"orelse" => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_node[0]), .optional),
+        // payload's type, as `x.?` has, where the other side coerces to it; the peer type of
+        // both where the other side wraps the payload itself (`opt orelse f()` with `f`
+        // returning `E!T` is an `E!T`, `x catch null` a `?T`).
+        .@"catch", .@"orelse" => {
+            const sides = tree.nodeData(node).node_and_node;
+            const wrapper: std.meta.Tag(Value) = if (tag == .@"catch") .error_union else .optional;
+            const inner = try self.payload(try self.resolve(file, sides[0]), wrapper);
+            if (inner == .unknown or never(tree, sides[1])) return inner;
+            return switch (try self.resolve(file, sides[1])) {
+                .error_union => if (tag == .@"orelse") .{ .error_union = try self.boxed(inner) } else inner,
+                .optional => if (tag == .@"catch") .{ .optional = try self.boxed(inner) } else inner,
+                else => inner,
+            };
+        },
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
         .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(null, file, node)) |value| return value,
@@ -3720,7 +3854,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, parent)) |call| {
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .{ .unknown = .unsupported };
-        return self.parameterType(file, call, position);
+        return self.parameterType(file, parent, call, position);
     }
     var parent_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&parent_buffer, parent) != null) {
@@ -3754,16 +3888,28 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
         .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
         .@"break" => {
-            const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap() orelse return .{ .unknown = .unsupported };
+            // A `break` with no label leaves the nearest loop; one with a label, the block or
+            // loop it names. Each gives that its value.
+            const label = tree.nodeData(parent).opt_token_and_opt_node[0].unwrap();
             var at: ?Ast.Node.Index = model.parentOf(parent);
             while (at) |candidate| : (at = model.parentOf(candidate)) {
+                const loop = tree.fullWhile(candidate) != null or tree.fullFor(candidate) != null;
+                const name = label orelse {
+                    if (loop) return self.placeType(file, candidate, depth + 1);
+                    continue;
+                };
                 const tag = tree.nodeTag(candidate);
-                if (tag != .block and tag != .block_semicolon and tag != .block_two and tag != .block_two_semicolon) continue;
-                // A labeled block's brace follows its label and a colon.
-                const brace = tree.nodeMainToken(candidate);
-                if (brace >= 2 and tree.tokenTag(brace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(brace - 2), tree.tokenSlice(label))) return self.placeType(file, candidate, depth + 1);
+                // A labeled block's brace follows its label and a colon, as a labeled loop's
+                // first token does.
+                const start = if (loop) tree.firstToken(candidate) else if (tag == .block or tag == .block_semicolon or tag == .block_two or tag == .block_two_semicolon) tree.nodeMainToken(candidate) else continue;
+                if (start >= 2 and tree.tokenTag(start - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(start - 2), tree.tokenSlice(name))) return self.placeType(file, candidate, depth + 1);
             }
             return .{ .unknown = .unsupported };
+        },
+        // A loop's `else` gives the loop's value.
+        .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
+            const otherwise = if (tree.fullFor(parent)) |loop| loop.ast.else_expr else tree.fullWhile(parent).?.ast.else_expr; // unreachable: the tag is a loop's
+            return if (otherwise.unwrap() == node) self.placeType(file, parent, depth + 1) else .{ .unknown = .unsupported };
         },
         .@"return" => {
             var at: ?Ast.Node.Index = model.parentOf(parent);
@@ -3787,7 +3933,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
 /// The written type of a call's argument at `position`: the callee's parameter (a method's
 /// receiver first), a made container's method read with the arguments that made it.
 /// `.scalar` for `anytype`, which takes the argument's own type.
-fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, position: usize) ResolveError!Value {
+fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call, position: usize) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     const callee = try self.resolve(file, call.ast.fn_expr);
     if (callee == .unknown) return callee;
@@ -3811,7 +3957,18 @@ fn parameterType(self: *Facts, file: Project.FileId, call: Ast.full.Call, positi
                 made = m;
             };
         }
+        // A function of a made type called on the type (`Atomic(T).init(x)`): its bindings.
+        if (on == .container) if (on.container.made_by) |m| if (decl.file == on.container.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == on.container.scope) {
+            made = m;
+        };
     }
+    // A declaration literal's call (`.init(x)`) is a function of the type its place takes.
+    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) switch (try self.placeType(file, node, 1)) {
+        .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
+            made = m;
+        },
+        else => {},
+    };
     const target_tree = &self.project.at(decl.file).file.tree;
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{ .unknown = .unsupported };

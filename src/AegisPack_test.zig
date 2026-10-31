@@ -440,6 +440,37 @@ test "aegis is recognized by its published names in the pinned layout and the fi
     defer flat_report.deinit();
     try expectEverySite(flat_report);
 }
+test "A004 reads a scalar's raw integer by meaning, through every place it is put, and a scalar made by a cast" {
+    const head = "const aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u16);\nconst Box = struct { v: u16 };\n";
+    // Read out by the language, by a name for `raw`, or through `@call`.
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @backingInt(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @intFromEnum(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return Index.raw(i) + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { return @call(.auto, Index.raw, .{i}) + 1; }", pack.scalar, true, 1);
+    // Put in a field, a literal, an array, behind a pointer, an optional captured, a
+    // destructuring and a vector's lanes.
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { var b: Box = .{ .v = 0 }; b.v = i.raw(); return b.v + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const b: Box = .{ .v = i.raw() }; return b.v + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const a = [_]u16{i.raw()}; return a[0] + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { var v = i.raw(); const p = &v; return p.* + 1; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index, c: bool) u16 { const m: ?u16 = if (c) i.raw() else null; if (m) |v| return v + 1; return 0; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) u16 { const a, const b = .{ i.raw(), @as(u16, 0) }; return a + b; }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(i: Index) @Vector(2, u16) { const v: @Vector(2, u16) = @splat(i.raw()); return v + v; }", pack.scalar, true, 1);
+    // A scalar made from an integer by a cast skips its checked construction.
+    try expectJudged(head ++ "pub fn f(v: u16) Index { return @enumFromInt(v); }", pack.scalar, true, 1);
+    try expectJudged(head ++ "pub fn f(v: u16) Index { return @fromBackingInt(v); }", pack.scalar, true, 1);
+    // A made type's function called on the type or by a declaration literal types its
+    // argument with the type's bindings.
+    try expectJudged(head ++ "const Color = enum(u8) { red, _ };\nvar a: aegis.Atomic(Color) = .init(@fromBackingInt(0));\nvar b: aegis.Atomic(Index) = .init(@fromBackingInt(0));\nvar d: aegis.Atomic(Index) = aegis.Atomic(Index).init(@fromBackingInt(0));\npub fn f() void { _ = &a; _ = &b; _ = &d; }", pack.scalar, true, 2);
+    // A cast by a generic parameter's type is each binding's: decided where it is bound.
+    const generic = "fn Lib(comptime R: type) type { return struct { pub const Role = R; roles: []const R }; }\nfn role(library: anytype, n: u32) @TypeOf(library).Role { const Role = @TypeOf(library).Role; return @as(Role, @fromBackingInt(@as(u16, @intCast(n)))); }\nfn total(library: anytype) u32 { var sum: u32 = 0; for (library.roles) |r| sum += @intCast(@backingInt(r)); return sum; }\n";
+    try expectJudged(head ++ generic ++ "pub fn open(library: anytype, n: u32) @TypeOf(library).Role { return role(library, n); }", pack.scalar, true, 0);
+    try expectJudged(head ++ generic ++ "const Kind = enum(u16) { a, _ };\nconst lib: Lib(Kind) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 0);
+    try expectJudged(head ++ generic ++ "const lib: Lib(Index) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 2);
+    // An enum of the program's own, an array's length, a comparison of scalars: no raw integer.
+    try expectJudged(head ++ "const Color = enum(u8) { red, green };\npub fn f(i: Index, x: u8) usize { const c: Color = @enumFromInt(x); const a = [_]u16{ i.raw(), 3 }; return a.len + @intFromEnum(c); }", pack.scalar, true, 0);
+}
+
 test "a standalone aegis namespace module is recognized" {
     var project = try fixture("const Id = @import(\"aegis.id\").Id; const Tag = struct {}; pub fn f() void { const v = Id(Tag, u32).fromRaw(1); _ = v.raw() + 2; }");
     defer project.deinit();
@@ -740,10 +771,11 @@ test "A002 follows a copy's value through every shape it is written in to the pl
     // A `return` copies what it reads, as a declaration does; the function's own local moves.
     try expectJudged(head ++ "pub fn f(h: *H) S(u32) { return h.s; }", pack.copies, true, 1);
     try expectJudged(head ++ "pub fn f() S(u32) { const s = S(u32).init(1); return s; }", pack.copies, true, 0);
-    // A part of a generic's value, chosen or wrapped, is each binding's copy: decided where
-    // it is bound, the binding's argument read through the part.
+    // A part of a generic's value, chosen or wrapped, is each binding's copy where only the
+    // binding settles it; where its callers settle it (a private generic), each part is
+    // decided where it is written.
     try expectJudged(head ++ "pub fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, true, 0);
-    try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 2);
     try expectJudged(head ++ "const P = struct { s: u32, t: u32 };\nfn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; _ = &copy; }\npub fn g(h: *P) void { f(h, true); }", pack.copies, true, 0);
     // Plain data written any of these ways is decided.
     try expectJudged(head ++ "pub fn f(c: bool, k: u8, n: u32) u32 { const a = if (c) n else 1; const b = switch (k) { 0 => a, else => blk: { break :blk @as(u32, 2); } }; return b; }", pack.copies, true, 0);
@@ -784,6 +816,18 @@ test "A002 follows a generic's copy through any number of generics passing it on
     while (i > 0) : (i -= 1) try chain.print(std.testing.allocator, "fn h{d}(x: anytype) void {{ h{d}(x); }}\n", .{ i, i - 1 });
     try chain.appendSlice(std.testing.allocator, "fn h0(x: anytype) void { var kept = x; kept.deinit(); }\n");
     try expectJudged(chain.items, pack.copies, true, 1);
+}
+
+test "A002 records for a generic's bindings only a copy whose value a binding settles" {
+    // gantry's `scan(context: anytype, comptime read: anytype)` shapes, bound to a function
+    // and a pointer: a `comptime` block's locals, what `@TypeOf` is given, a copy into a type
+    // written apart from the parameters, and a place whose value resolves where it is written
+    // are each decided where they are written, so a binding has nothing left to settle.
+    const head = "const R = struct { specs: []const u8 = &.{} };\nfn extract(text: []const u8) !R { _ = text; return .{}; }\nconst Kind = enum { a, b };\nconst Spec = struct { kind: Kind };\n";
+    const generic = "pub fn scan(context: anytype, comptime read: anytype, cached: []?R, i: usize) !void { comptime { const Inner = @typeInfo(@TypeOf(read(context))).error_union.error_set; _ = Inner; } const text = try read(context); const prior = if (cached.len > 0) cached[i] else null; const recovery = (prior orelse extract(text)) catch R{}; const specs = recovery.specs; _ = specs; const spec: Spec = .{ .kind = .a }; const kind: Kind = if (text.len == 0) .b else spec.kind; _ = kind; }\n";
+    try expectJudged(head ++ generic ++ "fn reader(c: *u32) error{Bad}![]const u8 { _ = c; return \"\"; }\npub fn f(store: *u32, cached: []?R) !void { try scan(store, reader, cached, 0); }", pack.copies, true, 0);
+    // `?R orelse f()` with `f` returning `!R` is an error union: `catch` unwraps it.
+    try expectJudged(head ++ "pub fn f(cached: []?R, i: usize, text: []const u8) void { const prior = if (cached.len > 0) cached[i] else null; const recovery = (prior orelse extract(text)) catch R{}; const specs = recovery.specs; _ = specs; }", pack.copies, true, 0);
 }
 
 test "A002 clears a move only of the function's own local or a value captured in place, with no copy or address of it before" {
@@ -1338,6 +1382,20 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
     try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { var text = try Bytes.init(gpa, 0); var w = Bytes.Writer.init(&text, gpa); w.interface.end = 0; }", pack.cleanup, true, 1);
 }
 
+test "an adoption of an allocation freed, changed or kept elsewhere before it is reported" {
+    const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize, keep: *[]u8) !Bytes { const buffer = try gpa.alloc(u8, n); keep.* = buffer; return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // Two owners of one allocation: the second adoption is reported, the first is not handed
+    // over alone.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) ![2]Bytes { const buffer = try gpa.alloc(u8, n); return .{ try Bytes.adopt(buffer, n), try Bytes.adopt(buffer, n) }; }", pack.capacity, false, 1);
+    // Its elements written and its length read leave it whole.
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (buffer.len != n) return error.Short; buffer[0] = 1; @memset(buffer[1..], 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+}
+
 test "an adoption of a whole byte allocation, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
@@ -1567,6 +1625,16 @@ test "A006 strict: a call through anything but a function is undecided" {
     const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
     try expectJudged(head ++ "const Step = *const fn ([]const u8) usize;\npub fn read(text: Text, step: Step) usize { return step(text.readForParse()); }", pack.recursion, false, 0);
     try expectJudged(head ++ "fn step(bytes: []const u8) usize { return bytes.len; }\npub fn read(text: Text) usize { return step(text.readForParse()); }", pack.recursion, true, 0);
+}
+
+test "A001 finds a public source's field written in place, by name, by @field or through its address" {
+    const head = "const err = @import(\"aegis\").err;\nconst Other = struct { bytes: []const u8 };\n";
+    try expectJudged(head ++ "pub fn f(secret: []const u8) err.PublicSource { var p = err.PublicSource.classify(\"fixed label\", \"ok\"); p.bytes = secret; return p; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource, secret: []const u8) void { p.bytes = secret; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource, secret: []const u8) void { @field(p, \"bytes\") = secret; }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn f(p: *err.PublicSource) *[]const u8 { return &p.bytes; }", pack.access, true, 1);
+    // Another type's field of the same name, and a read, are not.
+    try expectJudged(head ++ "pub fn f(o: *Other, p: *const err.PublicSource, secret: []const u8) usize { o.bytes = secret; return p.bytes.len; }", pack.access, true, 0);
 }
 
 test "A001 finds public text built by a literal, by the type the literal takes from its place" {
