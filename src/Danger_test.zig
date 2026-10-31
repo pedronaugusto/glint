@@ -2020,6 +2020,40 @@ test "A019 reads a local after a call that gives it `undefined`: a deinit's, std
     try std.testing.expectEqualSlices(u32, &.{ 4, 7, 8, 11, 12, 13 }, found.lines[0..found.findings]);
 }
 
+test "A019 leaves undecided a call whose calls run past the depth it reads, whatever the deepest gives, and a call read whole a finding or clean" {
+    // A chain of methods handing `self` on, deeper than A019 reads: one that writes a field at
+    // its end (h1) and one that gives it `undefined` there (h2) are each undecided, where the
+    // cut was taken for `undefined` given and h1 a finding. Read whole: a short chain giving it
+    // `undefined` is a finding (3), one writing a field clean (h4).
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var program: std.Io.Writer.Allocating = .init(a);
+    const w = &program.writer;
+    try w.writeAll(
+        \\pub fn h1() u32 { var s: S = .{ .n = 0 }; s.c0(); return s.n; }
+        \\pub fn h2() u32 { var s: S = .{ .n = 0 }; s.d0(); return s.n; }
+        \\pub fn h3() u32 { var s: S = .{ .n = 0 }; s.e0(); return s.n; }
+        \\pub fn h4() u32 { var s: S = .{ .n = 0 }; s.f0(); return s.n; }
+        \\const S = struct {
+        \\    n: u32,
+        \\    fn e0(self: *S) void { self.e1(); }
+        \\    fn e1(self: *S) void { self.* = undefined; }
+        \\    fn f0(self: *S) void { self.f1(); }
+        \\    fn f1(self: *S) void { self.n = 2; }
+        \\
+    );
+    const deep = 24;
+    for ([_]u8{ 'c', 'd' }) |chain| {
+        for (0..deep) |i| try w.print("    fn {c}{d}(self: *S) void {{ self.{c}{d}(); }}\n", .{ chain, i, chain, i + 1 });
+        try w.print("    fn {c}{d}(self: *S) void {{ {s} }}\n", .{ chain, deep, if (chain == 'c') "self.n = 1;" else "self.* = undefined;" });
+    }
+    try w.writeAll("};\n");
+    const found = try run(pack.unsafe_set, program.written());
+    try std.testing.expectEqualSlices(u32, &.{3}, found.lines[0..found.findings]);
+    try std.testing.expectEqual(2, found.undecided);
+}
+
 test "A019 reads a fill that may stop early as none: a `for` setting each element that may leave, an error set's error returned as a value, a labeled switch dispatching again into the prong its check guards" {
     // Findings: the extern (2), a `for` setting each element that may `break` (5) or `continue`
     // an outer loop (7), a function answering an error set returning before its write (8), a
