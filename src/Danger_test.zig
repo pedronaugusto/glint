@@ -332,6 +332,24 @@ test "A008 finds hand wipes, hand comparisons and std secret keys held by value"
     , 4);
 }
 
+test "A008 finds a use through an alias another name gives in a file the run did not select, where the alias itself is no site this run reports" {
+    // `other.zig` names std's wipe `zero` and the secret key `Key`: the call (3) and the key
+    // held by value (5) are the sites. A comparison of the key's type is still no site (6).
+    const found = try runWithFile(pack.secrets,
+        \\const other = @import("other.zig");
+        \\pub fn f(buffer: []u8) void {
+        \\    other.zero(u8, buffer);
+        \\}
+        \\pub fn g(k: other.Key) usize { return k.bytes.len; }
+        \\pub const same = other.Key == other.Key;
+    ,
+        \\const std = @import("std");
+        \\pub const zero = std.crypto.secureZero;
+        \\pub const Key = std.crypto.sign.Ed25519.SecretKey;
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5 }, found.lines[0..found.findings]);
+}
+
 test "A008 leaves borrowed keys, sealed keys, public keys and compared key types alone" {
     try expect(pack.secrets,
         \\const std = @import("std");
@@ -1151,20 +1169,38 @@ const generic_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
     \\pub fn through(x: anytype, f: *const fn (@TypeOf(x)) usize) usize { return f(x); }
 };
 
+/// Dependencies whose generics read what they are handed and copy no field of it. A generic
+/// nothing calls binds no argument, and one that names the field of what it may be handed
+/// shows nothing (as in the program's own file), so each holds only what is called.
+const total_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes = "pub fn total(x: anytype) usize { return x.count; }" };
+const part_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes = "pub fn part(x: anytype) usize { return x.interface.end; }" };
+/// A dependency whose generic hands what it is given to a function pointer it is given.
+const pointer_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
+    \\pub fn total(x: anytype) usize { return x.count; }
+    \\pub fn through(x: anytype, f: *const fn (@TypeOf(x)) usize) usize { return f(x); }
+};
+
 /// `interface_program` returning `value`, with the dependency imported and `extra` declared.
 fn handed(comptime value: []const u8, comptime extra: []const u8) !Run {
+    return handedTo(generic_dependency, value, extra);
+}
+fn handedTo(dependency: sources.Extra, comptime value: []const u8, comptime extra: []const u8) !Run {
     const program = comptime edited(edited(interface_program, "    return s.count + s.interface.end;", "    return " ++ value ++ ";"), "pub fn use() !usize {", "const dep = @import(\"dep\");\n" ++ extra ++ "pub fn use() !usize {");
-    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{generic_dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
+    return runWith(pack.unsafe_set, program, &(std_files ++ [_]sources.Extra{dependency}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep", .target = std_files.len }}));
 }
 
-test "A019 follows a parent handed to a generic outside the program into its body, where a copy of the field by its name or a computed one leaves the conversion a finding" {
-    // Clean: another field read, by pointer and by value; a part of the interface read.
-    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.total(&s) + dep.total(s)", "")).findings);
-    try std.testing.expectEqual(@as(usize, 0), (try handed("dep.part(&s)", "")).findings);
-    // Findings (11, the conversion and its alignment): the field copied by name, by pointer
-    // and by value; by a name the caller gives; each field of a tuple holding a C copied, as
-    // std.fmt's `{any}` does, from the program or through a generic of its own.
+test "A019 reads a parent handed to a dependency's generic: its body is the program's, where a copy of the field by its name or a computed one leaves the conversion a finding" {
+    // Clean: a dependency's generics that read another field, by pointer and by value, or a
+    // part of the interface.
+    try std.testing.expectEqual(@as(usize, 0), (try handedTo(total_dependency, "dep.total(&s) + dep.total(s)", "")).findings);
+    try std.testing.expectEqual(@as(usize, 0), (try handedTo(part_dependency, "dep.part(&s)", "")).findings);
+    // Findings (11, the conversion and its alignment): a dependency's generic that copies the
+    // field leaves the conversion a finding whether or not it is handed the parent (`grab`
+    // beside `total`); the field copied by name, by pointer and by value; by a name the caller
+    // gives; each field of a tuple holding a C copied, as std.fmt's `{any}` does, from the
+    // program or through a generic of its own.
     for ([_]Run{
+        try handed("dep.total(&s)", ""),
         try handed("dep.grab(&s)", ""),
         try handed("dep.grab(s)", ""),
         try handed("dep.named(&s, \"interface\")", ""),
@@ -1172,8 +1208,8 @@ test "A019 follows a parent handed to a generic outside the program into its bod
         try handed("log(s)", "fn log(x: anytype) usize { return dep.print(.{x}); }\n"),
     }) |found| try std.testing.expectEqualSlices(u32, &.{ 11, 11 }, found.lines[0..found.findings]);
     // Undecided: a function pointer the C is handed through, whose body is not known.
-    const baseline = try handed("dep.total(&s)", "");
-    const unread = try handed("dep.through(&s, show)", "fn show(x: *Sink) usize { return x.count; }\n");
+    const baseline = try handedTo(pointer_dependency, "dep.total(&s)", "");
+    const unread = try handedTo(pointer_dependency, "dep.through(&s, show)", "fn show(x: *Sink) usize { return x.count; }\n");
     try std.testing.expectEqual(@as(usize, 0), unread.findings);
     try std.testing.expect(unread.undecided > baseline.undecided);
 }
@@ -1573,6 +1609,31 @@ test "A019 reads the prefix a cursor writer counts, where its type steps the cou
         \\pub fn c1() void { var buf: [16]u8 = undefined; const w: Writer = .{ .bytes = &buf }; _ = w.written(); use(buf[0..1]); }
     );
     try std.testing.expectEqualSlices(u32, &.{ 16, 17, 18, 24, 24, 25 }, found.lines[0..found.findings]);
+}
+
+test "A019 reads a function in a file the run did not select as the program's: what it writes of a local, and a cursor writer it keeps" {
+    // Clean: `fill` writes all of the local (3); `more` keeps the writer over what it was given
+    // (5). Findings: `first` writes one byte of four (4); `elsewhere` points the writer at other
+    // memory (6).
+    const found = try runWithFile(pack.unsafe_set,
+        \\const other = @import("other.zig");
+        \\fn use(b: []const u8) void { _ = b; }
+        \\pub fn fa() void { var buf: [4]u8 = undefined; other.fill(&buf); use(&buf); }
+        \\pub fn fb() void { var buf: [4]u8 = undefined; other.first(&buf); use(&buf); }
+        \\pub fn fc() !void { var buf: [16]u8 = undefined; var w: other.Writer = .{ .bytes = &buf }; try w.put("ab"); try other.more(&w); use(buf[0..w.pos]); }
+        \\pub fn fd(to: []u8) !void { var buf: [16]u8 = undefined; var w: other.Writer = .{ .bytes = &buf }; try w.put("ab"); other.elsewhere(&w, to); try w.put("y"); use(buf[0..w.pos]); }
+    ,
+        \\pub fn fill(b: *[4]u8) void { b.* = .{ 1, 2, 3, 4 }; }
+        \\pub fn first(b: *[4]u8) void { b[0] = 1; }
+        \\pub const Writer = struct {
+        \\    bytes: []u8,
+        \\    pos: usize = 0,
+        \\    pub fn put(self: *Writer, v: []const u8) error{Full}!void { if (v.len > self.bytes.len - self.pos) return error.Full; @memcpy(self.bytes[self.pos..][0..v.len], v); self.pos += v.len; }
+        \\};
+        \\pub fn more(w: *Writer) !void { try w.put("x"); }
+        \\pub fn elsewhere(w: *Writer, to: []u8) void { w.* = .{ .bytes = to }; }
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 4, 6 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads a local a range's passes wrote a stride at a time, all of it" {
@@ -4084,8 +4145,9 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
     ;
     // `check` and `skip` move the position past what they checked; `peek` only reads it.
     try expect(pack.untrusted_input, program, 2);
-    // The checks with what follows them leaving the position where they saw it.
-    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        std.log.debug(\"checked\", .{});\n    }\n    fn peek"), "return self.advance();", "return std.log.debug(\"skipped\", .{});");
+    // The checks with what follows them leaving the position where they saw it: a store to a
+    // local of their own.
+    const kept = comptime edited(edited(program, "        self.at += 1;\n    }\n    fn peek", "        var seen: usize = 0;\n        seen += 1;\n    }\n    fn peek"), "return self.advance();", "return;");
     try expect(pack.untrusted_input, kept, 0);
     // A guard after the move holds where the call succeeded, unless a statement before it may
     // return without failing, so the call succeeded past it.
@@ -4107,6 +4169,64 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
     ;
     try expect(pack.untrusted_input, entered, 0);
     try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 1);
+}
+
+test "A009 reads a callee's check only where nothing after it, its defers included, may write what the caller sees, by any name" {
+    const program =
+        \\const std = @import("std");
+        \\pub const P = struct {
+        \\    table: [16]u8 = @splat(0),
+        \\    at: usize = 0,
+        \\    me: *P,
+        \\    fn check(self: *P, other: *P) !void {
+        \\        if (self.at >= self.table.len) return error.Range;
+        \\        _ = other;
+        \\    }
+        \\    pub fn get(self: *P, reader: *std.Io.Reader) !u8 {
+        \\        self.at = try reader.takeByte();
+        \\        try self.check(self);
+        \\        return self.table[self.at];
+        \\    }
+        \\};
+        \\pub var shared: P = undefined;
+    ;
+    try expect(pack.untrusted_input, program, 0);
+    // The receiver written through another parameter, `@field`, a local naming it, a pointer a
+    // field holds, a global it may be, in a `defer`, or by any call.
+    try expect(pack.untrusted_input, comptime edited(program, "_ = other;", "other.at = other.table.len;"), 1);
+    const writes = [_][]const u8{
+        "@field(self, \"at\") = self.table.len;",
+        "const q = self;\n        q.at = q.table.len;",
+        "const m = self.me;\n        m.at = m.table.len;",
+        "shared.at = shared.table.len;",
+        "std.log.debug(\"{d}\", .{self.at});",
+    };
+    inline for (writes) |write| try expect(pack.untrusted_input, comptime edited(program, "_ = other;", "_ = other;\n        " ++ write), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        defer self.at = self.table.len;\n        if (self.at >= self.table.len) return error.Range;\n"), 1);
+    // A condition naming a local of the callee says nothing of the caller's value of that name.
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        const at = self.at + 0;\n        if (at >= self.table.len) return error.Range;\n"), 1);
+}
+
+test "A009 judges a slice's bounds in order: each at most the length leaves the start past the end a peer may choose" {
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) ![]const u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    if (n > buf.len) return error.Bad;
+        \\    _ = buf[i..n];
+        \\    _ = buf[i..@min(n, buf.len)];
+        \\    _ = buf[5..n];
+        \\    if (i != n) _ = buf[i..n];
+        \\    _ = buf[0..n];
+        \\    _ = buf[i..buf.len];
+        \\    if (i > n) return error.Bad;
+        \\    return buf[i..n];
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 8, 8, 9, 10, 10 }, result.lines[0..result.findings]);
 }
 
 test "A012 reads a count an aegis Budget reservation charged, itself or as a checked multiple" {
@@ -4416,6 +4536,30 @@ test "A015 reads a function std's Io calls through its vtable as returning what 
         \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
         \\pub const Routed = Layer(.{ .start = &routedSpawn, .processSpawn = spawn });
     , 2);
+}
+
+test "A015 finds the vtable slot a function is given in any file of the program, selected or not" {
+    // `layer.zig`, outside the selection, gives `routedSpawn` the `processSpawn` slot; `spawn`
+    // takes no userdata (7).
+    const layer: sources.Extra = .{ .name = "layer.zig", .bytes =
+        \\const main = @import("main.zig");
+        \\fn Layer(comptime overrides: anytype) type { return struct { const slots = overrides; }; }
+        \\pub const Routed = Layer(.{ .processSpawn = &main.routedSpawn });
+        \\pub const Plain = Layer(.{ .start = &main.spawn });
+    };
+    const found = try runWith(pack.ownership,
+        \\const std = @import("std");
+        \\const State = struct { base: std.Io };
+        \\pub fn routedSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    const state: *State = @ptrCast(@alignCast(userdata.?));
+        \\    return std.process.spawn(state.base, options);
+        \\}
+        \\pub fn spawn(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        \\    return std.process.spawn(io, options);
+        \\}
+        \\pub const routed = @import("layer.zig").Routed;
+    , &(std_files ++ [_]sources.Extra{layer}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "layer.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "main.zig", .target = sources.consumer_file } }));
+    try std.testing.expectEqualSlices(u32, &.{7}, found.lines[0..found.findings]);
 }
 
 test "A014 reads a local list nothing grows or frees once its items are stored as no borrow a growth moves" {
@@ -6201,4 +6345,143 @@ test "A010 reads a bound past a u128 as past it: a sum or a conversion into a ty
     ;
     // `r + 1` and the conversion each pass the type's greatest; a u136 holds the sum of two u128s.
     try expect(pack.integers, program, 2);
+}
+
+fn runWithFile(rule: glint.Rule, program: []const u8, other: []const u8) !Run {
+    var files: [std_files.len + 1]sources.Extra = undefined;
+    @memcpy(files[0..std_files.len], &std_files);
+    files[std_files.len] = .{ .name = "other.zig", .bytes = other };
+    var imports: [std_imports.len + 2]sources.ExtraImport = undefined;
+    @memcpy(imports[0..std_imports.len], &std_imports);
+    imports[std_imports.len] = .{ .spelling = "other.zig", .target = std_files.len };
+    imports[std_imports.len + 1] = .{ .from = std_files.len, .spelling = "std", .target = 0 };
+    var project = try sources.projectWithSources(std.testing.allocator, program, &files, &imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var result: Run = .{ .findings = 0, .undecided = 0 };
+    for (report.diagnostics) |d| if (d.rule == rule) {
+        if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
+        result.findings += 1;
+    };
+    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
+        result.undecided += 1;
+    };
+    return result;
+}
+
+test "A009 reads a callee in a file the run did not select as the program's own: what it reads is input" {
+    const result = try runWithFile(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    const i = try other.get(r);
+        \\    return table[i];
+        \\}
+    ,
+        \\const std = @import("std");
+        \\pub fn get(r: *std.Io.Reader) !u32 {
+        \\    return r.takeInt(u32, .little);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{5}, result.lines[0..result.findings]);
+}
+
+test "A009 follows input through a chain of calls of any length: the fact's rounds end when nothing changes" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "const std = @import(\"std\");\npub fn sink(r: *std.Io.Reader, table: []const u8) !u8 {\n    return table[try g80(r)];\n}\n");
+    // Each function calls the one below it, declared after it: one round reaches one step.
+    var i: usize = 80;
+    while (i > 0) : (i -= 1) {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "fn g{d}(r: *std.Io.Reader) !u32 {{\n    return g{d}(r);\n}}\n", .{ i, i - 1 });
+        defer std.testing.allocator.free(line);
+        try text.appendSlice(std.testing.allocator, line);
+    }
+    try text.appendSlice(std.testing.allocator, "fn g0(r: *std.Io.Reader) !u32 {\n    return r.takeInt(u32, .little);\n}\n");
+    try expect(pack.untrusted_input, text.items, 1);
+}
+
+test "A010 reads a union's payload through a prong's capture: the field the prong names, every field under else" {
+    const program =
+        \\const std = @import("std");
+        \\const V = union(enum) { num: u32, bytes: []u8, none };
+        \\fn decode(r: *std.Io.Reader) !V {
+        \\    return .{ .num = try r.takeInt(u32, .little) };
+        \\}
+        \\pub fn f(r: *std.Io.Reader, memory: *[512]u8) !usize {
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    const v: V = .{ .bytes = memory[0..@min(n, memory.len)] };
+        \\    const a: usize = switch (try decode(r)) {
+        \\        .num => |x| x + 1,
+        \\        else => 0,
+        \\    };
+        \\    const b: usize = switch (v) {
+        \\        .bytes => |s| s.len - 86,
+        \\        else => 0,
+        \\    };
+        \\    const c: usize = switch (v) {
+        \\        .none => 0,
+        \\        else => |w| switch (w) {
+        \\            .bytes => |s| s.len - 1,
+        \\            else => 0,
+        \\        },
+        \\    };
+        \\    return a +% b +% c;
+        \\}
+    ;
+    // x + 1 overflows (line 10), s.len - 86 and s.len - 1 underflow (14, 20).
+    try expect(pack.integers, program, 3);
+}
+
+test "A010 reads a field `@field` names by its declaration, and a value read whole holds each of its fields" {
+    const program =
+        \\const std = @import("std");
+        \\const S = struct { num: u32, other: u32 };
+        \\const P = packed struct { lo: u32, hi: u32 };
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    const v: S = .{ .num = try r.takeInt(u32, .little), .other = 0 };
+        \\    const w: P = .{ .lo = try r.takeInt(u32, .little), .hi = 0 };
+        \\    const raw: u64 = @bitCast(w);
+        \\    return (@field(v, "num") + 1) +% (raw + 1);
+        \\}
+    ;
+    try expect(pack.integers, program, 2);
+}
+
+test "A010 follows a pointer to where it is kept: a store through a struct's field, a literal, a vector, a global or a capture writes what it points at" {
+    const program =
+        \\const std = @import("std");
+        \\const H = struct { p: *u32 };
+        \\var target: *u32 = undefined;
+        \\fn setValue(out: *u32, r: *std.Io.Reader) !void {
+        \\    out.* = try r.takeInt(u32, .little);
+        \\}
+        \\fn set(h: H, r: *std.Io.Reader) !void {
+        \\    h.p.* = try r.takeInt(u32, .little);
+        \\}
+        \\fn setAll(outs: []const *u32, r: *std.Io.Reader) !void {
+        \\    for (outs) |o| o.* = try r.takeInt(u32, .little);
+        \\}
+        \\fn setTarget(r: *std.Io.Reader) !void {
+        \\    target.* = try r.takeInt(u32, .little);
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u32 {
+        \\    var a: u32 = 0;
+        \\    const h: H = .{ .p = &a };
+        \\    try setValue(h.p, r);
+        \\    var b: u32 = 0;
+        \\    try set(.{ .p = &b }, r);
+        \\    var c: u32 = 0;
+        \\    try setAll(&.{&c}, r);
+        \\    var d: u32 = 0;
+        \\    target = &d;
+        \\    try setTarget(r);
+        \\    var e: [4]u32 = @splat(0);
+        \\    for (&e) |*slot| slot.* = try r.takeInt(u32, .little);
+        \\    return (a + 1) +% (b + 1) +% (c + 1) +% (d + 1) +% (e[0] + 1);
+        \\}
+    ;
+    try expect(pack.integers, program, 5);
 }

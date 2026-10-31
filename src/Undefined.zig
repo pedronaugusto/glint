@@ -38,6 +38,7 @@ const Project = @import("Project.zig");
 const Danger = @import("Danger.zig");
 const ParentPointer = @import("ParentPointer.zig");
 const CContract = @import("CContract.zig");
+const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -1200,7 +1201,7 @@ const Walk = struct {
             if (!try w.typed(entry, index, false)) return handed;
             return try w.guarded(node, entry);
         }
-        if (!w.c.project.at(origin.file).input.selected) return handed;
+        if (!try Program.owns(w.c, origin.file)) return handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) return null;
         if (try writesParts(w.c, origin, index, w.depth + 1)) return null;
@@ -2310,7 +2311,7 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
 /// Whether the program's function `decl` keeps the cursor writer its parameter `index` gives
 /// it as `keepsWriterAt` says: a copy, where the parameter is no pointer, holds nothing back.
 fn keepsWriter(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
-    if (!c.project.at(decl.file).input.selected) return false;
+    if (!try Program.owns(c, decl.file)) return false;
     const memo = try c.facts.memo(Cursors);
     const key: Calls.Key = .{ .decl = decl, .index = index, .question = .keeps };
     if (memo.kept.get(key)) |known| return known;

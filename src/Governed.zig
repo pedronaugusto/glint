@@ -116,6 +116,13 @@ pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const 
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {
     if (governed.len == 0) return;
+    // What each target is also called, by an alias whose own site this run does not report.
+    const renamed = try self.allocator.alloc([]const []const u8, governed.len);
+    for (governed, renamed) |g, *names| {
+        var found: std.ArrayList([]const u8) = .empty;
+        try aliasNames(self, g.decls, g.symbol, &found);
+        names.* = found.items;
+    }
     const tree = &self.project.at(self.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -143,7 +150,7 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
         };
         var applies = false;
         const testing = self.inTest(site);
-        for (governed) |g| if (std.mem.eql(u8, g.name, spelled) and !(testing and g.target.production)) {
+        for (governed, renamed) |g, names| if (spells(g, names, spelled) and !(testing and g.target.production)) {
             applies = true;
         };
         if (!applies) continue;
@@ -161,8 +168,8 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
             },
             .decls => |decls| decls,
         };
-        found: for (decls, 0..) |decl, d| for (governed) |g| {
-            if (!std.mem.eql(u8, g.name, spelled) or (testing and g.target.production) or !matches(self, g, decl)) continue;
+        found: for (decls, 0..) |decl, d| for (governed, renamed) |g, names| {
+            if (!spells(g, names, spelled) or (testing and g.target.production) or !matches(self, g, decl)) continue;
             // `reach` gives a definition first and its origin second: a match on the origin of
             // a different declaration came through the program's alias.
             const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.at(decls[d - 1].file).input.selected;
@@ -175,6 +182,54 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
         };
     }
 }
+
+/// Whether `spelled` names `g`: its own name, or one of `names`, its aliases'.
+fn spells(g: Governed, names: []const []const u8, spelled: []const u8) bool {
+    if (std.mem.eql(u8, g.name, spelled)) return true;
+    for (names) |name| if (std.mem.eql(u8, name, spelled)) return true;
+    return false;
+}
+
+/// The names the program's files the run does not select give `decls` (or a function of the
+/// extern `symbol`) under another name: `pub const zero = std.crypto.secureZero;`. A use that
+/// spells one reaches the declaration, and the alias's own site is not reported in this run,
+/// so the use is the site. Each alias is found once, by the declaration its value reaches.
+pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8, out: *std.ArrayList([]const u8)) Context.Error!void {
+    const found = try self.facts.memo(Aliases);
+    if (!found.built) {
+        found.built = true;
+        for (self.project.sources) |*source| {
+            if (source.input.selected or source.file.status != .parsed or !try self.facts.program(source.id)) continue;
+            const tree = &source.file.tree;
+            for (source.model.declarations, 0..) |d, i| {
+                if (d.kind != .variable) continue;
+                const variable = tree.fullVarDecl(d.node) orelse continue;
+                const init = variable.ast.init_node.unwrap() orelse continue;
+                switch (tree.nodeTag(init)) {
+                    .identifier, .field_access => {},
+                    .builtin_call_two, .builtin_call_two_comma => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "@field")) continue,
+                    else => continue,
+                }
+                const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
+                const origin = (try self.facts.origin(decl)) orelse continue;
+                if (std.meta.eql(origin, decl)) continue;
+                const entry = try found.by_origin.getOrPut(self.allocator, origin);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.allocator, d.name);
+            }
+        }
+    }
+    for (decls) |decl| if (found.by_origin.get(decl)) |names| try out.appendSlice(self.allocator, names.items);
+    const wanted = symbol orelse return;
+    var each = found.by_origin.iterator();
+    while (each.next()) |entry| if (externSymbol(self.project, entry.key_ptr.*)) |own| if (std.mem.eql(u8, own, wanted)) {
+        try out.appendSlice(self.allocator, entry.value_ptr.items);
+    };
+}
+const Aliases = struct {
+    built: bool = false,
+    by_origin: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList([]const u8)) = .empty,
+};
 
 /// Whether every governed declaration named `name` is a function of a namespace: a container
 /// with no fields, so no value's method.

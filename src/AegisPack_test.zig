@@ -817,16 +817,28 @@ fn expectJudgedWithDependency(source: []const u8, dependency: []const u8, rule: 
     try std.testing.expectEqual(findings, count(report, rule));
 }
 
-test "an owner given by value to a dependency's function is the function's" {
+/// `expectJudged` with `other` beside the program as `other.zig`, imported by its path and not
+/// selected: a file of the program's own the run does not lint.
+fn expectJudgedWithFile(source: []const u8, other: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &.{.{ .name = "other.zig", .bytes = other }}, &.{.{ .spelling = "other.zig", .target = 0 }});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "an owner given by value to a function of the program's own, a dependency's or one in a file the run did not select, is undecided" {
+    // The program is every loaded file but std's and aegis's: a function there is not walked
+    // for what it does with the owner, and `keep` drops it.
     const head = "const S = @import(\"aegis\").Secret;\nconst lib = @import(\"lib\");\n";
     const map = "const S = @import(\"aegis\").Secret;\npub const Map = struct { pub fn put(self: *Map, value: S(u32)) !void { _ = self; _ = value; } pub fn keep(self: *Map, value: S(u32)) void { _ = self; _ = value; } };\n";
-    // Its last use, an errdefer covering the call's failure.
-    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) !void { var s = S(u32).init(1); errdefer s.deinit(); _ = s.expose(); try m.put(s); }", map, pack.cleanup, true, 0);
-    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) void { const s = S(u32).init(1); m.keep(s); }", map, pack.cleanup, true, 0);
-    // A failure that leaves the owner with nothing to release it, or a use after the call: undecided.
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) !void { var s = S(u32).init(1); errdefer s.deinit(); _ = s.expose(); try m.put(s); }", map, pack.cleanup, false, 0);
+    try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) void { const s = S(u32).init(1); m.keep(s); }", map, pack.cleanup, false, 0);
     try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) !void { const s = S(u32).init(1); try m.put(s); }", map, pack.cleanup, false, 0);
     try expectJudgedWithDependency(head ++ "pub fn f(m: *lib.Map) void { var s = S(u32).init(1); m.keep(s); s.deinit(); }", map, pack.cleanup, false, 0);
-    // A function of the program's own is not walked for what it does with the owner.
+    const keep = "pub fn keep(value: anytype) void { _ = value; }";
+    try expectJudgedWithFile("const S = @import(\"aegis\").Secret;\nconst other = @import(\"other.zig\");\npub fn f() void { const s = S(u32).init(1); other.keep(s); }", keep, pack.cleanup, false, 0);
     try expectJudged("const S = @import(\"aegis\").Secret;\nfn keep(value: S(u32)) void { _ = value; }\npub fn f() void { const s = S(u32).init(1); keep(s); }", pack.cleanup, false, 0);
 }
 
@@ -1424,6 +1436,30 @@ test "A006 strict: a guard that leaves before the call, the way the depth steps,
     try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { if (p.depth > 64) return error.TooDeep; p.depth += 1; defer p.depth -= 1; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };", pack.recursion, true, 0);
 }
 
+test "A006 strict: the depth is the one the cycle carries, passed on in its place, never reset" {
+    const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
+    // A stepped depth handed on as another parameter, and the guarded parameter given a constant.
+    try expectJudged(head ++ "pub fn read(text: Text) error{TooDeep}!usize { return nest(text.readForParse(), 0, 0); }\nfn nest(bytes: []const u8, depth: u8, other: u8) error{TooDeep}!usize { _ = other; if (depth > 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try nest(bytes[1..], 0, depth + 1); }", pack.recursion, true, 1);
+    // Across two functions, one of which starts the depth over, and one that hands it on.
+    const outer = "pub fn read(text: Text) error{TooDeep}!usize { return outer(text.readForParse(), 0); }\nfn outer(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (depth > 64) return error.TooDeep; if (bytes.len == 0) return 0; return 1 + try inner(bytes[1..], depth + 1); }\n";
+    try expectJudged(head ++ outer ++ "fn inner(bytes: []const u8, depth: u8) error{TooDeep}!usize { _ = depth; if (bytes.len == 0) return 0; return 1 + try outer(bytes[1..], 0); }", pack.recursion, true, 1);
+    try expectJudged(head ++ outer ++ "fn inner(bytes: []const u8, depth: u8) error{TooDeep}!usize { if (bytes.len == 0) return 0; return 1 + try outer(bytes[1..], @as(u8, depth)); }", pack.recursion, true, 0);
+    // A field of another object: a local counter, a fresh child, a fresh helper's receiver.
+    const parser = "pub fn read(text: Text) error{TooDeep}!void { var p: Parser = .{ .bytes = text.readForParse() }; try p.value(); }\n";
+    try expectJudged(head ++ parser ++ "const Counter = struct { n: u8 = 0 };\nconst Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { var scratch: Counter = .{}; scratch.n += 1; if (scratch.n > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; var child: Parser = .{ .bytes = p.bytes[1..] }; try child.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn enter(p: *Parser) error{TooDeep}!void { p.depth += 1; if (p.depth > 64) return error.TooDeep; }\n fn value(p: *Parser) error{TooDeep}!void { var fresh: Parser = .{ .bytes = &.{} }; try fresh.enter(); if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.value(); } };", pack.recursion, true, 1);
+    // The field reset elsewhere on the cycle, by its name, by `@field`, or the whole struct; a
+    // larger undo than the step.
+    const value = " fn value(p: *Parser) error{TooDeep}!void { p.depth += 1; defer p.depth -= 1; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.list(); }\n";
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { p.depth = 0; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { @field(p, \"depth\") = 0; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { const q = p; q.* = .{ .bytes = q.bytes }; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { p.depth += 1; defer p.depth -= 2; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.list(); }\n fn list(p: *Parser) error{TooDeep}!void { try p.value(); } };", pack.recursion, true, 1);
+    // Handed on through a second function, and called twice there.
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { try p.value(); try p.value(); } };", pack.recursion, true, 0);
+}
+
 test "A006 strict: a call through anything but a function is undecided" {
     const head = "const aegis = @import(\"aegis\");\nconst Text = aegis.input.Untrusted([]const u8);\n";
     try expectJudged(head ++ "const Step = *const fn ([]const u8) usize;\npub fn read(text: Text, step: Step) usize { return step(text.readForParse()); }", pack.recursion, false, 0);
@@ -1644,6 +1680,12 @@ test "an owner whose address a function of the program releases on every path is
     try expectJudged(head ++ "var kept: ?*O = null;\nfn keep(owner: *O) void { kept = owner; }\npub fn f() void { var owner = O.init(1); keep(&owner); }", pack.cleanup, false, 0);
     // Passed on to a function that releases it, the pointer it was given.
     try expectJudged(head ++ "fn release(owner: *O) void { owner.deinit(); }\nfn on(owner: *O) void { release(owner); }\npub fn f() void { var owner = O.init(1); on(&owner); }", pack.cleanup, true, 0);
+    // A function in a file the run did not select is the program's, read as one that is.
+    const other = "pub fn release(owner: anytype) void { owner.deinit(); }\npub fn half(owner: anytype, fail: bool) void { if (fail) return; owner.deinit(); }";
+    const imported = "const other = @import(\"other.zig\");\n";
+    try expectJudgedWithFile(head ++ imported ++ "pub fn f() void { var owner = O.init(1); other.release(&owner); }", other, pack.cleanup, true, 0);
+    try expectJudgedWithFile(head ++ imported ++ "pub fn f() void { var owner = O.init(1); other.release(&owner); owner.deinit(); }", other, pack.cleanup, true, 1);
+    try expectJudgedWithFile(head ++ imported ++ "pub fn f(fail: bool) void { var owner = O.init(1); other.half(&owner, fail); }", other, pack.cleanup, false, 0);
 }
 
 test "an owner handed on by its move is transferred where the result is returned, stored or bound, and a call given its address may take it only where it returns" {

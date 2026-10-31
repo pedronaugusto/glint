@@ -11,6 +11,7 @@ const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
+const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -94,7 +95,7 @@ fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Con
     const first = params.next() orelse return false;
     if (!std.mem.eql(u8, own.getNodeSource(first.type_expr orelse return false), "?*anyopaque")) return false;
     for (c.project.sources) |*source| {
-        if (!source.input.selected) continue;
+        if (!try Program.owns(c, source.id)) continue;
         const file = source.id;
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {

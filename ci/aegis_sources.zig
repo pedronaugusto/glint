@@ -197,8 +197,10 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
 /// A source of another module beside aegis's, such as a fixture standing for std.
 pub const Extra = struct { name: []const u8, bytes: []const u8 };
 /// An import among the extra sources, by their index in what the caller gives; a null `from` is
-/// the consumer's.
+/// the consumer's, and a `target` of `consumer_file` the consumer itself.
 pub const ExtraImport = struct { from: ?u32 = null, spelling: []const u8, target: u32 };
+/// The consumer, as an `ExtraImport`'s target.
+pub const consumer_file: u32 = std.math.maxInt(u32);
 
 /// The pinned revision's source `name`.
 pub fn pinned(name: []const u8) ?[]const u8 {
@@ -233,6 +235,6 @@ pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: [
     defer gpa.free(all);
     @memcpy(all[0..mapped.len], &mapped);
     const first: u32 = sources.len + 1;
-    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = first + entry.target };
+    for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = if (entry.target == consumer_file) 0 else first + entry.target };
     return Project.init(gpa, inputs, all, .{});
 }

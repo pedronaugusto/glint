@@ -11,6 +11,7 @@ const Danger = @import("Danger.zig");
 const Shapes = @import("DangerShapes.zig");
 const Undefined = @import("Undefined.zig");
 const Flows = @import("DangerFlow.zig");
+const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Report = @import("Report.zig");
 const Ast = std.zig.Ast;
@@ -2166,9 +2167,10 @@ const Flow = struct {
 
     /// A statement that is a call, or keeps or tries its result, with the owner itself among
     /// its arguments and named nowhere else in the statement, to a function outside the
-    /// program's own sources (std's containers, a dependency's): one that takes an owner by
-    /// value keeps it, as a `put` or an `append` does. A function of the program's own is not
-    /// walked for what it does with its parameter, so a call to one stays undecided.
+    /// program (std's containers): one that takes an owner by value keeps it, as a `put` or an
+    /// `append` does. A function of the program's own, in a file the run selected or not, a
+    /// dependency's among them, is not walked for what it does with its parameter, so a call to
+    /// one stays undecided.
     fn argument(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         var value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) f.tree.nodeData(stmt).node_and_node[1] else stmt;
         if (f.tree.nodeTag(value) == .@"try") value = f.tree.nodeData(value).node;
@@ -2180,7 +2182,7 @@ const Flow = struct {
         }
         if (given != 1) return false;
         const callee = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return false;
-        if (f.c.project.at(callee.file).input.selected) return false;
+        if (try Program.owns(f.c, callee.file)) return false;
         const first = f.tree.firstToken(stmt);
         const last = f.tree.lastToken(stmt);
         var named: usize = 0;
@@ -2222,7 +2224,7 @@ const Flow = struct {
         if (named != 1) return null;
         const decl = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return null;
         const function = (try f.c.facts.origin(decl)) orelse return null;
-        if (!f.c.project.at(function.file).input.selected or try f.c.inLibrary(Contract.library, function.file)) return null;
+        if (!try Program.owns(f.c, function.file)) return null;
         const model = &f.c.project.at(function.file).model;
         const record = model.declarations[@backingInt(function.index)];
         if (record.kind != .function) return null;
