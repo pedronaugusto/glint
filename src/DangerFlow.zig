@@ -314,7 +314,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                     const prong = tree.fullSwitchCase(case_node).?.ast.target_expr; // unreachable: a switch's cases are cases
                     if (!continuesTo(c, prong, node)) continue;
                     goes_on = true;
-                    if (!try cancels(c, c.file, prong, 1, false)) break false;
+                    if (!try cancels(c, c.file, prong, 1, .{})) break false;
                 } else true;
                 if (!goes_on or every) continue;
                 if (unread) {
@@ -350,7 +350,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 unknown = unknown or level == .unknown;
             }
             if (!unbounded and !by_input and !unknown) continue;
-            if (try cancels(c, c.file, body, 0, false)) continue;
+            if (try cancels(c, c.file, body, 0, .{})) continue;
             // A bound the input fact cannot read may be one a peer sets: never cleared.
             if (unread or (!unbounded and !by_input)) {
                 if (unread) {
@@ -473,10 +473,10 @@ fn continuesTo(c: *Context, prong: Ast.Node.Index, choice: Ast.Node.Index) bool 
 /// operation's `Cancelable`) by its declared error set. A call is none for being given an `Io`
 /// (`Clock.now(io)` cannot cancel), nor for its name. A callee chosen per target (`const wait =
 /// if (windows) waitWindows else waitPosix`, or a method of a type so chosen) is one where every
-/// choice is; a pointer to a function, or a vtable's, is none. `errors_end` says, for a function's
+/// choice is; a pointer to a function, or a vtable's, is none. `ends` says, for a function's
 /// body, that the call judged ends the loop on every error the function returns (`endsOnError`),
 /// so a path of the body that leaves by an error before its point lets no pass go on.
-fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, errors_end: bool) Context.Error!bool {
+fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, ending: Ends) Context.Error!bool {
     if (depth > 16) return false;
     const tree = &c.project.at(file).file.tree;
     const first = tree.firstToken(body);
@@ -488,10 +488,13 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (!try passedOn(c, file, node)) continue;
-        if (!try always(c, file, node, body, .{ .every_so_often = depth == 0, .errors_end = errors_end, .through_loops = true })) continue;
+        if (!try always(c, file, node, body, .{ .every_so_often = depth == 0, .ending = ending, .through_loops = true, .depth = depth })) continue;
         // Whether an error the callee returns ends the loop: in the loop judged, by what the call
         // does with it; in a function's body, by going on out of it to a call that does.
-        const ended = if (depth == 0) try endsOnError(c, file, node, body) else errors_end and propagates(c, file, node);
+        // What ends the loop past the callee's point: in the loop judged, by what the call does
+        // with its result; in a function's body, all of it where the call is what the body
+        // returns, else an error where the call's goes on out of it.
+        const ended: Ends = if (depth == 0) try endsOf(c, file, node, body) else if (returned(c, file, node)) ending else .{ .errors = ending.errors and propagates(c, file, node) };
         const callee = try c.facts.resolve(file, call.ast.fn_expr);
         const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
         const every = for (choices) |choice| {
@@ -502,23 +505,45 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
     return false;
 }
 
-const Cancels = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, bool }, bool) = .empty };
+const Cancels = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u64 }, bool) = .empty };
+
+/// What ends the loop a call is made in when the callee leaves before its cancellation point:
+/// an error it returns (`try`, returned, or a handler that ends the loop), an enum literal its
+/// result is switched on to a prong that ends the loop (`.ended => break`), or any value where a
+/// non-null result ends it (`if (term) |t| return t`). A callee may leave before its point only
+/// with such a value.
+const Ends = struct {
+    errors: bool = false,
+    literals: []const []const u8 = &.{},
+    some: bool = false,
+
+    fn key(e: Ends) u64 {
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(&.{ @intFromBool(e.errors), @intFromBool(e.some) });
+        for (e.literals) |name| {
+            hash.update(name);
+            hash.update(&.{0});
+        }
+        return hash.final();
+    }
+};
 
 /// Whether a call of `callee` is a cancellation point: a function of the program where its body
 /// reaches one, whatever its error set declares (`error{Canceled}!void {}` cancels nothing); one
 /// of std's where its declared error set holds `error.Canceled`, as `Io`'s contract has each
 /// operation so declared return it to a task canceled (its bodies go through `Io`'s vtable).
-/// `errors_end` as `cancels` takes it.
-fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, errors_end: bool) Context.Error!bool {
+/// `ends` as `cancels` takes it.
+fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, ending: Ends) Context.Error!bool {
     const callee_tree = &c.project.at(callee.file).file.tree;
     const callee_model = &c.project.at(callee.file).model;
     if (try Program.owns(c, callee.file)) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
         const memo = try c.facts.memo(Cancels);
-        if (memo.map.get(.{ callee, errors_end })) |known| return known;
+        const key = ending.key();
+        if (memo.map.get(.{ callee, key })) |known| return known;
         // A function that reaches itself is no cancellation point while it is being read.
-        try memo.map.put(c.allocator, .{ callee, errors_end }, false);
-        const out = try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1, errors_end);
-        try memo.map.put(c.allocator, .{ callee, errors_end }, out);
+        try memo.map.put(c.allocator, .{ callee, key }, false);
+        const out = try cancels(c, callee.file, callee_tree.nodeData(parent).node_and_node[1], depth + 1, ending);
+        try memo.map.put(c.allocator, .{ callee, key }, out);
         return out;
     };
     // A dependency's function with no body here (`extern`, a declaration only) says nothing of
@@ -555,8 +580,60 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
             const capture = branch.error_token orelse return false;
             return handled(c, file, parent, branch.ast.else_expr.unwrap() orelse return false, capture);
         },
+        else => {
+            // Handed to the program's function that passes its error on (`finished(wait(io))`):
+            // on from that call.
+            var buffer: [1]Ast.Node.Index = undefined;
+            const outer = tree.fullCall(&buffer, parent) orelse return false;
+            const position = std.mem.findScalar(Ast.Node.Index, outer.ast.params, at) orelse return false;
+            if (!try passesParameter(c, file, outer, position)) return false;
+        },
+    };
+    return false;
+}
+
+/// Whether a program function given a call's error union at `position` passes `error.Canceled`
+/// on: a read of that parameter is caught (`result catch |e| ...`, or an `if`'s `else |e|`) by a
+/// handler whose path for it returns it (`handled`).
+fn passesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, position: usize) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |decl| (try c.facts.origin(decl)) orelse decl,
         else => return false,
     };
+    if (!try Program.owns(c, callee.file)) return false;
+    // A method called on a value takes it first.
+    const skip: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+        .container => 0,
+        else => 1,
+    } else 0;
+    const target = &c.project.at(callee.file).file.tree;
+    const model = &c.project.at(callee.file).model;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = target.fullFnProto(&proto_buffer, model.declarations[@backingInt(callee.index)].node) orelse return false;
+    var params = proto.iterate(target);
+    var at: usize = 0;
+    const name = while (params.next()) |param| : (at += 1) {
+        if (at == position + skip) break param.name_token orelse return false;
+    } else return false;
+    for (model.declarations, 0..) |decl, i| {
+        if (decl.kind != .parameter or decl.token != name) continue;
+        const id: Model.Declaration.Id = @fromBackingInt(@intCast(i));
+        for (model.references) |reference| {
+            if (reference.declaration != id) continue;
+            const holder = model.parentOf(reference.node) orelse continue;
+            if (target.nodeTag(holder) == .@"catch") {
+                const caught, const handler = target.nodeData(holder).node_and_node;
+                if (caught != reference.node) continue;
+                const catch_token = target.nodeMainToken(holder);
+                if (try handled(c, callee.file, holder, handler, if (target.tokenTag(catch_token + 1) == .pipe) catch_token + 2 else null)) return true;
+            } else if (target.fullIf(holder)) |branch| {
+                if (branch.ast.cond_expr != reference.node) continue;
+                const capture = branch.error_token orelse continue;
+                if (try handled(c, callee.file, holder, branch.ast.else_expr.unwrap() orelse continue, capture)) return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -569,19 +646,13 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
 fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: Ast.Node.Index, capture: ?Ast.TokenIndex) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = taken: {
-        const name = capture orelse break :taken .{ handler, null };
-        const chosen = tree.fullSwitch(handler) orelse break :taken .{ handler, null };
-        if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) break :taken .{ handler, null };
-        var otherwise: ?Ast.full.SwitchCase = null;
-        for (chosen.ast.cases) |case_node| {
-            const case = tree.fullSwitchCase(case_node).?;
-            if (case.ast.values.len == 0) otherwise = case;
-            for (case.ast.values) |value| if (namesCanceled(tree, value)) break :taken .{ case.ast.target_expr, case.payload_token };
-        }
-        const chosen_prong = otherwise orelse return false;
-        break :taken .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
+    // `return switch (e) { error.Canceled => error.Canceled, ... }`: the prong's value returned.
+    if (tree.nodeTag(handler) == .@"return") if (tree.nodeData(handler).opt_node.unwrap()) |value| if (capture) |name| if (tree.fullSwitch(value) != null) {
+        const prong, const payload = (cancelProng(tree, value, name) orelse return false);
+        const names = [_]?Ast.TokenIndex{ capture, payload };
+        return isIt(tree, prong, &names) and try errorResult(c, file, handler);
     };
+    const prong: Ast.Node.Index, const payload: ?Ast.TokenIndex = if (capture) |name| (if (tree.fullSwitch(handler) != null) (cancelProng(tree, handler, name) orelse return false) else .{ handler, null }) else .{ handler, null };
     const names = [_]?Ast.TokenIndex{ capture, payload };
     if (try returnsIt(c, file, prong, &names)) return true;
     // The prong's value is the error, and the whole is returned or tried.
@@ -594,6 +665,21 @@ fn handled(c: *Context, file: Project.FileId, whole: Ast.Node.Index, handler: As
         else => return false,
     };
     return false;
+}
+
+/// The prong a switch on the error captured as `name` takes for `error.Canceled`: the one naming
+/// it, or `else`; null where none does. The whole switch where it switches on something else.
+fn cancelProng(tree: *const Ast, switch_node: Ast.Node.Index, name: Ast.TokenIndex) ?struct { Ast.Node.Index, ?Ast.TokenIndex } {
+    const chosen = tree.fullSwitch(switch_node).?; // unreachable: the caller found a switch
+    if (tree.nodeTag(chosen.ast.condition) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(chosen.ast.condition)), tree.tokenSlice(name))) return .{ switch_node, null };
+    var otherwise: ?Ast.full.SwitchCase = null;
+    for (chosen.ast.cases) |case_node| {
+        const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
+        if (case.ast.values.len == 0) otherwise = case;
+        for (case.ast.values) |value| if (namesCanceled(tree, value)) return .{ case.ast.target_expr, case.payload_token };
+    }
+    const chosen_prong = otherwise orelse return null;
+    return .{ chosen_prong.ast.target_expr, chosen_prong.payload_token };
 }
 
 /// Whether a handler's path returns what it caught itself: `return x` with `x` the error
@@ -674,8 +760,11 @@ fn holdsNoError(t: Facts.Value) bool {
 const Pass = struct {
     /// A branch in one of the two periodic forms runs on a pass in turn.
     every_so_often: bool = false,
-    /// In a function's body, a path that leaves by an error lets no pass go on (`cancels`).
-    errors_end: bool = false,
+    /// In a function's body, a path that leaves with what ends the loop lets no pass go on
+    /// (`cancels`).
+    ending: Ends = .{},
+    /// How deep in the callees `cancels` reads: a `return` of a call that is a point reads it.
+    depth: u8 = 0,
     /// A `while (true)` around `node` runs its first pass: what `node` is reached on at least
     /// once a pass is enough, as for a cancellation point, where a count stepped each pass is not.
     through_loops: bool = false,
@@ -698,7 +787,7 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Nod
                 var buffer: [2]Ast.Node.Index = undefined;
                 for (tree.blockStatements(&buffer, parent).?) |statement| {
                     if (statement == at) break;
-                    if (try skips(c, file, statement, body, function, pass.errors_end)) return false;
+                    if (try skips(c, file, statement, body, function, pass.ending, pass.depth)) return false;
                 }
             },
             else => if (tree.fullIf(parent)) |branch| {
@@ -718,24 +807,27 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Nod
 
 /// Whether a statement before `node` on its path through `body` may end the pass while what runs
 /// it goes on. In a function's body (`function`) a `return` or a `try` leaves it, which lets the
-/// loop go on unless it leaves by an error (a `try`, or `return error.X`) and `errors_end`. A `break` or
+/// loop go on unless it leaves with what ends the loop (`ends`: a `try` or `return error.X` where
+/// errors do, `endsWith`), or returns a call that reaches its point first. A `break` or
 /// `continue` goes where it names, resolved by its label or, unlabeled, to the innermost loop
 /// whose body holds it (`jumpTarget`), not by its spelling: to a loop or block inside the
 /// statement it ends only that; a `break` of the loop judged (the innermost one around `body`)
 /// or a jump past it ends that loop with the pass, as a `return` does; any other, and one whose
 /// target does not resolve, may skip the rest of the pass.
-fn skips(c: *Context, file: Project.FileId, statement: Ast.Node.Index, body: Ast.Node.Index, function: bool, errors_end: bool) Context.Error!bool {
+fn skips(c: *Context, file: Project.FileId, statement: Ast.Node.Index, body: Ast.Node.Index, function: bool, ending: Ends, depth: u8) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const first = tree.firstToken(statement);
     const last = tree.lastToken(statement);
     for (first..last + 1) |token| switch (tree.tokenTag(@intCast(token))) {
-        .keyword_try => if (function and !errors_end) return true,
+        .keyword_try => if (function and !ending.errors) return true,
         .keyword_return => if (function) {
-            if (!errors_end) return true;
             const exit = (try jumpAt(c, file, @intCast(token))) orelse return true;
             const value = tree.nodeData(exit).opt_node.unwrap() orelse return true;
-            if (tree.nodeTag(value) != .error_value) return true;
+            // Only with what ends the loop, or by a call it returns that reaches its point.
+            if (endsWith(tree, model, value, ending)) continue;
+            if (try cancels(c, file, exit, depth + 1, ending)) continue;
+            return true;
         },
         .keyword_continue, .keyword_break => {
             const jump = (try jumpAt(c, file, @intCast(token))) orelse return true;
@@ -839,6 +931,101 @@ fn propagates(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
     return false;
 }
 
+/// Whether a call is what its function returns: `return f()`, `return try f()`.
+fn returned(c: *Context, file: Project.FileId, call: Ast.Node.Index) bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = call;
+    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .grouped_expression, .@"try" => {},
+        .@"return" => return true,
+        else => return false,
+    };
+    return false;
+}
+
+/// What ends the loop whose body is `body` when the call `call` in it leaves before its point
+/// (`Ends`): its errors (`endsOnError`); the enum literals of the prongs that end the loop where
+/// its result is switched on (`switch (try f()) { .ended => break, ... }`); any value where its
+/// payload is captured by an `if` that ends the loop, directly or through a constant the next
+/// statement so tests (`const term = try f(); if (term) |t| return t;`).
+fn endsOf(c: *Context, file: Project.FileId, call: Ast.Node.Index, body: Ast.Node.Index) Context.Error!Ends {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var out: Ends = .{ .errors = try endsOnError(c, file, call, body) };
+    var at = call;
+    var parent = model.parentOf(at) orelse return out;
+    while (tree.nodeTag(parent) == .grouped_expression or tree.nodeTag(parent) == .@"try") {
+        at = parent;
+        parent = model.parentOf(at) orelse return out;
+    }
+    if (tree.fullSwitch(parent)) |choice| {
+        if (choice.ast.condition != at) return out;
+        var literals: std.ArrayList([]const u8) = .empty;
+        for (choice.ast.cases) |case_node| {
+            const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
+            if (!try ends(c, file, case.ast.target_expr, body)) continue;
+            for (case.ast.values) |value| if (tree.nodeTag(value) == .enum_literal) try literals.append(c.allocator, tree.tokenSlice(tree.nodeMainToken(value)));
+        }
+        out.literals = literals.items;
+        return out;
+    }
+    if (tree.fullIf(parent)) |branch| {
+        out.some = branch.ast.cond_expr == at and branch.payload_token != null and try ends(c, file, branch.ast.then_expr, body);
+        return out;
+    }
+    // `const term = try f();` and the statement after it `if (term) |t| ...`.
+    const local = tree.fullVarDecl(parent) orelse return out;
+    if (local.ast.init_node.unwrap() != at or tree.tokenTag(local.ast.mut_token) != .keyword_const) return out;
+    const block = model.parentOf(parent) orelse return out;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return out;
+    const next = for (statements, 0..) |statement, i| {
+        if (statement == parent) break if (i + 1 < statements.len) statements[i + 1] else return out;
+    } else return out;
+    const branch = tree.fullIf(next) orelse return out;
+    if (branch.payload_token == null or tree.nodeTag(branch.ast.cond_expr) != .identifier) return out;
+    const tested = (model.reference(branch.ast.cond_expr) orelse return out).declaration orelse return out;
+    if (model.declarations[@backingInt(tested)].node != parent) return out;
+    out.some = try ends(c, file, branch.ast.then_expr, body);
+    return out;
+}
+
+/// Whether every value `value` can give ends the loop by `ends`: an error where errors do, an
+/// enum literal it names, a payload an `if` or `while` captured where any value does; a switch or
+/// an `if` each branch of which does, `unreachable` none.
+fn endsWith(tree: *const Ast, model: *const Model, value: Ast.Node.Index, ending: Ends) bool {
+    switch (tree.nodeTag(value)) {
+        .grouped_expression => return endsWith(tree, model, tree.nodeData(value).node_and_token[0], ending),
+        .error_value => return ending.errors,
+        .unreachable_literal => return true,
+        .enum_literal => {
+            const name = tree.tokenSlice(tree.nodeMainToken(value));
+            for (ending.literals) |each| if (std.mem.eql(u8, each, name)) return true;
+            return false;
+        },
+        .identifier => {
+            if (!ending.some) return false;
+            const declared = (model.reference(value) orelse return false).declaration orelse return false;
+            const record = model.declarations[@backingInt(declared)];
+            if (record.kind != .capture) return false;
+            if (tree.fullIf(record.node)) |branch| return branch.payload_token != null and branch.error_token != record.token;
+            if (tree.fullWhile(record.node)) |loop| return loop.payload_token != null and loop.error_token != record.token;
+            return false;
+        },
+        .@"switch", .switch_comma => {
+            const choice = tree.fullSwitch(value).?; // unreachable: tagged a switch
+            for (choice.ast.cases) |case| if (!endsWith(tree, model, tree.fullSwitchCase(case).?.ast.target_expr, ending)) return false; // unreachable: a switch's cases are cases
+            return true;
+        },
+        else => {
+            const branch = tree.fullIf(value) orelse return false;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return endsWith(tree, model, branch.ast.then_expr, ending) and endsWith(tree, model, otherwise, ending);
+        },
+    }
+}
+
 /// Whether no path through `node`, a handler in the loop body `body`, goes on with that loop: it
 /// returns, is `unreachable`, or jumps where the loop ends (`endsLoop`); a switch whose every
 /// prong does, an `if` whose both branches do, or a block whose last statement does with no
@@ -857,7 +1044,7 @@ fn ends(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, node).?;
             if (statements.len == 0) return false;
-            for (statements[0 .. statements.len - 1]) |statement| if (try skips(c, file, statement, body, false, false)) return false;
+            for (statements[0 .. statements.len - 1]) |statement| if (try skips(c, file, statement, body, false, .{}, 0)) return false;
             return ends(c, file, statements[statements.len - 1], body);
         },
         else => {},

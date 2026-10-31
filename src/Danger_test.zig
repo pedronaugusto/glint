@@ -7267,6 +7267,116 @@ test "A020 and A009 read a call inside @TypeOf, never evaluated, as no cancellat
     , 0);
 }
 
+test "A020 lets a callee leave before its point with a value its caller's loop ends on: an enum literal a prong that ends it names, any value where a non-null one ends it" {
+    // `.ended => break` around a callee that returns `.ended` early; `if (term) |t| return t` around
+    // one that returns a captured payload early; the same through a call the callee returns.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Wait = enum { ended, woken, timeout };
+        \\fn wait(io: std.Io, gone: bool) !Wait {
+        \\    if (gone) return .ended;
+        \\    try io.checkCancel();
+        \\    return .timeout;
+        \\}
+        \\pub fn literal(io: std.Io, gone: bool) !void {
+        \\    while (true) switch (try wait(io, gone)) {
+        \\        .ended => break,
+        \\        .woken => return error.Canceled,
+        \\        .timeout => {},
+        \\    };
+        \\}
+        \\fn reap(io: std.Io, ready: ?u8) !?u8 {
+        \\    if (ready) |term| return term;
+        \\    try io.checkCancel();
+        \\    return null;
+        \\}
+        \\pub fn some(io: std.Io, ready: ?u8) !u8 {
+        \\    while (true) {
+        \\        const term = try reap(io, ready);
+        \\        if (term) |ended| return ended;
+        \\    }
+        \\}
+        \\fn inner(io: std.Io) !Wait {
+        \\    try io.checkCancel();
+        \\    return .timeout;
+        \\}
+        \\fn outer(io: std.Io, gone: bool) !Wait {
+        \\    if (gone) return .ended;
+        \\    return inner(io);
+        \\}
+        \\pub fn through(io: std.Io, gone: bool) !void {
+        \\    while (true) switch (try outer(io, gone)) {
+        \\        .ended => break,
+        \\        else => {},
+        \\    };
+        \\}
+    , 0);
+    // An early value the loop goes on after (`.timeout => {}`), or a null: no point that pass.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Wait = enum { ended, woken, timeout };
+        \\fn waitTimeout(io: std.Io, gone: bool) !Wait {
+        \\    if (gone) return .timeout;
+        \\    try io.checkCancel();
+        \\    return .ended;
+        \\}
+        \\pub fn literalGoesOn(io: std.Io, gone: bool) !void {
+        \\    while (true) switch (try waitTimeout(io, gone)) {
+        \\        .ended => break,
+        \\        .woken => return error.Canceled,
+        \\        .timeout => {},
+        \\    };
+        \\}
+        \\fn reapNull(io: std.Io, ready: ?u8) !?u8 {
+        \\    if (ready == null) return null;
+        \\    try io.checkCancel();
+        \\    return ready;
+        \\}
+        \\pub fn someNull(io: std.Io, ready: ?u8) !u8 {
+        \\    while (true) {
+        \\        const term = try reapNull(io, ready);
+        \\        if (term) |ended| return ended;
+        \\    }
+        \\}
+    , 2);
+}
+
+test "A020 follows a call's error union into the program's function it is handed to, where that function returns error.Canceled on" {
+    // `finished(io.checkCancel())`: `result catch |err| return switch (err) { error.Canceled =>
+    // error.Canceled }` passes it on, so the call tried around it is a point.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Wait = enum { ended, timeout };
+        \\fn finished(result: std.Io.Cancelable!void) error{ Canceled, Other }!Wait {
+        \\    result catch |err| return switch (err) {
+        \\        error.Canceled => error.Canceled,
+        \\    };
+        \\    return .ended;
+        \\}
+        \\pub fn mapped(io: std.Io) !void {
+        \\    while (true) switch (try finished(io.checkCancel())) {
+        \\        .ended => {},
+        \\        .timeout => {},
+        \\    };
+        \\}
+    , 0);
+    // One that turns it into a value drops it.
+    try expect(pack.cancellation,
+        \\const std = @import("std");
+        \\const Wait = enum { ended, timeout };
+        \\fn swallowed(result: std.Io.Cancelable!void) Wait {
+        \\    result catch return .timeout;
+        \\    return .ended;
+        \\}
+        \\pub fn dropped(io: std.Io) !void {
+        \\    while (true) switch (swallowed(io.checkCancel())) {
+        \\        .ended => {},
+        \\        .timeout => {},
+        \\    };
+        \\}
+    , 1);
+}
+
 test "A020 reads a dependency's function by its body, as the program's: a declared error.Canceled is no cancellation point outside std" {
     const dependency =
         \\const std = @import("std");
