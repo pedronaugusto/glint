@@ -7498,12 +7498,19 @@ test "A007 finds std's synchronization a dependency names under its own name, he
     , dependency);
     try std.testing.expectEqual(@as(usize, 0), clean.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 0), clean.findings);
-    // A type the dependency names that does not resolve may be one: undecided, never clean.
+    // A type the dependency names that does not resolve may be one: undecided, never clean,
+    // but where every value a variable is given is an enum literal, a tag.
     const unknown = try runWithDependency(pack.shared_state,
         \\const dep = @import("dep");
         \\const Held = struct { lock: [2]dep.Elsewhere };
+        \\pub fn pick(x: bool) void {
+        \\    const tag: dep.Elsewhere = if (x) .a else .b;
+        \\    _ = tag;
+        \\    var lock: dep.Elsewhere = undefined;
+        \\    _ = &lock;
+        \\}
     , dependency);
-    try std.testing.expectEqual(@as(usize, 1), unknown.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 2), unknown.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }
 
