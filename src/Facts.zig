@@ -3195,6 +3195,9 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
     if (record.public and try self.exportedFunction(function)) return null;
     const name_token = record.token;
     const name = self.project.at(function.file).file.tree.tokenSlice(name_token);
+    // std's or aegis's code may call it on a value the program hands it: callers no scan of the
+    // program sees.
+    if (record.public and try self.calledOutside(name)) return null;
     var values: std.ArrayList(Value) = .empty;
     for (self.project.sources) |*source| {
         const file = &source.file;
@@ -3274,6 +3277,77 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         }
     }
     return values.items;
+}
+
+/// Whether code outside the program (std's or a known library's) may call a function named
+/// `name` of the program's: a call through a member so spelled, or through `@field` with a name
+/// that is so spelled or computed, on a receiver that does not resolve to a container of its own
+/// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`.
+fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
+    const found = try self.memo(OutsideCalls);
+    if (!found.built) {
+        found.built = true;
+        for (self.project.sources) |*source| {
+            if (source.file.status != .parsed or try self.program(source.id)) continue;
+            const tree = &source.file.tree;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const parent = source.model.node_parents[i] orelse continue;
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, parent) orelse continue;
+                if (call.ast.fn_expr != node) continue;
+                const receiver: Ast.Node.Index, const spelled: []const u8 = switch (tag) {
+                    .field_access => .{ tree.nodeData(node).node_and_token[0], tree.tokenSlice(tree.nodeData(node).node_and_token[1]) },
+                    .builtin_call_two, .builtin_call_two_comma => blk: {
+                        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const args = builtinArgs(tree, node, &buffer);
+                        if (args.len != 2) continue;
+                        if (tree.nodeTag(args[1]) != .string_literal) {
+                            try found.computed.append(self.gpa, .{ .file = source.id, .node = args[0] });
+                            continue;
+                        }
+                        break :blk .{ args[0], tree.tokenSlice(tree.nodeMainToken(args[1])) };
+                    },
+                    else => continue,
+                };
+                const entry = try found.by_name.getOrPut(self.gpa, std.mem.trim(u8, spelled, "\""));
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.gpa, .{ .file = source.id, .node = receiver });
+            }
+        }
+    }
+    if (found.verdicts.get(name)) |known| return known;
+    var any = false;
+    const named = if (found.by_name.get(name)) |list| list.items else &.{};
+    for ([_][]const Key{ named, found.computed.items }) |receivers| for (receivers) |receiver| {
+        if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
+        if (any) break;
+    };
+    try found.verdicts.put(self.gpa, name, any);
+    return any;
+}
+const OutsideCalls = struct {
+    built: bool = false,
+    /// Each name called through a member outside the program, with the receivers it is called on.
+    by_name: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
+    /// The receivers of calls through `@field` with a computed name: any name.
+    computed: std.ArrayList(Key) = .empty,
+    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
+};
+
+/// Whether a value may be the program's: it does not resolve, or reaches a container of a
+/// program file.
+fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
+    return switch (value) {
+        .unknown => true,
+        .container, .instance => |c| try self.program(c.file),
+        .pointer, .array, .optional, .error_union => |inner| self.mayBeProgram(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (try self.mayBeProgram(one)) break true;
+        } else false,
+        else => false,
+    };
 }
 
 /// The arguments `parent` passes when it calls what `node` names: `f(a, b)`, or
