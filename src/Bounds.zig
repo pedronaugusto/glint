@@ -35,6 +35,8 @@ const Project = @import("Project.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
 const Program = @import("Program.zig");
+const Facts = @import("Facts.zig");
+const Governed = @import("Governed.zig");
 
 const Error = Context.Error;
 
@@ -1072,6 +1074,19 @@ const Frame = struct {
     /// The length of `memory`'s memory: what evaluating it gave, an array's fixed length, or a
     /// tracked slice's length variable.
     fn lengthOf(f: *Frame, s: State, memory: Ast.Node.Index, value: Value) Error!struct { State, ?Lin } {
+        if (try table(f.c, f.file, memory)) |most| {
+            // A table std names by a u32 index: whatever else is known of its length, at most
+            // the indexes there are.
+            var out = s;
+            const l = value.length orelse made: {
+                const t = try f.temp(s, memory, 5);
+                out = t[0];
+                break :made try single(f.a, t[1]);
+            };
+            out = try assume(f.a, out, try atLeast(f.a, l, constant(0)));
+            out = try assume(f.a, out, try atLeast(f.a, constant(most), l));
+            return .{ out, l };
+        }
         if (value.length) |known_length| return .{ s, known_length };
         if (try Range.memoryLength(f.c, f.file, memory)) |fixed| if (fixed <= std.math.maxInt(Coef)) return .{ s, constant(@intCast(fixed)) };
         const d = f.trackedName(memory) orelse return .{ s, null };
@@ -1962,6 +1977,40 @@ const Frame = struct {
         return .{ .rows = summary.rows, .params = summary.params, .fails = fails };
     }
 };
+
+/// The most entries `memory` holds where it is one of the tables std names by a u32 index (an
+/// `Ast`'s `nodes` or `tokens`), or a field's view of one (`t.nodes.items(.tag)`). std makes
+/// each node's index with `@intCast(p.nodes.len)` (zig/Parse.zig:78, `addNode`; a reserved
+/// node's index is cast where it is set) and each token's start with `@intCast` of its offset
+/// (zig/Ast.zig:162), so a table past `maxInt(u32) + 1` entries is never made.
+fn table(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Error!?Coef {
+    const tree = &c.project.at(file).file.tree;
+    var node = memory;
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, node)) |call| {
+        if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+        const holder, const name = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(name), "items")) return null;
+        node = holder;
+    }
+    if (tree.nodeTag(node) != .field_access) return null;
+    const decl = (try c.facts.definition(file, node)) orelse return null;
+    const tables = try c.facts.memo(Tables);
+    if (!tables.found) {
+        tables.found = true;
+        for ((try Governed.declarations(c, "std", "zig.Ast")) orelse &.{}) |ast| {
+            const value = try c.facts.declaration((try c.facts.origin(ast)) orelse ast);
+            if (value != .container) continue;
+            for ([_][]const u8{ "nodes", "tokens" }) |name| if (c.facts.member(value.container, name)) |field| {
+                try tables.fields.append(c.allocator, field);
+            };
+        }
+    }
+    const field = (try c.facts.origin(decl)) orelse decl;
+    for (tables.fields.items) |each| if (std.meta.eql(each, field)) return @as(Coef, std.math.maxInt(u32)) + 1;
+    return null;
+}
+const Tables = struct { found: bool = false, fields: std.ArrayList(Facts.Decl) = .empty };
 
 /// A labeled block's label: `blk: { … }`.
 fn blockLabel(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
