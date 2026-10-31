@@ -47,8 +47,6 @@
   ],
   "glint_paths": [
     "src",
-    "examples/project.zig",
-    "examples/report.zig",
     "ci",
     "bench",
     "build.zig"
