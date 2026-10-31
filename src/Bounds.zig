@@ -294,32 +294,6 @@ fn forget(a: std.mem.Allocator, s: State, v: Var) Error!State {
     return .{ .rows = kept.items };
 }
 
-/// What holds on either path: each constraint one holds that the other implies.
-fn join(a: std.mem.Allocator, x: State, y: State) Error!State {
-    if (x.dead) return y;
-    if (y.dead) return x;
-    var out: std.ArrayList(Lin) = .empty;
-    for (x.rows) |row| if (try entails(a, y, row)) try out.append(a, row);
-    for (y.rows) |row| if (try entails(a, x, row)) try out.append(a, row);
-    return .{ .rows = try canonical(a, out.items) };
-}
-
-/// Whether `s` implies every constraint of `t`.
-fn implies(a: std.mem.Allocator, s: State, t: State) Error!bool {
-    if (s.dead) return true;
-    if (t.dead) return false;
-    for (t.rows) |row| if (!try entails(a, s, row)) return false;
-    return true;
-}
-
-/// The constraints of `s` that `t` implies: what a loop's pass preserved.
-fn preserved(a: std.mem.Allocator, s: State, t: State) Error!State {
-    if (s.dead) return s;
-    var out: std.ArrayList(Lin) = .empty;
-    for (s.rows) |row| if (try entails(a, t, row)) try out.append(a, row);
-    return .{ .rows = out.items };
-}
-
 //======================================================================
 // Verdicts, analyses and summaries.
 //======================================================================
@@ -562,11 +536,6 @@ const Frame = struct {
             if (param.type_expr) |type_node| if (try Range.intNamed(f.c, f.file, type_node, f.width)) |int| {
                 s = try f.typed(s, try f.variable(.{ .value = d }), int);
             };
-            // A slice's length is one from the start: a fact first read inside a loop then
-            // holds at its entry too.
-            if (param.type_expr) |type_node| if (f.tree.fullPtrType(type_node)) |pointer| if (pointer.size == .slice) {
-                s = try f.lengthy(s, try f.variable(.{ .length = d }));
-            };
         }
         f.params = params.items;
         if (proto.ast.return_type.unwrap()) |result| {
@@ -635,13 +604,59 @@ const Frame = struct {
         return out;
     }
 
-    /// The state with `v` a length of memory: at zero or above, below half the address space.
-    fn lengthy(f: *Frame, s: State, v: Var) Error!State {
-        const x = try single(f.a, v);
+    /// `s` with what holds of every length it or `goal` reads: one object's length is at zero
+    /// or above and below half the address space. A length's range holds everywhere, so no
+    /// state keeps it: it takes no room a state's limit would give another fact, and a length
+    /// first read inside a loop holds at the loop's entry as well.
+    fn axioms(f: *Frame, s: State, goal: ?Lin) Error!State {
+        if (s.dead) return s;
+        var rows: std.ArrayList(Lin) = .empty;
+        try rows.appendSlice(f.a, s.rows);
+        var seen: std.AutoHashMapUnmanaged(Var, void) = .empty;
         const most = Range.longest(f.width);
-        var out = try assume(f.a, s, x);
-        if (most <= std.math.maxInt(Coef)) out = try assume(f.a, out, try atLeast(f.a, constant(@intCast(most)), x));
-        return out;
+        for ([_][]const Lin{ s.rows, if (goal) |g| &.{g} else &.{} }) |group| for (group) |row| for (row.terms) |term| {
+            switch (f.vars.keys()[term.v]) {
+                .length, .result_length => {},
+                else => continue,
+            }
+            if ((try seen.getOrPut(f.a, term.v)).found_existing) continue;
+            const x = try single(f.a, term.v);
+            try rows.append(f.a, x);
+            if (most <= std.math.maxInt(Coef)) if (try atLeast(f.a, constant(@intCast(most)), x)) |row_most| try rows.append(f.a, row_most);
+        };
+        return .{ .rows = rows.items };
+    }
+
+    /// Whether `s` shows `goal`, the lengths' ranges with it.
+    fn shows(f: *Frame, s: State, goal: Lin) Error!bool {
+        if (s.dead) return true;
+        return entails(f.a, try f.axioms(s, goal), goal);
+    }
+
+    /// What holds on either path: each constraint one holds that the other shows.
+    fn join(f: *Frame, x: State, y: State) Error!State {
+        if (x.dead) return y;
+        if (y.dead) return x;
+        var out: std.ArrayList(Lin) = .empty;
+        for (x.rows) |row| if (try f.shows(y, row)) try out.append(f.a, row);
+        for (y.rows) |row| if (try f.shows(x, row)) try out.append(f.a, row);
+        return .{ .rows = try canonical(f.a, out.items) };
+    }
+
+    /// Whether `s` shows every constraint of `t`.
+    fn implied(f: *Frame, s: State, t: State) Error!bool {
+        if (s.dead) return true;
+        if (t.dead) return false;
+        for (t.rows) |row| if (!try f.shows(s, row)) return false;
+        return true;
+    }
+
+    /// The constraints of `s` that `t` shows: what a loop's pass preserved.
+    fn preservedBy(f: *Frame, s: State, t: State) Error!State {
+        if (s.dead) return s;
+        var out: std.ArrayList(Lin) = .empty;
+        for (s.rows) |row| if (try f.shows(t, row)) try out.append(f.a, row);
+        return .{ .rows = out.items };
     }
 
     fn record(f: *Frame, node: Ast.Node.Index, kind: Kind, proven: bool) Error!void {
@@ -671,7 +686,7 @@ const Frame = struct {
     }
 
     fn holds(f: *Frame, s: State, goal: ?Lin) Error!bool {
-        return goal != null and try entails(f.a, s, goal.?);
+        return goal != null and try f.shows(s, goal.?);
     }
 
     /// Whether a declaration is a variable this function alone writes: a parameter, a local
@@ -779,7 +794,7 @@ const Frame = struct {
         for (f.exits.items) |exit| {
             if (exit.failed or exit.state.dead) continue;
             const projected = try f.project(exit.state);
-            joined = if (joined) |j| try join(f.a, j, projected) else projected;
+            joined = if (joined) |j| try f.join(j, projected) else projected;
         }
         const s = joined orelse {
             // No successful exit: every call that succeeds is unreachable.
@@ -859,7 +874,7 @@ const Frame = struct {
         f.defers.shrinkRetainingCapacity(mark);
         if (label == null) return .{ .s = out };
         const target = f.targets.pop().?; // unreachable: pushed above
-        for (target.breaks.items) |state| out = try join(f.a, out, state);
+        for (target.breaks.items) |state| out = try f.join(out, state);
         return .{ .s = out, .v = .{ .lin = try single(f.a, result.?) } };
     }
 
@@ -880,7 +895,6 @@ const Frame = struct {
         var out = try f.assign(s, try f.variable(.{ .value = d }), if (int != null) value.lin else null, int);
         const length = try f.variable(.{ .length = d });
         out = try f.assign(out, length, value.length, null);
-        if (value.length == null) out = try f.lengthy(out, length);
         return out;
     }
 
@@ -989,7 +1003,7 @@ const Frame = struct {
             },
             .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or, .bool_not => {
                 const split = try f.cond(s, node);
-                return .{ .s = try join(f.a, split.yes, split.no) };
+                return .{ .s = try f.join(split.yes, split.no) };
             },
             .@"try" => return f.tried(s, node),
             .@"catch", .@"orelse" => return f.otherwise(s, node),
@@ -1089,10 +1103,7 @@ const Frame = struct {
         if (value.length) |known_length| return .{ s, known_length };
         if (try Range.memoryLength(f.c, f.file, memory)) |fixed| if (fixed <= std.math.maxInt(Coef)) return .{ s, constant(@intCast(fixed)) };
         const d = f.trackedName(memory) orelse return .{ s, null };
-        const key: Key = .{ .length = d };
-        const made = f.known(key) == null;
-        const v = try f.variable(key);
-        return .{ if (made) try f.lengthy(s, v) else s, try single(f.a, v) };
+        return .{ s, try single(f.a, try f.variable(.{ .length = d })) };
     }
 
     /// `m[i]`: the index below the memory's length, checked by a safe build and so held past it.
@@ -1105,7 +1116,7 @@ const Frame = struct {
         if (i.v.lin) |position| if (measured[1]) |length| {
             const low = try atLeast(f.a, position, constant(0));
             const high = try above(f.a, length, position);
-            try f.record(at, .index, (low != null and try entails(f.a, out, low.?)) and (high != null and try entails(f.a, out, high.?)));
+            try f.record(at, .index, (low != null and try f.shows(out, low.?)) and (high != null and try f.shows(out, high.?)));
             out = try assume(f.a, out, low);
             out = try assume(f.a, out, high);
             return f.fresh(out, node, 0);
@@ -1137,14 +1148,14 @@ const Frame = struct {
         const last = if (full.ast.end != .none) end else length;
         if (full.ast.end.unwrap()) |end_node| {
             const fits_end = if (last != null and room != null) try atLeast(f.a, room.?, last.?) else null;
-            try f.record(end_node, .end, fits_end != null and try entails(f.a, out, fits_end.?));
+            try f.record(end_node, .end, fits_end != null and try f.shows(out, fits_end.?));
             out = try assume(f.a, out, fits_end);
             const ordered_bounds = if (start.v.lin != null and last != null) try atLeast(f.a, last.?, start.v.lin.?) else null;
-            try f.record(full.ast.start, .order, ordered_bounds != null and try entails(f.a, out, ordered_bounds.?));
+            try f.record(full.ast.start, .order, ordered_bounds != null and try f.shows(out, ordered_bounds.?));
             out = try assume(f.a, out, ordered_bounds);
         }
         const fits_start = if (start.v.lin != null and room != null) try atLeast(f.a, room.?, start.v.lin.?) else null;
-        try f.record(full.ast.start, .start, fits_start != null and try entails(f.a, out, fits_start.?));
+        try f.record(full.ast.start, .start, fits_start != null and try f.shows(out, fits_start.?));
         out = try assume(f.a, out, fits_start);
         const size: ?Lin = if (last != null and start.v.lin != null) try minus(f.a, last.?, start.v.lin.?) else null;
         return .{ .s = out, .v = .{ .length = size } };
@@ -1172,7 +1183,7 @@ const Frame = struct {
                 };
                 const low = if (bounds.low) |l| try atLeast(f.a, result, constant(l)) else null;
                 const high = if (bounds.high) |h| try atLeast(f.a, constant(h), result) else null;
-                try f.record(node, .arith, low != null and high != null and try entails(f.a, out, low.?) and try entails(f.a, out, high.?));
+                try f.record(node, .arith, low != null and high != null and try f.shows(out, low.?) and try f.shows(out, high.?));
                 out = try assume(f.a, out, low);
                 out = try assume(f.a, out, high);
                 return .{ .s = out, .v = .{ .lin = result } };
@@ -1188,8 +1199,8 @@ const Frame = struct {
                 if (exact != null and int != null) {
                     const bounds = try f.range(int.?, false);
                     if (bounds.low != null and bounds.high != null and
-                        try entails(f.a, out, (try atLeast(f.a, exact.?, constant(bounds.low.?))) orelse return f.fresh(out, node, 0)) and
-                        try entails(f.a, out, (try atLeast(f.a, constant(bounds.high.?), exact.?)) orelse return f.fresh(out, node, 0)))
+                        try f.shows(out, (try atLeast(f.a, exact.?, constant(bounds.low.?))) orelse return f.fresh(out, node, 0)) and
+                        try f.shows(out, (try atLeast(f.a, constant(bounds.high.?), exact.?)) orelse return f.fresh(out, node, 0)))
                         return .{ .s = out, .v = .{ .lin = exact } };
                 }
                 return f.fresh(out, node, 0);
@@ -1198,17 +1209,17 @@ const Frame = struct {
                 if (y) |d| {
                     const positive = try atLeast(f.a, d, constant(1));
                     const negative = try atLeast(f.a, constant(-1), d);
-                    try f.record(divisor, .divisor, (positive != null and try entails(f.a, out, positive.?)) or (negative != null and try entails(f.a, out, negative.?)));
+                    try f.record(divisor, .divisor, (positive != null and try f.shows(out, positive.?)) or (negative != null and try f.shows(out, negative.?)));
                     // An unsigned divisor other than zero is one or more.
-                    if (try entails(f.a, out, (try atLeast(f.a, d, constant(0))).?)) out = try assume(f.a, out, positive);
+                    if (try f.shows(out, (try atLeast(f.a, d, constant(0))).?)) out = try assume(f.a, out, positive);
                 } else try f.record(divisor, .divisor, false);
                 const made = try f.fresh(out, node, 0);
                 out = made.s;
                 const t = made.v.lin orelse return made;
                 const left = x orelse return made;
                 const d = y orelse return made;
-                const left_natural = try entails(f.a, out, (try atLeast(f.a, left, constant(0))).?);
-                const d_positive = try entails(f.a, out, (try atLeast(f.a, d, constant(1))).?);
+                const left_natural = try f.shows(out, (try atLeast(f.a, left, constant(0))).?);
+                const d_positive = try f.shows(out, (try atLeast(f.a, d, constant(1))).?);
                 if (!left_natural or !d_positive) return made;
                 if (op == .mod) {
                     // `0 <= x % d < d`, and at most `x`.
@@ -1232,11 +1243,11 @@ const Frame = struct {
                 out = made.s;
                 const t = made.v.lin orelse return made;
                 const left = x orelse return made;
-                if (!try entails(f.a, out, (try atLeast(f.a, left, constant(0))).?)) return made;
+                if (!try f.shows(out, (try atLeast(f.a, left, constant(0))).?)) return made;
                 // An unsigned shift right or mask is at most what it takes from.
                 out = try assume(f.a, out, try atLeast(f.a, t, constant(0)));
                 out = try assume(f.a, out, try atLeast(f.a, left, t));
-                if (op == .bit_and) if (y) |mask| if (try entails(f.a, out, (try atLeast(f.a, mask, constant(0))).?)) {
+                if (op == .bit_and) if (y) |mask| if (try f.shows(out, (try atLeast(f.a, mask, constant(0))).?)) {
                     out = try assume(f.a, out, try atLeast(f.a, mask, t));
                 };
                 return .{ .s = out, .v = made.v };
@@ -1297,7 +1308,7 @@ const Frame = struct {
             const x = values[0].lin;
             const low = if (x != null and bounds.low != null) try atLeast(f.a, x.?, constant(bounds.low.?)) else null;
             const high = if (x != null and bounds.high != null) try atLeast(f.a, constant(bounds.high.?), x.?) else null;
-            const within_type = low != null and high != null and try entails(f.a, out, low.?) and try entails(f.a, out, high.?);
+            const within_type = low != null and high != null and try f.shows(out, low.?) and try f.shows(out, high.?);
             if (is(which, "@intCast")) {
                 try f.record(node, .cast, within_type);
                 // A safe build checks the conversion: past it the value is within.
@@ -1348,13 +1359,13 @@ const Frame = struct {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try f.cond(s, lhs);
                 const right = try f.cond(left.yes, rhs);
-                return .{ .yes = right.yes, .no = try join(f.a, left.no, right.no) };
+                return .{ .yes = right.yes, .no = try f.join(left.no, right.no) };
             },
             .bool_or => {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const left = try f.cond(s, lhs);
                 const right = try f.cond(left.no, rhs);
-                return .{ .yes = try join(f.a, left.yes, right.yes), .no = right.no };
+                return .{ .yes = try f.join(left.yes, right.yes), .no = right.no };
             },
             .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -1426,7 +1437,7 @@ const Frame = struct {
             else_out = try f.assign(else_value.s, t[1], else_value.v.lin, null);
             else_out = try f.assign(else_out, tl, else_value.v.length, null);
         }
-        return .{ .s = try join(f.a, then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+        return .{ .s = try f.join(then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
     }
 
     /// The state where an optional or error union held its payload: what the expression's
@@ -1462,7 +1473,7 @@ const Frame = struct {
         const fallback = try f.eval(missing, rhs);
         missing = try f.assign(fallback.s, t[1], fallback.v.lin, null);
         missing = try f.assign(missing, tl, fallback.v.length, null);
-        return .{ .s = try join(f.a, held, missing), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+        return .{ .s = try f.join(held, missing), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
     }
 
     fn switchOn(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
@@ -1497,7 +1508,7 @@ const Frame = struct {
             const e = try f.eval(arm, case.ast.target_expr);
             var done = try f.assign(e.s, t[1], e.v.lin, null);
             done = try f.assign(done, tl, e.v.length, null);
-            joined = try join(f.a, joined, done);
+            joined = try f.join(joined, done);
         }
         return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
     }
@@ -1580,7 +1591,7 @@ const Frame = struct {
         // What the entry gives of the variables no pass assigns holds on every pass: its
         // constraints among them alone (`found0 = 0` where `found0 = found = 0`).
         var invariant = try f.fixedOver(entry, node);
-        for (candidates) |row| if (try entails(f.a, entry, row)) {
+        for (candidates) |row| if (try f.shows(entry, row)) {
             invariant = try assume(f.a, invariant, row);
         };
         const t = try f.temp(invariant, node, 7);
@@ -1594,25 +1605,25 @@ const Frame = struct {
                 f.trial += 1;
                 const pass = try f.passOf(invariant, node, label, t[1], form);
                 f.trial -= 1;
-                if (!try implies(f.a, pass.back, invariant)) invariant = .{};
+                if (!try f.implied(pass.back, invariant)) invariant = .{};
                 break;
             }
             f.trial += 1;
             const pass = try f.passOf(invariant, node, label, t[1], form);
             f.trial -= 1;
-            var next = try preserved(f.a, invariant, pass.back);
+            var next = try f.preservedBy(invariant, pass.back);
             // A candidate the head holds and the pass keeps is kept, though the head held it
             // in a tighter form the pass does not keep (`i < n` on entry, `i <= n` after).
             for (candidates) |row| {
-                if (try entails(f.a, next, row)) continue;
-                if (try entails(f.a, invariant, row) and try entails(f.a, pass.back, row)) next = try assume(f.a, next, row);
+                if (try f.shows(next, row)) continue;
+                if (try f.shows(invariant, row) and try f.shows(pass.back, row)) next = try assume(f.a, next, row);
             }
-            if (try implies(f.a, next, invariant)) break;
+            if (try f.implied(next, invariant)) break;
             invariant = next;
         }
         const final = try f.passOf(invariant, node, label, t[1], form);
         var out = final.exit;
-        for (final.breaks) |state| out = try join(f.a, out, state);
+        for (final.breaks) |state| out = try f.join(out, state);
         return .{ .s = out, .v = .{ .lin = try single(f.a, t[1]) } };
     }
 
@@ -1752,7 +1763,7 @@ const Frame = struct {
         };
         const target = f.targets.pop().?; // unreachable: pushed above
         var back = ran.body;
-        for (target.continues.items) |state| back = try join(f.a, back, state);
+        for (target.continues.items) |state| back = try f.join(back, state);
         if (form == .@"while") back = try f.whileContinue(back, node);
         // One more pass has run.
         const p = try f.variable(.{ .passes = node });
