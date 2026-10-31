@@ -450,7 +450,13 @@ const Key = union(enum) {
     /// A `for` loop's count of passes, as its inputs gave it when the loop was entered: an input
     /// the body shrinks (`s = s[1..]`) does not change how many passes run.
     count: Ast.Node.Index,
+    /// A field of a tracked declaration's struct or of the struct it points to (`self.at`),
+    /// its value and its memory's length (`Frame.placeOf`).
+    place: Place,
+    place_length: Place,
 };
+
+const Place = struct { root: Model.Declaration.Id, field: Facts.Decl };
 
 /// What an expression gives: its integer value and the length of its memory, where they are
 /// linear in what the state knows, and constraints that hold once it is unwrapped (an
@@ -647,7 +653,7 @@ const Frame = struct {
         return switch (space) {
             .slots => v % 2 == 1,
             .frame => switch (f.vars.keys()[v]) {
-                .length, .result_length => true,
+                .length, .result_length, .place_length => true,
                 else => false,
             },
         };
@@ -922,7 +928,9 @@ const Frame = struct {
     /// The state with a tracked declaration given a value: its integer where its type is one,
     /// and the length of its memory.
     fn bind(f: *Frame, s: State, d: Model.Declaration.Id, value: Value, int: ?Range.Int) Error!State {
-        var out = try f.assign(s, try f.variable(.{ .value = d }), if (int != null) value.lin else null, int);
+        // Another struct, or a pointer to another: its fields are not the old ones.
+        var out = try f.forgetPlaces(s, d, null, null);
+        out = try f.assign(out, try f.variable(.{ .value = d }), if (int != null) value.lin else null, int);
         const length = try f.variable(.{ .length = d });
         out = try f.assign(out, length, value.length, null);
         if (value.claimed) try f.claimed.put(f.a, length, {}) else _ = f.claimed.remove(length);
@@ -934,9 +942,10 @@ const Frame = struct {
         const target, const rhs = f.tree.nodeData(node).node_and_node;
         const d = f.trackedName(target) orelse {
             if (try f.lengthStored(target)) |memory| return f.storeLength(s, node, target, rhs, memory);
+            if (try f.placeOf(target)) |p| return f.storePlace(s, node, target, rhs, p);
             // A store to memory: what it reads is evaluated, and no tracked variable changes.
             const place = try f.eval(s, target);
-            return (try f.eval(place.s, rhs)).s;
+            return f.storedThrough((try f.eval(place.s, rhs)).s, target);
         };
         const e = try f.eval(s, rhs);
         const int = try f.intOf(target);
@@ -971,6 +980,98 @@ const Frame = struct {
             .assign_bit_or => .bit_or,
             else => .bit_xor,
         };
+    }
+
+    /// The place `node` names: a field, but `len` and `ptr`, of a tracked declaration's struct
+    /// or of the struct it points to, that only stores through its name change
+    /// (`Range.placeable`): no pointer reaches it, and no byte view or reflection writes it.
+    fn placeOf(f: *Frame, node: Ast.Node.Index) Error!?Place {
+        if (f.tree.nodeTag(node) != .field_access) return null;
+        const holder = f.tree.nodeData(node).node_and_token[0];
+        const root = f.trackedName(holder) orelse return null;
+        const decl = (try f.c.facts.definition(f.file, node)) orelse return null;
+        const member = (try f.c.facts.origin(decl)) orelse decl;
+        if (!try Range.placeable(f.c, member)) return null;
+        return .{ .root = root, .field = member };
+    }
+
+    /// A place's value, within its type, or the length of the memory it holds.
+    fn placeValue(f: *Frame, s: State, node: Ast.Node.Index, p: Place) Error!Eval {
+        var out = s;
+        if (try f.intOf(node)) |int| {
+            const v = try f.variable(.{ .place = p });
+            if (!f.typed_vars.contains(v)) {
+                out = try f.typed(out, v, int);
+                try f.typed_vars.put(f.a, v, {});
+            }
+            return .{ .s = out, .v = .{ .lin = try single(f.a, v) } };
+        }
+        // An array's length is its type's (`knownLength`); a struct or a pointer with no length
+        // holds none.
+        if (!try f.holdsLength(node) or try Range.memoryLength(f.c, f.file, node) != null) return .{ .s = out };
+        const l = try f.variable(.{ .place_length = p });
+        return .{ .s = out, .v = .{ .length = try single(f.a, l), .claimed = f.claimed.contains(l) } };
+    }
+
+    /// `place = rhs`, or `place op= rhs`: the place takes the value; the same field of
+    /// another struct, which this one may be through another pointer, is no longer known.
+    fn storePlace(f: *Frame, s: State, node: Ast.Node.Index, target: Ast.Node.Index, rhs: Ast.Node.Index, p: Place) RunError!State {
+        const tag = f.tree.nodeTag(node);
+        const e = try f.eval(s, rhs);
+        const out = try f.forgetPlaces(e.s, null, p.field, p.root);
+        const int = try f.intOf(target);
+        if (tag == .assign) {
+            if (int != null) return f.assign(out, try f.variable(.{ .place = p }), e.v.lin, int);
+            if (!try f.holdsLength(target) or try Range.memoryLength(f.c, f.file, target) != null) return out;
+            const l = try f.variable(.{ .place_length = p });
+            if (e.v.claimed) try f.claimed.put(f.a, l, {}) else _ = f.claimed.remove(l);
+            return f.assign(out, l, e.v.length, null);
+        }
+        const current = try f.placeValue(out, target, p);
+        const result = try f.arith(current.s, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
+        return f.assign(result.s, try f.variable(.{ .place = p }), result.v.lin, int);
+    }
+
+    /// The state past a store to `target`, no place of this function's: the same field of a
+    /// struct a place may be, or, for a value that may hold one (a struct, a union, an unknown),
+    /// every place. A number or a pointer stored into memory writes no place, as no pointer
+    /// reaches a place's field (`placeOf`); `_ = x` stores nothing.
+    fn storedThrough(f: *Frame, s: State, target: Ast.Node.Index) Error!State {
+        switch (f.tree.nodeTag(target)) {
+            .identifier => if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "_")) return s,
+            .field_access => {
+                // A field that does not resolve (`p.at` of an `anytype` `p`) may be any place's.
+                const decl = (try f.c.facts.definition(f.file, target)) orelse return f.forgetPlaces(s, null, null, null);
+                const value = try f.c.facts.resolve(f.file, target);
+                if (value == .scalar or value == .pointer) return f.forgetPlaces(s, null, (try f.c.facts.origin(decl)) orelse decl, null);
+            },
+            // `@field(x, "at") = v`: a field by a name read as the program compiles.
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.forgetPlaces(s, null, null, null),
+            else => {},
+        }
+        return switch (try f.c.facts.resolve(f.file, target)) {
+            .scalar, .pointer => s,
+            else => f.forgetPlaces(s, null, null, null),
+        };
+    }
+
+    /// The state with nothing known of the places of `root` (any root where null), of the field
+    /// `member` (any where null), but those of `except`.
+    fn forgetPlaces(f: *Frame, s: State, root: ?Model.Declaration.Id, member: ?Facts.Decl, except: ?Model.Declaration.Id) Error!State {
+        var out = s;
+        for (f.vars.keys(), f.vars.values()) |key, v| {
+            const p = switch (key) {
+                .place, .place_length => |p| p,
+                else => continue,
+            };
+            if (root) |r| if (p.root != r) continue;
+            if (member) |d| if (!std.meta.eql(p.field, d)) continue;
+            if (except) |r| if (p.root == r) continue;
+            out = try forget(f.a, out, v);
+            _ = f.typed_vars.remove(v);
+            _ = f.claimed.remove(v);
+        }
+        return out;
     }
 
     fn destructure(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
@@ -1141,7 +1242,8 @@ const Frame = struct {
                 else => {},
             }
         }
-        return f.fresh(s, node, 0);
+        // What it does is not read: it may call or store into any place.
+        return f.fresh(try f.forgetPlaces(s, null, null, null), node, 0);
     }
 
     /// A fresh variable for what `node` gives, within its integer type where it has one.
@@ -1176,7 +1278,10 @@ const Frame = struct {
         const holder, const field_token = f.tree.nodeData(node).node_and_token;
         const e = try f.eval(s, holder);
         // `len` is a slice's or an array's length; a struct's own field of that name is a field.
-        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder)) return f.fresh(e.s, node, 0);
+        if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder)) {
+            if (try f.placeOf(node)) |p| return f.placeValue(e.s, node, p);
+            return f.fresh(e.s, node, 0);
+        }
         const measured = try f.lengthOf(e.s, holder, e.v);
         return .{ .s = measured[0], .v = .{ .lin = measured[1] } };
     }
@@ -1381,7 +1486,18 @@ const Frame = struct {
         return .{ .low = 0, .high = (@as(Coef, 1) << @intCast(bits)) - 1 };
     }
 
+    /// A builtin call; one that writes through a pointer it is given (`@memcpy`, an atomic
+    /// store) leaves nothing known of any place.
     fn builtin(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const made = try f.builtinValue(s, node);
+        const which = f.tree.tokenSlice(f.tree.nodeMainToken(node));
+        for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |writes| if (std.mem.eql(u8, which, writes)) {
+            return .{ .s = try f.forgetPlaces(made.s, null, null, null), .v = made.v };
+        };
+        return made;
+    }
+
+    fn builtinValue(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         const tree = f.tree;
         const which = tree.tokenSlice(tree.nodeMainToken(node));
         var buffer: [2]Ast.Node.Index = undefined;
@@ -2036,7 +2152,16 @@ const Frame = struct {
 
     /// A call: its arguments evaluated in order, and where it reaches one function of the
     /// program, that function's summary on the path where it returns a value.
+    /// A call: what its callee's summary gives, and, unless it cannot write the program's
+    /// memory (`Range.inert`), nothing known of any place after it.
     fn call(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const made = try f.bySummary(s, node);
+        if (try Range.inert(f.c, f.file, node)) return made;
+        return .{ .s = try f.forgetPlaces(made.s, null, null, null), .v = made.v };
+    }
+
+    /// What a call gives by its callee's summary, each argument read as it was before the call.
+    fn bySummary(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         var buffer: [1]Ast.Node.Index = undefined;
         const full = f.tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
         var out = s;
@@ -2050,22 +2175,24 @@ const Frame = struct {
                     const measured = try f.lengthOf(out, holder, e.v);
                     out = measured[0];
                     receiver = .{ .lin = e.v.lin, .length = measured[1] };
+                    out = try f.heldAtCall(out, node, 2, &receiver.?);
                 },
                 else => {},
             }
         }
         var args: std.ArrayList(Value) = .empty;
         if (receiver) |r| try args.append(f.a, r);
-        for (full.ast.params) |param| {
+        for (full.ast.params, 0..) |param, i| {
             const e = try f.eval(out, param);
             out = e.s;
-            if (e.v.lin != null) {
-                try args.append(f.a, .{ .lin = e.v.lin });
-                continue;
+            var arg: Value = .{ .lin = e.v.lin };
+            if (e.v.lin == null) {
+                const measured = try f.lengthOf(out, param, e.v);
+                out = measured[0];
+                arg = .{ .length = measured[1] };
             }
-            const measured = try f.lengthOf(out, param, e.v);
-            out = measured[0];
-            try args.append(f.a, .{ .length = measured[1] });
+            if (i < 120) out = try f.heldAtCall(out, node, @intCast(4 + 2 * i), &arg);
+            try args.append(f.a, arg);
         }
         const made = try f.fresh(out, node, 0);
         out = made.s;
@@ -2094,6 +2221,27 @@ const Frame = struct {
         if (summary.fails) return .{ .s = out, .v = value };
         // A callee that cannot fail returns where it succeeds.
         return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
+    }
+
+    /// `value`, where it reads a place, held in the call's own temporaries (`part`, `part + 1`):
+    /// the callee may store into the place, and what its summary says is of the value it was
+    /// given.
+    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, part: u8, value: *Value) Error!State {
+        var out = s;
+        inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(value, part_name)) |lin| if (f.readsPlace(lin)) {
+            const t = try f.temp(out, node, part + @as(u8, k));
+            out = try f.equal(t[0], t[1], lin);
+            @field(value, part_name) = try single(f.a, t[1]);
+        };
+        return out;
+    }
+
+    fn readsPlace(f: *Frame, lin: Lin) bool {
+        for (lin.terms) |term| switch (f.vars.keys()[term.v]) {
+            .place, .place_length => return true,
+            else => {},
+        };
+        return false;
     }
 
     /// The summary of the one function of the program a call reaches, at this pointer width.
