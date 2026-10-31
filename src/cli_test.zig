@@ -338,6 +338,21 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     defer a.free(by_path);
     try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
     try std.testing.expect(std.mem.startsWith(u8, by_path, "aegis pack: on (imported by "));
+    // aegis's sources vendored into the program's own package, with no manifest of their own:
+    // the program's identity, and aegis by what it publishes, on, by its name or another.
+    try tmp.dir.createDirPath(std.testing.io, "app/libs");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build.zig.zon", .data = ".{ .name = .app, .version = \"0.1.0\", .fingerprint = 0x1c0ffee5ca1ab1e, .paths = .{\"\"} }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/renamed.zig", .data = "const safety = @import(\"safety\");\ncomptime {\n    _ = safety;\n}\n" ++ cast });
+    var vendored = try tmp.dir.openDir(std.testing.io, "app/libs", .{});
+    defer vendored.close(std.testing.io);
+    try aegis_sources.writeTree(a, std.testing.io, vendored);
+    for ([_][2][]const u8{ .{ "aegis=app/libs/src/root.zig", "app/uses.zig" }, .{ "safety=app/libs/src/root.zig", "app/renamed.zig" } }) |case| {
+        const in_tree = try runOn(a, &tmp, &.{ "--module", case[0] }, case[1], &status);
+        defer a.free(in_tree);
+        try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
+        try std.testing.expect(std.mem.startsWith(u8, in_tree, "aegis pack: on (imported by "));
+    }
     // A module named aegis that is not aegis: off.
     const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
     defer a.free(other);

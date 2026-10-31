@@ -221,25 +221,32 @@ pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
     return input.fingerprint == library.fingerprint and std.mem.eql(u8, input.package, library.name);
 }
 
-/// The files a module's root is: each file of the known library a file outside it imports,
-/// by the module's name or under another name where it publishes every member the module
-/// requires; and, where the caller states no package for the file, each the project maps the
-/// module's name to. A file of another stated package is not one, whatever it is named or
-/// republishes. Found once per run.
+/// The files a module's root is: each file a file outside the known library imports by the
+/// module's name, where it is the library's own or its package is not stated; and each, under
+/// any name and of any package, that publishes every member the module requires: the library's
+/// own file, its sources vendored into another package's tree, a manifest that names nothing,
+/// a module republishing it. Which files leave the program is the library's identity alone
+/// (`outside`): a module republishing it stays the program's. Found once per run.
 pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
     const key = @intFromPtr(module.members.ptr);
     if (self.module_roots.get(key)) |found| return found;
     var required = false;
     for (module.members) |listed| required = required or listed.required;
     var roots: std.ArrayList(Project.FileId) = .empty;
+    var other: FileSet = .empty;
     for (self.project.imports) |mapping| {
         if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
+        // The library's own import of its parts is no program's import of a module.
+        if (self.knownFile(mapping.from) and self.knownFile(mapping.target)) continue;
         const named = std.mem.eql(u8, mapping.spelling, module.name);
-        if (self.knownFile(mapping.target)) {
-            // The library's own import of its parts is no program's import of a module.
-            if (self.knownFile(mapping.from)) continue;
-            if (!named and !(required and self.project.at(mapping.target).file.status == .parsed and try self.publishes(module, mapping.target))) continue;
-        } else if (!named or self.project.at(mapping.target).input.fingerprint != null) continue;
+        const stated = !self.knownFile(mapping.target) and self.project.at(mapping.target).input.fingerprint != null;
+        if (!named or stated) {
+            if (other.contains(@backingInt(mapping.target))) continue;
+            if (!(required and self.project.at(mapping.target).file.status == .parsed and try self.publishes(module, mapping.target))) {
+                try other.put(self.gpa, @backingInt(mapping.target), {});
+                continue;
+            }
+        }
         try roots.append(self.gpa, mapping.target);
     }
     try self.module_roots.put(self.gpa, key, roots.items);
