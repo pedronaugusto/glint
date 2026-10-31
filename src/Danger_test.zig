@@ -7094,3 +7094,48 @@ test "A010 follows a pointer to where it is kept: a store through a struct's fie
     ;
     try expect(pack.integers, program, 5);
 }
+
+/// The one diagnostic of `rule` a program gives, its message.
+fn onlyMessage(rule: glint.Rule, program: []const u8) ![]u8 {
+    var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    var found: ?[]u8 = null;
+    for (report.diagnostics) |d| if (d.rule == rule) {
+        try std.testing.expect(found == null);
+        found = try std.testing.allocator.dupe(u8, d.message);
+    };
+    return found orelse error.TestExpectedFinding;
+}
+
+test "a flow finding names each read once, and names a call it went through only where the read is inside it" {
+    // A field one read fills, beside another read: each named once, not the field's again.
+    const twice = try onlyMessage(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Graph = struct { buf: [4]u8 = @splat(0), count: u8 = 0 };
+        \\fn load(graph: *Graph, r: *std.Io.Reader) !void {
+        \\    try r.readSliceAll(&graph.buf);
+        \\}
+        \\pub fn f(r: *std.Io.Reader, table: []const u8) !u8 {
+        \\    var graph: Graph = .{};
+        \\    try load(&graph, r);
+        \\    graph.count = try r.takeByte();
+        \\    return table[graph.buf[0] + graph.count];
+        \\}
+    );
+    defer std.testing.allocator.free(twice);
+    try std.testing.expect(std.mem.endsWith(u8, twice, "(input from consumer:4 `r.readSliceAll` and consumer:9 `r.takeByte`)"));
+    // The walk enters `first` and leaves it through its callers to the read in `f`: no call
+    // into `first` holds it.
+    const back = try onlyMessage(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn first(bytes: []const u8) usize { return bytes[0]; }
+        \\pub fn f(gpa: std.mem.Allocator, io: std.Io, table: []const u8) !u8 {
+        \\    const result = try std.process.run(gpa, io, .{});
+        \\    return table[first(result.stdout)];
+        \\}
+    );
+    defer std.testing.allocator.free(back);
+    try std.testing.expect(std.mem.endsWith(u8, back, "(input from consumer:4 `std.process.run`)"));
+}
