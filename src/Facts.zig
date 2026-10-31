@@ -36,9 +36,6 @@ templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
 /// union of their arguments, or null when the function is reachable from outside or taken
 /// other than by a call.
 callers: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
-/// The containers a package's consumers reach by name through public declarations from its
-/// module roots, found once.
-exported: ?std.AutoHashMapUnmanaged(Container, void) = null,
 /// The names some container in the project declares as `comptime` fields, found once.
 comptime_fields: ?std.StringHashMapUnmanaged(void) = null,
 /// The declarations the program dereferences (`p.*`), found per file once.
@@ -191,7 +188,6 @@ pub fn deinit(self: *Facts) void {
     self.publications.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.callers.deinit(self.gpa);
-    if (self.exported) |*set| set.deinit(self.gpa);
     if (self.comptime_fields) |*names| names.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
     self.dereferences_found.deinit(self.gpa);
@@ -692,7 +688,7 @@ pub fn anytypeAt(self: *const Facts, function: Decl, token: Ast.TokenIndex) ?usi
     return null;
 }
 
-fn hasGenericParameter(self: *const Facts, function: Decl) bool {
+pub fn hasGenericParameter(self: *const Facts, function: Decl) bool {
     const t = self.syntaxOf(function.file);
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const proto = t.fullFnProto(&fn_buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
@@ -763,38 +759,64 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
     try self.scalarCasts(function, out);
 }
 
-/// The integers the language makes into a type, or reads out of a value, by the type of
-/// `function`'s generic parameter: `@enumFromInt` and `@fromBackingInt` into a type its result
-/// place writes in terms of one (`@as(@TypeOf(library).Role, ...)`), `@intFromEnum` and
-/// `@backingInt` of a value one gives. Each is the binding's: its type is the bound one's
-/// (`kind = .cast`, `source` the type written, or the value read).
+/// The integers made into a type, or read out of a value, by the type of `function`'s generic
+/// parameter: `@enumFromInt` and `@fromBackingInt` into a type its result place writes in terms
+/// of one (`@as(@TypeOf(library).Role, ...)`); `@intFromEnum`, `@backingInt` and a call of
+/// `raw` (`x.raw()`, `T.raw(x)`, `@call(.auto, T.raw, .{x})`) of a value one gives. Each is
+/// the binding's: its type is the bound one's (`kind = .cast`, `source` the type written, or
+/// the value read).
 fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
     const t = self.syntaxOf(function.file);
     const whole = self.scopeNode(function);
     const first = t.firstToken(whole);
     const last = t.lastToken(whole);
     for (t.nodes.items(.tag), 0..) |tag, i| {
-        switch (tag) {
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
-            else => continue,
-        }
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const at = t.nodeMainToken(node);
         if (at < first or at > last) continue;
-        const name = t.tokenSlice(at);
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = builtinArgs(t, node, &buffer);
-        const source: Ast.Node.Index = if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt"))
-            self.writtenType(function.file, node, 0) orelse continue
-        else if ((std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@backingInt")) and args.len == 1)
-            args[0]
-        else
-            continue;
+        const source: Ast.Node.Index = switch (tag) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
+                const name = t.tokenSlice(at);
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(t, node, &buffer);
+                if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) break :blk self.writtenType(function.file, node, 0) orelse continue;
+                if ((std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@backingInt")) and args.len == 1) break :blk args[0];
+                // `@call(modifier, T.raw, .{x})`: the value it is given.
+                if (std.mem.eql(u8, name, "@call") and args.len == 3) {
+                    var tuple_buffer: [2]Ast.Node.Index = undefined;
+                    const tuple = t.fullArrayInit(&tuple_buffer, args[2]) orelse continue;
+                    if (tuple.ast.elements.len != 1 or !spelledAs(t, args[1], "raw")) continue;
+                    break :blk tuple.ast.elements[0];
+                }
+                continue;
+            },
+            // A scalar's `raw` called on a value a generic parameter gives: `x.raw()`, or
+            // `T.raw(x)` given it.
+            .call_one, .call_one_comma, .call, .call_comma => blk: {
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = t.fullCall(&call_buffer, node).?; // unreachable: the tag is a call's
+                if (!spelledAs(t, call.ast.fn_expr, "raw")) continue;
+                if (call.ast.params.len == 0 and t.nodeTag(call.ast.fn_expr) == .field_access) break :blk t.nodeData(call.ast.fn_expr).node_and_token[0];
+                if (call.ast.params.len == 1) break :blk call.ast.params[0];
+                continue;
+            },
+            else => continue,
+        };
         const position = self.derivedParameter(function, source, 0) orelse continue;
         const site: Key = .{ .file = function.file, .node = node };
         try out.append(self.gpa, .{ .position = position, .site = site, .kind = .cast, .source = .{ .file = function.file, .node = source } });
         try self.cast_sites.put(self.gpa, site, {});
     }
+}
+
+/// Whether `callee` is spelled with the name `name` (`x.raw`, `Index.raw`, `raw`).
+fn spelledAs(t: *const Ast, callee: Ast.Node.Index, name: []const u8) bool {
+    const token = switch (t.nodeTag(callee)) {
+        .field_access => t.nodeData(callee).node_and_token[1],
+        .identifier => t.nodeMainToken(callee),
+        else => return false,
+    };
+    return std.mem.eql(u8, t.tokenSlice(token), name);
 }
 
 /// The type written for the place `node`'s value goes to: `@as`'s, a declaration's, the
@@ -1817,6 +1839,12 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
     };
     if (kept.items.len == 0) return .{ .unknown = .unresolved };
     return self.choose(kept.items);
+}
+
+/// What the member `decl` of `container` holds: a field's value, read with the bindings of
+/// the call that made the container, if any.
+pub fn fieldValue(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
+    return self.memberOf(container, decl);
 }
 
 /// A member of `container`: a field of a container a type function made is of its declared
@@ -3382,16 +3410,17 @@ fn absent(value: Value) bool {
 }
 
 /// The arguments every call of `function` in the project passes at `position`, or null when
-/// the function is used other than by a call, or when a consumer can call it by name.
+/// the function is used other than by a call, or is public. A public function's callers are
+/// never all known: a consumer of the package may call it by name, in a run that need not hold
+/// any file importing the package, and std's or aegis's code may call it by name on a value the
+/// program hands them. Its parameters are each binding's: a judgment of its body that reads them
+/// is recorded per binding (`parameterCopies`) or stays undecided.
 fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]const Value {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
-    if (record.public and try self.exportedFunction(function)) return null;
+    if (record.public) return null;
     const name_token = record.token;
     const name = self.project.at(function.file).file.tree.tokenSlice(name_token);
-    // std's or aegis's code may call it on a value the program hands it: callers no scan of the
-    // program sees.
-    if (record.public and try self.calledOutside(name)) return null;
     var values: std.ArrayList(Value) = .empty;
     for (self.project.sources) |*source| {
         const file = &source.file;
@@ -3471,77 +3500,6 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         }
     }
     return values.items;
-}
-
-/// Whether code outside the program (std's or a known library's) may call a function named
-/// `name` of the program's: a call through a member so spelled, or through `@field` with a name
-/// that is so spelled or computed, on a receiver that does not resolve to a container of its own
-/// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`.
-fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
-    const found = try self.memo(OutsideCalls);
-    if (!found.built) {
-        found.built = true;
-        for (self.project.sources) |*source| {
-            if (source.file.status != .parsed or try self.program(source.id)) continue;
-            const tree = &source.file.tree;
-            for (tree.nodes.items(.tag), 0..) |tag, i| {
-                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                const parent = source.model.node_parents[i] orelse continue;
-                var call_buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&call_buffer, parent) orelse continue;
-                if (call.ast.fn_expr != node) continue;
-                const receiver: Ast.Node.Index, const spelled: []const u8 = switch (tag) {
-                    .field_access => .{ tree.nodeData(node).node_and_token[0], tree.tokenSlice(tree.nodeData(node).node_and_token[1]) },
-                    .builtin_call_two, .builtin_call_two_comma => blk: {
-                        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
-                        var buffer: [2]Ast.Node.Index = undefined;
-                        const args = builtinArgs(tree, node, &buffer);
-                        if (args.len != 2) continue;
-                        if (tree.nodeTag(args[1]) != .string_literal) {
-                            try found.computed.append(self.gpa, .{ .file = source.id, .node = args[0] });
-                            continue;
-                        }
-                        break :blk .{ args[0], tree.tokenSlice(tree.nodeMainToken(args[1])) };
-                    },
-                    else => continue,
-                };
-                const entry = try found.by_name.getOrPut(self.gpa, std.mem.trim(u8, spelled, "\""));
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(self.gpa, .{ .file = source.id, .node = receiver });
-            }
-        }
-    }
-    if (found.verdicts.get(name)) |known| return known;
-    var any = false;
-    const named = if (found.by_name.get(name)) |list| list.items else &.{};
-    for ([_][]const Key{ named, found.computed.items }) |receivers| for (receivers) |receiver| {
-        if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
-        if (any) break;
-    };
-    try found.verdicts.put(self.gpa, name, any);
-    return any;
-}
-const OutsideCalls = struct {
-    built: bool = false,
-    /// Each name called through a member outside the program, with the receivers it is called on.
-    by_name: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
-    /// The receivers of calls through `@field` with a computed name: any name.
-    computed: std.ArrayList(Key) = .empty,
-    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
-};
-
-/// Whether a value may be the program's: it does not resolve, or reaches a container of a
-/// program file.
-fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
-    return switch (value) {
-        .unknown => true,
-        .container, .instance => |c| try self.program(c.file),
-        .pointer, .array, .optional, .error_union => |inner| self.mayBeProgram(inner.*),
-        .alternatives => |each| for (each) |one| {
-            if (try self.mayBeProgram(one)) break true;
-        } else false,
-        else => false,
-    };
 }
 
 /// The arguments `parent` passes when it calls what `node` names: `f(a, b)`, or
@@ -3727,61 +3685,6 @@ fn isTypeQuery(tree: *const Ast, node: Ast.Node.Index) bool {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@TypeOf"),
         else => false,
     };
-}
-
-/// Whether consumers of the package reach `function` by name: it is public and its container
-/// is reached through public declarations from a module root another file imports by name.
-fn exportedFunction(self: *Facts, function: Decl) ResolveError!bool {
-    const model = &self.project.at(function.file).model;
-    var scope = model.declarations[@backingInt(function.index)].scope;
-    while (model.scopes[@backingInt(scope)].kind != .container and model.scopes[@backingInt(scope)].kind != .file) scope = model.scopes[@backingInt(scope)].parent orelse return true;
-    const set = try self.exportedContainers();
-    return set.contains(.{ .file = function.file, .scope = scope });
-}
-
-/// Whether `file` is of the package the run lints: selected, or of a package a selected file is.
-fn linted(self: *const Facts, file: Project.FileId) bool {
-    const input = self.project.at(file).input;
-    if (input.selected) return true;
-    if (input.package.len == 0) return false;
-    for (self.project.sources) |*source| {
-        if (source.input.selected and std.mem.eql(u8, source.input.package, input.package)) return true;
-    }
-    return false;
-}
-
-fn exportedContainers(self: *Facts) ResolveError!*const std.AutoHashMapUnmanaged(Container, void) {
-    if (self.exported) |*set| return set;
-    var set: std.AutoHashMapUnmanaged(Container, void) = .empty;
-    var queue: std.ArrayList(Container) = .empty;
-    // A module root of the package the run lints: a file imported by a module name rather than
-    // a path. A consumer outside this build may call what it exports; a dependency's module is
-    // called by nothing this build does not load.
-    for (self.project.imports) |edge| {
-        if (std.mem.endsWith(u8, edge.spelling, ".zig") or std.mem.eql(u8, edge.spelling, "std") or std.mem.eql(u8, edge.spelling, "builtin")) continue;
-        if (!self.linted(edge.target)) continue;
-        const root = self.rootOf(edge.target);
-        if ((try set.getOrPut(self.gpa, root)).found_existing) continue;
-        try queue.append(self.gpa, root);
-    }
-    var next: usize = 0;
-    while (next < queue.items.len) : (next += 1) {
-        const container = queue.items[next];
-        const model = &self.project.at(container.file).model;
-        for (model.declarations, 0..) |d, i| {
-            if (d.scope != container.scope or !d.public or d.kind != .variable) continue;
-            const value = try self.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
-            const reached = switch (value) {
-                .container, .instance => |c| c,
-                else => continue,
-            };
-            const plain: Container = .{ .file = reached.file, .scope = reached.scope };
-            if ((try set.getOrPut(self.gpa, plain)).found_existing) continue;
-            try queue.append(self.gpa, plain);
-        }
-    }
-    self.exported = set;
-    return &self.exported.?;
 }
 
 pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {

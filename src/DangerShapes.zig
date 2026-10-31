@@ -11,6 +11,7 @@ const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
+const Taint = @import("Taint.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
@@ -37,8 +38,16 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
             },
             else => continue,
         };
-        const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
-        const which = find(resources, held) orelse continue;
+        const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
+            .resource => |which| which,
+            .other => continue,
+            // A generic's parameter: each binding's, judged where it is bound (`bindings`).
+            .generic => continue,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, if (decl.kind == .field) "a field whose type does not resolve may hold a std resource by value" else "a function whose result type does not resolve may return a std resource by value");
+                continue;
+            },
+        };
         if (decl.kind == .function and try views(c, resources, decl)) continue;
         if (decl.kind == .function) {
             if (!looked) {
@@ -60,9 +69,93 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         const first = tree.firstToken(node);
         if (c.inTest(first)) continue;
         const written = field.ast.type_expr.unwrap() orelse continue;
-        const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
-        const which = find(resources, held) orelse continue;
+        const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
+            .resource => |which| which,
+            .other, .generic => continue,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(first), .unresolved, "a tuple's field whose type does not resolve may hold a std resource by value");
+                continue;
+            },
+        };
         try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{paths[which]}));
+    }
+    try bindings(c, rule, resources, &paths);
+}
+
+/// What a value holds by value of the std resources: one of them (`resource`, its index);
+/// none; a type a generic's binding gives (`generic`); or a type that does not resolve. A
+/// pointer borrows; an optional, an error union and an array hold what they wrap; a choice of
+/// types per build holds what any of them holds.
+const Holding = union(enum) { resource: usize, other, generic, unknown };
+
+fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, depth: usize) Context.Error!Holding {
+    if (depth == 16) return .unknown;
+    return switch (value) {
+        .container, .instance => |k| if (find(resources, k)) |which| .{ .resource = which } else .other,
+        .optional, .error_union, .array => |inner| heldBy(c, resources, inner.*, depth + 1),
+        .alternatives => |each| blk: {
+            var found: Holding = .other;
+            for (each) |one| switch (try heldBy(c, resources, one, depth + 1)) {
+                .resource => |which| break :blk .{ .resource = which },
+                .unknown => found = .unknown,
+                .generic => if (found == .other) {
+                    found = .generic;
+                },
+                .other => {},
+            };
+            break :blk found;
+        },
+        .unknown => |why| if (why == .generic) .generic else .unknown,
+        else => .other,
+    };
+}
+
+/// A015 at each binding of a public generic, the consumer's among them: a container a type
+/// function makes (`Box(std.Io.File)`), each of whose fields holds what its type, read with the
+/// call's arguments, holds; and a value a generic function returns of a type its parameters
+/// give. A private generic's fields and result are read from its callers where it is declared;
+/// aegis's own are the owners and borrows this rule asks for.
+fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths: []const []const u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    for (tree.nodes.items(.tag), 0..) |_, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse continue;
+        if (c.inTest(tree.nodeMainToken(node))) continue;
+        const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
+        const function = (try c.facts.origin(callee)) orelse continue;
+        const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
+        if (record.kind != .function or !record.public or !c.facts.hasGenericParameter(function)) continue;
+        // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
+        if (try c.inLibrary(Contract.library, function.file)) continue;
+        const made = try c.facts.resolve(c.file, node);
+        switch (made) {
+            // A type function's container: what each field holds with these arguments.
+            .container => |container| {
+                if (container.made_by == null) continue;
+                for (try Taint.fieldsOf(c, container)) |field| {
+                    const name = c.project.at(field.file).model.declarations[@backingInt(field.index)].name;
+                    switch (try heldBy(c, resources, try c.facts.fieldValue(container, field), 0)) {
+                        .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes field '{s}' of '{s}' hold a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ name, record.name, paths[which] })),
+                        .other, .generic => {},
+                        .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a field this binding makes has a type that does not resolve: it may hold a std resource by value"),
+                    }
+                }
+            },
+            // A generic function's result, where its declared type is a parameter's.
+            else => {
+                const written_tree = &c.project.at(function.file).file.tree;
+                var proto_buffer: [1]Ast.Node.Index = undefined;
+                const proto = written_tree.fullFnProto(&proto_buffer, record.node) orelse continue;
+                const result = proto.ast.return_type.unwrap() orelse continue;
+                if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
+                switch (try heldBy(c, resources, made, 0)) {
+                    .resource => |which| try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value: aegis own.Owned names its one owner and checks it is released once, own.Lent a borrow of another's", .{ record.name, paths[which] })),
+                    .other, .generic => {},
+                    .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
+                }
+            },
+        }
     }
 }
 
