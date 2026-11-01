@@ -86,7 +86,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             runner.config = setting.config;
         };
         // Each file's analysis has its own budget: work a scan of the program did for an
-        // earlier file is kept, and charged to that file.
+        // earlier file is kept, and charged to that file, unless that file's budget ran out.
         runner.facts.remaining = runner.config.fact_budget;
         try runner.config.validate();
         try validateRules(runner.config, definitions);
@@ -166,14 +166,19 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = .unsupported, .detail = detail.written() });
         }
         runner.covered.clearRetainingCapacity();
-        if (runner.facts.remaining == 0) {
-            runner.complete = false;
-            try runner.coverage.append(a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
-        }
+        if (runner.facts.remaining == 0) try runner.exhausted();
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
     return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+}
+
+/// The file's fact budget ran out: the run is incomplete, and what its analysis kept, computed
+/// short of the budget, no later file reads (`Facts.forget`).
+fn exhausted(runner: *Runner) error{OutOfMemory}!void {
+    runner.complete = false;
+    try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .budget_exhausted, .detail = "semantic fact budget exhausted" });
+    runner.facts.forget();
 }
 
 /// Every rule glint has: the core's, this run's own and the aegis pack's, whether or not this

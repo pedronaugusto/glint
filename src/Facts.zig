@@ -447,6 +447,19 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
     };
 }
 
+/// What a file whose budget ran out kept, dropped: its memos and indexes may have been built
+/// short of it (a part that came back unknown(budget)), which its file reports as exhausted but
+/// which would answer a later file as if complete (C1). What `resolve` keeps stays: it keeps
+/// only what was read with budget left, and the sets of assumptions its keys name.
+pub fn forget(self: *Facts) void {
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .settled = self.settled };
+    self.cache = .empty;
+    self.settled = .empty;
+    self.deinit();
+    fresh.active = .empty;
+    self.* = fresh;
+}
+
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     if (self.project.at(file).file.status != .parsed) return .{ .unknown = .invalid_front_end };
     const key: Settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed };
@@ -461,7 +474,8 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     defer self.assumed = outer;
     self.assumed = try self.settle(file, node, outer);
     const value = try self.resolveInner(file, node);
-    try self.cache.put(self.gpa, key, value);
+    // Read with none left, a part of it may have come back unknown(budget): it is not kept.
+    if (self.remaining != 0) try self.cache.put(self.gpa, key, value);
     return value;
 }
 
