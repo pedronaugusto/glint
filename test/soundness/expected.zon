@@ -3,11 +3,15 @@
     .rules = .{
         .{ .rule = "A001", .no_hole = .{ .assignment, .field, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A002", .no_hole = .{ .destructure, .field, .deferred, .inline_loop, .compile_time, .operator, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A003", .no_hole = .{ .destructure, .capture, .field, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        // An owner (a File, Dir, Stream, Server or Child, a struct) is no operand of any arithmetic,
+        // bit or comparison operator: A003's value cannot pass through one.
+        .{ .rule = "A003", .na = .{.operator} },
         .{ .rule = "A004", .no_hole = .{ .field, .deferred, .jump, .compile_time, .operator, .unwrap, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A005", .no_hole = .{ .destructure, .capture, .field, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A006", .no_hole = .{ .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A007", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        // A lock or an atomic cell is no operand of an operator, and an operator makes no type:
+        // A007's value (a sync type held, a raw atomic) cannot pass through one.
+        .{ .rule = "A007", .na = .{.operator} },
         .{ .rule = "A008", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A009", .no_hole = .{ .field, .unwrap, .branch }, .no_twin = .{ .field, .deferred, .jump, .aggregate, .branch } },
         .{ .rule = "A010", .no_hole = .{ .field, .jump, .aggregate, .branch }, .no_twin = .{ .field, .inline_loop, .aggregate, .branch } },
@@ -15,12 +19,14 @@
         .{ .rule = "A012", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A013", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A014", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A015", .no_hole = .{ .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        // An owner held in a field (a File, Dir, Stream, Server or Child, a struct) is no operand
+        // of any arithmetic, bit or comparison operator: A015's value cannot pass through one.
+        .{ .rule = "A015", .na = .{.operator} },
         .{ .rule = "A016", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A017", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        .{ .rule = "A017" },
         .{ .rule = "A018", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A019", .no_hole = .{ .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch } },
-        .{ .rule = "A020", .no_hole = .{ .field, .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .field, .deferred, .conversion, .memory } },
+        .{ .rule = "A020" },
         .{ .rule = "A021", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "Z003", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "Z011", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
@@ -42,5 +48,14 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
+        // warp-fast: A003 reads a copy made through an owner's address (@memcpy) as an alias it does not follow: undecided until Facts.accesses follows the pointer
+        "A003/memory/wf-copy-closed-twice/twin.zig",
+        // warp-fast: A015 reads a field whose address is taken as written through it: owned until Facts.accesses follows the pointer
+        "A015/address/wf-release-through-pointer/twin.zig",
+        "A015/memory/wf-owner-by-memcpy/twin.zig",
+        // warp-fast: A020 does not resolve a call through @field (@field(w, "io").checkCancel()): undecided until Facts.accesses reads @field
+        "A020/field/wf-io-by-field-builtin/twin.zig",
+        // warp-fast, Taint: an input's bytes copied by @memcpy into an integer stay data (a peer's bytes), never a number, so A020 reads the loop as bounded by the program
+        "A020/memory/wf-bound-by-memcpy/hole.zig",
     },
 }

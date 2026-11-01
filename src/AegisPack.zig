@@ -1759,12 +1759,19 @@ fn checkCleanup(c: *Context) Context.Error!void {
     for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup);
     for (model.declarations) |decl| {
         const k = (try acquiredOwner(c, tree, model, decl, true)) orelse continue;
+        // A local's statements follow its declaration (a destructure's, the destructure); an
+        // `if`'s payload's are its branch's.
+        const scope = if (decl.kind == .capture) tree.fullIf(decl.node).?.ast.then_expr else model.scopes[@backingInt(decl.scope)].node; // unreachable: acquiredOwner takes only an `if`'s capture
         var buffer: [2]Ast.Node.Index = undefined;
-        const statements = tree.blockStatements(&buffer, model.scopes[@backingInt(decl.scope)].node) orelse continue;
-        const at = for (statements, 0..) |stmt, i| {
-            if (stmt == decl.node) break i + 1;
+        const statements = tree.blockStatements(&buffer, scope) orelse {
+            try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "an acquisition captured by a branch that is no block; no leak claimed");
+            continue;
+        };
+        const declared = model.parentOf(decl.node);
+        const at = if (decl.kind == .capture) 0 else for (statements, 0..) |stmt, i| {
+            if (stmt == decl.node or (declared != null and stmt == declared.? and tree.nodeTag(stmt) == .assign_destructure)) break i + 1;
         } else continue;
-        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = model.scopes[@backingInt(decl.scope)].node };
+        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = scope };
         switch (try flow.walk(statements[at..], .live)) {
             .paths => |paths| if (paths.falls == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
             .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
@@ -1779,18 +1786,109 @@ fn checkCleanup(c: *Context) Context.Error!void {
 /// leave the acquisition itself. `report`: whether a receiver that does not resolve is reported
 /// undecided, as A003's own.
 fn acquiredOwner(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration, report: bool) Context.Error!?Contract.Kind {
-    if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .block) return null;
+    const init = acquiredFrom(tree, model, decl) orelse return null;
+    var leaves: std.ArrayList(Ast.Node.Index) = .empty;
+    try valueLeaves(c, tree, model, init, &leaves, 0);
+    // Every way the value is made acquires the same kind of owner, or none does: one where
+    // only some do, or kinds differ, may or may not be an owner.
+    var kind: ?Contract.Kind = null;
+    var plain = false;
+    for (leaves.items) |leaf| {
+        const k = (try acquisitionOwner(c, tree, leaf, report)) orelse {
+            plain = true;
+            continue;
+        };
+        if (kind != null and kind.? != k) plain = true;
+        kind = k;
+    }
+    const k = kind orelse return null;
+    if (plain) {
+        if (report) try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "a local made by an acquisition on some of the ways it is made only; no leak claimed");
+        return null;
+    }
+    return k;
+}
+
+/// What a local `decl` holds from its start: a variable's value, a destructure's element of a
+/// literal of as many, an `if`'s payload its condition's. A `while`'s or `for`'s capture, or a
+/// destructure of anything else, is none.
+fn acquiredFrom(tree: *const Ast, model: *const Model, decl: Model.Declaration) ?Ast.Node.Index {
+    switch (decl.kind) {
+        .variable => if (model.scopes[@backingInt(decl.scope)].kind != .block) return null,
+        .capture => {
+            const branch = tree.fullIf(decl.node) orelse return null;
+            if (branch.payload_token == null or branch.error_token == decl.token) return null;
+            return branch.ast.cond_expr;
+        },
+        else => return null,
+    }
     const v = tree.fullVarDecl(decl.node) orelse return null;
-    const init = v.ast.init_node.unwrap() orelse return null;
+    if (v.ast.init_node.unwrap()) |init| return init;
+    const parent = model.parentOf(decl.node) orelse return null;
+    if (tree.nodeTag(parent) != .assign_destructure) return null;
+    const destructure = tree.assignDestructure(parent);
+    const position = std.mem.findScalar(Ast.Node.Index, destructure.ast.variables, decl.node) orelse return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const literal = tree.fullArrayInit(&buffer, destructure.ast.value_expr) orelse return null;
+    if (literal.ast.elements.len != destructure.ast.variables.len) return null;
+    return literal.ast.elements[position];
+}
+
+/// The expressions whose value `node`'s is, through what hands one on whole: `try`, parentheses,
+/// `@as`, both sides of `catch` and `orelse`, an `if`'s or a switch prong's result, a labeled
+/// block's `break`s. One that gives no value (`return`, `unreachable`, a jump) is none.
+fn valueLeaves(c: *Context, tree: *const Ast, model: *const Model, node: Ast.Node.Index, into: *std.ArrayList(Ast.Node.Index), depth: u8) Context.Error!void {
+    if (depth == 16) return into.append(c.allocator, node);
+    const next = depth + 1;
+    switch (tree.nodeTag(node)) {
+        .@"try" => return valueLeaves(c, tree, model, tree.nodeData(node).node, into, next),
+        .grouped_expression => return valueLeaves(c, tree, model, tree.nodeData(node).node_and_token[0], into, next),
+        .@"catch", .@"orelse" => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            try valueLeaves(c, tree, model, lhs, into, next);
+            return valueLeaves(c, tree, model, rhs, into, next);
+        },
+        .@"return", .unreachable_literal, .@"break", .@"continue" => return,
+        .builtin_call_two, .builtin_call_two_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len == 2 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return valueLeaves(c, tree, model, args[1], into, next);
+        },
+        .@"switch", .switch_comma => {
+            for (tree.fullSwitch(node).?.ast.cases) |case| try valueLeaves(c, tree, model, tree.fullSwitchCase(case).?.ast.target_expr, into, next);
+            return;
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            const lbrace = tree.nodeMainToken(node);
+            if (lbrace >= 2 and tree.tokenTag(lbrace - 1) == .colon) {
+                const label = tree.tokenSlice(lbrace - 2);
+                for (tree.nodes.items(.tag), 0..) |tag, i| {
+                    if (tag != .@"break") continue;
+                    const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                    const at = tree.nodeMainToken(jump);
+                    if (at < tree.firstToken(node) or at > tree.lastToken(node)) continue;
+                    const target, const value = tree.nodeData(jump).opt_token_and_opt_node;
+                    if (!std.mem.eql(u8, tree.tokenSlice(target.unwrap() orelse continue), label)) continue;
+                    try valueLeaves(c, tree, model, value.unwrap() orelse continue, into, next);
+                }
+                return;
+            }
+        },
+        else => if (tree.fullIf(node)) |branch| if (branch.ast.else_expr.unwrap()) |otherwise| {
+            try valueLeaves(c, tree, model, branch.ast.then_expr, into, next);
+            return valueLeaves(c, tree, model, otherwise, into, next);
+        },
+    }
+    try into.append(c.allocator, node);
+}
+
+/// The owner a call at `acquisition` gives: a std handle opened raw, an owner's constructor or
+/// an operation that gives one by its name, or the program's function returning one.
+fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, report: bool) Context.Error!?Contract.Kind {
     var call_buffer: [1]Ast.Node.Index = undefined;
-    const acquisition = switch (tree.nodeTag(init)) {
-        .@"try" => tree.nodeData(init).node,
-        .@"catch", .@"orelse" => tree.nodeData(init).node_and_node[0],
-        else => init,
-    };
     const acquired = tree.fullCall(&call_buffer, acquisition) orelse return null;
     // By a function of the generic's type parameter: each binding's, checked at the binding.
-    if (c.facts.madeByParameter(c.file, init) != null) return null;
+    if (c.facts.madeByParameter(c.file, acquisition) != null) return null;
     // A std handle acquired raw (`dir.openFile`): released by its `close`.
     if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
     const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {

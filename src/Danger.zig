@@ -27,7 +27,9 @@ const Ast = std.zig.Ast;
 pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const sync = [_][]const u8{ "Io.Mutex", "Io.RwLock", "Io.Condition", "Io.Semaphore", "atomic.Value", "atomic.Mutex" };
     const message = "{s}: raw synchronization; aegis Guarded, BlockingGuarded, RwGuarded, SpinRwGuarded, Condition, Atomic, Once or Lazy holds the data it guards";
-    const held = try heldUnderOtherNames(c, rule, &sync, try governedHeld(c, rule, &sync, message), message);
+    const spelled = try governedHeld(c, rule, &sync, message);
+    const held = try heldUnderOtherNames(c, rule, &sync, spelled, message);
+    try heldUnspelled(c, rule, &sync, spelled.found, held, message);
     // A futex is a lock or a signal made by hand on a word the program writes as it likes.
     const futex = [_][]const u8{ "Io.futexWait", "Io.futexWaitTimeout", "Io.futexWaitUncancelable", "Io.futexWake" };
     try governed(c, rule, &futex, true, "{s}: a wait or wake on a word the program synchronizes by hand; aegis Atomic, Condition or Once holds the state it signals, Io.Event a signal alone");
@@ -615,6 +617,47 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
         }
     }
     return held.items;
+}
+
+/// A local or a capture that holds a synchronization type by value its declaration never
+/// spells, read by what its value is: a copy of the lock a pointer lends (`var m = p.*`, `p.*.?`),
+/// a destructure's element, a capture by value of each lock a slice lends. One whose type or
+/// value holds a governed name it spells is judged by that name.
+fn heldUnspelled(c: *Context, rule: Rule, paths: []const []const u8, found: []const Governed.Governed, held: []const Ast.TokenIndex, comptime message: []const u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    for (model.declarations, 0..) |decl, d| {
+        switch (decl.kind) {
+            .capture => {},
+            .variable => switch (model.scopes[@backingInt(decl.scope)].kind) {
+                .file, .container => continue,
+                else => {
+                    const variable = tree.fullVarDecl(decl.node) orelse continue;
+                    if (variable.ast.type_node != .none) continue;
+                    if (variable.ast.init_node.unwrap()) |init| if (within(tree, held, init)) continue;
+                },
+            },
+            else => continue,
+        }
+        if (c.inTest(decl.token) or !atRuntime(c, decl.node)) continue;
+        const value = try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) });
+        const index = (try syncHeld(c, found, value)) orelse continue;
+        try c.at(rule, decl.token, try c.allocator.print(message, .{paths[index]}));
+    }
+}
+
+/// `syncType` of what a value holds by value: an instance's type, past arrays, optionals and
+/// error unions, or any alternative that does.
+fn syncHeld(c: *Context, found: []const Governed.Governed, value: Facts.Value) Context.Error!?usize {
+    switch (value) {
+        .instance => |held| return syncType(c, found, .{ .container = held }),
+        .array, .optional, .error_union => |inner| return syncHeld(c, found, inner.*),
+        .alternatives => |each| {
+            for (each) |one| if (try syncHeld(c, found, one)) |index| return index;
+            return null;
+        },
+        else => return null,
+    }
 }
 
 /// Whether every value an expression can give is an enum literal (`.a`, `if (x) .a else .b`, a

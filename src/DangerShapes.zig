@@ -711,7 +711,26 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             }
             return result;
         },
-        else => {},
+        // A copy assigned: to a local, by each read of it; to another field, by each read of
+        // that field of its holder's type; to `_`, nowhere; through anything else, maybe.
+        .assign => {
+            const target, const value = tree.nodeData(parent).node_and_node;
+            if (value != node) return .no;
+            switch (tree.nodeTag(target)) {
+                .identifier => {
+                    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return .no;
+                    const d = (model.reference(target) orelse return .unknown).declaration orelse return .unknown;
+                    return readsReleased(c, file, d, next);
+                },
+                .field_access => {
+                    const receiver, const name = tree.nodeData(target).node_and_token;
+                    const holder = byPointer(try c.facts.resolve(file, receiver)) orelse return .unknown;
+                    return typeReleased(c, holder, tree.tokenSlice(name), next);
+                },
+                else => return .unknown,
+            }
+        },
+        else => if (carrier(tree, model, node)) |whole| return released(c, file, whole, next),
     }
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, parent)) |call| {
@@ -742,6 +761,59 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         return readsReleased(c, file, @fromBackingInt(@intCast(i)), next);
     }
     return .no;
+}
+
+/// The expression whose value is `node`'s whole, where its parent hands it on: a conversion
+/// (`@as`), an `if`'s or a switch prong's result, either side of `orelse` or `catch`, a
+/// labeled `break`'s value (its block or loop).
+fn carrier(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+    const parent = model.parentOf(node) orelse return null;
+    switch (tree.nodeTag(parent)) {
+        .builtin_call_two, .builtin_call_two_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, parent, &buffer);
+            if (args.len != 2 or args[1] != node or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return null;
+            return parent;
+        },
+        .@"orelse", .@"catch" => return parent,
+        .@"break" => {
+            const label, const value = tree.nodeData(parent).opt_token_and_opt_node;
+            if (value.unwrap() != node) return null;
+            return breakTarget(tree, model, parent, label.unwrap() orelse return null);
+        },
+        else => {},
+    }
+    if (tree.fullSwitchCase(parent)) |case| {
+        if (case.ast.target_expr != node) return null;
+        return model.parentOf(parent);
+    }
+    if (tree.fullIf(parent)) |branch| {
+        if (branch.ast.cond_expr == node) return null;
+        return parent;
+    }
+    return null;
+}
+
+/// The labeled block or loop `label` names around the `break` at `jump`.
+fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, label: Ast.TokenIndex) ?Ast.Node.Index {
+    const name = tree.tokenSlice(label);
+    var at = jump;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                const lbrace = tree.nodeMainToken(parent);
+                if (lbrace >= 2 and tree.tokenTag(lbrace - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(lbrace - 2), name)) return parent;
+            },
+            .@"while", .while_simple, .while_cont, .@"for", .for_simple => {
+                var first = tree.firstToken(parent);
+                if (tree.tokenTag(first) == .keyword_inline) first += 1;
+                if (tree.tokenTag(first) == .identifier and tree.tokenTag(first + 1) == .colon and std.mem.eql(u8, tree.tokenSlice(first), name)) return parent;
+            },
+            .fn_decl => return null,
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Whether the field `name` of a struct literal is `released`: the literal a local's value, by
@@ -1074,6 +1146,28 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
             for (full.ast.cases) |case| if (!try viewed(c, resources, file, tree.fullSwitchCase(case).?.ast.target_expr, next, bound)) return false;
             return true;
         },
+        // `@as(T, v)` is `v`.
+        .builtin_call_two, .builtin_call_two_comma => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 2 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return false;
+            return viewed(c, resources, file, args[1], next, bound);
+        },
+        // A labeled block holds what each `break` to it gives.
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            const lbrace = tree.nodeMainToken(node);
+            if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon) return false;
+            var any = false;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .@"break") continue;
+                const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const label, const value = tree.nodeData(jump).opt_token_and_opt_node;
+                if (breakTarget(tree, model, jump, label.unwrap() orelse continue) != node) continue;
+                if (!try viewed(c, resources, file, value.unwrap() orelse return false, next, bound)) return false;
+                any = true;
+            }
+            return any;
+        },
         else => {
             if (tree.fullIf(node)) |branch| {
                 const otherwise = branch.ast.else_expr.unwrap() orelse return false;
@@ -1296,11 +1390,17 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 }
 
 /// A017: an enum state written by two or more functions, switched on, and moved on its own value:
-/// a state machine kept by hand, where nothing says which transitions are allowed. A move is a
-/// write under a switch or a condition on the field (`switch (f.state) { .start => f.state =
-/// .value, ... }`), there or where the function that writes it is called. A kind set where its
-/// value is built or read (a table's layout, a date's kind) is data. A field moved on the records
-/// a loop walks is moved on each of them: a record's states kept by hand all the same.
+/// a state machine kept by hand, where nothing says which transitions are allowed. A field is
+/// read by meaning: a read `x.state` or `@field(x, "state")`, through any holder of the type; a
+/// write by `=`, by its place in a destructure, through its address (`&x.state`, a `|*p|`
+/// capture: it may be written through, `@atomicStore` alike), or by a struct literal of its type
+/// assigned over a value (`x.* = .{ .state = .done }`). A move is a write under a switch or a
+/// condition on the field (`switch (f.state) { .start => f.state = .value, ... }`), or one whose
+/// value reads it (`f.state = if (f.state == .a) .b else f.state`, its integer plus one), there
+/// or where the function that writes it is called; each function that calls a writer writes it
+/// too. A switch on it reads past `orelse`, `.?` and parentheses. A kind set where its value is
+/// built or read (a table's layout, a date's kind) is data. A field moved on the records a loop
+/// walks is moved on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -1311,53 +1411,146 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         if (!isEnum(c, state)) continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
-        var writes: std.ArrayList(Facts.Key) = .empty;
-        var writers: std.ArrayList(Facts.Key) = .empty;
+        var writes: std.ArrayList(StateWrite) = .empty;
         var switched = false;
-        for (try c.facts.memberUses(decl.name)) |use| {
+        for (try fieldUses(c, decl.name)) |use| {
             const use_tree = &c.project.at(use.file).file.tree;
             const use_model = &c.project.at(use.file).model;
-            const receiver = try c.facts.resolve(use.file, use_tree.nodeData(use.node).node_and_token[0]);
-            const owner = byPointer(receiver) orelse continue;
+            const owner = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
             if (owner.file != holder.file or owner.scope != holder.scope) continue;
-            try uses.append(c.allocator, use);
-            const parent = use_model.parentOf(use.node) orelse continue;
-            if (use_tree.nodeTag(parent) == .assign and use_tree.nodeData(parent).node_and_node[0] == use.node) {
-                try writes.append(c.allocator, .{ .file = use.file, .node = parent });
-                const function = enclosingFunction(use_model, use_tree, parent) orelse continue;
-                for (writers.items) |seen| {
-                    if (seen.file == use.file and seen.node == function) break;
-                } else try writers.append(c.allocator, .{ .file = use.file, .node = function });
-            }
-            if (use_tree.fullSwitch(parent)) |s| switched = switched or s.ast.condition == use.node;
+            try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
+            if (stateWritten(use_tree, use_model, use.node)) |write| try writes.append(c.allocator, .{ .file = use.file, .node = write.node, .value = write.value });
+            switched = switched or switchedOn(use_tree, use_model, use.node);
         }
-        if (writers.items.len < 2 or !switched or !try moved(c, uses.items, writes.items)) continue;
+        // A literal of the holder's type assigned over a value writes the field it names.
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .assign) continue;
+            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const value = tree.nodeData(assignment).node_and_node[1];
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullStructInit(&buffer, value) orelse continue;
+            const made = byValue(try c.facts.literalType(c.file, value)) orelse continue;
+            if (made.file != holder.file or made.scope != holder.scope) continue;
+            for (literal.ast.fields) |field| {
+                if (!std.mem.eql(u8, tree.tokenSlice(Model.initName(tree, field) orelse continue), decl.name)) continue;
+                try writes.append(c.allocator, .{ .file = c.file, .node = assignment, .value = field });
+            }
+        }
+        var writers: std.ArrayList(Facts.Key) = .empty;
+        for (writes.items) |write| try writersOf(c, write, &writers, 0);
+        if (writers.items.len < 2 or !switched) continue;
+        switch (try moved(c, uses.items, writes.items)) {
+            .no => continue,
+            .maybe => {
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written through its address, or by a destructure of a value not read, may be moved on its own value");
+                continue;
+            },
+            .yes => {},
+        }
         try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions, moved on its own value and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
     }
 }
 
-/// Whether one of `writes` is a move: under a switch or a condition on the field (one of `uses`),
-/// or in a function a call under one makes.
-fn moved(c: *Context, uses: []const Facts.Key, writes: []const Facts.Key) Context.Error!bool {
-    for (writes) |write| {
-        const tree = &c.project.at(write.file).file.tree;
-        const model = &c.project.at(write.file).model;
-        const function = enclosingFunction(model, tree, write.node) orelse continue;
-        if (conditioned(tree, model, uses, write.file, write.node, function)) return true;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&buffer, function) orelse continue;
-        const name = tree.tokenSlice(proto.name_token orelse continue);
-        for (try c.facts.memberUses(name)) |call| {
-            const callee = try c.facts.resolve(call.file, call.node);
-            if (callee != .function or callee.function.file != write.file) continue;
-            if (model.declarations[@backingInt(callee.function.index)].node != tree.nodeData(function).node_and_node[0]) continue;
-            const call_tree = &c.project.at(call.file).file.tree;
-            const call_model = &c.project.at(call.file).model;
-            const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
-            if (conditioned(call_tree, call_model, uses, call.file, call.node, caller)) return true;
+/// A write of a state field: the node it is made at, and the value it writes where one is read.
+const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, value: ?Ast.Node.Index };
+
+/// How the field read at `node` is written there, if it is: the target of `=` (its value), a
+/// place in a destructure (its element of a literal), its address taken or captured by `|*p|`
+/// (written through it as anything may: no value read).
+fn stateWritten(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?struct { node: Ast.Node.Index, value: ?Ast.Node.Index } {
+    const parent = model.parentOf(node) orelse return null;
+    if (tree.nodeTag(parent) == .address_of or pointerCapture(tree, model, parent, node)) return .{ .node = node, .value = null };
+    switch (tree.nodeTag(parent)) {
+        .assign => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            if (lhs != node) return null;
+            return .{ .node = parent, .value = rhs };
+        },
+        .assign_destructure => {
+            const full = tree.assignDestructure(parent);
+            const position = std.mem.findScalar(Ast.Node.Index, full.ast.variables, node) orelse return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const literal = tree.fullArrayInit(&buffer, full.ast.value_expr) orelse return .{ .node = parent, .value = null };
+            if (literal.ast.elements.len != full.ast.variables.len) return .{ .node = parent, .value = null };
+            return .{ .node = parent, .value = literal.ast.elements[position] };
+        },
+        else => return null,
+    }
+}
+
+/// Whether the field read at `node` is a switch's operand, read past `orelse`'s left side, `.?`,
+/// parentheses and `@as`.
+fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at;
+        switch (tree.nodeTag(parent)) {
+            .unwrap_optional, .grouped_expression => {},
+            .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
+            .builtin_call_two, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return false;
+            },
+            else => return false,
         }
     }
     return false;
+}
+
+/// Adds to `writers` the function a write is made in, and, through calls of the program, each
+/// function that calls one that writes (a setter's callers write it too).
+fn writersOf(c: *Context, write: StateWrite, writers: *std.ArrayList(Facts.Key), depth: u8) Context.Error!void {
+    const tree = &c.project.at(write.file).file.tree;
+    const model = &c.project.at(write.file).model;
+    const function = enclosingFunction(model, tree, write.node) orelse return;
+    for (writers.items) |seen| {
+        if (seen.file == write.file and seen.node == function) return;
+    }
+    try writers.append(c.allocator, .{ .file = write.file, .node = function });
+    if (depth == 4) return;
+    for (try callsOf(c, write.file, function)) |call| try writersOf(c, .{ .file = call.file, .node = call.node, .value = null }, writers, depth + 1);
+}
+
+/// The calls of the program that call the function declared by `function` in `file`.
+fn callsOf(c: *Context, file: Project.FileId, function: Ast.Node.Index) Context.Error![]const Facts.Key {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, function) orelse return &.{};
+    const name = tree.tokenSlice(proto.name_token orelse return &.{});
+    var calls: std.ArrayList(Facts.Key) = .empty;
+    for (try c.facts.memberUses(name)) |call| {
+        const callee = try c.facts.resolve(call.file, call.node);
+        if (callee != .function or callee.function.file != file) continue;
+        if (model.declarations[@backingInt(callee.function.index)].node != tree.nodeData(function).node_and_node[0]) continue;
+        try calls.append(c.allocator, call);
+    }
+    return calls.items;
+}
+
+/// Whether one of `writes` is a move: under a switch or a condition on the field (one of `uses`),
+/// one whose value reads the field, or in a function a call under one makes. A write whose value
+/// is not read (through its address, a destructure of no literal) may be one.
+fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite) Context.Error!enum { no, maybe, yes } {
+    var maybe = false;
+    for (writes) |write| {
+        const tree = &c.project.at(write.file).file.tree;
+        const model = &c.project.at(write.file).model;
+        if (write.value) |value| for (uses) |use| {
+            if (use.file != write.file) continue;
+            const token = tree.nodeMainToken(use.node);
+            if (token >= tree.firstToken(value) and token <= tree.lastToken(value)) return .yes;
+        };
+        const function = enclosingFunction(model, tree, write.node) orelse continue;
+        if (conditioned(tree, model, uses, write.file, write.node, function)) return .yes;
+        for (try callsOf(c, write.file, function)) |call| {
+            const call_tree = &c.project.at(call.file).file.tree;
+            const call_model = &c.project.at(call.file).model;
+            const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
+            if (conditioned(call_tree, call_model, uses, call.file, call.node, caller)) return .yes;
+        }
+        maybe = maybe or write.value == null;
+    }
+    return if (maybe) .maybe else .no;
 }
 
 /// Whether `node` sits in a branch a switch or an `if`/`while` on one of `uses` selects, within
