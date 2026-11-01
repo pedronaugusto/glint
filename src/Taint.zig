@@ -270,6 +270,7 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
         try functionsOf(c, flow, file);
     }
     try parsers(c, flow);
+    try escaped(c, flow);
     try linksOf(c, flow);
     // Every step joins, and each level and set is finite: the rounds end when one changes
     // nothing, however long a chain of calls the fact runs through.
@@ -566,6 +567,27 @@ fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declara
 }
 
 /// The declaration a `var`/`const` node declares.
+/// A function of the program code outside it may call (`Facts.escapes`: std's sort given
+/// `less`, a hash map's context, a spawned thread's worker, an exported name) is called with
+/// values no call of the program shows: each parameter a comptime one does not fix, and each
+/// one's length, may hold the fact at its most.
+fn escaped(c: *Context, flow: *Flow) Context.Error!void {
+    var by_node: std.AutoHashMapUnmanaged(Facts.Key, Model.Declaration.Id) = .empty;
+    var indexed: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty;
+    for (flow.functions.items) |*f| {
+        const model = &c.project.at(f.file).model;
+        if (!(try indexed.getOrPut(c.allocator, f.file)).found_existing) {
+            for (model.declarations, 0..) |decl, d| if (decl.kind == .function) if (model.parentOf(decl.node)) |body| try by_node.put(c.allocator, .{ .file = f.file, .node = body }, @fromBackingInt(@intCast(d)));
+        }
+        const d = by_node.get(.{ .file = f.file, .node = f.node }) orelse continue;
+        if (!try c.facts.handedOut(.{ .file = f.file, .index = d })) continue;
+        for (f.levels, 0..) |*level, slot| {
+            const index = if (slot >= 32 and slot - 32 < f.params.len) slot - 32 else slot;
+            if (f.fixed & bit(index) == 0) level.* = .number;
+        }
+    }
+}
+
 fn declaredAt(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
     for (model.declarations, 0..) |decl, d| if (decl.node == node and decl.kind == .variable) return @fromBackingInt(@intCast(d));
     return null;
@@ -1960,6 +1982,11 @@ const Walk = struct {
         if (tree.nodeTag(node) == .field_access) if (try w.c.facts.definition(f.file, node)) |decl| {
             if ((w.flow.globals.get(decl) orelse .clean) != .clean) if (try w.stored(decl, depth)) |found| return found;
         };
+        // Memory's length holds what was written to it (`s.len = n`), where its contents carry
+        // nothing: the receiver is walked back for the write, whatever it carries itself.
+        if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.lastToken(node)), "len") and try w.c.facts.memoryField(f.file, node) == .memory) {
+            if (try w.from(function, tree.nodeData(node).node_and_token[0], depth + 1)) |found| return found;
+        }
         for (try children(w.c, f.file, node)) |child| {
             if (!try w.carries(function, child)) continue;
             if (try w.from(function, child, depth + 1)) |found| return found;

@@ -4328,6 +4328,13 @@ pub fn escapes(self: *Facts, function: Decl) ResolveError!bool {
     return (try self.callSites(function)) == null;
 }
 
+/// Whether std's or a known library's code, or anyone given the function as a value, may call
+/// `function`: what `escapes` reads but a consumer calling it by its exported name, which hands
+/// it the consumer's own values, as the program's own callers do.
+pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
+    return try self.namedCalls(function) == null;
+}
+
 /// One call of a function the program makes: its arguments, after the receiver a method call
 /// on a value passes first (`holder`).
 const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
@@ -4337,7 +4344,7 @@ const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite
 fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const read = try self.memo(CallSites);
     if (read.map.get(function)) |known_sites| return known_sites;
-    const found = try self.scanCallSites(function, false);
+    const found = try self.scanCallSites(function, .consumers);
     try read.map.put(self.gpa, function, found);
     return found;
 }
@@ -4353,7 +4360,7 @@ const NamedSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty
 fn namedCalls(self: *Facts, function: Decl) ResolveError!?usize {
     const read = try self.memo(NamedSites);
     if (read.map.get(function)) |known| return known;
-    const found: ?usize = if (try self.scanCallSites(function, true)) |sites| sites.len else null;
+    const found: ?usize = if (try self.scanCallSites(function, .program)) |sites| sites.len else null;
     try read.map.put(self.gpa, function, found);
     return found;
 }
@@ -4363,10 +4370,12 @@ pub fn judgedAtBindings(self: *Facts, function: Decl) ResolveError!bool {
     return try self.namedCalls(function) != null;
 }
 
-fn scanCallSites(self: *Facts, function: Decl, by_name: bool) ResolveError!?[]const CallSite {
+/// `callers` says whether a consumer calling a public function by its name is a caller no
+/// scan of the program sees (`consumers`), or one judged in the consumer's own run (`program`).
+fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, program }) ResolveError!?[]const CallSite {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
-    if (record.public and !by_name) return null;
+    if (callers == .consumers and record.public) return null;
     const name_token = record.token;
     const name = self.project.at(function.file).file.tree.tokenSlice(name_token);
     // std's or aegis's code may call it on a value the program hands it: callers no scan of the
@@ -4491,6 +4500,7 @@ fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
     var any = false;
     const named = if (found.by_name.get(name)) |list| list.items else &.{};
     for ([_][]const Key{ named, found.computed.items }) |receivers| for (receivers) |receiver| {
+        if (try self.closedField(receiver)) continue;
         if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
         if (any) break;
     };
@@ -4508,6 +4518,110 @@ const OutsideCalls = struct {
 
 /// Whether a value may be the program's: it does not resolve, or reaches a container of a
 /// program file.
+/// Whether `receiver` is a field of code outside the program whose declared type names none of
+/// its generic's parameters (`lock: std.atomic.Value(bool)` in aegis's `Guarded(T)`): what it
+/// holds is decided there, so never the program's, even where the type itself does not
+/// resolve. A type naming a parameter, a builtin or a name that does not resolve may be.
+fn closedField(self: *Facts, receiver: Key) ResolveError!bool {
+    const tree = &self.project.at(receiver.file).file.tree;
+    if (tree.nodeTag(receiver.node) == .identifier) return self.closedLocal(receiver);
+    if (tree.nodeTag(receiver.node) != .field_access) return false;
+    // A member of a value whose type is closed is that type's, and so closed itself.
+    const decl = (try self.definition(receiver.file, receiver.node)) orelse
+        return self.closedField(.{ .file = receiver.file, .node = tree.nodeData(receiver.node).node_and_token[0] });
+    if (try self.program(decl.file)) return false;
+    const source = self.project.at(decl.file);
+    const record = source.model.declarations[@backingInt(decl.index)];
+    if (record.kind != .field) return false;
+    const field = source.file.tree.fullContainerField(record.node) orelse return false;
+    return closedType(source, field.ast.type_expr.unwrap() orelse return false, 0);
+}
+
+/// Whether `receiver` names a variable or parameter of code outside the program declared with a
+/// closed type (`torn: *std.atomic.Value(usize)`), or a constant whose value is closed. A
+/// parameter of type `type` or `anytype` may be given the program's.
+fn closedLocal(self: *Facts, receiver: Key) ResolveError!bool {
+    if (try self.program(receiver.file)) return false;
+    const source = self.project.at(receiver.file);
+    const tree = &source.file.tree;
+    const ref = source.model.reference(receiver.node) orelse return false;
+    const declared = source.model.declarations[@backingInt(ref.declaration orelse return false)];
+    const type_node = switch (declared.kind) {
+        .parameter => declared.node,
+        .variable => blk: {
+            const variable = tree.fullVarDecl(declared.node) orelse return false;
+            if (variable.ast.type_node.unwrap()) |typed| break :blk typed;
+            // Untyped, it holds what its initializer reads (`&self.slots[i]`): that value's
+            // place, or an expression closed itself.
+            var value = variable.ast.init_node.unwrap() orelse return false;
+            while (true) switch (tree.nodeTag(value)) {
+                .address_of, .deref => value = tree.nodeData(value).node,
+                .array_access => value = tree.nodeData(value).node_and_node[0],
+                .unwrap_optional, .grouped_expression => value = tree.nodeData(value).node_and_token[0],
+                else => break,
+            };
+            return switch (tree.nodeTag(value)) {
+                .identifier, .field_access => self.closedField(.{ .file = receiver.file, .node = value }),
+                else => closedType(source, value, 0),
+            };
+        },
+        .function, .capture, .field => return false,
+    };
+    if (tree.nodeTag(type_node) != .identifier and tree.nodeTag(type_node) != .field_access and tree.nodeTag(type_node) != .call and tree.nodeTag(type_node) != .call_one and tree.nodeTag(type_node) != .ptr_type_aligned and tree.nodeTag(type_node) != .ptr_type and tree.nodeTag(type_node) != .optional_type) return false;
+    if (tree.nodeTag(type_node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_node)), "type")) return false;
+    return closedType(source, type_node, 0);
+}
+
+/// Whether the expression `node` of `source` names no parameter or capture, through the
+/// constants it names (`const C = Context;`), no builtin and nothing that does not resolve.
+fn closedType(source: *const Project.Source, node: Ast.Node.Index, depth: u8) bool {
+    if (depth > 4) return false;
+    const tree = &source.file.tree;
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (tree.nodes.items(.tag), tree.nodes.items(.main_token), 0..) |tag, token, i| {
+        if (token < first or token > last) continue;
+        switch (tag) {
+            .identifier => {
+                // A primitive type (`u32`, `bool`) names nothing of the program's; `type` holds
+                // whatever type it is given, the program's among them.
+                if (std.mem.eql(u8, tree.tokenSlice(token), "type")) return false;
+                if (std.zig.primitives.isPrimitive(tree.tokenSlice(token))) continue;
+                // An enum's bare field (`enum { empty, ready }`) is a name, which the parser
+                // keeps where a tuple field keeps its type.
+                if (enumField(tree, &source.model, @fromBackingInt(@intCast(i)))) continue;
+                const ref = source.model.reference(@fromBackingInt(@intCast(i))) orelse return false;
+                const named = ref.declaration orelse {
+                    if (ref.unknown == .primitive) continue;
+                    return false;
+                };
+                const declared = source.model.declarations[@backingInt(named)];
+                switch (declared.kind) {
+                    .parameter, .capture => return false,
+                    .function, .field => {},
+                    .variable => {
+                        const variable = tree.fullVarDecl(declared.node) orelse return false;
+                        if (!closedType(source, variable.ast.init_node.unwrap() orelse return false, depth + 1)) return false;
+                    },
+                }
+            },
+            // Its own container, and a file it imports by path: std's `@import("root")` is the
+            // program's.
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                const which = tree.tokenSlice(token);
+                if (std.mem.eql(u8, which, "@This")) continue;
+                if (!std.mem.eql(u8, which, "@import")) return false;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(tree, @fromBackingInt(@intCast(i)), &buffer);
+                if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return false;
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "\"root\"")) return false;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
 fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
     return switch (value) {
         .unknown => true,
@@ -5216,11 +5330,60 @@ test "a function handed to code outside the program as a value escapes: its call
     const model = &project.sources[0].model;
     var less: ?Decl = null;
     var twice: ?Decl = null;
+    var entry: ?Decl = null;
     for (model.declarations, 0..) |decl, i| {
         const id: Decl = .{ .file = project.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
         if (std.mem.eql(u8, decl.name, "less")) less = id;
         if (std.mem.eql(u8, decl.name, "twice")) twice = id;
+        if (std.mem.eql(u8, decl.name, "f")) entry = id;
     }
     try std.testing.expect(try facts.escapes(less.?));
     try std.testing.expect(!try facts.escapes(twice.?));
+    // Only `less` is handed out to be called with anything: `f` is called by its name alone.
+    try std.testing.expect(try facts.handedOut(less.?));
+    try std.testing.expect(!try facts.handedOut(entry.?) and !try facts.handedOut(twice.?));
+}
+
+test "a library's call through a field whose type names none of its generic's parameters calls none of the program's functions" {
+    // `lock`'s type does not resolve (a type a generic makes), but the library declares it
+    // with no parameter of its own: its `load` is the library's. `ctx` is the parameter's, and
+    // may be the program's value, whose `hash` the library then calls.
+    const lib =
+        \\pub fn Value(comptime T: type) type {
+        \\    return struct { raw: T, pub fn load(self: @This()) T { return self.raw; } };
+        \\}
+        \\pub fn Guarded(comptime T: type) type {
+        \\    return struct {
+        \\        lock: Value(bool),
+        \\        data: T,
+        \\        pub fn spin(owner: *@This()) bool { return owner.lock.load(); }
+        \\        pub fn peek(owner: *@This()) bool { const held = (&owner.lock); return held.load(); }
+        \\    };
+        \\}
+        \\pub fn Table(comptime Context: type) type {
+        \\    return struct {
+        \\        ctx: Context,
+        \\        pub fn find(self: *@This()) u32 { return self.ctx.hash(); }
+        \\    };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\npub fn load(x: u8) u8 {\n    return x;\n}\npub fn hash(x: u8) u8 {\n    return x;\n}\n" },
+        .{ .name = "lib", .bytes = lib, .selected = false, .package = "lib", .fingerprint = 1 },
+    }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .known = .{ .name = "lib", .fingerprint = 1 } };
+    defer facts.deinit();
+    const model = &project.sources[0].model;
+    var load: ?Decl = null;
+    var hash: ?Decl = null;
+    for (model.declarations, 0..) |decl, i| {
+        const id: Decl = .{ .file = project.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+        if (std.mem.eql(u8, decl.name, "load")) load = id;
+        if (std.mem.eql(u8, decl.name, "hash")) hash = id;
+    }
+    try std.testing.expect(!try facts.handedOut(load.?));
+    try std.testing.expect(try facts.handedOut(hash.?));
 }
