@@ -1511,6 +1511,7 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             return out;
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => return labeled(c, flow, function, node),
+        .while_simple, .while_cont, .@"while", .for_simple, .@"for" => return loopValue(c, flow, function, node),
         // A comparison's truth is what it compares chose: a bool, data, for the facts that take
         // what they decide.
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
@@ -1848,25 +1849,48 @@ fn unrefinedBy(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.
 
 /// A labeled block's value: what its `break`s give it.
 fn labeled(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
-    const f = flow.functions.items[@backingInt(function)];
-    const tree = &c.project.at(f.file).file.tree;
+    const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
     const lbrace = tree.nodeMainToken(node);
     if (lbrace < 2 or tree.tokenTag(lbrace - 1) != .colon) return .{};
-    const label = tree.tokenSlice(lbrace - 2);
+    return breaksTo(c, flow, function, node);
+}
+
+/// A loop's value: which pass ends it is its condition's choice (a `for`'s, its inputs'
+/// lengths), and it gives what a `break` that leaves it gives, or its `else`.
+fn loopValue(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
+    var out = try breaksTo(c, flow, function, node);
+    if (tree.fullWhile(node)) |loop| {
+        out = try out.join(c.allocator, try (try dep(c, flow, function, loop.ast.cond_expr)).ruling(c.allocator, flow.masks));
+        if (loop.ast.else_expr.unwrap()) |e| out = try out.join(c.allocator, try dep(c, flow, function, e));
+    } else if (tree.fullFor(node)) |loop| {
+        for (loop.ast.inputs) |input| {
+            const count = if (tree.nodeTag(input) == .for_range) try composed(c, flow, function, input) else (try dep(c, flow, function, input)).measured();
+            out = try out.join(c.allocator, try count.ruling(c.allocator, flow.masks));
+        }
+        if (loop.ast.else_expr.unwrap()) |e| out = try out.join(c.allocator, try dep(c, flow, function, e));
+    }
+    return out;
+}
+
+/// What the `break`s that leave `target` (a labeled block, a loop) give it, each with the
+/// conditions that choose it.
+fn breaksTo(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const model = &c.project.at(f.file).model;
     var out: Dep = .{};
-    const first = tree.firstToken(node);
-    const last = tree.lastToken(node);
+    const first = tree.firstToken(target);
+    const last = tree.lastToken(target);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
         const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(brk);
         if (token < first or token > last) continue;
-        const target, const value = tree.nodeData(brk).opt_token_and_opt_node;
-        const named = target.unwrap() orelse continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(named), label)) continue;
-        if (value.unwrap()) |v| out = try out.join(c.allocator, try dep(c, flow, function, v));
+        if (jumpTarget(tree, model, brk) != target) continue;
+        if (tree.nodeData(brk).opt_token_and_opt_node[1].unwrap()) |v| out = try out.join(c.allocator, try dep(c, flow, function, v));
         // Which `break` runs is the conditions' choice.
-        out = try out.join(c.allocator, try controlWithin(c, flow, function, brk, node));
+        out = try out.join(c.allocator, try controlWithin(c, flow, function, brk, target));
     }
     return out;
 }
