@@ -82,6 +82,19 @@ const rows = [_]Row{
     .{ .name = "R5 copy", .source = shapes ++ "fn w(p: *const S) S {\n    return p.*;\n}\n", .place = "f", .query = .reads, .expected = &.{"4 read holder"} },
     .{ .name = "R5 twin", .source = shapes ++ "fn w(p: *const T) T {\n    return p.*;\n}\n", .place = "f", .query = .reads, .expected = &.{} },
     .{ .name = "R6 address", .source = "fn w() *const u32 {\n    const x: u32 = 1;\n    return &x;\n}\n", .place = "x", .decl = true, .expected = &.{ "2 init exact", "3 address exact" } },
+    // An address taken reads the place as anything the pointer goes to may.
+    .{ .name = "R6 address read", .source = "fn w() *const u32 {\n    const x: u32 = 1;\n    return &x;\n}\n", .place = "x", .decl = true, .query = .reads, .expected = &.{"3 address exact"} },
+    .{ .name = "R6 member's address", .source = shapes ++ "fn w(s: *S) *u32 {\n    return &s.f;\n}\n", .place = "f", .query = .reads, .expected = &.{"4 address exact through"} },
+    .{ .name = "R6 twin", .source = shapes ++ "fn w(s: *S) *u32 {\n    return &s.g;\n}\n", .place = "f", .query = .reads, .expected = &.{} },
+    .{ .name = "R7 memcpy source", .source = shapes ++ "fn w(d: []S, s: []const S) void {\n    @memcpy(d, s);\n}\n", .place = "f", .query = .reads, .expected = &.{"4 read holder through"} },
+    .{ .name = "R7 twin", .source = shapes ++ "fn w(d: []T, s: []const T) void {\n    @memcpy(d, s);\n}\n", .place = "f", .query = .reads, .expected = &.{} },
+    .{ .name = "R7 memcpy from an address", .source = shapes ++ "fn w(d: *[2]S) void {\n    const v: [2]S = undefined;\n    @memcpy(d, &v);\n}\n", .place = "v", .decl = true, .query = .reads, .expected = &.{ "5 address exact", "5 read exact" } },
+    .{ .name = "R7 atomic load", .source = shapes ++ "fn w(s: *S) u32 {\n    return @atomicLoad(u32, &s.f, .seq_cst);\n}\n", .place = "f", .query = .reads, .expected = &.{ "4 address exact through", "4 read exact through" } },
+    // A view of a parameter's memory (`std.mem.asBytes`) points at what its argument does.
+    .{ .name = "R7 memcpy through a view", .source = "fn bytes(p: anytype) *const [4]u8 {\n    return @ptrCast(p);\n}\nfn w(d: *[4]u8) void {\n    const v: u32 = 1;\n    @memcpy(d, bytes(&v));\n}\n", .place = "v", .decl = true, .query = .reads, .expected = &.{ "6 address exact", "6 read exact" } },
+    .{ .name = "R7 view twin", .source = "const table: [4]u8 = .{ 0, 0, 0, 0 };\nfn bytes(p: anytype) *const [4]u8 {\n    _ = p;\n    return &table;\n}\nfn w(d: *[4]u8) void {\n    const v: u32 = 1;\n    @memcpy(d, bytes(&v));\n}\n", .place = "v", .decl = true, .query = .reads, .expected = &.{"8 address exact"} },
+    .{ .name = "W9 memcpy through a view", .source = "fn bytes(p: anytype) *[4]u8 {\n    return @ptrCast(p);\n}\nfn w(s: *const [4]u8) void {\n    var v: u32 = 1;\n    @memcpy(bytes(&v), s);\n}\n", .place = "v", .decl = true, .expected = &.{ "5 init exact", "6 address exact", "6 set exact" } },
+    .{ .name = "R7 atomic load twin", .source = shapes ++ "fn w(s: *S) u32 {\n    return @atomicLoad(u32, &s.g, .seq_cst);\n}\n", .place = "f", .query = .reads, .expected = &.{} },
 };
 
 fn found(a: std.mem.Allocator, project: *const Project, site: accesses.Site) ![]const u8 {

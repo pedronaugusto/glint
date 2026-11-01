@@ -5254,6 +5254,75 @@ pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.
     return tree.builtinCallParams(buffer, node) orelse &.{};
 }
 
+/// The functions each found a view of (`viewOf`).
+const Views = struct { found: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty };
+
+/// The position of the parameter whose memory every pointer `function` returns points into: a
+/// view of it, as `std.mem.asBytes(ptr)` and `sliceAsBytes(slice)` are. Each `return` gives the
+/// parameter through what keeps the memory it points at (`@ptrCast`, `@alignCast`,
+/// `@constCast`, `@volatileCast`, `@as`, a slice of it, parentheses), or the address of an
+/// empty literal (`&[0]u8{}`), no memory at all. Null where one gives anything else, a bare
+/// `return`, a body the program does not hold: then what it returns is no known view.
+pub fn viewOf(self: *Facts, function: Decl) ResolveError!?usize {
+    const views = try self.memo(Views);
+    if (views.found.get(function)) |kept| return kept;
+    try views.found.put(self.gpa, function, null);
+    const found = try self.findView(function);
+    try views.found.put(self.gpa, function, found);
+    return found;
+}
+
+fn findView(self: *Facts, function: Decl) ResolveError!?usize {
+    const tree = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const whole = self.scopeNode(function);
+    if (tree.nodeTag(whole) != .fn_decl) return null;
+    const body = tree.nodeData(whole).node_and_node[1];
+    var position: ?usize = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < tree.firstToken(body) or token > tree.lastToken(body)) continue;
+        // A return of a function declared inside is that function's own.
+        var parent = model.parentOf(node);
+        while (parent) |p| : (parent = model.parentOf(p)) if (tree.nodeTag(p) == .fn_decl) break;
+        if (parent != whole) continue;
+        var at = tree.nodeData(node).opt_node.unwrap() orelse return null;
+        while (true) switch (tree.nodeTag(at)) {
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .slice_open, .slice, .slice_sentinel => at = tree.fullSlice(at).?.ast.sliced, // unreachable: the tag is a slice's
+            .builtin_call_two, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(at));
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(tree, at, &buffer);
+                const kept = for ([_]struct { []const u8, usize }{ .{ "@ptrCast", 0 }, .{ "@alignCast", 0 }, .{ "@constCast", 0 }, .{ "@volatileCast", 0 }, .{ "@as", 1 } }) |cast| {
+                    if (std.mem.eql(u8, name, cast[0]) and args.len == cast[1] + 1) break args[cast[1]];
+                } else return null;
+                at = kept;
+            },
+            else => break,
+        };
+        if (tree.nodeTag(at) == .address_of and emptyLiteral(tree, tree.nodeData(at).node)) continue;
+        if (tree.nodeTag(at) != .identifier) return null;
+        const named = (model.reference(at) orelse return null).declaration orelse return null;
+        const record = model.declarations[@backingInt(named)];
+        if (record.kind != .parameter or model.scopes[@backingInt(record.scope)].node != whole) return null;
+        const here = self.parameterPosition(function.file, function, record.token) orelse return null;
+        if (position) |other| if (other != here) return null;
+        position = here;
+    }
+    return position;
+}
+
+/// Whether `node` is a literal of no elements or fields: `[0]u8{}`, `.{}`.
+fn emptyLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, node)) |literal| return literal.ast.elements.len == 0;
+    if (tree.fullStructInit(&buffer, node)) |literal| return literal.ast.fields.len == 0;
+    return false;
+}
+
 /// Where the program writes, reads and takes the address of each place: the one index every
 /// analysis asks "where is this written or read" (`Facts.accesses`). A place is a variable, a
 /// parameter or a capture by its declaration, or a container's field in every value of the
@@ -5268,7 +5337,8 @@ pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.
 /// a type from other memory (W10), a pointer handed to a function whose body the program does
 /// not hold (W11), an element store (W12), one in a `defer` or `errdefer` (W13, marked) and `asm`
 /// (W14). Reads: a name (R1), `x.f` (R2), `@field` (R3), a by-value capture (R4), a copy or a
-/// value passed (R5), and `&x` (R6, an address).
+/// value passed (R5), `&x` (R6, an address), and the memory builtins (R7: a copy's source, an
+/// atomic's).
 ///
 /// A site whose place does not resolve is never skipped. A member written on a holder whose type
 /// does not resolve is kept by the member's name, and a query for a field so named gets it
@@ -5514,6 +5584,59 @@ pub const accesses = struct {
         try walk.reads();
         try state.reads.put(facts.gpa, file, index);
         return index;
+    }
+
+    /// The pointer whose memory `pointer` points at, through each call of a view (`viewOf`): the
+    /// argument it is a view of (`std.mem.asBytes(&x)` points at what `&x` does). A call of a
+    /// choice of functions is followed where each is a view of the same argument.
+    pub fn viewed(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!Ast.Node.Index {
+        const tree = &facts.project.at(file).file.tree;
+        var at = pointer;
+        for (0..16) |_| {
+            at = uncast(tree, at);
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&buffer, at) == null) return at;
+            const call = (try calls.at(facts, file, at)) orelse return at;
+            const args = switch (call.args) {
+                .known => |each| each,
+                .unknown => return at,
+            };
+            const viewing = switch (call.callee) {
+                .function => |function| try facts.viewOf(function) orelse return at,
+                .choice => |each| try sameView(facts, each) orelse return at,
+                .any => return at,
+            };
+            if (viewing >= args.len) return at;
+            at = args[viewing];
+        }
+        return at;
+    }
+
+    /// The parameter each of `functions` is a view of, where it is the same one.
+    fn sameView(facts: *Facts, functions: []const Facts.Decl) Error!?usize {
+        var position: ?usize = null;
+        for (functions) |function| {
+            const here = try facts.viewOf(function) orelse return null;
+            if (position) |other| if (other != here) return null;
+            position = here;
+        }
+        return position;
+    }
+
+    /// The place whose memory `pointer` points at, where it names one: through a view, the
+    /// operand of `&x`, or an array a slice is of; null where it points at what no place here
+    /// names (a pointer's own pointee, a call's result).
+    pub fn pointed(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!?Ast.Node.Index {
+        const tree = &facts.project.at(file).file.tree;
+        const at = try viewed(facts, file, pointer);
+        return switch (tree.nodeTag(at)) {
+            .address_of => tree.nodeData(at).node,
+            .slice_open, .slice, .slice_sentinel => {
+                const base = tree.fullSlice(at).?.ast.sliced; // unreachable: the tag is a slice's
+                return if (pointing(try facts.resolve(file, base))) null else base;
+            },
+            else => null,
+        };
     }
 
     const Walk = struct {
@@ -5990,7 +6113,7 @@ pub const accesses = struct {
                 const pointer = if (entry[1].pointer < args.len) args[entry[1].pointer] else return;
                 const value: ?Ast.Node.Index = if (entry[1].value) |k| (if (k < args.len) args[k] else null) else null;
                 if (!try w.wants(pointer)) return;
-                return w.into(w.make(node, pointer, entry[1].kind, value));
+                return w.pointee(w.make(node, pointer, entry[1].kind, value));
             }
             if (std.mem.eql(u8, name, "@ptrCast") or std.mem.eql(u8, name, "@bitCast")) {
                 // A value of the result's type made of other memory's bits; for a pointer, the memory
@@ -6010,12 +6133,12 @@ pub const accesses = struct {
             }
         }
 
-        /// A store at `at` into the memory its target points at, as `target.* = value` stores: the
-        /// pointee's containers, and where the pointer is an address taken or a slice of an array,
-        /// the place it is of, in part.
-        fn into(w: *Walk, at: Site) Error!void {
+        /// An access at `at` of the memory its target points at, as `target.* = value` stores and
+        /// `target.*` reads: the pointee's containers, and where the pointer is an address taken
+        /// or a slice of an array, the place it is of, in part.
+        fn pointee(w: *Walk, at: Site) Error!void {
             const tree = w.syntax();
-            const pointer = at.target.?;
+            const pointer = try viewed(w.facts, w.file, at.target.?);
             var through = at;
             through.through = true;
             if (w.holders()) switch (try w.facts.resolve(w.file, pointer)) {
@@ -6132,7 +6255,11 @@ pub const accesses = struct {
                         try w.member(.{ .file = w.file, .node = node, .target = node, .kind = .read, .part = w.inPath(node), .deferred = deferred(tree, model, node) }, value, try Model.identifier(facts.gpa, tree.tokenSlice(token)));
                         if (!w.inPath(node)) try w.readWhole(node);
                     },
+                    // An address taken reads the place as anything the pointer goes to may, as it
+                    // writes it (`&x.f`, `std.mem.asBytes(&x)`).
+                    .address_of => _ = try w.path(w.make(node, tree.nodeData(node).node, .address, null)),
                     .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                        try w.readBuiltin(node);
                         if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
                         if (try w.written(node)) continue;
                         var buffer: [2]Ast.Node.Index = undefined;
@@ -6153,6 +6280,24 @@ pub const accesses = struct {
             }
         }
 
+        /// What a memory builtin reads through the pointer it is given, as `builtin`'s writers
+        /// write theirs: a copy's source, the memory an atomic loads, replaces or compares.
+        fn readBuiltin(w: *Walk, node: Ast.Node.Index) Error!void {
+            const tree = w.syntax();
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            const readers = [_]struct { []const u8, usize }{
+                .{ "@memcpy", 1 },    .{ "@memmove", 1 },     .{ "@atomicLoad", 1 },
+                .{ "@atomicRmw", 1 }, .{ "@cmpxchgWeak", 1 }, .{ "@cmpxchgStrong", 1 },
+            };
+            for (readers) |entry| {
+                if (!std.mem.eql(u8, name, entry[0])) continue;
+                if (entry[1] >= args.len) return;
+                return w.pointee(w.make(node, args[entry[1]], .read, null));
+            }
+        }
+
         /// Whether `node` is the holder in a longer path: a member's, an element's, a payload's,
         /// `@field`'s.
         fn inPath(w: *const Walk, node: Ast.Node.Index) bool {
@@ -6167,8 +6312,9 @@ pub const accesses = struct {
         }
 
         /// Whether `node` names memory a store writes without reading it: the target of `=` or of
-        /// a destructure, the operand of `&`, or a holder in such a path up to the first pointer.
-        /// A store's other operands, an `op=`'s target and a pointer stored through are read.
+        /// a destructure, the operand of `&` (its address is its site), or a holder in such a path
+        /// up to the first pointer. A store's other operands, an `op=`'s target and a pointer
+        /// stored through are read.
         fn written(w: *Walk, node: Ast.Node.Index) Error!bool {
             const tree = w.syntax();
             var at = node;
