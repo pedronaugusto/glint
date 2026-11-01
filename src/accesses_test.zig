@@ -13,6 +13,8 @@ const Row = struct {
     place: []const u8,
     decl: bool = false,
     query: Query = .writes,
+    /// For a field's writes: whether whole values and outside code's writes are asked for.
+    holders: bool = true,
     /// Each site found, as "line kind reach", with " part", " through", " deferred" as set.
     expected: []const []const u8,
 };
@@ -58,6 +60,18 @@ const rows = [_]Row{
     .{ .name = "literal twin", .source = shapes ++ "fn w() S {\n    return .{ .g = 1 };\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "method receiver", .source = "const S = struct {\n    f: u32,\n    fn bump(self: *S) void {\n        self.f += 1;\n    }\n};\nfn w() void {\n    var s: S = .{ .f = 0 };\n    s.bump();\n}\n", .place = "s", .decl = true, .expected = &.{ "8 init exact", "9 address exact" } },
     .{ .name = "method receiver twin", .source = "const S = struct {\n    f: u32,\n    fn get(self: S) u32 {\n        return self.f;\n    }\n};\nfn w() u32 {\n    var s: S = .{ .f = 0 };\n    return s.get();\n}\n", .place = "s", .decl = true, .expected = &.{"8 init exact"} },
+    // A field query that leaves out whole values (a function pointer's stores) still keeps
+    // each site that may name the field without its spelling.
+    .{ .name = "narrow: spelled", .holders = false, .source = shapes ++ "fn w(s: *S) void {\n    s.f = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set exact through" } },
+    .{ .name = "narrow: other field", .holders = false, .source = shapes ++ "fn w(s: *S) void {\n    s.g = 1;\n}\n", .place = "f", .expected = &.{"1 init exact"} },
+    .{ .name = "narrow: computed @field", .holders = false, .source = shapes ++ "fn w(s: *S, comptime n: []const u8) void {\n    @field(s, n) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set holder part through computed" } },
+    .{ .name = "narrow: @field by a const", .holders = false, .source = shapes ++ "const name = \"f\";\nfn w(s: *S) void {\n    @field(s, name) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "5 set holder part through computed" } },
+    .{ .name = "narrow: anytype holder", .holders = false, .source = shapes ++ "fn w(s: anytype) void {\n    s.f = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set named" } },
+    .{ .name = "narrow: cast", .holders = false, .source = shapes ++ "fn w(b: *[12]u8) *S {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
+    .{ .name = "narrow: asm", .holders = false, .source = shapes ++ "fn w() void {\n    asm volatile (\"\");\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered unresolved" } },
+    .{ .name = "narrow: address", .holders = false, .source = shapes ++ "fn w(s: *S) *u32 {\n    return &s.f;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 address exact through" } },
+    // Left out by design there: a whole value copied, which carries what other stores gave.
+    .{ .name = "narrow: whole store left out", .holders = false, .source = shapes ++ "fn w(s: *S, t: S) void {\n    s.* = t;\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "R1 name", .source = "fn w() u32 {\n    const x: u32 = 1;\n    const z: u32 = 2;\n    _ = z;\n    return x;\n}\n", .place = "x", .decl = true, .query = .reads, .expected = &.{"5 read exact"} },
     .{ .name = "R2 member", .source = shapes ++ "fn w(s: S) u32 {\n    return s.f;\n}\n", .place = "f", .query = .reads, .expected = &.{"4 read exact"} },
     .{ .name = "R2 twin", .source = shapes ++ "fn w(s: S) u32 {\n    return s.g;\n}\n", .place = "f", .query = .reads, .expected = &.{} },
@@ -106,7 +120,7 @@ test "accesses: each construct's probe is found and its twin is not" {
         const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(index)) };
         const place: accesses.Place = if (row.decl) .{ .declaration = decl } else .{ .field = decl };
         const sites = switch (row.query) {
-            .writes => try accesses.writes(&facts, place, &.{file}),
+            .writes => try accesses.writesFor(&facts, place, &.{file}, .{ .holders = row.holders }),
             .reads => try accesses.reads(&facts, place, &.{file}),
         };
         var lines: std.ArrayList([]const u8) = .empty;
