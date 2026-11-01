@@ -911,7 +911,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         if (copy.kind == .cast) {
             // The library's own generics are its safe types' internals.
             if (try c.inLibrary(Contract.library, copy.site.file)) continue;
-            const site = &c.project.at(copy.site.file).file;
+            const site = c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.nodeMainToken(copy.site.node))) + 1;
             switch (try perBuild(c, try instanceOf(c, value))) {
                 .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), try c.allocator.print("this binding makes the integer {s}:{d} makes or reads by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{ c.project.at(copy.site.file).input.name, line })),
@@ -928,7 +928,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             else => value,
         };
         if (copy.kind == .made) {
-            const site = &c.project.at(copy.site.file).file;
+            const site = c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
             switch (try perBuild(c, bound)) {
                 .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
@@ -939,7 +939,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         }
         switch (try copied(c, bound, 0)) {
             .owner => |k| if (copiedOwner(k)) {
-                const site = &c.project.at(copy.site.file).file;
+                const site = c.project.at(copy.site.file).file;
                 const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.at(copy.site.file).input.name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
                 try c.at(copies, tree.nodeMainToken(node), detail);
                 return;

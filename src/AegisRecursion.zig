@@ -94,7 +94,7 @@ fn entry(self: *Walk, start: Facts.Decl, token: Ast.TokenIndex) Context.Error!vo
         // Each by its place and spelling: an unresolved call is settled by giving it a type.
         var names: std.Io.Writer.Allocating = .init(self.c.allocator);
         for (self.unresolved.items, 0..) |one, i| {
-            const file = &self.c.project.at(one.file).file;
+            const file = self.c.project.at(one.file).file;
             const at = file.line(file.tree.tokenStart(file.tree.firstToken(one.call))) + 1;
             var buffer: [1]Ast.Node.Index = undefined;
             const callee = file.tree.getNodeSource(file.tree.fullCall(&buffer, one.call).?.ast.fn_expr);

@@ -1478,7 +1478,7 @@ fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, lev
 /// A call as `file:line `callee``, the callee as written on one line: a chain split over lines
 /// is joined without its breaks.
 fn callSite(c: *Context, at: Taint.Site) Context.Error![]const u8 {
-    const file = &c.project.at(at.file).file;
+    const file = c.project.at(at.file).file;
     var buffer: [1]Ast.Node.Index = undefined;
     const made = file.tree.fullCall(&buffer, at.node).?;
     const line = file.line(file.tree.tokenStart(file.tree.firstToken(at.node))) + 1;

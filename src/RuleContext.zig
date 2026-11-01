@@ -207,7 +207,7 @@ pub fn selected(self: *const RuleContext, selection: []const rules.Rule) bool {
 }
 /// A token of a file, as a finding's related place.
 pub fn spanOf(self: *const RuleContext, file: Project.FileId, token: std.zig.Ast.TokenIndex) Report.Span {
-    const held = &self.project.at(file).file;
+    const held = self.project.at(file).file;
     const named = held.tree.tokenToSpan(token);
     const line = held.line(named.start);
     return .{ .file = file, .start = named.start, .end = named.end, .line = line + 1, .column = held.column(named.start) };

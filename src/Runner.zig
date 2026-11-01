@@ -86,7 +86,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         runner.facts.remaining = runner.config.fact_budget;
         try runner.config.validate();
         try validateRules(runner.config, definitions);
-        const file = &source.file;
+        const file = source.file;
         var malformed: std.ArrayList(Suppression.Malformed) = .empty;
         runner.suppressions = try Suppression.parseConfigured(a, file, known, &malformed);
         for (malformed.items) |entry| {
@@ -204,7 +204,7 @@ fn diagnosticLess(project: *const Project, lhs: Report.Diagnostic, rhs: Report.D
 
 fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: []const u8, related: []const Report.Span, fix: []const Report.Edit) Context.Error!void {
     if (!self.config.has(rule)) return;
-    const file = &self.project.at(self.file).file;
+    const file = self.project.at(self.file).file;
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = file.column(start) };

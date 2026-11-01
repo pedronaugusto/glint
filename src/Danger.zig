@@ -427,7 +427,7 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
 fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const file = &c.project.at(c.file).file;
+    const file = c.project.at(c.file).file;
     var after_std: u32 = 0;
     for (model.declarations) |decl| {
         if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .file) continue;

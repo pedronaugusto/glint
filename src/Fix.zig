@@ -111,13 +111,13 @@ pub fn apply(a: std.mem.Allocator, project: *const Project, report: *const Repor
     }
     for (report.stale) |stale| {
         if (!std.mem.eql(u8, stale.name, "aegis")) continue;
-        const file = &project.at(stale.span.file).file;
+        const file = project.at(stale.span.file).file;
         const entry = try by_file.getOrPut(a, stale.span.file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         try entry.value_ptr.append(a, removal(file, stale.span.start, stale.span.end) orelse return error.InvalidEdit);
     }
     for (report.malformed) |entry| {
-        const file = &project.at(entry.span.file).file;
+        const file = project.at(entry.span.file).file;
         const edit = (try oldSuppression(a, file, entry.span.start, entry.span.end)) orelse (try unnamedEscape(a, project, report, entry.span, options.escapes_before)) orelse continue;
         const slot = try by_file.getOrPut(a, entry.span.file);
         if (!slot.found_existing) slot.value_ptr.* = .empty;
@@ -178,7 +178,7 @@ fn spanned(file: *const File, start: u32, end: u32) ?[]const u8 {
 /// with none of today's rules, is left for its owner to name. One that covers nothing goes as a
 /// stale escape instead.
 fn unnamedEscape(a: std.mem.Allocator, project: *const Project, report: *const Report, span: Report.Span, before: []const Escaped) std.mem.Allocator.Error!?Report.Edit {
-    const file = &project.at(span.file).file;
+    const file = project.at(span.file).file;
     const text = spanned(file, span.start, span.end) orelse return null;
     if (!std.mem.startsWith(u8, text, "// aegis:")) return null;
     for (report.escapes) |escape| {

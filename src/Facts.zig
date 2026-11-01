@@ -598,7 +598,7 @@ fn findCopies(self: *Facts) ResolveError!void {
     const std_files = &(try self.outside()).std_files;
     var functions: std.ArrayList(Decl) = .empty;
     for (self.project.sources) |*source| {
-        const file = &source.file;
+        const file = source.file;
         const model = &source.model;
         const id = source.id;
         if (file.status != .parsed or std_files.contains(@backingInt(id))) continue;
@@ -4374,7 +4374,7 @@ fn scanCallSites(self: *Facts, function: Decl, by_name: bool) ResolveError!?[]co
     if (record.public and try self.calledOutside(name)) return null;
     var sites: std.ArrayList(CallSite) = .empty;
     for (self.project.sources) |*source| {
-        const file = &source.file;
+        const file = source.file;
         const file_model = &source.model;
         if (file.status != .parsed) continue;
         // A private function is used in its own file only; a file outside the package
@@ -4648,7 +4648,7 @@ fn comptimeField(self: *Facts, name: []const u8) ResolveError!bool {
     if (self.comptime_fields == null) {
         var names: std.StringHashMapUnmanaged(void) = .empty;
         for (self.project.sources) |*source| {
-            const file = &source.file;
+            const file = source.file;
             const model = &source.model;
             if (file.status != .parsed) continue;
             for (model.declarations) |d| {

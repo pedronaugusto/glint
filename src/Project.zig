@@ -14,11 +14,13 @@ sources: []Source,
 imports: []const Edge,
 /// Private: distinguishes handles from separate snapshots, even at the same index.
 identity: u64,
+/// Private: the store this project made for itself when its caller gave none.
+own: ?*Store,
 
 /// One source: its front end, its model (which refers only to this immutable file), and the
 /// input it was made from.
 pub const Source = struct {
-    file: File,
+    file: *const File,
     model: Model,
     input: Input,
     id: Id,
@@ -71,6 +73,57 @@ pub const Options = struct {
     /// lowered: a canceled build is `Canceled`. Null: none is asked, and a
     /// canceller waits for every file.
     io: ?std.Io = null,
+    /// Where the files are read: a store several projects share reads each file once, std's
+    /// among them. Null: the project reads its own.
+    store: ?*Store = null,
+};
+
+/// Files read once and shared by every project made with this store: what a file means on its
+/// own, its bytes, tree, ZIR and per-file model, kept by its bytes and the limits and lowering
+/// it was read under. Nothing a program's other files decide is kept here: what the analyses
+/// find of a program is each run's own. The caller owns it, and it outlives every project made
+/// with it; one thread uses it at a time.
+pub const Store = struct {
+    gpa: std.mem.Allocator,
+    entries: std.AutoHashMapUnmanaged(u64, std.ArrayList(*Entry)) = .empty,
+
+    const Entry = struct { file: File, model: Model, limits: File.Limits, lowering: bool };
+
+    pub fn init(gpa: std.mem.Allocator) Store {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Store) void {
+        var each = self.entries.valueIterator();
+        while (each.next()) |list| {
+            for (list.items) |entry| {
+                entry.file.deinit();
+                self.gpa.destroy(entry);
+            }
+            list.deinit(self.gpa);
+        }
+        self.entries.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// The file `bytes` are, read under `limits`: the one this store read before from the same
+    /// bytes so, or one read now.
+    fn read(self: *Store, bytes: []const u8, limits: File.Limits, lowering: bool) (File.InitError || Model.InitError)!*const Entry {
+        const found = try self.entries.getOrPut(self.gpa, std.hash.Wyhash.hash(0, bytes));
+        if (!found.found_existing) found.value_ptr.* = .empty;
+        for (found.value_ptr.items) |entry| {
+            if (entry.lowering == lowering and std.meta.eql(entry.limits, limits) and std.mem.eql(u8, entry.file.source, bytes)) return entry;
+        }
+        const entry = try self.gpa.create(Entry);
+        errdefer self.gpa.destroy(entry);
+        entry.file = try File.initWithLowering(self.gpa, bytes, limits, lowering);
+        errdefer entry.file.deinit();
+        entry.model = try Model.init(&entry.file);
+        entry.limits = limits;
+        entry.lowering = lowering;
+        try found.value_ptr.append(self.gpa, entry);
+        return entry;
+    }
 };
 /// Construction errors always propagate; no unread/allocation failure is clean.
 pub const InitError = File.InitError || Model.InitError || std.Io.Cancelable || error{ InvalidMapping, DuplicateMapping, ProjectBudgetExceeded, SnapshotLimit };
@@ -87,15 +140,17 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
+    const own: ?*Store = if (options.store == null) try a.create(Store) else null;
+    if (own) |store| store.* = .init(gpa);
+    errdefer if (own) |store| store.deinit();
+    const store = options.store orelse own.?;
     const sources = try a.alloc(Source, inputs.len);
-    var initialized: usize = 0;
-    errdefer for (sources[0..initialized]) |*each| each.file.deinit();
     for (sources, inputs, 0..) |*each, input, index| {
         if (options.io) |io| try io.checkCancel();
         each.id = @fromBackingInt(@intCast(index));
-        each.file = try File.initWithLowering(gpa, input.bytes, options.limits, options.lowering);
-        initialized += 1;
-        each.model = try Model.init(&each.file);
+        const entry = try store.read(input.bytes, options.limits, options.lowering);
+        each.file = &entry.file;
+        each.model = entry.model;
         each.input = input;
         each.input.bytes = each.file.source;
         each.input.name = try a.dupe(u8, input.name);
@@ -112,12 +167,12 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
     }
     const identity = try nextIdentity();
-    return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity };
+    return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity, .own = own };
 }
 
-/// Releases all owned source/front-end/model storage.
+/// Releases all owned source/front-end/model storage; a store the caller gave stays.
 pub fn deinit(self: *Project) void {
-    for (self.sources) |*each| each.file.deinit();
+    if (self.own) |store| store.deinit();
     self.arena.deinit();
     self.* = undefined;
 }
@@ -198,7 +253,7 @@ pub fn syntax(self: *const Project, h: Handle) QueryError!*const std.zig.Ast {
 }
 /// Frozen std ZIR, absent when parsing failed.
 pub fn lowered(self: *const Project, h: Handle) QueryError!?*const std.zig.Zir {
-    const file = &(try self.checked(h)).file;
+    const file = (try self.checked(h)).file;
     return if (file.zir) |*zir| zir else null;
 }
 /// Honest front-end status, independent of selected rules.

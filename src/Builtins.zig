@@ -30,7 +30,7 @@ pub fn check(context: *Context) RunError!void {
 
 fn parser(self: *Context) RunError!void {
     if (!self.config.has(.Z003)) return;
-    const file = &self.project.at(self.file).file;
+    const file = self.project.at(self.file).file;
     for (file.tree.errors) |err| {
         if (err.is_note) continue;
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -345,7 +345,7 @@ fn standardContainer(self: *Context, root: Facts.Container, path_parts: []const 
 }
 
 fn lineLength(self: *Context) RunError!void {
-    const file = &self.project.at(self.file).file;
+    const file = self.project.at(self.file).file;
     if (self.config.has(.Z024)) for (file.lines, 0..) |_, l| {
         const line = file.lineBytes(l);
         if (line.text.len <= self.config.max_line_length) continue;
@@ -447,7 +447,7 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
     if (model.scopes[@backingInt(decl.scope)].kind != .container and model.scopes[@backingInt(decl.scope)].kind != .file) return false;
     if (!try genericReads(self, name)) return false;
     for (self.project.sources) |*each| {
-        const file = &each.file;
+        const file = each.file;
         const other = &each.model;
         const input = each.input;
         if (input.selected or file.status != .parsed) continue;
@@ -463,7 +463,7 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
 /// `type` (comptime by necessity) or `anytype`.
 fn genericReads(self: *Context, name: []const u8) RunError!bool {
     for (self.project.sources) |*each| {
-        const file = &each.file;
+        const file = each.file;
         const model = &each.model;
         const input = each.input;
         if (!input.selected or file.status != .parsed) continue;
@@ -543,7 +543,7 @@ fn sourcePolicies(self: *Context) RunError!void {
 }
 fn functionLengths(self: *Context) RunError!void {
     if (!self.config.has(.P003)) return;
-    const file = &self.project.at(self.file).file;
+    const file = self.project.at(self.file).file;
     const tree = &file.tree;
     const used = try self.allocator.alloc(bool, self.config.function_exceptions.len);
     @memset(used, false);

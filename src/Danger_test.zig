@@ -1725,6 +1725,49 @@ test "A019 follows a pointer an interface's file stores in a field past reads of
     try std.testing.expectEqualSlices(u32, &.{ 13, 13 }, any.lines[0..any.findings]);
 }
 
+test "projects sharing a store each get their own whole-program answers: a file read once is judged by the program around it" {
+    // lib.zig's conversion (13) holds where the program uses its interface in place, and not
+    // where the program reads its vtable out into another; both read lib.zig from one store,
+    // in each order.
+    const lib =
+        \\pub const Observer = struct {
+        \\    vtable: *const VTable,
+        \\    pub const VTable = struct { see: *const fn (*Observer, u32) void };
+        \\    pub fn see(o: *Observer, n: u32) void {
+        \\        o.vtable.see(o, n);
+        \\    }
+        \\};
+        \\pub const Counter = struct {
+        \\    total: u32 = 0,
+        \\    observer: Observer = .{ .vtable = &vtable },
+        \\    const vtable: Observer.VTable = .{ .see = see };
+        \\    fn see(o: *Observer, n: u32) void {
+        \\        const self: *Counter = @alignCast(@fieldParentPtr("observer", o));
+        \\        self.total += n;
+        \\    }
+        \\};
+        \\
+    ;
+    const in_place = "const lib = @import(\"lib.zig\");\npub fn run() u32 {\n    var c: lib.Counter = .{};\n    c.total = 1;\n    c.observer.see(3);\n    return c.total;\n}\n";
+    const read_out = "const lib = @import(\"lib.zig\");\npub fn run() u32 {\n    var c: lib.Counter = .{};\n    c.total = 1;\n    var spare: lib.Observer = .{ .vtable = c.observer.vtable };\n    spare.see(3);\n    return c.total;\n}\n";
+    var store: glint.Project.Store = .init(std.testing.allocator);
+    defer store.deinit();
+    for ([_][2][]const u8{ .{ in_place, read_out }, .{ read_out, in_place } }) |order| for (order) |program| {
+        const inputs = [_]glint.Project.Input{ .{ .name = "lib.zig", .bytes = lib }, .{ .name = "main.zig", .bytes = program } };
+        var project = try glint.Project.init(std.testing.allocator, &inputs, &.{.{ .from = 1, .spelling = "lib.zig", .target = 0 }}, .{ .store = &store });
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.unsafe_set, .level = .report }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        var conversions: usize = 0;
+        for (report.diagnostics) |d| if (d.rule == pack.unsafe_set and d.span.file == try project.fileAt(0) and d.span.line == 13) {
+            conversions += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (program.ptr == read_out.ptr) 2 else 0), conversions);
+    };
+    // One read of each file served all four projects.
+    try std.testing.expectEqual(@as(usize, 3), store.entries.count());
+}
+
 /// `program`'s findings of `rule` at report level, the only file the project loads.
 fn runAlone(rule: glint.Rule, program: []const u8) !Run {
     const inputs = [_]glint.Project.Input{.{ .name = "alone.zig", .bytes = program }};
