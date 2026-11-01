@@ -1,0 +1,42 @@
+.{
+    .open = .{
+        // matrix: a borrowed key pair copied by `.*`; a key is found only where its type is spelled
+        "address/mx-a08-05_deref_copy/hole.zig",
+        // matrix: a borrowed key pair's secret_key read out by value; a key is found only where its type is spelled
+        "address/mx-a08-05b_field_of_borrow/hole.zig",
+        // matrix: a dependency's key pair held in a tuple literal; a key's value is not read, only its spelled type
+        "aggregate/mx-a08-14_tuple_dep_value/hole.zig",
+        // matrix: a constant given a key pair a dependency's function returns; a key's value is not read, only its spelled type
+        "assignment/mx-a08-01_dep_value/hole.zig",
+        // matrix: std's BlindKeyPair held by value; only declarations named SecretKey or KeyPair are secret
+        "assignment/mx-a08-01b_blind_key_pair/hole.zig",
+        // matrix: an `if` choosing the dependency's key pair; a key's value is not read, only its spelled type
+        "branch/mx-a08-16_if_dep_value/hole.zig",
+        // matrix: @call making the dependency's key pair; a key's value is not read, only its spelled type
+        "call/mx-a08-06_atcall_dep_value/hole.zig",
+        // matrix: a dependency's optional key pair captured by value; a key's value is not read, only its spelled type
+        "capture/mx-a08-03_capture_value/hole.zig",
+        // matrix: a constant typed @TypeOf a borrowed key pair's value; @TypeOf is not resolved
+        "compile_time/mx-a08-10_typeof_deref/hole.zig",
+        // matrix precision: a secret key type's constant (encoded_length) read as a key held by value
+        "compile_time/mx-a08-10b_type_constant/twin.zig",
+        // matrix: a key @as makes of a type a dependency's function gives; a type named outside the program is not resolved
+        "conversion/mx-a08-12_as_dep_type/hole.zig",
+        // matrix: a destructure takes a key pair from a dependency's tuple; a key's value is not read, only its spelled type
+        "destructure/mx-a08-02_destructure_dep/hole.zig",
+        // matrix: a field typed @field(Ed25519, "Key" ++ "Pair"); a computed @field name is not read
+        "field/mx-a08-04_field_computed_type/hole.zig",
+        // matrix: secureZero named by @field with a computed name; only a string literal's @field name is read
+        "field/mx-a08-04b_field_computed_wipe/hole.zig",
+        // matrix: Scheme.KeyPair over an inline for's schemes; a KeyPair spelling that does not resolve is passed, not undecided
+        "inline_loop/mx-a08-09_inline_for_schemes/hole.zig",
+        // matrix: a labeled block's break carries the dependency's key pair; a key's value is not read, only its spelled type
+        "jump/mx-a08-08_block_break_value/hole.zig",
+        // matrix: a borrowed secret key wiped by @memset; only std's secureZero is read as a hand wipe
+        "memory/mx-a08-15_memset_wipe/hole.zig",
+        // matrix: a borrowed secret key compared by xor and or over its bytes; only std's timing_safe calls are read as hand comparisons
+        "operator/mx-a08-11_xor_compare/hole.zig",
+        // matrix: `try` unwraps the dependency's key pair; a key's value is not read, only its spelled type
+        "unwrap/mx-a08-13_try_dep_value/hole.zig",
+    },
+}

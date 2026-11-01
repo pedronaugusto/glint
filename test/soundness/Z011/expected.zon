@@ -1,0 +1,37 @@
+.{
+    .na = .{
+        // No operator yields a function: arithmetic, bit and comparison operators take
+        // numbers, bools and many-item pointers, never a callable.
+        .operator,
+    },
+    .open = .{
+        // matrix Z011: a callee with a declaration that resolves to no function is passed silently, unknown or not
+        "assignment/mx-z11-runtime_pointer/hole.zig",
+        // matrix Z011: the same, a pointer to the deprecated function
+        "address/mx-z11-pointer_call/hole.zig",
+        // matrix Z011: the same, a function chosen by an if expression
+        "branch/mx-z11-if_choice/hole.zig",
+        // matrix Z011: the same, a function-pointer parameter
+        "call/mx-z11-parameter/hole.zig",
+        // matrix Z011: the same, an if's payload
+        "capture/mx-z11-optional_payload/hole.zig",
+        // matrix Z011: the same, a comptime parameter
+        "compile_time/mx-z11-comptime_parameter/hole.zig",
+        // matrix Z011: the same, a pointer @ptrCast converts
+        "conversion/mx-z11-ptrcast/hole.zig",
+        // matrix Z011: the same, an inline loop's capture
+        "inline_loop/mx-z11-inline_tuple/hole.zig",
+        // matrix Z011: the same, a labeled block's result
+        "jump/mx-z11-label_break/hole.zig",
+        // matrix Z011: @call is no call node, so its callee is never read
+        "call/mx-z11-builtin_call/hole.zig",
+        // matrix Z011 precision: a callee with no declaration (p.*, @field, @as, .?, a field, an element, a load) is undecided whatever it calls
+        "address/mx-z11-deref_call/twin.zig",
+        "aggregate/mx-z11-struct_field/twin.zig",
+        "aggregate/mx-z11-table/twin.zig",
+        "conversion/mx-z11-as_call/twin.zig",
+        "field/mx-z11-field_named/twin.zig",
+        "memory/mx-z11-atomic_store/twin.zig",
+        "unwrap/mx-z11-optional_unwrap/twin.zig",
+    },
+}

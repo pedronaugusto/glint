@@ -1,0 +1,5 @@
+// An owner held in a field (a File, Dir, Stream, Server or Child, a struct) is no operand
+// of any arithmetic, bit or comparison operator: A015's value cannot pass through one.
+.{
+    .na = .{.operator},
+}

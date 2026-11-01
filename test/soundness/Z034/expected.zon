@@ -1,0 +1,7 @@
+// Z034 judges how the parse tree nests two binary operators, a property of the source text:
+// only the operator row holds what it reads, and no value moves through the others.
+.{
+    .na = .{
+        .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch,
+    },
+}

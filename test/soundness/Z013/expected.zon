@@ -1,0 +1,37 @@
+.{
+    .na = .{
+        // Zig parses no destructure at container level and refuses an unused local, so no
+        // destructured binding of an import is left dead.
+        .destructure,
+        // A capture binds a local, which Zig refuses unused; a binding Z013 can find dead is a
+        // container declaration.
+        .capture,
+        // A defer runs in a function body; no container binding takes its value.
+        .deferred,
+        // An inline loop unrolls in a body; what it binds are locals, refused unused.
+        .inline_loop,
+        // An import is a namespace type; no operator yields one.
+        .operator,
+        // An import is a comptime type; no binding of one at container level is unwrapped out of
+        // an optional or error union.
+        .unwrap,
+        // A literal holding imports binds the aggregate, not an import; a dead one is D001's.
+        .aggregate,
+        // @memcpy, @memset and atomics move run-time values; an import is a comptime type.
+        .memory,
+    },
+    .open = .{
+        // matrix Z013: an import binding is one spelled `= @import(...)`: a dead alias of an import is none
+        "assignment/mx-z13-alias/hole.zig",
+        // matrix Z013: the same, an import through a type function
+        "call/mx-z13-type_function/hole.zig",
+        // matrix Z013: the same, an import through @as
+        "conversion/mx-z13-as_type/hole.zig",
+        // matrix Z013: the same, an import carried out of a labeled block
+        "jump/mx-z13-label_break/hole.zig",
+        // matrix Z013: @hasDecl counts as a use, though it sees no private declaration
+        "compile_time/mx-z13-hasdecl/hole.zig",
+        // matrix Z013 precision: a binding of an import chosen by a comptime if, used, is undecided
+        "branch/mx-z13-platform_choice/twin.zig",
+    },
+}

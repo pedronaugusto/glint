@@ -1,0 +1,22 @@
+.{
+    .open = .{
+        // matrix A017: a switch on a local copy of the state is no switch on the field
+        "assignment/mx-state_copied_to_local/hole.zig",
+        // matrix A017: a switch on an `if` capture of the state is no switch on the field
+        "capture/mx-captured_optional_state/hole.zig",
+        // matrix A017: writers called as free functions under a switch are not followed; only method calls are
+        "call/mx-writers_called_plainly/hole.zig",
+        // matrix A017: a switch on a getter's return of the state is no switch on the field
+        "call/mx-switch_on_getter/hole.zig",
+        // matrix A017: a defer's write of the next state a switch chose is under no condition on it
+        "deferred/mx-deferred_write/hole.zig",
+        // matrix A017: a write after a guard's `return` on the state is under no condition on it
+        "jump/mx-guard_return/hole.zig",
+        // matrix A017: a state held as its enum's integer is no enum field, so it is not read
+        "conversion/mx-state_as_integer/hole.zig",
+        // matrix A017: a whole-record literal's write of the state is not read as a write
+        "aggregate/mx-whole_record_write/hole.zig",
+        // matrix A017: atomic loads and stores of the state are not read as uses or writes
+        "memory/mx-atomic_state/hole.zig",
+    },
+}

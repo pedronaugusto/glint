@@ -1,0 +1,42 @@
+.{
+    .open = .{
+        // matrix A021: a guard no declaration binds is held to the end of its own block, though a store keeps it past
+        "assignment/mx-a21-store_outlives_block/hole.zig",
+        // matrix A021: the same, the guard written by a destructure
+        "destructure/mx-a21-destructure_outlives_block/hole.zig",
+        // matrix A021: the same, the guard put into a struct literal
+        "aggregate/mx-a21-literal_outlives_block/hole.zig",
+        // matrix A021: the same, the guard copied out by @memcpy
+        "memory/mx-a21-memcpy_guard/hole.zig",
+        // matrix A021: the same, the labeled block whose break carries the guard is taken as its block
+        "jump/mx-a21-label_break_guard/hole.zig",
+        // matrix A021: held is a span of tokens, so a loop's next pass taking a lock written earlier is not inside it
+        "jump/mx-a21-loop_carries_guard/hole.zig",
+        // matrix A021: the same, a deferred acquisition written before the guard but run while it is held
+        "deferred/mx-a21-defer_runs_while_held/hole.zig",
+        // matrix A021: one acquisition run by each pass of a loop is never held against itself
+        "capture/mx-a21-loop_capture_each/hole.zig",
+        // matrix A021: the same, an inline loop
+        "inline_loop/mx-a21-inline_each_lock/hole.zig",
+        // matrix A021: an acquisition is only a `receiver.acquire*(` call: a callee returning a guard is none
+        "call/mx-a21-helper_returns_guard/hole.zig",
+        // matrix A021: the same, acquire called by @call
+        "call/mx-a21-call_builtin/hole.zig",
+        // matrix A021: the same, acquire named by @field
+        "field/mx-a21-field_named_acquire/hole.zig",
+        // matrix A021: the same, acquire called through an alias of L.acquire
+        "address/mx-a21-method_alias/hole.zig",
+        // matrix A021: ranked is a method spelled Ordered, so locks ranked by two separate Orders pass as ordered
+        "compile_time/mx-a21-two_orders/hole.zig",
+        // matrix A021 precision: an if expression's two acquisitions are held against each other
+        "branch/mx-a21-exclusive_branches/twin.zig",
+        // matrix A021 precision: an acquire inside @TypeOf, which never runs, counts as taken
+        "compile_time/mx-a21-typeof_not_taken/twin.zig",
+        // matrix A021 precision: a guard unwrapped by orelse is held to its block's end, its release unread
+        "unwrap/mx-a21-orelse_guard/twin.zig",
+        // matrix A021 precision: a lock read by @atomicLoad does not resolve
+        "memory/mx-a21-atomic_lock_pointer/twin.zig",
+        // matrix A021 precision: a lock reached by pointer arithmetic does not resolve
+        "operator/mx-a21-pointer_arithmetic/twin.zig",
+    },
+}

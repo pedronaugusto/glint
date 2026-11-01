@@ -1,0 +1,4 @@
+.{
+    .no_hole = .{ .assignment, .field, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .unwrap, .aggregate, .branch },
+    .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch },
+}

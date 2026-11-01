@@ -1,0 +1,6 @@
+// Z003 reports the parser's errors (Builtins.zig `parser`): syntax, which carries no value.
+.{
+    .na = .{
+        .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch,
+    },
+}

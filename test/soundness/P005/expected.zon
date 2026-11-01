@@ -1,0 +1,17 @@
+.{
+    .na = .{
+        // No operator yields a function.
+        .operator,
+        // std.debug.print is generic (anytype arguments): a comptime-only value no run-time
+        // memory holds, so no @memcpy, @memset or atomic moves it.
+        .memory,
+    },
+    .open = .{
+        // matrix P005: std's print matches only where the judged file imports std itself, not through a re-export
+        "address/mx-p05-reexported_std/hole.zig",
+        // matrix P005: a callee resolving to alternatives is passed silently
+        "branch/mx-p05-comptime_choice/hole.zig",
+        // matrix P005: @call is no call node, so its callee is never read
+        "call/mx-p05-builtin_call/hole.zig",
+    },
+}

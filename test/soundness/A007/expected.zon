@@ -1,0 +1,19 @@
+// A lock or an atomic cell is no operand of an operator, and an operator makes no type:
+// A007's value (a sync type held, a raw atomic) cannot pass through one.
+.{
+    .na = .{.operator},
+    .open = .{
+        // matrix: a dependency's lock held in a tuple literal; a value of a lock type is not matched, only the type
+        "aggregate/mx-a07-13_tuple_dep_value/hole.zig",
+        // matrix: @call making the dependency's lock; a lock's value is not matched (only its type), nor @call read as its call
+        "call/mx-a07-06_atcall_dep_value/hole.zig",
+        // matrix: a futex wake through Io's vtable; only Io's futex functions are governed, not VTable's fields
+        "call/mx-a07-06b_vtable_futex/hole.zig",
+        // matrix: a variable typed @TypeOf a borrowed lock's value; @TypeOf is not resolved
+        "compile_time/mx-a07-10_typeof_deref/hole.zig",
+        // matrix: a field typed @field(std.Io, "Mu" ++ "tex"); only a string literal's @field name is read
+        "field/mx-a07-04_field_computed_name/hole.zig",
+        // matrix: an inline for over a dependency's cell types; the loop's capture is not resolved to them
+        "inline_loop/mx-a07-09_inline_for_types/hole.zig",
+    },
+}
