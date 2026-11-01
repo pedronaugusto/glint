@@ -10,7 +10,7 @@ const Row = struct {
     source: []const u8,
     /// Each call found, as "line callee args": the callee a function's name, a choice's names
     /// joined by "|", or "any" and its reason; args their count, "r" first where a receiver is
-    /// bound, "?" where they are not known.
+    /// bound, "?" and why where they are not known.
     expected: []const []const u8,
 };
 
@@ -28,7 +28,7 @@ const rows = [_]Row{
     .{ .name = "a local constant", .source = fns ++ "fn w() void {\n    const p = &b;\n    p();\n}\n", .expected = &.{"5 b 0"} },
     .{ .name = "@call", .source = fns ++ "fn w() void {\n    @call(.auto, a, .{});\n}\n", .expected = &.{"4 a 0"} },
     .{ .name = "@call of a method", .source = method ++ "fn w(s: S) void {\n    @call(.never_inline, S.m, .{ s, 1 });\n}\n", .expected = &.{"8 m 2"} },
-    .{ .name = "@call given no tuple literal", .source = fns ++ "fn w() void {\n    const t = .{};\n    @call(.auto, a, t);\n}\n", .expected = &.{"5 a ?"} },
+    .{ .name = "@call given no tuple literal", .source = fns ++ "fn w() void {\n    const t = .{};\n    @call(.auto, a, t);\n}\n", .expected = &.{"5 a ? unsupported"} },
     .{ .name = "@field spelled, through a type", .source = method ++ "fn w(s: S) void {\n    @field(S, \"m\")(s, 1);\n}\n", .expected = &.{"8 m 2"} },
     .{ .name = "@field spelled, on a value", .source = method ++ "fn w(s: S) void {\n    @field(s, \"m\")(1);\n}\n", .expected = &.{"8 m r2"} },
     .{ .name = "@field computed", .source = fns ++ "fn w(comptime n: []const u8) void {\n    @field(@This(), n)();\n}\n", .expected = &.{"4 any comptime_dependent 0"} },
@@ -58,7 +58,7 @@ const rows = [_]Row{
     .{ .name = "a load of memory a caller gives", .source = fns ++ "pub fn w(slot: **const fn () void) void {\n    @atomicStore(*const fn () void, slot, &a, .release);\n    @atomicLoad(*const fn () void, slot, .acquire)();\n}\n", .expected = &.{"5 any unsupported 0"} },
     .{ .name = "an element", .source = fns ++ "var fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    fs[0]();\n}\n", .expected = &.{"5 any unsupported 0"} },
     .{ .name = "a call's result", .source = fns ++ "fn get() *const fn () void {\n    return &a;\n}\nfn w() void {\n    get()();\n}\n", .expected = &.{ "7 any unsupported 0", "7 get 0" } },
-    .{ .name = "a member of a holder that does not resolve", .source = "fn w(s: anytype) void {\n    s.m();\n}\n", .expected = &.{"2 any generic ?"} },
+    .{ .name = "a member of a holder that does not resolve", .source = "fn w(s: anytype) void {\n    s.m();\n}\n", .expected = &.{"2 any generic ? generic"} },
 };
 
 fn name(project: *const Project, decl: Facts.Decl) []const u8 {
@@ -80,7 +80,10 @@ fn found(a: std.mem.Allocator, project: *const Project, call: calls.Call) ![]con
         },
         .any => |why| try out.writer.print("any {t}", .{why}),
     }
-    if (call.args) |args| try out.writer.print(" {s}{d}", .{ if (call.receiver != null) "r" else "", args.len }) else try out.writer.writeAll(" ?");
+    switch (call.args) {
+        .known => |args| try out.writer.print(" {s}{d}", .{ if (call.receiver == .bound) "r" else "", args.len }),
+        .unknown => |why| try out.writer.print(" ? {t}", .{why}),
+    }
     return out.written();
 }
 
@@ -126,6 +129,6 @@ test "calls: a call of one argument keeps it past the next call read" {
     const made = try calls.in(&facts, project.sources[0].id);
     try std.testing.expectEqual(@as(usize, 2), made.len);
     for (made, [_][]const u8{ "7", "8" }) |call, literal| {
-        try std.testing.expectEqualStrings(literal, tree.getNodeSource(call.args.?[0]));
+        try std.testing.expectEqualStrings(literal, tree.getNodeSource(call.args.known[0]));
     }
 }
