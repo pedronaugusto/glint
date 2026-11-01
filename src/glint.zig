@@ -23,6 +23,7 @@ test {
     _ = @import("Model.zig");
     _ = Project;
     _ = Completion;
+    _ = Constructs;
     _ = @import("Rule.zig");
     _ = @import("Suppression.zig");
     _ = @import("Runner.zig");
