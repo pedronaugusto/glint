@@ -3,6 +3,9 @@
 pub const version: []const u8 = @import("release").version;
 /// An owned, immutable project constructed from explicit source inputs.
 pub const Project = @import("Project.zig");
+/// Every way Zig moves a value: each ZIR instruction and Ast node form in one row of the
+/// soundness matrix, or moving none.
+pub const Constructs = @import("Constructs.zig");
 /// Verifies CLI completion independently of finding acceptance.
 pub const Completion = @import("Completion.zig");
 /// Stable diagnostic selection IDs.
