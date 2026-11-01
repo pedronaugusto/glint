@@ -7,8 +7,10 @@
         .{ .rule = "A004", .no_hole = .{ .field, .deferred, .jump, .compile_time, .operator, .unwrap, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A005", .no_hole = .{ .destructure, .capture, .field, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A006", .no_hole = .{ .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A007", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A008", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        // A007 operator: a lock, an atomic cell or a futex call is no operator's result, and an operator on
+        // shared state leaves its declaration the site.
+        .{ .rule = "A007", .na = .{.operator} },
+        .{ .rule = "A008" },
         .{ .rule = "A009", .no_hole = .{ .field, .unwrap, .branch }, .no_twin = .{ .field, .deferred, .jump, .aggregate, .branch } },
         .{ .rule = "A010", .no_hole = .{ .field, .jump, .aggregate, .branch }, .no_twin = .{ .field, .inline_loop, .aggregate, .branch } },
         .{ .rule = "A011", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
@@ -42,5 +44,73 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
+        // matrix: a borrowed lock copied by `.*` into a variable; a lock is found only where its type is spelled
+        "A007/address/mx-a07-05_deref_copy/hole.zig",
+        // matrix: a dependency's lock held in a tuple literal; a value of a lock type is not matched, only the type
+        "A007/aggregate/mx-a07-13_tuple_dep_value/hole.zig",
+        // matrix: a variable given a lock a dependency's function returns; a value of a lock type is not matched, only the type
+        "A007/assignment/mx-a07-01_dep_value/hole.zig",
+        // matrix: an `if` choosing the dependency's lock a variable holds; a lock's value is not matched (only its type), nor an `if` read through
+        "A007/branch/mx-a07-15_if_dep_value/hole.zig",
+        // matrix: @call making the dependency's lock; a lock's value is not matched (only its type), nor @call read as its call
+        "A007/call/mx-a07-06_atcall_dep_value/hole.zig",
+        // matrix: a futex wake through Io's vtable; only Io's futex functions are governed, not VTable's fields
+        "A007/call/mx-a07-06b_vtable_futex/hole.zig",
+        // matrix: an optional lock captured by value and held in a variable; neither the capture nor the variable it gives is read
+        "A007/capture/mx-a07-03_capture_copy/hole.zig",
+        // matrix: a variable typed @TypeOf a borrowed lock's value; @TypeOf is not resolved
+        "A007/compile_time/mx-a07-10_typeof_deref/hole.zig",
+        // matrix: @as gives a variable a dependency-made atomic.Value; @as's type is not read
+        "A007/conversion/mx-a07-11_as_dep_type/hole.zig",
+        // matrix: a destructure takes a lock from a dependency's tuple; a destructure's variables and its value are not read
+        "A007/destructure/mx-a07-02_destructure_dep/hole.zig",
+        // matrix: a field typed @field(std.Io, "Mu" ++ "tex"); only a string literal's @field name is read
+        "A007/field/mx-a07-04_field_computed_name/hole.zig",
+        // matrix: an inline for over a dependency's cell types; the loop's capture is not resolved to them
+        "A007/inline_loop/mx-a07-09_inline_for_types/hole.zig",
+        // matrix: a labeled block's break carries the dependency's lock; a lock's value is not matched (only its type), nor a block's value read
+        "A007/jump/mx-a07-08_block_break_value/hole.zig",
+        // matrix: `try` unwraps the dependency's lock; a lock's value is not matched (only its type), nor `try` read through
+        "A007/unwrap/mx-a07-12_try_dep_value/hole.zig",
+        // matrix: `orelse` unwraps the dependency's optional lock; a lock's value is not matched (only its type), nor `orelse` read through
+        "A007/unwrap/mx-a07-12b_orelse_dep_value/hole.zig",
+        // matrix: a borrowed key pair copied by `.*`; a key is found only where its type is spelled
+        "A008/address/mx-a08-05_deref_copy/hole.zig",
+        // matrix: a borrowed key pair's secret_key read out by value; a key is found only where its type is spelled
+        "A008/address/mx-a08-05b_field_of_borrow/hole.zig",
+        // matrix: a dependency's key pair held in a tuple literal; a key's value is not read, only its spelled type
+        "A008/aggregate/mx-a08-14_tuple_dep_value/hole.zig",
+        // matrix: a constant given a key pair a dependency's function returns; a key's value is not read, only its spelled type
+        "A008/assignment/mx-a08-01_dep_value/hole.zig",
+        // matrix: std's BlindKeyPair held by value; only declarations named SecretKey or KeyPair are secret
+        "A008/assignment/mx-a08-01b_blind_key_pair/hole.zig",
+        // matrix: an `if` choosing the dependency's key pair; a key's value is not read, only its spelled type
+        "A008/branch/mx-a08-16_if_dep_value/hole.zig",
+        // matrix: @call making the dependency's key pair; a key's value is not read, only its spelled type
+        "A008/call/mx-a08-06_atcall_dep_value/hole.zig",
+        // matrix: a dependency's optional key pair captured by value; a key's value is not read, only its spelled type
+        "A008/capture/mx-a08-03_capture_value/hole.zig",
+        // matrix: a constant typed @TypeOf a borrowed key pair's value; @TypeOf is not resolved
+        "A008/compile_time/mx-a08-10_typeof_deref/hole.zig",
+        // matrix precision: a secret key type's constant (encoded_length) read as a key held by value
+        "A008/compile_time/mx-a08-10b_type_constant/twin.zig",
+        // matrix: a key @as makes of a type a dependency's function gives; a type named outside the program is not resolved
+        "A008/conversion/mx-a08-12_as_dep_type/hole.zig",
+        // matrix: a destructure takes a key pair from a dependency's tuple; a key's value is not read, only its spelled type
+        "A008/destructure/mx-a08-02_destructure_dep/hole.zig",
+        // matrix: a field typed @field(Ed25519, "Key" ++ "Pair"); a computed @field name is not read
+        "A008/field/mx-a08-04_field_computed_type/hole.zig",
+        // matrix: secureZero named by @field with a computed name; only a string literal's @field name is read
+        "A008/field/mx-a08-04b_field_computed_wipe/hole.zig",
+        // matrix: Scheme.KeyPair over an inline for's schemes; a KeyPair spelling that does not resolve is passed, not undecided
+        "A008/inline_loop/mx-a08-09_inline_for_schemes/hole.zig",
+        // matrix: a labeled block's break carries the dependency's key pair; a key's value is not read, only its spelled type
+        "A008/jump/mx-a08-08_block_break_value/hole.zig",
+        // matrix: a borrowed secret key wiped by @memset; only std's secureZero is read as a hand wipe
+        "A008/memory/mx-a08-15_memset_wipe/hole.zig",
+        // matrix: a borrowed secret key compared by xor and or over its bytes; only std's timing_safe calls are read as hand comparisons
+        "A008/operator/mx-a08-11_xor_compare/hole.zig",
+        // matrix: `try` unwraps the dependency's key pair; a key's value is not read, only its spelled type
+        "A008/unwrap/mx-a08-13_try_dep_value/hole.zig",
     },
 }
