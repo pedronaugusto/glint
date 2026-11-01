@@ -4918,6 +4918,16 @@ pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.
 /// is kept as unresolved, and every query for a place it may reach gets it (`.unresolved`). A
 /// file the front end refused gives one unresolved site.
 pub const accesses = struct {
+    /// Whether `node` is a literal that holds no memory and names no type, whatever type its
+    /// use gives it: an enum, number or character literal, or `{}`.
+    pub fn inert(tree: *const Ast, node: Ast.Node.Index) bool {
+        return switch (tree.nodeTag(node)) {
+            .enum_literal, .number_literal, .char_literal => true,
+            .block_two => tree.nodeData(node).opt_node_and_opt_node[0] == .none,
+            else => false,
+        };
+    }
+
     pub const Place = union(enum) {
         /// A variable, a parameter or a capture.
         declaration: Facts.Decl,
@@ -5512,7 +5522,8 @@ pub const accesses = struct {
         /// container's variable; by its name where the holder's type does not resolve.
         fn member(w: *Walk, site: Site, holder: Facts.Value, name: []const u8) Error!void {
             switch (holder) {
-                .pointer, .optional => |inner| try w.member(site, inner.*, name),
+                // A literal returned as an error union's or optional's payload makes a value of the payload.
+                .pointer, .optional, .error_union => |inner| try w.member(site, inner.*, name),
                 .instance, .container => |container| {
                     const d = w.facts.member(container, name) orelse return w.named(name, site);
                     switch (w.facts.project.at(d.file).model.declarations[@backingInt(d.index)].kind) {
@@ -5688,6 +5699,7 @@ pub const accesses = struct {
         /// `arg` handed at `node` to code the program does not hold: what its pointers reach is
         /// written as it may.
         fn handed(w: *Walk, node: Ast.Node.Index, arg: Ast.Node.Index) Error!void {
+            if (inert(w.syntax(), arg)) return;
             try w.shapes(w.make(node, arg, .covered, null), try w.facts.resolve(w.file, arg), true);
         }
 

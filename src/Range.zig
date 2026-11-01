@@ -912,7 +912,7 @@ fn givenTypes(c: *Context) Context.Error!*Given {
 fn typeArgument(c: *Context, memo: *Given, file: Project.FileId, callee: Ast.Node.Index, at: usize, arg: Ast.Node.Index) Context.Error!void {
     // A parameter declared of a type other than `type` or `anytype` takes no type: what is
     // given there is not read at all.
-    if (!try takesType(c, file, callee, at)) return;
+    if (Facts.accesses.inert(&c.project.at(file).file.tree, arg) or !try takesType(c, file, callee, at)) return;
     const value = try c.facts.resolve(file, arg);
     switch (value) {
         .container, .alternatives, .reified => return typeShapes(c, memo, value, 0),
