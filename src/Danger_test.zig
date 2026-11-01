@@ -9763,3 +9763,29 @@ test "A010 reads a slice's length through a pointer as written by a callee hande
         \\}
     , 0);
 }
+
+const captured_field_program =
+    \\pub const Observer = struct { boundary: ?*const fn (*Observer) void = null };
+    \\const Counter = struct {
+    \\    n: usize = 0,
+    \\    observer: Observer = .{ .boundary = seen },
+    \\    fn seen(o: *Observer) void {
+    \\        const self: *Counter = @alignCast(@fieldParentPtr("observer", o));
+    \\        self.n += 1;
+    \\    }
+    \\};
+    \\pub fn scan(seen_by: ?*Observer) void {
+    \\    if (seen_by) |observer| if (observer.boundary) |boundary| boundary(observer);
+    \\}
+    \\
+;
+
+test "A019 reads a call through a function field's captured payload as one through the field" {
+    // `if (o.f) |f| f(o)` hands the interface as `o.f.?(o)` does: what the field holds is judged
+    // where it is installed, never left undecided at the call.
+    const captured = try run(pack.unsafe_set, captured_field_program);
+    const unwrapped = try runEdited(pack.unsafe_set, captured_field_program, "if (observer.boundary) |boundary| boundary(observer);", "observer.boundary.?(observer);");
+    try std.testing.expectEqual(@as(usize, 0), captured.undecided);
+    try std.testing.expectEqual(unwrapped.undecided, captured.undecided);
+    try std.testing.expectEqual(unwrapped.findings, captured.findings);
+}

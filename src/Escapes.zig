@@ -234,10 +234,13 @@ const Walk = struct {
                 return left == right;
             },
             .field_access => {
-                const left = (try self.c.facts.definition(self.c.file, a)).orNull();
-                const right = (try self.c.facts.definition(self.c.file, b)).orNull();
-                if (left != null or right != null) {
-                    if (!std.meta.eql(left, right)) return false;
+                // One member's declaration, known on one side but not the other, may be the other's
+                // or not: never the same. With none known on either, the same holder's member of
+                // one name is one field.
+                const left = try self.c.facts.definition(self.c.file, a);
+                const right = try self.c.facts.definition(self.c.file, b);
+                if (left == .decl or right == .decl) {
+                    if (left != .decl or right != .decl or !std.meta.eql(left.decl, right.decl)) return false;
                 } else if (!std.mem.eql(u8, try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(a).node_and_token[1])), try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(b).node_and_token[1])))) return false;
                 return self.same(tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1);
             },

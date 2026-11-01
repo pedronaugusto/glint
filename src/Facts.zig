@@ -1328,8 +1328,16 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
         const inner = step_tree.fullCall(&step_buffer, step.node) orelse return .{ .unknown = .unsupported };
-        const callee = ((try self.definition(step.file, inner.ast.fn_expr)).orNull()) orelse return .{ .unknown = .unresolved };
-        const target = ((try self.origin(callee)).orNull()) orelse return .{ .unknown = .unresolved };
+        const callee = switch (try self.definition(step.file, inner.ast.fn_expr)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unresolved },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        const target = switch (try self.origin(callee)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unresolved },
+            .unknown => |why| return .{ .unknown = why },
+        };
         var inner_args: std.ArrayList(Value) = .empty;
         if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
         for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
@@ -1826,9 +1834,13 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         }
     }
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
-        const target = ((try self.reflected(file, node)).orNull()) orelse return .{ .unknown = .comptime_dependent };
+        // `@hasDecl` is a `bool` whatever it names.
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
-        return self.declaration(target);
+        return switch (try self.reflected(file, node)) {
+            .decl => |target| self.declaration(target),
+            .none => .{ .unknown = .unresolved },
+            .unknown => |why| .{ .unknown = why },
+        };
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) {
         const named = try self.resolveIn(env, file, args[0]);
@@ -2607,8 +2619,16 @@ fn forwarded(self: *Facts, function: Decl) ResolveError!?struct { function: Decl
     const returned = finalReturn(tree, &self.project.at(function.file).model, record) orelse return null;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, returned) orelse return null;
-    const callee = ((try self.definition(function.file, call.ast.fn_expr)).orNull()) orelse return null;
-    const target = ((try self.origin(callee)).orNull()) orelse return null;
+    // A callee not known is followed no further: the container it makes is unknown too, as its
+    // template is (`findTemplate`), so no binding read through it is taken as known.
+    const callee = switch (try self.definition(function.file, call.ast.fn_expr)) {
+        .decl => |d| d,
+        .none, .unknown => return null,
+    };
+    const target = switch (try self.origin(callee)) {
+        .decl => |d| d,
+        .none, .unknown => return null,
+    };
     if (self.project.at(target.file).model.declarations[@backingInt(target.index)].kind != .function) return null;
     return .{ .function = target, .call = returned };
 }
@@ -2923,7 +2943,11 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
 /// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
 /// the pointer's function type returns.
 fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) ResolveError!?Value {
-    var decl = ((try self.definition(file, callee)).orNull()) orelse return null;
+    var decl = switch (try self.definition(file, callee)) {
+        .decl => |d| d,
+        .none => return null,
+        .unknown => |why| return .{ .unknown = why },
+    };
     var record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     // A local holding the field, unwrapped: `const f = x.handler orelse return;`.
     if (record.kind == .variable) {
@@ -2934,7 +2958,11 @@ fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) Re
             .unwrap_optional, .grouped_expression => local.nodeData(value).node_and_token[0],
             else => break,
         };
-        decl = ((try self.definition(decl.file, value)).orNull()) orelse return null;
+        decl = switch (try self.definition(decl.file, value)) {
+            .decl => |d| d,
+            .none => return null,
+            .unknown => |why| return .{ .unknown = why },
+        };
         record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     }
     if (record.kind != .field) return null;
@@ -3236,8 +3264,17 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
         // same template whatever arguments this one passes it.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buffer, returned) orelse return null;
-        const callee = ((try self.definition(decl.file, call.ast.fn_expr)).orNull()) orelse return null;
-        const function = ((try self.origin(callee)).orNull()) orelse return null;
+        // A callee not known makes a container not known: unknown, never no template.
+        const callee = switch (try self.definition(decl.file, call.ast.fn_expr)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unresolved },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        const function = switch (try self.origin(callee)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unresolved },
+            .unknown => |why| return .{ .unknown = why },
+        };
         if (self.project.at(function.file).model.declarations[@backingInt(function.index)].kind != .function) return null;
         return self.template(function);
     }
@@ -4775,8 +4812,12 @@ fn closedField(self: *Facts, receiver: Key) ResolveError!bool {
     if (tree.nodeTag(receiver.node) == .identifier) return self.closedLocal(receiver);
     if (tree.nodeTag(receiver.node) != .field_access) return false;
     // A member of a value whose type is closed is that type's, and so closed itself.
-    const decl = ((try self.definition(receiver.file, receiver.node)).orNull()) orelse
-        return self.closedField(.{ .file = receiver.file, .node = tree.nodeData(receiver.node).node_and_token[0] });
+    // Where the member's declaration is not known, it is closed only as a member of a holder
+    // whose type is.
+    const decl = switch (try self.definition(receiver.file, receiver.node)) {
+        .decl => |d| d,
+        .none, .unknown => return self.closedField(.{ .file = receiver.file, .node = tree.nodeData(receiver.node).node_and_token[0] }),
+    };
     if (try self.program(decl.file)) return false;
     const source = self.project.at(decl.file);
     const record = source.model.declarations[@backingInt(decl.index)];
@@ -5040,7 +5081,7 @@ fn cannotBe(self: *Facts, tree: *const Ast, parent: Ast.Node.Index, node: Ast.No
 }
 
 /// Whether `node` is a path of declarations from a module imported by name: `reactor.Loop`.
-fn throughModule(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+pub fn throughModule(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) bool {
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
     var at = node;

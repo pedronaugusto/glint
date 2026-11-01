@@ -647,8 +647,7 @@ const Walk = struct {
         };
         var left: u64 = 0;
         // A per-build choice gives what any of its functions gives.
-        for (decls) |decl| {
-            const origin = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
+        for (decls) |origin| {
             const index = if (receiver) 0 else if (at_call) |at| at.position else parameterAt(w.c, w.file, call.?, origin, std.mem.findScalar(Ast.Node.Index, call.?.ast.params, argument).?);
             const found = try undefines(w.c, origin, index, w.depth + 1);
             if (!found.known) w.unknown = true;
@@ -827,8 +826,7 @@ const Walk = struct {
                     if (!holdsResult(try w.c.facts.resolve(w.file, node))) continue;
                     // Given by value, the method holds a copy.
                     const decl = (try w.callee(node, call)) orelse break :value node;
-                    const function = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
-                    if (try parameter(w.c, function, 0, false) == null) continue;
+                    if (try parameter(w.c, decl, 0, false) == null) continue;
                     break :value node;
                 },
                 else => continue,
@@ -1865,7 +1863,7 @@ const Walk = struct {
     fn handedTo(w: *Walk, node: Ast.Node.Index, call: Ast.full.Call, position: usize, receiver: bool, whole: bool, key: Ast.TokenIndex) Context.Error!?Use {
         const tree = w.tree;
         const handed: Use = .{ .key = key, .effect = .handed };
-        const decl = (try w.callee(node, call)) orelse {
+        const origin = (try w.callee(node, call)) orelse {
             if (receiver) return handed;
             return switch ((try w.chosen(node, call, position)) orelse return handed) {
                 .keep => null,
@@ -1873,7 +1871,6 @@ const Walk = struct {
                 .contract => |entry| if (entry.success == .count or !whole) null else try w.guarded(node, entry),
             };
         };
-        const origin = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
         const index = if (receiver) 0 else parameterAt(w.c, w.file, call, origin, position);
         const written: Use = .{ .key = tree.lastToken(node), .effect = .write };
         const leaves = w.failureLeaves(node, origin);
@@ -1932,11 +1929,10 @@ const Walk = struct {
         if (value != .alternatives) return null;
         var found: ?Choice = null;
         for (value.alternatives) |each| {
-            const decl = switch (each) {
+            const origin = switch (each) {
                 .function => |function| function,
                 else => return null,
             };
-            const origin = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
             const index = parameterAt(w.c, w.file, call, origin, position);
             const this: Choice = if (try named(w.c, &std_fills, origin, index)) fill: {
                 if (!w.failureLeaves(node, origin)) return null;
@@ -1961,12 +1957,7 @@ const Walk = struct {
     /// Whether a call reaches std's declaration at `path`.
     fn isStd(w: *Walk, node: Ast.Node.Index, call: Ast.full.Call, path: []const u8) Context.Error!bool {
         const decl = (try w.callee(node, call)) orelse return false;
-        const origin = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
-        for (((try Governed.declarations(w.c, "std", path)).orNull()) orelse &.{}) |found| {
-            const target = ((try w.c.facts.origin(found)).orNull()) orelse found;
-            if (std.meta.eql(target, origin)) return true;
-        }
-        return false;
+        return try stdAt(w.c, decl, path) == .yes;
     }
 
     /// The function a call reaches: by its name, or a declaration literal (`.fixed(&buf)`) by
@@ -2105,8 +2096,7 @@ const Walk = struct {
         }
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, source) orelse return false;
-        const decl = (try w.callee(source, call)) orelse return false;
-        const origin = ((try w.c.facts.origin(decl)).orNull()) orelse decl;
+        const origin = (try w.callee(source, call)) orelse return false;
         var offset: usize = 0;
         if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try w.c.facts.resolve(w.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
             .instance, .pointer, .optional => offset = 1,
@@ -2449,7 +2439,13 @@ const Walk = struct {
         }
         const got = try w.c.facts.resolve(w.file, kind);
         if (Model.primitive(name)) return got == .primitive and std.mem.eql(u8, got.primitive, name);
-        for (((try Governed.declarations(w.c, "std", name)).orNull()) orelse &.{}) |decl| {
+        // Only a type known to be std's is: one std's declarations do not show (the budget) is
+        // not, and its contract is not taken.
+        const found = switch (try Governed.declarations(w.c, "std", name)) {
+            .decls => |each| each,
+            .none, .unknown => return false,
+        };
+        for (found) |decl| {
             if (sameValue(got, try w.c.facts.declaration(decl), 0)) return true;
         }
         return false;
@@ -2809,9 +2805,22 @@ fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Conte
         else => return null,
     };
     for ([_][]const u8{ "Io.Reader", "Io.Writer" }, [_]@FieldType(Slot, "interface"){ .reader, .writer }) |path, interface| {
-        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| {
-            const declared = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
-            if (declared == .container and std.meta.eql(declared.container, container)) return .{ .interface = interface, .name = tree.tokenSlice(name), .field = ((try c.facts.definition(file, function)).orNull()) orelse return null };
+        // An interface std's declarations do not show (the budget), or one an alias not followed
+        // names, is no slot known: the call's callee is then not known.
+        const found = switch (try Governed.declarations(c, "std", path)) {
+            .decls => |each| each,
+            .none, .unknown => continue,
+        };
+        for (found) |decl| {
+            const target = switch (try c.facts.origin(decl)) {
+                .decl => |d| d,
+                .none, .unknown => continue,
+            };
+            const declared = try c.facts.declaration(target);
+            if (declared == .container and std.meta.eql(declared.container, container)) return .{ .interface = interface, .name = tree.tokenSlice(name), .field = switch (try c.facts.definition(file, function)) {
+                .decl => |d| d,
+                .none, .unknown => return null,
+            } };
         }
     }
     return null;
@@ -3082,13 +3091,12 @@ fn holderKeptThrough(c: *Context, file: Project.FileId, call: Ast.full.Call, pos
 }
 
 fn holderKeptIn(c: *Context, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl, position: ?usize, depth: u8) Context.Error!bool {
-    const origin = ((try c.facts.origin(decl)).orNull()) orelse decl;
-    for (std_room) |path| for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |found| {
-        if (std.meta.eql(((try c.facts.origin(found)).orNull()) orelse found, origin)) return false;
-    };
-    if (try inStd(c, origin.file)) return true;
-    const index = if (position) |at| parameterAt(c, file, call, origin, at) else 0;
-    return remembered(bool, c, .{ .decl = origin, .index = index, .question = .holds }, depth + 1, holderKeptByParameter, false);
+    // One of std's that leaves room in what it keeps, or one that may be (not known), keeps no
+    // holder whole.
+    for (std_room) |path| if (try stdAt(c, decl, path) != .no) return false;
+    if (try inStd(c, decl.file)) return true;
+    const index = if (position) |at| parameterAt(c, file, call, decl, at) else 0;
+    return remembered(bool, c, .{ .decl = decl, .index = index, .question = .holds }, depth + 1, holderKeptByParameter, false);
 }
 
 fn holderKeptByParameter(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
@@ -3445,7 +3453,7 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
                 .function => |function| function,
                 else => return false,
             };
-            return keepsWriter(c, ((try c.facts.origin(decl)).orNull()) orelse decl, 0, depth);
+            return keepsWriter(c, decl, 0, depth);
         },
         .address_of => {
             const grand = model.parentOf(parent) orelse return false;
@@ -3455,8 +3463,8 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
                 .function => |function| function,
                 else => return false,
             };
-            const index = parameterAt(c, file, call, ((try c.facts.origin(decl)).orNull()) orelse decl, position);
-            return keepsWriter(c, ((try c.facts.origin(decl)).orNull()) orelse decl, index, depth);
+            const index = parameterAt(c, file, call, decl, position);
+            return keepsWriter(c, decl, index, depth);
         },
         else => return false,
     }
@@ -3527,8 +3535,8 @@ fn keepsPointerAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth
                 .function => |function| function,
                 else => return false,
             };
-            const index = parameterAt(c, file, call, ((try c.facts.origin(decl)).orNull()) orelse decl, position);
-            return keepsWriter(c, ((try c.facts.origin(decl)).orNull()) orelse decl, index, depth);
+            const index = parameterAt(c, file, call, decl, position);
+            return keepsWriter(c, decl, index, depth);
         },
     }
 }
@@ -4032,16 +4040,35 @@ fn needsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
     return .{ .mask = walk.needed, .owner = owner };
 }
 
-/// Whether `decl` is one of std's calls `list` names, at its parameter `index`.
+/// Whether `decl` is known to be one of std's calls `list` names, at its parameter `index`.
+/// One not known to be is not: std's own is then read for what it reads of what it is given,
+/// and nothing it writes is taken as written.
 fn named(c: *Context, list: []const Named, decl: Facts.Decl, index: usize) Context.Error!bool {
     for (list) |each| {
         if (each.param != index) continue;
-        for (((try Governed.declarations(c, "std", each.path)).orNull()) orelse &.{}) |found| {
-            const origin = ((try c.facts.origin(found)).orNull()) orelse found;
-            if (std.meta.eql(origin, decl)) return true;
-        }
+        if (try stdAt(c, decl, each.path) == .yes) return true;
     }
     return false;
+}
+
+const Match = enum { yes, no, unknown };
+
+/// Whether the function `decl` is std's declaration at `path`, through the aliases that one is
+/// spelled by: not known where std's declarations are not read (the budget) or an alias of
+/// one is not followed. Each caller takes `unknown` the way that clears nothing.
+fn stdAt(c: *Context, decl: Facts.Decl, path: []const u8) Context.Error!Match {
+    const found = switch (try Governed.declarations(c, "std", path)) {
+        .decls => |each| each,
+        .none => return .no,
+        .unknown => return .unknown,
+    };
+    var answer: Match = .no;
+    for (found) |each| switch (try c.facts.origin(each)) {
+        .decl => |target| if (std.meta.eql(target, decl)) return .yes,
+        .none => if (std.meta.eql(each, decl)) return .yes,
+        .unknown => answer = .unknown,
+    };
+    return answer;
 }
 
 /// Whether a `return` returns an error by name (`return error.Short`) from a function whose
