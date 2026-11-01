@@ -189,15 +189,19 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
     const model = &c.project.at(c.file).model;
     // The mentions that give a call a local, or a part of it, as its receiver or by address:
     // where a call may give it `undefined` (a `deinit`), read as each local is.
+    // A local's alias (`const p = &x`) hands it as a pointer does, as it is (`f(p)`).
     var handed: std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) = .empty;
+    var pointing: std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const id = (model.reference(node) orelse continue).declaration orelse continue;
         if (model.declarations[@backingInt(id)].kind != .variable) continue;
-        if (handedPlace(tree, model, node, false) == null) continue;
-        const entry = try handed.getOrPutValue(c.allocator, id, .empty);
-        try entry.value_ptr.append(c.allocator, node);
+        for ([_]bool{ false, true }, [_]*@TypeOf(handed){ &handed, &pointing }) |pointer, map| {
+            if (handedPlace(tree, model, node, pointer) == null) continue;
+            const entry = try map.getOrPutValue(c.allocator, id, .empty);
+            try entry.value_ptr.append(c.allocator, node);
+        }
     }
     for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or c.inTest(decl.token)) continue;
@@ -215,7 +219,10 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
         // `undefined` again.
         const declared = holdsUndefined(tree, init);
         const local: Model.Declaration.Id = @fromBackingInt(@intCast(d));
-        const calls = if (handed.get(local)) |list| list.items else &.{};
+        var given: std.ArrayList(Ast.Node.Index) = .empty;
+        if (handed.get(local)) |list| try given.appendSlice(c.allocator, list.items);
+        for (try aliasesOf(c.allocator, tree, model, local, false)) |alias| if (pointing.get(alias)) |list| try given.appendSlice(c.allocator, list.items);
+        const calls = given.items;
         if (!declared and !spellsUndefined(tree, block) and calls.len == 0) continue;
         var walk: Walk = .init(c, c.file, local, false, 0);
         try walk.collect();
@@ -249,11 +256,23 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
         if (calls.len != 0 and try follows(c, decl)) continue;
         for (calls) |call| {
             const memo = try c.facts.memo(Calls);
-            const cuts = memo.cuts;
-            const left = try walk.undoneBy(call);
+            var cuts = memo.cuts;
+            walk.unknown = false;
+            var left = try walk.undoneBy(call);
+            // A reading cut short at the depth answered all of it without reading it. The
+            // functions it left unread are read from the top (`readDeferred`), whose answers
+            // hold for any caller, and the call is asked again; one still cut leaves a read
+            // after it undecided, never a finding.
+            var rounds: usize = 0;
+            while (memo.cuts != cuts and rounds < 8 and try readDeferred(c)) : (rounds += 1) {
+                cuts = memo.cuts;
+                walk.unknown = false;
+                left = try walk.undoneBy(call);
+            }
+            memo.deferred.clearRetainingCapacity();
+            memo.seen.clearRetainingCapacity();
+            const unknown = walk.unknown;
             if (left == 0) continue;
-            // A reading cut short at the depth answered all of it without reading it: what the
-            // call leaves is not known, so a read after it is undecided, never a finding.
             const cut = memo.cuts != cuts;
             const line = tree.tokenLocation(0, tree.nodeMainToken(call)).line + 1;
             if (try walk.aliasAfter(call, block)) |alias| {
@@ -265,6 +284,10 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
             _ = try from.onFrom(call, left, block);
             const token = from.read orelse continue;
             if (found == token) continue;
+            if (unknown) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unsupported, try c.allocator.print("'{s}' is handed here to a call that reaches a function not known here (a function pointer, a field its callers fill): whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, tree.tokenLocation(0, token).line + 1 }));
+                continue;
+            }
             if (cut) {
                 try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .budget_exhausted, try c.allocator.print("'{s}' is handed to a call here whose calls run deeper than {d} are read: whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, undefines_depth_limit, tree.tokenLocation(0, token).line + 1 }));
                 continue;
@@ -333,8 +356,14 @@ const Walk = struct {
     local: Model.Declaration.Id,
     param: bool,
     depth: u8,
-    /// The identifiers that name the local, in source order.
+    /// The identifiers that name the local, or one of its aliases (`aliases`), in source order.
     mentions: std.ArrayList(Ast.Node.Index) = .empty,
+    /// The locals that hold the local's memory's address as it is (`aliasesOf`): a mention of
+    /// one names that memory as a parameter's pointer does.
+    aliases: []const Model.Declaration.Id = &.{},
+    /// Whether a call the local was handed to reaches a function not known here (a pointer, a
+    /// value the program's callers give): what it leaves undefined is not known (`undoneBy`).
+    unknown: bool = false,
     /// The `asm` outputs bound to the local, by the token naming it, with the `asm` they are in.
     outputs: std.ArrayList(struct { token: Ast.TokenIndex, asm_node: Ast.Node.Index }) = .empty,
     /// The function's `return`s, for a parameter's walk.
@@ -344,6 +373,17 @@ const Walk = struct {
     handed: bool = false,
     /// Whether a path returns with a parameter's memory not yet written whole.
     exit_unwritten: bool = false,
+    /// Of those, whether one returns an error (`return error.X`, a `try`), and whether one
+    /// returns otherwise: what the memory is on each exit (`leftExits`).
+    exit_failure: bool = false,
+    exit_success: bool = false,
+    /// The `try`s of a parameter's function: each leaves it with an error.
+    tries: std.ArrayList(Ast.Node.Index) = .empty,
+    /// What of the memory a call handed it leaves `undefined` where the call's failure leaves
+    /// the function: by an error (`try`, `failing`), or by a `return` that may be either
+    /// (`catch return`, `leaving`) (`undoneBy`).
+    failing: u64 = 0,
+    leaving: u64 = 0,
     /// Whether an error's `return` counts as any other for `exit_unwritten`: where the walk
     /// asks what a caller's `catch` may go on with (`undefines`), not what a call writes.
     every_exit: bool = false,
@@ -373,10 +413,15 @@ const Walk = struct {
 
     fn collect(w: *Walk) Context.Error!void {
         const name = w.model.declarations[@backingInt(w.local)].name;
+        w.aliases = try aliasesOf(w.c.allocator, w.tree, w.model, w.local, w.param);
         for (w.tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (tag == .@"return") {
                 if (w.param) try w.returns.append(w.c.allocator, node);
+                continue;
+            }
+            if (tag == .@"try") {
+                if (w.param) try w.tries.append(w.c.allocator, node);
                 continue;
             }
             if (tag == .asm_output) {
@@ -389,9 +434,31 @@ const Walk = struct {
             }
             if (tag != .identifier) continue;
             const ref = w.model.reference(node) orelse continue;
-            if (ref.declaration == w.local) try w.mentions.append(w.c.allocator, node);
+            const decl = ref.declaration orelse continue;
+            if (decl == w.local or std.mem.findScalar(Model.Declaration.Id, w.aliases, decl) != null) try w.mentions.append(w.c.allocator, node);
         }
         w.shape = try w.partsOf();
+    }
+
+    /// Whether `mention` names the memory through a pointer to it: a parameter's, or an
+    /// alias's (`aliases`), where the local itself names it as it is.
+    fn viaPointer(w: *const Walk, mention: Ast.Node.Index) bool {
+        if (w.param) return true;
+        const ref = w.model.reference(mention) orelse return false;
+        return ref.declaration != w.local;
+    }
+
+    /// Whether `access`, a field, element or dereference of a mention, reaches the memory
+    /// through a pointer (`viaPointer`).
+    fn throughPointer(w: *const Walk, access: Ast.Node.Index) bool {
+        var at = access;
+        while (true) at = switch (w.tree.nodeTag(at)) {
+            .field_access => w.tree.nodeData(at).node_and_token[0],
+            .array_access => w.tree.nodeData(at).node_and_node[0],
+            .deref => w.tree.nodeData(at).node,
+            .identifier => return w.viaPointer(at),
+            else => return w.param,
+        };
     }
 
     /// The parts of what the local is, or a parameter's single-item pointer points at: an
@@ -400,8 +467,11 @@ const Walk = struct {
         const tree = w.tree;
         var kind = if (w.param)
             w.c.facts.parameterTypeNode(.{ .file = w.file, .index = w.local }) orelse return .none
-        else
-            (tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return .none).ast.type_node.unwrap() orelse return .none;
+        else kind: {
+            const variable = tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return .none;
+            // With no type written, the type of what it is made from (`var s = list.pop().?`).
+            break :kind variable.ast.type_node.unwrap() orelse return w.partsOfValue(variable.ast.init_node.unwrap() orelse return .none);
+        };
         if (w.param) {
             const pointer = tree.fullPtrType(kind) orelse return .none;
             if (pointer.size != .one) return .none;
@@ -415,6 +485,17 @@ const Walk = struct {
         }
         const container = switch (try w.c.facts.resolve(w.file, kind)) {
             .container => |container| container,
+            else => return .none,
+        };
+        const shape = try fieldsOf(w.c, container);
+        if (shape != .none) w.owner = .{ .container = .{ .file = container.file, .scope = container.scope } };
+        return shape;
+    }
+
+    /// The parts of a struct instance `first` makes, the local's first value.
+    fn partsOfValue(w: *Walk, first: Ast.Node.Index) Context.Error!Shape {
+        const container = switch (try w.c.facts.resolve(w.file, first)) {
+            .instance => |container| container,
             else => return .none,
         };
         const shape = try fieldsOf(w.c, container);
@@ -465,6 +546,12 @@ const Walk = struct {
             if (isBlock(tree, each)) break i;
         } else return start;
         const statement_at = if (inner == 0) mention else around.items[inner - 1];
+        // A `return` that holds it (`orelse return giveUp(&x)`) leaves with it so: nothing after
+        // it is reached.
+        for (around.items[0..inner]) |each| if (tree.nodeTag(each) == .@"return") {
+            if (w.param and w.exitsBy(each)) w.exited(each);
+            return .left;
+        };
         // The constructs a jump from the rest may go to, outermost first.
         var i = around.items.len;
         while (i > inner) {
@@ -524,7 +611,8 @@ const Walk = struct {
     fn undoneBy(w: *Walk, mention: Ast.Node.Index) Context.Error!u64 {
         const tree = w.tree;
         const all = std.math.maxInt(u64);
-        const place = handedPlace(tree, w.model, mention, w.param) orelse return 0;
+        const pointer = w.viaPointer(mention);
+        const place = handedPlace(tree, w.model, mention, pointer) orelse return 0;
         if (!try w.inMemory(mention, place)) return 0;
         // A field or element handed: the part its first step names.
         const part_handed: ?u64 = if (place == mention) null else part: {
@@ -535,23 +623,96 @@ const Walk = struct {
         const holder = w.model.parentOf(place).?;
         var buffer: [1]Ast.Node.Index = undefined;
         const receiver = tree.nodeTag(holder) == .field_access;
-        const node = if (receiver) w.model.parentOf(holder).? else w.model.parentOf(if (tree.nodeTag(holder) == .address_of) holder else place).?;
-        const call = tree.fullCall(&buffer, node).?;
+        const argument = if (tree.nodeTag(holder) == .address_of) holder else place;
+        // `@call(modifier, f, .{&x})` calls f with the tuple's elements as its arguments.
+        const at_call = if (receiver) null else atCall(tree, w.model, argument);
+        const node = if (at_call) |at| at.node else if (receiver) w.model.parentOf(holder).? else w.model.parentOf(argument).?;
+        const call: ?Ast.full.Call = if (at_call != null) null else tree.fullCall(&buffer, node).?;
         // A local that is a pointer gives a method, or a field's address, what it points at.
-        if (!w.param and (receiver or place != mention)) {
+        if (!pointer and (receiver or place != mention)) {
             if (try w.c.facts.resolve(w.file, mention) == .pointer) return 0;
         }
         if (receiver and place != mention and try w.c.facts.resolve(w.file, place) != .instance) return 0;
-        const decl = (try w.callee(node, call)) orelse return 0;
-        const origin = (try w.c.facts.origin(decl)) orelse decl;
-        const index = if (receiver) 0 else parameterAt(w.c, w.file, call, origin, std.mem.findScalar(Ast.Node.Index, call.ast.params, if (tree.nodeTag(holder) == .address_of) holder else place).?);
-        const found = try undefines(w.c, origin, index, w.depth + 1);
-        if (found.mask == 0) return 0;
+        // What a call reaches that is not known here (a pointer, a field a caller fills) may
+        // give it `undefined`: all of what it is handed, and the read after it undecided.
+        const decls = (try w.callees(node, if (at_call) |at| at.function else call.?.ast.fn_expr, call)) orelse {
+            w.unknown = true;
+            return part_handed orelse all;
+        };
+        var left: u64 = 0;
+        // A per-build choice gives what any of its functions gives.
+        for (decls) |decl| {
+            const origin = (try w.c.facts.origin(decl)) orelse decl;
+            const index = if (receiver) 0 else if (at_call) |at| at.position else parameterAt(w.c, w.file, call.?, origin, std.mem.findScalar(Ast.Node.Index, call.?.ast.params, argument).?);
+            const found = try undefines(w.c, origin, index, w.depth + 1);
+            if (!found.known) w.unknown = true;
+            // The path past the call goes on from its success where its failure leaves (`try`,
+            // `catch return`), which takes what the failure leaves with it; else from either.
+            const failure = w.failureExit(node, origin);
+            const going = if (failure == .goes_on) found.mask | found.failing else found.mask;
+            left |= w.fitted(going, found.owner, part_handed);
+            switch (failure) {
+                .goes_on, .stops => {},
+                .fails => w.failing |= w.fitted(found.failing, found.owner, part_handed),
+                .returns => w.leaving |= w.fitted(found.failing, found.owner, part_handed),
+            }
+        }
+        return left;
+    }
+
+    /// What of the local `found`, parts of the callee's parameter's memory (of `theirs`), is:
+    /// the part handed where one is, those parts where the memory is the local's own type,
+    /// else all of it.
+    fn fitted(w: *const Walk, found: u64, theirs: ?Owner, part_handed: ?u64) u64 {
+        const all = std.math.maxInt(u64);
+        if (found == 0) return 0;
         if (part_handed) |handed| return handed;
-        if (found.mask == all) return all;
+        if (found == all) return all;
         const owner = w.owner orelse return all;
-        const theirs = found.owner orelse return all;
-        return if (std.meta.eql(owner, theirs)) found.mask else all;
+        return if (std.meta.eql(owner, theirs orelse return all)) found else all;
+    }
+
+    /// Where a call's failure goes: on past the call (a `catch` that goes on), out of the
+    /// function by its error (`try`), out by a `return` (`catch return`), or nowhere (`catch
+    /// unreachable`, a call that cannot fail).
+    fn failureExit(w: *const Walk, node: Ast.Node.Index, function: Facts.Decl) enum { goes_on, fails, returns, stops } {
+        if (w.succeeding == node) return .stops;
+        const tree = &w.c.project.at(function.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, w.c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return .goes_on;
+        const result = proto.ast.return_type.unwrap() orelse return .goes_on;
+        if (tree.nodeTag(result) != .error_union and !Model.inferredErrors(tree, result)) return .stops;
+        const parent = w.model.parentOf(node) orelse return .goes_on;
+        return switch (w.tree.nodeTag(parent)) {
+            .@"try" => .fails,
+            .@"catch" => {
+                const lhs, const rhs = w.tree.nodeData(parent).node_and_node;
+                if (lhs != node) return .goes_on;
+                return switch (w.tree.nodeTag(rhs)) {
+                    .@"return" => .returns,
+                    .unreachable_literal => .stops,
+                    else => .goes_on,
+                };
+            },
+            else => .goes_on,
+        };
+    }
+
+    /// The functions a call may reach: the one it names (`callee`), or each of a per-build
+    /// choice, through a pointer to them too; null where what it reaches is not known here
+    /// (a function pointer the program's callers give, a field nothing here fills).
+    fn callees(w: *Walk, node: Ast.Node.Index, function: Ast.Node.Index, call: ?Ast.full.Call) Context.Error!?[]const Facts.Decl {
+        var found: std.ArrayList(Facts.Decl) = .empty;
+        if (call) |full| if (try w.callee(node, full)) |decl| {
+            try found.append(w.c.allocator, decl);
+            return found.items;
+        };
+        if (try functionsOf(w.c.allocator, try w.c.facts.resolve(w.file, function), &found)) return found.items;
+        // Through std's Io.Reader or Io.Writer vtable (`w.vtable.drain(w, …)`): std's own
+        // implementations leave neither the interface nor its buffer `undefined`
+        // (`std_interface_implementations`), and the program's are read where it installs them.
+        const slot = (try vtableSlot(w.c, w.file, function)) orelse return null;
+        return installed(w.c, slot);
     }
 
     /// Whether `place`, reached from `mention` by fields and elements, lies in the local's own
@@ -567,7 +728,7 @@ const Walk = struct {
                 else => return false,
             };
             // A parameter's pointer is how its memory is reached.
-            if (!(w.param and inner == mention) and try w.pointerAt(inner)) return false;
+            if (!(w.viaPointer(mention) and inner == mention) and try w.pointerAt(inner)) return false;
             at = inner;
         }
         return true;
@@ -608,11 +769,33 @@ const Walk = struct {
     /// returns, walking on from `mention`, which leaves them so, to the end of `body`. One that
     /// reads it there (its own fault) is taken as leaving it.
     fn leftUndefined(w: *Walk, mention: Ast.Node.Index, left: u64, body: Ast.Node.Index) Context.Error!bool {
+        const exits = try w.leftExits(mention, left, body);
+        return exits.success or exits.failure;
+    }
+
+    /// The exits of a parameter's function that leave its memory `undefined`, the parts in
+    /// `left`, walking on from `mention`, which leaves them so, to the end of `body`: one that
+    /// returns an error (`return error.X`, a `try`), and one that returns otherwise (running off
+    /// the end too). An `errdefer` runs at the first only. One that reads it there (its own
+    /// fault) is taken as leaving it on both.
+    fn leftExits(w: *Walk, mention: Ast.Node.Index, left: u64, body: Ast.Node.Index) Context.Error!struct { success: bool, failure: bool } {
+        var at = mention;
+        while (w.model.parentOf(at)) |up| : (at = up) {
+            if (at == body) break;
+            if (w.tree.nodeTag(up) == .@"errdefer") return .{ .success = false, .failure = true };
+        }
         var from: Walk = .init(w.c, w.file, w.local, true, w.depth);
         from.every_exit = true;
         try from.collect();
         const past = try from.onFrom(mention, left, body);
-        return from.read != null or from.exit_unwritten or past.at == .unwritten or past.at == .done;
+        const both = from.read != null or past.at == .done;
+        return .{ .success = both or from.exit_success or past.at == .unwritten, .failure = both or from.exit_failure };
+    }
+
+    /// A path leaves by `node`, a `return` or a `try`, with the memory not written whole.
+    fn exited(w: *Walk, node: Ast.Node.Index) void {
+        w.exit_unwritten = true;
+        if (w.tree.nodeTag(node) == .@"try" or errorReturn(w.tree, w.model, node)) w.exit_failure = true else w.exit_success = true;
     }
 
     /// Where an alias of the local, taken before `origin` (a call that leaves it `undefined`),
@@ -655,6 +838,8 @@ const Walk = struct {
             if (tree.fullCall(&buffer, goes) != null or isBlock(tree, goes)) continue;
             const binding = w.declaredAt(goes) orelse return tree.nodeMainToken(value);
             if (tree.fullVarDecl(goes).?.ast.init_node.unwrap() != result) return tree.nodeMainToken(value);
+            // An alias the walk follows (`aliases`): its mentions are the local's.
+            if (std.mem.findScalar(Model.Declaration.Id, w.aliases, binding) != null) continue;
             if (w.mentionedAfter(binding, origin, scope)) return tree.nodeMainToken(value);
         }
         return null;
@@ -838,7 +1023,7 @@ const Walk = struct {
             .@"return", .@"break", .@"continue", .unreachable_literal => {
                 const past = if (w.mentioned(node)) try w.simple(node, state) else state;
                 if (past.at == .done) return .done;
-                if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and w.exitsBy(node)) w.exit_unwritten = true;
+                if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and w.exitsBy(node)) w.exited(node);
                 w.jump(node, past);
                 return .left;
             },
@@ -1341,13 +1526,15 @@ const Walk = struct {
         return null;
     }
 
-    /// Whether `node` names the local itself, or a parameter's pointer's memory (`p.*`).
+    /// Whether `node` names the local itself, or a parameter's or an alias's pointer's memory
+    /// (`p.*`).
     fn isLocal(w: *const Walk, node: Ast.Node.Index) bool {
         var at = node;
-        if (w.param and w.tree.nodeTag(at) == .deref) at = w.tree.nodeData(at).node;
+        if (w.tree.nodeTag(at) == .deref and w.tree.nodeTag(w.tree.nodeData(at).node) == .identifier and w.viaPointer(w.tree.nodeData(at).node)) at = w.tree.nodeData(at).node;
         if (w.tree.nodeTag(at) != .identifier) return false;
         const ref = w.model.reference(at) orelse return false;
-        return ref.declaration == w.local;
+        const decl = ref.declaration orelse return false;
+        return decl == w.local or std.mem.findScalar(Model.Declaration.Id, w.aliases, decl) != null;
     }
 
     /// Whether `node` is an `if` or a `switch` whose condition tests the result of the call
@@ -1446,8 +1633,13 @@ const Walk = struct {
         for (w.returns.items) |each| {
             if (each == node or !w.exitsBy(each)) continue;
             const token = w.tree.firstToken(each);
-            if (token >= first and token <= last) w.exit_unwritten = true;
+            if (token >= first and token <= last) w.exited(each);
         }
+        // A `try` in it returns its error with the memory as it is here.
+        if (w.every_exit) for (w.tries.items) |each| {
+            const token = w.tree.firstToken(each);
+            if (token >= first and token <= last) w.exited(each);
+        };
         w.jumpsIn(node, state);
         const Found = struct {
             use: Use,
@@ -1543,12 +1735,12 @@ const Walk = struct {
         if (unevaluated(tree, w.model, mention)) return null;
         switch (tree.nodeTag(parent)) {
             .field_access => {
-                // A parameter's slice or array pointer carries its own length.
-                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len") and (w.param or w.array())) return null;
                 const grand = w.model.parentOf(parent) orelse return read;
                 var buffer: [1]Ast.Node.Index = undefined;
                 // A method called on it is handed it as its receiver.
                 if (tree.fullCall(&buffer, grand)) |call| if (call.ast.fn_expr == parent) return try w.handedTo(grand, call, 0, true, true, key);
+                // A parameter's slice or array pointer carries its own length.
+                if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len") and (w.viaPointer(mention) or w.array())) return null;
                 return w.part(parent, w.partAt(parent, true), true, key);
             },
             .array_access => {
@@ -1558,11 +1750,11 @@ const Walk = struct {
             .assign => {
                 // A parameter given another address no longer names the caller's memory.
                 const target, const value = tree.nodeData(parent).node_and_node;
-                if (target != mention or w.param) return read;
+                if (target != mention or w.viaPointer(mention)) return read;
                 return w.assignedWhole(parent, value);
             },
             .deref => {
-                if (!w.param) return read;
+                if (!w.viaPointer(mention)) return read;
                 const grand = w.model.parentOf(parent) orelse return read;
                 if (tree.nodeTag(grand) == .assign and tree.nodeData(grand).node_and_node[0] == parent) return w.assignedWhole(grand, tree.nodeData(grand).node_and_node[1]);
                 return switch (tree.nodeTag(grand)) {
@@ -1571,7 +1763,7 @@ const Walk = struct {
                     else => read,
                 };
             },
-            .address_of => return if (w.param) read else try w.given(parent, true, key),
+            .address_of => return if (w.viaPointer(mention)) read else try w.given(parent, true, key),
             .slice_open, .slice, .slice_sentinel => {
                 if ((tree.fullSlice(parent) orelse return read).ast.sliced != mention) return read;
                 // `buf[0..n]` with n the count a call that wrote that prefix returned.
@@ -1593,8 +1785,8 @@ const Walk = struct {
                     if (tree.nodeTag(grand) == .address_of or tree.nodeTag(grand) == .field_access) return read;
                     return .{ .key = key, .effect = .{ .get = at orelse return read } };
                 }
-                // A parameter's pointer handed on hands on the memory it points at.
-                return if (w.param) try w.given(mention, true, key) else read;
+                // A parameter's pointer, or an alias, handed on hands on the memory it points at.
+                return if (w.viaPointer(mention)) try w.given(mention, true, key) else read;
             },
         }
     }
@@ -1612,7 +1804,7 @@ const Walk = struct {
     fn partSet(w: *Walk, access: Ast.Node.Index, field: bool) bool {
         const grand = w.model.parentOf(access) orelse return false;
         if (w.tree.nodeTag(grand) != .assign or w.tree.nodeData(grand).node_and_node[0] != access) return false;
-        if (w.param) return true;
+        if (w.throughPointer(access)) return true;
         return if (field) w.structure() else w.array();
     }
 
@@ -1699,7 +1891,9 @@ const Walk = struct {
             if (!try w.typed(entry, index, false)) return handed;
             return try w.guarded(node, entry);
         }
-        if (!try Program.owns(w.c, origin.file)) return handed;
+        // std's own: what it reads of what it is given, where that is known; nothing it writes
+        // is taken as written.
+        if (!try Program.owns(w.c, origin.file)) return try w.reading(origin, index, whole, key) orelse handed;
         if (try writesWhole(w.c, origin, index, w.depth + 1)) return if (whole and leaves) written else null;
         // What it returns may hold what it keeps: followed here as a holder.
         if (try keepsOnly(w.c, origin, index, w.depth + 1)) {
@@ -1707,12 +1901,16 @@ const Walk = struct {
             return if (try holderKept(w.c, w.file, node, w.depth)) null else handed;
         }
         if (try writesParts(w.c, origin, index, w.depth + 1)) return null;
-        // One that reads only some parts of what it is given, through a pointer to the same
-        // type, reads those.
-        if (!whole) return handed;
-        const owner = w.owner orelse return handed;
-        const found = (try needs(w.c, origin, index, w.depth + 1)) orelse return handed;
-        if (!std.meta.eql(owner, found.owner)) return handed;
+        return try w.reading(origin, index, whole, key) orelse handed;
+    }
+
+    /// A function given all of the local, through a pointer to its type, that reads only some
+    /// of its parts: reads those (`needs`). Null where what it reads is not known.
+    fn reading(w: *Walk, origin: Facts.Decl, index: usize, whole: bool, key: Ast.TokenIndex) Context.Error!?Use {
+        if (!whole) return null;
+        const owner = w.owner orelse return null;
+        const found = (try needs(w.c, origin, index, w.depth + 1)) orelse return null;
+        if (!std.meta.eql(owner, found.owner)) return null;
         return .{ .key = key, .effect = .{ .needs = found.mask } };
     }
 
@@ -2485,9 +2683,9 @@ fn placeOf(tree: *const Ast, model: *const Model, mention: Ast.Node.Index) Ast.N
 }
 
 /// The place (`placeOf`) a mention gives a call, as the call's receiver (`x.deinit(gpa)`) or
-/// by address (`f(&x.list)`), or for a parameter's pointer, as it is (`f(p)`); null where it
-/// gives none.
-fn handedPlace(tree: *const Ast, model: *const Model, mention: Ast.Node.Index, param: bool) ?Ast.Node.Index {
+/// by address (`f(&x.list)`), or for a parameter's or an alias's pointer, as it is (`f(p)`),
+/// `@call`'s tuple included; null where it gives none.
+fn handedPlace(tree: *const Ast, model: *const Model, mention: Ast.Node.Index, pointer: bool) ?Ast.Node.Index {
     var buffer: [1]Ast.Node.Index = undefined;
     const place = placeOf(tree, model, mention);
     const holder = model.parentOf(place) orelse return null;
@@ -2497,15 +2695,192 @@ fn handedPlace(tree: *const Ast, model: *const Model, mention: Ast.Node.Index, p
             return if (call.ast.fn_expr == holder) place else null;
         },
         .address_of => {
+            if (atCall(tree, model, holder) != null) return place;
             const call = tree.fullCall(&buffer, model.parentOf(holder) orelse return null) orelse return null;
             return if (std.mem.findScalar(Ast.Node.Index, call.ast.params, holder) != null) place else null;
         },
         else => {
-            if (!param or place != mention) return null;
+            if (!pointer or place != mention) return null;
+            if (atCall(tree, model, place) != null) return place;
             const call = tree.fullCall(&buffer, holder) orelse return null;
             return if (std.mem.findScalar(Ast.Node.Index, call.ast.params, place) != null) place else null;
         },
     }
+}
+
+/// `@call(modifier, f, .{…, argument, …})`: the call, the function it names, and the argument's
+/// place among the tuple's elements, which are f's arguments.
+fn atCall(tree: *const Ast, model: *const Model, argument: Ast.Node.Index) ?struct { node: Ast.Node.Index, function: Ast.Node.Index, position: usize } {
+    const tuple = model.parentOf(argument) orelse return null;
+    var elements: [2]Ast.Node.Index = undefined;
+    const literal = tree.fullArrayInit(&elements, tuple) orelse return null;
+    if (literal.ast.type_expr != .none) return null;
+    const builtin = model.parentOf(tuple) orelse return null;
+    switch (tree.nodeTag(builtin)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(builtin)), "@call")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const params = tree.builtinCallParams(&buffer, builtin) orelse return null;
+    if (params.len != 3 or params[2] != tuple) return null;
+    return .{ .node = builtin, .function = params[1], .position = std.mem.findScalar(Ast.Node.Index, literal.ast.elements, argument).? };
+}
+
+/// Adds to `found` each function `value` is: itself, each of a per-build choice, or what a
+/// pointer points at. False where any of it is not a function known here.
+fn functionsOf(gpa: std.mem.Allocator, value: Facts.Value, found: *std.ArrayList(Facts.Decl)) Context.Error!bool {
+    switch (value) {
+        .function => |decl| try found.append(gpa, decl),
+        .alternatives => |each| for (each) |one| if (!try functionsOf(gpa, one, found)) return false,
+        .pointer => |to| return functionsOf(gpa, to.*, found),
+        else => return false,
+    }
+    return true;
+}
+
+/// std 0.17.0's own implementations of Io.Reader's and Io.Writer's vtables, each read in std's
+/// source (2026-11-01): none gives the interface it is handed (`*Reader`, `*Writer`, the one a
+/// `stream` writes to) or its buffer `undefined`; what `undefined` they spell is their own
+/// locals'. The defaults a vtable leaves unnamed are std's too. A vtable the program installs
+/// is read where it installs it (`installed`).
+const std_interface_implementations = [_][]const u8{
+    // Io/Writer.zig: the defaults, fixed, failing, discarding, hashed and allocating writers.
+    "Io/Writer.zig:392 defaultFlush",                   "Io/Writer.zig:419 defaultRebase",                   "Io/Writer.zig:2426 unimplementedSendFile",
+    "Io/Writer.zig:398 noopFlush",                      "Io/Writer.zig:2437 fixedDrain",                     "Io/Writer.zig:2325 failingDrain",
+    "Io/Writer.zig:2332 failingSendFile",               "Io/Writer.zig:2339 failingRebase",                  "Io/Writer.zig:2368 Discarding.drain",
+    "Io/Writer.zig:2379 Discarding.sendFile",           "Io/Writer.zig:2469 unreachableDrain",               "Io/Writer.zig:2476 unreachableRebase",
+    "Io/Writer.zig:2541 Hashed.drain",                  "Io/Writer.zig:2622 Hashing.drain",                  "Io/Writer.zig:2841 Allocating.drain",
+    "Io/Writer.zig:2865 Allocating.sendFile",           "Io/Writer.zig:2884 growingRebase",
+    // Io/Reader.zig: the defaults, failing, ending, fixed and hashed readers.
+                     "Io/Reader.zig:196 defaultDiscard",
+    "Io/Reader.zig:450 defaultReadVec",                 "Io/Reader.zig:1432 defaultRebase",                  "Io/Reader.zig:1836 endingStream",
+    "Io/Reader.zig:1843 endingReadVec",                 "Io/Reader.zig:1849 endingDiscard",                  "Io/Reader.zig:1855 endingRebase",
+    "Io/Reader.zig:1861 failingStream",                 "Io/Reader.zig:1868 failingDiscard",                 "Io/Reader.zig:2013 Hashed.stream",
+    "Io/Reader.zig:2023 Hashed.readVec",                "Io/Reader.zig:2048 Hashed.discard",                 "Io/Reader/Limited.zig:28 stream",
+    "Io/Reader/Limited.zig:52 discard",
+    // Files, sockets and the multiplexed reader.
+                    "Io/File/Reader.zig:199 stream",                     "Io/File/Reader.zig:231 readVec",
+    "Io/File/Reader.zig:300 discard",                   "Io/File/Writer.zig:89 drain",                       "Io/File/Writer.zig:134 sendFile",
+    "Io/File/MultiReader.zig:149 stream",               "Io/File/MultiReader.zig:158 discard",               "Io/File/MultiReader.zig:166 readVec",
+    "Io/File/MultiReader.zig:174 rebase",               "Io/net.zig:1354 Socket.Reader.streamImpl",          "Io/net.zig:1362 Socket.Reader.readVec",
+    "Io/net.zig:1439 Stream.Writer.drain",              "Io/net.zig:1462 Stream.Writer.sendFile",
+    // HTTP bodies, TLS, the compressors and decompressors, PDB streams, the AST renderer.
+               "http.zig:509 contentLengthStream",
+    "http.zig:527 contentLengthDiscard",                "http.zig:541 chunkedStream",                        "http.zig:610 chunkedDiscard",
+    "http.zig:886 contentLengthDrain",                  "http.zig:895 noneDrain",                            "http.zig:903 elidingDrain",
+    "http.zig:917 elidingSendFile",                     "http.zig:944 noneSendFile",                         "http.zig:952 contentLengthSendFile",
+    "http.zig:961 chunkedSendFile",                     "http.zig:997 chunkedDrain",                         "crypto/tls/Client.zig:965 drain",
+    "crypto/tls/Client.zig:997 flush",                  "crypto/tls/Client.zig:1124 stream",                 "crypto/tls/Client.zig:1132 readVec",
+    "compress/flate/Compress.zig:345 drain",            "compress/flate/Compress.zig:356 flush",             "compress/flate/Compress.zig:371 rebase",
+    "compress/flate/Compress.zig:1631 Raw.drain",       "compress/flate/Compress.zig:1741 Raw.flush",        "compress/flate/Compress.zig:1752 Raw.rebase",
+    "compress/flate/Compress.zig:1877 drain",           "compress/flate/Compress.zig:1964 flush",            "compress/flate/Compress.zig:2126 Huffman.drain",
+    "compress/flate/Compress.zig:2332 Huffman.flush",   "compress/flate/Compress.zig:2347 Huffman.rebase",   "compress/flate/Decompress.zig:105 rebaseFallible",
+    "compress/flate/Decompress.zig:121 discardDirect",  "compress/flate/Decompress.zig:144 discardIndirect", "compress/flate/Decompress.zig:164 readVec",
+    "compress/flate/Decompress.zig:244 streamDirect",   "compress/flate/Decompress.zig:249 streamIndirect",  "compress/zstd/Decompress.zig:110 streamDirect",
+    "compress/zstd/Decompress.zig:115 streamIndirect",  "compress/zstd/Decompress.zig:122 rebaseFallible",   "compress/zstd/Decompress.zig:159 discardDirect",
+    "compress/zstd/Decompress.zig:182 discardIndirect", "compress/zstd/Decompress.zig:202 readVec",          "compress/xz/Decompress.zig:104 readVec",
+    "compress/xz/Decompress.zig:109 stream",            "compress/xz/Decompress.zig:115 discard",            "compress/lzma.zig:685 readVec",
+    "compress/lzma.zig:690 stream",                     "compress/lzma.zig:696 discard",                     "debug/Pdb.zig:1068 stream",
+    "zig.zig:648 drain",                                "zig.zig:660 flush",                                 "zig/Ast/Render.zig:943 drainNoNewline",
+};
+
+/// A function of std's Io.Reader or Io.Writer vtable a call reaches: `x.vtable.name(…)` with `x`
+/// one of those interfaces (or a pointer to one), and the vtable field's name.
+const Slot = struct { interface: enum { reader, writer }, name: []const u8 };
+
+fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Context.Error!?Slot {
+    const tree = &c.project.at(file).file.tree;
+    if (tree.nodeTag(function) != .field_access) return null;
+    const table, const name = tree.nodeData(function).node_and_token;
+    if (tree.nodeTag(table) != .field_access) return null;
+    const holder, const field = tree.nodeData(table).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(field), "vtable")) return null;
+    var value = try c.facts.resolve(file, holder);
+    if (value == .pointer) value = value.pointer.*;
+    const container = switch (value) {
+        .instance => |container| container,
+        else => return null,
+    };
+    for ([_][]const u8{ "Io.Reader", "Io.Writer" }, [_]@FieldType(Slot, "interface"){ .reader, .writer }) |path, interface| {
+        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| {
+            const declared = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+            if (declared == .container and std.meta.eql(declared.container, container)) return .{ .interface = interface, .name = tree.tokenSlice(name) };
+        }
+    }
+    return null;
+}
+
+/// The functions the program, outside std, installs in a vtable's slot: each struct literal's
+/// field of that name, and each assignment to a field of that name, whose value is a function
+/// (or a choice of them). Null where one of them is anything else that may be a function there
+/// (a parameter, a value not known here): what it installs is not known. std's own are none of
+/// these (`std_interface_implementations`).
+fn installed(c: *Context, slot: Slot) Context.Error!?[]const Facts.Decl {
+    var found: std.ArrayList(Facts.Decl) = .empty;
+    for (0..c.project.count()) |i| {
+        const file: Project.FileId = @fromBackingInt(@intCast(i));
+        if (try inStd(c, file)) continue;
+        const tree = &c.project.at(file).file.tree;
+        const model = &c.project.at(file).model;
+        for (tree.nodes.items(.tag), 0..) |tag, n| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+            const value: Ast.Node.Index = switch (tag) {
+                .assign => value: {
+                    const target, const stored = tree.nodeData(node).node_and_node;
+                    if (tree.nodeTag(target) != .field_access) continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), slot.name)) continue;
+                    break :value stored;
+                },
+                else => value: {
+                    // A struct literal's field `.name = value`: the token before `=` names it.
+                    const parent = model.parentOf(node) orelse continue;
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const literal = tree.fullStructInit(&buffer, parent) orelse continue;
+                    if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, node) == null) continue;
+                    const field_name = tree.firstToken(node) - 2;
+                    if (!std.mem.eql(u8, tree.tokenSlice(field_name), slot.name)) continue;
+                    break :value node;
+                },
+            };
+            const resolved = try c.facts.resolve(file, value);
+            if (try functionsOf(c.allocator, resolved, &found)) continue;
+            switch (resolved) {
+                // Plainly no function: a field of that name holding something else.
+                .literal, .primitive, .scalar, .instance, .array, .container, .error_set, .error_union => {},
+                else => return null,
+            }
+        }
+    }
+    return found.items;
+}
+
+/// The locals that hold the address of `local`'s memory as it is, with no step through it:
+/// `const p = &x` for a local, `const q = p` for a parameter's pointer (`param`), and one of
+/// those again (`const r = q`).
+fn aliasesOf(gpa: std.mem.Allocator, tree: *const Ast, model: *const Model, local: Model.Declaration.Id, param: bool) Context.Error![]const Model.Declaration.Id {
+    var found: std.ArrayList(Model.Declaration.Id) = .empty;
+    var grown = true;
+    while (grown) {
+        grown = false;
+        for (model.declarations, 0..) |decl, d| {
+            if (decl.kind != .variable) continue;
+            const id: Model.Declaration.Id = @fromBackingInt(@intCast(d));
+            if (id == local or std.mem.findScalar(Model.Declaration.Id, found.items, id) != null) continue;
+            const variable = tree.fullVarDecl(decl.node) orelse continue;
+            const init = ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
+            const address = tree.nodeTag(init) == .address_of;
+            const spelled = ungrouped(tree, if (address) tree.nodeData(init).node else init);
+            if (tree.nodeTag(spelled) != .identifier) continue;
+            const of = (model.reference(spelled) orelse continue).declaration orelse continue;
+            // The local's address, or a parameter's pointer as it is; an alias's, as it is.
+            const alias = if (of == local) address != param else !address and std.mem.findScalar(Model.Declaration.Id, found.items, of) != null;
+            if (!alias) continue;
+            try found.append(gpa, id);
+            grown = true;
+        }
+    }
+    return found.items;
 }
 
 /// The name a `for`'s capture at `position` binds (`|x, *slot|`), where it is a pointer's as
@@ -3420,7 +3795,46 @@ const Calls = struct {
     remembered_reads: usize = 0,
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,
+    /// The `undefines` readings cut at the depth, unread, deepest last (`readDeferred`).
+    deferred: std.ArrayList(Key) = .empty,
+    /// What the call's own walk read, whether a reading from the top is under way, and whether
+    /// one came back to what the walk read without keeping it: a cycle longer than the depth,
+    /// which no reading from the top settles.
+    seen: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    topping: bool = false,
+    wrapped: bool = false,
 };
+
+/// Reads each function a reading cut at the depth left unread, from the top, deepest first:
+/// what a function leaves undefined does not depend on who asks, so its answer, kept, settles
+/// the readings above it the next time they ask, and a chain of any length is read a stretch
+/// at a time. A function is read again only where an answer was kept since its last reading,
+/// all it leans on; a reading that comes back to what the call's walk read is in a cycle longer
+/// than the depth, and ends them. False where no answer was kept, the readings came back, or
+/// `budget` readings did not settle them.
+fn readDeferred(c: *Context) Context.Error!bool {
+    const memo = try c.facts.memo(Calls);
+    const before = memo.left.count();
+    var tried: std.AutoHashMapUnmanaged(Calls.Key, usize) = .empty;
+    defer tried.deinit(c.allocator);
+    var budget: usize = 1024;
+    memo.topping = true;
+    memo.wrapped = false;
+    defer memo.topping = false;
+    while (memo.deferred.pop()) |key| {
+        if (memo.left.contains(key)) continue;
+        if (tried.get(key)) |kept| if (kept == memo.left.count()) continue;
+        if (budget == 0) return false;
+        budget -= 1;
+        try tried.put(c.allocator, key, memo.left.count());
+        const mark = memo.deferred.items.len;
+        _ = try undefines(c, key.decl, key.index, 0);
+        if (memo.wrapped) return false;
+        // Cut again below it: the deeper ones first, then it once more.
+        if (!memo.left.contains(key)) try memo.deferred.insert(c.allocator, mark, key);
+    }
+    return memo.left.count() != before;
+}
 
 /// What of a parameter's memory a function may read before writing it: the parts in `mask`, of
 /// the struct `owner` (or the array of that many elements) the parameter points at.
@@ -3477,10 +3891,19 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
         memo.lowest = @min(memo.lowest, at);
         return each.sofar;
     };
+    const cut: Left = .{ .mask = std.math.maxInt(u64), .owner = null, .failing = std.math.maxInt(u64) };
+    // Once one comes back, the rest of the reading from the top is cut with it.
+    if (memo.topping and (memo.wrapped or memo.seen.contains(key))) {
+        memo.cuts += 1;
+        memo.wrapped = true;
+        return cut;
+    }
     if (depth > undefines_depth_limit) {
         memo.cuts += 1;
-        return .{ .mask = std.math.maxInt(u64), .owner = null };
+        try memo.deferred.append(c.allocator, key);
+        return cut;
     }
+    if (!memo.topping) try memo.seen.put(c.allocator, key, {});
     const at = memo.reading.items.len;
     const lowest = memo.lowest;
     try memo.reading.append(c.allocator, .{ .key = key, .sofar = .{ .mask = 0, .owner = null } });
@@ -3490,8 +3913,8 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
         memo.lowest = std.math.maxInt(usize);
         const shown = try undefinesRead(c, decl, index, depth);
         const sofar = &memo.reading.items[at].sofar;
-        const settled: Left = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner };
-        if (memo.lowest > at or settled.mask == sofar.mask) {
+        const settled: Left = .{ .mask = shown.mask | sofar.mask, .owner = shown.owner, .failing = shown.failing | sofar.failing, .known = shown.known and sofar.known };
+        if (memo.lowest > at or (settled.mask == sofar.mask and settled.failing == sofar.failing)) {
             const above = memo.lowest < at;
             // Leaning on a reading above it, it is kept for that one's pass; cut short, for the
             // outermost reading's: read once a pass either way, and never kept past it.
@@ -3534,19 +3957,45 @@ fn undefinesRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
     var mask: u64 = 0;
+    var failing: u64 = 0;
     for (try walk.undefinings()) |again| {
-        if (try walk.leftUndefined(again.mention, again.left, found.body)) mask |= again.left;
+        const exits = try walk.leftExits(again.mention, again.left, found.body);
+        if (exits.success) mask |= again.left;
+        if (exits.failure) failing |= again.left;
     }
+    var known = true;
     for (walk.mentions.items) |mention| {
+        walk.unknown = false;
+        walk.failing = 0;
+        walk.leaving = 0;
         const left = try walk.undoneBy(mention);
-        if (left != 0 and try walk.leftUndefined(mention, left, found.body)) mask |= left;
+        const unknown = walk.unknown;
+        // What the call's failure leaves with: returned at once, by an error or by a `return`.
+        failing |= walk.failing | walk.leaving;
+        mask |= walk.leaving;
+        if (unknown and (walk.failing | walk.leaving) != 0) known = false;
+        if (left == 0) continue;
+        const exits = try walk.leftExits(mention, left, found.body);
+        if (exits.success) mask |= left;
+        if (exits.failure) failing |= left;
+        if (unknown and (exits.success or exits.failure)) known = false;
     }
-    return .{ .mask = mask, .owner = walk.owner };
+    return .{ .mask = mask, .owner = walk.owner, .failing = failing, .known = known };
 }
 
 /// The parts of what a parameter points at a function leaves `undefined` (`undefines`), of
 /// `owner`'s struct or array; every bit set, all of it.
-const Left = struct { mask: u64, owner: ?Owner };
+const Left = struct {
+    /// What it leaves on an exit that does not return an error.
+    mask: u64,
+    owner: ?Owner,
+    /// What it leaves on an exit that returns an error, which a caller's `try` passes on and a
+    /// `catch` that goes on goes on with.
+    failing: u64 = 0,
+    /// False where a call it was handed to reaches a function not known here, which may give
+    /// it `undefined` (`Walk.unknown`): the mask holds that as all it was handed.
+    known: bool = true,
+};
 
 /// What of the memory its pointer parameter `index` points at the program's function `decl`
 /// may read before writing it, on any path, as parts of that memory: null where it may read

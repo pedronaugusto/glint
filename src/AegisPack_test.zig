@@ -1996,13 +1996,13 @@ test "A019 leaves a use after cleanup of a local A003 follows to A003 where it r
     try std.testing.expectEqual(@as(usize, 0), shared.undefined_read + shared.undefined_undecided);
     const own = try cleanupAndUndefined(after, false);
     try std.testing.expectEqual(@as(usize, 1), own.undefined_read);
-    // Read through an alias taken before its deinit: undecided by whichever rule has it, cleared
-    // by neither.
+    // Read through an alias taken before its deinit: A003's where it runs, and A019's own finding
+    // where it is off (the alias followed), cleared by neither.
     const alias = head ++ "pub fn f(gpa: std.mem.Allocator) !usize { var b = try Bytes.init(gpa, 4); const p = &b; b.deinit(gpa); return p.len(); }";
     const shared_alias = try cleanupAndUndefined(alias, true);
     try std.testing.expect(shared_alias.cleanup + shared_alias.cleanup_undecided != 0);
     try std.testing.expectEqual(@as(usize, 0), shared_alias.undefined_read + shared_alias.undefined_undecided);
     const own_alias = try cleanupAndUndefined(alias, false);
-    try std.testing.expectEqual(@as(usize, 0), own_alias.undefined_read);
-    try std.testing.expectEqual(@as(usize, 1), own_alias.undefined_undecided);
+    try std.testing.expectEqual(@as(usize, 1), own_alias.undefined_read);
+    try std.testing.expectEqual(@as(usize, 0), own_alias.undefined_undecided);
 }
