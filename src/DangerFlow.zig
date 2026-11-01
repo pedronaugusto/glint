@@ -21,7 +21,7 @@ const Ast = std.zig.Ast;
 /// A009: input that indexes, slices, bounds a loop or names a path before an aegis
 /// `input.Untrusted` parser has refined it.
 pub fn input(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, Danger.peer_input);
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -100,7 +100,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const call = tree.fullCall(&buffer, node) orelse continue;
                 const reached = try Taint.reached(c, flow, c.file, call);
                 const decl = reached.decl orelse continue;
-                const dir = Taint.directoryType(flow) orelse continue;
+                const dir = Taint.directoryType(flow.flow) orelse continue;
                 if (decl.file != dir.file) continue;
                 const names = try parameters(c, decl);
                 for (reached.args, 0..) |arg, position| {
@@ -123,7 +123,7 @@ const loop_message = "a number from input bounds a loop: a peer chooses how long
 /// `@truncate` keeps the low bits by intent and is no conversion that fails. Float arithmetic
 /// gives an infinity or a NaN where an integer's would stop, so it is none of A010's.
 pub fn integers(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, Danger.peer_input);
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -211,7 +211,7 @@ fn amountFits(c: *Context, operand: Ast.Node.Index) Context.Error!bool {
 /// and for an exact division a remainder, so its dividend too), an exact shift's operands
 /// (`@shlExact`, `@shrExact`: bits shifted out, or an amount past the width) and a shift's amount
 /// (`@shlWithOverflow`). Whether `name` is one of them, judged.
-fn arithmeticBuiltin(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, name: []const u8) Context.Error!bool {
+fn arithmeticBuiltin(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, name: []const u8) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const Operand = enum { divisor, both, amount };
     const table = [_]struct { []const u8, Operand }{
@@ -242,7 +242,7 @@ fn arithmeticBuiltin(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.
 /// A012: work sized by a number from input without a stated limit: an allocation, a
 /// container's growth or a read sized by one, and any read with `.unlimited`.
 pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, Danger.peer_input);
     const tree = &c.project.at(c.file).file.tree;
     const sizes = [_][]const u8{ "n", "len", "new_len", "new_n", "new_capacity", "additional_count", "num", "capacity", "count", "new_size", "size" };
     for (tree.nodes.items(.tag), 0..) |_, i| {
@@ -254,9 +254,9 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const decl = reached.decl orelse continue;
         if (!reached.std) continue;
         const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
-        const from_reader = if (Taint.readerType(flow)) |r| r.file == decl.file else false;
+        const from_reader = if (Taint.readerType(flow.flow)) |r| r.file == decl.file else false;
         // A reader over the program's own bytes (`Reader.fixed`) reads no peer's size.
-        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
+        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
         if (from_reader and !own and std.mem.find(u8, name, "Unlimited") != null) {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
             continue;
@@ -295,7 +295,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
         else => {},
     };
     if (!named) return;
-    const flow = try Taint.get(c, .peer);
+    const flow = try Taint.get(c, Danger.peer_writer);
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
@@ -339,7 +339,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         if (value == .container) container = value.container;
     }
     const io_type = container orelse return;
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, Danger.peer_input);
     const tree = &c.project.at(c.file).file.tree;
     var given: std.AutoHashMapUnmanaged(Ast.Node.Index, usize) = .empty;
     var holders: std.ArrayList(Holding) = .empty;
@@ -759,7 +759,7 @@ fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, ending: Ends) Context
     };
     // A dependency's function with no body here (`extern`, a declaration only) says nothing of
     // what it does: none.
-    if (!Taint.inStd(try Taint.get(c, .input), callee)) return false;
+    if (!Taint.inStd((try Taint.get(c, Danger.peer_input)).flow, callee)) return false;
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = callee_tree.fullFnProto(&proto_buffer, callee_model.declarations[@backingInt(callee.index)].node) orelse return false;
     return canceling(c, callee.file, proto.ast.return_type.unwrap() orelse return false, 0);
@@ -1423,7 +1423,7 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 
 /// A sink in the checked file: a finding where the value is input, undecided where the fact
 /// cannot tell.
-fn sink(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
+fn sink(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
     try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
 }
 
@@ -1523,7 +1523,7 @@ fn declaredSlice(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
 }
 
 /// Whether a comparison holding where `node` is read puts it at most a clean value.
-fn capped(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!bool {
+fn capped(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!bool {
     for (try Range.ceilings(c, c.file, node)) |limit| if (try Taint.levelAt(c, flow, c.file, limit) == .clean) return true;
     return false;
 }
@@ -1531,7 +1531,7 @@ fn capped(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!bo
 /// The level of `node`, a number counting no more than a short or the memory the function
 /// holds read as data, on every path to it (Proof.counts): a count a short holds, as a decode
 /// of 16 bits gives, or one the path held there, as a check or a store of a constant does.
-fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
+fn ranged(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!Taint.Level {
     const level = try Taint.levelAt(c, flow, c.file, node);
     if (level == .number and try Proof.counts(c, c.file, node)) return .data;
     return level;
@@ -1540,7 +1540,7 @@ fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Ta
 /// A loop bound's level: a counter the loop steps by what it enters with and steps by
 /// (Taint.counterLevel); data where it counts no more passes than a short or the memory the
 /// function holds (Proof.counts).
-fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+fn loopOperand(c: *Context, flow: Taint.Fact, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
     const level = try countered(c, flow, loop, node);
     if (level == .number and try Proof.counts(c, c.file, node)) return .data;
     return level;
@@ -1548,7 +1548,7 @@ fn loopOperand(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.N
 
 /// The level of a loop operand with each counter in it read by `Taint.counterLevel`: the
 /// counter itself, a sum with it (`at + 2`) or a difference from it (`end - 1`).
-fn countered(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
+fn countered(c: *Context, flow: Taint.Fact, loop: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Taint.Level {
     const tree = &c.project.at(c.file).file.tree;
     if (try Taint.counterLevel(c, flow, c.file, loop, node)) |level| return level;
     switch (tree.nodeTag(node)) {
@@ -1571,7 +1571,7 @@ fn countered(c: *Context, flow: *Taint.Flow, loop: Ast.Node.Index, node: Ast.Nod
 /// Reports `node` where its level reaches `least`, naming the read its input came from where
 /// `flow` is the input fact and the walk back finds one (`input from src/config.zig:683
 /// `file.readAll``), so a package fixes each source once at its parser.
-fn judged(c: *Context, flow: ?*Taint.Flow, rule: Rule, node: Ast.Node.Index, level: Taint.Level, least: Taint.Level, message: []const u8) Context.Error!void {
+fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, level: Taint.Level, least: Taint.Level, message: []const u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;
@@ -1941,7 +1941,7 @@ fn assigns(tag: Ast.Node.Tag) bool {
 /// read of a count shown above zero), advances a slice declared outside it past a part shown
 /// above zero (`cp = cp[slash + 1 ..]`), or checks for cancelation and passes it on (`try io.checkCancel()`). A
 /// peek, a read whose count may be zero, and one on a branch some pass skips consume nothing.
-fn consumes(c: *Context, flow: *Taint.Flow, body: Ast.Node.Index) Context.Error!bool {
+fn consumes(c: *Context, flow: Taint.Fact, body: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     const first = tree.firstToken(body);

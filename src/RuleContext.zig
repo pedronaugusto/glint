@@ -15,6 +15,8 @@ config: rules.Config,
 facts: *Facts,
 definitions: []const rules.Definition,
 sink: *Sink,
+/// The run's compiled rules: the facts they declare are the ones `Taint` solves together.
+compiled: []const Rule = &.{},
 
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
 /// Where a rule's findings go. Its owner embeds it in its own state and gets that back from
@@ -25,8 +27,9 @@ pub const Sink = struct {
     /// The configuration another selected file is checked with.
     config: *const fn (*Sink, Project.FileId) rules.Config,
 };
-/// Compiled rule. Metadata and callback are validated once before execution.
-pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void };
+/// Compiled rule. Metadata and callback are validated once before execution. `facts` are the
+/// flow facts its check asks (`Taint.get`), solved once for every rule that asks one.
+pub const Rule = struct { definition: rules.Definition, check: *const fn (*RuleContext) Error!void, facts: []const @import("FactSpec.zig").Spec = &.{} };
 /// Checked immutable handle for all model queries.
 pub fn source(self: *const RuleContext) Project.QueryError!Project.Handle {
     return self.project.handle(self.file);

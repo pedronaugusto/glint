@@ -20,6 +20,11 @@ const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
 const Taint = @import("Taint.zig");
 const Rule = @import("Rule.zig").Rule;
+
+/// The facts the pack's flow rules ask of the program's values (`Taint.Spec`): input a peer
+/// gives, which aegis's parse answers, and the writers that reach a peer.
+pub const peer_input: Taint.Spec = .{ .source = .{ .input = .{ .peer = true, .operator = false } }, .control = true, .answers = .{ .aegis = true } };
+pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = true };
 const Ast = std.zig.Ast;
 
 /// A007: shared state outside aegis's guards. `Io.Event` is none: a signal set once, which
@@ -273,7 +278,7 @@ fn nanoseconds(tree: *const Ast, node: Ast.Node.Index) bool {
 /// behaviour in a consumer's ReleaseFast build. An internal invariant no input reaches is the
 /// program's to state, as Zig's own checks are; ReleaseFast is the consumer's choice.
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, peer_input);
     try asserts(c, rule, flow);
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -293,7 +298,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
 /// in, the operands of the switches whose prongs hold it, and a `catch` or `orelse` it is the
 /// answer of, through the call before it (what the call reads and is given), up to its
 /// function.
-fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
+fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!Taint.Level {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var out: Taint.Level = .clean;
@@ -322,7 +327,7 @@ fn chosenBy(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!
 
 /// How far input can make `expression` fail: what it holds, and what a call it makes reads
 /// and is given.
-fn failedBy(c: *Context, flow: *Taint.Flow, expression: Ast.Node.Index) Context.Error!Taint.Level {
+fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index) Context.Error!Taint.Level {
     const tree = &c.project.at(c.file).file.tree;
     var out = try Taint.levelAt(c, flow, c.file, expression);
     var inner = expression;
@@ -338,7 +343,7 @@ fn failedBy(c: *Context, flow: *Taint.Flow, expression: Ast.Node.Index) Context.
 /// A013's `std.debug.assert` sites whose condition holds input, each with its fix where the
 /// file's code alone decides it: `std.debug.assert(c)`, or a call through a private alias,
 /// becomes `aegis.assert.invariant(c, "c")`, the file importing aegis for it when it does not.
-fn asserts(c: *Context, rule: Rule, flow: *Taint.Flow) Context.Error!void {
+fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     const message = "std.debug.assert on input: a contract a peer can break, a panic or undefined behaviour in a consumer's ReleaseFast build; return an error, or aegis assert.invariant checks it in every build";
     var target: [1]Governed.Target = .{.{ .source = "std", .declaration = "debug.assert", .production = true }};
     var index: [1]usize = .{0};

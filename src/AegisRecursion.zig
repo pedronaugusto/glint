@@ -26,6 +26,7 @@ const Model = @import("Model.zig");
 const Program = @import("Program.zig");
 const Range = @import("Range.zig");
 const Taint = @import("Taint.zig");
+const Danger = @import("Danger.zig");
 const Report = @import("Report.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
@@ -229,7 +230,7 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
     const file = from.file;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const flow = try Taint.get(c, .input);
+    const flow = try Taint.get(c, Danger.peer_input);
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, edge.call).?; // unreachable: an edge is a call
     const receiver = try hasReceiver(c, file, call);
@@ -505,7 +506,7 @@ fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
 }
 
 /// Whether a comparison holding where `at` is evaluated holds `depth` to a clean bound on `side`.
-fn held(c: *Context, flow: *Taint.Flow, file: @import("Project.zig").FileId, at: Ast.Node.Index, depth: Ast.Node.Index, side: Range.Side) Context.Error!bool {
+fn held(c: *Context, flow: Taint.Fact, file: @import("Project.zig").FileId, at: Ast.Node.Index, depth: Ast.Node.Index, side: Range.Side) Context.Error!bool {
     for (try Range.boundsAt(c, file, at, depth, side)) |bound| if (try Taint.levelAt(c, flow, file, bound) == .clean) return true;
     return false;
 }

@@ -65,6 +65,8 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (@backingInt(setting.file) >= project.count()) return error.InvalidHandle;
         for (options.files[0..i]) |earlier| if (setting.file == earlier.file) return error.InvalidSelection;
     }
+    // The flow facts the rules declare are solved together, a lane each.
+    if (!@import("Taint.zig").fits(options.project_rules)) return error.InvalidSelection;
     const definitions = try a.alloc(rules.Definition, options.project_rules.len);
     for (options.project_rules, 0..) |rule, i| {
         definitions[i] = rule.definition;
@@ -115,7 +117,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
-        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink };
+        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
         try Builtins.check(&context);
         if (config.metrics) {
             const counts = try Metrics.count(&context);

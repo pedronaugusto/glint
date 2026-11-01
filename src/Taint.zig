@@ -44,92 +44,95 @@ const Project = @import("Project.zig");
 const Governed = @import("Governed.zig");
 const Contract = @import("AegisContract.zig");
 const Program = @import("Program.zig");
+const FactSpec = @import("FactSpec.zig");
 const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
-/// How far a value is input's, each level holding the ones below it: clean; unknown, through a
-/// call that does not resolve; data, bytes from outside; a number a peer chooses.
-pub const Level = enum(u2) {
-    clean,
-    unknown,
-    data,
-    number,
-
-    pub fn join(a: Level, b: Level) Level {
-        return if (@backingInt(a) >= @backingInt(b)) a else b; // safe: two-bit levels.
-    }
-    /// Whether the value is input at `least` (data or number).
-    pub fn reaches(a: Level, least: Level) bool {
-        return a != .unknown and @backingInt(a) >= @backingInt(least); // safe: two-bit levels.
-    }
-};
+pub const Level = FactSpec.Level;
+pub const Spec = FactSpec.Spec;
 
 /// What an expression holds, read inside one function: a level of its own, and the
 /// parameters it depends on: fully; made a number (a parameter's data shifted or multiplied);
 /// kept to a range the program chose (a parameter's number masked or truncated: data); or,
-/// through a call that did not resolve, at most as unknown.
+/// through a call that did not resolve, at most as unknown. Each level is per fact (`Levels`);
+/// the parameters it depends on are the same for every fact.
+///
+/// What a condition decides (`ruling`) holds only for the facts that take what they decide
+/// (`Spec.control`): its level is those lanes', and the parameters it reads are `ruled`.
 ///
 /// Memory also has a length, which is not what it holds: `out[0..n]` holds the program's
 /// bytes in a length the peer chose. `length` and `lengths` are that length's level and the
 /// slots it depends on (`lengthSlot`): a parameter's value as a bound, or a parameter's own
 /// length. What the memory holds stays the program's; its `.len` is the peer's.
 pub const Dep = struct {
-    level: Level = .clean,
+    level: Levels = .clean,
     params: Slots = .{},
     numbers: Slots = .{},
     ranged: Slots = .{},
     maybe: Slots = .{},
-    length: Level = .clean,
+    ruled: Slots = .{},
+    length: Levels = .clean,
     lengths: Slots = .{},
+    /// The parameters a condition reads that decides the length (`ruled`'s, for the length).
+    ruled_lengths: Slots = .{},
     /// A length no build holds to the memory: written in place (`s.len = n`), or one a
     /// measure already gave (a global's, a parameter's own); its level, and the parameters
     /// whose value it was written from, as the callers give them.
-    unchecked: Level = .clean,
+    unchecked: Levels = .clean,
     bare: Slots = .{},
 
     pub fn join(a: Dep, gpa: Allocator, b: Dep) Allocator.Error!Dep {
-        return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare) };
+        return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare) };
     }
     fn lowered(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = if (a.level == .clean) .clean else .unknown, .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.lowered(), .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled = a.ruled, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
     /// Data made a number: a shift or a product of it, or what std decodes from it.
     fn widened(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = if (a.level == .data) .number else a.level, .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.widened(), .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
     /// A value kept to a range the program chose: a number is data there.
     fn narrowed(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = if (a.level == .number) .data else a.level, .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .length = a.length, .lengths = a.lengths, .unchecked = a.unchecked, .bare = a.bare };
+        return .{ .level = a.level.narrowed(), .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
+    }
+    /// What a condition reading this value decides: data held to the choice, for the facts
+    /// that take what they decide (`Masks.control`); for the others nothing.
+    fn ruling(a: Dep, gpa: Allocator, masks: Masks) Allocator.Error!Dep {
+        return .{ .level = a.level.narrowed().masked(masks.control), .ruled = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe, a.ruled }) };
     }
     /// Its length read as a value (`.len`): within the memory, so data at most, unless no
     /// build holds it there (`unchecked`). A parameter's own length (its `lengthSlot`) is
     /// what its callers measured; a parameter's value bounding a slice is data.
     fn measured(a: Dep) Dep {
-        return .{ .level = @as(Level, if (a.length == .number) .data else a.length).join(a.unchecked), .params = a.bare, .ranged = a.lengths };
+        return .{ .level = a.length.narrowed().join(a.unchecked), .params = a.bare, .ranged = a.lengths, .ruled = a.ruled_lengths };
     }
     /// Memory whose length is this value written in place (`s.len = n`), which no build
     /// checks against the memory: the value's level, and a parameter's as its callers give it
     /// (a number where it was made one).
     fn written(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .unchecked = a.level.join(if (!a.numbers.empty()) .number else .clean), .bare = a.params, .lengths = try a.ranged.unite(gpa, a.maybe) };
+        return .{ .unchecked = a.level.join(if (!a.numbers.empty()) Levels.all(.number) else .clean), .bare = a.params, .lengths = try a.ranged.unite(gpa, a.maybe), .ruled_lengths = a.ruled };
     }
     /// Memory whose length a measure gave (`concreteLength`), read back.
-    fn measuredLength(level: Level) Dep {
+    fn measuredLength(level: Levels) Dep {
         return .{ .unchecked = level };
     }
     /// Memory whose length is this value (a slice's bound): data at most.
     fn sizing(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .length = if (a.level == .number) .data else a.level, .lengths = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }) };
+        return .{ .length = a.level.narrowed(), .lengths = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled_lengths = a.ruled };
     }
     /// What it holds, with no length.
     fn held(a: Dep) Dep {
-        return .{ .level = a.level, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe };
+        return .{ .level = a.level, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe, .ruled = a.ruled };
+    }
+    /// Its length alone: what a slice to the end of this memory keeps of it.
+    fn lengthOnly(a: Dep) Dep {
+        return .{ .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
     fn clean(a: Dep) bool {
-        return a.level == .clean and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.length == .clean and a.lengths.empty() and a.unchecked == .clean and a.bare.empty();
+        return a.level.isClean() and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.ruled.empty() and a.length.isClean() and a.lengths.empty() and a.ruled_lengths.empty() and a.unchecked.isClean() and a.bare.empty();
     }
     fn eql(a: Dep, b: Dep) bool {
-        return a.level == b.level and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.length == b.length and a.lengths.eql(b.lengths) and a.unchecked == b.unchecked and a.bare.eql(b.bare);
+        return a.level.eql(b.level) and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.ruled.eql(b.ruled) and a.length.eql(b.length) and a.lengths.eql(b.lengths) and a.ruled_lengths.eql(b.ruled_lengths) and a.unchecked.eql(b.unchecked) and a.bare.eql(b.bare);
     }
 };
 
@@ -205,7 +208,90 @@ fn slots(n: usize) usize {
     return 2 * n;
 }
 
-pub const Fact = enum { input, peer };
+/// The most facts one run solves together.
+pub const lane_count = 8;
+
+/// Lanes, a bit each.
+pub const Mask = u8;
+
+const none: Mask = 0;
+
+fn selected(mask: Mask) @Vector(lane_count, bool) {
+    return @bitCast(mask);
+}
+
+/// A level per fact: one solve carries every fact the run asks at once, each in its own lane.
+pub const Levels = struct {
+    v: @Vector(lane_count, u2) = @splat(0),
+
+    pub const clean: Levels = .{};
+
+    pub fn all(level: Level) Levels {
+        return .{ .v = @splat(@backingInt(level)) };
+    }
+    /// `level` in the lanes `mask` holds, clean in the rest.
+    pub fn in(mask: Mask, level: Level) Levels {
+        return .{ .v = @select(u2, selected(mask), @as(@Vector(lane_count, u2), @splat(@backingInt(level))), Levels.clean.v) };
+    }
+    pub fn join(a: Levels, b: Levels) Levels {
+        return .{ .v = @max(a.v, b.v) };
+    }
+    pub fn eql(a: Levels, b: Levels) bool {
+        return @reduce(.And, a.v == b.v);
+    }
+    pub fn isClean(a: Levels) bool {
+        return a.eql(.clean);
+    }
+    pub fn at(a: Levels, lane: usize) Level {
+        const lanes: [lane_count]u2 = a.v;
+        return @fromBackingInt(lanes[lane]);
+    }
+    /// Its lanes `mask` holds, the rest clean.
+    pub fn masked(a: Levels, mask: Mask) Levels {
+        return .{ .v = @select(u2, selected(mask), a.v, Levels.clean.v) };
+    }
+    /// Data made a number.
+    fn widened(a: Levels) Levels {
+        return a.mapped(.data, .number);
+    }
+    /// A number kept to a range the program chose: data.
+    fn narrowed(a: Levels) Levels {
+        return a.mapped(.number, .data);
+    }
+    /// What it is, read through a call that does not resolve: unknown where it is not clean.
+    fn lowered(a: Levels) Levels {
+        return .{ .v = @select(u2, a.v != Levels.clean.v, Levels.all(.unknown).v, a.v) };
+    }
+    fn mapped(a: Levels, from: Level, to: Level) Levels {
+        return .{ .v = @select(u2, a.v == Levels.all(from).v, Levels.all(to).v, a.v) };
+    }
+};
+
+/// The lanes each kind of source, answer and choice reaches, from the run's specs.
+const Masks = struct {
+    /// Input a peer gives.
+    peer: Mask = none,
+    /// Input the operator gives.
+    operator: Mask = none,
+    error_text: Mask = none,
+    peer_writer: Mask = none,
+    /// The facts what they decide takes (`Spec.control`).
+    control: Mask = none,
+    /// The facts aegis answers.
+    aegis: Mask = none,
+    int_from_error: Mask = none,
+
+    fn input(m: Masks) Mask {
+        return m.peer | m.operator;
+    }
+};
+
+/// A fact a rule asks: the run's solve and the fact's lane in it.
+pub const Fact = struct {
+    flow: *Flow,
+    lane: u8,
+    spec: Spec,
+};
 
 const Function = struct {
     file: Project.FileId,
@@ -213,7 +299,7 @@ const Function = struct {
     /// Its parameters' declarations in order, the receiver first; null for an unnamed one.
     params: []const ?Model.Declaration.Id,
     /// What its callers give each parameter, and the length of each (`lengthSlot`).
-    levels: []Level,
+    levels: []Levels,
     ret: Dep = .{},
     /// What it stores through each parameter, by position (`out.* = v`, `list.append(gpa, v)`,
     /// `self.part = buf[0..n]` of a field outside the program): a summary as `ret` is, which
@@ -230,7 +316,7 @@ const Function = struct {
     parser: bool = false,
     /// What a parse given it gives: the level of the values it returns without showing their
     /// range, which the parse refines nothing of.
-    unrefined: Level = .clean,
+    unrefined: Levels = .clean,
 
     /// The position of the parameter `d` declares.
     fn position(f: Function, d: Model.Declaration.Id) ?usize {
@@ -244,7 +330,9 @@ const Function = struct {
 
 pub const Flow = struct {
     solved: bool = false,
-    fact: Fact = .input,
+    /// The facts solved, a lane each, and the lanes each kind of source and answer reaches.
+    specs: []const Spec = &.{},
+    masks: Masks = .{},
     functions: std.ArrayList(Function) = .empty,
     /// Per file, each node's nearest enclosing function, by its index in `functions`.
     owners: std.AutoHashMapUnmanaged(Project.FileId, []const ?Function.Id) = .empty,
@@ -254,14 +342,14 @@ pub const Flow = struct {
     jumps: std.AutoHashMapUnmanaged(Project.FileId, []const Ast.Node.Index) = .empty,
     locals: std.AutoHashMapUnmanaged(Facts.Decl, Dep) = .empty,
     /// Fields and container-level variables, by declaration.
-    globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
+    globals: std.AutoHashMapUnmanaged(Facts.Decl, Levels) = .empty,
     /// The lengths of the memory they hold, by declaration (`Dep.length`).
-    lengths: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
+    lengths: std.AutoHashMapUnmanaged(Facts.Decl, Levels) = .empty,
     /// Memory no place names (`Place.unknown`: what a pointer made from an integer or a call
     /// that does not resolve reaches): what any store into it puts there, and the length of the
     /// memory it holds. A read of such memory may read any of it.
-    unnamed: Level = .clean,
-    unnamed_length: Level = .clean,
+    unnamed: Levels = .clean,
+    unnamed_length: Levels = .clean,
     /// The files that are the program (`Program`).
     program: *const Program = undefined,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
@@ -306,22 +394,74 @@ pub const Flow = struct {
 /// its callers, read as undecided).
 const Link = struct { function: Function.Id, owner: Place, holder: Place };
 
-/// Both facts, kept for the run.
-const Flows = struct { input: Flow = .{}, peer: Flow = .{} };
+/// The run's solve: the facts the enabled rules declare, and any other a rule asked since.
+const Solved = struct { flow: ?*Flow = null };
 
-/// The program's `fact`, solved the first time a rule asks.
-pub fn get(c: *Context, fact: Fact) Context.Error!*Flow {
-    const flows = try c.facts.memo(Flows);
-    const flow = switch (fact) {
-        .input => &flows.input,
-        .peer => &flows.peer,
-    };
-    if (!flow.solved) {
-        flow.fact = fact;
+/// The fact `spec` describes, solved with every other the run's enabled rules declare the
+/// first time one is asked. A rule asks only the facts it declares (`Context.Rule.facts`);
+/// another is `error.InvalidSelection`.
+pub fn get(c: *Context, spec: Spec) Context.Error!Fact {
+    const memo = try c.facts.memo(Solved);
+    const flow = memo.flow orelse solved: {
+        var specs: std.ArrayList(Spec) = .empty;
+        for (c.compiled) |rule| {
+            if (!try enabled(c, rule)) continue;
+            for (rule.facts) |each| if (laneOf(specs.items, each) == null) try specs.append(c.allocator, each);
+        }
+        // The run's rules fit the lanes (`fits`): the Runner refuses a set that does not.
+        const flow = try c.allocator.create(Flow);
+        flow.* = .{ .specs = specs.items, .masks = masksOf(specs.items) };
         try solve(c, flow);
         flow.solved = true;
+        memo.flow = flow;
+        break :solved flow;
+    };
+    const lane = laneOf(flow.specs, spec) orelse return error.InvalidSelection;
+    return .{ .flow = flow, .lane = lane, .spec = spec };
+}
+
+/// Whether the facts `rules` declare fit one solve's lanes.
+pub fn fits(rules: []const Context.Rule) bool {
+    var lanes: [lane_count]Spec = undefined;
+    var count: usize = 0;
+    for (rules) |rule| for (rule.facts) |spec| {
+        if (laneOf(lanes[0..count], spec) != null) continue;
+        if (count == lane_count) return false;
+        lanes[count] = spec;
+        count += 1;
+    };
+    return true;
+}
+
+fn laneOf(specs: []const Spec, spec: Spec) ?u8 {
+    for (specs, 0..) |each, i| if (std.meta.eql(each, spec)) return @intCast(i);
+    return null;
+}
+
+/// Whether some file of the program is checked with `rule`.
+fn enabled(c: *Context, rule: Context.Rule) Context.Error!bool {
+    if (c.config.has(rule.definition.id)) return true;
+    for (c.project.sources) |*each| if (c.configOf(each.id).has(rule.definition.id)) return true;
+    return false;
+}
+
+fn masksOf(specs: []const Spec) Masks {
+    var out: Masks = .{};
+    for (specs, 0..) |spec, i| {
+        const bit = @as(Mask, 1) << @intCast(i);
+        switch (spec.source) {
+            .input => |from| {
+                if (from.peer) out.peer |= bit;
+                if (from.operator) out.operator |= bit;
+            },
+            .error_text => out.error_text |= bit,
+            .peer_writer => out.peer_writer |= bit,
+        }
+        if (spec.control) out.control |= bit;
+        if (spec.answers.aegis) out.aegis |= bit;
+        if (spec.answers.int_from_error) out.int_from_error |= bit;
     }
-    return flow;
+    return out;
 }
 
 fn solve(c: *Context, flow: *Flow) Context.Error!void {
@@ -331,9 +471,9 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
         if (each.input.classification == .@"test") continue;
         const file = each.id;
         if (!flow.own(file)) continue;
-        // A file whose rules read neither fact (a tool the package develops with) is no part
-        // of the program the facts describe.
-        if (!reads(c.configOf(file), flow.fact)) continue;
+        // A file whose rules ask no fact (a tool the package develops with) is no part of the
+        // program the facts describe.
+        if (!asks(c, c.configOf(file))) continue;
         try functionsOf(c, flow, file);
     }
     try parsers(c, flow);
@@ -351,12 +491,10 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     }
 }
 
-fn reads(config: @import("Rule.zig").Config, fact: Fact) bool {
-    const pack = @import("AegisRules.zig");
-    return switch (fact) {
-        .input => config.has(pack.untrusted_input) or config.has(pack.integers) or config.has(pack.bounded_work) or config.has(pack.cancellation) or config.has(pack.contracts) or config.has(pack.recursion),
-        .peer => config.has(pack.diagnostics),
-    };
+/// Whether a file's rules ask a fact.
+fn asks(c: *Context, config: @import("Rule.zig").Config) bool {
+    for (c.compiled) |rule| if (rule.facts.len > 0 and config.has(rule.definition.id)) return true;
+    return false;
 }
 
 /// Marks each function the program hands to `Untrusted.parse`, before the rounds, so what its
@@ -448,7 +586,7 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
             };
             try params.append(c.allocator, found);
         }
-        const levels = try c.allocator.alloc(Level, slots(params.items.len));
+        const levels = try c.allocator.alloc(Levels, slots(params.items.len));
         @memset(levels, .clean);
         const writes = try c.allocator.alloc(Dep, params.items.len);
         @memset(writes, .{});
@@ -553,7 +691,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                         // held to that range, which a sink judges as it judges any value's.
                         const given = try (try dep(c, flow, function, value)).join(c.allocator, try control(c, flow, function, node, null));
                         var level = concrete(flow, function, given);
-                        if (refined and level == .number and try shownField(c, f.file, value, field)) level = .data;
+                        if (refined and anyAt(level, .number) and try shownField(c, f.file, value, field)) level = level.narrowed();
                         try raiseGlobal(c, flow, field, level, concreteLength(flow, function, given));
                     }
                 };
@@ -671,7 +809,7 @@ fn escaped(c: *Context, flow: *Flow) Context.Error!void {
         const d = by_node.get(.{ .file = f.file, .node = f.node }) orelse continue;
         if (!try c.facts.handedOut(.{ .file = f.file, .index = d })) continue;
         for (f.levels, 0..) |*level, slot| {
-            if (!f.fixed.has(slot / 2)) level.* = .number;
+            if (!f.fixed.has(slot / 2)) level.* = .all(.number);
         }
     }
 }
@@ -691,14 +829,14 @@ fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Er
 }
 
 /// A field or a container-level variable given a value of `level` in memory of `length`.
-fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Level, length: Level) Context.Error!void {
-    for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Level), Level }{ .{ &flow.globals, level }, .{ &flow.lengths, length } }) |each| {
+fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Levels, length: Levels) Context.Error!void {
+    for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Levels), Levels }{ .{ &flow.globals, level }, .{ &flow.lengths, length } }) |each| {
         const map, const raised = each;
-        if (raised == .clean) continue;
+        if (raised.isClean()) continue;
         const entry = try map.getOrPut(c.allocator, decl);
-        const before: Level = if (entry.found_existing) entry.value_ptr.* else .clean;
+        const before: Levels = if (entry.found_existing) entry.value_ptr.* else .clean;
         entry.value_ptr.* = before.join(raised);
-        if (entry.value_ptr.* != before) flow.changed = true;
+        if (!entry.value_ptr.eql(before)) flow.changed = true;
     }
 }
 
@@ -920,7 +1058,7 @@ fn raise(c: *Context, flow: *Flow, function: Function.Id, place: Place, value: D
         .unknown => {
             const level = flow.unnamed.join(concrete(flow, function, value));
             const length = flow.unnamed_length.join(concreteLength(flow, function, value));
-            if (level != flow.unnamed or length != flow.unnamed_length) flow.changed = true;
+            if (!level.eql(flow.unnamed) or !length.eql(flow.unnamed_length)) flow.changed = true;
             flow.unnamed = level;
             flow.unnamed_length = length;
         },
@@ -961,10 +1099,10 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
                 if (index >= g.params.len) break;
                 if (g.fixed.has(index)) continue;
                 const given = try dep(c, flow, function, arg);
-                for ([_]struct { usize, Level }{ .{ valueSlot(index), concrete(flow, function, given) }, .{ lengthSlot(index), concreteLength(flow, function, given) } }) |each| {
+                for ([_]struct { usize, Levels }{ .{ valueSlot(index), concrete(flow, function, given) }, .{ lengthSlot(index), concreteLength(flow, function, given) } }) |each| {
                     const slot, const level = each;
                     if (slot >= g.levels.len) continue;
-                    if (level.join(g.levels[slot]) != g.levels[slot]) {
+                    if (!level.join(g.levels[slot]).eql(g.levels[slot])) {
                         flow.functions.items[@backingInt(target)].levels[slot] = level.join(g.levels[slot]);
                         flow.changed = true;
                     }
@@ -976,9 +1114,10 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
             }
         },
         .source => {
-            if (try fixedClean(c, flow, function, call)) return;
+            const lanes = try readLanes(c, flow, function, call);
+            if (lanes == none) return;
             const buffers = try bufferParams(c, callee.decl.?);
-            for (callee.args.items, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, arg);
+            for (callee.args.items, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, arg, lanes);
         },
         .outside => {
             // What a function outside the program is given may go into any memory it is given
@@ -996,7 +1135,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
         .aegis => try parsed(c, flow, f.file, call, callee.decl.?),
         // A call that does not resolve may write anything into the memory it is given.
         .none => for (callee.args.items) |arg| {
-            if (try pointing(c, f.file, arg)) try store(c, flow, function, arg, .{ .level = .unknown });
+            if (try pointing(c, f.file, arg)) try store(c, flow, function, arg, .{ .level = .all(.unknown) });
         },
         .holder => {},
     }
@@ -1009,8 +1148,9 @@ fn parsed(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, d
     const target = (try parserOf(c, flow, file, call, decl)) orelse return;
     const levels = flow.functions.items[@backingInt(target)].levels;
     const value = valueSlot(1);
-    if (levels.len <= value or levels[value].join(.data) == levels[value]) return;
-    levels[value] = levels[value].join(.data);
+    const given: Levels = .in(flow.masks.input(), .data);
+    if (levels.len <= value or levels[value].join(given).eql(levels[value])) return;
+    levels[value] = levels[value].join(given);
     flow.changed = true;
 }
 
@@ -1071,27 +1211,28 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!Slots {
     return out;
 }
 
-/// A read fills `arg`'s memory with the fact: each place a store into it reaches, a vector's
-/// buffers among them, and a parameter's memory in its callers.
-fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!void {
-    try store(c, flow, function, arg, .{ .level = .data });
+/// A read fills `arg`'s memory with input in `lanes`: each place a store into it reaches, a
+/// vector's buffers among them, and a parameter's memory in its callers.
+fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index, lanes: Mask) Context.Error!void {
+    try store(c, flow, function, arg, .{ .level = .in(lanes, .data) });
 }
 
 /// A dependence read as a level, with what callers give the function's parameters.
-fn concrete(flow: *const Flow, function: Function.Id, value: Dep) Level {
+fn concrete(flow: *const Flow, function: Function.Id, value: Dep) Levels {
     var level = value.level;
     const f = flow.functions.items[@backingInt(function)];
     for (f.levels, 0..) |given, index| {
         if (value.params.has(index)) level = level.join(given);
-        if (value.numbers.has(index) and given == .data) level = level.join(.number);
-        if (value.ranged.has(index)) level = level.join(if (given == .number) .data else given);
-        if (value.maybe.has(index) and given != .clean) level = level.join(.unknown);
+        if (value.numbers.has(index)) level = level.join(given.masked(@bitCast(given.v == Levels.all(.data).v)).widened());
+        if (value.ranged.has(index)) level = level.join(given.narrowed());
+        if (value.maybe.has(index)) level = level.join(given.lowered());
+        if (value.ruled.has(index)) level = level.join(given.narrowed().masked(flow.masks.control));
     }
     return level;
 }
 
 /// The level of a dependence's length, with what callers give the function's parameters.
-fn concreteLength(flow: *const Flow, function: Function.Id, value: Dep) Level {
+fn concreteLength(flow: *const Flow, function: Function.Id, value: Dep) Levels {
     return concrete(flow, function, value.measured());
 }
 
@@ -1104,6 +1245,9 @@ const Callee = struct {
     /// How many parameters precede the first argument (a method's receiver given by the call).
     skip: usize = 0,
     decl: ?Facts.Decl = null,
+    /// It gives a writer whose bytes reach a peer: `net.Stream.writer`, or a function the
+    /// configuration declares one, wherever it is declared, the program's own among them.
+    writer: bool = false,
 };
 
 /// What a call reaches: the program's own function, a read, another function outside the
@@ -1157,9 +1301,11 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     // A writer the configuration declares a peer's is one wherever it is declared, the
     // program's own among them: the declaration says where its bytes go, not its body.
-    if (flow.fact == .peer) for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) {
-        out.kind = .source;
-        return out;
+    for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) {
+        out.writer = true;
+    };
+    if (flow.stream) |stream| if (stream.file == decl.file and std.mem.eql(u8, record.name, "writer")) {
+        out.writer = true;
     };
     if (flow.by_node.get(.{ .file = decl.file, .node = fnDecl(c, decl) orelse record.node })) |target| {
         out.kind = .{ .program = target };
@@ -1180,41 +1326,42 @@ fn fnDecl(c: *Context, decl: Facts.Decl) ?Ast.Node.Index {
     return if (tree.nodeTag(parent) == .fn_decl) parent else null;
 }
 
-/// Whether a function outside the program starts the fact: a read of input, or a peer writer.
+/// Whether a function outside the program reads a peer's input.
 fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.Error!bool {
     _ = c;
     const file = decl.file;
-    switch (flow.fact) {
-        .input => {
-            for (flow.reads.items) |read| if (std.meta.eql(read, decl)) return true;
-            if (flow.reader) |reader| if (reader.file == file) {
-                for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
-            };
-            if (flow.file) |handle| if (handle.file == file) {
-                for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (std.mem.eql(u8, name, read)) return true;
-            };
-            if (flow.dir) |dir| if (dir.file == file) {
-                for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (std.mem.eql(u8, name, read)) return true;
-            };
-            return false;
-        },
-        .peer => {
-            for (flow.peer_writers.items) |writer| if (std.meta.eql(writer, decl)) return true;
-            const stream = flow.stream orelse return false;
-            return stream.file == file and std.mem.eql(u8, name, "writer");
-        },
-    }
+    for (flow.reads.items) |read| if (std.meta.eql(read, decl)) return true;
+    if (flow.reader) |reader| if (reader.file == file) {
+        for ([_][]const u8{ "take", "peek", "readSlice", "readVec", "readAlloc", "allocRemaining", "appendExact", "appendRemaining", "buffered" }) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
+    };
+    if (flow.file) |handle| if (handle.file == file) {
+        for ([_][]const u8{ "readStreaming", "readPositional", "readPositionalAll" }) |read| if (std.mem.eql(u8, name, read)) return true;
+    };
+    if (flow.dir) |dir| if (dir.file == file) {
+        for ([_][]const u8{ "readFile", "readFileAlloc", "readFileAllocOptions", "readLink" }) |read| if (std.mem.eql(u8, name, read)) return true;
+    };
+    return false;
 }
 
-/// Whether a read is from a reader std's `Reader.fixed` made over clean bytes (`fixedBytes`):
-/// such a read carries the bytes' fact, not input's.
-fn fixedClean(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!bool {
-    if (flow.fact != .input) return false;
+/// The lanes a read reads a peer's input in: every peer lane, but where the reader is one
+/// std's `Reader.fixed` made over bytes clean in that lane (`fixedBytes`), whose read carries
+/// the bytes' fact, not input's.
+fn readLanes(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!Mask {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const bytes = (try fixedBytes(c, flow, f.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) orelse return false;
-    return concrete(flow, function, try dep(c, flow, function, bytes)) == .clean;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return flow.masks.peer;
+    const bytes = (try fixedBytes(c, flow, f.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) orelse return flow.masks.peer;
+    return flow.masks.peer & lanesOf(concrete(flow, function, try dep(c, flow, function, bytes)));
+}
+
+/// The lanes a level is other than clean in.
+fn lanesOf(levels: Levels) Mask {
+    return @bitCast(levels.v != Levels.clean.v);
+}
+
+/// Whether some lane is at `level`.
+fn anyAt(levels: Levels, level: Level) bool {
+    return @reduce(.Or, levels.v == Levels.all(level).v);
 }
 
 /// The bytes a reader is made over, where it is a local of a function the fact reads that
@@ -1313,7 +1460,7 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             var out = try memory.held().join(c.allocator, try (try dep(c, flow, function, slice.ast.start)).sizing(c.allocator));
             if (slice.ast.end.unwrap()) |end| {
                 out = try out.join(c.allocator, try (try dep(c, flow, function, end)).sizing(c.allocator));
-            } else out = try out.join(c.allocator, .{ .length = memory.length, .lengths = memory.lengths, .unchecked = memory.unchecked, .bare = memory.bare });
+            } else out = try out.join(c.allocator, memory.lengthOnly());
             return out;
         },
         .grouped_expression, .unwrap_optional => return dep(c, flow, function, tree.nodeData(node).node_and_token[0]),
@@ -1353,24 +1500,25 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
         .@"if", .if_simple => {
             const branch = tree.fullIf(node).?;
             // Which branch gives the value is the condition's choice.
-            var out = try (try dep(c, flow, function, branch.ast.cond_expr)).held().narrowed(c.allocator);
+            var out = try (try dep(c, flow, function, branch.ast.cond_expr)).ruling(c.allocator, flow.masks);
             out = try out.join(c.allocator, try dep(c, flow, function, branch.ast.then_expr));
             if (branch.ast.else_expr.unwrap()) |e| out = try out.join(c.allocator, try dep(c, flow, function, e));
             return out;
         },
         .@"switch", .switch_comma => {
-            var out = try (try dep(c, flow, function, tree.fullSwitch(node).?.ast.condition)).held().narrowed(c.allocator);
+            var out = try (try dep(c, flow, function, tree.fullSwitch(node).?.ast.condition)).ruling(c.allocator, flow.masks);
             for (tree.fullSwitch(node).?.ast.cases) |case| out = try out.join(c.allocator, try dep(c, flow, function, (tree.fullSwitchCase(case) orelse continue).ast.target_expr));
             return out;
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => return labeled(c, flow, function, node),
-        // A comparison's truth is input's choice where what it compares is: a bool, data.
+        // A comparison's truth is what it compares chose: a bool, data, for the facts that take
+        // what they decide.
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const both = try (try dep(c, flow, function, lhs)).join(c.allocator, try dep(c, flow, function, rhs));
-            return both.narrowed(c.allocator);
+            return both.ruling(c.allocator, flow.masks);
         },
-        .bool_not => return try (try dep(c, flow, function, tree.nodeData(node).node)).narrowed(c.allocator),
+        .bool_not => return try (try dep(c, flow, function, tree.nodeData(node).node)).ruling(c.allocator, flow.masks),
         else => {},
     }
     if (try literalDep(c, flow, function, node)) |out| return out;
@@ -1388,7 +1536,7 @@ fn declaredDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
         // A primitive (`true`, `u8`) or a name a literal's type gives holds no data.
         .primitive, .literal_context => .{},
         // A name that does not resolve may be anything, memory no place names among it.
-        .unresolved, .invalid_lowering, .before_declaration => .{ .level = Level.unknown.join(flow.unnamed), .unchecked = flow.unnamed_length },
+        .unresolved, .invalid_lowering, .before_declaration => .{ .level = Levels.all(.unknown).join(flow.unnamed), .unchecked = flow.unnamed_length },
     } else .{};
     // A parameter's own length is what its callers measured (`concreteLength`).
     if (f.position(d)) |index| return .{ .params = try .of(c.allocator, valueSlot(index)), .bare = try .of(c.allocator, lengthSlot(index)) };
@@ -1421,7 +1569,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         };
         if (flow.globals.get(decl)) |level| out = try out.join(c.allocator, .{ .level = level });
         if (flow.lengths.get(decl)) |length| out = try out.join(c.allocator, Dep.measuredLength(length));
-        if (flow.zig_text.contains(decl)) out = try out.join(c.allocator, .{ .level = .data });
+        if (flow.zig_text.contains(decl)) out = try out.join(c.allocator, .{ .level = .in(flow.masks.peer, .data) });
         // A function or a type named through a value is no part of its data.
         const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
         if (kind == .function) return .{};
@@ -1523,8 +1671,8 @@ fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
 /// of its instantiations, `Untrusted.parse` over each parser): what the program stores in the
 /// field of that name in each of them. Through one whose type does not resolve, what it stores
 /// in any of its fields so named.
-fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: Ast.Node.Index, name: []const u8) Context.Error!Level {
-    var out: Level = .clean;
+fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: Ast.Node.Index, name: []const u8) Context.Error!Levels {
+    var out: Levels = .clean;
     const value = try c.facts.resolve(file, receiver);
     for (if (value == .alternatives) value.alternatives else &.{value}) |each| {
         var held = each;
@@ -1690,9 +1838,9 @@ fn unrefined(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.In
 /// as data held to that range.
 fn unrefinedBy(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.Index, shown: bool) Context.Error!void {
     var level = concrete(flow, function, try dep(c, flow, function, value));
-    if (shown and level == .number) level = .data;
+    if (shown) level = level.narrowed();
     const now = flow.functions.items[@backingInt(function)].unrefined.join(level);
-    if (now != flow.functions.items[@backingInt(function)].unrefined) {
+    if (!now.eql(flow.functions.items[@backingInt(function)].unrefined)) {
         flow.functions.items[@backingInt(function)].unrefined = now;
         flow.changed = true;
     }
@@ -1734,13 +1882,14 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
         const given = try dep(c, flow, function, arg);
         for ([_]struct { usize, Dep }{ .{ valueSlot(index), given }, .{ lengthSlot(index), given.measured() } }) |each| {
             const slot, const held_there = each;
-
             if (summary.params.has(slot)) out = try out.join(c.allocator, held_there);
             if (summary.numbers.has(slot)) out = try out.join(c.allocator, try held_there.widened(c.allocator));
             if (summary.ranged.has(slot)) out = try out.join(c.allocator, try held_there.narrowed(c.allocator));
             if (summary.maybe.has(slot)) out = try out.join(c.allocator, try held_there.lowered(c.allocator));
             if (summary.lengths.has(slot)) out = try out.join(c.allocator, try held_there.sizing(c.allocator));
             if (summary.bare.has(slot)) out = try out.join(c.allocator, try held_there.written(c.allocator));
+            if (summary.ruled.has(slot)) out = try out.join(c.allocator, try held_there.ruling(c.allocator, flow.masks));
+            if (summary.ruled_lengths.has(slot)) out = try out.join(c.allocator, try (try held_there.ruling(c.allocator, flow.masks)).sizing(c.allocator));
         }
     }
     return out;
@@ -1759,16 +1908,30 @@ fn outsideArg(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Ind
 fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
     const callee = try resolveCall(c, flow, f.file, call);
+    const made = try resultOf(c, flow, function, call, callee);
+    // A writer that reaches a peer, whatever else the call gives.
+    return if (callee.writer) try made.join(c.allocator, .{ .level = .in(flow.masks.peer_writer, .data) }) else made;
+}
+
+fn resultOf(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call, callee: Callee) Context.Error!Dep {
+    const f = flow.functions.items[@backingInt(function)];
     switch (callee.kind) {
         // A parse gives what its parser returns refined, but for the values it showed no range
         // of. aegis's other functions give what they are given: a conversion (`int.cast`), a
         // checked sum or an id's `raw` holds the peer's choice as much as its operand did,
         // though the checks the conversion makes are aegis's.
+        //
+        // Where aegis answers the fact, the parse's refinement is the answer; an error's text
+        // aegis gives is its answer to the error's. Where it does not, the parse gives what its
+        // parser returns.
         .aegis => {
-            if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| return .{ .level = flow.functions.items[@backingInt(target)].unrefined };
+            if (try parserOf(c, flow, f.file, call, callee.decl.?)) |target| {
+                const parser = flow.functions.items[@backingInt(target)];
+                return .{ .level = parser.unrefined.masked(flow.masks.aegis).join(concrete(flow, target, parser.ret).masked(~flow.masks.aegis)) };
+            }
             var out: Dep = .{};
             for (callee.args.items) |arg| out = try out.join(c.allocator, try outsideArg(c, flow, function, arg));
-            return out;
+            return answered(out, flow.masks.aegis & flow.masks.error_text);
         },
         // What it holds: `init`'s value, the receiver of `lend`, `get`, `borrow` and `move`.
         .holder => {
@@ -1780,13 +1943,13 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             return summarized(c, flow, function, callee, flow.functions.items[@backingInt(target)].ret);
         },
         .source => {
-            if (try fixedClean(c, flow, function, call)) return .{};
+            const lanes = try readLanes(c, flow, function, call);
             const decl = callee.decl.?;
             // A read into the caller's buffer returns how much it read: a count the buffer
             // bounds, a peer's within it.
-            if (!(try bufferParams(c, decl)).empty() and returnsCount(c, decl)) return .{ .level = .data };
-            if (flow.fact == .input and decodes(c, decl)) return .{ .level = if (narrow(c, f.file, call)) .data else .number };
-            return .{ .level = .data };
+            if (!(try bufferParams(c, decl)).empty() and returnsCount(c, decl)) return .{ .level = .in(lanes, .data) };
+            if (decodes(c, decl)) return .{ .level = .in(lanes, if (narrow(c, f.file, call)) .data else .number) };
+            return .{ .level = .in(lanes, .data) };
         },
         .outside => {
             // What std's file and directory handles answer that is no read of a file's contents
@@ -1800,7 +1963,7 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
                 // indexes the tree's own tables. What else is read of the tree (`treeValue`)
                 // stays input.
                 if (f.parser and flow.zig_parse.contains(decl)) return .{};
-                if (flow.zig_text.contains(decl)) return .{ .level = .data };
+                if (flow.zig_text.contains(decl)) return .{ .level = .in(flow.masks.peer, .data) };
             }
             // A function outside the program gives what it is given, its receiver among it.
             var out: Dep = .{};
@@ -1829,6 +1992,18 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
             return try (try out.lowered(c.allocator)).join(c.allocator, unnamed(flow));
         },
     }
+}
+
+/// What a call gives, clean in the lanes `lanes` its callee answers. A parameter's part of it
+/// is read in every lane, as the parameters a value depends on are the same for every fact:
+/// an answer in some lanes clears only what the function itself gives.
+fn answered(given: Dep, lanes: Mask) Dep {
+    if (lanes == none) return given;
+    var out = given;
+    out.level = given.level.masked(~lanes);
+    out.length = given.length.masked(~lanes);
+    out.unchecked = given.unchecked.masked(~lanes);
+    return out;
 }
 
 /// Whether a function's result is a count or a position: its declared result is `usize`, or
@@ -1871,18 +2046,19 @@ fn decodes(c: *Context, decl: Facts.Decl) bool {
     return false;
 }
 
-/// The level of `node` in its file as the solved fact reads it, or clean outside the functions
-/// it reads.
-pub fn levelAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
-    const function = owner(flow, file, node) orelse return .clean;
-    return concrete(flow, function, try dep(c, flow, function, node));
+/// The level of `node` in its file as the fact reads it, or clean outside the functions it
+/// reads.
+pub fn levelAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+    const function = owner(fact.flow, file, node) orelse return .clean;
+    return concrete(fact.flow, function, try dep(c, fact.flow, function, node)).at(fact.lane);
 }
 
 /// The level of a counter `loop` steps, as it decides how many passes the loop takes: what it
 /// holds on entry (each assignment outside the loop, under its own conditions) and what each
 /// pass steps it by. Whether a pass steps it is the loop's to decide, which its bound answers.
 /// Null where `operand` names no local the loop assigns.
-pub fn counterLevel(c: *Context, flow: *Flow, file: Project.FileId, loop: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!?Level {
+pub fn counterLevel(c: *Context, fact: Fact, file: Project.FileId, loop: Ast.Node.Index, operand: Ast.Node.Index) Context.Error!?Level {
+    const flow = fact.flow;
     const function = owner(flow, file, operand) orelse return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -1920,7 +2096,7 @@ pub fn counterLevel(c: *Context, flow: *Flow, file: Project.FileId, loop: Ast.No
         out = try out.join(c.allocator, try dep(c, flow, function, stepOf(tree, model, d, tag, value)));
     }
     if (!stepped) return null;
-    return concrete(flow, function, out);
+    return concrete(flow, function, out).at(fact.lane);
 }
 
 /// What an assignment in a loop steps a counter by: a compound assignment's operand, the other
@@ -1951,7 +2127,8 @@ fn namesDeclaration(tree: *const Ast, model: *const Model, node: Ast.Node.Index,
 /// The program's call or the function outside it that a call reaches, for a sink reading its
 /// arguments by the callee's parameters.
 pub const Reached = struct { decl: ?Facts.Decl, args: []const Ast.Node.Index, skip: usize, std: bool, method: bool };
-pub fn reached(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!Reached {
+pub fn reached(c: *Context, fact: Fact, file: Project.FileId, call: Ast.full.Call) Context.Error!Reached {
+    const flow = fact.flow;
     const callee = try resolveCall(c, flow, file, call);
     const decl = callee.decl;
     const in_std = if (decl) |d| flow.program.std_files.contains(@backingInt(d.file)) else false;
@@ -1960,21 +2137,21 @@ pub fn reached(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
 
 /// The level of what a condition reads: its comparisons' and its logic's operands, each as
 /// the fact reads it (a comparison's own result is clean; what it compares is not).
-pub fn conditionAt(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+pub fn conditionAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
     const tree = &c.project.at(file).file.tree;
     switch (tree.nodeTag(node)) {
         .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return (try conditionAt(c, flow, file, lhs)).join(try conditionAt(c, flow, file, rhs));
+            return (try conditionAt(c, fact, file, lhs)).join(try conditionAt(c, fact, file, rhs));
         },
-        .bool_not, .grouped_expression => return conditionAt(c, flow, file, if (tree.nodeTag(node) == .bool_not) tree.nodeData(node).node else tree.nodeData(node).node_and_token[0]),
-        else => return levelAt(c, flow, file, node),
+        .bool_not, .grouped_expression => return conditionAt(c, fact, file, if (tree.nodeTag(node) == .bool_not) tree.nodeData(node).node else tree.nodeData(node).node_and_token[0]),
+        else => return levelAt(c, fact, file, node),
     }
 }
 
-/// Whether a call reads input: a read the fact starts at.
-pub fn isRead(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call) Context.Error!bool {
-    return (try resolveCall(c, flow, file, call)).kind == .source;
+/// Whether a call reads a peer's input.
+pub fn isRead(c: *Context, fact: Fact, file: Project.FileId, call: Ast.full.Call) Context.Error!bool {
+    return (try resolveCall(c, fact.flow, file, call)).kind == .source;
 }
 
 /// Whether a function is declared in std's `Io.File` or `Io.Dir`, or a container inside one
@@ -2035,10 +2212,11 @@ fn treeValue(c: *Context, flow: *const Flow, file: Project.FileId, type_node: As
 /// is the parse's, its length (of a slice) the peer's; anything else is the peer's, within
 /// the source the tree holds, whatever it was given.
 fn treeDep(c: *Context, flow: *const Flow, file: Project.FileId, type_node: ?Ast.Node.Index) Context.Error!Dep {
-    const t = type_node orelse return .{ .level = .data, .length = .data };
+    const data: Levels = .in(flow.masks.peer, .data);
+    const t = type_node orelse return .{ .level = data, .length = data };
     return switch (try treeValue(c, flow, file, t)) {
-        .index, .container => .{ .length = .data },
-        .data => .{ .level = .data, .length = .data },
+        .index, .container => .{ .length = data },
+        .data => .{ .level = data, .length = data },
     };
 }
 
@@ -2067,20 +2245,20 @@ pub const Site = struct { file: Project.FileId, node: Ast.Node.Index };
 /// reads that fill it, the program's callees' returns and the arguments a parameter's callers
 /// give it. The first read found, or null where the walk ends without one (a field the program
 /// stores elsewhere, a walk too long). Read only to name a finding's source.
-pub fn sourceOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Origin {
-    const function = owner(flow, file, node) orelse return null;
-    var walk: Walk = .{ .c = c, .flow = flow };
+pub fn sourceOf(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Origin {
+    const function = owner(fact.flow, file, node) orelse return null;
+    var walk: Walk = .{ .c = c, .flow = fact.flow, .lane = fact.lane };
     return walk.from(function, node, 0);
 }
 
 /// The reads input reaching `node` comes from, at most `most` of them, each found as
 /// `sourceOf` finds one with those already found left out: where several reads reach it, a
 /// finding names more than the first, so no reader takes one source for the only one.
-pub fn sourcesOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, most: usize) Context.Error![]const Origin {
-    const function = owner(flow, file, node) orelse return &.{};
+pub fn sourcesOf(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, most: usize) Context.Error![]const Origin {
+    const function = owner(fact.flow, file, node) orelse return &.{};
     var found: std.ArrayList(Origin) = .empty;
     while (found.items.len < most) {
-        var walk: Walk = .{ .c = c, .flow = flow, .excluded = found.items };
+        var walk: Walk = .{ .c = c, .flow = fact.flow, .lane = fact.lane, .excluded = found.items };
         try found.append(c.allocator, (try walk.from(function, node, 0)) orelse break);
     }
     return found.items;
@@ -2089,6 +2267,8 @@ pub fn sourcesOf(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.
 const Walk = struct {
     c: *Context,
     flow: *Flow,
+    /// The fact walked back.
+    lane: u8,
     seen: std.AutoHashMapUnmanaged(struct { Function.Id, Ast.Node.Index }, void) = .empty,
     steps: u32 = 0,
     /// Reads already found: the walk looks past them for another.
@@ -2103,7 +2283,7 @@ const Walk = struct {
     }
 
     fn carries(w: *Walk, function: Function.Id, node: Ast.Node.Index) Context.Error!bool {
-        return concrete(w.flow, function, try dep(w.c, w.flow, function, node)) != .clean;
+        return concrete(w.flow, function, try dep(w.c, w.flow, function, node)).at(w.lane) != .clean;
     }
 
     fn from(w: *Walk, function: Function.Id, node: Ast.Node.Index, depth: u8) Context.Error!?Origin {
@@ -2126,7 +2306,7 @@ const Walk = struct {
         }
         // A field holds what the program stores in it anywhere, by its declaration.
         if (tree.nodeTag(node) == .field_access) if ((try w.c.facts.definition(f.file, node)).orNull()) |decl| {
-            if ((w.flow.globals.get(decl) orelse .clean) != .clean) if (try w.stored(decl, depth)) |found| return found;
+            if ((w.flow.globals.get(decl) orelse Levels.clean).at(w.lane) != .clean) if (try w.stored(decl, depth)) |found| return found;
         };
         // Memory's length holds what was written to it (`s.len = n`), where its contents carry
         // nothing: the receiver is walked back for the write, whatever it carries itself.
@@ -2540,7 +2720,7 @@ fn takeHeld(c: *Context, flow: *Flow) Context.Error!void {
         const value: Dep = switch (each.holder) {
             .local => |d| flow.locals.get(.{ .file = f.file, .index = d }) orelse continue,
             .global => |decl| .{ .level = flow.globals.get(decl) orelse .clean, .unchecked = flow.lengths.get(decl) orelse .clean },
-            .param, .unknown => .{ .level = .unknown },
+            .param, .unknown => .{ .level = .all(.unknown) },
         };
         // What a store through the holder writes is what the owner holds, not its length.
         try raise(c, flow, each.function, each.owner, value.held());
@@ -2557,7 +2737,7 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
     const fields = (try wholeFields(c, try c.facts.resolve(file, node))) orelse {
         // An integer holds no fields.
         if (try Range.intOf(c, file, node, 64) != null) return out;
-        return try out.join(c.allocator, .{ .level = .unknown });
+        return try out.join(c.allocator, .{ .level = .all(.unknown) });
     };
     for (fields) |field| out = try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
     return out;
@@ -2627,13 +2807,13 @@ fn control(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index
             if ((decl.kind == .variable or decl.kind == .capture) and scope != .file and scope != .container) bound = decl.token;
         };
     }
-    return controlUpTo(c, flow, function, node, bound);
+    return (try controlUpTo(c, flow, function, node, bound)).ruling(c.allocator, flow.masks);
 }
 
 /// `control` of a `break` up to the labeled block it leaves.
 fn controlWithin(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, block: Ast.Node.Index) Context.Error!Dep {
     const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
-    return controlUpTo(c, flow, function, node, tree.firstToken(block));
+    return (try controlUpTo(c, flow, function, node, tree.firstToken(block))).ruling(c.allocator, flow.masks);
 }
 
 fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, bound: ?Ast.TokenIndex) Context.Error!Dep {
@@ -2839,6 +3019,19 @@ fn operands(c: *Context, flow: *Flow, function: Function.Id, condition: Ast.Node
     }
 }
 
+test "the aegis pack's facts fit one solve's lanes, and a set that needs more does not" {
+    // `get` solves every enabled rule's fact in one run, a lane each: the pack declares no more.
+    try std.testing.expect(fits(&@import("AegisPack.zig").rules));
+    var many: [lane_count + 1]Spec = undefined;
+    const sources = [_]FactSpec.Source{ .peer_writer, .error_text, .{ .input = .{ .peer = true, .operator = false } } };
+    for (&many, 0..) |*spec, i| spec.* = .{ .source = sources[i % 3], .control = true, .answers = .{ .aegis = (i / 3) & 1 != 0, .int_from_error = (i / 3) & 2 != 0 } };
+    const check = struct {
+        fn check(_: *Context) Context.Error!void {}
+    }.check;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input" }, .check = check, .facts = &many };
+    try std.testing.expect(!fits(&.{rule}));
+}
+
 test "the input fact asks a governed name once per run, however many places read a field" {
     // Every round reads every field, and each read asks whether the field is one of std's
     // text accessors (`zig_text`). Those are resolved once, as the fact starts: the lookups
@@ -2866,9 +3059,12 @@ fn lookupsFor(n: usize) !usize {
         fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
             return config;
         }
+        fn check(_: *Context) Context.Error!void {}
     };
+    const peer_input = @import("Danger.zig").peer_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input" }, .check = Quiet.check, .facts = &.{peer_input} };
     var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
-    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink };
-    _ = try get(&c, .input);
+    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    _ = try get(&c, peer_input);
     return (try facts.memo(Governed.Lookups)).asked;
 }
