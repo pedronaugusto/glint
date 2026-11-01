@@ -128,8 +128,9 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
         else => return false,
     }
 }
-/// A required library member that did not resolve, at the first import of its module in this
-/// file. Recognition of that library is incomplete here, so a rule reports it as coverage.
+/// A required library member that did not resolve, at the first import in this file of the
+/// root that lacks it, under whatever name. Recognition of that library is incomplete here, so
+/// a rule reports it as coverage.
 pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unknown, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     const found = try self.facts.publication(library);
@@ -140,7 +141,12 @@ pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
         const args = Facts.builtinArgs(tree, node, &buffer);
         if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
         const literal = tree.tokenSlice(tree.nodeMainToken(args[0]));
-        if (literal.len != gap.module.len + 2 or !std.mem.eql(u8, literal[1 .. literal.len - 1], gap.module)) continue;
+        if (literal.len < 2) continue;
+        const spelling = literal[1 .. literal.len - 1];
+        const imports_root = for (self.project.imports) |mapping| {
+            if (mapping.from == self.file and mapping.target == gap.root and std.mem.eql(u8, mapping.spelling, spelling)) break true;
+        } else false;
+        if (!imports_root) continue;
         return .{ .module = gap.module, .path = gap.path, .why = gap.why, .start = tree.tokenStart(tree.nodeMainToken(node)) };
     };
     return null;

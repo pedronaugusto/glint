@@ -377,15 +377,17 @@ const flat_units = scalarFile(&.{ "Count", "Bytes", "Bits", "Duration", "Instant
 const Flat = struct { root: []const u8 = flat_root, vault: []const u8 = "", library_selected: bool = false };
 fn flatFixture(bytes: []const u8, options: Flat) !P {
     const selected = options.library_selected;
+    // aegis's sources, stated as its package as a caller states them; the vault is no package.
+    const own = glint.AegisPack.package;
     var inputs = [_]P.Input{
         .{ .name = "consumer", .bytes = bytes },
-        .{ .name = "root.zig", .bytes = options.root, .selected = selected },
-        .{ .name = "Secret.zig", .bytes = flat_secret, .selected = selected },
-        .{ .name = "Guarded.zig", .bytes = flat_guarded, .selected = selected },
-        .{ .name = "SecretBytes.zig", .bytes = flat_bytes, .selected = selected },
-        .{ .name = "int.zig", .bytes = flat_int, .selected = selected },
-        .{ .name = "id.zig", .bytes = flat_id, .selected = selected },
-        .{ .name = "units.zig", .bytes = flat_units, .selected = selected },
+        .{ .name = "root.zig", .bytes = options.root, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "Secret.zig", .bytes = flat_secret, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "Guarded.zig", .bytes = flat_guarded, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "SecretBytes.zig", .bytes = flat_bytes, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "int.zig", .bytes = flat_int, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "id.zig", .bytes = flat_id, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
+        .{ .name = "units.zig", .bytes = flat_units, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
         .{ .name = "vault.zig", .bytes = options.vault, .selected = false },
     };
     const imports = [_]P.Import{

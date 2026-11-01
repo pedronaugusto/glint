@@ -63,7 +63,7 @@ pub const Kind = enum {
 /// module root reaches it, so recognition survives any revision that keeps its public names and
 /// reports one that drops them (Context.drift). The same members are listed once per way aegis
 /// is imported: the root, and each namespace module a program may depend on alone.
-pub const library: Lib = .{ .modules = &modules };
+pub const library: Lib = .{ .modules = &modules, .package = package };
 /// Aegis's package, as its `build.zig.zon` names it (`Facts.known`): its own files are not the
 /// program's, as the analyses know aegis by its declarations, under whatever name it is
 /// imported. Its fingerprint stays the same in every revision.

@@ -292,6 +292,11 @@ test "--only beside --config runs only its rules, under the configuration's opti
 
 /// The run's output on `file` under `tmp`, with `options` before it; its status in `status`.
 fn runOn(a: std.mem.Allocator, tmp: *std.testing.TmpDir, options: []const []const u8, file: []const u8, status: *u8) ![]u8 {
+    return runOnFiles(a, tmp, options, &.{file}, status);
+}
+
+/// `runOn` with several files selected, each under `tmp`.
+fn runOnFiles(a: std.mem.Allocator, tmp: *std.testing.TmpDir, options: []const []const u8, files: []const []const u8, status: *u8) ![]u8 {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(root);
     var args: std.ArrayList([]const u8) = .empty;
@@ -310,13 +315,83 @@ fn runOn(a: std.mem.Allocator, tmp: *std.testing.TmpDir, options: []const []cons
             try args.append(a, joined);
         } else try args.append(a, option);
     }
-    const path = try std.Io.Dir.path.join(a, &.{ root, file });
-    try owned.append(a, path);
-    try args.append(a, path);
+    for (files) |file| {
+        const path = try std.Io.Dir.path.join(a, &.{ root, file });
+        try owned.append(a, path);
+        try args.append(a, path);
+    }
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
     status.* = try cli.execute(a, std.testing.io, args.items, &output.writer, &quiet.writer);
     return a.dupe(u8, output.written());
+}
+
+test "publishing aegis's API turns the pack on and nothing more: a program file republishing it stays the program's, and aegis's own revision under any name is aegis" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const manifest = try a.print(".{{ .name = .aegis, .version = \"0.2.1\", .fingerprint = 0x{x}, .paths = .{{\"\"}} }}\n", .{glint.AegisPack.package.fingerprint});
+    defer a.free(manifest);
+    for ([_][]const u8{ "aegis", "old" }) |dir| {
+        try tmp.dir.createDirPath(std.testing.io, dir);
+        var tree = try tmp.dir.openDir(std.testing.io, dir, .{});
+        defer tree.close(std.testing.io);
+        try aegis_sources.writeTree(a, std.testing.io, tree);
+        try tree.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = manifest });
+    }
+    const index =
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    return buf[i];
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const std = @import(\"std\");\nconst common = @import(\"common.zig\");\npub fn g(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const k: common.Secret(u64) = .init(1);\n    _ = k;\n    return common.f(r, buf);\n}\n" });
+    // std as 0.17 lays out the read the cases make, and nothing else.
+    try tmp.dir.createDirPath(std.testing.io, "lib/std/Io");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/std/std.zig", .data = "pub const Io = @import(\"Io.zig\");\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/std/Io.zig", .data = "pub const Reader = @import(\"Io/Reader.zig\");\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/std/Io/Reader.zig", .data = "pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T {\n    _ = r;\n    _ = endian;\n    return 0;\n}\n" });
+    var status: u8 = undefined;
+    // A program file republishing aegis.Secret and SecretBytes, which aegis.secret requires,
+    // beside its own code, or forwarding a helper file's: the program's files, read.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "common.zig", .data = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\npub const Secret = aegis.Secret;\npub const SecretBytes = aegis.SecretBytes;\n" ++ index });
+    const republished = try runOnFiles(a, &tmp, &.{ "--only", "A009", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig" }, &.{ "main.zig", "common.zig" }, &status);
+    defer a.free(republished);
+    try std.testing.expect(std.mem.find(u8, republished, "A009: ") != null);
+    // aegis's root, imported as aegis, is no namespace module of it: it lacks no member.
+    try std.testing.expect(std.mem.find(u8, republished, "does not resolve") == null);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "helpers.zig", .data = "const std = @import(\"std\");\n" ++ index });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "common.zig", .data = "const aegis = @import(\"aegis\");\npub const Secret = aegis.Secret;\npub const SecretBytes = aegis.SecretBytes;\npub const f = @import(\"helpers.zig\").f;\n" });
+    const forwarded = try runOnFiles(a, &tmp, &.{ "--only", "A009", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig" }, &.{ "main.zig", "helpers.zig" }, &status);
+    defer a.free(forwarded);
+    try std.testing.expect(std.mem.find(u8, forwarded, "A009: ") != null);
+    // A wrapper package, under its own manifest, republishing aegis's secret types beside its
+    // own helper: its files are the program's.
+    try tmp.dir.createDirPath(std.testing.io, "wrap");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wrap/build.zig.zon", .data = ".{ .name = .wrap, .version = \"0.1.0\", .fingerprint = 0x2a2a2a2a2a2a2a2a, .paths = .{\"\"} }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wrap/root.zig", .data = "pub const aegis = @import(\"aegis\");\npub const Secret = aegis.Secret;\npub const SecretBytes = aegis.SecretBytes;\npub fn pick(buf: []const u8, i: usize) u8 {\n    return buf[i];\n}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.zig", .data = "const std = @import(\"std\");\nconst w = @import(\"wrap\");\npub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {\n    const k: w.Secret(u64) = .init(1);\n    _ = k;\n    const i: usize = try r.takeInt(u32, .little);\n    return w.pick(buf, i);\n}\n" });
+    const wrapped = try runOnFiles(a, &tmp, &.{ "--only", "A009", "--zig-lib-path=lib", "--module", "aegis=aegis/src/root.zig", "--module", "wrap=wrap/root.zig", "--package", "wrap=wrap" }, &.{ "app.zig", "wrap/root.zig" }, &status);
+    defer a.free(wrapped);
+    try std.testing.expect(std.mem.find(u8, wrapped, "A009: ") != null);
+    try std.testing.expect(std.mem.find(u8, wrapped, "does not resolve") == null);
+    // A second revision of aegis under its own manifest, imported as aegis_old and lacking a
+    // member aegis requires: aegis, its roles read from what it publishes, the member it lacks
+    // a gap the run reports where it is imported.
+    var old = try tmp.dir.openDir(std.testing.io, "old", .{});
+    defer old.close(std.testing.io);
+    const root = try old.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
+    defer a.free(root);
+    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Removed =");
+    defer a.free(lacking);
+    try std.testing.expect(!std.mem.eql(u8, root, lacking));
+    try old.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two.zig", .data = "const old = @import(\"aegis_old\");\nconst Index = old.id.Id(struct {}, u16);\npub fn f(i: Index) u16 {\n    return @backingInt(i) + 1;\n}\n" });
+    const second = try runOn(a, &tmp, &.{ "--only", "A004", "--module", "aegis_old=old/src/root.zig" }, "two.zig", &status);
+    defer a.free(second);
+    try std.testing.expect(std.mem.find(u8, second, "A004: ") != null);
+    try std.testing.expect(std.mem.find(u8, second, "published member Guarded of aegis does not resolve") != null);
 }
 
 test "the aegis pack is on where a file's import of aegis resolves to aegis, and on whatever the files import with --aegis" {

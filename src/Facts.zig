@@ -144,12 +144,17 @@ pub const Publication = struct {
     entries: []const Entry,
     /// Required members that did not resolve: drift or a missing module mapping, never silence.
     gaps: []const Gap,
-    /// Every file the library's own roots reach, std and builtin aside.
+    /// The library's own files. A library with a package (aegis's) has the files of that
+    /// identity: a file publishing its API, a program's re-export or a copy without its
+    /// manifest, stays the program's, whatever it turns on. One without is known by its import
+    /// alone: every file its roots reach, std and builtin aside.
     files: []const Project.FileId,
 };
 pub const Entry = struct { role: u32, target: Target };
 pub const Target = union(enum) { function: Decl, container: Container };
-pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
+/// A required member `module`'s root `root` does not publish: reported where a file imports
+/// that root, under whatever name.
+pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown, root: Project.FileId };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
 /// (`param_types[6]` of a table whose functions take at most six), so the code that needs it
@@ -243,18 +248,23 @@ pub fn deinit(self: *Facts) void {
 }
 
 /// A package by its identity: the name and fingerprint its `build.zig.zon` gives.
-pub const Package = struct { name: []const u8, fingerprint: u64 };
+pub const Package = @import("Library.zig").Package;
 
 /// Whether `file` is one of the known library's own (`known`): its package is the library's,
 /// as the caller states it. A file whose package the caller does not state is not.
 pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
-    const library = self.known orelse return false;
+    return self.ofPackage(file, self.known orelse return false);
+}
+
+/// Whether the caller states `file` to be of `package`, by name and fingerprint.
+fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
     const input = self.project.at(file).input;
-    return input.fingerprint == library.fingerprint and std.mem.eql(u8, input.package, library.name);
+    return input.fingerprint == package.fingerprint and std.mem.eql(u8, input.package, package.name);
 }
 
 /// The files a module's root is: each file a file outside the known library imports by the
-/// module's name, where it is the library's own or its package is not stated, or where it
+/// module's name, or the library's own file under any name, where it is the library's own or
+/// its package is not stated, or where it
 /// publishes any member the module requires or does not parse (the members it lacks are
 /// gaps the run reports); and each, under any name and of any package, that publishes every
 /// member the module requires: the library's own file, its sources vendored into another
@@ -272,10 +282,16 @@ pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.F
         if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
         // The library's own import of its parts is no program's import of a module.
         if (self.knownFile(mapping.from) and self.knownFile(mapping.target)) continue;
-        const named = std.mem.eql(u8, mapping.spelling, module.name);
+        // The library's own file is it under any name (a second revision imported as
+        // `aegis_old`): by identity, as its files leave the program. Under another module's
+        // name it is that module where it publishes some of it (aegis's root is not
+        // `aegis.int`, whose members it publishes under `int`).
+        const spelled = std.mem.eql(u8, mapping.spelling, module.name);
+        const named = spelled or self.knownFile(mapping.target);
         const stated = !self.knownFile(mapping.target) and self.project.at(mapping.target).input.fingerprint != null;
+        const parsed = self.project.at(mapping.target).file.status == .parsed;
+        if (!spelled and named and parsed and !try self.publishesAny(module, mapping.target)) continue;
         if (!named or stated) {
-            const parsed = self.project.at(mapping.target).file.status == .parsed;
             // Under its name, a module publishing some of it is it with members missing, and
             // one that does not parse may be; publishing none, it is another.
             if (!(named and (!parsed or try self.publishesAny(module, mapping.target)))) {
@@ -312,14 +328,18 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
                         try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = returned.container.file, .scope = returned.container.scope } } });
                     };
                 },
-                .gap => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why }),
+                .gap => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why, .root = root }),
             };
         }
     }
-    try self.reach(&reached, .library);
     var files: std.ArrayList(Project.FileId) = .empty;
-    var each = reached.keyIterator();
-    while (each.next()) |file| try files.append(self.gpa, @fromBackingInt(file.*));
+    if (library.package) |package| {
+        for (self.project.sources) |*source| if (self.ofPackage(source.id, package)) try files.append(self.gpa, source.id);
+    } else {
+        try self.reach(&reached, .library);
+        var each = reached.keyIterator();
+        while (each.next()) |file| try files.append(self.gpa, @fromBackingInt(file.*));
+    }
     const result = try self.gpa.create(Publication);
     result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
     try self.publications.put(self.gpa, key, result);
