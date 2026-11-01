@@ -6251,8 +6251,9 @@ test "A014 reads a local list nothing grows or frees once its items are stored a
 test "A020 reads a cancellation point the loop reaches through the project's functions: a call whose error set holds error.Canceled, never one only given an Io" {
     // uplink's connection loop (its socket holds the Io); relic's fetch-pack packets read from
     // a stream reader, which reports a cancel as ReadFailed, and a call only given the Io, are
-    // no cancellation point.
-    try expect(pack.cancellation,
+    // no cancellation point. The packet's read, of a reader a field holds, returned as it is, is
+    // the lost cancel's undecided case.
+    const found = try run(pack.cancellation,
         \\const std = @import("std");
         \\const Socket = struct { io: std.Io, file: std.Io.File, reader: std.Io.File.Reader };
         \\fn awaitRequest(s: *Socket) std.Io.Cancelable!bool {
@@ -6283,7 +6284,9 @@ test "A020 reads a cancellation point the loop reaches through the project's fun
         \\    var total: u64 = 0;
         \\    while (true) total +%= now(io);
         \\}
-    , 3);
+    );
+    try std.testing.expectEqual(@as(usize, 3), found.findings);
+    try std.testing.expectEqual(@as(usize, 1), found.undecided);
     // A reader passed in may be a fixed one over the program's bytes, a toss never refills, and
     // a function that reaches no Io is no cancellation point.
     const head =
@@ -7843,6 +7846,63 @@ test "A009 reads a loop condition that calls a program predicate by what it retu
     try std.testing.expectEqual(@as(usize, 2), doubt.undecided);
 }
 
+test "A020 flags a read of a std reader the function makes whose ReadFailed is passed on, mapped or dropped without its err" {
+    // A cancel inside the read is on the reader's err; a reader the function makes has no
+    // caller to ask it, so each of these loses it.
+    const found = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn passed(f: std.Io.File, io: std.Io) !u8 {
+        \\    var r = f.reader(io, &.{});
+        \\    return try r.interface.takeByte();
+        \\}
+        \\pub fn mapped(f: std.Io.File, io: std.Io) error{Gone}!u8 {
+        \\    var r = f.reader(io, &.{});
+        \\    return r.interface.takeByte() catch return error.Gone;
+        \\}
+        \\pub fn dropped(f: std.Io.File, io: std.Io) void {
+        \\    var r = f.reader(io, &.{});
+        \\    _ = r.interface.takeByte() catch {};
+        \\}
+        \\fn load(in: *std.Io.Reader) !void {
+        \\    _ = try in.takeByte();
+        \\}
+        \\pub fn handed(f: std.Io.File, io: std.Io) void {
+        \\    var r = f.reader(io, &.{});
+        \\    load(&r.interface) catch {};
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 8, 12, 19 }, found.lines[0..found.findings]);
+    // Asked of the reader (its err read, or the reader handed to a call that may), or a reader
+    // the caller gives, which the caller asks: none. One held in a field is undecided.
+    const twins = try run(pack.cancellation,
+        \\const std = @import("std");
+        \\pub fn asked(f: std.Io.File, io: std.Io) !u8 {
+        \\    var r = f.reader(io, &.{});
+        \\    return r.interface.takeByte() catch |err| switch (err) {
+        \\        error.ReadFailed => return r.err.?,
+        \\        else => |other| return other,
+        \\    };
+        \\}
+        \\fn cause(r: *std.Io.File.Reader) anyerror {
+        \\    return r.err orelse error.ReadFailed;
+        \\}
+        \\pub fn helper(f: std.Io.File, io: std.Io) !u8 {
+        \\    var r = f.reader(io, &.{});
+        \\    return r.interface.takeByte() catch return cause(&r);
+        \\}
+        \\pub fn given(r: *std.Io.File.Reader) !u8 {
+        \\    return try r.interface.takeByte();
+        \\}
+        \\const Holder = struct { r: std.Io.File.Reader };
+        \\pub fn field(h: *Holder) !u8 {
+        \\    return try h.r.interface.takeByte();
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), twins.findings);
+    try std.testing.expectEqual(@as(usize, 1), twins.undecided);
+}
+
 test "A020 judges a function that reaches an Io outside its parameters: a global, a global's field, a call" {
     // Each names the Io it is given where its message says to cancel.
     const found = try run(pack.cancellation,
@@ -8830,6 +8890,22 @@ test "A003 leaves a copy handed to a function pointer, or put in a literal a cal
     );
     try std.testing.expectEqual(@as(usize, 0), found.findings);
     try std.testing.expectEqual(@as(usize, 2), found.undecided);
+    // A literal no local holds goes where its type's values go: released where that field of
+    // the type is read and released (`Closing`), lent where it only is read (`Reading`).
+    const typed = try run(pack.cleanup,
+        \\const std = @import("std");
+        \\fn opened() std.Io.File { return undefined; }
+        \\const Closing = struct { f: std.Io.File };
+        \\fn closeIt(b: Closing) void { b.f.close(); }
+        \\fn viaClosing(f: std.Io.File) void { closeIt(.{ .f = f }); }
+        \\pub fn closing() void { const file = opened(); defer file.close(); viaClosing(file); }
+        \\const Reading = struct { f: std.Io.File };
+        \\fn readIt(b: Reading) i32 { return b.f.handle; }
+        \\fn viaReading(f: std.Io.File) i32 { return readIt(.{ .f = f }); }
+        \\pub fn reading() void { const file = opened(); defer file.close(); _ = viaReading(file); }
+    );
+    try std.testing.expectEqual(@as(usize, 0), typed.findings);
+    try std.testing.expectEqual(@as(usize, 1), typed.undecided);
 }
 
 test "A015 reads a capture as a view only where what it binds is one" {
