@@ -11,10 +11,10 @@
         .{ .rule = "A008", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A009", .no_hole = .{ .field, .unwrap, .branch }, .no_twin = .{ .field, .deferred, .jump, .aggregate, .branch } },
         .{ .rule = "A010", .no_hole = .{ .field, .jump, .aggregate, .branch }, .no_twin = .{ .field, .inline_loop, .aggregate, .branch } },
-        .{ .rule = "A011", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A012", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A013", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A014", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        .{ .rule = "A011" },
+        .{ .rule = "A012" },
+        .{ .rule = "A013" },
+        .{ .rule = "A014" },
         .{ .rule = "A015", .no_hole = .{ .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A016", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A017", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
@@ -42,5 +42,89 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
+        // matrix A011: a decl literal `.fromMilliseconds(ms)` is no site; Governed.sites reads identifiers, members and @field only
+        "A011/assignment/mx-decl_literal_store/hole.zig",
+        // matrix A011: a decl literal argument (`io.sleep(.fromMilliseconds(ms), ...)`) is no site
+        "A011/call/mx-decl_literal_argument/hole.zig",
+        // matrix A011: `return .fromMilliseconds(ms)` is no site
+        "A011/jump/mx-return_decl_literal/hole.zig",
+        // matrix A011: decl literals in a switch's prongs are no sites
+        "A011/branch/mx-decl_literal_switch/hole.zig",
+        // matrix A011: a decl literal on orelse's right is no site
+        "A011/unwrap/mx-orelse_decl_literal/hole.zig",
+        // matrix A011: a decl literal under @as is no site
+        "A011/conversion/mx-as_decl_literal/hole.zig",
+        // matrix A011: a struct literal's `.nanoseconds = raw` is no site: std's Duration made with no door
+        "A011/aggregate/mx-struct_literal_nanoseconds/hole.zig",
+        // matrix A011: a decl literal nested in a Timeout literal is no site
+        "A011/aggregate/mx-nested_timeout_literal/hole.zig",
+        // matrix A011: @field with a name held in a constant is skipped, neither resolved nor undecided
+        "A011/field/mx-computed_door_name/hole.zig",
+        // matrix A011: @field with a concatenated name is skipped, neither resolved nor undecided
+        "A011/compile_time/mx-concatenated_name/hole.zig",
+        // matrix A011: @field by a reflected declaration's name is skipped, neither resolved nor undecided
+        "A011/inline_loop/mx-reflected_constant/hole.zig",
+        // matrix A011: sameUnit clears a comparison with any field spelled `nanoseconds`, std's or not
+        "A011/operator/mx-wire_named_nanoseconds/hole.zig",
+        // matrix A011: a raw count copied into std's Duration's bytes crosses no door the rule reads
+        "A011/memory/mx-memcpy_raw/hole.zig",
+        // matrix A012: a std call made through @call is no call the rule reads
+        "A012/call/mx-builtin_call/hole.zig",
+        // matrix A012: HashMapUnmanaged.ensureUnusedCapacity's size is named additional_size, not in the size names
+        "A012/call/mx-map_unused_capacity/hole.zig",
+        // matrix A012: Writer.splatBytesAll's count is named splat, not in the size names
+        "A012/call/mx-splat_count/hole.zig",
+        // matrix A012: @bitCast of a peer's four bytes keeps a byte's level, not a number's
+        "A012/conversion/mx-bitcast_bytes/hole.zig",
+        // matrix A012: @memcpy of a peer's bytes into an integer keeps a byte's level, not a number's
+        "A012/memory/mx-memcpy_bytes/hole.zig",
+        // matrix A013: `.?` on an optional input chooses is `orelse unreachable` and not read
+        "A013/unwrap/mx-optional_unwrap/hole.zig",
+        // matrix A013: std's assert by @field with a name held in a constant is skipped, neither resolved nor undecided
+        "A013/field/mx-computed_assert_name/hole.zig",
+        // matrix A014: a store through a local copy of the caller's pointer is not one that outlives the call
+        "A014/assignment/mx-store_through_local_alias/hole.zig",
+        // matrix A014: a std list's items stored in a field through a local are no borrow the rule reads
+        "A014/assignment/mx-items_through_local/hole.zig",
+        // matrix A014: a destructured name is no alias the rule follows
+        "A014/destructure/mx-destructured_pointer/hole.zig",
+        // matrix A014: a destructuring assignment is no store the rule reads
+        "A014/destructure/mx-destructure_store/hole.zig",
+        // matrix A014: a pointer capture into a local optional is no alias the rule follows
+        "A014/capture/mx-optional_pointer_capture/hole.zig",
+        // matrix A014: a for loop's pointer capture into a local array is no alias the rule follows
+        "A014/capture/mx-for_pointer_capture/hole.zig",
+        // matrix A014: `&@field(s, "a")` is no path into the local the rule reads
+        "A014/field/mx-field_builtin_address/hole.zig",
+        // matrix A014: `&p.*` is no path into the local the rule reads
+        "A014/address/mx-address_of_deref/hole.zig",
+        // matrix A014: a slice's `.ptr` is no pointer into the local the rule reads
+        "A014/address/mx-slice_ptr/hole.zig",
+        // matrix A014: a call's result is not followed into what it was given
+        "A014/call/mx-identity_callee/hole.zig",
+        // matrix A014: a pointer handed to a callee that stores it is no store the rule reads
+        "A014/call/mx-callee_stores/hole.zig",
+        // matrix A014: a defer that makes the store counts as the defer that undoes it
+        "A014/deferred/mx-defer_stores/hole.zig",
+        // matrix A014: a labeled block's result is not followed
+        "A014/jump/mx-block_result_pointer/hole.zig",
+        // matrix A014: an inline for's capture of a pointer is no alias the rule follows
+        "A014/inline_loop/mx-inline_capture/hole.zig",
+        // matrix A014: pointer arithmetic on a pointer into the local is not followed
+        "A014/operator/mx-pointer_arithmetic/hole.zig",
+        // matrix A014: @ptrCast of a pointer into the local is not followed
+        "A014/conversion/mx-ptr_cast/hole.zig",
+        // matrix A014: @as of a pointer into the local is not followed
+        "A014/conversion/mx-as_coerced/hole.zig",
+        // matrix A014: `.?` of a local optional holding a pointer into the frame is not followed
+        "A014/unwrap/mx-optional_local_pointer/hole.zig",
+        // matrix A014: orelse's right is not followed
+        "A014/unwrap/mx-orelse_local/hole.zig",
+        // matrix A014: an array literal is not read, only a struct literal
+        "A014/aggregate/mx-tuple_literal/hole.zig",
+        // matrix A014: @atomicStore is no store the rule reads
+        "A014/memory/mx-atomic_store_global/hole.zig",
+        // matrix A014: an if expression's result is not followed
+        "A014/branch/mx-if_result_pointer/hole.zig",
     },
 }
