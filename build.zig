@@ -46,14 +46,20 @@ pub fn dev(b: *std.Build, tools: type) void {
         .imports = &.{.{ .name = "token", .module = portable_tokens }},
     }) });
     b.step("check-token-portable", "Compile the std-only token API at a different pointer width").dependOn(&portable_contract.step);
-    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path("src/tests.zig"), .target = target, .optimize = optimize }), .filters = if (filter) |f| &.{f} else &.{} });
-    tests.root_module.addImport("aegis", aegis);
-    tests.root_module.addImport("glint", module);
-    tests.root_module.addImport("aegis_sources", aegisSources(b, p, module, aegis_dependency, target));
-    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize });
-    tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
     const test_step = b.step("test", "Run selected contract tests and benchmark smoke");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const check = b.step("check", "Compile CLI and tests");
+    // The contract tests, in a few roots that compile and run as parallel steps.
+    const test_imports = [_]std.Build.Module.Import{
+        .{ .name = "aegis", .module = aegis },
+        .{ .name = "glint", .module = module },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) },
+        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
+    };
+    for ([_][]const u8{ "src/tests.zig", "src/test_danger.zig", "src/test_pack.zig" }) |root| {
+        const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = p.path(root), .target = target, .optimize = optimize, .imports = &test_imports }), .filters = if (filter) |f| &.{f} else &.{} });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+        check.dependOn(&tests.step);
+    }
     const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     // The soundness suite: every case under test/soundness/ on the glint just built, std from
@@ -120,6 +126,8 @@ pub fn dev(b: *std.Build, tools: type) void {
             p.path("src/main.zig"),
             p.path("src/names.zig"),
             p.path("src/tests.zig"),
+            p.path("src/test_danger.zig"),
+            p.path("src/test_pack.zig"),
         },
         .directories = &.{p.path("src")},
         .args = &.{ "--only", "P003", "--gate", "P003" },
@@ -132,8 +140,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     portable_smoke.addArgs(&.{ "--only", "LOCAL_EXPORT", "examples/project.zig" });
     portable_smoke.addFileInput(p.path("examples/project.zig"));
     test_step.dependOn(&portable_smoke.step);
-    const check = b.step("check", "Compile CLI and tests");
-    check.dependOn(&tests.step);
     check.dependOn(&executable.step);
     check.dependOn(&project_linter.step);
     tools.preflight.addCi(b, p, .{ .tests = test_step, .portable_tests = true, .bench = .{

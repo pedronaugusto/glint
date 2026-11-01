@@ -53,6 +53,8 @@
   ],
   "test_roots": [
     "src/tests.zig",
+    "src/test_danger.zig",
+    "src/test_pack.zig",
     "src/glint.zig"
   ],
   "test_dependencies": [
