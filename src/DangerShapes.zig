@@ -114,6 +114,9 @@ fn placeRoot(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
     };
 }
 
+/// What A015 says a field lent its owner should hold instead.
+const advice = "aegis own.Owned holds an owner, and its borrow().* is what a type that lends its field is given";
+
 /// A015 where ownership happens: the checked file's own writes and releases of a resource field
 /// another file declares (`outside`). That type is lent what its field holds (0.3's raw handle is
 /// lent, `own.OwnedIo` owned) as far as its own file shows, so an owner written into it (`s.f = opened()`, a literal of it), a release
@@ -123,7 +126,6 @@ fn placeRoot(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
 /// address taken, is undecided.
 fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    const advice = "aegis own.Owned holds an owner, and its borrow().* is what a type that lends its field is given";
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
@@ -180,41 +182,8 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
             }
             continue;
         }
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        const callee: ?Facts.Decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| try originKnown(c, decl),
-            .unknown => null,
-            else => continue,
-        };
-        // A method called on a value takes it first.
-        var given: std.ArrayList(struct { node: Ast.Node.Index, position: usize }) = .empty;
-        var skip: usize = 0;
-        if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-            const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-            switch (try c.facts.resolve(c.file, receiver)) {
-                .container => {},
-                else => {
-                    skip = 1;
-                    try given.append(c.allocator, .{ .node = receiver, .position = 0 });
-                },
-            }
-        }
-        for (call.ast.params, 0..) |argument, position| try given.append(c.allocator, .{ .node = argument, .position = position + skip });
-        for (given.items) |each| {
-            const held = byValue(try c.facts.resolve(c.file, each.node)) orelse continue;
-            const which = find(resources, held) orelse continue;
-            if (try filled(c, resources, c.file, each.node) or try keptHere(c, each.node)) continue;
-            const decl = callee orelse {
-                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(each.node)), .unresolved, "an owner handed by value to a function that does not resolve, which may keep it");
-                continue;
-            };
-            switch (try stores(c, resources, decl, each.position, 0)) {
-                .no => {},
-                .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(each.node)), .unresolved, "an owner handed by value to a function outside the program that passes it where nothing resolves, which may keep it"),
-                .yes => try c.at(rule, tree.nodeMainToken(each.node), try c.allocator.print("a std.{s} owner handed by value to '{s}', which keeps it in a field it releases: the owner is held by hand there; {s}", .{ resource_paths[which], c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, advice })),
-            }
-        }
+        const call = (try Facts.calls.at(c.facts, c.file, node)) orelse continue;
+        try handed(c, rule, resources, &call);
     }
     // A tuple's fields, named by position only, are no declarations: each is read where it is
     // written, as a field is. An enum's or a union's field written without a type parses the
@@ -239,6 +208,52 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
             };
             try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{resource_paths[which]}));
         }
+    }
+}
+
+/// A015 at `call`, which hands a std owner by value to a function that keeps it (`stores`): each
+/// of a choice of callees read as one it calls. A callee that does not resolve, or a parameter
+/// that takes the owner where which one is not known (`@call` given no tuple literal), may keep
+/// it: undecided.
+fn handed(c: *Context, rule: Rule, resources: []const ?Facts.Container, call: *const Facts.calls.Call) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const written: []const Ast.Node.Index = switch (call.args) {
+        .known => |args| args,
+        .unknown => if (tree.fullCall(&buffer, call.node)) |full| full.ast.params else &.{},
+    };
+    for (written, 0..) |argument, position| {
+        const held = byValue(try c.facts.resolve(c.file, argument)) orelse continue;
+        const which = find(resources, held) orelse continue;
+        if (try filled(c, resources, c.file, argument) or try keptHere(c, argument)) continue;
+        const at = tree.tokenStart(tree.nodeMainToken(argument));
+        if (call.args == .unknown) {
+            try c.undecided(rule, at, .unresolved, "an owner handed by value where which parameter takes it does not resolve, which may keep it");
+            continue;
+        }
+        const callees: []const Facts.Decl = switch (call.callee) {
+            .function => |*one| one[0..1],
+            .choice => |each| each,
+            .any => {
+                try c.undecided(rule, at, .unresolved, "an owner handed by value to a function that does not resolve, which may keep it");
+                continue;
+            },
+        };
+        var unknown = false;
+        for (callees) |callee| {
+            const decl = (try originKnown(c, callee)) orelse {
+                unknown = true;
+                continue;
+            };
+            switch (try stores(c, resources, decl, position, 0)) {
+                .no => {},
+                .unknown => unknown = true,
+                .yes => {
+                    try c.at(rule, tree.nodeMainToken(argument), try c.allocator.print("a std.{s} owner handed by value to '{s}', which keeps it in a field it releases: the owner is held by hand there; {s}", .{ resource_paths[which], c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, advice }));
+                    break;
+                },
+            }
+        } else if (unknown) try c.undecided(rule, at, .unresolved, "an owner handed by value to a function outside the program that passes it where nothing resolves, which may keep it");
     }
 }
 
