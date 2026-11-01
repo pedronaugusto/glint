@@ -362,6 +362,9 @@ fn slot(param: usize, length: bool) Var {
 
 /// How many places a summary gives: as many as a call's temporaries hold.
 const max_slot_places = 6;
+/// The temporaries of an operator's node that hold its left operand (`heldPast`), past any part
+/// an operator's own value takes.
+const held_part: u8 = 8;
 
 /// A summary's slot of its `k`th place, after the parameters' and the result's: its value or
 /// length at entry or at exit, a length's slot odd as `slot`'s are. A function of more
@@ -1127,19 +1130,35 @@ const Frame = struct {
         const tag = f.tree.nodeTag(node);
         const e = try f.eval(s, rhs);
         const int = try f.intOf(target);
-        if (tag == .assign) {
-            const out = try f.storedIn(e.s, p);
-            if (int != null) return f.assign(out, try f.placeVar(p, false), e.v.lin, int);
-            if (!try f.holdsLength(target) or try Range.memoryLength(f.c, f.file, target) != null) return out;
-            const l = try f.placeVar(p, true);
-            if (e.v.claimed) try f.claimed.put(f.a, l, {}) else _ = f.claimed.remove(l);
-            return f.assign(out, l, e.v.length, null);
-        }
+        if (tag == .assign) return f.setPlace(e.s, target, p, e.v);
         // `op=` reads the place first: what it held at entry, where nothing has stored one yet.
         const current = try f.placeValue(e.s, target, p);
         const out = try f.storedIn(current.s, p);
         const result = try f.arith(out, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
         return f.assign(result.s, try f.placeVar(p, false), result.v.lin, int);
+    }
+
+    /// The state past `p` given `value` (`=`): within its type, or the length of the memory it
+    /// holds.
+    fn setPlace(f: *Frame, s: State, target: Ast.Node.Index, p: Place, value: Value) Error!State {
+        const int = try f.intOf(target);
+        const out = try f.storedIn(s, p);
+        if (int != null) return f.assign(out, try f.placeVar(p, false), value.lin, int);
+        if (!try f.holdsLength(target) or try Range.memoryLength(f.c, f.file, target) != null) return out;
+        const l = try f.placeVar(p, true);
+        if (value.claimed) try f.claimed.put(f.a, l, {}) else _ = f.claimed.remove(l);
+        return f.assign(out, l, value.length, null);
+    }
+
+    /// The state past a store of `value` into `target`, a name's place aside, as `=` gives it:
+    /// a length, a place, or memory no place of this function's is. A destructure's targets
+    /// each take one so.
+    fn storeValue(f: *Frame, s: State, target: Ast.Node.Index, value: Value) RunError!State {
+        if (try f.lengthStored(target)) |memory| return f.setLength(s, target, memory, value);
+        if (try f.placeOf(target)) |p| return f.setPlace(s, target, p, value);
+        // A store to memory: what it reads is evaluated, and no tracked variable changes.
+        const place = try f.eval(s, target);
+        return f.storedThrough(place.s, target);
     }
 
     /// The state past a store to `target`, no place of this function's: the same field of a
@@ -1213,18 +1232,31 @@ const Frame = struct {
 
     fn destructure(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
         const full = f.tree.assignDestructure(node);
-        var out = (try f.eval(s, full.ast.value_expr)).s;
-        for (full.ast.variables) |target| {
+        // A literal of as many values gives each target its own; any other value, nothing linear.
+        var values: std.ArrayList(Value) = .empty;
+        var out = s;
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (f.tree.fullArrayInit(&buffer, full.ast.value_expr)) |literal| if (literal.ast.type_expr == .none and literal.ast.elements.len == full.ast.variables.len) {
+            for (literal.ast.elements) |item| {
+                const e = try f.eval(out, item);
+                out = e.s;
+                try values.append(f.a, e.v);
+            }
+        };
+        if (values.items.len == 0) out = (try f.eval(s, full.ast.value_expr)).s;
+        for (full.ast.variables, 0..) |target, k| {
+            const value: Value = if (k < values.items.len) values.items[k] else .{};
             if (f.tree.fullVarDecl(target)) |local| {
                 const d = f.decls.get(local.ast.mut_token + 1) orelse continue;
-                if (f.tracked(d)) out = try f.bind(out, d, .{}, null);
+                if (f.tracked(d)) out = try f.bind(out, d, value, null);
                 continue;
             }
             if (f.trackedName(target)) |d| {
-                out = try f.bind(out, d, .{}, null);
+                out = try f.bind(out, d, value, try f.intOf(target));
                 continue;
             }
-            out = (try f.eval(out, target)).s;
+            // A field, a length or memory: stored as `=` stores it.
+            out = try f.storeValue(out, target, value);
         }
         return out;
     }
@@ -1270,14 +1302,21 @@ const Frame = struct {
     fn storeLength(f: *Frame, s: State, node: Ast.Node.Index, target: Ast.Node.Index, rhs: Ast.Node.Index, d: Model.Declaration.Id) RunError!State {
         const tag = f.tree.nodeTag(node);
         const e = try f.eval(s, rhs);
+        if (tag == .assign or f.tree.nodeTag(target) != .field_access) return f.setLength(e.s, target, d, e.v);
         const v = try f.variable(.{ .length = d });
         try f.claimed.put(f.a, v, {});
-        // `@field(s, name)` with a name read as the program compiles: any field, `len` among them.
-        if (f.tree.nodeTag(target) != .field_access) return f.assign(try f.wrote(e.s, null, null), v, null, null);
-        if (tag == .assign) return f.assign(e.s, v, e.v.lin, null);
         const int = try f.intOf(target);
         const result = try f.arith(e.s, node, opOf(tag), try single(f.a, v), e.v.lin, rhs, int);
         return f.assign(result.s, v, result.v.lin, null);
+    }
+
+    /// The state past `d`'s length given `value` (`=`): a length claimed, no longer its memory's.
+    fn setLength(f: *Frame, s: State, target: Ast.Node.Index, d: Model.Declaration.Id, value: Value) Error!State {
+        const v = try f.variable(.{ .length = d });
+        try f.claimed.put(f.a, v, {});
+        // `@field(s, name)` with a name read as the program compiles: any field, `len` among them.
+        if (f.tree.nodeTag(target) != .field_access) return f.assign(try f.wrote(s, null, null), v, null, null);
+        return f.assign(s, v, value.lin, null);
     }
 
     /// The tracked declaration an identifier names, where it names one.
@@ -1310,7 +1349,7 @@ const Frame = struct {
             .slice_open, .slice, .slice_sentinel => return f.slice(s, node),
             .add, .sub, .mul, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor => {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try f.eval(s, lhs);
+                const left = try f.heldPast(try f.eval(s, lhs), node, rhs);
                 const right = try f.eval(left.s, rhs);
                 return f.arith(right.s, node, tree.nodeTag(node), left.v.lin, right.v.lin, rhs, try f.intOf(node));
             },
@@ -1632,7 +1671,9 @@ const Frame = struct {
     fn builtin(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         const made = try f.builtinValue(s, node);
         const which = f.tree.tokenSlice(f.tree.nodeMainToken(node));
-        for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |writes| if (std.mem.eql(u8, which, writes)) {
+        // `@call` calls a function this reading does not follow: it may write any memory its
+        // arguments reach, as a builtin that writes memory does.
+        for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong", "@call" }) |writes| if (std.mem.eql(u8, which, writes)) {
             return .{ .s = try f.wrote(made.s, null, null), .v = made.v };
         };
         return made;
@@ -1738,7 +1779,7 @@ const Frame = struct {
             },
             .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try f.eval(s, lhs);
+                const left = try f.heldPast(try f.eval(s, lhs), node, rhs);
                 const right = try f.eval(left.s, rhs);
                 const base = right.s;
                 try f.counted(base, lhs, left.v.lin);
@@ -2312,7 +2353,7 @@ const Frame = struct {
                     out = measured[0];
                     receiver = .{ .lin = e.v.lin, .length = measured[1] };
                     holder_node = holder;
-                    out = try f.heldAtCall(out, node, 1, &receiver.?);
+                    out = try f.heldAtCall(out, node, 1, &receiver.?, f.assignsAny(full.ast.params));
                 },
                 else => {},
             }
@@ -2328,7 +2369,7 @@ const Frame = struct {
                 out = measured[0];
                 arg = .{ .length = measured[1] };
             }
-            if (i < 120) out = try f.heldAtCall(out, node, @intCast(2 + i), &arg);
+            if (i < 120) out = try f.heldAtCall(out, node, @intCast(2 + i), &arg, f.assignsAny(full.ast.params[i + 1 ..]));
             try args.append(f.a, arg);
         }
         const summary = try f.summaryOf(full.ast.fn_expr);
@@ -2414,17 +2455,51 @@ const Frame = struct {
     /// A place a call's summary reads, where an operand holds it, and what it held before.
     const Given = struct { place: ?Place = null, before: [2]?Lin = .{ null, null } };
 
-    /// `value`, where it reads a place, held in the call's own temporaries for its `ordinal`th
-    /// operand (the receiver's first, `2 * ordinal` and the next): the callee may store into the
-    /// place, and what its summary says is of the value it was given.
-    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, ordinal: u7, value: *Value) Error!State {
+    /// `value`, where it reads a place, or with `later` any variable, held in the call's own
+    /// temporaries for its `ordinal`th operand (the receiver's first, `2 * ordinal` and the
+    /// next): the callee may store into the place, and what its summary says is of the value it
+    /// was given; a later operand may assign a variable it reads (`get(i, blk: { i = 3; … })`),
+    /// and Zig passes the value it read.
+    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, ordinal: u7, value: *Value, later: bool) Error!State {
         var out = s;
-        inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(value, part_name)) |lin| if (f.readsPlace(lin)) {
+        inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(value, part_name)) |lin| if (f.readsPlace(lin) or (later and lin.terms.len != 0)) {
             const t = try f.temp(out, node, @as(u8, ordinal) * 2 + @as(u8, k));
             out = try f.equal(t[0], t[1], lin);
             @field(value, part_name) = try single(f.a, t[1]);
         };
         return out;
+    }
+
+    /// `e`'s value held in `node`'s own temporaries where `later`, evaluated after it, may
+    /// assign a variable it reads (`i + blk: { i = 0; break :blk 0; }`): Zig takes each operand's
+    /// value where it reads it.
+    fn heldPast(f: *Frame, e: Eval, node: Ast.Node.Index, later: Ast.Node.Index) Error!Eval {
+        if (!f.assigns(later)) return e;
+        var out = e;
+        inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(e.v, part_name)) |lin| if (lin.terms.len != 0) {
+            const t = try f.temp(out.s, node, held_part + k);
+            out.s = try f.equal(t[0], t[1], lin);
+            @field(out.v, part_name) = try single(f.a, t[1]);
+        };
+        return out;
+    }
+
+    /// Whether any of `nodes` may assign a variable: holds an assignment's operator.
+    fn assignsAny(f: *Frame, nodes: []const Ast.Node.Index) bool {
+        for (nodes) |node| if (f.assigns(node)) return true;
+        return false;
+    }
+
+    /// Whether `node` may assign a variable: an assignment's operator among its tokens (a
+    /// declaration's or a literal's `=` among them, read the same).
+    fn assigns(f: *Frame, node: Ast.Node.Index) bool {
+        const tree = f.tree;
+        var token = tree.firstToken(node);
+        while (token <= tree.lastToken(node)) : (token += 1) switch (tree.tokenTag(token)) {
+            .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal, .ampersand_equal, .pipe_equal, .caret_equal, .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_left_pipe_equal, .angle_bracket_angle_bracket_right_equal, .plus_percent_equal, .minus_percent_equal, .asterisk_percent_equal, .plus_pipe_equal, .minus_pipe_equal, .asterisk_pipe_equal => return true,
+            else => {},
+        };
+        return false;
     }
 
     fn readsPlace(f: *Frame, lin: Lin) bool {
