@@ -1737,10 +1737,11 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// A017: an enum state written by two or more functions, switched on, and moved on its own value:
 /// a state machine kept by hand, where nothing says which transitions are allowed. A field is
 /// read by meaning: a read `x.state` or `@field(x, "state")`, through any holder of the type; a
-/// write by `=`, by its place in a destructure, through its address (`&x.state`, a `|*p|`
-/// capture: it may be written through, `@atomicStore` alike), or by a struct literal of its type
-/// assigned over a value (`x.* = .{ .state = .done }`). A move is a write under a switch or a
-/// condition on the field (`switch (f.state) { .start => f.state = .value, ... }`), or one whose
+/// write by `=`, by its place in a destructure, by `@atomicStore`, through any pointer to it (by
+/// its type), or by a struct literal of its type assigned over a value
+/// (`x.* = .{ .state = .done }`); a whole copy of a holder is none (`stateWrites`). A move is a
+/// write under a switch or a condition on the field
+/// (`switch (f.state) { .start => f.state = .value, ... }`), or one whose
 /// value reads it (`f.state = if (f.state == .a) .b else f.state`, its integer plus one), there
 /// or where the function that writes it is called; each function that calls a writer writes it
 /// too. A switch on it reads past `orelse`, `.?` and parentheses. A kind set where its value is
@@ -1749,7 +1750,7 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    for (model.declarations) |decl| {
+    for (model.declarations, 0..) |decl, index| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
         const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
         const state = byValue(try c.facts.resolve(c.file, written)) orelse continue;
@@ -1764,23 +1765,9 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             const owner = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
             if (owner.file != holder.file or owner.scope != holder.scope) continue;
             try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
-            if (stateWritten(use_tree, use_model, use.node)) |write| try writes.append(c.allocator, .{ .file = use.file, .node = write.node, .value = write.value });
             switched = switched or switchedOn(use_tree, use_model, use.node);
         }
-        // A literal of the holder's type assigned over a value writes the field it names.
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .assign) continue;
-            const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const value = tree.nodeData(assignment).node_and_node[1];
-            var buffer: [2]Ast.Node.Index = undefined;
-            const literal = tree.fullStructInit(&buffer, value) orelse continue;
-            const made = byValue(try c.facts.literalType(c.file, value)) orelse continue;
-            if (made.file != holder.file or made.scope != holder.scope) continue;
-            for (literal.ast.fields) |field| {
-                if (!std.mem.eql(u8, tree.tokenSlice(Model.initName(tree, field) orelse continue), decl.name)) continue;
-                try writes.append(c.allocator, .{ .file = c.file, .node = assignment, .value = field });
-            }
-        }
+        try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, &writes);
         var writers: std.ArrayList(Facts.Key) = .empty;
         for (writes.items) |write| try writersOf(c, write, &writers, 0);
         if (writers.items.len < 2 or !switched) continue;
@@ -1796,31 +1783,59 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// A write of a state field: the node it is made at, and the value it writes where one is read.
-const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, value: ?Ast.Node.Index };
+/// A write of a state field: the node it is made at, the value it writes where one is read, and
+/// whether a value not read may be one chosen on the state's own (through its address, a
+/// destructure of no literal), which memory code the program does not hold writes is not: it stores bytes.
+const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, value: ?Ast.Node.Index, unread: bool = true };
 
-/// How the field read at `node` is written there, if it is: the target of `=` (its value), a
-/// place in a destructure (its element of a literal), its address taken or captured by `|*p|`
-/// (written through it as anything may: no value read).
-fn stateWritten(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?struct { node: Ast.Node.Index, value: ?Ast.Node.Index } {
-    const parent = model.parentOf(node) orelse return null;
-    if (tree.nodeTag(parent) == .address_of or pointerCapture(tree, model, parent, node)) return .{ .node = node, .value = null };
-    switch (tree.nodeTag(parent)) {
-        .assign => {
-            const lhs, const rhs = tree.nodeData(parent).node_and_node;
-            if (lhs != node) return null;
-            return .{ .node = parent, .value = rhs };
-        },
-        .assign_destructure => {
-            const full = tree.assignDestructure(parent);
-            const position = std.mem.findScalar(Ast.Node.Index, full.ast.variables, node) orelse return null;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const literal = tree.fullArrayInit(&buffer, full.ast.value_expr) orelse return .{ .node = parent, .value = null };
-            if (literal.ast.elements.len != full.ast.variables.len) return .{ .node = parent, .value = null };
-            return .{ .node = parent, .value = literal.ast.elements[position] };
-        },
-        else => return null,
+/// Each write of the state field `field` in the program's files, as Facts.accesses finds them by
+/// meaning: a store (`=`, a destructure's place, a memory builtin's, `@atomicStore`), and a
+/// literal of its holder stored over a value (`j.* = .{}` resets it). A store that reads it
+/// first (`op=`, `@atomicRmw`) reads it in its value. A copy of a whole holder (`a = b`, an
+/// `append` of one, `std.mem.sort` over them) carries a state chosen where its value was made,
+/// and a value made with it (a literal, a default) is data: neither is a write. A holder's
+/// address taken (a method's receiver) is none either: what is written through it is, at its
+/// own site, by its type; the state's own address (`&x.state`) is a write of no value read. Memory
+/// code the program does not hold writes over it (bytes, `extern`) is a write that chooses no
+/// state on its own value. A store of `undefined` gives it no state. A holder whose type does
+/// not resolve is read as no holder of it, as its uses are.
+fn stateWrites(c: *Context, field: Facts.Decl, writes: *std.ArrayList(StateWrite)) Context.Error!void {
+    const program = try Program.get(c);
+    var files: std.ArrayList(Project.FileId) = .empty;
+    for (c.project.sources) |*each| {
+        if (each.input.classification == .@"test" or !program.own(each.id)) continue;
+        try files.append(c.allocator, each.id);
     }
+    for (try Facts.accesses.writes(c.facts, .{ .field = field }, files.items)) |site| {
+        if (site.reach == .named or site.reach == .unresolved) continue;
+        const tree = &c.project.at(site.file).file.tree;
+        const value: ?Ast.Node.Index = switch (site.kind) {
+            .init, .read => continue,
+            // A pointer to a whole holder writes it by its type, at a site of its own; one to
+            // the state alone (`&x.state`) may write it as anything.
+            .address => if (site.reach == .holder) continue else null,
+            .set => if (site.value) |value| written: {
+                // `undefined` gives it no state: reading it after is illegal.
+                if (undefinedValue(tree, value)) continue;
+                if (site.reach == .holder and !recordLiteral(tree, value)) continue;
+                break :written value;
+            } else null,
+            .update => site.node,
+            .covered => if (site.reach == .holder) continue else null,
+        };
+        try writes.append(c.allocator, .{ .file = site.file, .node = site.node, .value = value, .unread = site.kind != .covered });
+    }
+}
+
+/// Whether `node` is `undefined`.
+fn undefinedValue(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
+}
+
+/// Whether `node` is a struct literal, typed or not (`.{ .state = .done }`, `.{}`, `Job{}`).
+fn recordLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.fullStructInit(&buffer, node) != null;
 }
 
 /// Whether the field read at `node` is a switch's operand, read past `orelse`'s left side, `.?`,
@@ -1830,10 +1845,16 @@ fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool 
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at;
         switch (tree.nodeTag(parent)) {
-            .unwrap_optional, .grouped_expression => {},
+            .unwrap_optional, .grouped_expression, .address_of => {},
             .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
             .builtin_call_two, .builtin_call_two_comma => {
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return false;
+            },
+            // `@atomicLoad(T, &x.state, order)`: the state, loaded.
+            .builtin_call, .builtin_call_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, parent, &buffer);
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@atomicLoad") or args.len != 3 or args[1] != at) return false;
             },
             else => return false,
         }
@@ -1855,21 +1876,31 @@ fn writersOf(c: *Context, write: StateWrite, writers: *std.ArrayList(Facts.Key),
     for (try callsOf(c, write.file, function)) |call| try writersOf(c, .{ .file = call.file, .node = call.node, .value = null }, writers, depth + 1);
 }
 
-/// The calls of the program that call the function declared by `function` in `file`.
+/// The calls of the program that call the function declared by `function` in `file`, as
+/// Facts.calls reads each callee: a method's, a free function's, `@call`'s, each of a choice.
 fn callsOf(c: *Context, file: Project.FileId, function: Ast.Node.Index) Context.Error![]const Facts.Key {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, function) orelse return &.{};
-    const name = tree.tokenSlice(proto.name_token orelse return &.{});
-    var calls: std.ArrayList(Facts.Key) = .empty;
-    for (try c.facts.memberUses(name)) |call| {
-        const callee = try c.facts.resolve(call.file, call.node);
-        if (callee != .function or callee.function.file != file) continue;
-        if (model.declarations[@backingInt(callee.function.index)].node != tree.nodeData(function).node_and_node[0]) continue;
-        try calls.append(c.allocator, call);
+    const proto = tree.nodeData(function).node_and_node[0];
+    const program = try Program.get(c);
+    var found: std.ArrayList(Facts.Key) = .empty;
+    for (c.project.sources) |*each| {
+        if (each.input.classification == .@"test" or !program.own(each.id)) continue;
+        for (try Facts.calls.in(c.facts, each.id)) |*call| {
+            const choices: []const Facts.Decl = switch (call.callee) {
+                .function => |*one| one[0..1],
+                .choice => |all| all,
+                .any => continue,
+            };
+            for (choices) |choice| {
+                const decl = (try originKnown(c, choice)) orelse continue;
+                if (decl.file != file or model.declarations[@backingInt(decl.index)].node != proto) continue;
+                try found.append(c.allocator, .{ .file = each.id, .node = call.node });
+                break;
+            }
+        }
     }
-    return calls.items;
+    return found.items;
 }
 
 /// Whether one of `writes` is a move: under a switch or a condition on the field (one of `uses`),
@@ -1893,7 +1924,7 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite) Conte
             const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
             if (conditioned(call_tree, call_model, uses, call.file, call.node, caller)) return .yes;
         }
-        maybe = maybe or write.value == null;
+        maybe = maybe or (write.value == null and write.unread);
     }
     return if (maybe) .maybe else .no;
 }
