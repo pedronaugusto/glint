@@ -351,12 +351,10 @@ fn bindingOf(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths
         }
         // A generic function's result, where its declared type is a parameter's: an owner handed
         // over unless each return reads one held (`views`), its parameters this call's arguments.
-        // `@call` binds no `Ast.full.Call` to read the views with: its result is no view.
         if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
-        var call_buffer: [1]Ast.Node.Index = undefined;
         switch (try heldBy(c, resources, made, 0)) {
             .resource => |which| {
-                const a_view = if (tree.fullCall(&call_buffer, node)) |full| try views(c, resources, function, 0, &.{ .file = c.file, .call = full, .callee = function, .outer = null }) else false;
+                const a_view = try views(c, resources, function, 0, &.{ .file = c.file, .call = call, .callee = function, .outer = null });
                 if (!a_view) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] }));
             },
             .other => {},
@@ -1311,7 +1309,7 @@ pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Err
 /// A call of the program's function whose returns `views` reads: there a parameter of the
 /// callee is the argument the call passes at it, read where the call is (`outer` the binding in
 /// force there).
-const Binding = struct { file: Project.FileId, call: Ast.full.Call, callee: Facts.Decl, outer: ?*const Binding };
+const Binding = struct { file: Project.FileId, call: *const Facts.calls.Call, callee: Facts.Decl, outer: ?*const Binding };
 
 /// Whether the parameter `record` of `file` is a view: in its own function, read with no call
 /// binding it, it is lent; bound, it is the argument passed at it (a method's receiver first). A
@@ -1328,20 +1326,13 @@ fn argumentViewed(c: *Context, resources: []const ?Facts.Container, file: Projec
     while (params.next()) |param| : (position += 1) {
         if (param.name_token == record.token) break;
     } else return false;
-    const caller = &c.project.at(binding.file).file.tree;
-    const call = binding.call;
-    if (caller.nodeTag(call.ast.fn_expr) == .field_access) {
-        const receiver = caller.nodeData(call.ast.fn_expr).node_and_token[0];
-        switch (try c.facts.resolve(binding.file, receiver)) {
-            .container => {},
-            else => {
-                if (position == 0) return viewed(c, resources, binding.file, receiver, depth, binding.outer);
-                position -= 1;
-            },
-        }
-    }
-    if (position >= call.ast.params.len) return false;
-    return viewed(c, resources, binding.file, call.ast.params[position], depth, binding.outer);
+    // Where which argument it binds is not known, it is no view: what it gives is an owner.
+    const args = switch (binding.call.args) {
+        .known => |args| args,
+        .unknown => return false,
+    };
+    if (position >= args.len) return false;
+    return viewed(c, resources, binding.file, args[position], depth, binding.outer);
 }
 
 /// Whether every return of a function reads a resource someone already holds, so it hands over
@@ -1478,8 +1469,7 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
                 const otherwise = branch.ast.else_expr.unwrap() orelse return false;
                 return try viewed(c, resources, file, branch.ast.then_expr, next, bound) and try viewed(c, resources, file, otherwise, next, bound);
             }
-            var buffer: [1]Ast.Node.Index = undefined;
-            if (tree.fullCall(&buffer, node)) |call| return callViewed(c, resources, file, call, next, bound);
+            if (try Facts.calls.at(c.facts, file, node)) |call| return callViewed(c, resources, file, &call, next, bound);
             var init_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullStructInit(&init_buffer, node)) |literal| {
                 // A std handle made from one it is given: the literal of a std resource type.
@@ -1526,21 +1516,35 @@ fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
 
 /// What a call returns is a view: an `own.Lent`'s `get()`, the program's function whose every
 /// return is one, or std's handles to the process's own streams and directory.
-fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: Ast.full.Call, next: u8, bound: ?*const Binding) Context.Error!bool {
+fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: *const Facts.calls.Call, next: u8, bound: ?*const Binding) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
-    // An `own.Lent`'s `get()`: a copy its owner lends.
-    if (call.ast.params.len == 0 and tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .lent) return true;
-    }
-    // One that does not resolve is no view: what it gives is judged an owner.
-    const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| (try originKnown(c, decl)) orelse return false,
-        else => return false,
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => return false,
     };
+    // An `own.Lent`'s `get()`: a copy its owner lends.
+    if (call.receiver == .bound and args.len == 1 and tree.nodeTag(call.callee_expr) == .field_access) {
+        const method = tree.nodeData(call.callee_expr).node_and_token[1];
+        if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, call.receiver.bound)) == .lent) return true;
+    }
+    // One that does not resolve is no view: what it gives is judged an owner. Of a choice, each
+    // must give one.
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |each| each,
+        .any => return false,
+    };
+    for (choices) |choice| {
+        if (!try calleeViewed(c, resources, file, call, (try originKnown(c, choice)) orelse return false, args.len, next, bound)) return false;
+    }
+    return true;
+}
+
+/// `callViewed` where the call is to `callee`, given `given` arguments.
+fn calleeViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: *const Facts.calls.Call, callee: Facts.Decl, given: usize, next: u8, bound: ?*const Binding) Context.Error!bool {
     // The program's function whose every return is a view returns one.
     if (try c.facts.program(callee.file)) return views(c, resources, callee, next, &.{ .file = file, .call = call, .callee = callee, .outer = bound });
-    if (call.ast.params.len != 0) return false;
+    if (given != 0) return false;
     for ([_][]const u8{ "Io.File.stdin", "Io.File.stdout", "Io.File.stderr", "Io.Dir.cwd" }) |standard| {
         const decls = switch (try Governed.declarations(c, "std", standard)) {
             .decls => |decls| decls,
