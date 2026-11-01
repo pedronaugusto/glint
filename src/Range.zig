@@ -1075,12 +1075,13 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     return out;
 }
 
-/// Whether a value is a container's instance, or an optional, error union or array of one.
+/// Whether a value is a container's instance, or an optional, error union or array of one; or
+/// a struct literal with no type of its own, whose fields' values are sites of their own.
 fn wholeValue(value: Facts.Value) bool {
     var current = value;
     while (true) current = switch (current) {
         .optional, .error_union, .array => |inner| inner.*,
-        .instance => return true,
+        .instance, .literal => return true,
         .alternatives => |each| {
             for (each) |one| if (!wholeValue(one)) return false;
             return true;
@@ -2454,6 +2455,9 @@ fn kept(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: 
 fn keptAcross(c: *Context, file: Project.FileId, compared: Ast.Node.Index, condition: Ast.Node.Index, use: Ast.Node.Index, also: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     if (literal(tree, compared) != null) return true;
+    // An array compared is compared by its length, which is its type's: a store through a
+    // pointer into it writes its elements, never that.
+    if (try c.facts.resolve(file, compared) == .array) return true;
     if (try varies(c, file, compared)) return false;
     const from = tree.lastToken(condition);
     const to = tree.firstToken(use);
@@ -2774,6 +2778,15 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     // Whether a pointer is followed past the declaration's own step.
     var deep = false;
     var at = bare(tree, node);
+    // An array's length, or that of an array behind a pointer, is its type's: no store or
+    // pointer writes it.
+    if (tree.nodeTag(at) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "len")) {
+        switch (try c.facts.resolve(file, tree.nodeData(at).node_and_token[0])) {
+            .array => return null,
+            .pointer => |inner| if (inner.* == .array) return null,
+            else => {},
+        }
+    }
     for (0..expression_tokens) |_| {
         if (tree.nodeTag(at) == .identifier) break;
         const part: ?[]const u8, const inner = switch (tree.nodeTag(at)) {
