@@ -1148,7 +1148,18 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
             },
             .assign, .changes => {
                 const target = if (site_tree.nodeTag(site.node) == .address_of) site_tree.nodeData(site.node).node else site_tree.nodeData(site.node).node_and_node[0];
-                const reached = (try c.facts.definition(site.file, target)) orelse continue;
+                const reached = (try c.facts.definition(site.file, target)) orelse {
+                    // A holder whose type is not known may be this one (a generic's `c.limit`):
+                    // what it stores, the field may hold.
+                    if (site_tree.nodeTag(target) != .field_access or !unknownHolder(try c.facts.resolve(site.file, site_tree.nodeData(target).node_and_token[0]))) continue;
+                    if (site.kind == .changes) {
+                        out = null;
+                        continue;
+                    }
+                    const value = site_tree.nodeData(site.node).node_and_node[1];
+                    if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
+                    continue;
+                };
                 if (!std.meta.eql(reached, decl)) continue;
                 if (site.kind == .changes) {
                     out = null;
@@ -1166,7 +1177,12 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
                 };
                 const container = switch (holder_type) {
                     .container, .instance => |k| k,
-                    else => continue,
+                    // A literal whose type is not known may be this one's: what it gives, the
+                    // field may hold.
+                    else => {
+                        if (unknownHolder(holder_type) and !empty(site_tree, site.node)) out = wider(out, try bound(c, site.file, site.node, pointer, depth));
+                        continue;
+                    },
                 };
                 const member = c.facts.member(container, record.name) orelse continue;
                 if (!std.meta.eql(member, decl)) continue;
@@ -1176,6 +1192,18 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     }
     try memo.map.put(c.allocator, key, out);
     return out;
+}
+
+/// Whether a store's holder, as it resolves, may be any struct: its type not known (a
+/// generic's binding, a value no reading reaches), itself or behind a pointer or optional.
+/// std's own and code the build does not compile are no program's struct.
+fn unknownHolder(value: Facts.Value) bool {
+    var current = value;
+    while (true) current = switch (current) {
+        .pointer, .optional, .error_union => |inner| inner.*,
+        .unknown => |why| return why != .std_internal and why != .absent,
+        else => return false,
+    };
 }
 
 /// The name a container is declared by (`const Index = struct { … }`), or for a file's own

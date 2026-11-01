@@ -574,6 +574,67 @@ test "a scalar receiver is known through an unwrapped optional" {
     try std.testing.expectEqual(@as(usize, 1), try scalarFindings(&project)); // safe: one raw comparison, decided.
 }
 
+/// A std of its reinterpreting reads: bytes of a value, a value or an integer out of bytes, an
+/// enum out of an integer.
+const reinterpreting_std = [_]aegis_sources.Extra{
+    .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\npub const enums = @import(\"enums.zig\");" },
+    .{ .name = "std/mem.zig", .bytes = "pub const Endian = enum { little, big };\npub fn asBytes(ptr: anytype) []const u8 { _ = ptr; return &.{}; }\npub fn toBytes(value: anytype) [8]u8 { _ = value; return undefined; }\npub fn readInt(comptime T: type, buffer: []const u8, endian: Endian) T { _ = buffer; _ = endian; return undefined; }\npub fn bytesToValue(comptime T: type, bytes: anytype) T { _ = bytes; return undefined; }" },
+    .{ .name = "std/enums.zig", .bytes = "pub fn fromInt(comptime E: type, integer: anytype) ?E { _ = integer; return null; }" },
+};
+const reinterpreting_imports = [_]aegis_sources.ExtraImport{
+    .{ .spelling = "std", .target = 0 },
+    .{ .from = 0, .spelling = "mem.zig", .target = 1 },
+    .{ .from = 0, .spelling = "enums.zig", .target = 2 },
+};
+fn expectReinterpreted(source: []const u8, findings: usize) !void {
+    try expectWithBytes(source, pack.scalar, true, findings);
+}
+fn expectWithBytes(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &reinterpreting_std, &reinterpreting_imports);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "A001 reads a public source rewritten by a destructure, or through its whole address handed where it is written" {
+    const head = "const std = @import(\"std\");\nconst err = @import(\"aegis\").err;\n";
+    const made = "var p = err.PublicSource.classify(\"fixed label\", \"ok\");\n";
+    try expectWithBytes(head ++ "pub fn f(secret: []const u8) err.PublicSource {\n" ++ made ++ "var n: usize = 0;\np.bytes, n = .{ secret, 1 };\n_ = &n;\nreturn p;\n}", pack.access, true, 1);
+    try expectWithBytes(head ++ "pub fn f(secret: []const u8) err.PublicSource {\n" ++ made ++ "@memcpy(std.mem.asBytes(&p)[0..16], std.mem.asBytes(&secret)[0..16]);\nreturn p;\n}", pack.access, true, 1);
+    // A function that may write through what it is given: undecided; one given a `*const`
+    // pointer, and a `const` source's bytes, read only.
+    try expectWithBytes(head ++ "fn fill(s: *err.PublicSource) void { _ = s; }\npub fn f() err.PublicSource {\n" ++ made ++ "fill(&p);\nreturn p;\n}", pack.access, false, 0);
+    try expectWithBytes(head ++ "fn show(s: *const err.PublicSource) void { _ = s; }\npub fn f() err.PublicSource {\n" ++ made ++ "show(&p);\nreturn p;\n}", pack.access, true, 0);
+    try expectWithBytes(head ++ "pub fn f() usize {\nconst p = err.PublicSource.classify(\"fixed label\", \"ok\");\nreturn std.mem.asBytes(&p).len;\n}", pack.access, true, 0);
+}
+
+test "A004 reads a scalar's bits reinterpreted by the language or std as its raw integer, and a scalar made so" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u16);\n";
+    // Its bits read as an integer, or through a pointer to them, or as bytes read back.
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { const v: u16 = @bitCast(i); return v + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { return @as(u16, @bitCast(i)) + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { const p: *const u16 = @ptrCast(&i); return p.* + 1; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(i: Index) u16 { return std.mem.readInt(u16, std.mem.asBytes(&i), .little) + 1; }", 1);
+    // A scalar made of an integer's bits, out of bytes, or by std's enum reading.
+    try expectReinterpreted(head ++ "pub fn f(v: u16) Index { return @bitCast(v); }", 1);
+    try expectReinterpreted(head ++ "pub fn f(v: *const u16) Index { const p: *const Index = @ptrCast(v); return p.*; }", 1);
+    try expectReinterpreted(head ++ "pub fn f(b: [2]u8) Index { return std.mem.bytesToValue(Index, &b); }", 1);
+    try expectReinterpreted(head ++ "pub fn f(v: u16) !Index { return std.enums.fromInt(Index, v) orelse error.Bad; }", 1);
+    // A number's bits, bytes and values out of them are no scalar's.
+    try expectReinterpreted(head ++ "pub fn f(n: i16) u16 { const v: u16 = @bitCast(n); return v + 1; }", 0);
+    try expectReinterpreted(head ++ "pub fn f(n: u16) u16 { return std.mem.readInt(u16, std.mem.asBytes(&n), .little) + 1; }", 0);
+    try expectReinterpreted(head ++ "pub fn f(b: [2]u8) u16 { return std.mem.bytesToValue(u16, &b) + 1; }", 0);
+    try expectReinterpreted(head ++ "const E = enum(u8) { a, b };\npub fn f(v: u8) ?E { return std.enums.fromInt(E, v); }", 0);
+    // A generic that casts what it looks up by its type parameter makes a value of the type
+    // it is bound to: a scalar's there, a plain struct's here. What it looks up is no value of
+    // the parameter, though its place is computed from it.
+    const lookup = "fn get(slots: []*anyopaque, comptime T: type) *T { const at = @sizeOf(T) % slots.len; return @ptrCast(@alignCast(slots[at])); }\n";
+    try expectReinterpreted(head ++ lookup ++ "pub fn f(slots: []*anyopaque) *Index { return get(slots, Index); }", 1);
+    try expectReinterpreted(head ++ lookup ++ "const Plain = struct { n: u32 };\npub fn f(slots: []*anyopaque) u32 { return get(slots, Plain).n; }", 0);
+}
+
 test "A004 strict: every operator, compound assignment and cast on a raw value, and one carried through a local or a branch" {
     const head = "const Index = @import(\"aegis\").id.Id(struct {}, u16);\nfn use(v: u16) void { _ = v; }\npub fn f(i: Index, maybe: ?u16, limit: u16) !u16 {\n    _ = .{ i, maybe, limit };\n";
     // Each unsafe probe computes with the raw value once; its safe twin hands it on or checks it.
@@ -752,6 +813,55 @@ test "A002 reads a copy from any place an owner is read through, an assignment's
     const budget = "const bounded = @import(\"aegis\").bounded;\n";
     try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { const r = try b.reserve(1); var kept = r; defer kept.release(); }", pack.copies, true, 0);
     try expectJudged(budget ++ "pub fn f(b: *bounded.Budget(u32)) !void { var r = try b.reserve(1); const p = &r; var kept = r; defer kept.release(); _ = p; }", pack.copies, true, 1);
+}
+
+test "A002 reads a copy through a pointer a call returns, and an iterator a type function declared in another's container makes" {
+    // A map's iterator is made by `Iterator(V)`, declared in `Map(K, V)`'s container: its
+    // `next` gives a pointer to a stored owner, whatever path reads through it.
+    const head =
+        \\const S = @import("aegis").Secret;
+        \\fn Map(comptime K: type, comptime V: type) type {
+        \\    return struct {
+        \\        keys: []K, values: []V,
+        \\        pub const ValueIterator = Iterator(V);
+        \\        fn Iterator(comptime T: type) type { return struct { items: []T, i: usize = 0, pub fn next(it: *@This()) ?*T { if (it.i == it.items.len) return null; it.i += 1; return &it.items[it.i - 1]; } }; }
+        \\        pub fn valueIterator(m: *@This()) ValueIterator { return .{ .items = m.values }; }
+        \\        pub fn getPtr(m: *@This(), i: usize) ?*V { return &m.values[i]; }
+        \\    };
+        \\}
+        \\const Pair = struct { s: S(u32), n: u32 };
+        \\fn make() Pair { return undefined; }
+        \\
+    ;
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); const copy = it.next().?.*; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); const p = it.next(); const copy = p.?.*; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, S(u32))) void { var it = m.valueIterator(); while (it.next()) |p| { const copy = p.*; _ = copy; } }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { const copy = m.getPtr(0).?.s; _ = copy; }", pack.copies, true, 1);
+    // A number read through the same pointer, and an owner read off a value a call makes,
+    // which no other holder shares, copy none.
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { const n = m.getPtr(0).?.n; _ = n; }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, u32)) void { var it = m.valueIterator(); while (it.next()) |p| { const n = p.*; _ = n; } }", pack.copies, true, 0);
+    try expectJudged(head ++ "pub fn f() void { const s = make().s; _ = s; }", pack.copies, true, 0);
+    // A column of a list of rows (std's MultiArrayList): `items(field)` gives the row type's
+    // field, `Elem` a constant of the made container read through the method's reading.
+    const columns =
+        \\fn Columns(comptime T: type) type {
+        \\    return struct {
+        \\        const Elem = switch (@typeInfo(T)) { .@"struct" => T, else => @compileError("rows") };
+        \\        rows: []Elem,
+        \\        pub const Slice = struct { base: []Elem, pub fn items(self: Slice, comptime field: []const u8) []FieldType(field) { _ = self; return undefined; } };
+        \\        fn FieldType(comptime field: []const u8) type { return @FieldType(Elem, field); }
+        \\        pub fn slice(c: *@This()) Slice { return .{ .base = c.rows }; }
+        \\    };
+        \\}
+        \\
+    ;
+    try expectJudged(head ++ columns ++ "pub fn f(c: *Columns(Pair), i: usize) void { const copy = c.slice().items(\"s\")[i]; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ columns ++ "pub fn f(c: *Columns(Pair), i: usize) void { const n = c.slice().items(\"n\")[i]; _ = n; }", pack.copies, true, 0);
+    // A branch a `@hasDecl` known as the program compiles rules out is not analysed.
+    try expectJudged(head ++ "const A = struct { pub fn scan() void {} };\nconst B = struct {};\npub fn f(m: *Map(u32, Pair)) void { const p = m.getPtr(0).?; const x = if (comptime @hasDecl(A, \"scan\")) p.s else 0; const y = if (comptime @hasDecl(B, \"scan\")) p.s else 0; _ = .{ x, y }; }", pack.copies, true, 1);
+    // A `while (true)` gives what its breaks give.
+    try expectJudged(head ++ "pub fn f(m: *Map(u32, Pair)) void { var i: usize = 0; const p = while (true) { if (m.getPtr(i)) |found| break found; i += 1; }; const n = p.n; const copy = p.s; _ = .{ n, copy }; }", pack.copies, true, 1);
 }
 
 test "A002 follows a copy's value through every shape it is written in to the places it reads" {
@@ -952,6 +1062,36 @@ fn expectJudgedWithFile(source: []const u8, other: []const u8, rule: glint.Rule,
     try std.testing.expectEqual(findings, count(report, rule));
 }
 
+fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try aegis_sources.projectWith(std.testing.allocator, source, lib);
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
+
+test "a public generic's parameters are each binding's, a consumer's among them; a private one's are its callers'" {
+    // A raw integer read in a public generic, bound inside its package only to a plain type:
+    // the read is each binding's, so the package alone is clean and a consumer's binding of an
+    // aegis id is the finding, whether the package is linted with it or not. One no call
+    // binds is given whatever binding is made: undecided where it is written.
+    const lib = "pub fn bump(x: anytype) u32 { return x.raw() + 1; }\nconst Plain = struct { pub fn raw(_: Plain) u32 { return 1; } };\npub fn use() u32 { return bump(Plain{}); }\n";
+    const consumer = "const lib = @import(\"lib\");\nconst Index = @import(\"aegis\").id.Id(struct {}, u32);\npub fn f() u32 { return lib.bump(Index.fromRaw(3)); }";
+    try expectJudged(lib, pack.scalar, true, 0);
+    try expectJudgedWithDependency(consumer, lib, pack.scalar, true, 1);
+    try expectJudgedWithLib(consumer, lib, pack.scalar, true, 1);
+    try expectJudged("const Index = @import(\"aegis\").id.Id(struct {}, u32);\n" ++ lib ++ "pub fn f() u32 { return bump(Index.fromRaw(3)); }", pack.scalar, true, 1);
+    try expectJudged("pub fn bump(x: anytype) u32 { return x.raw() + 1; }\n", pack.scalar, false, 0);
+    // A judgment of a generic's body not recorded per binding reads its parameters from its
+    // callers only where they are all known: a private generic, not a public one, which a
+    // consumer may call with anything.
+    const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32 };\n";
+    try expectJudged(head ++ "fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *Plain) u32 { return peek(p); }", pack.access, true, 0);
+    try expectJudged(head ++ "fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *G(u32)) u32 { return peek(p); }", pack.access, true, 1);
+    try expectJudged(head ++ "pub fn peek(g: anytype) u32 { return g.data; }\npub fn f(p: *Plain) u32 { return peek(p); }", pack.access, false, 0);
+}
+
 test "an owner given by value to a function of the program's own, a dependency's or one in a file the run did not select, is undecided" {
     // The program is every loaded file but std's and aegis's: a function there is not walked
     // for what it does with the owner, and `keep` drops it.
@@ -1027,8 +1167,13 @@ test "generic parameters are what the project's own calls pass, when no consumer
     try expectJudged(head ++ "const Box = struct { fn look(_: *const Box, p: anytype) void { _ = p.owner; } };\nfn pass(b: *const Box, p: anytype) void { b.look(p); }\npub fn f(b: *const Box, x: *Plain) void { pass(b, x); }", pack.access, true, 0);
     // A `comptime` type parameter of a private type function.
     try expectJudged(head ++ "fn Holder(comptime T: type) type { return struct { pub fn get(t: *T) void { _ = t.data; } }; }\npub fn f(x: *Plain) void { Holder(Plain).get(x); }", pack.access, true, 0);
-    // A method's own generic, called on a pointer the caller's generic was given.
-    try expectJudged(head ++ "const Sched = struct { processors: []Plain, monitor: ?*Monitor };\nconst Monitor = struct {\n    samples: []u32,\n    pub fn run(m: *Monitor, s: anytype) void { for (s.processors, m.samples) |*p, *sample| { _ = m.look(s, p, sample); } }\n    fn look(m: *Monitor, s: anytype, p: anytype, sample: *u32) bool { _ = m; _ = s; _ = sample; _ = p.owner; return false; }\n};\npub fn go(s: *Sched) void { s.monitor.?.run(s); }", pack.access, true, 0);
+    // A method's own generic, called on a pointer the caller's generic was given. Public, it
+    // is a consumer's to call too (a private type is reached through `go`'s parameter type):
+    // its `anytype` holds what any binding gives, undecided here.
+    const sched = "const Sched = struct { processors: []Plain, monitor: ?*Monitor };\nconst Monitor = struct {\n    samples: []u32,\n    ";
+    const monitor = "fn run(m: *Monitor, s: anytype) void { for (s.processors, m.samples) |*p, *sample| { _ = m.look(s, p, sample); } }\n    fn look(m: *Monitor, s: anytype, p: anytype, sample: *u32) bool { _ = m; _ = s; _ = sample; _ = p.owner; return false; }\n};\npub fn go(s: *Sched) void { s.monitor.?.run(s); }";
+    try expectJudged(head ++ sched ++ monitor, pack.access, true, 0);
+    try expectJudged(head ++ sched ++ "pub " ++ monitor, pack.access, false, 0);
     // Taken other than by a call, its arguments are not all known: undecided.
     try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f() void { const taken = look; _ = taken; }", pack.access, false, 0);
 }
@@ -1053,6 +1198,31 @@ test "a generic method std may call on a type the program hands it binds what st
         defer report.deinit();
         try std.testing.expectEqual(case[1], report.complete);
         try std.testing.expectEqual(@as(usize, 0), count(report, pack.access));
+    }
+}
+
+test "a generic std may call on a context the program hands it is judged where it is written too: a cast or a copy of its value is not each program call's alone" {
+    // std's `Map` calls its context's `hash` with what it is given, an aegis id or secret here,
+    // no call of the program's showing it: the generic's own cast or copy stays undecided. A
+    // private method std cannot name is bound by the program's calls only, each deciding it.
+    const lib = "pub fn Map(comptime C: type) type { return struct { ctx: C, pub fn put(self: *@This(), key: anytype) void { _ = self.ctx.hash(key); } }; }";
+    const extra = std_fixture ++ [_]aegis_sources.Extra{.{ .name = "std/map.zig", .bytes = lib }};
+    const imports = std_fixture_imports ++ [_]aegis_sources.ExtraImport{ .{ .from = 0, .spelling = "map.zig", .target = std_fixture.len }, .{ .spelling = "map.zig", .target = std_fixture.len } };
+    const head = "const aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u32);\nconst S = aegis.Secret(u32);\nconst lib = @import(\"map.zig\");\n";
+    for ([_]struct { glint.Rule, []const u8, bool }{
+        .{ pack.scalar, "const Ctx = struct { pub fn hash(_: Ctx, key: anytype) u64 { return @intFromEnum(key) *% 31; } };\npub fn f(i: Index) void { var m: lib.Map(Ctx) = .{ .ctx = .{} }; m.put(i); }", false },
+        .{ pack.scalar, "const Ctx = struct { fn hash(_: Ctx, key: anytype) u64 { return @intFromEnum(key) *% 31; } };\nconst E = enum(u32) { a };\npub fn f() u64 { const c: Ctx = .{}; return c.hash(E.a); }", true },
+        .{ pack.copies, "const Ctx = struct { pub fn hash(_: Ctx, key: anytype) u64 { const copy = key; _ = copy; return 0; } };\npub fn f(s: S) void { var m: lib.Map(Ctx) = .{ .ctx = .{} }; m.put(s); }", false },
+        .{ pack.copies, "const Ctx = struct { fn hash(_: Ctx, key: anytype) u64 { const copy = key; _ = copy; return 0; } };\npub fn f() u64 { const c: Ctx = .{}; return c.hash(@as(u32, 1)); }", true },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case[1] });
+        defer std.testing.allocator.free(source);
+        var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &extra, &imports);
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expectEqual(case[2], report.complete);
+        try std.testing.expectEqual(@as(usize, 0), count(report, case[0]));
     }
 }
 
@@ -1385,6 +1555,15 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
 test "an adoption of an allocation freed, changed or kept elsewhere before it is reported" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // A function it is handed to, whatever it returns: one that keeps it, frees it, or frees
+    // it by its pointer; and its address kept as a number.
+    try expectJudgedStd(head ++ "var kept: []u8 = &.{};\nfn stash(p: []u8) void { kept = p; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); stash(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "fn drop(gpa: std.mem.Allocator, p: []u8) void { gpa.free(p); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); drop(gpa, buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "fn release(gpa: std.mem.Allocator, p: [*]u8, len: usize) usize { gpa.free(p[0..len]); return len; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); _ = release(gpa, buffer.ptr, buffer.len); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudgedStd(head ++ "var where: usize = 0;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); where = @intFromPtr(buffer.ptr); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    // One that only fills it and gives back nothing, and its address compared, leave it whole.
+    try expectJudgedStd(head ++ "fn fill(p: []u8) void { @memset(p, 0); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); fill(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (@intFromPtr(buffer.ptr) == 0) unreachable; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
     try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);

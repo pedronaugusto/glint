@@ -581,12 +581,170 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     return result;
 }
 
+test "A015 judges a public generic at each binding, a consumer's among them, and leaves a type that does not resolve undecided" {
+    // The package alone binds its type function and its generic only to a number: nothing.
+    const lib =
+        \\pub fn Box(comptime T: type) type { return struct { v: T, pub fn deinit(b: *@This()) void { b.v.close(); } }; }
+        \\pub fn View(comptime T: type) type { return struct { v: T }; }
+        \\pub const Plain = Box(u32);
+        \\pub fn make(comptime T: type) T { return undefined; }
+        \\pub fn use() u32 { return make(u32); }
+    ;
+    try expect(pack.ownership, lib, 0);
+    // A consumer binding them to a file: a field its type function releases holds an owner by
+    // hand, and a result hands one over; a field nothing releases is a borrow.
+    const result = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const S = struct { b: dep.Box(std.Io.File), w: dep.View(std.Io.File) };
+        \\pub fn f() void { _ = dep.make(std.Io.File); }
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 2), result.findings);
+    // A field whose type does not resolve may hold one: undecided, never clear.
+    const missing = try run(pack.ownership,
+        \\const ext = @import("missing");
+        \\pub const S = struct { f: ext.Handle };
+    );
+    try std.testing.expectEqual(@as(usize, 1), missing.undecided);
+    try std.testing.expectEqual(@as(usize, 0), missing.findings);
+}
+
+test "A015 reads a container a type function makes inside another's with the outer call's arguments, and a type function's every return" {
+    // `Outer(T)` holds a `Box(T)`, which releases what it holds: the consumer's
+    // `Outer(std.Io.File)` makes `Box`'s field own the file by hand, and `Opt(std.Io.Dir)` through
+    // an optional; aegis's own owner holds it as the answer.
+    const lib =
+        \\pub fn Box(comptime T: type) type { return struct { f: T, pub fn deinit(b: *@This()) void { b.f.close(); } }; }
+        \\pub fn Outer(comptime T: type) type { return struct { b: Box(T) }; }
+        \\pub fn Opt(comptime T: type) type { return struct { b: ?Box(T) }; }
+        \\pub fn Bits(comptime n: usize) type { if (n <= 64) return Narrow(n); return Wide(n); }
+        \\fn Narrow(comptime n: usize) type { return struct { mask: @Int(.unsigned, n) }; }
+        \\fn Wide(comptime n: usize) type { return struct { masks: [(n + 63) / 64]u64 }; }
+        \\pub fn Set(comptime E: type) type { return struct { bits: Bits(@typeInfo(E).@"enum".fields.len) }; }
+        \\pub fn Pick(comptime T: type, comptime n: usize) type { if (n > 3) return Box(T); return struct { g: T }; }
+    ;
+    const nested = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const S = dep.Outer(std.Io.File);
+        \\pub const O = dep.Opt(std.Io.Dir);
+        \\pub const W = struct { s: dep.Outer(std.Io.File) };
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), nested.undecided);
+    try std.testing.expectEqual(@as(usize, 3), nested.findings);
+    try expect(pack.ownership,
+        \\const std = @import("std");
+        \\const aegis = @import("aegis");
+        \\fn shut(f: *std.Io.File) void { _ = f; }
+        \\pub fn Outer(comptime T: type) type { return struct { o: aegis.own.Owned(T, shut) }; }
+        \\pub const S = Outer(std.Io.File);
+    , 0);
+    // A set over an enum, whose bits are one of two containers by its size, each a number's:
+    // decided, nothing held. One of whose returns is a container the function declares, which
+    // only its template reads: undecided, never clear.
+    const chosen = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub const E = enum { a, b };
+        \\pub const Flags = dep.Set(E);
+        \\pub const P = dep.Pick(std.Io.File, 1);
+    , lib);
+    try std.testing.expectEqual(@as(usize, 1), chosen.undecided);
+    try std.testing.expectEqual(@as(usize, 0), chosen.findings);
+}
+
+test "A015 reads a type built by reflection on its argument: the fields a comptime loop writes, the prong a switch on type information takes" {
+    // ensign's shapes: options and commands each of one type, `Partial(T)` an optional of each
+    // of T's fields' types written element by element, `Tag(T)` and `Fields(T)` enums.
+    const lib =
+        \\pub const Option = struct { short: ?u8 = null };
+        \\pub fn Options(comptime T: type) type {
+        \\    const fields = @typeInfo(T).@"struct";
+        \\    const final = fields.field_names[0..fields.field_names.len].*;
+        \\    return @Struct(.auto, null, &final, &@splat(Option), &@splat(.{}));
+        \\}
+        \\pub fn Commands(comptime T: type) type {
+        \\    for (@typeInfo(T).@"struct".field_types) |F| {
+        \\        if (@typeInfo(F) != .@"union") continue;
+        \\        return @Struct(.auto, null, @typeInfo(F).@"union".field_names, &@splat(Option), &@splat(.{}));
+        \\    }
+        \\    return struct {};
+        \\}
+        \\pub fn Partial(comptime T: type) type {
+        \\    const fields = @typeInfo(T).@"struct";
+        \\    var types: [fields.field_names.len]type = undefined;
+        \\    var len: usize = 0;
+        \\    for (fields.field_types) |F| {
+        \\        types[len] = ?F;
+        \\        len += 1;
+        \\    }
+        \\    const final_types = types[0..len].*;
+        \\    return @Struct(.auto, null, fields.field_names, &final_types, &@splat(.{}));
+        \\}
+        \\pub fn Spec(comptime T: type) type {
+        \\    return struct { options: Options(T), commands: Commands(T), sets: Partial(T) };
+        \\}
+        \\pub fn Keep(comptime T: type) type {
+        \\    return struct { held: Partial(T), pub fn deinit(k: *@This()) void { k.held.deinit(); } };
+        \\}
+        \\pub fn Tag(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .@"enum" => |info| info.tag_type,
+        \\        .@"union" => |info| info.tag_type orelse @compileError("untagged"),
+        \\        else => @compileError("no tag"),
+        \\    };
+        \\}
+        \\pub fn Fields(comptime T: type) type {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => |u| if (u.tag_type) |EnumTag| return EnumTag,
+        \\        else => {},
+        \\    }
+        \\    if (@typeInfo(T).@"struct".field_names.len == 0) return enum {};
+        \\    return @Enum(u8, .exhaustive, @typeInfo(T).@"struct".field_names, &@splat(0));
+        \\}
+    ;
+    // A plain argument: every one decided, nothing held.
+    const plain = try runWithDependency(pack.ownership,
+        \\const dep = @import("dep");
+        \\const Value = union(enum) { a: u8, b };
+        \\const Plain = struct { name: []const u8, n: u32 = 0, pub const spec: dep.Spec(@This()) = undefined; };
+        \\pub const K = dep.Tag(Value);
+        \\pub const E = dep.Tag(enum(u8) { x });
+        \\pub const F = dep.Fields(Plain);
+        \\pub const G = dep.Fields(Value);
+    , lib);
+    try std.testing.expectEqual(@as(usize, 0), plain.undecided);
+    try std.testing.expectEqual(@as(usize, 0), plain.findings);
+    // One holding a file: `Partial` holds it, an optional of it, a borrow in a spec nothing
+    // releases and an owner by hand in `Keep`, which releases it; one whose field's type does
+    // not resolve: undecided, never clear.
+    const held = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\const ext = @import("missing");
+        \\const Holds = struct { out: std.Io.File, pub const spec: dep.Spec(@This()) = undefined; pub const kept: dep.Keep(@This()) = undefined; };
+        \\const Unseen = struct { h: ext.Handle, pub const spec: dep.Spec(@This()) = undefined; };
+    , lib);
+    try std.testing.expectEqual(@as(usize, 2), held.undecided);
+    try std.testing.expectEqual(@as(usize, 1), held.findings);
+}
+
 test "A015 reads a tuple's fields, named by position only, as fields" {
     try expect(pack.ownership,
         \\const std = @import("std");
         \\pub const S = struct { pair: struct { std.Io.File, u32 } };
         \\pub const T = struct { std.Io.Dir, *std.Io.File };
     , 2);
+    // An enum's or a union's field written without a type parses as a tuple's does: a name,
+    // neither held nor undecided.
+    const names = try run(pack.ownership,
+        \\pub const Kind = enum { secret, bytes, scalar };
+        \\pub const Tag = union(enum) { none, some: u8 };
+        \\pub const Raw = struct { u8, u32 };
+    );
+    try std.testing.expectEqual(@as(usize, 0), names.undecided);
+    try std.testing.expectEqual(@as(usize, 0), names.findings);
 }
 
 test "A015 finds std resources held by value in a field the program releases, or returned by value, not borrowed by pointer" {
@@ -1782,9 +1940,10 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     // vtable constant in a struct and a constant naming it. Findings (8, the conversion and
     // its alignment): that vtable installed into another type's field, the function stored
     // into C's other field or another struct's, the constant made `pub`, the interface handed
-    // to a generic that reads the vtable's function (and the contract's sites: the read, 26, and
-    // the handing, 30). The same generic handed nothing of it is clean: what it reads is what it
-    // is given, which the follow takes into it.
+    // to a generic that reads the vtable's function (and the contract's site, the handing, 30:
+    // the generic is public, so what it reads at 26 is each binding's, judged where one is
+    // made). The same generic handed nothing of it is clean: what it reads is what it is given,
+    // which the follow takes into it.
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, file_program)).findings);
     const other = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "fn wrong(buffer: []u8) Other { return .{ .interface = .{ .vtable = &data_vtable, .buffer = buffer } }; }\npub fn use(buffer: []u8) !usize {");
     try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, other.lines[0..other.findings]);
@@ -1799,7 +1958,7 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     const peek = comptime edited(file_program, "pub fn use(buffer: []u8) !usize {", "pub fn peek(t: anytype) void { _ = t.vtable.drain; }\npub fn use(buffer: []u8) !usize {");
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, peek)).findings);
     const peeked = try runEdited(pack.unsafe_set, peek, "    reset(&o.body.data, buffer);", "    reset(&o.body.data, buffer);\n    peek(&o.body.data.interface);");
-    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 26, 30 }, peeked.lines[0..peeked.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 30 }, peeked.lines[0..peeked.findings]);
 }
 
 const lookup_program =
@@ -2927,6 +3086,12 @@ test "A009 and A010 read every file of the program, selected or not: a table's o
     try std.testing.expectEqual(@as(usize, 0), kept.findings);
     const widened = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.limit = r.takeInt(u64, 0) catch 0; }");
     try std.testing.expectEqualSlices(u32, &.{8}, widened.lines[0..widened.findings]);
+    // The same store through a public generic's binding whose type this run does not fix, as a
+    // literal of that binding's type: what it gives, the field may hold.
+    const literal = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.* = .{ .limit = r.takeInt(u64, 0) catch 0 }; }");
+    try std.testing.expectEqualSlices(u32, &.{8}, literal.lines[0..literal.findings]);
+    const small = try runWithOther(pack.integers, stored, "pub fn touch(c: anytype) void { c.* = .{ .limit = 7 }; }");
+    try std.testing.expectEqual(@as(usize, 0), small.findings);
 }
 
 test "A009 reads a for capture as the input at its own position, a discarded capture counted" {

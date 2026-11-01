@@ -11,6 +11,7 @@ const Model = @import("Model.zig");
 const Project = @import("Project.zig");
 const Contract = @import("AegisContract.zig");
 const Danger = @import("Danger.zig");
+const Taint = @import("Taint.zig");
 const Program = @import("Program.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
@@ -42,11 +43,19 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
             },
             else => continue,
         };
-        const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
-        const which = find(resources, held) orelse continue;
+        const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
+            .resource => |which| which,
+            .other => continue,
+            // A generic's parameter: each binding's, judged where it is bound (`bindings`).
+            .generic => continue,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, if (decl.kind == .field) "a field whose type does not resolve may hold a std resource by value" else "a function whose result type does not resolve may return a std resource by value");
+                continue;
+            },
+        };
         const id: Model.Declaration.Id = @fromBackingInt(@intCast(index));
         const why = switch (decl.kind) {
-            .field => try owns(c, rule, resources, .{ .file = c.file, .scope = decl.scope }, decl) orelse continue,
+            .field => try owns(c, rule, resources, .{ .file = c.file, .scope = decl.scope }, c.file, decl, decl.token) orelse continue,
             else => why: {
                 if (try views(c, resources, .{ .file = c.file, .index = id }, 0, null)) continue;
                 if (!looked) {
@@ -62,6 +71,7 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
         try c.at(rule, decl.token, try c.allocator.print("{s} '{s}' {s} a std.{s} by value {s}: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ what, decl.name, how, resource_paths[which], why }));
     }
     try foreign(c, rule, resources);
+    try bindings(c, rule, resources, &resource_paths);
 }
 
 /// A015 where ownership happens: the checked file's own writes and releases of a resource field
@@ -164,17 +174,149 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
         }
     }
     // A tuple's fields, named by position only, are no declarations: each is read where it is
-    // written, as a field is.
+    // written, as a field is. An enum's or a union's field written without a type parses the
+    // same, and is a name.
+    var buffer: [2]Ast.Node.Index = undefined;
+    for (tree.nodes.items(.tag), 0..) |_, i| {
+        const container = tree.fullContainerDecl(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
+        if (tree.tokenTag(container.ast.main_token) != .keyword_struct) continue;
+        for (container.ast.members) |node| {
+            const field = tree.fullContainerField(node) orelse continue;
+            if (!field.ast.tuple_like) continue;
+            const first = tree.firstToken(node);
+            if (c.inTest(first)) continue;
+            const written = field.ast.type_expr.unwrap() orelse continue;
+            const which = switch (try heldBy(c, resources, try c.facts.resolve(c.file, written), 0)) {
+                .resource => |which| which,
+                .other, .generic => continue,
+                .unknown => {
+                    try c.undecided(rule, tree.tokenStart(first), .unresolved, "a tuple's field whose type does not resolve may hold a std resource by value");
+                    continue;
+                },
+            };
+            try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{resource_paths[which]}));
+        }
+    }
+}
+
+/// What a value holds by value of the std resources: one of them (`resource`, its index);
+/// none; a type a generic's binding gives (`generic`); or a type that does not resolve. A
+/// pointer borrows; an optional, an error union and an array hold what they wrap, a type built from field types (`@Struct`) what they hold; a choice of
+/// types per build holds what any of them holds; a container a type function made holds what
+/// its fields hold with the call's arguments (`Box(T)` inside `Outer(T)`), one declared once
+/// being judged at its declaration, and aegis's own (`own.Owned`) being the answer.
+const Holding = union(enum) { resource: usize, other, generic, unknown };
+
+fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, depth: usize) Context.Error!Holding {
+    if (depth == 16) return .unknown;
+    return switch (value) {
+        .container, .instance => |k| blk: {
+            if (find(resources, k)) |which| break :blk .{ .resource = which };
+            const made = k.made_by orelse break :blk .other;
+            if (try c.inLibrary(Contract.library, made.function.file)) break :blk .other;
+            var found: Holding = .other;
+            for (try Taint.fieldsOf(c, k)) |field| found = holdingOf(found, try heldBy(c, resources, try c.facts.memberField(k, field), depth + 1));
+            break :blk found;
+        },
+        .optional, .error_union, .array => |inner| heldBy(c, resources, inner.*, depth + 1),
+        // A type Zig builds from a list of field types holds what they do.
+        .reified => |built| heldBy(c, resources, built.fields.*, depth + 1),
+        .alternatives => |each| blk: {
+            var found: Holding = .other;
+            for (each) |one| found = holdingOf(found, try heldBy(c, resources, one, depth + 1));
+            break :blk found;
+        },
+        .unknown => |why| if (why == .generic) .generic else .unknown,
+        else => .other,
+    };
+}
+
+/// What two parts together hold: a resource either holds, else a type that does not resolve,
+/// else a binding's type.
+fn holdingOf(a: Holding, b: Holding) Holding {
+    if (a == .resource) return a;
+    if (b == .resource) return b;
+    if (a == .unknown or b == .unknown) return .unknown;
+    if (a == .generic or b == .generic) return .generic;
+    return .other;
+}
+
+/// A015 at each binding of a public generic, the consumer's among them: a container a type
+/// function makes (`Box(std.Io.File)`), each of whose fields holds what its type, read with the
+/// call's arguments, holds; and a value a generic function returns of a type its parameters
+/// give. A private generic's fields and result are read from its callers where it is declared;
+/// aegis's own are the owners and borrows this rule asks for.
+fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths: []const []const u8) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const field = tree.fullContainerField(node) orelse continue;
-        if (!field.ast.tuple_like) continue;
-        const first = tree.firstToken(node);
-        if (c.inTest(first)) continue;
-        const written = field.ast.type_expr.unwrap() orelse continue;
-        const held = byValue(try c.facts.resolve(c.file, written)) orelse continue;
-        const which = find(resources, held) orelse continue;
-        try c.at(rule, first, try c.allocator.print("a tuple's field holds a std.{s} by value: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{resource_paths[which]}));
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, node) orelse continue;
+        if (c.inTest(tree.nodeMainToken(node))) continue;
+        const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
+        const function = (try c.facts.origin(callee)) orelse continue;
+        const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
+        if (record.kind != .function or !record.public or !c.facts.hasGenericParameter(function)) continue;
+        // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
+        if (try c.inLibrary(Contract.library, function.file)) continue;
+        const made = try c.facts.resolve(c.file, node);
+        const written_tree = &c.project.at(function.file).file.tree;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = written_tree.fullFnProto(&proto_buffer, record.node) orelse continue;
+        const result = proto.ast.return_type.unwrap() orelse continue;
+        if (written_tree.nodeTag(result) == .identifier and std.mem.eql(u8, written_tree.tokenSlice(written_tree.nodeMainToken(result)), "type")) {
+            // A type function's container: what each field holds with these arguments, a
+            // container another type function made in it read the same way; a type that does
+            // not resolve may hold one.
+            try madeHolds(c, rule, resources, paths, tree.nodeMainToken(node), record.name, made, 0);
+            continue;
+        }
+        // A generic function's result, where its declared type is a parameter's: an owner handed
+        // over unless each return reads one held (`views`).
+        if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
+        switch (try heldBy(c, resources, made, 0)) {
+            .resource => |which| if (!try views(c, resources, function, 0)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] })),
+            .other, .generic => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
+        }
+    }
+}
+
+/// A015 at a binding for what a type function made, `value`: each resource one of its fields
+/// holds by value, through optionals, error unions, arrays, a choice of types and a type built
+/// from field types, is a finding where that field's file makes it an owner (`owns`), else a
+/// borrow; a container another type function made, held so, is read the same way; aegis's own
+/// are the answer; a type that does not resolve is undecided, never clear.
+fn madeHolds(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths: []const []const u8, at: Ast.TokenIndex, maker: []const u8, value: Facts.Value, depth: usize) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    if (depth == 16) return c.undecided(rule, tree.tokenStart(at), .unresolved, "a container this binding makes nests past what is read: it may hold a std resource by value");
+    switch (value) {
+        .container, .instance => |container| {
+            const made = container.made_by orelse return;
+            if (try c.inLibrary(Contract.library, made.function.file)) return;
+            for (try Taint.fieldsOf(c, container)) |field| {
+                const declared = c.project.at(field.file).model.declarations[@backingInt(field.index)];
+                const held = try c.facts.memberField(container, field);
+                switch (try heldBy(c, resources, held, 0)) {
+                    .resource => |which| {
+                        // The field itself holds one, or a container made in it does.
+                        if (byValue(held)) |k| if (find(resources, k) == null) {
+                            try madeHolds(c, rule, resources, paths, at, maker, held, depth + 1);
+                            continue;
+                        };
+                        const why = try owns(c, rule, resources, .{ .file = field.file, .scope = declared.scope }, field.file, declared, at) orelse continue;
+                        try c.at(rule, at, try c.allocator.print("this binding makes field '{s}' of '{s}' hold a std.{s} by value {s}: aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ declared.name, maker, paths[which], why }));
+                    },
+                    .other, .generic => {},
+                    .unknown => try c.undecided(rule, tree.tokenStart(at), .unresolved, "a field this binding makes has a type that does not resolve: it may hold a std resource by value"),
+                }
+            }
+        },
+        .optional, .error_union, .array => |inner| try madeHolds(c, rule, resources, paths, at, maker, inner.*, depth + 1),
+        .reified => |built| try madeHolds(c, rule, resources, paths, at, maker, built.fields.*, depth + 1),
+        .alternatives => |each| for (each) |one| try madeHolds(c, rule, resources, paths, at, maker, one, depth + 1),
+        .unknown => |why| if (why != .generic) try c.undecided(rule, tree.tokenStart(at), .unresolved, "the type this binding makes does not resolve: it may hold a std resource by value"),
+        else => {},
     }
 }
 
@@ -465,16 +607,17 @@ fn pointerCapture(tree: *const Ast, model: *const Model, parent: Ast.Node.Index,
 /// an assignment to it or its `handle`, a literal of its container (or one whose type does not
 /// resolve) naming it, or its default. Its address taken may be written through. `undefined`
 /// holds nothing to own. A release through a receiver that does not resolve, or a read of it
-/// passed where nothing resolves, is undecided.
-fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Facts.Container, decl: Model.Declaration) Context.Error!?[]const u8 {
-    const own = &c.project.at(c.file).file.tree;
+/// passed where nothing resolves, is undecided, reported at `doubt_at` in the checked file. The
+/// field is `file`'s: the checked file's own, or a type function's a binding here makes.
+fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Facts.Container, file: Project.FileId, decl: Model.Declaration, doubt_at: Ast.TokenIndex) Context.Error!?[]const u8 {
+    const own = &c.project.at(file).file.tree;
     const owner = "that its file makes and writes into it";
     var doubt = false;
     if ((own.fullContainerField(decl.node) orelse return null).ast.value_expr.unwrap()) |default| {
-        if (!try filled(c, resources, c.file, default)) return owner;
+        if (!try filled(c, resources, file, default)) return owner;
     }
     for (try fieldUses(c, decl.name)) |use| {
-        if (use.file != c.file) continue;
+        if (use.file != file) continue;
         const resolved = try c.facts.resolve(use.file, use.receiver);
         if (resolved == .unknown) {
             doubt = doubt or try released(c, use.file, use.node, 0) != .no;
@@ -504,15 +647,15 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
         const literal = own.fullStructInit(&buffer, node) orelse continue;
         for (literal.ast.fields) |value| {
             if (!std.mem.eql(u8, own.tokenSlice(Model.initName(own, value) orelse continue), decl.name)) continue;
-            const made = try c.facts.literalType(c.file, node);
+            const made = try c.facts.literalType(file, node);
             if (made != .unknown) {
                 const of = byValue(made) orelse break;
                 if (of.file != holder.file or of.scope != holder.scope) break;
             }
-            if (!try filled(c, resources, c.file, value)) return owner;
+            if (!try filled(c, resources, file, value)) return owner;
         }
     }
-    if (doubt) try c.undecided(rule, own.tokenStart(decl.token), .unresolved, "a field that may be released: read through a receiver that does not resolve, or passed where nothing resolves");
+    if (doubt) try c.undecided(rule, c.project.at(c.file).file.tree.tokenStart(doubt_at), .unresolved, "a field that may be released: read through a receiver that does not resolve, or passed where nothing resolves");
     return null;
 }
 
