@@ -292,6 +292,18 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         if (decl.kind != .parameter or c.inTest(decl.token)) continue;
         try hold(c, &given, &holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = try parameterIo(c, decl, io_type) });
     }
+    // A function no parameter gives one may make one of its own: a local or a capture whose
+    // value holds an `Io` (`const w: *Worker = @ptrCast(raw)`), one in a form not read only
+    // where its declaration spells one.
+    for (model.declarations, 0..) |decl, d| {
+        if ((decl.kind != .variable and decl.kind != .capture) or c.inTest(decl.token)) continue;
+        if (decl.kind == .variable and containerLevel(c, decl)) continue;
+        const function = functionOf(c, decl.node) orelse continue;
+        if (given.get(function)) |entry| if (holders.items[entry].held == .at) continue;
+        var held = try heldIo(c, try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }), io_type, 1);
+        if (held == .unread and !try spellsIo(c, c.file, decl.node, io_type)) held = .none;
+        try hold(c, &given, &holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = held });
+    }
     for (model.references) |ref| {
         const id = ref.declaration orelse continue;
         if (tree.nodeTag(ref.node) != .identifier or c.inTest(ref.token) or !containerLevel(c, model.declarations[@backingInt(id)])) continue;

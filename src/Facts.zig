@@ -3470,7 +3470,9 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, node, &buffer);
     if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
-    const value = try self.resolve(file, args[0]);
+    // `@field(p, "name")` on a single pointer names its pointee's member.
+    const resolved = try self.resolve(file, args[0]);
+    const value = if (resolved == .pointer) resolved.pointer.* else resolved;
     const container = switch (value) {
         .container, .instance => |c| c,
         else => return null,
