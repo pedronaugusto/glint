@@ -5152,7 +5152,7 @@ test "A010 reads a midpoint, a nonnegative negation, a divisor that cannot be ze
     , 0);
     // The unsafe forms stay findings, each its own: a plain sum, a negated input, a divisor
     // only read, a prong that holds zero, a signed divisor only other than zero (it may be -1),
-    // and a byte grown past a byte.
+    // the same divisor to @divTrunc, and a byte grown past a byte.
     const head =
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !i64 {
@@ -5163,7 +5163,8 @@ test "A010 reads a midpoint, a nonnegative negation, a divisor that cannot be ze
         "    const v: i64 = try r.takeInt(i64, .little);\n    return -v;\n}\n",
         "    const n: usize = try r.takeInt(u8, .little);\n    return @intCast(4096 / n);\n}\n",
         "    const n: usize = try r.takeInt(u8, .little);\n    switch (n) {\n        inline 0...3 => |k| return @intCast(16 % k),\n        else => return 0,\n    }\n}\n",
-        "    const v: i64 = try r.takeInt(i64, .little);\n    const d: i64 = try r.takeInt(i64, .little);\n    if (d == 0) return 0;\n    return @divTrunc(v, d) +% @rem(v, 3) +% @divTrunc(v, 1) +% v % d;\n}\n",
+        "    const v: i64 = try r.takeInt(i64, .little);\n    const d: i64 = try r.takeInt(i64, .little);\n    if (d == 0) return 0;\n    return @rem(v, 3) +% @divTrunc(v, 1) +% v % d;\n}\n",
+        "    const v: i64 = try r.takeInt(i64, .little);\n    const d: i64 = try r.takeInt(i64, .little);\n    if (d == 0) return 0;\n    return @divTrunc(v, d);\n}\n",
         "    const in = try r.take(16);\n    var digits: u8 = 0;\n    for (in) |byte| digits = digits * 10 +% byte;\n    return digits;\n}\n",
     }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});

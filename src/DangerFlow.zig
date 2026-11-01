@@ -165,8 +165,17 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (!site(c, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .data, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
+            // A shift's amount past the operand's width (one whose width is no power of two
+            // takes an amount type wider than it) stops the program.
+            .shl, .shr, .assign_shl, .assign_shr => {
+                if (!site(c, node)) continue;
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                if (try amountFits(c, lhs)) continue;
+                try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "a shift by an amount from input: a peer's amount past the operand's width stops the program; aegis int.Checked returns the error");
+            },
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
+                if (try arithmeticBuiltin(c, flow, rule, node, name)) continue;
                 var fallible = false;
                 for ([_][]const u8{ "@intCast", "@intFromFloat", "@enumFromInt", "@fromBackingInt" }) |cast| fallible = fallible or std.mem.eql(u8, name, cast);
                 if (!fallible or !site(c, node)) continue;
@@ -183,6 +192,50 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             else => {},
         }
     }
+}
+
+/// Whether a shift of `operand` takes no amount past its width: an integer whose width is a
+/// power of two, whose amount type (`Log2Int`) holds only amounts below it.
+fn amountFits(c: *Context, operand: Ast.Node.Index) Context.Error!bool {
+    const value = try c.facts.resolve(c.file, operand);
+    if (value != .primitive) return false;
+    const name = value.primitive;
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return false;
+    const bits = std.fmt.parseInt(u16, name[1..], 10) catch return false;
+    return bits != 0 and std.math.isPowerOfTwo(bits);
+}
+
+/// A010's builtins that stop the program on some operands, judged as the operators are: a
+/// quotient's or remainder's divisor (`@divTrunc`, `@divFloor`, `@divExact`, `@mod`, `@rem`; zero,
+/// and for an exact division a remainder, so its dividend too), an exact shift's operands
+/// (`@shlExact`, `@shrExact`: bits shifted out, or an amount past the width) and a shift's amount
+/// (`@shlWithOverflow`). Whether `name` is one of them, judged.
+fn arithmeticBuiltin(c: *Context, flow: *Taint.Flow, rule: Rule, node: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const Operand = enum { divisor, both, amount };
+    const table = [_]struct { []const u8, Operand }{
+        .{ "@divTrunc", .divisor }, .{ "@divFloor", .divisor }, .{ "@mod", .divisor },   .{ "@rem", .divisor },
+        .{ "@divExact", .both },    .{ "@shlExact", .both },    .{ "@shrExact", .both }, .{ "@shlWithOverflow", .amount },
+    };
+    const operand = for (table) |entry| {
+        if (std.mem.eql(u8, entry[0], name)) break entry[1];
+    } else return false;
+    if (!site(c, node)) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return true;
+    switch (operand) {
+        .divisor => {
+            if (try Proof.nonzero(c, c.file, args[1])) return true;
+            try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, args[1]), .data, try c.allocator.print("{s} by input: a peer's zero, or a signed -1 under the least value, stops the program; aegis int.Checked returns the error", .{name}));
+        },
+        .both => {
+            const level = (try Taint.levelAt(c, flow, c.file, args[0])).join(try Taint.levelAt(c, flow, c.file, args[1]));
+            try judged(c, flow, rule, node, level, .data, try c.allocator.print("{s} of input: a peer's operands that leave a remainder or shift bits out stop the program; aegis int.Checked returns the error", .{name}));
+        },
+        .amount => if (!try amountFits(c, args[0])) try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, args[1]), .data, try c.allocator.print("{s} by an amount from input: a peer's amount past the operand's width stops the program; aegis int.Checked returns the error", .{name})),
+    }
+    return true;
 }
 
 /// A012: work sized by a number from input without a stated limit: an allocation, a
