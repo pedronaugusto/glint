@@ -3125,7 +3125,7 @@ const Flow = struct {
             }
             // A std handle is a value: a copy given to a call that does not release that
             // parameter is lent to it.
-            if (f.kind == .std_handle and try Shapes.lentArgument(f.c, f.c.file, candidate)) {
+            if (f.kind == .std_handle and try Shapes.lentArgument(f.c, cleanup, f.c.file, candidate)) {
                 found = .members;
                 continue;
             }
