@@ -545,7 +545,8 @@ const ast = [_]Entry{
 };
 
 fn table(comptime Tag: type, comptime entries: []const Entry) std.EnumArray(Tag, ?Row) {
-    @setEvalBranchQuota(100_000);
+    // stringToEnum sorts a map of every tag at compile time: hundreds of ZIR tags.
+    @setEvalBranchQuota(10_000_000);
     var rows: std.EnumArray(Tag, ?Row) = .initFill(null);
     for (entries) |entry| if (std.meta.stringToEnum(Tag, entry[0])) |tag| rows.set(tag, entry[1]);
     return rows;
