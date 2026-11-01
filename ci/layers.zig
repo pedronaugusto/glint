@@ -2,7 +2,7 @@
 const gantry = @import("gantry");
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "tokens", .patterns = &.{ "src/Token.zig", "src/Token/**" } },
-    .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
+    .{ .name = "front end and selection", .patterns = &.{ "src/File.zig", "src/Constructs.zig", "src/Rule.zig", "src/names.zig", "src/Completion.zig" } },
     .{ .name = "bindings and comments", .patterns = &.{ "src/Model.zig", "src/Suppression.zig" } },
     .{ .name = "project", .patterns = &.{"src/Project.zig"} },
     .{ .name = "facts and diagnostics", .patterns = &.{ "src/Facts.zig", "src/Library.zig", "src/Report.zig", "src/Fix.zig" } },

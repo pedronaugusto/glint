@@ -356,6 +356,14 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, wri
 }
 /// Standalone CLI for compiled project rules. Same completion and output contract.
 pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, project_rules: []const RuleContext.Rule) !u8 {
+    return executeWith(gpa, io, args, writer, problems, project_rules, null);
+}
+/// Runs glint on `args` as `execute` does, each file read through `store`: runs sharing it
+/// read a file they share once, std's among them (glint's soundness suite, a run per case).
+pub fn executeStored(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, store: *Project.Store) !u8 {
+    return executeWith(gpa, io, args, writer, problems, &AegisPack.rules, store);
+}
+fn executeWith(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, project_rules: []const RuleContext.Rule, store: ?*Project.Store) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -370,7 +378,7 @@ pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []con
     const requested = try Result.request(request.result, request.run_id);
     var record: Result.Record = .{ .run_id = if (requested) |req| req.run_id else "", .version = 1, .completed = false, .outcome = .running, .sources = 0, .findings = 0, .suppressed = 0, .output_bytes = 0, .output_sha256 = "" };
     try Result.publish(a, io, requested, record);
-    const status = executeInner(gpa, a, io, request.arguments, writer, problems, &record, project_rules) catch |err| {
+    const status = executeInner(gpa, a, io, request.arguments, writer, problems, &record, project_rules, store) catch |err| {
         if (err == error.Canceled) record.outcome = .canceled;
         if (err == error.OutOfMemory) record.outcome = .tool_failure;
         switch (err) {
@@ -384,7 +392,7 @@ pub fn executeConfigured(gpa: std.mem.Allocator, io: std.Io, args: []const []con
     return status;
 }
 
-fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule) !u8 {
+fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io, args: []const []const u8, writer: *std.Io.Writer, problems: *std.Io.Writer, record: *Result.Record, project_rules: []const RuleContext.Rule, store: ?*Project.Store) !u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -428,7 +436,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     record.outcome = .traversal_failure;
     try loader.imports();
     record.outcome = .tool_failure;
-    var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io });
+    var project = try Project.init(gpa, loader.inputs.items, loader.mappings.items, .{ .io = io, .store = store });
     defer project.deinit();
     var config = configured.config;
     const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;

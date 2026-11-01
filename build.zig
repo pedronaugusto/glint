@@ -54,6 +54,20 @@ pub fn dev(b: *std.Build, tools: type) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
     const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
+    // The soundness suite: every case under test/soundness/ on the glint just built, std from
+    // this Zig and aegis as glint pins it.
+    const soundness = b.addExecutable(.{ .name = "glint-soundness", .root_module = b.createModule(.{
+        .root_source_file = p.path("test/soundness/run.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "glint", .module = module }},
+    }) });
+    const soundness_run = b.addRunArtifact(soundness);
+    soundness_run.addDirectoryArg2(p.path("test/soundness"), .{});
+    soundness_run.addDirectoryArg2(.zig_lib, .{});
+    soundness_run.addFileArg2(aegis_dependency.path("src/root.zig"), .{});
+    test_step.dependOn(&soundness_run.step);
+    b.step("soundness", "Run the soundness suite alone").dependOn(&soundness_run.step);
     const project_linter = b.addExecutable(.{ .name = "glint-project-example", .root_module = b.createModule(.{
         .root_source_file = p.path("examples/project.zig"),
         .target = target,

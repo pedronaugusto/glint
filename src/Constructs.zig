@@ -570,30 +570,26 @@ pub fn ofNode(tag: Ast.Node.Tag) ?Row {
     return ast_rows.get(tag);
 }
 
-/// Whether `tags` places every tag of `Tag` and names no tag `Tag` lacks; each it misses
-/// either way printed.
-fn complete(comptime Tag: type, comptime entries: []const Entry, kind: []const u8) bool {
-    var ok = true;
+/// Each tag of `Tag` that `entries` places in no row, and each entry naming a tag `Tag` lacks,
+/// a line to `w`.
+fn complete(comptime Tag: type, comptime entries: []const Entry, kind: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (std.meta.tags(Tag)) |tag| {
         for (entries) |entry| {
             if (std.mem.eql(u8, entry[0], @tagName(tag))) break;
-        } else {
-            std.debug.print("{s} {s} is in no row: place it in Constructs.zig\n", .{ kind, @tagName(tag) });
-            ok = false;
-        }
+        } else try w.print("{s} {s} is in no row: place it in Constructs.zig\n", .{ kind, @tagName(tag) });
     }
     for (entries) |entry| if (std.meta.stringToEnum(Tag, entry[0]) == null) {
-        std.debug.print("{s} {s} is no tag of this Zig: take it out of Constructs.zig\n", .{ kind, entry[0] });
-        ok = false;
+        try w.print("{s} {s} is no tag of this Zig: take it out of Constructs.zig\n", .{ kind, entry[0] });
     };
-    return ok;
 }
 
 test "every ZIR instruction, extended instruction and Ast node form this Zig has is in one row" {
-    const zir_ok = complete(Zir.Inst.Tag, &zir, "ZIR instruction");
-    const extended_ok = complete(Zir.Inst.Extended, &extended, "extended ZIR instruction");
-    const ast_ok = complete(Ast.Node.Tag, &ast, "Ast node");
-    try std.testing.expect(zir_ok and extended_ok and ast_ok);
+    var missing: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer missing.deinit();
+    try complete(Zir.Inst.Tag, &zir, "ZIR instruction", &missing.writer);
+    try complete(Zir.Inst.Extended, &extended, "extended ZIR instruction", &missing.writer);
+    try complete(Ast.Node.Tag, &ast, "Ast node", &missing.writer);
+    try std.testing.expectEqualStrings("", missing.written());
 }
 
 test "rows read as their constructs" {
