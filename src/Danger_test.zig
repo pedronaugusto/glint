@@ -9487,6 +9487,197 @@ test "A009 and A010 read a destructure and a pointer capture as writes of what t
     , 0);
 }
 
+test "A009 reads a destructure into a field or a length as a store of each value, and @call as a call that may write what its arguments reach (pre-review 7 B1, B2)" {
+    // d01_place_destructure
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn widen(s: *S, x: usize) void {
+        \\    s.at = x; // any value: no field invariant
+        \\}
+        \\// Hole: the place is given the input by a destructure after `s.at = 3`.
+        \\pub fn f(r: *std.Io.Reader, s: *S, table: *const [16]u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    s.at = 3;
+        \\    s.at, _ = .{ n, 0 };
+        \\    return table[s.at];
+        \\}
+    , 1);
+    // d02_place_destructure_callee
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn widen(s: *S, x: usize) void {
+        \\    s.at = x; // any value: no field invariant
+        \\}
+        \\fn set(p: *S, n: usize) void {
+        \\    p.at, _ = .{ n, 0 };
+        \\}
+        \\// Hole: a callee writes the place by a destructure; its summary lists no write.
+        \\pub fn f(r: *std.Io.Reader, s: *S, table: *const [16]u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    s.at = 3;
+        \\    set(s, n);
+        \\    return table[s.at];
+        \\}
+    , 1);
+    // d03_place_alias_destructure
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn widen(s: *S, x: usize) void {
+        \\    s.at = x; // any value: no field invariant
+        \\}
+        \\// Hole: another pointer, maybe to the same struct, is written by a destructure.
+        \\pub fn f(r: *std.Io.Reader, a: *S, b: *S, table: *const [16]u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    a.at = 3;
+        \\    b.at, _ = .{ n, 0 };
+        \\    return table[a.at];
+        \\}
+    , 1);
+    // d04_call_builtin
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn fill(r: *std.Io.Reader, s: *S) !void {
+        \\    s.at = try r.takeInt(u32, .little); // the field holds input
+        \\}
+        \\fn set(p: *S, n: usize) void {
+        \\    p.at = n;
+        \\}
+        \\// Hole: @call runs set, which writes the place; Bounds keeps `s.at == 3` past it.
+        \\pub fn f(s: *S, n: usize, table: *const [16]u8) u8 {
+        \\    s.at = 3;
+        \\    @call(.auto, set, .{ s, n });
+        \\    return table[s.at];
+        \\}
+    , 1);
+    // d05_len_destructure
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\// Hole: a slice's length set by a destructure; Bounds keeps it at 16.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var memory: [16]u8 = @splat(0);
+        \\    var s: []u8 = memory[0..];
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n == 0) return 0;
+        \\    s.len, _ = .{ n, 0 };
+        \\    return memory[s.len - 1];
+        \\}
+    , 1);
+    // d01 twin: the program's own value, or the place stored again past the call
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn widen(s: *S, x: usize) void {
+        \\    s.at = x; // any value: no field invariant
+        \\}
+        \\// Hole: the place is given the input by a destructure after `s.at = 3`.
+        \\pub fn f(r: *std.Io.Reader, s: *S, table: *const [16]u8) !u8 {
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    s.at = 3;
+        \\    s.at, _ = .{ 5, 0 };
+        \\    _ = n;
+        \\    return table[s.at];
+        \\}
+    , 0);
+    // d04 twin: the program's own value, or the place stored again past the call
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const S = struct { at: usize = 0 };
+        \\pub fn fill(r: *std.Io.Reader, s: *S) !void {
+        \\    s.at = try r.takeInt(u32, .little); // the field holds input
+        \\}
+        \\fn set(p: *S, n: usize) void {
+        \\    p.at = n;
+        \\}
+        \\// Hole: @call runs set, which writes the place; Bounds keeps `s.at == 3` past it.
+        \\pub fn f(s: *S, n: usize, table: *const [16]u8) u8 {
+        \\    s.at = 3;
+        \\    @call(.auto, set, .{ s, n });
+        \\    s.at = 3;
+        \\    return table[s.at];
+        \\}
+    , 0);
+    // d05 twin: the program's own value, or the place stored again past the call
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\// Hole: a slice's length set by a destructure; Bounds keeps it at 16.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var memory: [16]u8 = @splat(0);
+        \\    var s: []u8 = memory[0..];
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    if (n == 0) return 0;
+        \\    s.len, _ = .{ 8, 0 };
+        \\    return memory[s.len - 1];
+        \\}
+    , 0);
+}
+
+test "A009 reads an operand as the value it had where Zig read it, past a later operand that assigns its variable (pre-review 7 B3)" {
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\var table: [16]u8 = @splat(0);
+        \\fn first(a: usize, b: usize) usize {
+        \\    _ = b;
+        \\    return a;
+        \\}
+        \\// Hole? (summaries): first() returns the old i; Bounds applies its summary to the new.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var i: usize = try r.takeInt(u32, .little);
+        \\    const x = first(i, blk: {
+        \\        i = 3;
+        \\        break :blk 0;
+        \\    });
+        \\    return table[x];
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\var table: [16]u8 = @splat(0);
+        \\// Hole? (Bounds core): `table[i + blk]` indexes with the old i; Bounds reads the new.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var i: usize = try r.takeInt(u32, .little);
+        \\    return table[i + blk: {
+        \\        i = 0;
+        \\        break :blk 0;
+        \\    }];
+        \\}
+    , 1);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\var table: [16]u8 = @splat(0);
+        \\fn first(a: usize, b: usize) usize {
+        \\    _ = b;
+        \\    return a;
+        \\}
+        \\// Hole? (summaries): first() returns the old i; Bounds applies its summary to the new.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var i: usize = 3;
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    const x = first(i, blk: {
+        \\        i = n;
+        \\        break :blk 0;
+        \\    });
+        \\    return table[x];
+        \\}
+    , 0);
+    try expect(pack.untrusted_input,
+        \\const std = @import("std");
+        \\var table: [16]u8 = @splat(0);
+        \\// Hole? (Bounds core): `table[i + blk]` indexes with the old i; Bounds reads the new.
+        \\pub fn f(r: *std.Io.Reader) !u8 {
+        \\    var i: usize = 3;
+        \\    const n: usize = try r.takeInt(u32, .little);
+        \\    return table[i + blk: {
+        \\        i = n;
+        \\        break :blk 0;
+        \\    }];
+        \\}
+    , 0);
+}
+
 test "A009 reads what input decides through a jump, a call's or a builtin's write, the right side of and, a deferred write, and a labeled switch's dispatch" {
     // Each writes the program's own 1000 where the peer's byte decides whether it does.
     inline for (.{
