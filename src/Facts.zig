@@ -5047,9 +5047,11 @@ pub const accesses = struct {
     /// `writes`, of what `need` asks.
     pub fn writesFor(facts: *Facts, place: Place, files: []const Project.FileId, need: Need) Error![]const Site {
         var out: Sites = .empty;
+        // A query that keeps whole values and outside code's writes resolves nearly every store
+        // of a file: it reads the file's one index, built once, not one of its own per name.
         for (files) |file| try gather(facts, switch (place) {
             .declaration => try writesOf(facts, file),
-            .field => |d| try fieldWritesOf(facts, file, .{ .name = facts.project.at(d.file).model.declarations[@backingInt(d.index)].name, .holders = need.holders }),
+            .field => |d| if (need.holders) try writesOf(facts, file) else try fieldWritesOf(facts, file, .{ .name = facts.project.at(d.file).model.declarations[@backingInt(d.index)].name, .holders = false }),
         }, place, &out);
         return out.items;
     }
@@ -5264,7 +5266,22 @@ pub const accesses = struct {
                     },
                     .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => try w.builtin(node, own),
                     .call_one, .call_one_comma, .call, .call_comma => try w.call(node, own),
-                    .asm_simple, .@"asm" => try w.unresolved(w.make(node, null, .covered, null)),
+                    .asm_simple, .@"asm" => {
+                        const covered = w.make(node, null, .covered, null);
+                        try w.unresolved(covered);
+                        // An output by name (`[out] "=r" (x)`) writes the variable it names.
+                        const full = tree.fullAsm(node) orelse continue;
+                        for (full.outputs) |output| {
+                            const result, const rparen = tree.nodeData(output).opt_node_and_token;
+                            // `(-> T)` is the result, no variable.
+                            if (result.unwrap() != null) continue;
+                            const name = rparen - 1;
+                            if (tree.tokenTag(name) != .identifier or w.filter != null) continue;
+                            const model = w.lexicon();
+                            const d = model.lookup(model.scopeOf(name), tree.tokenSlice(name), name) orelse continue;
+                            try w.put(.{ .declaration = .{ .file = w.file, .index = d } }, covered);
+                        }
+                    },
                     .for_simple, .@"for" => {
                         const loop = tree.fullFor(node).?; // unreachable: the tag is a loop's
                         var token = loop.payload_token;
@@ -5391,7 +5408,7 @@ pub const accesses = struct {
                 .field_access => {
                     const holder = tree.nodeData(node).node_and_token[0];
                     const value = try w.facts.resolve(w.file, holder);
-                    try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) });
+                    try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) and !header(tree.tokenSlice(tree.nodeData(node).node_and_token[1]), value) });
                     node = holder;
                 },
                 .array_access => {
@@ -5413,7 +5430,7 @@ pub const accesses = struct {
                         const args = Facts.builtinArgs(tree, node, &buffer);
                         if (args.len == 2) {
                             const value = try w.facts.resolve(w.file, args[0]);
-                            try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) });
+                            try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) and !header(try w.spelled(args[1]) orelse "", value) });
                             node = args[0];
                             continue;
                         }
@@ -5859,6 +5876,22 @@ pub const accesses = struct {
                 if (one == .pointer) break true;
             } else false,
             else => false,
+        };
+    }
+
+    /// Whether `name` on a pointer `value` is a slice's own `len` or `ptr`: the slice's memory,
+    /// not what it points at. On a pointer to a container it is the container's member, which a
+    /// dereference reaches; on one whose pointee does not resolve it may be either, and the
+    /// slice's own is kept.
+    fn header(name: []const u8, value: Facts.Value) bool {
+        if (!std.mem.eql(u8, name, "len") and !std.mem.eql(u8, name, "ptr")) return false;
+        const held_type = switch (value) {
+            .pointer => |inner| inner.*,
+            else => return false,
+        };
+        return switch (held_type) {
+            .instance, .container => false,
+            else => true,
         };
     }
 

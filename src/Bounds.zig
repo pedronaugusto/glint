@@ -961,30 +961,27 @@ const Frame = struct {
         return .{ .rows = try canonical(f.a, rows.items) };
     }
 
-    /// The locals whose address is taken, and each declaration by its name's token.
+    /// The function's declarations by their names' tokens, and those another name may write, as
+    /// `Facts.accesses` finds their writes: an address taken (`&x`, `&x.f`, a slice of an
+    /// array, a `|*p|` capture) or memory code the program does not hold writes (`asm`). A
+    /// method's pointer receiver is the call's, which the callee's summary reads.
     fn indexDeclarations(f: *Frame) Error!void {
         const first = f.tree.firstToken(f.function);
         const last = f.tree.lastToken(f.function);
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .address_of) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = f.tree.nodeMainToken(node);
-            if (token < first or token > last) continue;
-            var operand = f.tree.nodeData(node).node;
-            while (true) operand = switch (f.tree.nodeTag(operand)) {
-                .grouped_expression => f.tree.nodeData(operand).node_and_token[0],
-                else => break,
-            };
-            if (f.tree.nodeTag(operand) != .identifier) continue;
-            const ref = f.model.reference(operand) orelse continue;
-            if (ref.declaration) |d| try f.addressed.put(f.a, d, {});
-        }
-        for (f.model.declarations, 0..) |decl, d| {
+        for (f.model.declarations, 0..) |decl, i| {
             if (decl.token < first or decl.token > last) continue;
             switch (decl.kind) {
-                .variable, .capture, .parameter => try f.decls.put(f.a, decl.token, @fromBackingInt(@intCast(d))),
-                else => {},
+                .variable, .capture, .parameter => {},
+                else => continue,
             }
+            const d: Model.Declaration.Id = @fromBackingInt(@intCast(i));
+            try f.decls.put(f.a, decl.token, d);
+            var buffer: [1]Ast.Node.Index = undefined;
+            for (try Facts.accesses.writes(f.c.facts, .{ .declaration = .{ .file = f.file, .index = d } }, &.{f.file})) |site| switch (site.kind) {
+                .address => if (f.tree.fullCall(&buffer, site.node) == null) try f.addressed.put(f.a, d, {}),
+                .covered => try f.addressed.put(f.a, d, {}),
+                else => {},
+            };
         }
     }
 

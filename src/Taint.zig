@@ -257,6 +257,11 @@ pub const Flow = struct {
     globals: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
     /// The lengths of the memory they hold, by declaration (`Dep.length`).
     lengths: std.AutoHashMapUnmanaged(Facts.Decl, Level) = .empty,
+    /// Memory no place names (`Place.unknown`: what a pointer made from an integer or a call
+    /// that does not resolve reaches): what any store into it puts there, and the length of the
+    /// memory it holds. A read of such memory may read any of it.
+    unnamed: Level = .clean,
+    unnamed_length: Level = .clean,
     /// The files that are the program (`Program`).
     program: *const Program = undefined,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
@@ -714,8 +719,10 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
     const model = &c.project.at(f.file).model;
     switch (tree.nodeTag(target)) {
         .identifier => {
-            const ref = model.reference(target) orelse return;
-            const d = ref.declaration orelse return;
+            // `_ = v` discards; a name that does not resolve may be any memory.
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return;
+            const ref = model.reference(target) orelse return addPlace(c, out, .unknown);
+            const d = ref.declaration orelse return addPlace(c, out, .unknown);
             const decl = model.declarations[@backingInt(d)];
             // A parameter is never assigned: a store reaching one goes through it, into its
             // callers' memory.
@@ -732,7 +739,13 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
                 var buffer: [2]Ast.Node.Index = undefined;
                 switch (tree.nodeTag(init)) {
                     .address_of, .slice_open, .slice, .slice_sentinel => try places(c, flow, function, init, out),
-                    else => if (tree.fullArrayInit(&buffer, init) != null) try places(c, flow, function, init, out),
+                    else => if (tree.fullArrayInit(&buffer, init) != null) {
+                        try places(c, flow, function, init, out);
+                    } else if (try pointing(c, f.file, target)) {
+                        // A pointer a call gives or a conversion makes (`list.addOne()`,
+                        // `@ptrFromInt(at)`) is the memory it was made from.
+                        try places(c, flow, function, init, out);
+                    },
                 }
             };
             if (decl.kind == .capture) if (try capturedFrom(c, f.file, decl)) |from| try places(c, flow, function, from, out);
@@ -741,10 +754,15 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             // The program's own field holds the fact by its declaration; a field of a type
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
             // the store reaches only the value it belongs to.
-            if ((try c.facts.definition(f.file, target)).orNull()) |decl| {
-                if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and flow.own(decl.file)) return addPlace(c, out, .{ .global = decl });
+            const holder, const name = tree.nodeData(target).node_and_token;
+            switch (try c.facts.definition(f.file, target)) {
+                .decl => |decl| if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and flow.own(decl.file)) return addPlace(c, out, .{ .global = decl }),
+                // A member that does not resolve, or one of a holder whose type does not, may be
+                // any of the program's fields so named.
+                .unknown => for (try fieldsNamed(c, flow, tree.tokenSlice(name))) |decl| try addPlace(c, out, .{ .global = decl }),
+                .none => if (unresolvedHolder(try c.facts.resolve(f.file, holder))) for (try fieldsNamed(c, flow, tree.tokenSlice(name))) |decl| try addPlace(c, out, .{ .global = decl }),
             }
-            return places(c, flow, function, tree.nodeData(target).node_and_token[0], out);
+            return places(c, flow, function, holder, out);
         },
         .array_access => return places(c, flow, function, tree.nodeData(target).node_and_node[0], out),
         .deref, .address_of, .@"try" => return places(c, flow, function, tree.nodeData(target).node, out),
@@ -779,8 +797,8 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
                 if (!any) try places(c, flow, function, args[0], out);
                 return;
             }
-            // A pointer converted is the memory it was.
-            for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@as" }) |cast| if (std.mem.eql(u8, name, cast) and args.len > 0) {
+            // A pointer converted is the memory it was, and a field's parent the memory its field is in.
+            for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@as", "@fieldParentPtr" }) |cast| if (std.mem.eql(u8, name, cast) and args.len > 0) {
                 return places(c, flow, function, args[args.len - 1], out);
             };
             try addPlace(c, out, .unknown);
@@ -821,8 +839,10 @@ fn resultPlaces(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.
             }
             for (g.returned_globals.items) |global| try addPlace(c, out, .{ .global = global });
         },
+        // A method's receiver, held by value or not, holds the memory it may give a pointer into
+        // (`list.addOne()`).
         .outside, .source, .aegis, .holder => for (callee.args.items) |arg| {
-            if (try pointing(c, f.file, arg)) try places(c, flow, function, arg, out);
+            if (callee.receiver == arg or try pointing(c, f.file, arg)) try places(c, flow, function, arg, out);
         },
         .none => try addPlace(c, out, .unknown),
     }
@@ -897,7 +917,13 @@ fn raise(c: *Context, flow: *Flow, function: Function.Id, place: Place, value: D
             }
         },
         .global => |decl| try raiseGlobal(c, flow, decl, concrete(flow, function, value), concreteLength(flow, function, value)),
-        .unknown => {},
+        .unknown => {
+            const level = flow.unnamed.join(concrete(flow, function, value));
+            const length = flow.unnamed_length.join(concreteLength(flow, function, value));
+            if (level != flow.unnamed or length != flow.unnamed_length) flow.changed = true;
+            flow.unnamed = level;
+            flow.unnamed_length = length;
+        },
     }
 }
 
@@ -1049,29 +1075,6 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!Slots {
 /// buffers among them, and a parameter's memory in its callers.
 fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index) Context.Error!void {
     try store(c, flow, function, arg, .{ .level = .data });
-}
-
-/// The buffers a vector given to a read names: a literal (`&.{ &buf, rest }`), or the literal
-/// a local vector was made with (`var vec = [_][]u8{ &buf, rest }; read(&vec)`).
-fn vectorOf(c: *Context, file: Project.FileId, buffer: *[2]Ast.Node.Index, arg: Ast.Node.Index) ?[]const Ast.Node.Index {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    var at = arg;
-    var named = false;
-    while (true) switch (tree.nodeTag(at)) {
-        .address_of => at = tree.nodeData(at).node,
-        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-        .identifier => {
-            if (named) return null;
-            named = true;
-            const d = (model.reference(at) orelse return null).declaration orelse return null;
-            const decl = model.declarations[@backingInt(d)];
-            if (decl.kind != .variable) return null;
-            const variable = tree.fullVarDecl(decl.node) orelse return null;
-            at = variable.ast.init_node.unwrap() orelse return null;
-        },
-        else => return (tree.fullArrayInit(buffer, at) orelse return null).ast.elements,
-    };
 }
 
 /// A dependence read as a level, with what callers give the function's parameters.
@@ -1381,7 +1384,12 @@ fn declaredDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
     const f = flow.functions.items[@backingInt(function)];
     const model = &c.project.at(f.file).model;
     const ref = model.reference(node) orelse return .{};
-    const d = ref.declaration orelse return .{};
+    const d = ref.declaration orelse return if (ref.unknown) |why| switch (why) {
+        // A primitive (`true`, `u8`) or a name a literal's type gives holds no data.
+        .primitive, .literal_context => .{},
+        // A name that does not resolve may be anything, memory no place names among it.
+        .unresolved, .invalid_lowering, .before_declaration => .{ .level = Level.unknown.join(flow.unnamed), .unchecked = flow.unnamed_length },
+    } else .{};
     // A parameter's own length is what its callers measured (`concreteLength`).
     if (f.position(d)) |index| return .{ .params = try .of(c.allocator, valueSlot(index)), .bare = try .of(c.allocator, lengthSlot(index)) };
     const decl = model.declarations[@backingInt(d)];
@@ -1486,7 +1494,14 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     // `[4]u8` cast to a `u32` is a peer's count; a pointer cast reads its memory as the new
     // type's).
     for ([_][]const u8{ "@bitCast", "@ptrCast" }) |cast| if (std.mem.eql(u8, name, cast)) return out.widened(c.allocator);
+    // A pointer made from an integer reaches memory no place names.
+    if (std.mem.eql(u8, name, "@ptrFromInt")) return out.join(c.allocator, unnamed(flow));
     return out;
+}
+
+/// What memory no place names may hold (`Flow.unnamed`).
+fn unnamed(flow: *const Flow) Dep {
+    return .{ .level = flow.unnamed, .unchecked = flow.unnamed_length };
 }
 
 /// What any other expression holds: what its parts hold (`a ** n`, an `asm`'s inputs, a loop's
@@ -1506,7 +1521,8 @@ fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
 
 /// A field read through a value whose type is one of several (a generic's result over each
 /// of its instantiations, `Untrusted.parse` over each parser): what the program stores in the
-/// field of that name in each of them.
+/// field of that name in each of them. Through one whose type does not resolve, what it stores
+/// in any of its fields so named.
 fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: Ast.Node.Index, name: []const u8) Context.Error!Level {
     var out: Level = .clean;
     const value = try c.facts.resolve(file, receiver);
@@ -1518,6 +1534,12 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
         };
         const container = switch (held) {
             .container, .instance => |k| k,
+            .unknown => |why| {
+                if (why != .std_internal and why != .absent) for (try fieldsNamed(c, flow, name)) |decl| {
+                    out = out.join(flow.globals.get(decl) orelse .clean);
+                };
+                continue;
+            },
             else => continue,
         };
         const decl = c.facts.member(container, name) orelse continue;
@@ -1525,6 +1547,42 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
         out = out.join(flow.globals.get(decl) orelse .clean);
     }
     return out;
+}
+
+/// Whether a holder's type does not resolve, itself or behind pointers and optionals: std's own
+/// and code the build does not compile are no program's struct.
+fn unresolvedHolder(value: Facts.Value) bool {
+    var current = value;
+    while (true) current = switch (current) {
+        .pointer, .optional, .error_union => |inner| inner.*,
+        .unknown => |why| return why != .std_internal and why != .absent,
+        else => return false,
+    };
+}
+
+/// The program's own fields, by name, found once.
+const FieldsNamed = struct {
+    built: bool = false,
+    map: std.StringHashMapUnmanaged(std.ArrayList(Facts.Decl)) = .empty,
+};
+
+/// The program's own fields named `name`: those a member of a holder whose type does not
+/// resolve may be.
+fn fieldsNamed(c: *Context, flow: *const Flow, name: []const u8) Context.Error![]const Facts.Decl {
+    const memo = try c.facts.memo(FieldsNamed);
+    if (!memo.built) {
+        memo.built = true;
+        for (c.project.sources) |*each| {
+            if (!flow.own(each.id)) continue;
+            for (each.model.declarations, 0..) |record, d| {
+                if (record.kind != .field) continue;
+                const entry = try memo.map.getOrPut(c.allocator, record.name);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(c.allocator, .{ .file = each.id, .index = @fromBackingInt(@intCast(d)) });
+            }
+        }
+    }
+    return if (memo.map.get(name)) |found| found.items else &.{};
 }
 
 /// The field declarations a struct literal's values initialize, in order, when its type
@@ -1767,7 +1825,8 @@ fn result(c: *Context, flow: *Flow, function: Function.Id, call: Ast.full.Call) 
         .none => {
             var out: Dep = .{};
             for (callee.args.items) |arg| out = try out.join(c.allocator, try outsideArg(c, flow, function, arg));
-            return try out.lowered(c.allocator);
+            // What it gives may point into memory no place names.
+            return try (try out.lowered(c.allocator)).join(c.allocator, unnamed(flow));
         },
     }
 }
@@ -2151,18 +2210,44 @@ const Walk = struct {
         return null;
     }
 
-    /// What the program stores in a field or a container-level variable: a value assigned or
-    /// given in a literal, or a read that fills it.
+    /// What the program stores in a field or a container-level variable, each write
+    /// `Facts.accesses` finds: a value assigned or given in a literal, or a read that fills it
+    /// (a source given its address or memory it holds).
     fn stored(w: *Walk, decl: Facts.Decl, depth: u8) Context.Error!?Origin {
-        const stores = try storeSites(w.c, w.flow);
-        for ((stores.map.get(decl) orelse return null).items) |site| {
-            const f = w.flow.functions.items[@backingInt(site.function)];
-            if (site.read) {
-                if (w.read(f.file, site.node)) |found| return found;
-                continue;
+        const place: Facts.accesses.Place = switch (w.c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind) {
+            .field => .{ .field = decl },
+            else => .{ .declaration = decl },
+        };
+        var files: std.ArrayList(Project.FileId) = .empty;
+        var each = w.flow.owners.keyIterator();
+        while (each.next()) |file| try files.append(w.c.allocator, file.*);
+        for (try Facts.accesses.writes(w.c.facts, place, files.items)) |site| {
+            const function = owner(w.flow, site.file, site.node) orelse continue;
+            switch (site.kind) {
+                .init, .set, .update => {
+                    const value = site.value orelse continue;
+                    if (!try w.carries(function, value)) continue;
+                    if (try w.from(function, value, depth + 1)) |found| return found;
+                },
+                .address, .covered => if (try w.sourceArgument(site.file, site.node)) |call| if (w.read(site.file, call)) |found| return found,
+                .read => {},
             }
-            if (!try w.carries(site.function, site.node)) continue;
-            if (try w.from(site.function, site.node, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+
+    /// The call of a source `node` is an argument of, or an element of a vector argument of.
+    fn sourceArgument(w: *Walk, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+        const tree = &w.c.project.at(file).file.tree;
+        const model = &w.c.project.at(file).model;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        // An outside function handed a pointer is the site itself.
+        var at = node;
+        for (0..3) |_| {
+            if (tree.fullCall(&call_buffer, at)) |made| {
+                return if ((try resolveCall(w.c, w.flow, file, made)).kind == .source) at else null;
+            }
+            at = model.parentOf(at) orelse return null;
         }
         return null;
     }
@@ -2249,82 +2334,6 @@ fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
         }
     }
     return memo;
-}
-
-/// Where the program stores into each field and container-level variable, by declaration: the
-/// value it assigns or gives in a literal, or the read that fills it. Built once per flow.
-const StoreSites = struct {
-    built: bool = false,
-    map: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList(StoreSite)) = .empty,
-};
-const StoreSite = struct { function: Function.Id, node: Ast.Node.Index, read: bool };
-
-fn storeSites(c: *Context, flow: *Flow) Context.Error!*StoreSites {
-    const memo = try c.facts.memo(StoreSites);
-    if (memo.built) return memo;
-    memo.built = true;
-    var files = flow.owners.iterator();
-    while (files.next()) |entry| {
-        const file = entry.key_ptr.*;
-        const tree = &c.project.at(file).file.tree;
-        for (entry.value_ptr.*, 0..) |own, i| {
-            const function = own orelse continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (tree.nodeTag(node) == .assign) {
-                const target, const value = tree.nodeData(node).node_and_node;
-                const decl = (try storedDecl(c, file, target)) orelse continue;
-                try addStore(c, memo, decl, .{ .function = function, .node = value, .read = false });
-                continue;
-            }
-            var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullStructInit(&buffer, node)) |literal| {
-                const fields = (try literalFields(c, file, node, literal)) orelse continue;
-                for (fields, literal.ast.fields) |decl, value| try addStore(c, memo, decl, .{ .function = function, .node = value, .read = false });
-                continue;
-            }
-            var call_buffer: [1]Ast.Node.Index = undefined;
-            const made = tree.fullCall(&call_buffer, node) orelse continue;
-            if ((try resolveCall(c, flow, file, made)).kind != .source) continue;
-            for (made.ast.params) |arg| {
-                var vector_buffer: [2]Ast.Node.Index = undefined;
-                const elements = vectorOf(c, file, &vector_buffer, arg) orelse &.{};
-                for (elements) |element| if (try storedDecl(c, file, element)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
-                if (try storedDecl(c, file, arg)) |decl| try addStore(c, memo, decl, .{ .function = function, .node = node, .read = true });
-            }
-        }
-    }
-    return memo;
-}
-
-fn addStore(c: *Context, memo: *StoreSites, decl: Facts.Decl, site: StoreSite) Context.Error!void {
-    const list = try memo.map.getOrPut(c.allocator, decl);
-    if (!list.found_existing) list.value_ptr.* = .empty;
-    try list.value_ptr.append(c.allocator, site);
-}
-
-/// The field or container-level variable an expression stores into: `x.field`, `x.field[i]`,
-/// `&x.field`, `global`.
-fn storedDecl(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .field_access => {
-            const decl = ((try c.facts.definition(file, at)).orNull()) orelse return null;
-            const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
-            return if (kind == .field or kind == .variable) decl else null;
-        },
-        .identifier => {
-            const d = (model.reference(at) orelse return null).declaration orelse return null;
-            const decl = model.declarations[@backingInt(d)];
-            const scope = model.scopes[@backingInt(decl.scope)].kind;
-            return if (decl.kind == .variable and (scope == .file or scope == .container)) .{ .file = file, .index = d } else null;
-        },
-        .array_access => at = tree.nodeData(at).node_and_node[0],
-        .address_of, .deref => at = tree.nodeData(at).node,
-        .slice_open, .slice, .slice_sentinel => at = (tree.fullSlice(at) orelse return null).ast.sliced,
-        else => return null,
-    };
 }
 
 /// The union fields a `switch` prong's capture binds: the one each tag it names declares, or

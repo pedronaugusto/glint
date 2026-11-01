@@ -381,32 +381,24 @@ fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
     return false;
 }
 
-/// Whether a local is written other than by an assignment to its name: its address taken, a
-/// destructuring assignment naming it, or an `asm` output.
+/// Whether a local is written other than by an assignment to its name: by another name
+/// (`addressed`), or by a destructure naming it.
 fn written(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error!bool {
+    if (try addressed(c, file, d)) return true;
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        switch (tag) {
-            .address_of => {
-                const operand = tree.nodeData(node).node;
-                if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |r| if (r.declaration == d) return true;
-            },
-            .assign_destructure => for (tree.assignDestructure(node).ast.variables) |variable| {
-                if (tree.nodeTag(variable) == .identifier) if (model.reference(variable)) |r| if (r.declaration == d) return true;
-            },
-            .asm_output => if (outputNames(tree, node, model.declarations[@backingInt(d)].name)) return true,
-            else => {},
-        }
-    }
+    for (try declarationWrites(c, file, d)) |site| if (tree.nodeTag(site.node) == .assign_destructure) return true;
     return false;
 }
 
-/// Whether an `asm` output writes the variable `name` (`[out] "=r" (name)`).
-fn outputNames(tree: *const Ast, output: Ast.Node.Index, name: []const u8) bool {
-    const rparen = tree.nodeData(output).opt_node_and_token[1];
-    return tree.tokenTag(rparen - 1) == .identifier and std.mem.eql(u8, tree.tokenSlice(rparen - 1), name);
+/// The writes `Facts.accesses` finds of a declaration: in its file for a function's own, in
+/// every file of the program's for one outside any function.
+fn declarationWrites(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error![]const Facts.accesses.Site {
+    const model = &c.project.at(file).model;
+    const files: []const Project.FileId = switch (model.scopes[@backingInt(model.declarations[@backingInt(d)].scope)].kind) {
+        .file, .container => try programFiles(c),
+        else => &.{file},
+    };
+    return Facts.accesses.writes(c.facts, .{ .declaration = .{ .file = file, .index = d } }, files);
 }
 
 /// Whether `a + half` is `a + (b - a) / k` with a literal `k` of at least one.
@@ -825,7 +817,7 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     if (record.kind == .field) return stored(c, decl, pointer, depth);
     if (record.kind != .variable) return null;
     const variable = tree.fullVarDecl(record.node) orelse return null;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return assigned(c, decl, variable, pointer, depth);
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return assigned(c, decl, pointer, depth);
     const init = variable.ast.init_node.unwrap() orelse return null;
     return bound(c, decl.file, init, pointer, depth);
 }
@@ -836,7 +828,7 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
 /// whose address is taken, is unknown.
 const Assigned = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
     const memo = try c.facts.memo(Assigned);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -844,68 +836,45 @@ fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: 
     try memo.map.put(c.allocator, key, null);
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
-    // Written by another name (an address, a method, a `|*p|` capture, an `asm` output).
+    // Written by another name (`addressed`).
     if (try addressed(c, decl.file, decl.index)) return null;
-    const function = enclosing(tree, model, model.declarations[@backingInt(decl.index)].node) orelse return null;
-    const first = tree.firstToken(function);
-    const last = tree.lastToken(function);
+    _ = enclosing(tree, model, model.declarations[@backingInt(decl.index)].node) orelse return null;
     var out: ?Magnitude = 0;
-    if (variable.ast.init_node.unwrap()) |init| if (!empty(tree, init)) {
-        out = try bound(c, decl.file, init, pointer, depth);
-    };
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
+    for (try declarationWrites(c, decl.file, decl.index)) |site| {
         if (out == null) break;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
-        if (token < first or token > last) continue;
-        switch (tag) {
-            .assign => {
-                const target, const value = tree.nodeData(node).node_and_node;
-                if (!namesDecl(model, tree, target, decl) or empty(tree, value)) continue;
-                out = wider(out, try bound(c, decl.file, value, pointer, depth));
+        switch (site.kind) {
+            // Its initializer, `x = v`, a destructure's element: what each gives. A destructure
+            // of anything but a literal gives no one value.
+            .init, .set => {
+                const value = site.value orelse {
+                    out = null;
+                    continue;
+                };
+                if (!empty(tree, value)) out = wider(out, try bound(c, decl.file, value, pointer, depth));
             },
-            // `x, y = .{ a, b }`: each its element; from anything else, unknown.
-            .assign_destructure => {
-                const parts = tree.assignDestructure(node);
-                var buffer: [2]Ast.Node.Index = undefined;
-                const elements = tree.fullArrayInit(&buffer, parts.ast.value_expr);
-                for (parts.ast.variables, 0..) |variable_node, at| {
-                    if (!namesDecl(model, tree, variable_node, decl)) continue;
-                    const each = if (elements) |l| (if (l.ast.elements.len == parts.ast.variables.len) l.ast.elements[at] else null) else null;
-                    out = if (each) |given| (if (empty(tree, given)) out else wider(out, try bound(c, decl.file, given, pointer, depth))) else null;
-                }
-            },
-            .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
-                if (namesDecl(model, tree, tree.nodeData(node).node_and_node[0], decl)) out = null;
-            },
-            else => {},
+            .update, .covered, .address => out = null,
+            .read => {},
         }
     }
     try memo.map.put(c.allocator, key, out);
     return out;
 }
 
-/// Where the program's own files store fields, by the field's name: assignments to a field and
-/// a struct literal's field values, found once for the run.
-const Stores = struct {
+/// The containers a type given as a call's argument names, found once for the run: a function
+/// may fill a type it is given by reflection (`std.json` parsing a `Config`, `bytesToValue(Header,
+/// …)`), and with it every container the type holds, so their fields have values no store sets.
+/// Each argument is read by what it resolves to, however it is spelled (an alias, `@TypeOf(x)`,
+/// `@call`'s tuple).
+const Given = struct {
     built: bool = false,
-    sites: std.StringHashMapUnmanaged(std.ArrayList(Site)) = .empty,
-    /// The names given to a call as arguments, each where it is given: a type a function fills
-    /// by reflection (`std.json` parsing a `Config`, `bytesToValue(Header, …)`) has fields no
-    /// store sets. Matched by name, then by what each resolves to.
-    arguments: std.StringHashMapUnmanaged(std.ArrayList(Facts.Key)) = .empty,
-    /// The structs whose bytes something may write that no store shows: a value of one viewed as
-    /// bytes (`std.mem.asBytes`) or reinterpreted (`@ptrCast`, `@bitCast`, `@memcpy`), a pointer
-    /// to one handed to a function outside the program (a reader, an `extern`), whose writes are
-    /// not read, or one stored into through a name not known as it compiles (`@field(x, name)`).
-    exposed: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, void) = .empty,
-    /// A store's file and node: an assignment (or one that changes the field in place, or takes
-    /// its address), or a struct literal's field value.
-    const Site = struct { file: Project.FileId, node: Ast.Node.Index, kind: enum { assign, changes, literal, named } };
+    /// Each container so given, by identity.
+    shapes: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, void) = .empty,
+    /// Whether an argument that may be a type does not resolve: it may be any container.
+    any: bool = false,
 };
 
-fn stores(c: *Context) Context.Error!*Stores {
-    const memo = try c.facts.memo(Stores);
+fn givenTypes(c: *Context) Context.Error!*Given {
+    const memo = try c.facts.memo(Given);
     if (memo.built) return memo;
     memo.built = true;
     for (c.project.sources) |*source| {
@@ -914,167 +883,132 @@ fn stores(c: *Context) Context.Error!*Stores {
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            try expose(c, memo, file, node);
-            const target: Ast.Node.Index, const kind: @FieldType(Stores.Site, "kind") = switch (tag) {
-                .assign => .{ tree.nodeData(node).node_and_node[0], .assign },
-                .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => .{ tree.nodeData(node).node_and_node[0], .changes },
-                .address_of => .{ tree.nodeData(node).node, .changes },
-                else => {
-                    var call_buffer: [1]Ast.Node.Index = undefined;
-                    var builtin_buffer: [2]Ast.Node.Index = undefined;
-                    const given: []const Ast.Node.Index = if (tree.fullCall(&call_buffer, node)) |call| call.ast.params else switch (tag) {
-                        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => Facts.builtinArgs(tree, node, &builtin_buffer),
-                        else => &.{},
-                    };
-                    for (given) |arg| {
-                        const last = switch (tree.nodeTag(arg)) {
-                            .identifier => tree.nodeMainToken(arg),
-                            .field_access => tree.nodeData(arg).node_and_token[1],
-                            else => continue,
-                        };
-                        const entry = try memo.arguments.getOrPut(c.allocator, tree.tokenSlice(last));
-                        if (!entry.found_existing) entry.value_ptr.* = .empty;
-                        try entry.value_ptr.append(c.allocator, .{ .file = file, .node = arg });
-                    }
-                    var buffer: [2]Ast.Node.Index = undefined;
-                    const literal_init = tree.fullStructInit(&buffer, node) orelse continue;
-                    for (literal_init.ast.fields) |value| {
-                        if (tree.firstToken(value) < 2) continue;
-                        try add(c, memo, tree.tokenSlice(Model.initName(tree, value) orelse continue), .{ .file = file, .node = value, .kind = .literal });
-                    }
-                    continue;
-                },
-            };
-            // `@field(x, "name") = v` stores into the field it names.
-            if (fieldBuiltin(tree, target)) |named_field| {
-                if (named_field.name) |name| try add(c, memo, name, .{ .file = file, .node = node, .kind = if (kind == .assign) .named else .changes });
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&call_buffer, node)) |call| {
+                for (call.ast.params, 0..) |arg, k| try typeArgument(c, memo, file, call.ast.fn_expr, k, arg);
                 continue;
             }
-            if (tree.nodeTag(target) != .field_access) continue;
-            try add(c, memo, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), .{ .file = file, .node = node, .kind = kind });
+            switch (tag) {
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+                else => continue,
+            }
+            // `@call(modifier, f, .{ … })` calls `f` with the tuple's elements.
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            if (args.len != 3) continue;
+            var tuple_buffer: [2]Ast.Node.Index = undefined;
+            const tuple = tree.fullArrayInit(&tuple_buffer, args[2]) orelse {
+                memo.any = true;
+                continue;
+            };
+            for (tuple.ast.elements, 0..) |arg, k| try typeArgument(c, memo, file, args[1], k, arg);
         }
     }
     return memo;
 }
 
-/// `@field(holder, name)`: its holder, and its name where a string literal spells it.
-fn fieldBuiltin(tree: *const Ast, node: Ast.Node.Index) ?struct { holder: Ast.Node.Index, name: ?[]const u8 } {
-    switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => {},
-        else => return null,
-    }
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return null;
-    const holder, const name_node = tree.nodeData(node).opt_node_and_opt_node;
-    const name = name_node.unwrap() orelse return null;
-    const spelled: ?[]const u8 = if (tree.nodeTag(name) == .string_literal) blk: {
-        const text = tree.tokenSlice(tree.nodeMainToken(name));
-        break :blk if (text.len >= 2) text[1 .. text.len - 1] else null;
-    } else null;
-    return .{ .holder = holder.unwrap() orelse return null, .name = spelled };
-}
-
-/// Marks the structs a node lets something write without a store: see `Stores.exposed`.
-fn expose(c: *Context, memo: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
-    const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, node, &buffer);
-            if (std.mem.eql(u8, name, "@field")) {
-                const named_field = fieldBuiltin(tree, node) orelse return;
-                if (named_field.name == null) try exposeValue(c, memo, file, named_field.holder);
-                return;
-            }
-            for ([_][]const u8{ "@ptrCast", "@bitCast", "@memcpy", "@memset", "@memmove" }) |reinterpret| if (std.mem.eql(u8, name, reinterpret)) {
-                for (args) |arg| try exposeValue(c, memo, file, arg);
-                // What a reinterpretation makes is its destination's: bytes viewed as a struct.
-                if (try destined(c, file, node)) |into| switch (into) {
-                    .named => |type_node| try exposeType(c, memo, try c.facts.resolve(type_node.file, type_node.node)),
-                    .assigned => |lhs| try exposeValue(c, memo, file, lhs),
-                    .field => |decl| try exposeType(c, memo, try c.facts.declaration(decl)),
-                    else => {},
-                };
-                return;
-            };
+/// Records what the argument at `position` of a call of `callee` gives as a type.
+fn typeArgument(c: *Context, memo: *Given, file: Project.FileId, callee: Ast.Node.Index, at: usize, arg: Ast.Node.Index) Context.Error!void {
+    // A parameter declared of a type other than `type` or `anytype` takes no type: what is
+    // given there is not read at all.
+    if (!try takesType(c, file, callee, at)) return;
+    const value = try c.facts.resolve(file, arg);
+    switch (value) {
+        .container, .alternatives, .reified => return typeShapes(c, memo, value, 0),
+        .unknown => |why| switch (why) {
+            .std_internal, .absent => return,
+            else => {},
         },
-        else => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node) orelse return;
-            const callee = try c.facts.resolve(file, call.ast.fn_expr);
-            const own = switch (callee) {
-                .function => |decl| try Program.owns(c, decl.file),
-                else => false,
-            };
-            // std's byte views write through the bytes they give.
-            const viewed = if (tree.nodeTag(call.ast.fn_expr) == .field_access) blk: {
-                const method = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
-                break :blk std.mem.eql(u8, method, "asBytes") or std.mem.eql(u8, method, "sliceAsBytes") or std.mem.eql(u8, method, "bytesAsValue") or std.mem.eql(u8, method, "bytesAsSlice");
-            } else false;
-            if (own and !viewed) return;
-            for (call.ast.params) |arg| {
-                // A struct handed over by value is a copy: what is written is not it.
-                if (!viewed and tree.nodeTag(arg) != .address_of) {
-                    var value = try c.facts.resolve(file, arg);
-                    while (value == .optional) value = value.optional.*;
-                    if (value != .pointer) continue;
-                }
-                try exposeValue(c, memo, file, arg);
-            }
-            if (viewed) if (try destined(c, file, node)) |into| switch (into) {
-                .named => |type_node| try exposeType(c, memo, try c.facts.resolve(type_node.file, type_node.node)),
-                else => {},
-            };
-        },
-    }
-}
-
-fn exposeValue(c: *Context, memo: *Stores, file: Project.FileId, node: Ast.Node.Index) Context.Error!void {
-    const tree = &c.project.at(file).file.tree;
-    var at = node;
-    while (true) at = switch (tree.nodeTag(at)) {
-        .address_of => tree.nodeData(at).node,
-        .grouped_expression => tree.nodeData(at).node_and_token[0],
-        else => break,
-    };
-    try exposeType(c, memo, try c.facts.resolve(file, at));
-}
-
-/// Marks the struct a value is, points to or holds an array of.
-fn exposeType(c: *Context, memo: *Stores, value: Facts.Value) Context.Error!void {
-    var inner_value = value;
-    while (true) inner_value = switch (inner_value) {
-        .pointer, .optional, .array, .error_union => |inner| inner.*,
-        else => break,
-    };
-    const k = switch (inner_value) {
-        .instance, .container => |k| k,
-        .alternatives => |each| {
-            for (each) |one| try exposeType(c, memo, one);
-            return;
-        },
+        // A value is no type: one handed over by a pointer is a write `Facts.accesses` finds.
         else => return,
+    }
+    // A parameter of a function of the program's is given by its calls, whose arguments are
+    // read where they are.
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (tree.nodeTag(arg) == .identifier) if (model.reference(arg)) |ref| if (ref.declaration) |d| {
+        if (model.declarations[@backingInt(d)].kind == .parameter) return;
     };
-    try memo.exposed.put(c.allocator, .{ k.file, k.scope }, {});
+    memo.any = true;
 }
 
-fn add(c: *Context, memo: *Stores, name: []const u8, site: Stores.Site) Context.Error!void {
-    const entry = try memo.sites.getOrPut(c.allocator, name);
-    if (!entry.found_existing) entry.value_ptr.* = .empty;
-    try entry.value_ptr.append(c.allocator, site);
+/// Whether a call of `callee` may take a type at `position`: unless it resolves to a function
+/// whose parameter there is declared of a type that is not `type`.
+fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usize) Context.Error!bool {
+    const function = switch (try c.facts.resolve(file, callee)) {
+        .function => |f| f,
+        else => return true,
+    };
+    const tree = &c.project.at(function.file).file.tree;
+    const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, switch (tree.nodeTag(record.node)) {
+        .fn_decl => tree.nodeData(record.node).node_and_node[0],
+        else => record.node,
+    }) orelse return true;
+    // A method called on a value is given its receiver first: the call is read in its own file.
+    const at_call = &c.project.at(file).file.tree;
+    const bound_receiver = at_call.nodeTag(callee) == .field_access and switch (try c.facts.resolve(file, at_call.nodeData(callee).node_and_token[0])) {
+        .container => false,
+        else => true,
+    };
+    var params = proto.iterate(tree);
+    var k: usize = 0;
+    while (params.next()) |param| : (k += 1) {
+        if (k != at + @intFromBool(bound_receiver)) continue;
+        const kind = param.type_expr orelse return true;
+        return tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type");
+    }
+    // A variadic `extern`'s or one past the list: nothing known.
+    return true;
+}
+
+/// Marks the containers a type is, and those its fields hold, by value or through pointers.
+fn typeShapes(c: *Context, memo: *Given, value: Facts.Value, depth: u8) Context.Error!void {
+    if (depth >= 16) {
+        memo.any = true;
+        return;
+    }
+    switch (value) {
+        .container => |k| {
+            if ((try memo.shapes.getOrPut(c.allocator, .{ k.file, k.scope })).found_existing) return;
+            const model = &c.project.at(k.file).model;
+            for (model.declarations, 0..) |record, d| {
+                if (record.kind != .field or record.scope != k.scope) continue;
+                try typeShapes(c, memo, try c.facts.memberOf(k, .{ .file = k.file, .index = @fromBackingInt(@intCast(d)) }), depth + 1);
+            }
+        },
+        // A field's type reads as a value of it.
+        .instance => |k| try typeShapes(c, memo, .{ .container = k }, depth),
+        .pointer, .optional, .array, .error_union => |inner| try typeShapes(c, memo, inner.*, depth + 1),
+        .alternatives => |each| for (each) |one| try typeShapes(c, memo, one, depth + 1),
+        .reified => memo.any = true,
+        else => {},
+    }
+}
+
+/// The program's own files, the ones whose stores a field's invariant reads.
+fn programFiles(c: *Context) Context.Error![]const Project.FileId {
+    const Files = struct { built: bool = false, list: std.ArrayList(Project.FileId) = .empty };
+    const memo = try c.facts.memo(Files);
+    if (memo.built) return memo.list.items;
+    memo.built = true;
+    for (c.project.sources) |*source| if (try Program.owns(c, source.id)) try memo.list.append(c.allocator, source.id);
+    return memo.list.items;
 }
 
 /// What a field of a plain struct holds at most, read once per field and pointer width: the
-/// widest of its default and of every value the program's own files store in it, by an
-/// assignment or a struct literal, each read where it is stored. One changed in place or whose
-/// address is taken is unknown, and so is a field of an `extern` or `packed` struct, whose bytes
-/// a reinterpretation (`@bitCast`, a reader's `takeStruct`) sets with no store to read.
+/// widest of its default and of every value the program's own files store in it, each read
+/// where it is stored. One changed in place or whose address is taken is unknown, and so is a
+/// field of an `extern` or `packed` struct, whose bytes a reinterpretation sets with no store.
 const Stored = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
-/// Whether every write of a field is a store the program's own files show (`Stores.sites`): a
-/// field of a plain struct of the program's (std and aegis set theirs), no value of which is
-/// viewed as bytes, reinterpreted or handed where its writes are not read (`Stores.exposed`),
-/// nor named as a call's argument, which may fill it by reflection.
+/// Whether every write of a field is a store the program's own files show: a field of a plain
+/// struct of the program's (std and aegis set theirs) that no write `Facts.accesses` finds
+/// covers (a cast, a byte view, a pointer handed to code the program does not hold, `asm`) or
+/// names as the program compiles (`@field(x, name)`), and no type a call is given holds, which
+/// it may fill by reflection.
 pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (!try Program.owns(c, decl.file)) return false;
     const model = &c.project.at(decl.file).model;
@@ -1085,32 +1019,20 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     var buffer: [2]Ast.Node.Index = undefined;
     const holder = tree.fullContainerDecl(&buffer, container_node) orelse return false;
     if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
-    const found = try stores(c);
-    const type_name = containerName(c, decl.file, container_node) orelse return false;
-    // An argument of its name is this struct where it resolves to it, or may be where it does
-    // not resolve; one resolving to another type of that name is not.
-    if (found.arguments.get(type_name)) |given| for (given.items) |arg| {
-        switch (try c.facts.resolve(arg.file, arg.node)) {
-            .container, .instance => |k| if (k.file == decl.file and k.scope == record.scope) return false,
-            .unknown => |why| if (why != .std_internal and why != .absent) return false,
-            else => {},
-        }
-    };
-    return !found.exposed.contains(.{ decl.file, record.scope });
+    const given = try givenTypes(c);
+    if (given.any or given.shapes.contains(.{ decl.file, record.scope })) return false;
+    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
+        if (site.kind == .covered or site.computed) return false;
+    }
+    return true;
 }
 
 /// Whether a field changes only by stores through its name (`x.field = v`, `x.field += v`): its
 /// writes are all shown (`storesShown`) and its address is never taken, so no pointer reaches it.
 pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (!try storesShown(c, decl)) return false;
-    const found = try stores(c);
-    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-    const sites = found.sites.get(record.name) orelse return true;
-    for (sites.items) |site| {
-        const site_tree = &c.project.at(site.file).file.tree;
-        if (site.kind != .changes or site_tree.nodeTag(site.node) != .address_of) continue;
-        const reached = ((try c.facts.definition(site.file, site_tree.nodeData(site.node).node)).orNull()) orelse return false;
-        if (std.meta.eql(reached, decl)) return false;
+    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
+        if (site.kind == .address and (site.reach == .exact or site.reach == .named)) return false;
     }
     return true;
 }
@@ -1122,97 +1044,47 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     // A field given a value that reads itself is unknown while it is being read.
     try memo.map.put(c.allocator, key, null);
     if (!try storesShown(c, decl)) return null;
-    const model = &c.project.at(decl.file).model;
-    const tree = &c.project.at(decl.file).file.tree;
-    const record = model.declarations[@backingInt(decl.index)];
-    const field_decl = tree.fullContainerField(record.node).?; // unreachable: `storesShown` holds only for a field
-    const found = try stores(c);
     var out: ?Magnitude = 0;
-    if (field_decl.ast.value_expr.unwrap()) |default| if (!empty(tree, default)) {
-        out = try bound(c, decl.file, default, pointer, depth);
-    };
-    const sites = found.sites.get(record.name) orelse std.ArrayList(Stores.Site).empty;
-    for (sites.items) |site| {
+    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
         if (out == null) break;
         const site_tree = &c.project.at(site.file).file.tree;
         switch (site.kind) {
-            // `@field(x, "name") = v`: a store to the field of x's struct it names.
-            .named => {
-                const target = site_tree.nodeData(site.node).node_and_node[0];
-                const field_holder = (fieldBuiltin(site_tree, target) orelse continue).holder;
-                var holder_value = try c.facts.resolve(site.file, field_holder);
-                while (true) holder_value = switch (holder_value) {
-                    .pointer, .optional => |inner| inner.*,
-                    else => break,
-                };
-                const container = switch (holder_value) {
-                    .instance, .container => |k| k,
-                    // A holder whose type is not known may be this one.
-                    else => {
-                        out = null;
-                        continue;
-                    },
-                };
-                if (container.file != decl.file or container.scope != record.scope) continue;
-                const value = site_tree.nodeData(site.node).node_and_node[1];
-                if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
-            },
-            .assign, .changes => {
-                const target = if (site_tree.nodeTag(site.node) == .address_of) site_tree.nodeData(site.node).node else site_tree.nodeData(site.node).node_and_node[0];
-                const reached = ((try c.facts.definition(site.file, target)).orNull()) orelse {
-                    // A holder whose type is not known may be this one (a generic's `c.limit`):
-                    // what it stores, the field may hold.
-                    if (site_tree.nodeTag(target) != .field_access or !unknownHolder(try c.facts.resolve(site.file, site_tree.nodeData(target).node_and_token[0]))) continue;
-                    if (site.kind == .changes) {
-                        out = null;
-                        continue;
-                    }
-                    const value = site_tree.nodeData(site.node).node_and_node[1];
-                    if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
-                    continue;
-                };
-                if (!std.meta.eql(reached, decl)) continue;
-                if (site.kind == .changes) {
+            .init, .set => {
+                // A field's default, a literal's value for it, a store: what it gives. A store
+                // with no one value (a destructure of a call's result, a copy into its memory)
+                // is unknown.
+                const value = site.value orelse {
                     out = null;
                     continue;
-                }
-                const value = site_tree.nodeData(site.node).node_and_node[1];
+                };
+                // A whole value of the struct (`s = t`, or one that holds it) carries what the
+                // stores that made it gave the field.
+                if (site.reach == .holder or site.reach == .unresolved) if (wholeValue(try c.facts.resolve(site.file, value))) continue;
                 if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
             },
-            .literal => {
-                const literal_node = c.project.at(site.file).model.parentOf(site.node) orelse continue;
-                var holder_type = try c.facts.literalType(site.file, literal_node);
-                while (true) holder_type = switch (holder_type) {
-                    .optional, .error_union, .pointer => |inner| inner.*,
-                    else => break,
-                };
-                const container = switch (holder_type) {
-                    .container, .instance => |k| k,
-                    // A literal whose type is not known may be this one's: what it gives, the
-                    // field may hold.
-                    else => {
-                        if (unknownHolder(holder_type) and !empty(site_tree, site.node)) out = wider(out, try bound(c, site.file, site.node, pointer, depth));
-                        continue;
-                    },
-                };
-                const member = c.facts.member(container, record.name) orelse continue;
-                if (!std.meta.eql(member, decl)) continue;
-                if (!empty(site_tree, site.node)) out = wider(out, try bound(c, site.file, site.node, pointer, depth));
+            .update, .covered => out = null,
+            // A pointer to the field writes it wherever it goes; one to a whole value writes
+            // the field by a member store, which is a site of its own.
+            .address => if (site.reach == .exact or site.reach == .named) {
+                out = null;
             },
+            .read => {},
         }
     }
     try memo.map.put(c.allocator, key, out);
     return out;
 }
 
-/// Whether a store's holder, as it resolves, may be any struct: its type not known (a
-/// generic's binding, a value no reading reaches), itself or behind a pointer or optional.
-/// std's own and code the build does not compile are no program's struct.
-fn unknownHolder(value: Facts.Value) bool {
+/// Whether a value is a container's instance, or an optional, error union or array of one.
+fn wholeValue(value: Facts.Value) bool {
     var current = value;
     while (true) current = switch (current) {
-        .pointer, .optional, .error_union => |inner| inner.*,
-        .unknown => |why| return why != .std_internal and why != .absent,
+        .optional, .error_union, .array => |inner| inner.*,
+        .instance => return true,
+        .alternatives => |each| {
+            for (each) |one| if (!wholeValue(one)) return false;
+            return true;
+        },
         else => return false,
     };
 }
@@ -2123,9 +1995,9 @@ fn receiverOnly(tree: *const Ast, model: anytype, condition: Ast.Node.Index, fun
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
-        const reference = model.reference(node) orelse continue;
+        // A name the model cannot place may be anything of the callee's.
+        const reference = model.reference(node) orelse return false;
         const d = reference.declaration orelse {
-            // A name the model cannot place may be anything of the callee's.
             if (reference.unknown == .primitive) continue;
             return false;
         };
@@ -2976,18 +2848,15 @@ fn structured(c: *Context, file: Project.FileId, root: Ast.Node.Index) Context.E
     return tree.tokenTag(declared.ast.main_token) == .keyword_struct;
 }
 
-/// Whether a function's local or parameter may be written by another name: its address is
-/// taken (`&x`, `&x.f`), a method is called on it (which may take its address), a capture
-/// binds a pointer into it (`if (x) |*p|`), or an `asm` output names it. Found once per
-/// declaration.
+/// Whether a declaration may be written by another name, as `Facts.accesses` finds its writes:
+/// its address taken (`&x`, `&x.f`, a slice of an array), a method whose receiver is a pointer
+/// called on it, a capture binding a pointer into it (`if (x) |*p|`), or memory code the program
+/// does not hold writes (an `asm` output naming it, an `extern`). Found once per declaration.
 const Addressed = struct { map: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Declaration.Id }, bool) = .empty };
 
-/// Each file's declarations whose memory's length is written in place (`s.len = n`,
-/// `@field(s, "len") = n`), found once per file.
-const LengthWrites = struct { files: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Model.Declaration.Id, void)) = .empty };
-
-/// Whether the memory `memory` names may hold a length no build checks: one written in place,
-/// or written by another name for it (its address taken). Such a length is any `usize`.
+/// Whether the memory `memory` names may hold a length no build checks: one written in place
+/// (`s.len = n`, `@field(s, "len") = n`, of it or of memory it holds), or written by another
+/// name for it (its address taken). Such a length is any `usize`.
 fn lengthWritten(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -2995,24 +2864,27 @@ fn lengthWritten(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Cont
     if (try c.facts.resolve(file, memory) == .array) return false;
     const d = rootOf(tree, model, memory) orelse return false;
     if (try addressed(c, file, d)) return true;
-    const memo = try c.facts.memo(LengthWrites);
-    const entry = try memo.files.getOrPut(c.allocator, file);
-    if (!entry.found_existing) {
-        entry.value_ptr.* = .empty;
-        for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod, .assign_shl, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap, .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat => {
-                const target = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node[0];
-                const holder = switch (tree.nodeTag(target)) {
-                    .field_access => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), "len")) tree.nodeData(target).node_and_token[0] else continue,
-                    .builtin_call_two, .builtin_call_two_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) tree.nodeData(target).opt_node_and_opt_node[0].unwrap() orelse continue else continue,
-                    else => continue,
-                };
-                if (rootOf(tree, model, holder)) |held_by| try entry.value_ptr.put(c.allocator, held_by, {});
-            },
-            else => {},
+    for (try declarationWrites(c, file, d)) |site| {
+        if (!site.part or site.kind == .init) continue;
+        const target = site.target orelse continue;
+        const site_tree = &c.project.at(site.file).file.tree;
+        const of_length = switch (site_tree.nodeTag(target)) {
+            .field_access => std.mem.eql(u8, site_tree.tokenSlice(site_tree.nodeData(target).node_and_token[1]), "len"),
+            .builtin_call_two, .builtin_call_two_comma => fieldNamed(site_tree, target, "len"),
+            else => false,
         };
+        if (of_length) return true;
     }
-    return entry.value_ptr.contains(d);
+    return false;
+}
+
+/// Whether `node` is `@field(holder, name)` with a name that is `name`, or one not spelled.
+fn fieldNamed(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return false;
+    const given = tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return true;
+    if (tree.nodeTag(given) != .string_literal) return true;
+    const text = tree.tokenSlice(tree.nodeMainToken(given));
+    return text.len < 2 or std.mem.eql(u8, text[1 .. text.len - 1], name);
 }
 
 fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error!bool {
@@ -3021,35 +2893,12 @@ fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context
     if (memo.map.get(key)) |known| return known;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const found = found: {
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            switch (tag) {
-                // An address discarded (`_ = &x;`) reaches nothing.
-                .address_of => if (rootOf(tree, model, tree.nodeData(node).node) == d and !discarded(tree, model, node)) break :found true,
-                .call_one, .call_one_comma, .call, .call_comma => {
-                    var buffer: [1]Ast.Node.Index = undefined;
-                    const call = tree.fullCall(&buffer, node).?;
-                    if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
-                    if (rootOf(tree, model, tree.nodeData(call.ast.fn_expr).node_and_token[0]) == d) break :found true;
-                },
-                .asm_output => if (outputNames(tree, node, model.declarations[@backingInt(d)].name)) break :found true,
-                else => {},
-            }
-        }
-        for (model.declarations) |decl| {
-            if (decl.kind != .capture or decl.token == 0 or tree.tokenTag(decl.token - 1) != .asterisk) continue;
-            const operand: ?Ast.Node.Index = if (tree.fullIf(decl.node)) |branch| branch.ast.cond_expr else if (tree.fullWhile(decl.node)) |loop| loop.ast.cond_expr else if (tree.fullSwitchCase(decl.node) != null) blk: {
-                const choice = model.parentOf(decl.node) orelse break :blk null;
-                break :blk if (tree.fullSwitch(choice)) |whole| whole.ast.condition else null;
-            } else if (tree.fullFor(decl.node)) |loop| blk: {
-                for (loop.ast.inputs) |each| if (rootOf(tree, model, each) == d) break :blk each;
-                break :blk null;
-            } else null;
-            if (operand) |each| if (rootOf(tree, model, each) == d) break :found true;
-        }
-        break :found false;
-    };
+    const found = for (try declarationWrites(c, file, d)) |site| switch (site.kind) {
+        // An address discarded (`_ = &x;`) reaches nothing.
+        .address => if (!discarded(tree, model, site.node)) break true,
+        .covered => break true,
+        else => {},
+    } else false;
     try memo.map.put(c.allocator, key, found);
     return found;
 }
