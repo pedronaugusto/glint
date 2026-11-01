@@ -11,6 +11,7 @@ const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
 const Contract = @import("AegisContract.zig");
+const AegisPack = @import("AegisPack.zig");
 
 a: std.mem.Allocator,
 project: *const Project,
@@ -67,6 +68,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         definitions[i].purpose = try a.dupe(u8, rule.definition.purpose);
     }
     try validateRules(config, definitions);
+    const known = try knownRules(a, definitions);
     var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = Contract.package, .remaining = config.fact_budget } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
@@ -86,7 +88,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         try validateRules(runner.config, definitions);
         const file = &source.file;
         var malformed: std.ArrayList(Suppression.Malformed) = .empty;
-        runner.suppressions = try Suppression.parseConfigured(a, file, definitions, &malformed);
+        runner.suppressions = try Suppression.parseConfigured(a, file, known, &malformed);
         for (malformed.items) |entry| {
             runner.complete = false;
             const start = entry.comment.start;
@@ -122,7 +124,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         if (file.status != .parsed) runner.complete = false;
         // Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
         // stale when every rule it names ran and none of their findings stood on the line (an
-        // escape in the older form, every pack rule).
+        // escape in the older form, every pack rule). One for a rule this run does not enable
+        // is not judged, and is counted as such.
+        var inactive: std.ArrayList(Report.Span) = .empty;
         for (runner.suppressions, 0..) |suppression, i| {
             const start = suppression.comment.start;
             const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
@@ -136,16 +140,26 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
                 }
                 if (suppression.used) {
                     try runner.escapes.append(a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
-                } else if (runner.escapeRan(suppression, options.project_rules)) {
+                } else if (runner.escapeRan(suppression, known)) {
                     if (runner.config.strict_suppressions) runner.complete = false;
                     try runner.stale.append(a, .{ .name = "aegis", .span = span });
-                }
+                } else try inactive.append(a, span);
                 continue;
             }
             const rule = suppression.rule.?;
-            if (suppression.used or !runner.config.has(rule)) continue;
+            if (suppression.used) continue;
+            if (!runner.config.has(rule)) {
+                try inactive.append(a, span);
+                continue;
+            }
             if (runner.config.strict_suppressions) runner.complete = false;
-            try runner.stale.append(a, .{ .name = (rules.definition(rule, definitions) orelse return error.InvalidSelection).name, .span = span });
+            try runner.stale.append(a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
+        }
+        if (inactive.items.len != 0) {
+            var detail: std.Io.Writer.Allocating = .init(a);
+            // An allocating writer fails only when memory does.
+            detail.writer.print("{d} {s} for rules this run does not enable", .{ inactive.items.len, if (inactive.items.len == 1) "escape" else "escapes" }) catch return error.OutOfMemory;
+            try runner.coverage.append(a, .{ .file = runner.file, .reason = .unsupported, .detail = detail.written() });
         }
         runner.covered.clearRetainingCapacity();
         if (runner.facts.remaining == 0) {
@@ -158,14 +172,26 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
 }
 
-/// Whether a rule of the aegis pack ran on the current file.
+/// Every rule glint has: the core's, this run's own and the aegis pack's, whether or not this
+/// run gives the pack. A suppression naming one this run does not enable is not judged; a name
+/// none of them has is malformed.
+fn knownRules(a: std.mem.Allocator, definitions: []const rules.Definition) std.mem.Allocator.Error![]const rules.Definition {
+    var known: std.ArrayList(rules.Definition) = .empty;
+    try known.appendSlice(a, definitions);
+    pack: for (AegisPack.rules) |rule| {
+        for (definitions) |own| if (own.id == rule.definition.id or std.mem.eql(u8, own.name, rule.definition.name)) continue :pack;
+        try known.append(a, rule.definition);
+    }
+    return known.items;
+}
+
 /// Whether every rule an escape covers ran: those it names, or, in the older form, the pack.
-fn escapeRan(self: *const Runner, escape: Suppression, project_rules: []const Context.Rule) bool {
+fn escapeRan(self: *const Runner, escape: Suppression, known: []const rules.Definition) bool {
     if (!escape.unnamed) {
         for (escape.covers[0..escape.covers_len]) |rule| if (!self.config.has(rule)) return false;
         return true;
     }
-    for (project_rules) |rule| if (rule.definition.exception == .aegis and !self.config.has(rule.definition.id)) return false;
+    for (known) |rule| if (rule.exception == .aegis and !self.config.has(rule.id)) return false;
     return true;
 }
 

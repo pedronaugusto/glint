@@ -16,8 +16,10 @@ fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
 pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [4096]u8 = undefined;
+    // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     var problems_buffer: [1024]u8 = undefined;
+    // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
     var problems = std.Io.File.stderr().writer(init.io, &problems_buffer);
     const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch std.process.exit(2);
     if (status != 0) std.process.exit(status);
