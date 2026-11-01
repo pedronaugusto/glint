@@ -21,13 +21,81 @@
         .{ .rule = "A018", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A019", .no_hole = .{ .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch } },
         .{ .rule = "A020", .no_hole = .{ .field, .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .field, .deferred, .conversion, .memory } },
-        .{ .rule = "A021", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "Z003", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "Z011", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "Z013", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "Z026", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "Z034", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "P005", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        .{ .rule = "A021" },
+        // Z003 reports the parser's errors (Builtins.zig `parser`): syntax, which carries no value.
+        .{ .rule = "Z003", .na = .{
+            .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch,
+        } },
+        .{
+            .rule = "Z011",
+            .na = .{
+                // No operator yields a function: arithmetic, bit and comparison operators take
+                // numbers, bools and many-item pointers, never a callable.
+                .operator,
+            },
+        },
+        .{
+            .rule = "Z013",
+            .na = .{
+                // Zig parses no destructure at container level and refuses an unused local, so no
+                // destructured binding of an import is left dead.
+                .destructure,
+                // A capture binds a local, which Zig refuses unused; a binding Z013 can find dead is a
+                // container declaration.
+                .capture,
+                // A defer runs in a function body; no container binding takes its value.
+                .deferred,
+                // An inline loop unrolls in a body; what it binds are locals, refused unused.
+                .inline_loop,
+                // An import is a namespace type; no operator yields one.
+                .operator,
+                // An import is a comptime type; no binding of one at container level is unwrapped out of
+                // an optional or error union.
+                .unwrap,
+                // A literal holding imports binds the aggregate, not an import; a dead one is D001's.
+                .aggregate,
+                // @memcpy, @memset and atomics move run-time values; an import is a comptime type.
+                .memory,
+            },
+        },
+        .{
+            .rule = "Z026",
+            .na = .{
+                // Zig refuses `_ = err` ("error set is discarded"); an error stored is kept, not dropped.
+                .assignment,
+                // A destructure stores an error into places, keeping it.
+                .destructure,
+                // @field names a field or declaration; an error is no container to name one of.
+                .field,
+                // A pointer to an error keeps it; no handler drops one by taking its address.
+                .address,
+                // A jump out of a handler (`catch return`, `catch break`) is how the contract answers an
+                // error; a jump that carries the error passes it on.
+                .jump,
+                // An operator only reads an error (`err == error.X`); the handler around it is the
+                // branch row.
+                .operator,
+                // An aggregate holding an error keeps it.
+                .aggregate,
+                // Atomics and @memcpy store an error into memory, keeping it.
+                .memory,
+            },
+        },
+        // Z034 judges how the parse tree nests two binary operators, a property of the source text:
+        // only the operator row holds what it reads, and no value moves through the others.
+        .{ .rule = "Z034", .na = .{
+            .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .conversion, .unwrap, .aggregate, .memory, .branch,
+        } },
+        .{
+            .rule = "P005",
+            .na = .{
+                // No operator yields a function.
+                .operator,
+                // std.debug.print is generic (anytype arguments): a comptime-only value no run-time
+                // memory holds, so no @memcpy, @memset or atomic moves it.
+                .memory,
+            },
+        },
         .{ .rule = "P006", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
     },
     // Cases glint does not pass yet, each with what it shows.
@@ -42,5 +110,103 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
+        // matrix A021: a guard no declaration binds is held to the end of its own block, though a store keeps it past
+        "A021/assignment/mx-a21-store_outlives_block/hole.zig",
+        // matrix A021: the same, the guard written by a destructure
+        "A021/destructure/mx-a21-destructure_outlives_block/hole.zig",
+        // matrix A021: the same, the guard put into a struct literal
+        "A021/aggregate/mx-a21-literal_outlives_block/hole.zig",
+        // matrix A021: the same, the guard copied out by @memcpy
+        "A021/memory/mx-a21-memcpy_guard/hole.zig",
+        // matrix A021: the same, the labeled block whose break carries the guard is taken as its block
+        "A021/jump/mx-a21-label_break_guard/hole.zig",
+        // matrix A021: held is a span of tokens, so a loop's next pass taking a lock written earlier is not inside it
+        "A021/jump/mx-a21-loop_carries_guard/hole.zig",
+        // matrix A021: the same, a deferred acquisition written before the guard but run while it is held
+        "A021/deferred/mx-a21-defer_runs_while_held/hole.zig",
+        // matrix A021: one acquisition run by each pass of a loop is never held against itself
+        "A021/capture/mx-a21-loop_capture_each/hole.zig",
+        // matrix A021: the same, an inline loop
+        "A021/inline_loop/mx-a21-inline_each_lock/hole.zig",
+        // matrix A021: an acquisition is only a `receiver.acquire*(` call: a callee returning a guard is none
+        "A021/call/mx-a21-helper_returns_guard/hole.zig",
+        // matrix A021: the same, acquire called by @call
+        "A021/call/mx-a21-call_builtin/hole.zig",
+        // matrix A021: the same, acquire named by @field
+        "A021/field/mx-a21-field_named_acquire/hole.zig",
+        // matrix A021: the same, acquire called through an alias of L.acquire
+        "A021/address/mx-a21-method_alias/hole.zig",
+        // matrix A021: ranked is a method spelled Ordered, so locks ranked by two separate Orders pass as ordered
+        "A021/compile_time/mx-a21-two_orders/hole.zig",
+        // matrix A021 precision: an if expression's two acquisitions are held against each other
+        "A021/branch/mx-a21-exclusive_branches/twin.zig",
+        // matrix A021 precision: an acquire inside @TypeOf, which never runs, counts as taken
+        "A021/compile_time/mx-a21-typeof_not_taken/twin.zig",
+        // matrix A021 precision: a guard unwrapped by orelse is held to its block's end, its release unread
+        "A021/unwrap/mx-a21-orelse_guard/twin.zig",
+        // matrix A021 precision: a lock read by @atomicLoad does not resolve
+        "A021/memory/mx-a21-atomic_lock_pointer/twin.zig",
+        // matrix A021 precision: a lock reached by pointer arithmetic does not resolve
+        "A021/operator/mx-a21-pointer_arithmetic/twin.zig",
+        // matrix Z011: a callee with a declaration that resolves to no function is passed silently, unknown or not
+        "Z011/assignment/mx-z11-runtime_pointer/hole.zig",
+        // matrix Z011: the same, a pointer to the deprecated function
+        "Z011/address/mx-z11-pointer_call/hole.zig",
+        // matrix Z011: the same, a function chosen by an if expression
+        "Z011/branch/mx-z11-if_choice/hole.zig",
+        // matrix Z011: the same, a function-pointer parameter
+        "Z011/call/mx-z11-parameter/hole.zig",
+        // matrix Z011: the same, an if's payload
+        "Z011/capture/mx-z11-optional_payload/hole.zig",
+        // matrix Z011: the same, a comptime parameter
+        "Z011/compile_time/mx-z11-comptime_parameter/hole.zig",
+        // matrix Z011: the same, a pointer @ptrCast converts
+        "Z011/conversion/mx-z11-ptrcast/hole.zig",
+        // matrix Z011: the same, an inline loop's capture
+        "Z011/inline_loop/mx-z11-inline_tuple/hole.zig",
+        // matrix Z011: the same, a labeled block's result
+        "Z011/jump/mx-z11-label_break/hole.zig",
+        // matrix Z011: @call is no call node, so its callee is never read
+        "Z011/call/mx-z11-builtin_call/hole.zig",
+        // matrix Z011 precision: a callee with no declaration (p.*, @field, @as, .?, a field, an element, a load) is undecided whatever it calls
+        "Z011/address/mx-z11-deref_call/twin.zig",
+        "Z011/aggregate/mx-z11-struct_field/twin.zig",
+        "Z011/aggregate/mx-z11-table/twin.zig",
+        "Z011/conversion/mx-z11-as_call/twin.zig",
+        "Z011/field/mx-z11-field_named/twin.zig",
+        "Z011/memory/mx-z11-atomic_store/twin.zig",
+        "Z011/unwrap/mx-z11-optional_unwrap/twin.zig",
+        // matrix Z013: an import binding is one spelled `= @import(...)`: a dead alias of an import is none
+        "Z013/assignment/mx-z13-alias/hole.zig",
+        // matrix Z013: the same, an import through a type function
+        "Z013/call/mx-z13-type_function/hole.zig",
+        // matrix Z013: the same, an import through @as
+        "Z013/conversion/mx-z13-as_type/hole.zig",
+        // matrix Z013: the same, an import carried out of a labeled block
+        "Z013/jump/mx-z13-label_break/hole.zig",
+        // matrix Z013: @hasDecl counts as a use, though it sees no private declaration
+        "Z013/compile_time/mx-z13-hasdecl/hole.zig",
+        // matrix Z013 precision: a binding of an import chosen by a comptime if, used, is undecided
+        "Z013/branch/mx-z13-platform_choice/twin.zig",
+        // matrix Z026: only a catch whose handler is a block of no statements is judged
+        "Z026/branch/mx-z26-switch_else_empty/hole.zig",
+        // matrix Z026: the same, a handler that hands the error to a callee that drops it
+        "Z026/call/mx-z26-callee_drops/hole.zig",
+        // matrix Z026: the same, an if's error captured by _ with an empty branch
+        "Z026/capture/mx-z26-if_else_discard/hole.zig",
+        // matrix Z026: the same, a while's else
+        "Z026/capture/mx-z26-while_else_discard/hole.zig",
+        // matrix Z026: the same, an errdefer's if
+        "Z026/deferred/mx-z26-errdefer_discard/hole.zig",
+        // matrix Z026: the same, @intFromError discarded
+        "Z026/conversion/mx-z26-int_from_error/hole.zig",
+        // matrix Z026: the same, an empty block in parentheses
+        "Z026/unwrap/mx-z26-grouped_empty_handler/hole.zig",
+        // matrix P005: std's print matches only where the judged file imports std itself, not through a re-export
+        "P005/address/mx-p05-reexported_std/hole.zig",
+        // matrix P005: a callee resolving to alternatives is passed silently
+        "P005/branch/mx-p05-comptime_choice/hole.zig",
+        // matrix P005: @call is no call node, so its callee is never read
+        "P005/call/mx-p05-builtin_call/hole.zig",
     },
 }
