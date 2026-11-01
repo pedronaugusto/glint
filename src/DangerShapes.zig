@@ -556,14 +556,39 @@ fn kept(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, 
         }
         return .no;
     }
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, parent) orelse return .no;
-    const Kept = struct { resources: []const ?Facts.Container, node: Ast.Node.Index, depth: u8 };
-    return eachCallee(c, file, call, Kept{ .resources = resources, .node = node, .depth = depth }, struct {
-        fn by(k: Kept, cc: *Context, f: Project.FileId, cl: Ast.full.Call, callee: Facts.Decl) Context.Error!Stored {
-            return keptBy(cc, k.resources, f, cl, callee, k.node, k.depth);
+    const argument = switch (try argumentOf(c, file, node)) {
+        .at => |at| at,
+        .unknown => return .unknown,
+        .none => return .no,
+    };
+    const Kept = struct { resources: []const ?Facts.Container, position: usize, depth: u8 };
+    return eachCallee(c, &argument.call, Kept{ .resources = resources, .position = argument.position, .depth = depth }, struct {
+        fn by(k: Kept, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
+            return stores(cc, k.resources, callee, k.position, k.depth + 1);
         }
     }.by);
+}
+
+/// Where a call takes `node` as an argument: the call and the position of the parameter it
+/// binds, a bound receiver first, as Facts.calls reads it (`f(x)`, `x.f()`, `@call`'s tuple
+/// element); unknown where the call passes it but which parameter takes it is not known.
+const Argument = union(enum) { none, at: struct { call: Facts.calls.Call, position: usize }, unknown };
+
+fn argumentOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Argument {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const parent = model.parentOf(node) orelse return .none;
+    var buffer: [2]Ast.Node.Index = undefined;
+    // A receiver's parent is the callee `x.f`, a tuple element's `@call`'s third operand.
+    const tuple = tree.fullArrayInit(&buffer, parent) != null;
+    const holder = if (tree.nodeTag(parent) == .field_access or tuple) model.parentOf(parent) orelse return .none else parent;
+    const call = (try Facts.calls.at(c.facts, file, holder)) orelse return .none;
+    if (tuple and call.modifier == null) return .none;
+    switch (call.args) {
+        .known => |args| for (args, 0..) |arg, position| if (arg == node) return .{ .at = .{ .call = call, .position = position } },
+        .unknown => return if (node == call.callee_expr) .none else .unknown,
+    }
+    return .none;
 }
 
 /// Whether the field `name` of the local `id` holds is kept where it is read: each read of the
@@ -598,44 +623,21 @@ fn literalLocal(tree: *const Ast, model: *const Model, literal: Ast.Node.Index) 
     return null;
 }
 
-/// `kept` where the call `call` makes is to `callee`: what it `stores`.
-fn keptBy(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: Ast.full.Call, callee: Facts.Decl, node: Ast.Node.Index, depth: u8) Context.Error!Stored {
-    const tree = &c.project.at(file).file.tree;
-    var skip: usize = 0;
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-        switch (try c.facts.resolve(file, receiver)) {
-            .container => {},
-            else => {
-                skip = 1;
-                if (receiver == node) return stores(c, resources, callee, 0, depth + 1);
-            },
-        }
+/// `by` for each function `call` may make: the one it names, or each of a choice (a build's,
+/// a function pointer's every store), joined. One that may be any function may do anything
+/// with what it is given.
+fn eachCallee(c: *Context, call: *const Facts.calls.Call, context: anytype, comptime by: fn (@TypeOf(context), *Context, Facts.Decl) Context.Error!Stored) Context.Error!Stored {
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |each| each,
+        .any => return .unknown,
+    };
+    var result: Stored = .no;
+    for (choices) |choice| {
+        result = join(result, try by(context, c, (try originKnown(c, choice)) orelse return .unknown));
+        if (result == .yes) return .yes;
     }
-    for (call.ast.params, 0..) |argument, position| if (argument == node) return stores(c, resources, callee, position + skip, depth + 1);
-    return .no;
-}
-
-/// `by` for each function `call` may make: the one it names, or each of a choice per build
-/// (`.alternatives`), joined. A callee that is no declared function (a function pointer, a
-/// value that does not resolve) may do anything with what it is given.
-fn eachCallee(c: *Context, file: Project.FileId, call: Ast.full.Call, context: anytype, comptime by: fn (@TypeOf(context), *Context, Project.FileId, Ast.full.Call, Facts.Decl) Context.Error!Stored) Context.Error!Stored {
-    switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| return by(context, c, file, call, (try originKnown(c, decl)) orelse return .unknown),
-        .alternatives => |choices| {
-            var result: Stored = .no;
-            for (choices) |choice| {
-                const decl = switch (choice) {
-                    .function => |decl| decl,
-                    else => return .unknown,
-                };
-                result = join(result, try by(context, c, file, call, (try originKnown(c, decl)) orelse return .unknown));
-                if (result == .yes) return .yes;
-            }
-            return result;
-        },
-        else => return .unknown,
-    }
+    return result;
 }
 
 /// Whether a field `name` of `holder` holds a resource by value that some file of the program
@@ -1008,11 +1010,13 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         },
         else => if (carrier(tree, model, node)) |whole| return released(c, file, whole, next),
     }
-    var buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&buffer, parent)) |call| {
-        for (call.ast.params, 0..) |argument, i| if (argument == node) return releasesParameter(c, file, call, i, next);
-        return .no;
+    switch (try argumentOf(c, file, node)) {
+        .at => |at| return releasesParameter(c, &at.call, at.position, next),
+        .unknown => return .unknown,
+        .none => {},
     }
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, parent) != null) return .no;
     // A copy put in a literal, by each read of the field it names (`literalReleased`); a
     // tuple's or an array's element may be.
     var init_buffer: [2]Ast.Node.Index = undefined;
@@ -1226,34 +1230,27 @@ fn releasing(name: []const u8) bool {
 /// parameter in its body (`released`), std's by its name (`close`, `deinit`, `kill`, `wait`), a
 /// choice per build by each (`eachCallee`), and one that is no declared function (a function
 /// pointer, a value that does not resolve) may.
-fn releasesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, position: usize, depth: u8) Context.Error!Stored {
+fn releasesParameter(c: *Context, call: *const Facts.calls.Call, position: usize, depth: u8) Context.Error!Stored {
     const At = struct { position: usize, depth: u8 };
-    return eachCallee(c, file, call, At{ .position = position, .depth = depth }, struct {
-        fn by(at: At, cc: *Context, f: Project.FileId, cl: Ast.full.Call, callee: Facts.Decl) Context.Error!Stored {
-            return releasesBy(cc, f, cl, callee, at.position, at.depth);
+    return eachCallee(c, call, At{ .position = position, .depth = depth }, struct {
+        fn by(at: At, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
+            return releasesBy(cc, callee, at.position, at.depth);
         }
     }.by);
 }
 
-/// `releasesParameter` where the call is to `callee`.
-fn releasesBy(c: *Context, file: Project.FileId, call: Ast.full.Call, callee: Facts.Decl, position: usize, depth: u8) Context.Error!Stored {
-    const tree = &c.project.at(file).file.tree;
+/// `releasesParameter` where the call is to `callee`, `position` among its parameters.
+fn releasesBy(c: *Context, callee: Facts.Decl, position: usize, depth: u8) Context.Error!Stored {
     const target = &c.project.at(callee.file).file.tree;
     const target_model = &c.project.at(callee.file).model;
     const record = target_model.declarations[@backingInt(callee.index)];
     if (!try c.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
-    // A method called on a value takes it as its first parameter.
-    var skip: usize = 0;
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-        .container => {},
-        else => skip = 1,
-    };
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = target.fullFnProto(&proto_buffer, record.node) orelse return .unknown;
     var params = proto.iterate(target);
     var at: usize = 0;
     const name_token = while (params.next()) |param| : (at += 1) {
-        if (at == position + skip) break param.name_token orelse return .no;
+        if (at == position) break param.name_token orelse return .no;
     } else return .no;
     for (target_model.declarations, 0..) |decl, i| {
         if (decl.kind != .parameter or decl.token != name_token) continue;
