@@ -103,6 +103,46 @@ test "a lookalike declaration under another module is not the library's" {
     defer report.deinit();
     try expectMessages(report, &.{ "none", "none" });
 }
+test "a copy under another name whose member does not resolve far enough to tell is the library, with that member drift" {
+    const vendored = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");";
+    const widget = "pub fn Widget(comptime T: type) type { return struct { value: T }; }";
+    const consumer_of = "const vendored = @import(\"vendored\");\npub const A = vendored.Widget;";
+    // The kit it imports is no file of the run: whether it holds `Gauge` is not known.
+    var unknown = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = consumer_of },
+        .{ .name = "vendored.zig", .bytes = vendored, .selected = false },
+        .{ .name = "widget.zig", .bytes = widget, .selected = false },
+    }, &.{
+        .{ .from = 0, .spelling = "vendored", .target = 1 },
+        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
+    }, .{});
+    defer unknown.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &unknown, config, .{ .project_rules = &.{rule} });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try expectMessages(report, &.{"widget"});
+    var drift = false;
+    for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, "drift gadgets kit.Gauge missing_mapping")) {
+        drift = true;
+    };
+    try std.testing.expect(drift);
+    // Twin: the kit is there and has no `Gauge`, so the copy is another module.
+    var absent = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = consumer_of },
+        .{ .name = "vendored.zig", .bytes = vendored, .selected = false },
+        .{ .name = "widget.zig", .bytes = widget, .selected = false },
+        .{ .name = "kit.zig", .bytes = "pub fn Dial(comptime T: type) type { return struct { reading: T }; }", .selected = false },
+    }, &.{
+        .{ .from = 0, .spelling = "vendored", .target = 1 },
+        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
+        .{ .from = 1, .spelling = "kit.zig", .target = 3 },
+    }, .{});
+    defer absent.deinit();
+    var clean = try glint.runConfigured(std.testing.allocator, &absent, config, .{ .project_rules = &.{rule} });
+    defer clean.deinit();
+    try std.testing.expect(clean.complete);
+    try expectMessages(clean, &.{"none"});
+}
 test "a dropped required member is drift, an absent optional member is not" {
     const dropped = [_]Layout{
         .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");" },
@@ -143,6 +183,32 @@ test "an unmapped namespace is drift with its reason" {
         found = true;
     };
     try std.testing.expect(found);
+}
+test "an import spelled with an escape is the root it names, its drift reported there" {
+    var built = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = "const gadgets = @import(\"g\\x61dgets\");\npub const A = gadgets.Widget;" },
+        .{ .name = "gadgets.zig", .bytes = "pub const Widget = @import(\"widget.zig\").Widget;\npub const kit = @import(\"kit.zig\");", .selected = false },
+        .{ .name = "widget.zig", .bytes = "pub fn Widget(comptime T: type) type { return struct { value: T }; }", .selected = false },
+    }, &.{
+        .{ .from = 0, .spelling = "gadgets", .target = 1 },
+        .{ .from = 1, .spelling = "widget.zig", .target = 2 },
+    }, .{});
+    defer built.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &built, config, .{ .project_rules = &.{rule} });
+    defer report.deinit();
+    try std.testing.expect(!report.complete);
+    try expectMessages(report, &.{"widget"});
+    var found = false;
+    for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, "drift gadgets kit.Gauge missing_mapping")) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    // Twin: the same spelling of a library that lacks nothing is complete.
+    var run = try probeAll("const gadgets = @import(\"g\\x61dgets\");\npub const A = gadgets.Widget;", &flat);
+    defer run.project.deinit();
+    defer run.report.deinit();
+    try std.testing.expect(run.report.complete);
+    try expectMessages(run.report, &.{"widget"});
 }
 test "the library's own files are not checked and two roots are both recognized" {
     var built = try P.init(std.testing.allocator, &.{

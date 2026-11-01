@@ -270,7 +270,9 @@ fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
 /// member the module requires: the library's own file, its sources vendored into another
 /// package's tree, a manifest that names nothing, a module republishing it. Which files leave
 /// the program is the library's identity alone (`outside`): a module republishing it stays
-/// the program's. Found once per run.
+/// the program's. A file whose members do not resolve far enough to tell is a root, as one
+/// that does not parse is: the members it may lack are gaps the run reports, never a module
+/// it is not. Found once per run.
 pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.FileId {
     const key = @intFromPtr(module.members.ptr);
     if (self.module_roots.get(key)) |found| return found;
@@ -290,13 +292,13 @@ pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.F
         const named = spelled or self.knownFile(mapping.target);
         const stated = !self.knownFile(mapping.target) and self.project.at(mapping.target).input.fingerprint != null;
         const parsed = self.project.at(mapping.target).file.status == .parsed;
-        if (!spelled and named and parsed and !try self.publishesAny(module, mapping.target)) continue;
+        if (!spelled and named and parsed and try self.publishesAny(module, mapping.target) == .no) continue;
         if (!named or stated) {
             // Under its name, a module publishing some of it is it with members missing, and
             // one that does not parse may be; publishing none, it is another.
-            if (!(named and (!parsed or try self.publishesAny(module, mapping.target)))) {
+            if (!(named and (!parsed or try self.publishesAny(module, mapping.target) != .no))) {
                 if (other.contains(@backingInt(mapping.target))) continue;
-                if (!(required and parsed and try self.publishes(module, mapping.target))) {
+                if (!(required and parsed and try self.publishes(module, mapping.target) != .no)) {
                     try other.put(self.gpa, @backingInt(mapping.target), {});
                     continue;
                 }
@@ -328,7 +330,8 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
                         try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = returned.container.file, .scope = returned.container.scope } } });
                     };
                 },
-                .gap => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why, .root = root }),
+                .absent => if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = .unresolved, .root = root }),
+                .unknown => |why| if (listed.required) try gaps.append(self.gpa, .{ .module = module.name, .path = listed.path, .why = why, .root = root }),
             };
         }
     }
@@ -359,26 +362,38 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
     return self.declaration(found);
 }
 
+/// Whether a file publishes a module's members: `unknown` where one does not resolve far enough
+/// to tell and none decides the answer.
+pub const Publishes = enum { yes, no, unknown };
+
 /// Whether the file `root` publishes every member `module` requires: that module, not another
-/// of its name.
-pub fn publishes(self: *Facts, module: anytype, root: Project.FileId) ResolveError!bool {
+/// of its name. One member it lacks says no; one that does not resolve, with none lacking, is
+/// unknown.
+pub fn publishes(self: *Facts, module: anytype, root: Project.FileId) ResolveError!Publishes {
+    var answer: Publishes = .yes;
     for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
         .found => {},
-        .gap => return false,
+        .absent => return .no,
+        .unknown => answer = .unknown,
     };
-    return true;
+    return answer;
 }
 
-/// Whether the file `root` publishes any member `module` requires.
-pub fn publishesAny(self: *Facts, module: anytype, root: Project.FileId) ResolveError!bool {
+/// Whether the file `root` publishes any member `module` requires. One it has says yes; one
+/// that does not resolve, with none found, is unknown.
+pub fn publishesAny(self: *Facts, module: anytype, root: Project.FileId) ResolveError!Publishes {
+    var answer: Publishes = .no;
     for (module.members) |listed| if (listed.required) switch (try self.published(root, listed.path)) {
-        .found => return true,
-        .gap => {},
+        .found => return .yes,
+        .absent => {},
+        .unknown => answer = .unknown,
     };
-    return false;
+    return answer;
 }
 
-const Found = union(enum) { found: Target, gap: Unknown };
+/// A member a root publishes; one it does not (no public declaration of that name on the
+/// path); or why the path does not resolve far enough to tell.
+const Found = union(enum) { found: Target, absent, unknown: Unknown };
 /// Walks public namespaces from a module root, the way a program names the declaration.
 fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!Found {
     var current: Value = .{ .container = self.rootOf(root) };
@@ -387,23 +402,28 @@ fn published(self: *Facts, root: Project.FileId, path: []const u8) ResolveError!
         const container = switch (current) {
             .container, .instance => |c| c,
             // A member of a type function's container, as `Budget.Reservation` names the
-            // reservation every budget declares.
-            .function => |function| switch ((try self.template(function)) orelse return .{ .gap = .unsupported }) {
+            // reservation every budget declares. A function whose container this does not
+            // find may still make one.
+            .function => |function| switch ((try self.template(function)) orelse return .{ .unknown = .unsupported }) {
                 .container, .instance => |c| c,
-                else => return .{ .gap = .unsupported },
+                else => return .{ .unknown = .unsupported },
             },
-            .unknown => |why| return .{ .gap = why },
-            else => return .{ .gap = .unsupported },
+            // A type that declares nothing, or a value of one, names no member.
+            .primitive, .scalar, .error_set, .pointer, .array, .optional, .error_union => return .absent,
+            .unknown => |why| return .{ .unknown = why },
+            .alternatives, .reflected, .literal, .reified, .fn_type => return .{ .unknown = .unsupported },
         };
-        const decl = self.member(container, name) orelse return .{ .gap = .unresolved };
-        if (!self.project.at(decl.file).model.declarations[@backingInt(decl.index)].public) return .{ .gap = .unresolved };
+        const decl = self.member(container, name) orelse return .absent;
+        if (!self.project.at(decl.file).model.declarations[@backingInt(decl.index)].public) return .absent;
         current = try self.declaration(decl);
     }
     return switch (current) {
         .function => |decl| .{ .found = .{ .function = decl } },
         .container => |c| .{ .found = .{ .container = .{ .file = c.file, .scope = c.scope } } },
-        .unknown => |why| .{ .gap = why },
-        else => .{ .gap = .unsupported },
+        .unknown => |why| .{ .unknown = why },
+        // A declaration of the name the library's is, of a kind no role names: there, but
+        // not what the library publishes there.
+        else => .{ .unknown = .unsupported },
     };
 }
 

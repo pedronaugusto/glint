@@ -44,9 +44,9 @@ pub const package = Contract.package;
 pub const danger = [_]Rule{ shared_state, secrets, untrusted_input, integers, units, bounded_work, contracts, lifetimes, ownership, identity, state_machines, diagnostics, unsafe_set, cancellation, lock_order };
 /// The first file outside aegis whose import resolves to an aegis module (`Facts.moduleRoots`):
 /// one, whatever the program names it after and whatever its package, that publishes what the
-/// module does; or one of aegis's name that publishes some of it or does not parse, whose
-/// missing members the run then reports. A module of aegis's name that publishes none of it is
-/// not aegis.
+/// module does; or one of aegis's name that publishes some of it, does not resolve far enough
+/// to tell, or does not parse, whose missing members the run then reports. A module of aegis's
+/// name that publishes none of it is not aegis.
 pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveError!?Project.FileId {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -55,7 +55,7 @@ pub fn importer(gpa: std.mem.Allocator, project: *const Project) Facts.ResolveEr
         if (facts.knownFile(mapping.from)) continue;
         for (Contract.library.modules) |module| {
             if (std.mem.findScalar(Project.FileId, try facts.moduleRoots(module), mapping.target) == null) continue;
-            if (project.at(mapping.target).file.status != .parsed or try facts.publishesAny(module, mapping.target)) return mapping.from;
+            if (project.at(mapping.target).file.status != .parsed or try facts.publishesAny(module, mapping.target) != .no) return mapping.from;
         }
     }
     return null;

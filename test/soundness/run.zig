@@ -2,7 +2,10 @@
 //! aegis real, every case its own program. The cases are judged on a pool of workers, each with
 //! its own store that reads each file once, and their verdicts read in case order, so a run's
 //! output is the same at any number of workers. A
-//! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. The row is a
+//! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. Undecided is any
+//! coverage glint writes of the case (std's note that its ZIR references are indexed in part
+//! aside, unless the budget cut it), a malformed suppression, or a run glint says is incomplete
+//! for nothing it wrote. The row is a
 //! `Constructs.Row`: how the case moves the value its rule judges. A case's `glint.json` is the
 //! policy its rule reads (P006's disallowed declarations, A018's peer writers): its options
 //! alone, since the case's rule is the one that runs. A case's `before.zig` is a file the run
@@ -247,16 +250,54 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
     if (job.before) |before| try args.append(a, before);
     try args.append(a, job.absolute);
-    _ = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
+    const status = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
+    return verdictOf(output.written(), status, rule, job.before);
+}
+
+/// What a run's text output and exit status say of the case: flagged where `rule` finds
+/// anything outside `before`; else undecided where glint writes coverage of any file but
+/// `before` (`--only` runs its rule at report level, where its coverage leaves the run
+/// complete), a malformed suppression, or, without `before`, says the run is incomplete
+/// (status 2); else clean.
+fn verdictOf(output: []const u8, status: u8, rule: []const u8, before: ?[]const u8) Verdict {
     var verdict: Verdict = .clean;
-    var lines = std.mem.splitScalar(u8, output.written(), '\n');
+    var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
-        if (job.before) |before| if (about(line, rule, before) or about(line, "coverage", before)) continue;
+        if (before) |path| if (about(line, rule, path) or about(line, "coverage", path) or about(line, "suppression", path)) continue;
         if (std.mem.startsWith(u8, line, rule) and std.mem.startsWith(u8, line[rule.len..], ": ")) return .flagged;
-        // Every run notes that std's ZIR references are indexed in part; that decides nothing.
-        if (std.mem.startsWith(u8, line, "coverage: ") and std.mem.find(u8, line, "std-ZIR declaration references") == null) verdict = .undecided;
+        if ((std.mem.startsWith(u8, line, "coverage: ") or std.mem.startsWith(u8, line, "suppression: ")) and !note(line)) verdict = .undecided;
     }
+    // An incomplete run no line explains is the case's, where no `before` is there to be it.
+    if (verdict == .clean and status == 2 and before == null) return .undecided;
     return verdict;
+}
+
+/// Whether `line` is a note that decides nothing: std's ZIR references indexed in part, which
+/// every parsed file gets (its budget cut short is no note), or a suppression that suppresses
+/// nothing.
+fn note(line: []const u8) bool {
+    if (std.mem.startsWith(u8, line, "suppression: ")) return std.mem.endsWith(u8, line, " suppresses nothing");
+    return std.mem.find(u8, line, ": unsupported: std-ZIR declaration references ") != null;
+}
+
+test "a case's verdict: any coverage of its files is undecided, std's note alone is not" {
+    const zir = "coverage: /s/case.zig: unsupported: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
+    const exhausted = "coverage: /s/case.zig: budget_exhausted: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
+    try std.testing.expectEqual(Verdict.clean, verdictOf(zir, 0, "A009", null));
+    try std.testing.expectEqual(Verdict.undecided, verdictOf(exhausted, 2, "A009", null));
+    try std.testing.expectEqual(Verdict.undecided, verdictOf("suppression: /s/case.zig:1:1: malformed: an aegis escape names the rules it covers\n", 2, "A009", null));
+    try std.testing.expectEqual(Verdict.clean, verdictOf("suppression: /s/case.zig:1:1: A009 suppresses nothing\n", 0, "A009", null));
+    // A rule at report level leaves the run complete with its coverage: still undecided.
+    try std.testing.expectEqual(Verdict.undecided, verdictOf("coverage: /s/case.zig: unsupported: cleanup/error exits require unsupported flow facts; no leak claimed\n" ++ zir, 0, "A003", null));
+    try std.testing.expectEqual(Verdict.undecided, verdictOf(zir, 2, "A009", null));
+    try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/case.zig:3:5: input used\ncoverage: /s/case.zig: unresolved: x\n", 2, "A009", null));
+}
+test "what a run says of before.zig alone is not the case's" {
+    const before = "/s/before.zig";
+    const zir = "coverage: /s/case.zig: unsupported: std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately\n";
+    try std.testing.expectEqual(Verdict.clean, verdictOf("A009: /s/before.zig:1:1: input used\ncoverage: /s/before.zig: budget_exhausted: semantic fact budget exhausted\n" ++ zir, 2, "A009", before));
+    try std.testing.expectEqual(Verdict.undecided, verdictOf("coverage: /s/before.zig: budget_exhausted: x\ncoverage: /s/case.zig: budget_exhausted: semantic fact budget exhausted\n", 2, "A009", before));
+    try std.testing.expectEqual(Verdict.flagged, verdictOf("A009: /s/before.zig:1:1: input used\nA009: /s/case.zig:2:1: input used\n", 1, "A009", before));
 }
 
 /// The names of `sub`'s entries of `kind`, sorted.

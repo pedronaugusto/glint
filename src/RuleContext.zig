@@ -129,24 +129,17 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
     }
 }
 /// A required library member that did not resolve, at the first import in this file of the
-/// root that lacks it, under whatever name. Recognition of that library is incomplete here, so
-/// a rule reports it as coverage.
+/// root that lacks it, under whatever name and however spelled: the import is the root where
+/// Facts resolves it to that root. Recognition of that library is incomplete here, so a rule
+/// reports it as coverage.
 pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unknown, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
     const found = try self.facts.publication(library);
     const tree = try self.project.syntax(try self.source());
     const model = &self.project.at(self.file).model;
     for (found.gaps) |gap| for (model.import_nodes) |node| {
-        var buffer: [2]std.zig.Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, node, &buffer);
-        if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
-        const literal = tree.tokenSlice(tree.nodeMainToken(args[0]));
-        if (literal.len < 2) continue;
-        const spelling = literal[1 .. literal.len - 1];
-        const imports_root = for (self.project.imports) |mapping| {
-            if (mapping.from == self.file and mapping.target == gap.root and std.mem.eql(u8, mapping.spelling, spelling)) break true;
-        } else false;
-        if (!imports_root) continue;
+        const value = try self.facts.resolve(self.file, node);
+        if (value != .container or value.container.file != gap.root) continue;
         return .{ .module = gap.module, .path = gap.path, .why = gap.why, .start = tree.tokenStart(tree.nodeMainToken(node)) };
     };
     return null;

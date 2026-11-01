@@ -77,6 +77,9 @@ pub fn dev(b: *std.Build, tools: type) void {
     soundness_run.addArg(b.fmt("{d}", .{soundness_jobs}));
     if (soundness_rules) |list| soundness_run.addArg(list);
     test_step.dependOn(&soundness_run.step);
+    const soundness_tests = b.addTest(.{ .root_module = soundness.root_module });
+    test_step.dependOn(&b.addRunArtifact(soundness_tests).step);
+    check.dependOn(&soundness_tests.step);
     b.step("soundness", "Run the soundness suite alone").dependOn(&soundness_run.step);
     const project_linter = b.addExecutable(.{ .name = "glint-project-example", .root_module = b.createModule(.{
         .root_source_file = p.path("examples/project.zig"),
