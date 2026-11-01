@@ -26,9 +26,10 @@ copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
 copier_names: std.StringHashMapUnmanaged(void) = .empty,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
-bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, void) = .empty,
-/// The builtins `scalarCasts` finds: casts each binding decides (`castAtBinding`).
-cast_sites: std.AutoHashMapUnmanaged(Key, void) = .empty,
+bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, Decl) = .empty,
+/// The builtins and `raw` calls `scalarCasts` finds, each with its function: casts each
+/// binding decides (`castAtBinding`).
+cast_sites: std.AutoHashMapUnmanaged(Key, Decl) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
@@ -809,7 +810,7 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             // The parameter itself is its argument, read as written where it is bound.
             const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
             try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
-            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, {});
+            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
         }
     }
     try self.scalarCasts(function, out);
@@ -841,7 +842,7 @@ fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy))
                 // Bits reinterpreted: a value one gives read as another type, or a type written
                 // in terms of one made out of another's bits.
                 if ((std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@ptrCast")) and args.len == 1) {
-                    if (self.derivedParameter(function, args[0], 0) != null) break :blk args[0];
+                    if (self.runtimeParameter(function, args[0], 0) != null) break :blk args[0];
                     break :blk self.writtenType(function.file, node, 0) orelse continue;
                 }
                 // `@call(modifier, T.raw, .{x})`: the value it is given.
@@ -868,7 +869,7 @@ fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy))
         const position = self.derivedParameter(function, source, 0) orelse continue;
         const site: Key = .{ .file = function.file, .node = node };
         try out.append(self.gpa, .{ .position = position, .site = site, .kind = .cast, .source = .{ .file = function.file, .node = source } });
-        try self.cast_sites.put(self.gpa, site, {});
+        try self.cast_sites.put(self.gpa, site, function);
     }
 }
 
@@ -912,11 +913,24 @@ fn writtenType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: 
     }
 }
 
-/// Whether the builtin `node` makes or reads an integer by the type of a generic parameter,
-/// which each binding of the generic decides (`scalarCasts`).
+/// Whether the builtin or `raw` call `node` makes or reads an integer by the type of a generic
+/// parameter, which each binding of the generic decides (`scalarCasts`): where every binding is
+/// a call a run judges (`judgedAtBindings`). One std may call on a context it is handed
+/// (`HashMap`'s `hash(key)`) is bound past the calls a rule judges, so it is judged where it
+/// is written too, its value as unknown as that leaves it.
 pub fn castAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     if (self.copies == null) try self.findCopies();
-    return self.cast_sites.contains(.{ .file = file, .node = node });
+    const function = self.cast_sites.get(.{ .file = file, .node = node }) orelse return false;
+    return self.judgedAtBindings(function);
+}
+
+/// Whether the `raw` call `node` on a generic parameter's value is each binding's
+/// (`castAtBinding`), the program binding it: a receiver no call of the run binds is given
+/// whatever a binding gives, unresolved where it is read.
+pub fn rawAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (self.copies == null) try self.findCopies();
+    const function = self.cast_sites.get(.{ .file = file, .node = node }) orelse return false;
+    return (try self.namedCalls(function) orelse return false) != 0;
 }
 
 /// What a copy of the value written `node` copies: the places it reads (a name, a field,
@@ -1066,10 +1080,12 @@ pub fn loopBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, labe
 }
 
 /// Whether the declaration `site` is a copy a generic function makes of its parameters'
-/// values that its bindings decide (`parameterCopies`), reading `place`.
+/// values that its bindings decide (`parameterCopies`), reading `place`: where every binding is
+/// a call a run judges (`judgedAtBindings`).
 pub fn boundAtBinding(self: *Facts, file: Project.FileId, site: Ast.Node.Index, place: Ast.Node.Index) ResolveError!bool {
     if (self.copies == null) try self.findCopies();
-    return self.bound_places.contains(.{ .site = .{ .file = file, .node = site }, .place = place });
+    const function = self.bound_places.get(.{ .site = .{ .file = file, .node = site }, .place = place }) orelse return false;
+    return self.judgedAtBindings(function);
 }
 
 /// The position of the type parameter whose function `value` calls (`T.init(...)`, through
@@ -1263,6 +1279,15 @@ pub fn parameterValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
     const index = (model.reference(node) orelse return false).declaration orelse return false;
     const function = self.functionOf(.{ .file = file, .index = index }) orelse return false;
     return self.valueOfParameter(function, index) != null;
+}
+
+/// Whether `node` names a value of a generic parameter of a function whose bindings are all
+/// calls a run judges, each deciding a copy of it (`parameterValue`, `judgedAtBindings`).
+pub fn parameterAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (!self.parameterValue(file, node)) return false;
+    const model = &self.project.at(file).model;
+    const index = model.reference(node).?.declaration.?; // unreachable: `parameterValue` holds only for a parameter's name
+    return self.judgedAtBindings(self.functionOf(.{ .file = file, .index = index }).?); // unreachable: as above
 }
 
 /// Whether `node`, written in a generic function, is or is a part of one of its generic
@@ -4203,17 +4228,41 @@ const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite
 fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const read = try self.memo(CallSites);
     if (read.map.get(function)) |known_sites| return known_sites;
-    const found = try self.scanCallSites(function);
+    const found = try self.scanCallSites(function, false);
     try read.map.put(self.gpa, function, found);
     return found;
 }
 
-fn scanCallSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
+const NamedSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty };
+
+/// How many calls of `function` the program makes where every binding of it is a call by its
+/// name that a run judges: the program's own, or a consumer's in the consumer's run, which
+/// reads this package too. Null where it is used otherwise (handed on as a value, called on a
+/// holder that does not resolve) or where std's or aegis's code may call a member of its name
+/// on a value the program hands it (`HashMap`'s `ctx.hash(key)`): a binding there is no call a
+/// rule sees. Read once.
+fn namedCalls(self: *Facts, function: Decl) ResolveError!?usize {
+    const read = try self.memo(NamedSites);
+    if (read.map.get(function)) |known| return known;
+    const found: ?usize = if (try self.scanCallSites(function, true)) |sites| sites.len else null;
+    try read.map.put(self.gpa, function, found);
+    return found;
+}
+
+/// Whether every binding of `function` is a call a run judges (`namedCalls`).
+pub fn judgedAtBindings(self: *Facts, function: Decl) ResolveError!bool {
+    return try self.namedCalls(function) != null;
+}
+
+fn scanCallSites(self: *Facts, function: Decl, by_name: bool) ResolveError!?[]const CallSite {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
-    if (record.public) return null;
+    if (record.public and !by_name) return null;
     const name_token = record.token;
     const name = self.project.at(function.file).file.tree.tokenSlice(name_token);
+    // std's or aegis's code may call it on a value the program hands it: callers no scan of the
+    // program sees.
+    if (record.public and try self.calledOutside(name)) return null;
     var sites: std.ArrayList(CallSite) = .empty;
     for (self.project.sources) |*source| {
         const file = &source.file;
@@ -4291,6 +4340,77 @@ fn scanCallSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     return sites.items;
 }
 
+/// Whether code outside the program (std's or a known library's) may call a function named
+/// `name` of the program's: a call through a member so spelled, or through `@field` with a name
+/// that is so spelled or computed, on a receiver that does not resolve to a container of its own
+/// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`.
+fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
+    const found = try self.memo(OutsideCalls);
+    if (!found.built) {
+        found.built = true;
+        for (self.project.sources) |*source| {
+            if (source.file.status != .parsed or try self.program(source.id)) continue;
+            const tree = &source.file.tree;
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const parent = source.model.node_parents[i] orelse continue;
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, parent) orelse continue;
+                if (call.ast.fn_expr != node) continue;
+                const receiver: Ast.Node.Index, const spelled: []const u8 = switch (tag) {
+                    .field_access => .{ tree.nodeData(node).node_and_token[0], tree.tokenSlice(tree.nodeData(node).node_and_token[1]) },
+                    .builtin_call_two, .builtin_call_two_comma => blk: {
+                        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const args = builtinArgs(tree, node, &buffer);
+                        if (args.len != 2) continue;
+                        if (tree.nodeTag(args[1]) != .string_literal) {
+                            try found.computed.append(self.gpa, .{ .file = source.id, .node = args[0] });
+                            continue;
+                        }
+                        break :blk .{ args[0], tree.tokenSlice(tree.nodeMainToken(args[1])) };
+                    },
+                    else => continue,
+                };
+                const entry = try found.by_name.getOrPut(self.gpa, std.mem.trim(u8, spelled, "\""));
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.gpa, .{ .file = source.id, .node = receiver });
+            }
+        }
+    }
+    if (found.verdicts.get(name)) |known| return known;
+    var any = false;
+    const named = if (found.by_name.get(name)) |list| list.items else &.{};
+    for ([_][]const Key{ named, found.computed.items }) |receivers| for (receivers) |receiver| {
+        if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
+        if (any) break;
+    };
+    try found.verdicts.put(self.gpa, name, any);
+    return any;
+}
+const OutsideCalls = struct {
+    built: bool = false,
+    /// Each name called through a member outside the program, with the receivers it is called on.
+    by_name: std.StringHashMapUnmanaged(std.ArrayList(Key)) = .empty,
+    /// The receivers of calls through `@field` with a computed name: any name.
+    computed: std.ArrayList(Key) = .empty,
+    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
+};
+
+/// Whether a value may be the program's: it does not resolve, or reaches a container of a
+/// program file.
+fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
+    return switch (value) {
+        .unknown => true,
+        .container, .instance => |c| try self.program(c.file),
+        .pointer, .array, .optional, .error_union => |inner| self.mayBeProgram(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (try self.mayBeProgram(one)) break true;
+        } else false,
+        else => false,
+    };
+}
+
 /// The arguments `parent` passes when it calls what `node` names: `f(a, b)`, or
 /// `@call(modifier, f, .{ a, b })`. Null when `parent` does not call it.
 fn callParams(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index, call_buffer: *[1]Ast.Node.Index, tuple_buffer: *[2]Ast.Node.Index) ?[]const Ast.Node.Index {
@@ -4304,11 +4424,20 @@ fn callParams(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index, ca
 }
 
 /// Whether `parent` uses its operand `node` as only a field can be used: as the target of an
-/// assignment, or as an operand of arithmetic, a comparison or a logical operator.
+/// assignment, an operand of arithmetic, a comparison or a logical operator, or what an
+/// integer builtin reads.
 fn fieldUse(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
     return switch (tree.nodeTag(parent)) {
         .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => tree.nodeData(parent).node_and_node[0] == node,
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat => true,
+        // An integer or an enum's read out of it, which no function is: `@backingInt(m.role)`.
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            const name = tree.tokenSlice(tree.nodeMainToken(parent));
+            for ([_][]const u8{ "@backingInt", "@intFromEnum", "@intCast", "@truncate", "@tagName" }) |integer| {
+                if (std.mem.eql(u8, name, integer)) break :blk true;
+            }
+            break :blk false;
+        },
         else => false,
     };
 }

@@ -1843,9 +1843,10 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     // vtable constant in a struct and a constant naming it. Findings (8, the conversion and
     // its alignment): that vtable installed into another type's field, the function stored
     // into C's other field or another struct's, the constant made `pub`, the interface handed
-    // to a generic that reads the vtable's function (and the contract's sites: the read, 26, and
-    // the handing, 30). The same generic handed nothing of it is clean: what it reads is what it
-    // is given, which the follow takes into it.
+    // to a generic that reads the vtable's function (and the contract's site, the handing, 30:
+    // the generic is public, so what it reads at 26 is each binding's, judged where one is
+    // made). The same generic handed nothing of it is clean: what it reads is what it is given,
+    // which the follow takes into it.
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, file_program)).findings);
     const other = try runEdited(pack.unsafe_set, file_program, "pub fn use(buffer: []u8) !usize {", "fn wrong(buffer: []u8) Other { return .{ .interface = .{ .vtable = &data_vtable, .buffer = buffer } }; }\npub fn use(buffer: []u8) !usize {");
     try std.testing.expectEqualSlices(u32, &.{ 8, 8 }, other.lines[0..other.findings]);
@@ -1860,7 +1861,7 @@ test "A019 clears a parent pointer whose function its file installs into C.F of 
     const peek = comptime edited(file_program, "pub fn use(buffer: []u8) !usize {", "pub fn peek(t: anytype) void { _ = t.vtable.drain; }\npub fn use(buffer: []u8) !usize {");
     try std.testing.expectEqual(@as(usize, 0), (try run(pack.unsafe_set, peek)).findings);
     const peeked = try runEdited(pack.unsafe_set, peek, "    reset(&o.body.data, buffer);", "    reset(&o.body.data, buffer);\n    peek(&o.body.data.interface);");
-    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 26, 30 }, peeked.lines[0..peeked.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 30 }, peeked.lines[0..peeked.findings]);
 }
 
 const lookup_program =
@@ -2909,6 +2910,12 @@ test "A009 and A010 read every file of the program, selected or not: a table's o
     try std.testing.expectEqual(@as(usize, 0), kept.findings);
     const widened = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.limit = r.takeInt(u64, 0) catch 0; }");
     try std.testing.expectEqualSlices(u32, &.{8}, widened.lines[0..widened.findings]);
+    // The same store through a public generic's binding whose type this run does not fix, as a
+    // literal of that binding's type: what it gives, the field may hold.
+    const literal = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.* = .{ .limit = r.takeInt(u64, 0) catch 0 }; }");
+    try std.testing.expectEqualSlices(u32, &.{8}, literal.lines[0..literal.findings]);
+    const small = try runWithOther(pack.integers, stored, "pub fn touch(c: anytype) void { c.* = .{ .limit = 7 }; }");
+    try std.testing.expectEqual(@as(usize, 0), small.findings);
 }
 
 test "A009 reads a for capture as the input at its own position, a discarded capture counted" {

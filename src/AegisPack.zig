@@ -1029,8 +1029,8 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     const returned = tree.nodeTag(copy) == .@"return";
     if (returned and tree.nodeTag(node) == .identifier and try moved(c, copy, node, true)) return;
     // A value of a generic's parameter, or read from one: each binding's copy, checked at
-    // the binding.
-    if (root == node and c.facts.parameterValue(c.file, node)) return;
+    // the binding, where every binding is a call a run judges.
+    if (root == node and try c.facts.parameterAtBinding(c.file, node)) return;
     if (try c.facts.boundAtBinding(c.file, copy, node)) return;
     // A `comptime` parameter's value, or a part of it, known as the program compiles: it
     // holds nothing at run time.
@@ -3280,7 +3280,7 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
     // Of a value a generic parameter gives: each binding's, checked there.
-    if (try c.facts.castAtBinding(c.file, node)) return false;
+    if (try c.facts.rawAtBinding(c.file, node)) return false;
     return rawCall(c, call.ast.fn_expr, call.ast.params, tree.nodeMainToken(node));
 }
 

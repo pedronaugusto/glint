@@ -627,6 +627,12 @@ test "A004 reads a scalar's bits reinterpreted by the language or std as its raw
     try expectReinterpreted(head ++ "pub fn f(n: u16) u16 { return std.mem.readInt(u16, std.mem.asBytes(&n), .little) + 1; }", 0);
     try expectReinterpreted(head ++ "pub fn f(b: [2]u8) u16 { return std.mem.bytesToValue(u16, &b) + 1; }", 0);
     try expectReinterpreted(head ++ "const E = enum(u8) { a, b };\npub fn f(v: u8) ?E { return std.enums.fromInt(E, v); }", 0);
+    // A generic that casts what it looks up by its type parameter makes a value of the type
+    // it is bound to: a scalar's there, a plain struct's here. What it looks up is no value of
+    // the parameter, though its place is computed from it.
+    const lookup = "fn get(slots: []*anyopaque, comptime T: type) *T { const at = @sizeOf(T) % slots.len; return @ptrCast(@alignCast(slots[at])); }\n";
+    try expectReinterpreted(head ++ lookup ++ "pub fn f(slots: []*anyopaque) *Index { return get(slots, Index); }", 1);
+    try expectReinterpreted(head ++ lookup ++ "const Plain = struct { n: u32 };\npub fn f(slots: []*anyopaque) u32 { return get(slots, Plain).n; }", 0);
 }
 
 test "A004 strict: every operator, compound assignment and cast on a raw value, and one carried through a local or a branch" {
@@ -1068,13 +1074,15 @@ fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, co
 test "a public generic's parameters are each binding's, a consumer's among them; a private one's are its callers'" {
     // A raw integer read in a public generic, bound inside its package only to a plain type:
     // the read is each binding's, so the package alone is clean and a consumer's binding of an
-    // aegis id is the finding, whether the package is linted with it or not.
+    // aegis id is the finding, whether the package is linted with it or not. One no call
+    // binds is given whatever binding is made: undecided where it is written.
     const lib = "pub fn bump(x: anytype) u32 { return x.raw() + 1; }\nconst Plain = struct { pub fn raw(_: Plain) u32 { return 1; } };\npub fn use() u32 { return bump(Plain{}); }\n";
     const consumer = "const lib = @import(\"lib\");\nconst Index = @import(\"aegis\").id.Id(struct {}, u32);\npub fn f() u32 { return lib.bump(Index.fromRaw(3)); }";
     try expectJudged(lib, pack.scalar, true, 0);
     try expectJudgedWithDependency(consumer, lib, pack.scalar, true, 1);
     try expectJudgedWithLib(consumer, lib, pack.scalar, true, 1);
     try expectJudged("const Index = @import(\"aegis\").id.Id(struct {}, u32);\n" ++ lib ++ "pub fn f() u32 { return bump(Index.fromRaw(3)); }", pack.scalar, true, 1);
+    try expectJudged("pub fn bump(x: anytype) u32 { return x.raw() + 1; }\n", pack.scalar, false, 0);
     // A judgment of a generic's body not recorded per binding reads its parameters from its
     // callers only where they are all known: a private generic, not a public one, which a
     // consumer may call with anything.
@@ -1159,8 +1167,13 @@ test "generic parameters are what the project's own calls pass, when no consumer
     try expectJudged(head ++ "const Box = struct { fn look(_: *const Box, p: anytype) void { _ = p.owner; } };\nfn pass(b: *const Box, p: anytype) void { b.look(p); }\npub fn f(b: *const Box, x: *Plain) void { pass(b, x); }", pack.access, true, 0);
     // A `comptime` type parameter of a private type function.
     try expectJudged(head ++ "fn Holder(comptime T: type) type { return struct { pub fn get(t: *T) void { _ = t.data; } }; }\npub fn f(x: *Plain) void { Holder(Plain).get(x); }", pack.access, true, 0);
-    // A method's own generic, called on a pointer the caller's generic was given.
-    try expectJudged(head ++ "const Sched = struct { processors: []Plain, monitor: ?*Monitor };\nconst Monitor = struct {\n    samples: []u32,\n    pub fn run(m: *Monitor, s: anytype) void { for (s.processors, m.samples) |*p, *sample| { _ = m.look(s, p, sample); } }\n    fn look(m: *Monitor, s: anytype, p: anytype, sample: *u32) bool { _ = m; _ = s; _ = sample; _ = p.owner; return false; }\n};\npub fn go(s: *Sched) void { s.monitor.?.run(s); }", pack.access, true, 0);
+    // A method's own generic, called on a pointer the caller's generic was given. Public, it
+    // is a consumer's to call too (a private type is reached through `go`'s parameter type):
+    // its `anytype` holds what any binding gives, undecided here.
+    const sched = "const Sched = struct { processors: []Plain, monitor: ?*Monitor };\nconst Monitor = struct {\n    samples: []u32,\n    ";
+    const monitor = "fn run(m: *Monitor, s: anytype) void { for (s.processors, m.samples) |*p, *sample| { _ = m.look(s, p, sample); } }\n    fn look(m: *Monitor, s: anytype, p: anytype, sample: *u32) bool { _ = m; _ = s; _ = sample; _ = p.owner; return false; }\n};\npub fn go(s: *Sched) void { s.monitor.?.run(s); }";
+    try expectJudged(head ++ sched ++ monitor, pack.access, true, 0);
+    try expectJudged(head ++ sched ++ "pub " ++ monitor, pack.access, false, 0);
     // Taken other than by a call, its arguments are not all known: undecided.
     try expectJudged(head ++ "fn look(p: anytype) void { _ = p.owner; }\npub fn f() void { const taken = look; _ = taken; }", pack.access, false, 0);
 }
@@ -1185,6 +1198,31 @@ test "a generic method std may call on a type the program hands it binds what st
         defer report.deinit();
         try std.testing.expectEqual(case[1], report.complete);
         try std.testing.expectEqual(@as(usize, 0), count(report, pack.access));
+    }
+}
+
+test "a generic std may call on a context the program hands it is judged where it is written too: a cast or a copy of its value is not each program call's alone" {
+    // std's `Map` calls its context's `hash` with what it is given, an aegis id or secret here,
+    // no call of the program's showing it: the generic's own cast or copy stays undecided. A
+    // private method std cannot name is bound by the program's calls only, each deciding it.
+    const lib = "pub fn Map(comptime C: type) type { return struct { ctx: C, pub fn put(self: *@This(), key: anytype) void { _ = self.ctx.hash(key); } }; }";
+    const extra = std_fixture ++ [_]aegis_sources.Extra{.{ .name = "std/map.zig", .bytes = lib }};
+    const imports = std_fixture_imports ++ [_]aegis_sources.ExtraImport{ .{ .from = 0, .spelling = "map.zig", .target = std_fixture.len }, .{ .spelling = "map.zig", .target = std_fixture.len } };
+    const head = "const aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u32);\nconst S = aegis.Secret(u32);\nconst lib = @import(\"map.zig\");\n";
+    for ([_]struct { glint.Rule, []const u8, bool }{
+        .{ pack.scalar, "const Ctx = struct { pub fn hash(_: Ctx, key: anytype) u64 { return @intFromEnum(key) *% 31; } };\npub fn f(i: Index) void { var m: lib.Map(Ctx) = .{ .ctx = .{} }; m.put(i); }", false },
+        .{ pack.scalar, "const Ctx = struct { fn hash(_: Ctx, key: anytype) u64 { return @intFromEnum(key) *% 31; } };\nconst E = enum(u32) { a };\npub fn f() u64 { const c: Ctx = .{}; return c.hash(E.a); }", true },
+        .{ pack.copies, "const Ctx = struct { pub fn hash(_: Ctx, key: anytype) u64 { const copy = key; _ = copy; return 0; } };\npub fn f(s: S) void { var m: lib.Map(Ctx) = .{ .ctx = .{} }; m.put(s); }", false },
+        .{ pack.copies, "const Ctx = struct { fn hash(_: Ctx, key: anytype) u64 { const copy = key; _ = copy; return 0; } };\npub fn f() u64 { const c: Ctx = .{}; return c.hash(@as(u32, 1)); }", true },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, case[1] });
+        defer std.testing.allocator.free(source);
+        var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &extra, &imports);
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = case[0], .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        try std.testing.expectEqual(case[2], report.complete);
+        try std.testing.expectEqual(@as(usize, 0), count(report, case[0]));
     }
 }
 
