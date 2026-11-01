@@ -635,6 +635,34 @@ test "A004 reads a scalar's bits reinterpreted by the language or std as its raw
     try expectReinterpreted(head ++ lookup ++ "const Plain = struct { n: u32 };\npub fn f(slots: []*anyopaque) u32 { return get(slots, Plain).n; }", 0);
 }
 
+test "A004 reports a binding once, naming each of the generic's casts it makes a scalar's, however many paths and instances reach it" {
+    const head = "const std = @import(\"std\");\nconst aegis = @import(\"aegis\");\nconst Index = aegis.id.Id(struct {}, u16);\n";
+    // A generic casting by its type parameter at three places, one of them on two paths.
+    const get = "fn get(slots: []*anyopaque, comptime T: type) *T {\n    if (slots.len == 1) return @ptrCast(@alignCast(slots[0]));\n    if (slots.len == 2) return @ptrCast(@alignCast(slots[1]));\n    return @ptrCast(@alignCast(slots[@sizeOf(T) % slots.len]));\n}\n";
+    const outer = "fn outer(slots: []*anyopaque, comptime T: type) *T { return if (slots.len > 3) get(slots, T) else get(slots[1..], T); }\n";
+    const rows = [_]struct { []const u8, usize }{
+        // One binding: one finding, each cast named.
+        .{ get ++ "pub fn f(slots: []*anyopaque) *Index { return get(slots, Index); }", 1 },
+        // Bound through a second generic, on two of its paths, and so in two instances of it.
+        .{ get ++ outer ++ "pub fn f(slots: []*anyopaque) *Index { return outer(slots, Index); }", 1 },
+        // Twins: two bindings are two sites; a plain type binds none.
+        .{ get ++ "pub fn f(slots: []*anyopaque) *Index { _ = get(slots, Index); return get(slots[1..], Index); }", 2 },
+        .{ get ++ "const Plain = struct { n: u32 };\npub fn f(slots: []*anyopaque) u32 { return get(slots, Plain).n; }", 0 },
+    };
+    inline for (rows) |row| {
+        var project = try aegis_sources.projectWithSources(std.testing.allocator, head ++ row[0], &reinterpreting_std, &reinterpreting_imports);
+        defer project.deinit();
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.scalar, .level = .gate }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        if (count(report, pack.scalar) != row[1]) std.debug.print("{s}: {d} findings\n", .{ row[0], count(report, pack.scalar) });
+        try std.testing.expectEqual(row[1], count(report, pack.scalar));
+        for (report.diagnostics) |diagnostic| {
+            try std.testing.expectEqual(@as(usize, 3), diagnostic.related.len); // safe: the generic's three casts.
+            try std.testing.expect(std.mem.find(u8, diagnostic.message, "the integers") != null);
+        }
+    }
+}
+
 test "A004 strict: every operator, compound assignment and cast on a raw value, and one carried through a local or a branch" {
     const head = "const Index = @import(\"aegis\").id.Id(struct {}, u16);\nfn use(v: u16) void { _ = v; }\npub fn f(i: Index, maybe: ?u16, limit: u16) !u16 {\n    _ = .{ i, maybe, limit };\n";
     // Each unsafe probe computes with the raw value once; its safe twin hands it on or checks it.

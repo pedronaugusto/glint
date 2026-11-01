@@ -17,6 +17,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- A finding is reported once per rule, site and cause. A rule reaching one site again (a generic's instances, its paths) repeated the finding, which multiplied counts (strand: 12525 findings on 3235 sites); the repeats now merge into it, their related places with it, and an escape takes it once. A004 reports a generic's binding once, naming each cast of the generic it makes an aegis scalar's, those casts its related places, where each cast was its own finding.
 - An escape in the older form, naming no rules, hides nothing: its line's findings stay in the report's diagnostics, their fixes held back, recorded as what it covers for the fix to name. It covered every pack finding there, so a finding added later went unseen.
 - A destructuring of a literal of as many elements (`x, y = .{ 5, try r.takeInt(i32, .little) }`) gives each variable its own element: the whole literal's input reached each, so `-x` of the constant was a finding.
 - A009 judges an address moved as an integer (`@ptrFromInt(@intFromPtr(out.ptr) + o)`) as it judges a pointer moved (`out.ptr + o`): only A019 saw the conversion, so an escape of A019 at a true boundary hid the address a peer chose.

@@ -45,6 +45,35 @@ test "G2 compiled project rules share metadata rendering and written site suppre
     try std.testing.expectEqual(@as(usize, 1), gated.gateFindings()); // safe: one gate finding, separate from one reasoned site.
     try std.testing.expectEqual(@as(usize, 0), report.gateFindings()); // safe: reports do not gate.
 }
+/// Reaches each public declaration three times with one cause, its related place a different
+/// token each time but the last, and once with another cause.
+fn repeating(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    const h = try context.source();
+    for (try context.project.declarations(h)) |decl| if (decl.public) {
+        const tree = try context.project.syntax(h);
+        const site = tree.tokenToSpan(decl.token);
+        for ([_]u32{ 0, 1, 1 }) |step| {
+            const related = [_]glint.Report.Span{context.spanOf(context.file, decl.token + step)};
+            try context.emitRelated(own, site.start, site.end, "public declaration needs the project contract", &related);
+        }
+        try context.at(own, decl.token, "public declaration needs a second contract");
+    };
+}
+test "G2 a finding is one per rule, site and cause, however many times its rule reaches it, with the related places of each" {
+    var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "pub const bad = 1;\n// glint-ignore: CUSTOM_API -- boundary exports this intentional constant\npub const allowed = 2;" }}, &.{}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, configuration(.report), .{ .project_rules = &.{.{ .definition = rule.definition, .check = repeating }} });
+    defer report.deinit();
+    // Each cause at `bad` once; the escaped site's two causes each taken once.
+    try std.testing.expectEqual(@as(usize, 2), report.diagnostics.len); // safe: two causes at one site.
+    try std.testing.expectEqual(@as(usize, 2), report.suppressed); // safe: two causes at the escaped site.
+    for (report.diagnostics) |diagnostic| try std.testing.expectEqual(report.diagnostics[0].span, diagnostic.span);
+    const repeated = for (report.diagnostics) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.message, "public declaration needs the project contract")) break diagnostic;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), repeated.related.len); // safe: two distinct related places of three.
+    try std.testing.expect(repeated.related[0].start != repeated.related[1].start);
+}
 test "G2 incomplete required project rule stays incomplete with every finding allowed" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "project", .bytes = "// glint-ignore: CUSTOM_API -- intentionally exported test contract\npub const allowed = 2;" }}, &.{}, .{});
     defer project.deinit();

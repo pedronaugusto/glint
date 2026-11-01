@@ -20,6 +20,10 @@ config: rules.Config,
 base: rules.Config = .{},
 facts: Facts,
 diagnostics: std.ArrayList(Report.Diagnostic) = .empty,
+/// Each finding made, by its rule, span and message: the index of its diagnostic, or null where
+/// an escape took it. A finding is one however many times its rule reaches it (a generic's
+/// instances, paths to one site); the related spans of each time are its.
+emitted: std.StringHashMapUnmanaged(?usize) = .empty,
 coverage: std.ArrayList(Report.Coverage) = .empty,
 suppressions: []Suppression = &.{},
 suppressed: usize = 0,
@@ -208,6 +212,22 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
     const line = file.line(start);
     const metadata = rules.definition(rule, self.definitions) orelse return error.InvalidSelection;
     const span: Report.Span = .{ .file = self.file, .start = start, .end = end, .line = line + 1, .column = file.column(start) };
+    const key = try self.a.print("{d} {d} {d} {d} {s}", .{ @backingInt(rule), @backingInt(self.file), start, end, message });
+    const seen = try self.emitted.getOrPut(self.a, key);
+    if (seen.found_existing) {
+        const index = seen.value_ptr.* orelse return;
+        const diagnostic = &self.diagnostics.items[index];
+        var merged: std.ArrayList(Report.Span) = .empty;
+        try merged.appendSlice(self.a, diagnostic.related);
+        for (related) |each| {
+            for (merged.items) |known| {
+                if (std.meta.eql(known, each)) break;
+            } else try merged.append(self.a, each);
+        }
+        diagnostic.related = merged.items;
+        return;
+    }
+    seen.value_ptr.* = null;
     // An escape in the older form names no rule it was judged for: what it covers is recorded
     // for the fix to name, and stays a finding, its fix held back, until its rules are named.
     var held = false;
@@ -225,6 +245,7 @@ fn emitRelated(self: *Runner, rule: rules.Rule, start: u32, end: u32, message: [
         self.suppressed += 1;
         return;
     }
+    seen.value_ptr.* = self.diagnostics.items.len;
     try self.diagnostics.append(self.a, .{ .rule = rule, .name = metadata.name, .rule_version = metadata.version, .class = switch (metadata.group) {
         .correctness => .correctness,
         .zig_style => .zig_style,

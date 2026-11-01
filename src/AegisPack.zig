@@ -988,6 +988,9 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         values[count] = param.anytype_ellipsis3 != null;
     }
     const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
+    // The generic's casts this binding makes an aegis scalar's: one finding at the binding,
+    // naming each, however many of the generic's paths and instances reach it.
+    var casts: std.ArrayList(Report.Span) = .empty;
     for (made) |copy| {
         // A cast by a parameter's type is A004's; a copy A002's, an acquisition A003's.
         if ((copy.kind == .cast) != (rule == scalar)) continue;
@@ -1012,10 +1015,13 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         if (copy.kind == .cast) {
             // The library's own generics are its safe types' internals.
             if (try c.inLibrary(Contract.library, copy.site.file)) continue;
-            const site = c.project.at(copy.site.file).file;
-            const line = site.line(site.tree.tokenStart(site.tree.nodeMainToken(copy.site.node))) + 1;
             switch (try perBuild(c, try instanceOf(c, value))) {
-                .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), try c.allocator.print("this binding makes the integer {s}:{d} makes or reads by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{ c.project.at(copy.site.file).input.name, line })),
+                .owner => |k| if (k == .scalar) {
+                    const span = c.spanOf(copy.site.file, c.project.at(copy.site.file).file.tree.nodeMainToken(copy.site.node));
+                    for (casts.items) |known| {
+                        if (known.file == span.file and known.start == span.start) break;
+                    } else try casts.append(c.allocator, span);
+                },
                 .other => {},
                 .unknown => if (!bindingTyped(value)) try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that casts integers by its parameter's type is bound to a type that does not resolve"),
             }
@@ -1049,6 +1055,18 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             .unknown => if (!bindingTyped(bound)) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve"),
         }
     }
+    if (casts.items.len == 0) return;
+    var named: std.ArrayList(u8) = .empty;
+    for (casts.items, 0..) |span, i| {
+        if (i != 0) try named.appendSlice(c.allocator, if (i + 1 == casts.items.len) " and " else ", ");
+        try named.print(c.allocator, "{s}:{d}", .{ c.project.at(span.file).input.name, span.line });
+    }
+    const message = if (casts.items.len == 1)
+        try c.allocator.print("this binding makes the integer {s} makes or reads by the generic's type an aegis scalar's, outside its checked construction and arithmetic", .{named.items})
+    else
+        try c.allocator.print("this binding makes the integers {s} make or read by the generic's type aegis scalars', outside their checked construction and arithmetic", .{named.items});
+    const at = tree.tokenToSpan(tree.nodeMainToken(node));
+    try c.emitRelated(scalar, at.start, at.end, message, casts.items);
 }
 
 fn checkCopies(c: *Context) Context.Error!void {
