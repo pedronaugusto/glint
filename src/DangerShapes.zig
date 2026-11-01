@@ -745,8 +745,10 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
 }
 
 /// Whether the field `name` of a struct literal is `released`: the literal a local's value, by
-/// each read of that field of it. The local read whole (passed, copied, its address taken) or a
-/// method called on it, or the literal not a local's value, may release it.
+/// each read of that field of it; the local read whole (passed, copied, its address taken) or a
+/// method called on it may release it. A literal no local holds goes where its type's values go:
+/// by each read of that field of its type in the program (`fieldUses`); one whose type does not
+/// resolve may release it.
 fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!Stored {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
@@ -756,7 +758,7 @@ fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, n
         if (decl.kind != .variable or decl.node != parent) continue;
         const variable = tree.fullVarDecl(decl.node) orelse continue;
         if (variable.ast.init_node.unwrap() == literal) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
-    } else return .unknown;
+    } else return typeReleased(c, byValue(try c.facts.literalType(file, literal)) orelse return .unknown, name, depth);
     var result: Stored = .no;
     for (model.references) |reference| {
         if (reference.declaration != id) continue;
@@ -769,6 +771,20 @@ fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, n
         }
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, model.parentOf(read) orelse continue)) |call| if (call.ast.fn_expr == read) return .unknown;
+    }
+    return result;
+}
+
+/// Whether a read of the field `name` of `holder`'s values anywhere in the program is
+/// `released` (an `@field` by a computed name on one may be).
+fn typeReleased(c: *Context, holder: Facts.Container, name: []const u8, depth: u8) Context.Error!Stored {
+    var result: Stored = .no;
+    for (try fieldUses(c, name)) |use| {
+        const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
+        if (receiver.file != holder.file or receiver.scope != holder.scope) continue;
+        const answer = try released(c, use.file, use.node, depth + 1);
+        result = join(result, if (use.named) answer else if (answer == .no) .no else .unknown);
+        if (result == .yes) return .yes;
     }
     return result;
 }
