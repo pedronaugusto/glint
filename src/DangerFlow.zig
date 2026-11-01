@@ -1602,11 +1602,12 @@ fn capped(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!bo
     return false;
 }
 
-/// The level of `node`, a number held to 16 bits read as data: a count a short holds, as a
-/// decode of 16 bits gives (Range.zig).
+/// The level of `node`, a number counting no more than a short or the memory the function
+/// holds read as data, on every path to it (Proof.counts): a count a short holds, as a decode
+/// of 16 bits gives, or one the path held there, as a check or a store of a constant does.
 fn ranged(c: *Context, flow: *Taint.Flow, node: Ast.Node.Index) Context.Error!Taint.Level {
     const level = try Taint.levelAt(c, flow, c.file, node);
-    if (level == .number and try Range.small(c, c.file, node)) return .data;
+    if (level == .number and try Proof.counts(c, c.file, node)) return .data;
     return level;
 }
 

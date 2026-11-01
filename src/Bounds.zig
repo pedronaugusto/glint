@@ -734,7 +734,7 @@ const Key = union(enum) {
     value: Model.Declaration.Id,
     length: Model.Declaration.Id,
     /// What an expression gives, read again on each pass over it.
-    temp: struct { node: Ast.Node.Index, part: u8 },
+    temp: struct { node: Ast.Node.Index, part: u8, index: u32 = 0 },
     result,
     result_length,
     /// How many passes a loop has run since it was entered.
@@ -922,7 +922,7 @@ const Frame = struct {
         var it = proto.iterate(callee_tree);
         while (it.next()) |_| count += 1;
         const entry = try f.calls.getOrPut(f.a, callee);
-        if (count != args.len or count > 64) {
+        if (count != args.len) {
             entry.value_ptr.* = null;
             return;
         }
@@ -1122,9 +1122,10 @@ const Frame = struct {
     /// Whether `node`, valued `value` in `s`, counts no more than the work the function holds:
     /// within a short's count either way, or between zero and the length of some memory it
     /// holds. Recorded at every node that may decide a loop's passes, as DangerFlow's `decides`
-    /// reads a condition: each comparison's operands, a payload loop's condition, and each value
-    /// a variable is given. DangerFlow asks only at the loops' own; a node never recorded here
-    /// is never cleared.
+    /// reads a condition (each comparison's operands, a payload loop's condition, and each
+    /// value a variable is given), and at each argument a call is given, which may size its
+    /// work. DangerFlow asks only at the loops' own and at the sizes a call takes; a node never
+    /// recorded here is never cleared.
     fn counted(f: *Frame, s: State, node: Ast.Node.Index, value: ?Lin) Error!void {
         if (f.trial > 0) return;
         const x = value orelse return f.record(node, .count, false);
@@ -1210,7 +1211,13 @@ const Frame = struct {
 
     /// A fresh variable for an expression's result, read again on each pass over it.
     fn temp(f: *Frame, s: State, node: Ast.Node.Index, part: u8) Error!struct { State, Var } {
-        const t = try f.variable(.{ .temp = .{ .node = node, .part = part } });
+        return f.tempAt(s, node, part, 0);
+    }
+
+    /// The `index`th of a node's temporaries of one `part`: an operand's, a place's, as many as
+    /// the node has.
+    fn tempAt(f: *Frame, s: State, node: Ast.Node.Index, part: u8, index: u32) Error!struct { State, Var } {
+        const t = try f.variable(.{ .temp = .{ .node = node, .part = part, .index = index } });
         return .{ try forget(f.a, s, t), t };
     }
 
@@ -2708,13 +2715,14 @@ const Frame = struct {
         for (full.ast.params, 0..) |param, i| {
             const e = try f.eval(out, param);
             out = e.s;
+            try f.counted(out, param, e.v.lin);
             var arg: Value = .{ .lin = e.v.lin };
             if (e.v.lin == null) {
                 const measured = try f.lengthOf(out, param, e.v);
                 out = measured[0];
                 arg = .{ .length = measured[1] };
             }
-            if (i < 120) out = try f.heldAtCall(out, node, @intCast(2 + i), &arg, f.assignsAny(full.ast.params[i + 1 ..]));
+            out = try f.heldAtCall(out, node, @intCast(2 + i), &arg, f.assignsAny(full.ast.params[i + 1 ..]));
             try args.append(f.a, arg);
         }
         try f.recordCall(out, node, full.ast.fn_expr, args.items);
@@ -2740,12 +2748,11 @@ const Frame = struct {
             const p: Place = .{ .root = root, .field = listed.field };
             entries[k].place = p;
             // Each place's entries in the temporaries after the operands'.
-            const slot_k: u8 = @intCast(k);
             inline for (.{ false, true }, 0..) |length, part| {
                 const made = f.known(if (length) .{ .place_length = p } else .{ .place = p }) == null;
                 const v = try f.placeVar(p, length);
                 if (made) out = try f.atEntry(out, v, p, length);
-                const t = try f.temp(out, node, 244 + slot_k * 2 + @as(u8, part));
+                const t = try f.tempAt(out, node, 3, @intCast(k * 2 + part));
                 out = try f.equal(t[0], t[1], try single(f.a, v));
                 entries[k].before[part] = try single(f.a, t[1]);
             }
@@ -2806,10 +2813,10 @@ const Frame = struct {
     /// next): the callee may store into the place, and what its summary says is of the value it
     /// was given; a later operand may assign a variable it reads (`get(i, blk: { i = 3; … })`),
     /// and Zig passes the value it read.
-    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, ordinal: u7, value: *Value, later: bool) Error!State {
+    fn heldAtCall(f: *Frame, s: State, node: Ast.Node.Index, ordinal: u32, value: *Value, later: bool) Error!State {
         var out = s;
         inline for (.{ "lin", "length" }, 0..) |part_name, k| if (@field(value, part_name)) |lin| if (f.readsPlace(lin) or (later and lin.terms.len != 0)) {
-            const t = try f.temp(out, node, @as(u8, ordinal) * 2 + @as(u8, k));
+            const t = try f.tempAt(out, node, 2, ordinal * 2 + @as(u32, k));
             out = try f.equal(t[0], t[1], lin);
             @field(value, part_name) = try single(f.a, t[1]);
         };

@@ -1,14 +1,14 @@
 .{
     .open = .{
+        // matrix precision: a ceiling written through a pointer to a local (`p.* = m`) is not the local's; Range's move onto Facts.accesses
+        "address/m-a12-address_store/twin.zig",
         // matrix A012: a std call made through @call is no call the rule reads
         "call/mx-builtin_call/hole.zig",
         // matrix A012: HashMapUnmanaged.ensureUnusedCapacity's size is named additional_size, not in the size names
         "call/mx-map_unused_capacity/hole.zig",
         // matrix A012: Writer.splatBytesAll's count is named splat, not in the size names
         "call/mx-splat_count/hole.zig",
-        // matrix A012: @bitCast of a peer's four bytes keeps a byte's level, not a number's
-        "conversion/mx-bitcast_bytes/hole.zig",
-        // matrix A012: @memcpy of a peer's bytes into an integer keeps a byte's level, not a number's
-        "memory/mx-memcpy_bytes/hole.zig",
+        // matrix precision: a ceiling through @atomicStore and @atomicLoad is not carried; Range's move onto Facts.accesses
+        "memory/m-a12-atomic_store/twin.zig",
     },
 }

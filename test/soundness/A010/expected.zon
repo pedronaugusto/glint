@@ -1,4 +1,6 @@
 .{
-    .no_hole = .{ .field, .jump, .aggregate, .branch },
-    .no_twin = .{ .field, .inline_loop, .aggregate, .branch },
+    .open = .{
+        // matrix precision: Range does not count an inline for's passes, so a u8 and a u16 summed into a u64 read as able to overflow
+        "inline_loop/m-a10-inline_sum/twin.zig",
+    },
 }

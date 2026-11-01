@@ -2566,8 +2566,7 @@ fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveE
     var body_buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&body_buffer, body) orelse return false;
     if (statements.len == 0) return false;
-    const changed = self.recursion(function, body, statements[statements.len - 1]) orelse return false;
-    return position < 64 and changed & (@as(u64, 1) << @intCast(position)) != 0;
+    return self.recursion(function, body, statements[statements.len - 1], position) orelse false;
 }
 
 /// What calling `callee` returns: its declared result, or the container a type function makes.
@@ -3140,7 +3139,7 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
     // branch or a nested block, gives this function's own container only by calling it again
     // (`Aligned(T, null)` for a list's natural alignment). Those after it are inside the
     // returned container, where only nested functions can contain one.
-    _ = self.recursion(decl, body, last) orelse return null;
+    _ = self.recursion(decl, body, last, 0) orelse return null;
     const returned = tree.nodeData(last).opt_node.unwrap() orelse return null;
     var container_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&container_buffer, returned) == null) {
@@ -3849,23 +3848,22 @@ fn valueOf(self: *Facts, value: Value) ResolveError!Value {
     };
 }
 
-/// The parameters a type function passes on changed where a `return` before its final one
-/// (`body`'s `last` statement) calls it again: a bit per position whose argument is not that
-/// same parameter. Null when an earlier `return` gives anything but such a call.
-fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Node.Index) ?u64 {
+/// Whether a type function passes its parameter at `position` on changed where a `return`
+/// before its final one (`body`'s `last` statement) calls it again: an argument there that is
+/// not that same parameter. Null when an earlier `return` gives anything but such a call.
+fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Node.Index, position: usize) ?bool {
     const tree = &self.project.at(decl.file).file.tree;
     const model = &self.project.at(decl.file).model;
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&fn_buffer, model.declarations[@backingInt(decl.index)].node) orelse return null;
-    var params: [64]Ast.TokenIndex = @splat(0);
+    var name: ?Ast.TokenIndex = null;
     var count: usize = 0;
     var it = proto.iterate(tree);
-    while (it.next()) |param| {
-        if (count == params.len) return null;
-        params[count] = param.name_token orelse return null;
-        count += 1;
+    while (it.next()) |param| : (count += 1) {
+        const token = param.name_token orelse return null;
+        if (count == position) name = token;
     }
-    var changed: u64 = 0;
+    var changed = false;
     const first = tree.firstToken(body);
     const end = tree.nodeMainToken(last);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -3879,10 +3877,10 @@ fn recursion(self: *const Facts, decl: Decl, body: Ast.Node.Index, last: Ast.Nod
         if (tree.nodeTag(call.ast.fn_expr) != .identifier) return null;
         const callee = (model.reference(call.ast.fn_expr) orelse return null).declaration orelse return null;
         if (callee != decl.index or call.ast.params.len != count) return null;
-        for (call.ast.params, 0..) |arg, position| {
-            const same_parameter = tree.nodeTag(arg) == .identifier and if (model.reference(arg)) |ref| if (ref.declaration) |index| model.declarations[@backingInt(index)].token == params[position] else false else false;
-            if (!same_parameter) changed |= @as(u64, 1) << @intCast(position);
-        }
+        const own = name orelse continue;
+        const arg = call.ast.params[position];
+        const same_parameter = tree.nodeTag(arg) == .identifier and if (model.reference(arg)) |ref| if (ref.declaration) |index| model.declarations[@backingInt(index)].token == own else false else false;
+        if (!same_parameter) changed = true;
     }
     return changed;
 }

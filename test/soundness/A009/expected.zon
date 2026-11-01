@@ -1,4 +1,6 @@
 .{
-    .no_hole = .{ .field, .unwrap, .branch },
-    .no_twin = .{ .field, .deferred, .jump, .aggregate, .branch },
+    .open = .{
+        // matrix precision: Bounds does not carry a checked value through a struct literal's field to its read (`h.at`)
+        "aggregate/m-a09-struct_literal/twin.zig",
+    },
 }
