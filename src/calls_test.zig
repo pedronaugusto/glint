@@ -41,7 +41,21 @@ const rows = [_]Row{
     .{ .name = "a private global's every store", .source = fns ++ "var h: *const fn () void = &a;\nfn s() void {\n    h = &b;\n}\nfn w() void {\n    h();\n}\n", .expected = &.{"8 a|b 0"} },
     .{ .name = "a public global", .source = fns ++ "pub var h: *const fn () void = &a;\nfn w() void {\n    h();\n}\n", .expected = &.{"5 any unresolved 0"} },
     .{ .name = "a parameter", .source = "fn w(f: *const fn () void) void {\n    f();\n}\n", .expected = &.{"2 any unresolved 0"} },
-    .{ .name = "a capture", .source = fns ++ "const fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    for (fs) |f| f();\n}\n", .expected = &.{"5 any unresolved 0"} },
+    .{ .name = "a capture", .source = fns ++ "const fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    for (fs) |f| f();\n}\n", .expected = &.{"5 a|b 0"} },
+    .{ .name = "an element of a constant table", .source = fns ++ "fn w(i: usize) void {\n    const t = [_]*const fn () void{ &a, &b };\n    t[i]();\n}\n", .expected = &.{"5 a|b 0"} },
+    .{ .name = "a typeless literal's field", .source = fns ++ "fn w() void {\n    const ops = .{ .run = &a };\n    ops.run();\n}\n", .expected = &.{"5 a 0"} },
+    .{ .name = "a mutable local's address dropped", .source = fns ++ "fn w() void {\n    var f: *const fn () void = &a;\n    _ = &f;\n    f();\n}\n", .expected = &.{"6 a 0"} },
+    .{ .name = "a branch's every result", .source = fns ++ "fn w(c: bool) void {\n    const f = if (c) &a else &b;\n    f();\n}\n", .expected = &.{"5 a|b 0"} },
+    .{ .name = "a private function's parameter, bound at its calls", .source = fns ++ "fn apply(f: *const fn () void) void {\n    f();\n}\nfn w() void {\n    apply(&a);\n}\n", .expected = &.{ "4 a 0", "7 apply 1" } },
+    .{ .name = "a comptime parameter, bound at its calls", .source = fns ++ "fn twice(comptime f: fn () void) void {\n    f();\n}\npub fn w() void {\n    twice(b);\n}\n", .expected = &.{ "4 b 0", "7 twice 1" } },
+    .{ .name = "a public function's parameter", .source = fns ++ "pub fn apply(f: *const fn () void) void {\n    f();\n}\nfn w() void {\n    apply(&a);\n}\n", .expected = &.{ "4 any generic 0", "7 apply 1" } },
+    .{ .name = "an optional's payload", .source = fns ++ "fn w(c: bool) void {\n    const m: ?*const fn () void = if (c) &a else null;\n    if (m) |f| f();\n}\n", .expected = &.{"5 a 0"} },
+    .{ .name = "an optional unwrapped", .source = fns ++ "fn w() void {\n    const m: ?*const fn () void = &a;\n    m.?();\n}\n", .expected = &.{"5 a 0"} },
+    .{ .name = "a cast of a function's pointer", .source = fns ++ "fn w() void {\n    const f: *const fn () void = @ptrCast(&a);\n    f();\n}\n", .expected = &.{"5 a 0"} },
+    .{ .name = "a destructure's elements", .source = fns ++ "fn w() void {\n    const f, const g = .{ a, b };\n    f();\n    g();\n}\n", .expected = &.{ "5 a 0", "6 b 0" } },
+    .{ .name = "an inline for over a tuple of functions", .source = fns ++ "fn w() void {\n    inline for (.{ a, b }) |f| f();\n}\n", .expected = &.{"4 a|b 0"} },
+    .{ .name = "a labeled block's every break", .source = fns ++ "fn w(c: bool) void {\n    const f = blk: {\n        if (c) break :blk &a;\n        break :blk &b;\n    };\n    f();\n}\n", .expected = &.{"8 a|b 0"} },
+    .{ .name = "a load of memory a caller gives", .source = fns ++ "pub fn w(slot: **const fn () void) void {\n    @atomicStore(*const fn () void, slot, &a, .release);\n    @atomicLoad(*const fn () void, slot, .acquire)();\n}\n", .expected = &.{"5 any unsupported 0"} },
     .{ .name = "an element", .source = fns ++ "var fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    fs[0]();\n}\n", .expected = &.{"5 any unsupported 0"} },
     .{ .name = "a call's result", .source = fns ++ "fn get() *const fn () void {\n    return &a;\n}\nfn w() void {\n    get()();\n}\n", .expected = &.{ "7 any unsupported 0", "7 get 0" } },
     .{ .name = "a member of a holder that does not resolve", .source = "fn w(s: anytype) void {\n    s.m();\n}\n", .expected = &.{"2 any generic ?"} },
@@ -99,4 +113,19 @@ test "calls: each construct's callee is read, and any where it cannot be known" 
         std.debug.print("\n", .{});
     }
     try std.testing.expect(!failed);
+}
+
+test "calls: a call of one argument keeps it past the next call read" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "fn one(x: u8) void {\n    _ = x;\n}\nfn w() void {\n    one(7);\n    one(8);\n}\n" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const made = try calls.in(&facts, project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 2), made.len);
+    for (made, [_][]const u8{ "7", "8" }) |call, literal| {
+        try std.testing.expectEqualStrings(literal, tree.getNodeSource(call.args.?[0]));
+    }
 }

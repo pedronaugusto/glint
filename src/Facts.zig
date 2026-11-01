@@ -5836,7 +5836,8 @@ pub const calls = struct {
             const fn_expr = call.ast.fn_expr;
             const receiver = try bound(facts, file, fn_expr);
             const args: ?[]const Ast.Node.Index = switch (receiver) {
-                .none => call.ast.params,
+                // `f(a)`'s argument may be in `call_buffer`: copied out of this frame.
+                .none => try facts.gpa.dupe(Ast.Node.Index, call.ast.params),
                 .value => |holder| try std.mem.concat(facts.gpa, Ast.Node.Index, &.{ &.{holder}, call.ast.params }),
                 .unknown => null,
             };
@@ -5900,7 +5901,8 @@ pub const calls = struct {
             else => return .none,
         };
         const value = try facts.resolve(file, holder);
-        if (value == .container) return .none;
+        // A type's member, or a typeless literal's field, binds nothing.
+        if (value == .container or value == .literal) return .none;
         // A field holds what it is given, and a call through it binds nothing.
         const decl = (try memberNamed(facts, file, callee)) orelse return .unknown;
         if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .none;
@@ -5925,124 +5927,286 @@ pub const calls = struct {
         return at_node;
     }
 
-    /// What calling the value of `node` calls. A constant is its initializer's, a field the
-    /// functions every store gives it, a mutable local the functions each of its stores gives;
-    /// a parameter, a capture, an element, a call's result and anything else may be any.
+    /// What calling the value of `node` calls: each function a source of it gives.
     fn calleeOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!Callee {
-        if (depth > 8) return .{ .any = .cycle };
+        var found: std.ArrayList(Facts.Decl) = .empty;
+        if (try gather(facts, file, node, depth, &found)) |why| return .{ .any = why };
+        return switch (found.items.len) {
+            // No source gives it a function: nothing it calls is known.
+            0 => .{ .any = .unresolved },
+            1 => .{ .function = found.items[0] },
+            else => .{ .choice = found.items },
+        };
+    }
+
+    /// Adds to `found` each function the value of `node` may be; why not, where one source may
+    /// be any. A constant is its initializer's; a branch, `orelse`, a labeled block each of
+    /// its results; a field the functions every store gives it, a mutable variable each of its
+    /// stores', a parameter each argument its function's calls pass, a capture what it is
+    /// taken from, an element each its table holds. `null` and `undefined` give none.
+    fn gather(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
+        if (depth > 8) return .cycle;
         const tree = &facts.project.at(file).file.tree;
         const model = &facts.project.at(file).model;
         switch (tree.nodeTag(node)) {
-            .grouped_expression => return calleeOf(facts, file, tree.nodeData(node).node_and_token[0], depth + 1),
+            .grouped_expression, .unwrap_optional => return gather(facts, file, tree.nodeData(node).node_and_token[0], depth + 1, found),
             // A function's address, or the function a pointer points at, is called the same.
-            .address_of, .deref => return calleeOf(facts, file, tree.nodeData(node).node, depth + 1),
+            .address_of, .deref => return gather(facts, file, tree.nodeData(node).node, depth + 1, found),
+            .@"orelse" => {
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                if (try gather(facts, file, lhs, depth + 1, found)) |why| return why;
+                return gather(facts, file, rhs, depth + 1, found);
+            },
             .identifier => {
-                const reference = model.reference(node) orelse return .{ .any = .unresolved };
-                const d = reference.declaration orelse return .{ .any = if (reference.unknown == .primitive) .unsupported else .unresolved };
-                return declared(facts, .{ .file = file, .index = d }, depth);
+                const spelled = tree.tokenSlice(tree.nodeMainToken(node));
+                if (std.mem.eql(u8, spelled, "null") or std.mem.eql(u8, spelled, "undefined")) return null;
+                const reference = model.reference(node) orelse return .unresolved;
+                const d = reference.declaration orelse return if (reference.unknown == .primitive) .unsupported else .unresolved;
+                return declared(facts, .{ .file = file, .index = d }, depth, found);
             },
             .field_access => {
-                const decl = (try facts.definition(file, node)) orelse return unresolved(facts, try facts.resolve(file, node));
-                return memberCallee(facts, file, tree.nodeData(node).node_and_token[0], decl, depth);
+                const holder, const name = tree.nodeData(node).node_and_token;
+                const decl = (try facts.definition(file, node)) orelse {
+                    // A member of a literal with no type of its own: the value it gives.
+                    if (try literalMember(facts, file, holder, try facts.memberName(tree.tokenSlice(name)), depth)) |value|
+                        return gather(facts, value.file, value.node, depth + 1, found);
+                    return addResolved(facts, try facts.resolve(file, node), found);
+                };
+                return memberCallee(facts, file, holder, decl, depth, found);
             },
+            .array_access => return elements(facts, file, tree.nodeData(node).node_and_node[0], depth, found),
             .builtin_call_two, .builtin_call_two_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
-                if (std.mem.eql(u8, name, "@as") and args.len == 2) return calleeOf(facts, file, args[1], depth + 1);
-                if (std.mem.eql(u8, name, "@field") and args.len == 2) {
-                    const decl = (try facts.reflected(file, node)) orelse return .{ .any = .comptime_dependent };
-                    return memberCallee(facts, file, args[0], decl, depth);
+                if (std.mem.eql(u8, name, "@as") and args.len == 2) return gather(facts, file, args[1], depth + 1, found);
+                // A cast of a function's pointer calls that function; one of other memory gives
+                // nothing known.
+                for ([_][]const u8{ "@ptrCast", "@alignCast", "@constCast", "@volatileCast" }) |cast| {
+                    if (std.mem.eql(u8, name, cast) and args.len == 1) return gather(facts, file, args[0], depth + 1, found);
                 }
-                return .{ .any = .unsupported };
+                if (std.mem.eql(u8, name, "@field") and args.len == 2) {
+                    const decl = (try facts.reflected(file, node)) orelse return .comptime_dependent;
+                    return memberCallee(facts, file, args[0], decl, depth, found);
+                }
+                return .unsupported;
             },
-            else => return .{ .any = .unsupported },
+            else => {},
         }
+        if (tree.fullIf(node)) |branch| {
+            if (try gather(facts, file, branch.ast.then_expr, depth + 1, found)) |why| return why;
+            return gather(facts, file, branch.ast.else_expr.unwrap() orelse return .unsupported, depth + 1, found);
+        }
+        if (tree.fullSwitch(node)) |choice| {
+            for (choice.ast.cases) |case| if (try gather(facts, file, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1, found)) |why| return why;
+            return null;
+        }
+        // `blk: { … break :blk value; }`: each value a break of its label gives.
+        if (blockLabel(tree, node)) |label| {
+            const first = tree.firstToken(node);
+            const last = tree.lastToken(node);
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                if (tag != .@"break") continue;
+                const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (tree.nodeMainToken(jump) < first or tree.nodeMainToken(jump) > last) continue;
+                const named, const value = tree.nodeData(jump).opt_token_and_opt_node;
+                if (!std.mem.eql(u8, tree.tokenSlice(named.unwrap() orelse continue), label)) continue;
+                if (try gather(facts, file, value.unwrap() orelse return .unsupported, depth + 1, found)) |why| return why;
+            }
+            return null;
+        }
+        return .unsupported;
     }
 
-    /// What calling a declaration's value calls.
-    fn declared(facts: *Facts, decl: Facts.Decl, depth: u8) Error!Callee {
+    /// A labeled block's label.
+    fn blockLabel(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+        switch (tree.nodeTag(node)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => return null,
+        }
+        const brace = tree.nodeMainToken(node);
+        if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return null;
+        return tree.tokenSlice(brace - 2);
+    }
+
+    /// What a declaration's value may be when called.
+    fn declared(facts: *Facts, decl: Facts.Decl, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         const source = facts.project.at(decl.file);
         const record = source.model.declarations[@backingInt(decl.index)];
         const tree = &source.file.tree;
         switch (record.kind) {
-            .function => return .{ .function = decl },
-            // What a caller or a loop gives it.
-            .parameter, .capture => return .{ .any = .unresolved },
-            .field => return .{ .any = .unresolved },
+            .function => {
+                try add(facts, found, decl);
+                return null;
+            },
+            .parameter => return argued(facts, decl, depth, found),
+            .capture => return captureCallee(facts, decl, depth, found),
+            .field => return .unresolved,
             .variable => {
-                const variable = tree.fullVarDecl(record.node) orelse return .{ .any = .unsupported };
-                if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return stored(facts, decl, depth);
+                // `const f, const g = .{ a, b };`: its element.
+                if (source.model.parentOf(record.node)) |parent| if (tree.nodeTag(parent) == .assign_destructure) {
+                    const full = tree.assignDestructure(parent);
+                    const position = std.mem.findScalar(Ast.Node.Index, full.ast.variables, record.node) orelse return .unsupported;
+                    const item = (try literalElement(facts, decl.file, full.ast.value_expr, position, full.ast.variables.len, depth)) orelse return .unsupported;
+                    return gather(facts, item.file, item.node, depth + 1, found);
+                };
+                const variable = tree.fullVarDecl(record.node) orelse return .unsupported;
+                if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return stored(facts, decl, depth, found);
                 // `extern`: a function another object defines.
-                const init = variable.ast.init_node.unwrap() orelse return .{ .any = .unresolved };
-                return calleeOf(facts, decl.file, init, depth + 1);
+                return gather(facts, decl.file, variable.ast.init_node.unwrap() orelse return .unresolved, depth + 1, found);
             },
         }
+    }
+
+    /// What a parameter may be: each argument its function's every call passes at its place,
+    /// where every call is the program's (`callSites`).
+    fn argued(facts: *Facts, parameter: Facts.Decl, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
+        const function = facts.functionOf(parameter) orelse return .comptime_dependent;
+        const source = facts.project.at(function.file);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = source.file.tree.fullFnProto(&buffer, source.model.declarations[@backingInt(function.index)].node) orelse return .unresolved;
+        var params = proto.iterate(&source.file.tree);
+        var position: usize = 0;
+        while (params.next()) |param| : (position += 1) {
+            if (param.name_token == source.model.declarations[@backingInt(parameter.index)].token) break;
+        } else return .unresolved;
+        for ((try facts.callSites(function)) orelse return .generic) |site| {
+            const argument = if (position < site.receiver) site.holder else if (position - site.receiver < site.params.len) site.params[position - site.receiver] else return .unresolved;
+            if (try gather(facts, site.file, argument, depth + 1, found)) |why| return why;
+        }
+        return null;
+    }
+
+    /// What a capture may be: an `if`'s or a `while`'s payload what its optional holds, a `for`'s
+    /// first capture each element of what it loops over. A pointer capture, a switch's, an
+    /// error's may be any.
+    fn captureCallee(facts: *Facts, capture: Facts.Decl, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
+        const source = facts.project.at(capture.file);
+        const tree = &source.file.tree;
+        const token = source.model.declarations[@backingInt(capture.index)].token;
+        var at_node = source.model.declarations[@backingInt(capture.index)].node;
+        while (true) {
+            if (tree.fullFor(at_node)) |loop| {
+                if (loop.payload_token != token) return .unsupported;
+                return elements(facts, capture.file, loop.ast.inputs[0], depth, found);
+            }
+            if (tree.fullIf(at_node)) |branch| {
+                if (branch.payload_token != token) return .unsupported;
+                return gather(facts, capture.file, branch.ast.cond_expr, depth + 1, found);
+            }
+            if (tree.fullWhile(at_node)) |loop| {
+                if (loop.payload_token != token) return .unsupported;
+                return gather(facts, capture.file, loop.ast.cond_expr, depth + 1, found);
+            }
+            at_node = source.model.parentOf(at_node) orelse return .unsupported;
+        }
+    }
+
+    /// Each element of the table `node` names: an array or tuple literal's, a constant's.
+    fn elements(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
+        const literal = (try constantValue(facts, file, node, depth)) orelse return .unsupported;
+        const tree = &facts.project.at(literal.file).file.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const array = tree.fullArrayInit(&buffer, literal.node) orelse return .unsupported;
+        for (array.ast.elements) |item| if (try gather(facts, literal.file, item, depth + 1, found)) |why| return why;
+        return null;
+    }
+
+    /// The expression a constant's chain of names ends at: `node` itself where it names none.
+    fn constantValue(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!?Facts.Key {
+        if (depth > 8) return null;
+        const tree = &facts.project.at(file).file.tree;
+        const model = &facts.project.at(file).model;
+        const at_node = ungrouped(tree, node);
+        if (tree.nodeTag(at_node) != .identifier) return .{ .file = file, .node = at_node };
+        const d = (model.reference(at_node) orelse return null).declaration orelse return null;
+        const record = model.declarations[@backingInt(d)];
+        if (record.kind != .variable) return null;
+        const variable = tree.fullVarDecl(record.node) orelse return null;
+        if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return null;
+        return constantValue(facts, file, variable.ast.init_node.unwrap() orelse return null, depth + 1);
+    }
+
+    /// The value a literal with no type of its own gives its field `name`, where `holder` is one.
+    fn literalMember(facts: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: []const u8, depth: u8) Error!?Facts.Key {
+        const literal = (try constantValue(facts, file, holder, depth)) orelse return null;
+        const tree = &facts.project.at(literal.file).file.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const init = tree.fullStructInit(&buffer, literal.node) orelse return null;
+        if (init.ast.type_expr != .none) return null;
+        for (init.ast.fields) |field| {
+            const spelled = tree.tokenSlice(tree.firstToken(field) - 2);
+            if (std.mem.eql(u8, try facts.memberName(spelled), name)) return .{ .file = literal.file, .node = field };
+        }
+        return null;
+    }
+
+    /// The element at `position` of a literal of `count` elements `node` is, as a destructure
+    /// reads it.
+    fn literalElement(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, position: usize, count: usize, depth: u8) Error!?Facts.Key {
+        const literal = (try constantValue(facts, file, node, depth)) orelse return null;
+        const tree = &facts.project.at(literal.file).file.tree;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const array = tree.fullArrayInit(&buffer, literal.node) orelse return null;
+        if (array.ast.elements.len != count) return null;
+        return .{ .file = literal.file, .node = array.ast.elements[position] };
     }
 
     /// What calling a member of `holder` calls: a declaration's value as `declared` reads it, a
     /// field's the functions its stores give.
-    fn memberCallee(facts: *Facts, file: Project.FileId, holder: Ast.Node.Index, decl: Facts.Decl, depth: u8) Error!Callee {
+    fn memberCallee(facts: *Facts, file: Project.FileId, holder: Ast.Node.Index, decl: Facts.Decl, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-        if (record.kind != .field) return declared(facts, decl, depth);
-        const container = fieldOwner(try facts.resolve(file, holder)) orelse return .{ .any = .unresolved };
-        return unresolved(facts, (try facts.storedFunctions(container, record.name)) orelse return .{ .any = .unresolved });
+        if (record.kind != .field) return declared(facts, decl, depth, found);
+        const container = fieldOwner(try facts.resolve(file, holder)) orelse return .unresolved;
+        return addResolved(facts, (try facts.storedFunctions(container, record.name)) orelse return .unresolved, found);
     }
 
     /// What a mutable variable may hold when called: each value a store gives it. Only a local or
     /// a private one of its file is read, in that file; a public one may be written where this run
-    /// does not look, and an address taken may write it anywhere.
-    fn stored(facts: *Facts, decl: Facts.Decl, depth: u8) Error!Callee {
+    /// does not look, and an address taken may write it anywhere but where it is dropped (`_ = &f`).
+    fn stored(facts: *Facts, decl: Facts.Decl, depth: u8, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-        if (record.public) return .{ .any = .unresolved };
-        var found: std.ArrayList(Facts.Decl) = .empty;
+        if (record.public) return .unresolved;
         for (try accesses.writes(facts, .{ .declaration = decl }, &.{decl.file})) |site| {
-            if (site.reach != .exact or site.part) return .{ .any = .unresolved };
+            if (site.reach != .exact or site.part) return .unresolved;
             switch (site.kind) {
                 .init, .set => {},
                 .read => continue,
-                .update, .covered, .address => return .{ .any = .unresolved },
+                .address => if (dropped(facts, site)) continue else return .unresolved,
+                .update, .covered => return .unresolved,
             }
-            const value = site.value orelse return .{ .any = .unresolved };
-            // `undefined` until a store gives it one: a call before that is no call this reads.
-            if (site.kind == .init and isUndefined(&facts.project.at(site.file).file.tree, value)) continue;
-            switch (try calleeOf(facts, site.file, value, depth + 1)) {
-                .function => |one| try add(facts, &found, one),
-                .choice => |each| for (each) |one| try add(facts, &found, one),
-                .any => |why| return .{ .any = why },
-            }
+            if (try gather(facts, site.file, site.value orelse return .unresolved, depth + 1, found)) |why| return why;
         }
-        return choice(found.items);
+        return null;
     }
 
-    /// The callee a resolved value is: a function, a pointer to one, a choice of them.
-    fn unresolved(facts: *Facts, value: Facts.Value) Error!Callee {
-        var found: std.ArrayList(Facts.Decl) = .empty;
+    /// Whether an address is taken only to be dropped: `_ = &f`.
+    fn dropped(facts: *Facts, site: accesses.Site) bool {
+        const tree = &facts.project.at(site.file).file.tree;
+        const parent = facts.project.at(site.file).model.parentOf(site.node) orelse return false;
+        if (tree.nodeTag(site.node) != .address_of or tree.nodeTag(parent) != .assign) return false;
+        const lhs, const rhs = tree.nodeData(parent).node_and_node;
+        return rhs == site.node and tree.nodeTag(lhs) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_");
+    }
+
+    /// Adds the functions a resolved value is: a function, a pointer to one, a choice of them.
+    fn addResolved(facts: *Facts, value: Facts.Value, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         const each: []const Facts.Value = if (value == .alternatives) value.alternatives else &.{value};
-        for (each) |one| try add(facts, &found, switch (one) {
+        for (each) |one| try add(facts, found, switch (one) {
             .function => |d| d,
             .pointer => |to| switch (to.*) {
                 .function => |d| d,
-                else => return .{ .any = .unresolved },
+                else => return .unresolved,
             },
-            .unknown => |why| return .{ .any = why },
-            else => return .{ .any = .unresolved },
+            .unknown => |why| return why,
+            else => return .unresolved,
         });
-        return choice(found.items);
+        return null;
     }
 
     fn add(facts: *Facts, found: *std.ArrayList(Facts.Decl), one: Facts.Decl) Error!void {
         for (found.items) |seen| if (std.meta.eql(seen, one)) return;
         try found.append(facts.gpa, one);
-    }
-
-    fn choice(found: []const Facts.Decl) Callee {
-        return switch (found.len) {
-            // No store gives it a function: nothing it calls is known.
-            0 => .{ .any = .unresolved },
-            1 => .{ .function = found[0] },
-            else => .{ .choice = found },
-        };
     }
 };
 
