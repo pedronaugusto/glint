@@ -32,13 +32,6 @@
     },
     // Cases glint does not pass yet, each with what it shows.
     .open = .{
-        // review 5 P1: a program function std calls (sort, a hash map context, a thread, a search) is given input no program call shows
-        "A009/call/r5-p-p01_sort_callback/hole.zig",
-        "A009/call/r5-p-p03_hashmap_context/hole.zig",
-        "A009/call/r5-p-p04_thread_spawn/hole.zig",
-        "A009/call/r5-p-p05_binary_search/hole.zig",
-        // review 5 N2, Range: a callee handed the slice writes its length between the check and the use
-        "A010/address/r5-b-b18c_ptrslice_callee/hole.zig",
         // review 6 precision: a call through a function-pointer field whose only stored function writes whole
         "A019/assignment/r6-fp-f05_field_whole/twin.zig",
         // review 6 precision: the safe holder of a function-pointer field
