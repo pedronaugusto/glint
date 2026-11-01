@@ -2786,8 +2786,8 @@ const std_interface_implementations = [_][]const u8{
 };
 
 /// A function of std's Io.Reader or Io.Writer vtable a call reaches: `x.vtable.name(…)` with `x`
-/// one of those interfaces (or a pointer to one), and the vtable field's name.
-const Slot = struct { interface: enum { reader, writer }, name: []const u8 };
+/// one of those interfaces (or a pointer to one), and the vtable's field by its declaration.
+const Slot = struct { interface: enum { reader, writer }, name: []const u8, field: Facts.Decl };
 
 fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Context.Error!?Slot {
     const tree = &c.project.at(file).file.tree;
@@ -2805,53 +2805,29 @@ fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Conte
     for ([_][]const u8{ "Io.Reader", "Io.Writer" }, [_]@FieldType(Slot, "interface"){ .reader, .writer }) |path, interface| {
         for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| {
             const declared = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
-            if (declared == .container and std.meta.eql(declared.container, container)) return .{ .interface = interface, .name = tree.tokenSlice(name) };
+            if (declared == .container and std.meta.eql(declared.container, container)) return .{ .interface = interface, .name = tree.tokenSlice(name), .field = (try c.facts.definition(file, function)) orelse return null };
         }
     }
     return null;
 }
 
-/// The functions the program, outside std, installs in a vtable's slot: each struct literal's
-/// field of that name, and each assignment to a field of that name, whose value is a function
-/// (or a choice of them). Null where one of them is anything else that may be a function there
-/// (a parameter, a value not known here): what it installs is not known. std's own are none of
-/// these (`std_interface_implementations`).
+/// The functions the program, outside std, installs in a vtable's slot: what each store
+/// `Facts.fieldStores` reads into the slot's field by meaning may hold (a literal's field, an
+/// assignment, a destructure, `@field` by its name). Null where one may install a function not
+/// known here (a parameter's, the slot's address taken, a name computed as the program
+/// compiles, a file the front end refused). std's own are none of these
+/// (`std_interface_implementations`).
 fn installed(c: *Context, slot: Slot) Context.Error!?[]const Facts.Decl {
-    var found: std.ArrayList(Facts.Decl) = .empty;
+    var files: std.ArrayList(Project.FileId) = .empty;
     for (0..c.project.count()) |i| {
         const file: Project.FileId = @fromBackingInt(@intCast(i));
         if (try inStd(c, file)) continue;
-        const tree = &c.project.at(file).file.tree;
-        const model = &c.project.at(file).model;
-        for (tree.nodes.items(.tag), 0..) |tag, n| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-            const value: Ast.Node.Index = switch (tag) {
-                .assign => value: {
-                    const target, const stored = tree.nodeData(node).node_and_node;
-                    if (tree.nodeTag(target) != .field_access) continue;
-                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(target).node_and_token[1]), slot.name)) continue;
-                    break :value stored;
-                },
-                else => value: {
-                    // A struct literal's field `.name = value`: the token before `=` names it.
-                    const parent = model.parentOf(node) orelse continue;
-                    var buffer: [2]Ast.Node.Index = undefined;
-                    const literal = tree.fullStructInit(&buffer, parent) orelse continue;
-                    if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, node) == null) continue;
-                    const field_name = tree.firstToken(node) - 2;
-                    if (!std.mem.eql(u8, tree.tokenSlice(field_name), slot.name)) continue;
-                    break :value node;
-                },
-            };
-            const resolved = try c.facts.resolve(file, value);
-            if (try functionsOf(c.allocator, resolved, &found)) continue;
-            switch (resolved) {
-                // Plainly no function: a field of that name holding something else.
-                .literal, .primitive, .scalar, .instance, .array, .container, .error_set, .error_union => {},
-                else => return null,
-            }
-        }
+        if (c.project.at(file).file.status != .parsed) return null;
+        try files.append(c.allocator, file);
     }
+    const stored = (try c.facts.fieldStores(slot.field, files.items)) orelse return null;
+    var found: std.ArrayList(Facts.Decl) = .empty;
+    for (stored) |value| if (!try functionsOf(c.allocator, value, &found)) return null;
     return found.items;
 }
 
