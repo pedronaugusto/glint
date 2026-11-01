@@ -1712,6 +1712,17 @@ fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u
     return found;
 }
 
+/// The place `std.mem.asBytes(&x)` names: `x`.
+fn addressed(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    if (call.ast.params.len != 1 or tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]), "asBytes")) return null;
+    const operand = call.ast.params[0];
+    if (tree.nodeTag(operand) != .address_of) return null;
+    return tree.nodeData(operand).node;
+}
+
 fn pointerShaped(value: Facts.Value) bool {
     return switch (value) {
         .pointer => true,
@@ -1836,7 +1847,8 @@ fn acquiredFrom(tree: *const Ast, model: *const Model, decl: Model.Declaration) 
 
 /// The expressions whose value `node`'s is, through what hands one on whole: `try`, parentheses,
 /// `@as`, both sides of `catch` and `orelse`, an `if`'s or a switch prong's result, a labeled
-/// block's `break`s. One that gives no value (`return`, `unreachable`, a jump) is none.
+/// block's `break`s. One that gives no value (`return`, `unreachable`, a jump, an unlabeled
+/// block) is none.
 fn valueLeaves(c: *Context, tree: *const Ast, model: *const Model, node: Ast.Node.Index, into: *std.ArrayList(Ast.Node.Index), depth: u8) Context.Error!void {
     if (depth == 16) return into.append(c.allocator, node);
     const next = depth + 1;
@@ -1871,8 +1883,10 @@ fn valueLeaves(c: *Context, tree: *const Ast, model: *const Model, node: Ast.Nod
                     if (!std.mem.eql(u8, tree.tokenSlice(target.unwrap() orelse continue), label)) continue;
                     try valueLeaves(c, tree, model, value.unwrap() orelse continue, into, next);
                 }
-                return;
             }
+            // An unlabeled block gives no value: one a handler runs leaves (`catch { ...;
+            // return error.Busy; }`).
+            return;
         },
         else => if (tree.fullIf(node)) |branch| if (branch.ast.else_expr.unwrap()) |otherwise| {
             try valueLeaves(c, tree, model, branch.ast.then_expr, into, next);
@@ -2078,6 +2092,10 @@ const Flow = struct {
             if (state == .live and !f.aggregate and !f.pointer) if (try f.movedInto(stmt)) |aggregate| {
                 f.token = aggregate;
                 f.aggregate = true;
+                continue;
+            };
+            if (state == .live and !f.aggregate and !f.pointer) if (f.copiedInto(stmt)) |copy| {
+                f.token = copy;
                 continue;
             };
             // `errdefer owner.deinit()`: the owner is released on the error exits that follow.
@@ -2764,6 +2782,48 @@ const Flow = struct {
         }
         if (!held) return null;
         return variable.ast.mut_token + 1;
+    }
+
+    /// The local of the owner's own block a statement copies the owner whole into, the owner
+    /// named nowhere after it: `const copy = owner;`, `copy = owner;`, or its bytes copied
+    /// (`@memcpy(std.mem.asBytes(&copy), std.mem.asBytes(&owner))`). The copy is then the owner.
+    fn copiedInto(f: Flow, stmt: Ast.Node.Index) ?Ast.TokenIndex {
+        if (f.model.parentOf(stmt) != f.scope) return null;
+        const copy: Ast.TokenIndex, const value: Ast.Node.Index = if (f.tree.fullVarDecl(stmt)) |variable| .{
+            variable.ast.mut_token + 1,
+            variable.ast.init_node.unwrap() orelse return null,
+        } else switch (f.tree.nodeTag(stmt)) {
+            .assign => assign: {
+                const place, const source = f.tree.nodeData(stmt).node_and_node;
+                break :assign .{ f.localToken(place) orelse return null, source };
+            },
+            .builtin_call_two, .builtin_call_two_comma => bytes: {
+                if (!std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(stmt)), "@memcpy")) return null;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(f.tree, stmt, &buffer);
+                if (args.len != 2) return null;
+                const into = addressed(f.tree, args[0]) orelse return null;
+                break :bytes .{ f.localToken(into) orelse return null, addressed(f.tree, args[1]) orelse return null };
+            },
+            else => return null,
+        };
+        if (!f.mine(value) or copy == f.token) return null;
+        // The owner named nowhere after: the copy is its one holder.
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (f.mine(candidate) and f.tree.nodeMainToken(candidate) > f.tree.lastToken(stmt)) return null;
+        }
+        return copy;
+    }
+
+    /// The declaration token of a local of the owner's block `node` names.
+    fn localToken(f: Flow, node: Ast.Node.Index) ?Ast.TokenIndex {
+        if (f.tree.nodeTag(node) != .identifier) return null;
+        const index = (f.model.reference(node) orelse return null).declaration orelse return null;
+        const decl = f.model.declarations[@backingInt(index)];
+        if (decl.kind != .variable or f.model.scopes[@backingInt(decl.scope)].node != f.scope) return null;
+        return decl.token;
     }
 
     fn mine(f: Flow, node: Ast.Node.Index) bool {

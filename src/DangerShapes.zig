@@ -74,6 +74,46 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     try bindings(c, rule, resources, &resource_paths);
 }
 
+/// Whether the field read at `node` is moved out of its holder: the value (or its `.?`) of a
+/// local's declaration whose block's next statement writes `null` to the same place, spelled
+/// alike from the same declaration.
+fn movedOut(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var read = node;
+    var parent = model.parentOf(read) orelse return false;
+    if (tree.nodeTag(parent) == .unwrap_optional) {
+        read = parent;
+        parent = model.parentOf(read) orelse return false;
+    }
+    const variable = tree.fullVarDecl(parent) orelse return false;
+    if (variable.ast.init_node.unwrap() != read) return false;
+    const block = model.parentOf(parent) orelse return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return false;
+    const at = std.mem.findScalar(Ast.Node.Index, statements, parent) orelse return false;
+    if (at + 1 >= statements.len) return false;
+    const next = statements[at + 1];
+    if (tree.nodeTag(next) != .assign) return false;
+    const place, const value = tree.nodeData(next).node_and_node;
+    if (tree.nodeTag(value) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) return false;
+    if (!std.mem.eql(u8, tree.getNodeSource(place), tree.getNodeSource(node))) return false;
+    const written = placeRoot(tree, place);
+    const named = placeRoot(tree, node);
+    if (tree.nodeTag(written) != .identifier or tree.nodeTag(named) != .identifier) return false;
+    const first = (model.reference(written) orelse return false).declaration orelse return false;
+    const second = (model.reference(named) orelse return false).declaration orelse return false;
+    return first == second;
+}
+
+/// The name a place is reached from: `x` of `x.f`, `x.*.f`, `x.f.g`.
+fn placeRoot(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .deref => at = tree.nodeData(at).node,
+        else => return at,
+    };
+}
+
 /// A015 where ownership happens: the checked file's own writes and releases of a resource field
 /// another file declares (`outside`). That type is lent what its field holds (0.3's raw handle is
 /// lent, `own.OwnedIo` owned) as far as its own file shows, so an owner written into it (`s.f = opened()`, a literal of it), a release
@@ -99,6 +139,9 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
                 continue;
             };
             const which = try outside(c, resources, receiver_value, name) orelse continue;
+            // Moved out (`const out = child.stderr.?; child.stderr = null;`): the local holds
+            // it, and the type no longer names what it held.
+            if (movedOut(tree, &c.project.at(c.file).model, node)) continue;
             switch (try released(c, c.file, node, 0)) {
                 .yes => {
                     try c.at(rule, name_token, try c.allocator.print("'{s}', a std.{s} field of another file's type, is released here: a type is lent what it holds where its own file does not release it, so this releases another's owner; {s}", .{ name, resource_paths[which], advice }));
@@ -208,7 +251,7 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
 const Holding = union(enum) { resource: usize, other, generic, unknown };
 
 fn heldBy(c: *Context, resources: []const ?Facts.Container, value: Facts.Value, depth: usize) Context.Error!Holding {
-    if (depth == 16) return .unknown;
+    if (depth >= 16) return .unknown;
     return switch (value) {
         .container, .instance => |k| blk: {
             if (find(resources, k)) |which| break :blk .{ .resource = which };
@@ -571,7 +614,8 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
     const model = &c.project.at(file).model;
     var target = node;
     var parent = model.parentOf(target) orelse return .none;
-    if (tree.nodeTag(parent) == .address_of or pointerCapture(tree, model, parent, target)) return .address;
+    if (tree.nodeTag(parent) == .address_of) return addressWrite(c, resources, file, parent);
+    if (pointerCapture(tree, model, parent, target)) return .address;
     if (tree.nodeTag(parent) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "handle")) {
         target = parent;
         parent = model.parentOf(target) orelse return .none;
@@ -591,6 +635,70 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
         },
         else => return .none,
     }
+}
+
+/// How the field whose address `address` takes is written through it: by `@memcpy` or
+/// `@memmove` into its bytes (`std.mem.asBytes(&s.f)` the destination), as `=` of the source's
+/// value; through a constant local that keeps the pointer, by each use of it (`p.* = v`,
+/// `p.handle = h`; a read of a member or of `p.*` writes nothing); handed anywhere else, it may
+/// be written through.
+fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, address: Ast.Node.Index) Context.Error!Write {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const parent = model.parentOf(address) orelse return .address;
+    if (bytesOf(tree, parent) == address) {
+        const copy = model.parentOf(parent) orelse return .address;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, copy, &buffer);
+        const name = switch (tree.nodeTag(copy)) {
+            .builtin_call_two, .builtin_call_two_comma => tree.tokenSlice(tree.nodeMainToken(copy)),
+            else => return .address,
+        };
+        if (!std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) return .address;
+        if (args.len != 2) return .address;
+        // The field's bytes as the source are read, not written.
+        if (args[0] != parent) return .none;
+        const source = bytesOf(tree, args[1]) orelse return .unknown;
+        const value = if (tree.nodeTag(source) == .address_of) tree.nodeData(source).node else return .unknown;
+        return if (try filled(c, resources, file, value)) .none else .owner;
+    }
+    const variable = tree.fullVarDecl(parent) orelse return .address;
+    if (variable.ast.init_node.unwrap() != address or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return .address;
+    const local = for (model.declarations, 0..) |decl, i| {
+        if (decl.kind == .variable and decl.node == parent) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
+    } else return .address;
+    var out: Write = .none;
+    for (model.references) |reference| {
+        if (reference.declaration != local) continue;
+        const use = model.parentOf(reference.node) orelse return .address;
+        const write: Write = switch (tree.nodeTag(use)) {
+            // `p.*`: written as the field is.
+            .deref => try writeOf(c, resources, file, use),
+            .field_access => if (tree.nodeData(use).node_and_token[0] != reference.node) .address else if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(use).node_and_token[1]), "handle")) try writeOf(c, resources, file, reference.node) else .none,
+            else => .address,
+        };
+        out = switch (write) {
+            .owner => return .owner,
+            .address => .address,
+            .unknown => if (out == .address) .address else .unknown,
+            .none => out,
+        };
+    }
+    return out;
+}
+
+/// The operand of `std.mem.asBytes(x)` at `node`, if it is one.
+fn bytesOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    if (call.ast.params.len != 1) return null;
+    const callee = switch (tree.nodeTag(call.ast.fn_expr)) {
+        .field_access => tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]),
+        .identifier => tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)),
+        else => return null,
+    };
+    if (!std.mem.eql(u8, callee, "asBytes")) return null;
+    return call.ast.params[0];
 }
 
 /// Whether `parent` (an `if`, `while` or `for`) captures `node` by pointer (`|*p|`).
@@ -674,7 +782,7 @@ fn filled(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
 fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!Stored {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (depth == 8) return .unknown;
+    if (depth >= 8) return .unknown;
     const next = depth + 1;
     const parent = model.parentOf(node) orelse return .no;
     switch (tree.nodeTag(parent)) {
@@ -824,7 +932,7 @@ fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, labe
 fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!Stored {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (depth == 8) return .unknown;
+    if (depth >= 8) return .unknown;
     const parent = model.parentOf(literal) orelse return .unknown;
     const id = for (model.declarations, 0..) |decl, i| {
         if (decl.kind != .variable or decl.node != parent) continue;
@@ -1087,7 +1195,7 @@ fn implements(c: *Context, index: Model.Declaration.Id, maybe_vtable: ?Facts.Con
 fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, node: Ast.Node.Index, depth: u8, bound: ?*const Binding) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (depth == 16) return false;
+    if (depth >= 16) return false;
     const next = depth + 1;
     switch (tree.nodeTag(node)) {
         .grouped_expression => return viewed(c, resources, file, tree.nodeData(node).node_and_token[0], next, bound),

@@ -48,13 +48,6 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
-        // warp-fast: A003 reads a copy made through an owner's address (@memcpy) as an alias it does not follow: undecided until Facts.accesses follows the pointer
-        "A003/memory/wf-copy-closed-twice/twin.zig",
-        // warp-fast: A015 reads a field whose address is taken as written through it: owned until Facts.accesses follows the pointer
-        "A015/address/wf-release-through-pointer/twin.zig",
-        "A015/memory/wf-owner-by-memcpy/twin.zig",
-        // warp-fast: A020 does not resolve a call through @field (@field(w, "io").checkCancel()): undecided until Facts.accesses reads @field
-        "A020/field/wf-io-by-field-builtin/twin.zig",
         // warp-fast, Taint: an input's bytes copied by @memcpy into an integer stay data (a peer's bytes), never a number, so A020 reads the loop as bounded by the program
         "A020/memory/wf-bound-by-memcpy/hole.zig",
     },
