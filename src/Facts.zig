@@ -616,11 +616,11 @@ fn findCopies(self: *Facts) ResolveError!void {
     // Through calls that pass a parameter on, to a fixed point: a function whose copies grow
     // is read again in each generic that calls it. Copies only grow, each route at most once
     // and at most `routes` routes to a source, so it ends.
-    var calls: std.AutoHashMapUnmanaged(Decl, []const Passing) = .empty;
+    var passes: std.AutoHashMapUnmanaged(Decl, []const Passing) = .empty;
     var callers: std.AutoHashMapUnmanaged(Decl, std.ArrayList(Decl)) = .empty;
     for (functions.items) |decl| {
         const passing = try self.passings(decl);
-        try calls.put(self.gpa, decl, passing);
+        try passes.put(self.gpa, decl, passing);
         for (passing) |each| {
             const entry = try callers.getOrPut(self.gpa, each.target);
             if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -641,7 +641,7 @@ fn findCopies(self: *Facts) ResolveError!void {
         // Each held copy its own, as a route found crowded is marked in place.
         for (found.get(decl) orelse &.{}) |copy| try more.append(self.gpa, copy);
         self.copies = found;
-        if (!try self.passedCopies(decl, calls.get(decl).?, &more)) continue; // unreachable: every function's calls are read above
+        if (!try self.passedCopies(decl, passes.get(decl).?, &more)) continue; // unreachable: every function's calls are read above
         try found.put(self.gpa, decl, more.items);
         for (if (callers.get(decl)) |list| list.items else &.{}) |caller| {
             if ((try queued.getOrPut(self.gpa, caller)).found_existing) continue;
@@ -5791,6 +5791,258 @@ pub const accesses = struct {
             else => {},
         };
         return false;
+    }
+};
+
+/// Every call by meaning: `f(a)`, a method's `x.f(a)`, `@call(modifier, f, .{a})`, a callee
+/// named through `@field`, a constant bound to a function or its address, a function pointer.
+/// Each with the function it calls, a choice of them, or `any`: a rule asks here what a call
+/// calls, and reads `any` as undecided, never as a call of none.
+pub const calls = struct {
+    pub const Callee = union(enum) {
+        function: Facts.Decl,
+        /// One of these, each known: a function pointer's every store, a mutable local's.
+        choice: []const Facts.Decl,
+        /// It may call any function: why its callee is not known.
+        any: Facts.Unknown,
+    };
+
+    pub const Call = struct {
+        file: Project.FileId,
+        /// The call: `f(a)`'s node, or `@call`'s.
+        node: Ast.Node.Index,
+        /// What it calls, as written: `f(a)`'s `f`, `@call`'s second argument.
+        callee_expr: Ast.Node.Index,
+        /// The value a method call binds as the first parameter (`x` of `x.f(a)`).
+        receiver: ?Ast.Node.Index = null,
+        /// What it passes, in the callee's parameter order, the receiver first: null where that
+        /// is not known (`@call` given no tuple literal, a member called on a holder that does
+        /// not resolve, which may or may not bind it).
+        args: ?[]const Ast.Node.Index,
+        /// `@call`'s modifier.
+        modifier: ?Ast.Node.Index = null,
+        callee: Callee,
+    };
+
+    pub const Error = Facts.ResolveError;
+
+    const State = struct { files: std.AutoHashMapUnmanaged(Project.FileId, []const Call) = .empty };
+
+    /// The call `node` makes, or null where it makes none.
+    pub fn at(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Call {
+        const tree = &facts.project.at(file).file.tree;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, node)) |call| {
+            const fn_expr = call.ast.fn_expr;
+            const receiver = try bound(facts, file, fn_expr);
+            const args: ?[]const Ast.Node.Index = switch (receiver) {
+                .none => call.ast.params,
+                .value => |holder| try std.mem.concat(facts.gpa, Ast.Node.Index, &.{ &.{holder}, call.ast.params }),
+                .unknown => null,
+            };
+            return .{
+                .file = file,
+                .node = node,
+                .callee_expr = fn_expr,
+                .receiver = if (receiver == .value) receiver.value else null,
+                .args = args,
+                .callee = try calleeOf(facts, file, fn_expr, 0),
+            };
+        }
+        switch (tree.nodeTag(node)) {
+            .builtin_call, .builtin_call_comma => {},
+            else => return null,
+        }
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call")) return null;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const operands = Facts.builtinArgs(tree, node, &buffer);
+        if (operands.len != 3) return null;
+        // `@call` binds no receiver: a method is named through its type, the value in the tuple.
+        var tuple_buffer: [2]Ast.Node.Index = undefined;
+        const args: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&tuple_buffer, operands[2])) |literal|
+            if (literal.ast.type_expr == .none) try facts.gpa.dupe(Ast.Node.Index, literal.ast.elements) else null
+        else if (tree.fullStructInit(&tuple_buffer, operands[2])) |empty|
+            // `.{}` parses as a struct literal: an empty tuple.
+            if (empty.ast.type_expr == .none and empty.ast.fields.len == 0) &.{} else null
+        else
+            null;
+        return .{ .file = file, .node = node, .callee_expr = operands[1], .args = args, .modifier = operands[0], .callee = try calleeOf(facts, file, operands[1], 0) };
+    }
+
+    /// Every call `file` makes, as `at` reads each. Found once.
+    pub fn in(facts: *Facts, file: Project.FileId) Error![]const Call {
+        const state = try facts.memo(State);
+        if (state.files.get(file)) |kept| return kept;
+        var found: std.ArrayList(Call) = .empty;
+        const tree = &facts.project.at(file).file.tree;
+        for (0..tree.nodes.len) |i| {
+            if (try at(facts, file, @fromBackingInt(@intCast(i)))) |call| try found.append(facts.gpa, call);
+        }
+        try state.files.put(facts.gpa, file, found.items);
+        return found.items;
+    }
+
+    /// Whether `x.f(a)` binds `x` as `f`'s first parameter: where `f` is a function declared in
+    /// `x`'s type and `x` a value of it. `T.f(a)` binds nothing; a holder that does not resolve
+    /// may bind it or not.
+    fn bound(facts: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index) Error!union(enum) { none, value: Ast.Node.Index, unknown } {
+        const tree = &facts.project.at(file).file.tree;
+        const callee = ungrouped(tree, fn_expr);
+        const holder = switch (tree.nodeTag(callee)) {
+            .field_access => tree.nodeData(callee).node_and_token[0],
+            .builtin_call_two, .builtin_call_two_comma => blk: {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@field")) return .none;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, callee, &buffer);
+                if (args.len != 2) return .none;
+                break :blk args[0];
+            },
+            else => return .none,
+        };
+        const value = try facts.resolve(file, holder);
+        if (value == .container) return .none;
+        // A field holds what it is given, and a call through it binds nothing.
+        const decl = (try memberNamed(facts, file, callee)) orelse return .unknown;
+        if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .none;
+        return switch (value) {
+            .instance, .pointer, .optional => .{ .value = holder },
+            else => .unknown,
+        };
+    }
+
+    /// The declaration `x.name` or `@field(x, "name")` names, where it resolves.
+    fn memberNamed(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Facts.Decl {
+        const tree = &facts.project.at(file).file.tree;
+        return switch (tree.nodeTag(node)) {
+            .field_access => facts.definition(file, node),
+            else => facts.reflected(file, node),
+        };
+    }
+
+    fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+        var at_node = node;
+        while (tree.nodeTag(at_node) == .grouped_expression) at_node = tree.nodeData(at_node).node_and_token[0];
+        return at_node;
+    }
+
+    /// What calling the value of `node` calls. A constant is its initializer's, a field the
+    /// functions every store gives it, a mutable local the functions each of its stores gives;
+    /// a parameter, a capture, an element, a call's result and anything else may be any.
+    fn calleeOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) Error!Callee {
+        if (depth > 8) return .{ .any = .cycle };
+        const tree = &facts.project.at(file).file.tree;
+        const model = &facts.project.at(file).model;
+        switch (tree.nodeTag(node)) {
+            .grouped_expression => return calleeOf(facts, file, tree.nodeData(node).node_and_token[0], depth + 1),
+            // A function's address, or the function a pointer points at, is called the same.
+            .address_of, .deref => return calleeOf(facts, file, tree.nodeData(node).node, depth + 1),
+            .identifier => {
+                const reference = model.reference(node) orelse return .{ .any = .unresolved };
+                const d = reference.declaration orelse return .{ .any = if (reference.unknown == .primitive) .unsupported else .unresolved };
+                return declared(facts, .{ .file = file, .index = d }, depth);
+            },
+            .field_access => {
+                const decl = (try facts.definition(file, node)) orelse return unresolved(facts, try facts.resolve(file, node));
+                return memberCallee(facts, file, tree.nodeData(node).node_and_token[0], decl, depth);
+            },
+            .builtin_call_two, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, node, &buffer);
+                if (std.mem.eql(u8, name, "@as") and args.len == 2) return calleeOf(facts, file, args[1], depth + 1);
+                if (std.mem.eql(u8, name, "@field") and args.len == 2) {
+                    const decl = (try facts.reflected(file, node)) orelse return .{ .any = .comptime_dependent };
+                    return memberCallee(facts, file, args[0], decl, depth);
+                }
+                return .{ .any = .unsupported };
+            },
+            else => return .{ .any = .unsupported },
+        }
+    }
+
+    /// What calling a declaration's value calls.
+    fn declared(facts: *Facts, decl: Facts.Decl, depth: u8) Error!Callee {
+        const source = facts.project.at(decl.file);
+        const record = source.model.declarations[@backingInt(decl.index)];
+        const tree = &source.file.tree;
+        switch (record.kind) {
+            .function => return .{ .function = decl },
+            // What a caller or a loop gives it.
+            .parameter, .capture => return .{ .any = .unresolved },
+            .field => return .{ .any = .unresolved },
+            .variable => {
+                const variable = tree.fullVarDecl(record.node) orelse return .{ .any = .unsupported };
+                if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return stored(facts, decl, depth);
+                // `extern`: a function another object defines.
+                const init = variable.ast.init_node.unwrap() orelse return .{ .any = .unresolved };
+                return calleeOf(facts, decl.file, init, depth + 1);
+            },
+        }
+    }
+
+    /// What calling a member of `holder` calls: a declaration's value as `declared` reads it, a
+    /// field's the functions its stores give.
+    fn memberCallee(facts: *Facts, file: Project.FileId, holder: Ast.Node.Index, decl: Facts.Decl, depth: u8) Error!Callee {
+        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .field) return declared(facts, decl, depth);
+        const container = fieldOwner(try facts.resolve(file, holder)) orelse return .{ .any = .unresolved };
+        return unresolved(facts, (try facts.storedFunctions(container, record.name)) orelse return .{ .any = .unresolved });
+    }
+
+    /// What a mutable variable may hold when called: each value a store gives it. Only a local or
+    /// a private one of its file is read, in that file; a public one may be written where this run
+    /// does not look, and an address taken may write it anywhere.
+    fn stored(facts: *Facts, decl: Facts.Decl, depth: u8) Error!Callee {
+        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.public) return .{ .any = .unresolved };
+        var found: std.ArrayList(Facts.Decl) = .empty;
+        for (try accesses.writes(facts, .{ .declaration = decl }, &.{decl.file})) |site| {
+            if (site.reach != .exact or site.part) return .{ .any = .unresolved };
+            switch (site.kind) {
+                .init, .set => {},
+                .read => continue,
+                .update, .covered, .address => return .{ .any = .unresolved },
+            }
+            const value = site.value orelse return .{ .any = .unresolved };
+            // `undefined` until a store gives it one: a call before that is no call this reads.
+            if (site.kind == .init and isUndefined(&facts.project.at(site.file).file.tree, value)) continue;
+            switch (try calleeOf(facts, site.file, value, depth + 1)) {
+                .function => |one| try add(facts, &found, one),
+                .choice => |each| for (each) |one| try add(facts, &found, one),
+                .any => |why| return .{ .any = why },
+            }
+        }
+        return choice(found.items);
+    }
+
+    /// The callee a resolved value is: a function, a pointer to one, a choice of them.
+    fn unresolved(facts: *Facts, value: Facts.Value) Error!Callee {
+        var found: std.ArrayList(Facts.Decl) = .empty;
+        const each: []const Facts.Value = if (value == .alternatives) value.alternatives else &.{value};
+        for (each) |one| try add(facts, &found, switch (one) {
+            .function => |d| d,
+            .pointer => |to| switch (to.*) {
+                .function => |d| d,
+                else => return .{ .any = .unresolved },
+            },
+            .unknown => |why| return .{ .any = why },
+            else => return .{ .any = .unresolved },
+        });
+        return choice(found.items);
+    }
+
+    fn add(facts: *Facts, found: *std.ArrayList(Facts.Decl), one: Facts.Decl) Error!void {
+        for (found.items) |seen| if (std.meta.eql(seen, one)) return;
+        try found.append(facts.gpa, one);
+    }
+
+    fn choice(found: []const Facts.Decl) Callee {
+        return switch (found.len) {
+            // No store gives it a function: nothing it calls is known.
+            0 => .{ .any = .unresolved },
+            1 => .{ .function = found[0] },
+            else => .{ .choice = found },
+        };
     }
 };
 

@@ -30,6 +30,7 @@ test {
     _ = Fix;
     _ = @import("Facts.zig");
     _ = @import("accesses_test.zig");
+    _ = @import("calls_test.zig");
     _ = @import("Taint.zig");
     _ = @import("Undefined.zig");
     _ = token;
