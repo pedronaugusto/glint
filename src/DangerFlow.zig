@@ -677,7 +677,8 @@ fn continuesTo(c: *Context, prong: Ast.Node.Index, choice: Ast.Node.Index) bool 
 /// operation's `Cancelable`) by its declared error set. A call is none for being given an `Io`
 /// (`Clock.now(io)` cannot cancel), nor for its name. A callee chosen per target (`const wait =
 /// if (windows) waitWindows else waitPosix`, or a method of a type so chosen) is one where every
-/// choice is; a pointer to a function, or a vtable's, is none. `ends` says, for a function's
+/// choice is, as is a pointer to a function every store of which Facts.calls knows; `@call`'s
+/// callee is read as a call's; one that may be any function (a vtable's) is none. `ends` says, for a function's
 /// body, that the call judged ends the loop on every error the function returns (`endsOnError`),
 /// so a path of the body that leaves by an error before its point lets no pass go on.
 fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, ending: Ends) Context.Error!bool {
@@ -685,12 +686,10 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
     const tree = &c.project.at(file).file.tree;
     const first = tree.firstToken(body);
     const last = tree.lastToken(body);
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+    for (try Facts.calls.in(c.facts, file)) |*call| {
+        const node = call.node;
         const token = tree.nodeMainToken(node);
         if (token < first or token > last) continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
         // An operation on a std stream whose failure returns the stream's cause (`r.err`,
         // `error.Canceled` among it) is one as `Io`'s own operations are.
         const stream = try Streams.point(c, file, node);
@@ -703,10 +702,14 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
         // with its result; in a function's body, all of it where the call is what the body
         // returns, else an error where the call's goes on out of it.
         const ended: Ends = if (depth == 0) try endsOf(c, file, node, body) else if (returned(c, file, node)) ending else .{ .errors = ending.errors and propagates(c, file, node) };
-        const callee = try c.facts.resolve(file, call.ast.fn_expr);
-        const choices: []const Facts.Value = if (callee == .alternatives) callee.alternatives else &.{callee};
+        const choices: []const Facts.Decl = switch (call.callee) {
+            .function => |*one| one[0..1],
+            .choice => |each| each,
+            // One whose callee is not known is no point it can show.
+            .any => continue,
+        };
         const every = for (choices) |choice| {
-            if (choice != .function or !try callCancels(c, choice.function, depth, ended)) break false;
+            if (!try callCancels(c, choice, depth, ended)) break false;
         } else true;
         if (every) return true;
     }
