@@ -627,7 +627,7 @@ test "A015 reads a public generic's returns at a binding with its parameters tha
     const result = try runWithDependency(pack.ownership,
         \\const std = @import("std");
         \\const dep = @import("dep");
-        \\pub fn opened(io: std.Io) !void { const file = dep.pass(std.Io.File, try std.Io.Dir.cwd().openFile(io, "x", .{})); _ = file; }
+        \\pub fn opened(dir: std.Io.Dir, io: std.Io) !void { const file = dep.pass(std.Io.File, try dir.openFile(io, "x", .{})); _ = file; }
         \\pub fn held(file: *const std.Io.File) void { const view = dep.pass(std.Io.File, file.*); _ = view; }
     ,
         \\pub fn pass(comptime T: type, x: T) T { return x; }

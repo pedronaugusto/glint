@@ -1386,7 +1386,12 @@ fn canceling(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8)
             return false;
         },
         .identifier, .field_access => {
-            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.at(file).model.reference(node) orelse return false).declaration orelse return false) } else ((try c.facts.definition(file, node)).orNull()) orelse return false;
+            // A set this does not name is read as not holding error.Canceled: its call is no
+            // cancellation point, so the loop it is in stays judged.
+            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.at(file).model.reference(node) orelse return false).declaration orelse return false) } else switch (try c.facts.definition(file, node)) {
+                .decl => |found| found,
+                .none, .unknown => return false,
+            };
             const declared = &c.project.at(decl.file).file.tree;
             const variable = declared.fullVarDecl(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
             return canceling(c, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
@@ -1498,7 +1503,11 @@ fn declaredSlice(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
         .identifier, .field_access => {},
         else => return false,
     }
-    const decl = ((try c.facts.definition(file, base)).orNull()) orelse return false;
+    // One this does not name is no slice: the length it is sliced by stays judged.
+    const decl = switch (try c.facts.definition(file, base)) {
+        .decl => |found| found,
+        .none, .unknown => return false,
+    };
     const written = &c.project.at(decl.file).file.tree;
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const type_node = switch (record.kind) {

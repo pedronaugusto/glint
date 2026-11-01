@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// The uses there may be, at most. Lower it with each site converted; never raise it.
-const recorded = 101;
+const recorded = 95;
 
 test "the uses of orNull only fall" {
     const io = std.testing.io;

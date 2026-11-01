@@ -291,13 +291,33 @@ fn holdingOf(a: Holding, b: Holding) Holding {
 /// aegis's own are the owners and borrows this rule asks for.
 fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths: []const []const u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&call_buffer, node) orelse continue;
-        if (c.inTest(tree.nodeMainToken(node))) continue;
-        const callee = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse continue;
-        const function = ((try c.facts.origin(callee)).orNull()) orelse continue;
+    for (try Facts.calls.in(c.facts, c.file)) |*call| {
+        if (c.inTest(tree.nodeMainToken(call.node))) continue;
+        switch (try c.facts.definition(c.file, call.callee_expr)) {
+            .decl => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
+            .none => {},
+            // A call on a value of a generic's type parameter is judged at the generic's
+            // bindings, with the type each gives.
+            .unknown => |why| if (why != .generic) switch (call.callee) {
+                // A choice of holders' members: each function the call may call, judged as one
+                // it does.
+                .function => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
+                .choice => |each| try bindingOf(c, rule, resources, paths, call, each),
+                .any => try unnamedBinding(c, rule, resources, call.node),
+            },
+        }
+    }
+}
+
+/// A015 at `call`, a binding of each of `functions` that is a public generic.
+fn bindingOf(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths: []const []const u8, call: *const Facts.calls.Call, functions: []const Facts.Decl) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const node = call.node;
+    for (functions) |callee| {
+        const function = (try originKnown(c, callee)) orelse {
+            try unnamedBinding(c, rule, resources, node);
+            continue;
+        };
         const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
         if (record.kind != .function or !record.public or !c.facts.hasGenericParameter(function)) continue;
         // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
@@ -316,13 +336,66 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
         }
         // A generic function's result, where its declared type is a parameter's: an owner handed
         // over unless each return reads one held (`views`), its parameters this call's arguments.
+        // `@call` binds no `Ast.full.Call` to read the views with: its result is no view.
         if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
+        var call_buffer: [1]Ast.Node.Index = undefined;
         switch (try heldBy(c, resources, made, 0)) {
-            .resource => |which| if (!try views(c, resources, function, 0, &.{ .file = c.file, .call = call, .callee = function, .outer = null })) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] })),
-            .other, .generic => {},
+            .resource => |which| {
+                const a_view = if (tree.fullCall(&call_buffer, node)) |full| try views(c, resources, function, 0, &.{ .file = c.file, .call = full, .callee = function, .outer = null }) else false;
+                if (!a_view) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] }));
+            },
+            .other => {},
+            // A type the enclosing generic's parameters give is judged at its own bindings; one
+            // outside any is this call's, not bound here (a choice of callees).
+            .generic => if (!inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return is not bound with its arguments: it may be a std resource by value"),
             .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
         }
     }
+}
+
+/// Whether `node` is in a function with a type or `anytype` parameter, as `hasGenericParameter`
+/// reads one.
+fn inGeneric(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    const function = while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) break parent;
+    } else return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return false;
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        if (param.anytype_ellipsis3 != null) return true;
+        if (param.type_expr) |type_expr| if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) return true;
+    }
+    return false;
+}
+
+/// A015 at a call whose function does not resolve: a public generic's binding it may be, so
+/// undecided where what it makes may hold a std resource by value. One that holds none hands no
+/// owner over, whatever it calls; nor does one made a statement (`x.close();`, under `try` or
+/// `defer`), whose value Zig compiles only as void. A type a parameter gives is judged at the
+/// enclosing generic's bindings; outside one, it is the unnamed callee's to give: undecided.
+fn unnamedBinding(c: *Context, rule: Rule, resources: []const ?Facts.Container, node: Ast.Node.Index) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    if (statementCall(tree, &c.project.at(c.file).model, node)) return;
+    switch (try heldBy(c, resources, try c.facts.resolve(c.file, node), 0)) {
+        .resource, .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
+        .generic => if (!inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
+        .other => {},
+    }
+}
+
+/// Whether the call `node`, past `try` and parentheses, is a statement of a block or a `defer`.
+fn statementCall(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .@"try", .grouped_expression => {},
+        .block, .block_semicolon, .block_two, .block_two_semicolon, .@"defer", .@"errdefer" => return true,
+        else => return false,
+    };
+    return false;
 }
 
 /// A015 at a binding for what a type function made, `value`: each resource one of its fields
@@ -1206,7 +1279,10 @@ pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Err
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse return false;
         const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
+            .function => |decl| (try originKnown(c, decl)) orelse {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve: it may acquire a std resource by value");
+                return false;
+            },
             else => return false,
         };
         const target = &c.project.at(callee.file).file.tree;
@@ -1985,7 +2061,11 @@ fn containersOf(c: *Context, rule: Rule, paths: []const []const u8) Context.Erro
     for (try Governed.resolve(c, rule, targets, indexes)) |found| {
         var container: ?Facts.Container = null;
         for (found.decls) |decl| {
-            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
+            const origin = (try originKnown(c, decl)) orelse {
+                try c.undecided(rule, 0, .unresolved, try c.allocator.print("std.{s} does not resolve to its declaration: no resource of it is judged", .{found.target.declaration}));
+                continue;
+            };
+            const value = try c.facts.declaration(origin);
             if (value == .container) container = value.container;
         }
         // Kept in the order of `paths`, an unresolved one as null.
