@@ -5,7 +5,10 @@
 //! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. The row is a
 //! `Constructs.Row`: how the case moves the value its rule judges. A case's `glint.json` is the
 //! policy its rule reads (P006's disallowed declarations, A018's peer writers): its options
-//! alone, since the case's rule is the one that runs.
+//! alone, since the case's rule is the one that runs. A case's `before.zig` is a file the run
+//! selects ahead of the case's, as a program's other file: what the case's file reads after it
+//! (a run-wide answer, the budget left) is the case. What glint says of `before.zig` itself is
+//! not read.
 //!
 //! Each rule's directory is a column of the matrix, and its `expected.zon` the rule's own: the
 //! cases glint does not pass yet (`open`, each a path under the rule's directory), the rows with
@@ -49,6 +52,7 @@ const Job = struct {
     role: Role,
     listed: bool,
     policy: ?[]const u8,
+    before: ?[]const u8,
     absolute: []const u8,
 };
 
@@ -90,11 +94,8 @@ pub fn main(init: std.process.Init) !void {
             if (row == .none) try w.print("{s}/none/: a case that moves no value\n", .{rule});
             for (try sortedEntries(a, io, rule_dir, row_name, .directory)) |case| {
                 const case_path = try std.Io.Dir.path.join(a, &.{ row_name, case });
-                const policy_path = try std.Io.Dir.path.join(a, &.{ case_path, "glint.json" });
-                const policy: ?[]const u8 = if (rule_dir.access(io, policy_path, .{})) try std.Io.Dir.path.join(a, &.{ suite_path, rule, policy_path }) else |err| switch (err) {
-                    error.FileNotFound => null,
-                    else => return err,
-                };
+                const policy = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "glint.json");
+                const before = try caseFile(a, io, rule_dir, suite_path, rule, case_path, "before.zig");
                 var any = false;
                 for ([_]Role{ .hole, .twin }) |role| {
                     const path = try std.fmt.allocPrint(a, "{s}/{t}.zig", .{ case_path, role });
@@ -113,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
                         .role = role,
                         .listed = open.remove(path),
                         .policy = policy,
+                        .before = before,
                         .absolute = try std.Io.Dir.path.join(a, &.{ suite_path, rule, path }),
                     });
                 }
@@ -206,7 +208,7 @@ const Pool = struct {
             const index = pool.next.fetchAdd(1, .monotonic);
             if (index >= pool.jobs.len) return;
             const job = pool.jobs[index];
-            pool.verdicts[index] = judge(gpa, io, &store, pool.columns[job.column].rule, pool.lib, pool.aegis, job.policy, job.absolute);
+            pool.verdicts[index] = judge(gpa, io, &store, pool.columns[job.column].rule, pool.lib, pool.aegis, job);
         }
     }
 };
@@ -221,8 +223,19 @@ fn expectedOf(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, suite: s
         return err;
     };
 }
-/// What glint says of the file at `path` under `rule` alone, with the case's policy if it has one.
-fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, policy: ?[]const u8, path: []const u8) !Verdict {
+/// The path of the case's file `name`, as the run opens it; null where the case has none.
+fn caseFile(a: std.mem.Allocator, io: std.Io, rule_dir: std.Io.Dir, suite_path: []const u8, rule: []const u8, case_path: []const u8, name: []const u8) !?[]const u8 {
+    const path = try std.Io.Dir.path.join(a, &.{ case_path, name });
+    rule_dir.access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return try std.Io.Dir.path.join(a, &.{ suite_path, rule, path });
+}
+
+/// What glint says of the case's file under `rule` alone, with the case's policy if it has one,
+/// after its `before.zig` if it has one, whose own findings and coverage are not read.
+fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, job: Job) !Verdict {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -231,12 +244,14 @@ fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: 
     var problems: std.Io.Writer.Allocating = .init(a);
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module });
-    if (policy) |config| try args.appendSlice(a, &.{ "--config", config });
-    try args.append(a, path);
+    if (job.policy) |config| try args.appendSlice(a, &.{ "--config", config });
+    if (job.before) |before| try args.append(a, before);
+    try args.append(a, job.absolute);
     _ = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
     var verdict: Verdict = .clean;
     var lines = std.mem.splitScalar(u8, output.written(), '\n');
     while (lines.next()) |line| {
+        if (job.before) |before| if (about(line, rule, before) or about(line, "coverage", before)) continue;
         if (std.mem.startsWith(u8, line, rule) and std.mem.startsWith(u8, line[rule.len..], ": ")) return .flagged;
         // Every run notes that std's ZIR references are indexed in part; that decides nothing.
         if (std.mem.startsWith(u8, line, "coverage: ") and std.mem.find(u8, line, "std-ZIR declaration references") == null) verdict = .undecided;
@@ -255,6 +270,13 @@ fn sortedEntries(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []const
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
     return names.items;
+}
+
+/// Whether `line` is `<kind>: <path>:...`, a finding or coverage line of the file at `path`.
+fn about(line: []const u8, kind: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, kind) or !std.mem.startsWith(u8, line[kind.len..], ": ")) return false;
+    const rest = line[kind.len + 2 ..];
+    return std.mem.startsWith(u8, rest, path) and std.mem.startsWith(u8, rest[path.len..], ":");
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {
