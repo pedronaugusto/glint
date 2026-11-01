@@ -333,11 +333,41 @@ const Analysis = struct {
 };
 
 /// What a function's successful returns give of its parameters and result: constraints over
-/// slots, each parameter's value and length and the result's (`slot`).
-const Summary = struct { rows: []const Lin, params: usize };
+/// slots, each parameter's value and length and the result's (`slot`), and each place of a
+/// parameter's at entry and, through a pointer, at its exit (`placeSlot`).
+const Summary = struct {
+    rows: []const Lin,
+    params: usize,
+    places: []const SlotPlace = &.{},
+    /// The fields of the program's structs the function may write, through any pointer; null
+    /// where it may write any.
+    written: ?[]const Facts.Decl = null,
+};
+
+/// A field of a parameter's struct, or of the struct it points to, a summary reads.
+const SlotPlace = struct {
+    param: usize,
+    /// The parameter's declaration, in the function the summary is of.
+    root: Model.Declaration.Id,
+    field: Facts.Decl,
+    /// A pointer parameter's: the caller's struct holds what the callee leaves in it.
+    exits: bool,
+    /// Its memory's elements take room (`Facts.sizedMemory`).
+    sized: bool,
+};
 
 fn slot(param: usize, length: bool) Var {
     return @intCast(param * 2 + @intFromBool(length));
+}
+
+/// How many places a summary gives: as many as a call's temporaries hold.
+const max_slot_places = 6;
+
+/// A summary's slot of its `k`th place, after the parameters' and the result's: its value or
+/// length at entry or at exit, a length's slot odd as `slot`'s are. A function of more
+/// parameters than a u16 counts gives no places.
+fn placeSlot(params: u16, k: u3, exit: bool, length: bool) Var {
+    return (@as(Var, params) + 1) * 2 + @as(Var, k) * 4 + @as(Var, @intFromBool(exit)) * 2 + @intFromBool(length);
 }
 
 const Analyses = struct {
@@ -373,7 +403,7 @@ fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: 
     if (frame.summary) |summary| {
         const rows = try c.allocator.alloc(Lin, summary.rows.len);
         for (summary.rows, rows) |row, *out| out.* = .{ .terms = try c.allocator.dupe(Term, row.terms), .c = row.c };
-        made.summary = .{ .rows = rows, .params = summary.params };
+        made.summary = .{ .rows = rows, .params = summary.params, .places = try c.allocator.dupe(SlotPlace, summary.places), .written = if (summary.written) |fields| try c.allocator.dupe(Facts.Decl, fields) else null };
     }
     return made;
 }
@@ -454,6 +484,9 @@ const Key = union(enum) {
     /// its value and its memory's length (`Frame.placeOf`).
     place: Place,
     place_length: Place,
+    /// A place of a parameter's as the function was entered (`Frame.placeValue`).
+    place_entry: Place,
+    place_entry_length: Place,
 };
 
 const Place = struct { root: Model.Declaration.Id, field: Facts.Decl };
@@ -511,7 +544,7 @@ const Frame = struct {
     /// The length variables whose value is claimed, not held (`Value.claimed`).
     claimed: std.AutoHashMapUnmanaged(Var, void) = .empty,
     /// Each place's variable, its value's or its length's (`placeVar`).
-    places: std.AutoArrayHashMapUnmanaged(Var, Place) = .empty,
+    places: std.array_hash_map.Auto(Var, Place) = .empty,
     /// Whether the function returns an integer, or an error union or optional of one.
     returns_int: bool = false,
     /// Whether the memory the function returns holds elements that take room.
@@ -526,6 +559,14 @@ const Frame = struct {
     /// count for nothing.
     trial: u32 = 0,
     params: []const ?Model.Declaration.Id = &.{},
+    /// Whether no place has been stored or forgotten yet: a parameter's place first read now
+    /// holds what it held at entry.
+    entry_places: bool = true,
+    /// The places the summary's slots read (`summarize`).
+    slot_places: []const SlotPlace = &.{},
+    /// The fields the function may write, or whether it may write any (`wrote`).
+    writes: std.ArrayList(Facts.Decl) = .empty,
+    writes_any: bool = false,
     summary: ?Summary = null,
 
     const RunError = Error || error{Unsupported};
@@ -658,21 +699,31 @@ const Frame = struct {
     /// Whether a length's memory holds elements that take room (`Facts.sizedMemory`).
     fn sizedLength(f: *Frame, space: Space, v: Var) Error!bool {
         const d = switch (space) {
-            .slots => if (v / 2 < f.params.len) f.params[v / 2] orelse return false else return f.result_sized,
+            .slots => if (v / 2 < f.params.len) f.params[v / 2] orelse return false else if (v / 2 == f.params.len) return f.result_sized else {
+                const width = std.math.cast(u16, f.params.len) orelse return false;
+                const k = (std.math.sub(Var, v, placeSlot(width, 0, false, false)) catch return false) / 4;
+                return k < f.slot_places.len and f.slot_places[k].sized;
+            },
             .frame => switch (f.vars.keys()[v]) {
                 .length => |d| d,
                 .result_length => return f.result_sized,
+                .place_length, .place_entry_length => |p| return f.sizedField(p.field),
                 else => return false,
             },
         };
         return f.c.facts.sizedMemory(try f.c.facts.declaration(.{ .file = f.file, .index = d }));
     }
 
+    /// Whether a field's memory holds elements that take room.
+    fn sizedField(f: *Frame, member: Facts.Decl) Error!bool {
+        return f.c.facts.sizedMemory(try f.c.facts.declaration(member));
+    }
+
     fn isLength(f: *Frame, space: Space, v: Var) bool {
         return switch (space) {
             .slots => v % 2 == 1,
             .frame => switch (f.vars.keys()[v]) {
-                .length, .result_length, .place_length => true,
+                .length, .result_length, .place_length, .place_entry_length => true,
                 else => false,
             },
         };
@@ -845,6 +896,20 @@ const Frame = struct {
 
     /// The summary: what the successful exits give of the parameters' slots and the result's.
     fn summarize(f: *Frame) Error!void {
+        // The places of parameters, each once, its value and length at entry and exit.
+        var places: std.ArrayList(SlotPlace) = .empty;
+        if (std.math.cast(u16, f.params.len) != null) for (f.places.values()) |p| {
+            if (places.items.len >= max_slot_places) break;
+            const param = std.mem.findScalar(?Model.Declaration.Id, f.params, p.root) orelse continue;
+            for (places.items) |listed| {
+                if (listed.param == param and std.meta.eql(listed.field, p.field)) break;
+            } else {
+                // What a parameter given by value holds at exit is the callee's copy's.
+                const exits = try f.c.facts.declaration(.{ .file = f.file, .index = p.root }) == .pointer;
+                try places.append(f.a, .{ .param = param, .root = p.root, .field = p.field, .exits = exits, .sized = try f.sizedField(p.field) });
+            }
+        };
+        f.slot_places = places.items;
         var joined: ?State = null;
         for (f.exits.items) |exit| {
             if (exit.failed or exit.state.dead) continue;
@@ -853,10 +918,10 @@ const Frame = struct {
         }
         const s = joined orelse {
             // No successful exit: every call that succeeds is unreachable.
-            f.summary = .{ .rows = &never, .params = f.params.len };
+            f.summary = .{ .rows = &never, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
             return;
         };
-        f.summary = .{ .rows = s.rows, .params = f.params.len };
+        f.summary = .{ .rows = s.rows, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
     }
 
     /// A state's constraints on the slots alone, each variable renamed to its slot.
@@ -870,6 +935,17 @@ const Frame = struct {
         }
         if (f.known(.result)) |v| try slots.put(f.a, v, slot(f.params.len, false));
         if (f.known(.result_length)) |v| try slots.put(f.a, v, slot(f.params.len, true));
+        if (std.math.cast(u16, f.params.len)) |width| for (0..max_slot_places) |k| {
+            if (k >= f.slot_places.len) break;
+            const listed = f.slot_places[k];
+            const slot_k: u3 = @intCast(k);
+            const p: Place = .{ .root = listed.root, .field = listed.field };
+            if (f.known(.{ .place_entry = p })) |v| try slots.put(f.a, v, placeSlot(width, slot_k, false, false));
+            if (f.known(.{ .place_entry_length = p })) |v| try slots.put(f.a, v, placeSlot(width, slot_k, false, true));
+            if (!listed.exits) continue;
+            if (f.known(.{ .place = p })) |v| try slots.put(f.a, v, placeSlot(width, slot_k, true, false));
+            if (f.known(.{ .place_length = p })) |v| try slots.put(f.a, v, placeSlot(width, slot_k, true, true));
+        };
         var others: std.ArrayList(Var) = .empty;
         for (s.rows) |row| for (row.terms) |term| if (!slots.contains(term.v)) {
             if (std.mem.findScalar(Var, others.items, term.v) == null) try others.append(f.a, term.v);
@@ -1018,18 +1094,31 @@ const Frame = struct {
     fn placeValue(f: *Frame, s: State, node: Ast.Node.Index, p: Place) Error!Eval {
         var out = s;
         if (try f.intOf(node)) |int| {
+            const made = f.known(.{ .place = p }) == null;
             const v = try f.placeVar(p, false);
             if (!f.typed_vars.contains(v)) {
                 out = try f.typed(out, v, int);
                 try f.typed_vars.put(f.a, v, {});
             }
+            if (made) out = try f.atEntry(out, v, p, false);
             return .{ .s = out, .v = .{ .lin = try single(f.a, v) } };
         }
         // An array's length is its type's (`knownLength`); a struct or a pointer with no length
         // holds none.
         if (!try f.holdsLength(node) or try Range.memoryLength(f.c, f.file, node) != null) return .{ .s = out };
+        const made = f.known(.{ .place_length = p }) == null;
         const l = try f.placeVar(p, true);
+        if (made) out = try f.atEntry(out, l, p, true);
         return .{ .s = out, .v = .{ .length = try single(f.a, l), .claimed = f.claimed.contains(l) } };
+    }
+
+    /// `s` with a parameter's place, first read while nothing has stored or forgotten a place,
+    /// equal to what it held at entry, which a summary's entry slot names.
+    fn atEntry(f: *Frame, s: State, v: Var, p: Place, length: bool) Error!State {
+        if (!f.entry_places) return s;
+        if (std.mem.findScalar(?Model.Declaration.Id, f.params, p.root) == null) return s;
+        const entry = try f.variable(if (length) .{ .place_entry_length = p } else .{ .place_entry = p });
+        return f.equal(s, v, try single(f.a, entry));
     }
 
     /// `place = rhs`, or `place op= rhs`: the place takes the value; the same field of
@@ -1037,17 +1126,19 @@ const Frame = struct {
     fn storePlace(f: *Frame, s: State, node: Ast.Node.Index, target: Ast.Node.Index, rhs: Ast.Node.Index, p: Place) RunError!State {
         const tag = f.tree.nodeTag(node);
         const e = try f.eval(s, rhs);
-        const out = try f.forgetPlaces(e.s, null, p.field, p.root);
         const int = try f.intOf(target);
         if (tag == .assign) {
+            const out = try f.storedIn(e.s, p);
             if (int != null) return f.assign(out, try f.placeVar(p, false), e.v.lin, int);
             if (!try f.holdsLength(target) or try Range.memoryLength(f.c, f.file, target) != null) return out;
             const l = try f.placeVar(p, true);
             if (e.v.claimed) try f.claimed.put(f.a, l, {}) else _ = f.claimed.remove(l);
             return f.assign(out, l, e.v.length, null);
         }
-        const current = try f.placeValue(out, target, p);
-        const result = try f.arith(current.s, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
+        // `op=` reads the place first: what it held at entry, where nothing has stored one yet.
+        const current = try f.placeValue(e.s, target, p);
+        const out = try f.storedIn(current.s, p);
+        const result = try f.arith(out, node, opOf(tag), current.v.lin, e.v.lin, rhs, int);
         return f.assign(result.s, try f.placeVar(p, false), result.v.lin, int);
     }
 
@@ -1060,23 +1151,47 @@ const Frame = struct {
             .identifier => if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "_")) return s,
             .field_access => {
                 // A field that does not resolve (`p.at` of an `anytype` `p`) may be any place's.
-                const decl = (try f.c.facts.definition(f.file, target)) orelse return f.forgetPlaces(s, null, null, null);
+                const decl = (try f.c.facts.definition(f.file, target)) orelse return f.wrote(s, null, null);
                 const value = try f.c.facts.resolve(f.file, target);
-                if (value == .scalar or value == .pointer) return f.forgetPlaces(s, null, (try f.c.facts.origin(decl)) orelse decl, null);
+                if (value == .scalar or value == .pointer) return f.wrote(s, (try f.c.facts.origin(decl)) orelse decl, null);
             },
             // `@field(x, "at") = v`: a field by a name read as the program compiles.
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.forgetPlaces(s, null, null, null),
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.wrote(s, null, null),
             else => {},
         }
         return switch (try f.c.facts.resolve(f.file, target)) {
             .scalar, .pointer => s,
-            else => f.forgetPlaces(s, null, null, null),
+            else => f.wrote(s, null, null),
         };
+    }
+
+    /// The state past a store to the place `p`: the same field of another struct, which this one
+    /// may be through another pointer, no longer known, and the write the summary's. A struct a
+    /// local or a parameter holds by value, whose address the function never takes (`tracked`),
+    /// is its own: no other pointer reaches it, and no caller sees the store.
+    fn storedIn(f: *Frame, s: State, p: Place) Error!State {
+        f.entry_places = false;
+        // A capture may name memory the function was given (`|*c|`).
+        const kind = f.model.declarations[@backingInt(p.root)].kind;
+        if ((kind == .variable or kind == .parameter) and try f.c.facts.declaration(.{ .file = f.file, .index = p.root }) == .instance) return s;
+        return f.wrote(s, p.field, p.root);
+    }
+
+    /// The state past a write to memory of the field `member` (any field where null), the
+    /// places of `except` aside: recorded as the summary's (`Summary.written`).
+    fn wrote(f: *Frame, s: State, member: ?Facts.Decl, except: ?Model.Declaration.Id) Error!State {
+        if (member) |d| {
+            if (!f.writes_any) for (f.writes.items) |listed| {
+                if (std.meta.eql(listed, d)) break;
+            } else try f.writes.append(f.a, d);
+        } else f.writes_any = true;
+        return f.forgetPlaces(s, null, member, except);
     }
 
     /// The state with nothing known of the places of `root` (any root where null), of the field
     /// `member` (any where null), but those of `except`.
     fn forgetPlaces(f: *Frame, s: State, root: ?Model.Declaration.Id, member: ?Facts.Decl, except: ?Model.Declaration.Id) Error!State {
+        f.entry_places = false;
         var out = s;
         for (f.places.keys(), f.places.values()) |v, p| {
             if (root) |r| if (p.root != r) continue;
@@ -1141,7 +1256,10 @@ const Frame = struct {
             },
             .builtin_call_two, .builtin_call_two_comma => {
                 if (!std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "@field")) return null;
-                return f.trackedName(f.tree.nodeData(target).opt_node_and_opt_node[0].unwrap() orelse return null);
+                const holder, const field_name = f.tree.nodeData(target).opt_node_and_opt_node;
+                // A name spelled out other than `len` stores another field: a store to memory.
+                if (field_name.unwrap()) |spelled| if (f.tree.nodeTag(spelled) == .string_literal and !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(spelled)), "\"len\"")) return null;
+                return f.trackedName(holder.unwrap() orelse return null);
             },
             else => return null,
         }
@@ -1154,7 +1272,8 @@ const Frame = struct {
         const e = try f.eval(s, rhs);
         const v = try f.variable(.{ .length = d });
         try f.claimed.put(f.a, v, {});
-        if (f.tree.nodeTag(target) != .field_access) return f.assign(e.s, v, null, null);
+        // `@field(s, name)` with a name read as the program compiles: any field, `len` among them.
+        if (f.tree.nodeTag(target) != .field_access) return f.assign(try f.wrote(e.s, null, null), v, null, null);
         if (tag == .assign) return f.assign(e.s, v, e.v.lin, null);
         const int = try f.intOf(target);
         const result = try f.arith(e.s, node, opOf(tag), try single(f.a, v), e.v.lin, rhs, int);
@@ -1265,7 +1384,7 @@ const Frame = struct {
             }
         }
         // What it does is not read: it may call or store into any place.
-        return f.fresh(try f.forgetPlaces(s, null, null, null), node, 0);
+        return f.fresh(try f.wrote(s, null, null), node, 0);
     }
 
     /// A fresh variable for what `node` gives, within its integer type where it has one.
@@ -1514,7 +1633,7 @@ const Frame = struct {
         const made = try f.builtinValue(s, node);
         const which = f.tree.tokenSlice(f.tree.nodeMainToken(node));
         for ([_][]const u8{ "@memcpy", "@memset", "@memmove", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |writes| if (std.mem.eql(u8, which, writes)) {
-            return .{ .s = try f.forgetPlaces(made.s, null, null, null), .v = made.v };
+            return .{ .s = try f.wrote(made.s, null, null), .v = made.v };
         };
         return made;
     }
@@ -2172,22 +2291,17 @@ const Frame = struct {
     // Calls.
     //------------------------------------------------------------------
 
-    /// A call: its arguments evaluated in order, and where it reaches one function of the
-    /// program, that function's summary on the path where it returns a value.
-    /// A call: what its callee's summary gives, and, unless it cannot write the program's
-    /// memory (`Range.inert`), nothing known of any place after it.
+    /// A call: its arguments evaluated in order, each read as it was before the call; unless it
+    /// cannot write the program's memory (`Range.inert`), nothing known of any place after it;
+    /// and where it reaches one function of the program, that function's summary on the path
+    /// where it returns a value, of the arguments, the result and the places the arguments
+    /// hold.
     fn call(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
-        const made = try f.bySummary(s, node);
-        if (try Range.inert(f.c, f.file, node)) return made;
-        return .{ .s = try f.forgetPlaces(made.s, null, null, null), .v = made.v };
-    }
-
-    /// What a call gives by its callee's summary, each argument read as it was before the call.
-    fn bySummary(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         var buffer: [1]Ast.Node.Index = undefined;
         const full = f.tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
         var out = s;
         var receiver: ?Value = null;
+        var holder_node: ?Ast.Node.Index = null;
         if (f.tree.nodeTag(full.ast.fn_expr) == .field_access) {
             const holder = f.tree.nodeData(full.ast.fn_expr).node_and_token[0];
             const e = try f.eval(out, holder);
@@ -2197,6 +2311,7 @@ const Frame = struct {
                     const measured = try f.lengthOf(out, holder, e.v);
                     out = measured[0];
                     receiver = .{ .lin = e.v.lin, .length = measured[1] };
+                    holder_node = holder;
                     out = try f.heldAtCall(out, node, 1, &receiver.?);
                 },
                 else => {},
@@ -2216,34 +2331,88 @@ const Frame = struct {
             if (i < 120) out = try f.heldAtCall(out, node, @intCast(2 + i), &arg);
             try args.append(f.a, arg);
         }
+        const summary = try f.summaryOf(full.ast.fn_expr);
+        // The places the summary reads, each where an argument holds it: what it held before the
+        // call, kept in the call's temporaries, and the place itself after.
+        const places: []const SlotPlace = if (summary) |callee| callee.places else &.{};
+        var entries: [max_slot_places]Given = @splat(.{});
+        for (0..max_slot_places) |k| {
+            if (k >= places.len) break;
+            const listed = places[k];
+            const operand = operand: {
+                if (holder_node) |holder| {
+                    // The receiver is the first operand.
+                    const i = std.math.sub(usize, listed.param, 1) catch break :operand holder;
+                    if (i >= full.ast.params.len) continue;
+                    break :operand full.ast.params[i];
+                }
+                if (listed.param >= full.ast.params.len) continue;
+                break :operand full.ast.params[listed.param];
+            };
+            const root = f.trackedName(if (f.tree.nodeTag(operand) == .address_of) f.tree.nodeData(operand).node else operand) orelse continue;
+            const p: Place = .{ .root = root, .field = listed.field };
+            entries[k].place = p;
+            // Each place's entries in the temporaries after the operands'.
+            const slot_k: u8 = @intCast(k);
+            inline for (.{ false, true }, 0..) |length, part| {
+                const made = f.known(if (length) .{ .place_length = p } else .{ .place = p }) == null;
+                const v = try f.placeVar(p, length);
+                if (made) out = try f.atEntry(out, v, p, length);
+                const t = try f.temp(out, node, 244 + slot_k * 2 + @as(u8, part));
+                out = try f.equal(t[0], t[1], try single(f.a, v));
+                entries[k].before[part] = try single(f.a, t[1]);
+            }
+        }
+        // The fields the callee may write: those its summary names, or any.
+        if (!try Range.inert(f.c, f.file, node)) {
+            if (summary) |callee| if (callee.written) |fields| {
+                for (fields) |written| out = try f.wrote(out, written, null);
+            } else {
+                out = try f.wrote(out, null, null);
+            } else out = try f.wrote(out, null, null);
+        }
         const made = try f.fresh(out, node, 0);
         out = made.s;
         const t = made.v.lin;
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
         out = try forget(f.a, out, tl);
-        const summary = try f.summaryOf(full.ast.fn_expr) orelse return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        const summed = summary orelse return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        // A place's exit holds where the success is read at once: a callee that cannot fail, or
+        // `try`; a result unwrapped later may meet a store to the place first.
+        const at_once = !summed.fails or if (f.model.parentOf(node)) |parent| f.tree.nodeTag(parent) == .@"try" else false;
         var rows: std.ArrayList(Lin) = .empty;
-        each: for (summary.rows) |row| {
+        each: for (summed.rows) |row| {
             var applied: Lin = constant(row.c);
             for (row.terms) |term| {
                 const param = term.v / 2;
                 const length = term.v % 2 == 1;
-                const given: ?Lin = if (param == summary.params)
+                const given: ?Lin = if (param == summed.params)
                     (if (length) try single(f.a, tl) else t)
-                else if (param < args.items.len)
-                    (if (length) args.items[param].length else args.items[param].lin)
-                else
-                    null;
+                else if (param < summed.params)
+                    (if (param < args.items.len) (if (length) args.items[param].length else args.items[param].lin) else null)
+                else at: {
+                    const width = std.math.cast(u16, summed.params) orelse break :at null;
+                    const offset = std.math.sub(Var, term.v, placeSlot(width, 0, false, false)) catch break :at null;
+                    const k = offset / 4;
+                    if (k >= entries.len) break :at null;
+                    if (offset % 4 < 2) break :at entries[k].before[@intFromBool(length)];
+                    if (!at_once) break :at null;
+                    const p = entries[k].place orelse break :at null;
+                    break :at try single(f.a, try f.placeVar(p, length));
+                };
                 const lin = given orelse continue :each;
                 applied = (try combine(f.a, applied, 1, lin, term.k)) orelse continue :each;
             }
             try rows.append(f.a, applied);
         }
         const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows.items };
-        if (summary.fails) return .{ .s = out, .v = value };
+        if (summed.fails) return .{ .s = out, .v = value };
         // A callee that cannot fail returns where it succeeds.
         return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
     }
+
+    /// A place a call's summary reads, where an operand holds it, and what it held before.
+    const Given = struct { place: ?Place = null, before: [2]?Lin = .{ null, null } };
 
     /// `value`, where it reads a place, held in the call's own temporaries for its `ordinal`th
     /// operand (the receiver's first, `2 * ordinal` and the next): the callee may store into the
@@ -2264,7 +2433,7 @@ const Frame = struct {
     }
 
     /// The summary of the one function of the program a call reaches, at this pointer width.
-    fn summaryOf(f: *Frame, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, params: usize, fails: bool } {
+    fn summaryOf(f: *Frame, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool } {
         const decl = switch (try f.c.facts.resolve(f.file, callee)) {
             .function => |d| d,
             else => return null,
@@ -2284,7 +2453,7 @@ const Frame = struct {
         const fails = callee_tree.nodeTag(result) == .error_union or
             (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang) or
             try mayFail(f.c, decl.file, result);
-        return .{ .rows = summary.rows, .params = summary.params, .fails = fails };
+        return .{ .rows = summary.rows, .params = summary.params, .places = summary.places, .written = summary.written, .fails = fails };
     }
 
     /// Whether a result type named rather than written in place (`R`, `Result(u64)`) may be an
