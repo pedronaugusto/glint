@@ -272,10 +272,10 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
             continue;
         }
         // A generic function's result, where its declared type is a parameter's: an owner handed
-        // over unless each return reads one held (`views`).
+        // over unless each return reads one held (`views`), its parameters this call's arguments.
         if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) continue;
         switch (try heldBy(c, resources, made, 0)) {
-            .resource => |which| if (!try views(c, resources, function, 0)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] })),
+            .resource => |which| if (!try views(c, resources, function, 0, &.{ .file = c.file, .call = call, .callee = function, .outer = null })) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("this binding makes function '{s}' return a std.{s} by value that is no view of one held: an owner handed over; aegis own.Owned names its one owner and checks it is released once; a borrow of it is its borrow().*, which is never released", .{ record.name, paths[which] })),
             .other, .generic => {},
             .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
         }

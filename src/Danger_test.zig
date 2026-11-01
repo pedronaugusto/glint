@@ -610,6 +610,21 @@ test "A015 judges a public generic at each binding, a consumer's among them, and
     try std.testing.expectEqual(@as(usize, 0), missing.findings);
 }
 
+test "A015 reads a public generic's returns at a binding with its parameters that call's arguments" {
+    // `pass` returns its parameter: at a binding handed a file just opened, the result is that
+    // owner; handed one the caller holds, a view of it.
+    const result = try runWithDependency(pack.ownership,
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\pub fn opened(io: std.Io) !void { const file = dep.pass(std.Io.File, try std.Io.Dir.cwd().openFile(io, "x", .{})); _ = file; }
+        \\pub fn held(file: *const std.Io.File) void { const view = dep.pass(std.Io.File, file.*); _ = view; }
+    ,
+        \\pub fn pass(comptime T: type, x: T) T { return x; }
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 1), result.findings);
+}
+
 test "A015 reads a container a type function makes inside another's with the outer call's arguments, and a type function's every return" {
     // `Outer(T)` holds a `Box(T)`, which releases what it holds: the consumer's
     // `Outer(std.Io.File)` makes `Box`'s field own the file by hand, and `Opt(std.Io.Dir)` through
