@@ -5,8 +5,5 @@
     .open = .{
         // glint-b precision: A015 leaves a type function's field read by a destructure undecided
         "destructure/glintb-tuple/twin.zig",
-        // warp-fast precision: Facts.resolve reads no `@call` as a call of its callee, so what a
-        // generic makes through one does not resolve and its binding is undecided (was flagged)
-        "call/wf-view-by-call/twin.zig",
     },
 }

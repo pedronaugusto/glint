@@ -1782,7 +1782,11 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
 fn callValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, node).?;
+    return self.calledValue(file, node, tree.fullCall(&call_buffer, node).?);
+}
+
+/// What `call`, the call at `node` (`f(a)`, or `@call`'s callee and tuple), gives.
+fn calledValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call) ResolveError!Value {
     const callee = try self.resolve(file, call.ast.fn_expr);
     if (callee == .alternatives) return self.map(callee, {}, callResult);
     if (callee == .function) {
@@ -1855,6 +1859,14 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
             .none => .{ .unknown = .unresolved },
             .unknown => |why| .{ .unknown = why },
         };
+    }
+    // `@call(modifier, f, .{ a, b })` calls `f` with the tuple's elements, binding no receiver.
+    if (std.mem.eql(u8, name, "@call") and args.len == 3) {
+        const passed = switch ((try calls.at(self, file, node)).?.args) { // unreachable: a three-operand `@call` is a call
+            .known => |each| each,
+            .unknown => |why| return .{ .unknown = why },
+        };
+        return self.calledValue(file, node, .{ .ast = .{ .lparen = tree.nodeMainToken(node), .fn_expr = args[1], .params = passed } });
     }
     if (std.mem.eql(u8, name, "@as") and args.len == 2) {
         const named = try self.resolveIn(env, file, args[0]);
