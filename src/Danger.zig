@@ -332,11 +332,9 @@ fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index) Context.E
     var out = try Taint.levelAt(c, flow, c.file, expression);
     var inner = expression;
     while (tree.nodeTag(inner) == .@"try" or tree.nodeTag(inner) == .grouped_expression) inner = if (tree.nodeTag(inner) == .@"try") tree.nodeData(inner).node else tree.nodeData(inner).node_and_token[0];
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, inner) orelse return out;
-    const reached = try Taint.reached(c, flow, c.file, call);
+    const reached = (try Taint.reached(c, flow, c.file, inner)) orelse return out;
     for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
-    if (try Taint.isRead(c, flow, c.file, call)) out = out.join(.data);
+    if (try Taint.isRead(c, flow, c.file, inner)) out = out.join(.data);
     return out;
 }
 

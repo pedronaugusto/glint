@@ -96,9 +96,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 }
             },
             else => {
-                var buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&buffer, node) orelse continue;
-                const reached = try Taint.reached(c, flow, c.file, call);
+                const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
                 const decl = reached.decl orelse continue;
                 const dir = Taint.directoryType(flow.flow) orelse continue;
                 if (decl.file != dir.file) continue;
@@ -250,7 +248,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         if (!site(c, node)) continue;
-        const reached = try Taint.reached(c, flow, c.file, call);
+        const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
         const decl = reached.decl orelse continue;
         if (!reached.std) continue;
         const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
@@ -1970,7 +1968,7 @@ fn consumes(c: *Context, flow: Taint.Fact, body: Ast.Node.Index) Context.Error!b
         const counted = std.mem.eql(u8, name, "take") or std.mem.eql(u8, name, "discard") or std.mem.eql(u8, name, "toss") or std.mem.eql(u8, name, "readSliceAll");
         const whole = std.mem.eql(u8, name, "takeByte") or std.mem.eql(u8, name, "takeByteSigned") or std.mem.eql(u8, name, "takeInt") or std.mem.eql(u8, name, "takeVarInt") or std.mem.eql(u8, name, "takeLeb128") or std.mem.eql(u8, name, "takeEnum");
         const taken = if (whole) true else if (counted and call.ast.params.len == 1) try Proof.nonzero(c, c.file, call.ast.params[0]) else false;
-        if (taken and try Taint.isRead(c, flow, c.file, call) and try always(c, c.file, node, body, .{})) return true;
+        if (taken and try Taint.isRead(c, flow, c.file, node) and try always(c, c.file, node, body, .{})) return true;
         if (std.mem.eql(u8, name, "checkCancel") and try passedOn(c, c.file, node) and try always(c, c.file, node, body, .{})) return true;
     }
     return false;
