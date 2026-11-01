@@ -299,46 +299,52 @@ fn movesSlot(self: *Walk, from: Facts.Decl, file: @import("Project.zig").FileId,
 /// Whether nothing in the program moves the field `decl` against `grows`: every store that
 /// may reach it steps it that way by a literal (`d.depth += 1`), or is a `defer` undoing at
 /// most a step its block took before it on the same object (`p.depth += 1; defer p.depth -= 1;`),
-/// which runs once that block's calls are done. Any other store to it, by any name (`@field`,
-/// the whole struct, a struct holding it, memory a builtin writes, a function outside the
-/// program handed a pointer that reaches it, `asm`) may reset it, and a depth reset is no depth.
+/// which runs once that block's calls are done. Any other store to it `Facts.accesses` finds,
+/// by any name (`@field`, a destructure, the whole struct, a struct holding it, memory a
+/// builtin writes, a function outside the program handed a pointer that reaches it, `asm`), or
+/// its address taken, may reset it, and a depth reset is no depth.
 fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
     const c = self.c;
     const program = try Program.get(c);
+    var files: std.ArrayList(@import("Project.zig").FileId) = .empty;
     for (c.project.sources) |*each| {
-        if (each.input.classification == .@"test") continue;
-        const file = each.id;
-        if (!program.own(file)) continue;
-        const tree = &each.file.tree;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            switch (tag) {
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (!try keepsWay(self, file, node, decl, grows)) return false,
-                .assign_destructure => for (tree.assignDestructure(node).ast.variables) |target| {
-                    if (tree.fullVarDecl(target) != null) continue;
-                    if (try reachesStore(c, file, target, decl)) return false;
-                },
-                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-                    const name_ = tree.tokenSlice(tree.nodeMainToken(node));
-                    if (!Range.writesMemory(name_)) continue;
-                    var args_buffer: [2]Ast.Node.Index = undefined;
-                    for (Facts.builtinArgs(tree, node, &args_buffer)) |arg| if (try reaches(c, file, arg, decl)) return false;
-                },
-                .asm_simple, .@"asm" => return false,
-                .call_one, .call_one_comma, .call, .call_comma => {
-                    var call_buffer: [1]Ast.Node.Index = undefined;
-                    const call = tree.fullCall(&call_buffer, node).?; // unreachable: the tag is a call's
-                    // The program's own functions are read here as they are.
-                    const callee = try c.facts.resolve(file, call.ast.fn_expr);
-                    if (callee == .function and program.own(callee.function.file)) continue;
-                    if (tree.nodeTag(call.ast.fn_expr) == .field_access) if (try reaches(c, file, tree.nodeData(call.ast.fn_expr).node_and_token[0], decl)) return false;
-                    for (call.ast.params) |arg| if (try reaches(c, file, arg, decl)) return false;
-                },
-                else => {},
-            }
-        }
+        if (each.input.classification == .@"test" or !program.own(each.id)) continue;
+        try files.append(c.allocator, each.id);
     }
+    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, files.items)) |site| switch (site.kind) {
+        // A value made with the field moves no depth another holds.
+        .init, .read => {},
+        .set, .update => switch (site.reach) {
+            .exact => {
+                if (site.part) return false;
+                const tree = &c.project.at(site.file).file.tree;
+                switch (tree.nodeTag(site.node)) {
+                    .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => if (!try keepsWay(self, site.file, site.node, decl, grows)) return false,
+                    else => return false,
+                }
+            },
+            // A whole value stored over the field resets it, but in a local by its own name,
+            // which is the function's.
+            .holder => if (!ownLocal(c, site)) return false,
+            .named, .unresolved => return false,
+        },
+        .covered, .address => return false,
+    };
     return true;
+}
+
+/// Whether a store's target is a local by its own name: a parameter, a capture or a variable
+/// of a function, whose memory is the function's.
+fn ownLocal(c: *Context, site: Facts.accesses.Site) bool {
+    const tree = &c.project.at(site.file).file.tree;
+    const model = &c.project.at(site.file).model;
+    const target = site.target orelse return false;
+    if (tree.nodeTag(target) != .identifier) return false;
+    const d = (model.reference(target) orelse return false).declaration orelse return false;
+    const record = model.declarations[@backingInt(d)];
+    if (record.kind == .parameter or record.kind == .capture) return true;
+    const scope = model.scopes[@backingInt(record.scope)].kind;
+    return record.kind == .variable and scope != .container and scope != .file;
 }
 
 /// Whether the store `node` keeps the field `decl` moving only as `grows` says (`monotone`).
@@ -348,7 +354,7 @@ fn keepsWay(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Ind
     const model = &c.project.at(file).model;
     const target, const by = tree.nodeData(node).node_and_node;
     const named = try storedField(c, file, target);
-    if (!std.meta.eql(named, decl)) return !try reachesStore(c, file, target, decl);
+    if (!std.meta.eql(named, decl)) return false;
     const step = fieldStep(tree, node) orelse return false;
     if (step.grows == grows) return true;
     // An undo: the whole of a `defer` in a block that stepped the same object at least as far
@@ -408,53 +414,6 @@ fn rootDeclaration(c: *Context, file: @import("Project.zig").FileId, target: Ast
     if (record.kind != .variable) return null;
     const local = tree.fullVarDecl(record.node) orelse return null;
     return if (tree.tokenTag(local.ast.mut_token) == .keyword_const) d else null;
-}
-
-/// Whether a store to `target` may write the field `decl`: its memory holds the field by value
-/// (the struct, a struct or array holding it), or its type does not resolve. A local by its own
-/// name is the function's, and a pointer stored is no pointee written.
-fn reachesStore(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    if (tree.nodeTag(target) == .identifier) {
-        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return false;
-        const d = (model.reference(target) orelse return true).declaration orelse return true;
-        const record = model.declarations[@backingInt(d)];
-        if (record.kind == .parameter or record.kind == .capture) return false;
-        const scope = model.scopes[@backingInt(record.scope)].kind;
-        if (scope != .container and scope != .file) return false;
-    }
-    return byValue(c, try c.facts.resolve(file, target), decl, 0);
-}
-
-/// Whether a value's own memory holds the field `decl`: it is an instance of a container that
-/// declares it, or holds one by value in a field or element; true where the type does not
-/// resolve.
-fn byValue(c: *Context, value: Facts.Value, decl: Facts.Decl, depth: u8) Context.Error!bool {
-    if (depth >= 16) return true;
-    switch (value) {
-        .instance => |k| {
-            for (try Taint.fieldsOf(c, k)) |field| {
-                if (std.meta.eql(field, decl)) return true;
-                if (try byValue(c, try c.facts.declaration(field), decl, depth + 1)) return true;
-            }
-            return false;
-        },
-        .array, .optional, .error_union => |inner| return byValue(c, inner.*, decl, depth + 1),
-        .alternatives => |each| {
-            for (each) |one| if (try byValue(c, one, decl, depth + 1)) return true;
-            return false;
-        },
-        .unknown, .reified, .literal => return true,
-        else => return false,
-    }
-}
-
-/// Whether memory `node` reaches, by value or through pointers, may hold the field `decl`.
-fn reaches(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
-    const fields = try Taint.wholeFields(c, try c.facts.resolve(file, node)) orelse return true;
-    for (fields) |field| if (std.meta.eql(field, decl)) return true;
-    return false;
 }
 
 /// The field `x.f` names by its declaration, where `x`'s type resolves.

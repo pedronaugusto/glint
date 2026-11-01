@@ -19,24 +19,35 @@ const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Model = @import("Model.zig");
 const Rule = @import("Rule.zig").Rule;
+const Facts = @import("Facts.zig");
 const Ast = std.zig.Ast;
+
+/// A value that may leave the call: a `return`'s, or a store's into `stored`.
+const Found = struct { node: Ast.Node.Index, operand: Ast.Node.Index, stored: ?Ast.Node.Index };
 
 pub fn check(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     const self: Walk = .{ .c = c, .tree = tree, .model = model };
+    var found: std.ArrayList(Found) = .empty;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"return") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const operand: Ast.Node.Index, const stored: ?Ast.Node.Index = switch (tag) {
-            .@"return" => .{ tree.nodeData(node).opt_node.unwrap() orelse continue, null },
-            .assign => .{ tree.nodeData(node).node_and_node[1], tree.nodeData(node).node_and_node[0] },
-            else => continue,
-        };
+        try found.append(c.allocator, .{ .node = node, .operand = tree.nodeData(node).opt_node.unwrap() orelse continue, .stored = null });
+    }
+    for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
+        if (site.kind != .set) continue;
+        try found.append(c.allocator, .{ .node = site.node, .operand = site.value orelse continue, .stored = site.target });
+    }
+    for (found.items) |each| {
+        const node = each.node;
+        const operand = each.operand;
+        const stored = each.stored;
         if (c.inTest(tree.nodeMainToken(node))) continue;
         const function = self.enclosing(node) orelse continue;
         if (stored) |target| if (!self.outlives(target)) continue;
         const local = (try self.escaping(operand, function, 0)) orelse continue;
-        if (stored) |target| if (self.restored(function, target)) continue;
+        if (stored) |target| if (try self.restored(function, target)) continue;
         const name = model.declarations[@backingInt(local)].name;
         const message = if (stored == null)
             try c.allocator.print("returns a pointer into local '{s}', which the return frees", .{name})
@@ -107,12 +118,9 @@ const Walk = struct {
                 const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
                 if (decl.ast.init_node.unwrap()) |init| if (try self.escaping(init, function, depth + 1)) |reached| return reached;
                 if (tree.tokenTag(decl.ast.mut_token) == .keyword_const) return null;
-                for (tree.nodes.items(.tag), 0..) |tag, i| {
-                    if (tag != .assign) continue;
-                    const assignment: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                    const target, const given = tree.nodeData(assignment).node_and_node;
-                    if (tree.nodeTag(target) != .identifier or self.own(target, function) != d) continue;
-                    if (try self.escaping(given, function, depth + 1)) |reached| return reached;
+                for (try Facts.accesses.writes(self.c.facts, .{ .declaration = .{ .file = self.c.file, .index = d } }, &.{self.c.file})) |site| {
+                    if (site.kind != .set and site.kind != .init or site.part) continue;
+                    if (try self.escaping(site.value orelse continue, function, depth + 1)) |reached| return reached;
                 }
                 return null;
             },
@@ -210,10 +218,45 @@ const Walk = struct {
         };
     }
 
-    /// Whether a `defer` of `function` assigns the target again, written the same way, as its
+    /// Whether two targets name the same memory by meaning: names of one declaration, the same
+    /// member (by its declaration where the holder's type resolves) of the same holder, the same
+    /// pointee, an element at a literal index spelled the same.
+    fn same(self: Walk, a: Ast.Node.Index, b: Ast.Node.Index, depth: u8) Context.Error!bool {
+        const tree = self.tree;
+        if (depth > 16) return false;
+        if (tree.nodeTag(a) == .grouped_expression) return self.same(tree.nodeData(a).node_and_token[0], b, depth + 1);
+        if (tree.nodeTag(b) == .grouped_expression) return self.same(a, tree.nodeData(b).node_and_token[0], depth + 1);
+        if (tree.nodeTag(a) != tree.nodeTag(b)) return false;
+        switch (tree.nodeTag(a)) {
+            .identifier => {
+                const left = (self.model.reference(a) orelse return false).declaration orelse return false;
+                const right = (self.model.reference(b) orelse return false).declaration orelse return false;
+                return left == right;
+            },
+            .field_access => {
+                const left = try self.c.facts.definition(self.c.file, a);
+                const right = try self.c.facts.definition(self.c.file, b);
+                if (left != null or right != null) {
+                    if (!std.meta.eql(left, right)) return false;
+                } else if (!std.mem.eql(u8, try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(a).node_and_token[1])), try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(b).node_and_token[1])))) return false;
+                return self.same(tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1);
+            },
+            .deref => return self.same(tree.nodeData(a).node, tree.nodeData(b).node, depth + 1),
+            .array_access => {
+                const left_holder, const left_index = tree.nodeData(a).node_and_node;
+                const right_holder, const right_index = tree.nodeData(b).node_and_node;
+                if (tree.nodeTag(left_index) != .number_literal or tree.nodeTag(right_index) != .number_literal) return false;
+                if (!std.mem.eql(u8, tree.getNodeSource(left_index), tree.getNodeSource(right_index))) return false;
+                return self.same(left_holder, right_holder, depth + 1);
+            },
+            else => return false,
+        }
+    }
+
+    /// Whether a `defer` of `function` assigns the target again, naming the same memory, as its
     /// statement or one of its block's own statements (never under a branch): a scoped
     /// registration cleared on every exit before the frame goes.
-    fn restored(self: Walk, function: Ast.Node.Index, target: Ast.Node.Index) bool {
+    fn restored(self: Walk, function: Ast.Node.Index, target: Ast.Node.Index) Context.Error!bool {
         const tree = self.tree;
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .@"defer") continue;
@@ -224,7 +267,7 @@ const Walk = struct {
             const statements = tree.blockStatements(&buffer, deferred) orelse &.{deferred};
             for (statements) |statement| {
                 if (tree.nodeTag(statement) != .assign) continue;
-                if (std.mem.eql(u8, tree.getNodeSource(tree.nodeData(statement).node_and_node[0]), tree.getNodeSource(target))) return true;
+                if (try self.same(tree.nodeData(statement).node_and_node[0], target, 0)) return true;
             }
         }
         return false;
