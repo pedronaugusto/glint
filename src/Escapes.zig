@@ -119,7 +119,7 @@ const Walk = struct {
                 if (decl.ast.init_node.unwrap()) |init| if (try self.escaping(init, function, depth + 1)) |reached| return reached;
                 if (tree.tokenTag(decl.ast.mut_token) == .keyword_const) return null;
                 for (try Facts.accesses.writes(self.c.facts, .{ .declaration = .{ .file = self.c.file, .index = d } }, &.{self.c.file})) |site| {
-                    if (site.kind != .set and site.kind != .init or site.part) continue;
+                    if ((site.kind != .set and site.kind != .init) or site.part) continue;
                     if (try self.escaping(site.value orelse continue, function, depth + 1)) |reached| return reached;
                 }
                 return null;
