@@ -3,7 +3,5 @@
 const std = @import("std");
 pub fn f(r: *std.Io.Reader, table: *const [16]u8) !u8 {
     const n = try r.takeByte();
-    var list: std.ArrayList(u8) = .empty;
-    _ = &list;
     return table[n];
 }
