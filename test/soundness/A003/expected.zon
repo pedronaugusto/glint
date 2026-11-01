@@ -2,4 +2,18 @@
 // bit or comparison operator: A003's value cannot pass through one.
 .{
     .na = .{.operator},
+    .open = .{
+        // glint-b precision: an acquisition assigned to a local, put in a literal, or handed to a call is not followed (undecided, never clear), so its release there is not seen
+        "aggregate/glintb-literal/twin.zig",
+        "assignment/glintb-write/twin.zig",
+        "call/glintb-helper/twin.zig",
+        // glint-b precision: A003's flow does not follow a release through an alias, a capture, a comptime-known branch, @field, a byte copy or an unwrap
+        "address/glintb-alias/twin.zig",
+        "capture/glintb-pointer/twin.zig",
+        "capture/glintb-value/twin.zig",
+        "compile_time/glintb-known/twin.zig",
+        "field/glintb-named/twin.zig",
+        "memory/glintb-bytes/twin.zig",
+        "unwrap/glintb-optional/twin.zig",
+    },
 }

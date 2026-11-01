@@ -165,6 +165,12 @@ fn checkAccess(c: *Context) Context.Error!void {
                 try checkWholeAddress(c, tree, node);
             }
         }
+        if (tag == .builtin_call_two or tag == .builtin_call_two_comma) {
+            try checkFieldBuiltin(c, tree, node);
+            try checkByteRead(c, tree, node);
+            continue;
+        }
+        if (tag == .call_one or tag == .call_one_comma) try checkByteRead(c, tree, node);
         if (tag != .field_access) continue;
         const data = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
@@ -175,6 +181,96 @@ fn checkAccess(c: *Context) Context.Error!void {
         const is_backing = backing(k, name);
         if (is_backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
+}
+
+/// A backing field named by `@field`, as a member access names it: by a name it spells
+/// (`@field(g, "data")`, `"\x64ata"`, a `const` that holds it), by each field of a struct
+/// whose `field_names` it ranges over that is one; by a name it computes, any field of the
+/// holder, undecided where the holder's kind has a backing field.
+fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return;
+    const holder = args[0];
+    const token = tree.nodeMainToken(node);
+    const named = try c.facts.fieldName(c.file, args[1]);
+    switch (named) {
+        .name => |name| if (!backingName(name)) return,
+        .each_of => {
+            if (!backingNamed(c, named, null)) return;
+        },
+        .computed => {},
+    }
+    if (try typeValue(c, holder)) return;
+    const k = (try requiredOwner(c, holder, access, token)) orelse return;
+    if (named == .computed) {
+        if (anyBacking(k)) try c.undecided(access, tree.tokenStart(token), .unresolved, "a name @field computes may be a published aegis backing field");
+        return;
+    }
+    if (backingNamed(c, named, k)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+}
+/// Whether a name `@field` spells or ranges over is a backing field: of kind `k`, or of any.
+fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
+    const candidates = [_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" };
+    switch (named) {
+        .name => |name| return if (k) |kind| backing(kind, name) else backingName(name),
+        .computed => return true,
+        .each_of => {
+            for (candidates) |name| if (c.facts.mayName(named, name) and (if (k) |kind| backing(kind, name) else true)) return true;
+            for (std.enums.values(Contract.Kind)) |each| {
+                if (k) |kind| if (each != kind) continue;
+                for (backingFields(each)) |name| if (c.facts.mayName(named, name)) return true;
+            }
+            return false;
+        },
+    }
+}
+
+/// The bytes of a published owner read outside aegis: a std byte view of it
+/// (`std.mem.asBytes(s)`, `toBytes`, `sliceAsBytes`) or `@bitCast` of it reads every field
+/// it keeps behind its operations at once. A byte view of what does not resolve is undecided
+/// where it may be an owner.
+fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    const operand: Ast.Node.Index = blk: {
+        switch (tree.nodeTag(node)) {
+            .builtin_call_two, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@bitCast")) return;
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, node, &buffer);
+                if (args.len != 1) return;
+                break :blk args[0];
+            },
+            else => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, node) orelse return;
+                if (call.ast.params.len != 1) return;
+                for ([_][]const u8{ "mem.asBytes", "mem.toBytes", "mem.sliceAsBytes" }) |path| {
+                    if (try stdCall(c, call, path)) break :blk call.ast.params[0];
+                }
+                return;
+            },
+        }
+    };
+    var place = operand;
+    while (true) switch (tree.nodeTag(place)) {
+        .address_of => place = tree.nodeData(place).node,
+        .grouped_expression => place = tree.nodeData(place).node_and_token[0],
+        else => break,
+    };
+    if (try typeValue(c, place)) return;
+    const token = tree.nodeMainToken(node);
+    switch (try ownerKind(c, place, access)) {
+        .owner => |k| if (anyBacking(k)) try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations"),
+        .other, .unknown => {},
+    }
+}
+
+/// Whether a kind publishes any backing field (`backing`).
+fn anyBacking(k: Contract.Kind) bool {
+    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" }) |candidate| if (backing(k, candidate)) return true;
+    for (backingFields(k)) |_| return true;
+    return false;
 }
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
@@ -206,22 +302,27 @@ fn checkLiteral(c: *Context, tree: *const Ast, node: Ast.Node.Index, targets: []
 fn checkFieldWrite(c: *Context, tree: *const Ast, target: Ast.Node.Index, at: Ast.Node.Index, targets: []const Facts.Container) Context.Error!void {
     var place = target;
     while (tree.nodeTag(place) == .grouped_expression) place = tree.nodeData(place).node_and_token[0];
-    const base: Ast.Node.Index, const name: []const u8 = switch (tree.nodeTag(place)) {
-        .field_access => .{ tree.nodeData(place).node_and_token[0], try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(place).node_and_token[1])) },
+    const base: Ast.Node.Index, const name: Facts.FieldName = switch (tree.nodeTag(place)) {
+        .field_access => .{ tree.nodeData(place).node_and_token[0], Facts.FieldName{ .name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(place).node_and_token[1])) } },
         .builtin_call_two, .builtin_call_two_comma => blk: {
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(place)), "@field")) return;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, place, &buffer);
-            if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return;
-            const quoted = tree.tokenSlice(tree.nodeMainToken(args[1]));
-            break :blk .{ args[0], quoted[1 .. quoted.len - 1] };
+            if (args.len != 2) return;
+            break :blk .{ args[0], try c.facts.fieldName(c.file, args[1]) };
         },
         else => return,
     };
+    // The name it writes may be a field the type declares: the one it spells, one of a
+    // struct's field names it ranges over, or any where it computes the name.
     var declared = false;
-    for (targets) |container| if (c.facts.member(container, name)) |field| {
-        declared = declared or c.project.at(field.file).model.declarations[@backingInt(field.index)].kind == .field;
-    };
+    for (targets) |container| {
+        const model = &c.project.at(container.file).model;
+        for (model.declarations) |d| {
+            if (d.kind != .field or d.scope != container.scope) continue;
+            declared = declared or c.facts.mayName(name, d.name);
+        }
+    }
     if (!declared) return;
     switch (try perBuild(c, try c.facts.resolve(c.file, base))) {
         .owner => |k| if (k == .public_source) try c.at(access, tree.nodeMainToken(at), "a public source's field written in place keeps a classification that no longer describes it; make a new one with err.PublicSource.classify(reason, bytes)"),
@@ -964,6 +1065,10 @@ fn checkCopies(c: *Context) Context.Error!void {
             if (tree.tokenTag(v.ast.mut_token) == .keyword_const and containerLevel(c, tree, node)) continue;
             try checkCopy(c, tree, node, init, v.ast.type_node.unwrap());
         }
+        // A destructure copies what its value reads, as a declaration does; a copy of bytes
+        // copies the memory it reads (`@memcpy(dst, std.mem.asBytes(&owner))`).
+        if (tag == .assign_destructure) try checkCopy(c, tree, node, tree.assignDestructure(node).ast.value_expr, null);
+        if (try byteCopy(c, tree, node)) |copy| try checkCopy(c, tree, node, copy.from, null);
         if (tag == .assign) {
             const sides = tree.nodeData(node).node_and_node;
             // `_ = x` discards the value: no second holder.
@@ -1788,6 +1893,127 @@ fn checkCleanup(c: *Context) Context.Error!void {
             .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
     }
+    for (0..tree.nodes.len) |i| try strayAcquisition(c, tree, model, @fromBackingInt(@intCast(i)));
+}
+
+/// An acquisition whose owner goes anywhere but where A003 follows it: a block's local it
+/// initialises (followed above), a `return` (the caller's), or a store into memory (a field,
+/// an element, a pointer's target: the holder's). Discarded (`_ = try dir.openFile(...)`) it
+/// leaks; assigned to a local, put in a literal or a destructure, handed to a call or chosen by
+/// a branch, it is not followed: undecided, never clear.
+fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: Ast.Node.Index) Context.Error!void {
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    _ = tree.fullCall(&call_buffer, node) orelse return;
+    // Up through what hands it on unchanged, the literals it is a field or element of and the
+    // branches it is the value of: their place decides (`return .{ .o = o.move() }`,
+    // `slot.* = .{ ... }`, `.w = if (w) |x| x.move() else null`).
+    // `value` is the acquisition as handed on, `at` what its place is decided at.
+    var at = node;
+    var value = node;
+    var in_literal = false;
+    const parent = while (model.parentOf(at)) |up| : (at = up) {
+        if (wraps(tree, up, at)) {
+            if (!in_literal) value = up;
+            continue;
+        }
+        if (literalPart(tree, up, at) or branchValue(tree, up, at)) {
+            in_literal = true;
+            continue;
+        }
+        break up;
+    } else return;
+    // A declaration's value: a block's local is followed from it, unless the owner is a part
+    // of a literal it holds; any other declaration holds no owner made at run time.
+    if (tree.fullVarDecl(parent) != null and !in_literal) return;
+    // A local A003 follows from it, through the ways it is made (`acquiredOwner`): a branch's
+    // value, a destructure's element of a literal, an `if`'s payload.
+    if (try followedAt(c, tree, model, parent, at)) return;
+    const discarded = switch (tree.nodeTag(parent)) {
+        .@"return" => return,
+        .assign => blk: {
+            if (tree.nodeData(parent).node_and_node[1] != at) break :blk false;
+            const target = tree.nodeData(parent).node_and_node[0];
+            switch (tree.nodeTag(target)) {
+                .field_access, .array_access, .deref => return,
+                .identifier => {
+                    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) break :blk true;
+                    // A local A003 follows, acquired again (`held = b.acquire()`): its flow
+                    // reads the assignment.
+                    if (!in_literal) if (Contract.local(c, target)) |index| {
+                        if (try acquiredOwner(c, tree, model, model.declarations[@backingInt(index)], false) != null) return;
+                    };
+                    break :blk false;
+                },
+                else => break :blk false,
+            }
+        },
+        else => false,
+    };
+    _ = (try acquisitionKind(c, tree, value, true)) orelse return;
+    if (discarded) return c.at(cleanup, tree.nodeMainToken(node), "an acquisition discarded with `_ =` is never released");
+    try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "an acquisition whose owner is not a block's local, returned, or stored into memory is not followed; no leak claimed");
+}
+
+/// Whether the place `parent` gives what `at` holds is a local A003 follows: a declaration's,
+/// a destructure's element, or an `if`'s or `while`'s payload of its condition.
+fn followedAt(c: *Context, tree: *const Ast, model: *const Model, parent: Ast.Node.Index, at: Ast.Node.Index) Context.Error!bool {
+    var nodes: std.ArrayList(Ast.Node.Index) = .empty;
+    var payload: ?Ast.TokenIndex = null;
+    if (tree.fullVarDecl(parent) != null) {
+        try nodes.append(c.allocator, parent);
+    } else if (tree.nodeTag(parent) == .assign_destructure) {
+        const destructure = tree.assignDestructure(parent);
+        if (destructure.ast.value_expr != at) return false;
+        try nodes.appendSlice(c.allocator, destructure.ast.variables);
+    } else if (tree.fullIf(parent)) |branch| {
+        if (branch.ast.cond_expr != at) return false;
+        payload = branch.payload_token;
+    } else if (tree.fullWhile(parent)) |loop| {
+        if (loop.ast.cond_expr != at) return false;
+        payload = loop.payload_token;
+    } else return false;
+    for (model.declarations) |decl| {
+        const mine = if (payload) |token| decl.kind == .capture and decl.token == token else std.mem.findScalar(Ast.Node.Index, nodes.items, decl.node) != null;
+        if (mine and try acquiredOwner(c, tree, model, decl, false) != null) return true;
+    }
+    return false;
+}
+
+/// Whether `node` is a value the expression `parent` may give: an `if`'s branch, a switch
+/// prong's, `catch`'s or `orelse`'s right side.
+fn branchValue(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
+    if (tree.fullIf(parent)) |branch| return branch.ast.then_expr == node or branch.ast.else_expr.unwrap() == node;
+    if (tree.fullSwitchCase(parent)) |prong| return prong.ast.target_expr == node;
+    if (tree.fullSwitch(parent) != null) return tree.nodeTag(node) == .switch_case or tree.nodeTag(node) == .switch_case_one or tree.nodeTag(node) == .switch_case_inline or tree.nodeTag(node) == .switch_case_inline_one;
+    return switch (tree.nodeTag(parent)) {
+        .@"catch", .@"orelse" => tree.nodeData(parent).node_and_node[1] == node,
+        else => false,
+    };
+}
+
+/// Whether `node` is a field's value or an element of the literal `parent`.
+fn literalPart(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, parent)) |literal| return std.mem.findScalar(Ast.Node.Index, literal.ast.fields, node) != null;
+    if (tree.fullArrayInit(&buffer, parent)) |literal| return std.mem.findScalar(Ast.Node.Index, literal.ast.elements, node) != null;
+    return false;
+}
+
+/// Whether `parent` hands its operand `node` on unchanged: `try`, `catch`'s or `orelse`'s
+/// left side, a grouping, or `@as`'s value.
+fn wraps(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(parent)) {
+        .@"try" => true,
+        .grouped_expression => tree.nodeData(parent).node_and_token[0] == node,
+        .@"catch", .@"orelse" => tree.nodeData(parent).node_and_node[0] == node,
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) break :blk false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, parent, &buffer);
+            break :blk args.len == 2 and args[1] == node;
+        },
+        else => false,
+    };
 }
 
 /// The kind of owner A003 follows the local `decl` as, from its acquisition to block end: a
@@ -1919,6 +2145,27 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
     };
     if (releases(k) == null) return null;
     return k;
+}
+
+/// The kind of owner the expression `init` acquires, read through `try`, `catch`, `orelse`, a
+/// grouping and `@as` to the acquisition itself (`acquisitionOwner`), or null where it acquires
+/// none.
+fn acquisitionKind(c: *Context, tree: *const Ast, init: Ast.Node.Index, report: bool) Context.Error!?Contract.Kind {
+    var acquisition = init;
+    while (true) acquisition = switch (tree.nodeTag(acquisition)) {
+        .@"try" => tree.nodeData(acquisition).node,
+        .grouped_expression => tree.nodeData(acquisition).node_and_token[0],
+        .@"catch", .@"orelse" => tree.nodeData(acquisition).node_and_node[0],
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(acquisition)), "@as")) break;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, acquisition, &buffer);
+            if (args.len != 2) break;
+            break :blk args[1];
+        },
+        else => break,
+    };
+    return acquisitionOwner(c, tree, acquisition, report);
 }
 
 /// Whether A003 follows the local `decl` from its acquisition (`acquiredOwner`) on this file,
@@ -3492,6 +3739,45 @@ fn stdCall(c: *Context, call: Ast.full.Call, path: []const u8) Context.Error!boo
     return false;
 }
 
+/// A copy of bytes `node` makes (`@memcpy` or `@memmove`): the places whose memory it writes
+/// and reads, each read through std's byte views (`std.mem.asBytes(&x)`, `sliceAsBytes`), a
+/// slice of it, or its address (`bytesPlace`).
+fn byteCopy(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?struct { into: Ast.Node.Index, from: Ast.Node.Index } {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    if (!std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return null;
+    return .{ .into = try bytesPlace(c, tree, args[0]), .from = try bytesPlace(c, tree, args[1]) };
+}
+
+/// The place whose memory a byte copy's argument names: through std's byte views, a slice and
+/// an address taken (`std.mem.asBytes(&x)[0..n]` is `x`), else the argument itself.
+fn bytesPlace(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!Ast.Node.Index {
+    var at = node;
+    var depth: usize = 0;
+    while (depth < 8) : (depth += 1) {
+        switch (tree.nodeTag(at)) {
+            .address_of => at = tree.nodeData(at).node,
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .slice_open => at = tree.nodeData(at).node_and_node[0],
+            .slice, .slice_sentinel => at = tree.nodeData(at).node_and_extra[0],
+            else => {
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, at) orelse return at;
+                if (call.ast.params.len != 1) return at;
+                if (!try stdCall(c, call, "mem.asBytes") and !try stdCall(c, call, "mem.sliceAsBytes")) return at;
+                at = call.ast.params[0];
+            },
+        }
+    }
+    return at;
+}
+
 /// Whether `node` may give what a scalar's `raw()` returned: the call itself, or that value
 /// carried unchanged through a grouping, `try`, `comptime`, `@as`, a branch of an `if`, an
 /// `orelse`, a `catch`, a `switch` or a labeled block's `break`, or a local: a constant it
@@ -3577,10 +3863,26 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
                 if (try rawValue(c, tree.assignDestructure(parent).ast.value_expr, followed)) return true;
             };
             if (tree.tokenTag(v.ast.mut_token) != .keyword_var) return false;
-            // Anything put in it, whole or in a part, by any assignment.
+            // Anything put in it, whole or in a part, by any assignment, a destructure, or a
+            // copy of bytes into it (`@memcpy(std.mem.asBytes(&v), std.mem.asBytes(&i))`).
             for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (tag == .assign_destructure) {
+                    const destructure = tree.assignDestructure(at);
+                    for (destructure.ast.variables) |target| {
+                        const root = placeRoot(tree, target) orelse continue;
+                        if (Contract.local(c, root) == index and try rawValue(c, destructure.ast.value_expr, followed)) return true;
+                    }
+                    continue;
+                }
+                if (try byteCopy(c, tree, at)) |copy| {
+                    const root = placeRoot(tree, copy.into) orelse continue;
+                    if (Contract.local(c, root) != index) continue;
+                    if (try rawValue(c, copy.from, followed) or try requiredOwner(c, copy.from, scalar, tree.nodeMainToken(at)) == .scalar) return true;
+                    continue;
+                }
                 if (!assigning(tag)) continue;
-                const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
+                const sides = tree.nodeData(at).node_and_node;
                 const root = placeRoot(tree, sides[0]) orelse continue;
                 if (Contract.local(c, root) != index) continue;
                 if (try rawValue(c, sides[1], followed)) return true;

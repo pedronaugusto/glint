@@ -1909,6 +1909,12 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
     const model = &self.project.at(file).model;
     const index = (model.reference(node) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(index)];
+    // A `const` that holds a name (`const field_name = "bytes"`) spells it.
+    if (record.kind == .variable) {
+        const variable = tree.fullVarDecl(record.node) orelse return null;
+        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+        return self.nameIn(env, file, variable.ast.init_node.unwrap() orelse return null, depth + 1);
+    }
     if (record.kind != .parameter) return null;
     var at: ?*const Env = env;
     while (at) |reading| : (at = reading.outer) {
@@ -1919,6 +1925,24 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
         return self.nameIn(source.env, source.file, source.node, depth + 1);
     }
     return null;
+}
+
+/// What `@field`'s name names: the one name it spells (a string literal with its escapes read,
+/// a `const` that holds one, an enum literal, `@tagName` of one), each field of a struct whose
+/// `field_names` it ranges over, or a name it computes, not known here.
+pub const FieldName = union(enum) { name: []const u8, each_of: Container, computed };
+pub fn fieldName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!FieldName {
+    if (try self.nameIn(null, file, node, 0)) |name| return .{ .name = name };
+    if (try self.fieldNamesOf(file, node)) |container| return .{ .each_of = container };
+    return .computed;
+}
+/// Whether a `@field` name may be `name`: it spells it, or ranges over a struct that has it.
+pub fn mayName(self: *Facts, field_name: FieldName, name: []const u8) bool {
+    return switch (field_name) {
+        .name => |spelled| std.mem.eql(u8, spelled, name),
+        .each_of => |container| self.hasField(container, name),
+        .computed => true,
+    };
 }
 
 /// The type of any of a container's fields, the choice of them: what `@FieldType` gives for a

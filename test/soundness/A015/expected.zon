@@ -2,4 +2,8 @@
 // of any arithmetic, bit or comparison operator: A015's value cannot pass through one.
 .{
     .na = .{.operator},
+    .open = .{
+        // glint-b precision: A015 leaves a type function's field read by a destructure undecided
+        "destructure/glintb-tuple/twin.zig",
+    },
 }
