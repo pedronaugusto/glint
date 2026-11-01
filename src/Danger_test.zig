@@ -3146,6 +3146,12 @@ test "A009 and A010 read every file of the program, selected or not: a table's o
     ;
     const kept = try runWithOther(pack.integers, stored, "pub fn touch(c: anytype) void { c.limit = 7; }");
     try std.testing.expectEqual(@as(usize, 0), kept.findings);
+    // A type another file names alike and hands to a call is that file's own: this one's
+    // stores are still all shown. Its own name handed to a call may be filled by reflection.
+    const named = try runWithOther(pack.integers, stored, "const Config = struct { limit: u64 = 0 };\nfn fill(comptime T: type) void { _ = T; }\npub fn touch(c: anytype) void { c.limit = 7; fill(Config); }");
+    try std.testing.expectEqual(@as(usize, 0), named.findings);
+    const filled = try runWithOther(pack.integers, stored ++ "fn fill(comptime T: type) void { _ = T; }\npub fn show() void { fill(Config); }\n", "pub fn touch(c: anytype) void { c.limit = 7; }");
+    try std.testing.expectEqualSlices(u32, &.{8}, filled.lines[0..filled.findings]);
     const widened = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.limit = r.takeInt(u64, 0) catch 0; }");
     try std.testing.expectEqualSlices(u32, &.{8}, widened.lines[0..widened.findings]);
     // The same store through a public generic's binding whose type this run does not fix, as a
@@ -5687,6 +5693,64 @@ test "Bounds clears an index or a slice the relations along every path keep with
     try std.testing.expectEqualSlices(u32, &.{ 14, 18, 34, 47 }, result.lines[0..result.findings]);
 }
 
+test "Bounds reads a function's parameters from what every caller gives them, where every caller is in the program" {
+    // Each call of `at` checks its index: cleared. `loose` has a caller that does not (line
+    // 16); `named` is named other than as a callee (line 24); `down` calls itself (line 34);
+    // `open` is public, which a consumer may call (line 42).
+    const result = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\fn at(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn get(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return at(buf, i);
+        \\}
+        \\pub fn next(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i + 1 >= buf.len) return error.Bad;
+        \\    return at(buf, i + 1);
+        \\}
+        \\fn loose(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn getLoose(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i > buf.len) return error.Bad;
+        \\    return loose(buf, i);
+        \\}
+        \\fn named(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\const kept = named;
+        \\pub fn getNamed(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return named(buf, i);
+        \\}
+        \\fn down(buf: []const u8, i: usize) u8 {
+        \\    if (i == 0) return buf[0];
+        \\    return buf[i] +% down(buf, i - 1);
+        \\}
+        \\pub fn getDown(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return down(buf, i);
+        \\}
+        \\pub fn open(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn getOpen(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, .little);
+        \\    if (i >= buf.len) return error.Bad;
+        \\    return open(buf, i);
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqualSlices(u32, &.{ 16, 24, 34, 42 }, result.lines[0..result.findings]);
+}
+
 test "A010 reads one object's length as at most maxInt(isize): two lengths and 1 fit a usize; two lengths and 2, or three lengths, may not" {
     const result = try run(pack.integers,
         \\const std = @import("std");
@@ -6540,7 +6604,7 @@ test "A010 reads C integer types by their narrowest width where a value goes int
     , 0);
     // A guard only a 64-bit `c_ulong` holds, a byte into `c_char` (above 127 on a signed
     // target), a `c_char` that may be negative into `u8`, and a `c_ulong` read into a `u32`
-    // (64 bits where it is long), each stays a finding.
+    // (64 bits where it is long) by a function any caller may call, each stays a finding.
     const head =
         \\const std = @import("std");
         \\
@@ -6549,11 +6613,13 @@ test "A010 reads C integer types by their narrowest width where a value goes int
         "pub fn f(r: *std.Io.Reader) !c_ulong {\n    const v = try r.takeInt(u64, 0);\n    if (v > 0xffff_ffff_ffff) return 0;\n    return @intCast(v);\n}\n",
         "pub fn f(r: *std.Io.Reader) !c_char {\n    const b = try r.takeByte();\n    return @intCast(b);\n}\n",
         "fn narrow(ch: c_char) u8 {\n    return @intCast(ch);\n}\npub fn f(r: *std.Io.Reader) !u8 {\n    return narrow(@bitCast(try r.takeByte()));\n}\n",
-        "fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n",
+        "pub fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n",
     }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
+    // Private, its one caller gives it a `u32`: the `c_ulong` holds no more (caller ranges).
+    try expect(pack.integers, head ++ "fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n", 0);
 }
 
 test "A009 reads the length of an array a field points to: a byte indexes 256 entries" {
