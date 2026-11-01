@@ -13,7 +13,7 @@ fn check(context: *glint.RuleContext) glint.RuleContext.Error!void {
         try context.at(local_export, declaration.token, "public constant requires the project's export contract");
     };
 }
-pub fn main(init: std.process.Init) void {
+pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
     var buffer: [4096]u8 = undefined;
     // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
@@ -21,6 +21,14 @@ pub fn main(init: std.process.Init) void {
     var problems_buffer: [1024]u8 = undefined;
     // aegis: design(A019): read only below what it wrote; ensign's Page calls it through a function-pointer field that std's generic reflective writers may store into until glint reaches them per instantiation
     var problems = std.Io.File.stderr().writer(init.io, &problems_buffer);
-    const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch std.process.exit(2);
+    const status = cli.executeConfigured(init.gpa, init.io, args, &output.interface, &problems.interface, &rules) catch |err| switch (err) {
+        // A write that failed has its cause on its file's writer: a cancel in either ends main as one.
+        error.WriteFailed => {
+            if (output.err) |cause| if (cause == error.Canceled) return error.Canceled;
+            if (problems.err) |cause| if (cause == error.Canceled) return error.Canceled;
+            std.process.exit(2);
+        },
+        else => std.process.exit(2),
+    };
     if (status != 0) std.process.exit(status);
 }

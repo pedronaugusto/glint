@@ -37,9 +37,10 @@ const Gate = struct {
     };
 };
 
-pub fn main(init: std.process.Init) void {
+pub fn main(init: std.process.Init) !void {
     const gate = ensign.parseOrExit(Gate, init);
-    const status = execute(init, gate) catch std.process.exit(2);
+    // A cancel ends the gate as one; any other failure is the tool's.
+    const status = execute(init, gate) catch |err| if (err == error.Canceled) return err else std.process.exit(2);
     if (status != 0) std.process.exit(status);
 }
 fn execute(init: std.process.Init, gate: Gate) !u8 {
@@ -61,13 +62,14 @@ fn execute(init: std.process.Init, gate: Gate) !u8 {
         else => return 2,
     };
     const receipt = try aegis.own.readFile(init.io, std.Io.Dir.cwd(), receipt_path, a, .fromRaw(64 * 1024));
-    var buffer: [4096]u8 = undefined;
+    var buffer: [4096]u8 = @splat(0);
     var output = std.Io.File.stdout().writer(init.io, &buffer);
-    try output.interface.writeAll(result.stdout);
-    try output.interface.flush();
-    var stderr_buffer: [4096]u8 = undefined;
+    // A write that fails gives the file's own error, a cancel among it, where WriteFailed hides it.
+    output.interface.writeAll(result.stdout) catch return output.err orelse error.WriteFailed;
+    output.interface.flush() catch return output.err orelse error.WriteFailed;
+    var stderr_buffer: [4096]u8 = @splat(0);
     var errors = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-    try errors.interface.writeAll(result.stderr);
-    try errors.interface.flush();
+    errors.interface.writeAll(result.stderr) catch return errors.err orelse error.WriteFailed;
+    errors.interface.flush() catch return errors.err orelse error.WriteFailed;
     return if (try accepted(a, receipt, &nonce, status, result.stdout)) 0 else if (status >= 2) 2 else 1;
 }
