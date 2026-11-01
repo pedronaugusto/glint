@@ -120,7 +120,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
-    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn total(items: anytype) usize { return items.count(); }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
+    .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn sort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void { _ = items; _ = lessThan; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn total(items: anytype) usize { return items.count(); }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
     .{ .name = "std/time.zig", .bytes =
     \\pub const ns_per_us = 1000;
     \\pub const ns_per_ms = 1000 * ns_per_us;
@@ -2400,7 +2400,11 @@ test "A009's input is a child's output and a file's contents, aegis's whole-file
         \\    return out.stdout[out.stdout[0]];
         \\}
     ;
-    try expect(pack.untrusted_input, program, 4);
+    // Four reads of input, and two of `name` (lines 6 and 9) that are not: aegis calls a member
+    // named `load` on a slot of `*Table(Brand)`, whose members Facts does not yet read through
+    // the generic, so the program's `pub fn load` may be what it calls, with anything. The
+    // shared resolver reads them, and these two go.
+    try expect(pack.untrusted_input, program, 6);
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .gate }} }, .{ .project_rules = &pack.rules });
@@ -8596,6 +8600,21 @@ test "A009 reads a slice's length written from input as input: no build checks i
     try std.testing.expectEqualSlices(u32, &.{7}, result.lines[0..result.findings]);
 }
 
+test "a length written from input names the read that wrote it, where the memory holds nothing from input" {
+    const back = try onlyMessage(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !usize {
+        \\    var memory: [512]u8 = @splat(0);
+        \\    var s: []u8 = memory[0..0];
+        \\    const n: usize = try r.takeInt(u16, .little);
+        \\    s.len = n;
+        \\    return s.len - 86;
+        \\}
+    );
+    defer std.testing.allocator.free(back);
+    try std.testing.expect(std.mem.endsWith(u8, back, "(input from consumer:5 `r.takeInt`)"));
+}
+
 test "A009 and A010 read a destructure and a pointer capture as writes of what they bind" {
     inline for (.{
         .{ pack.integers, "pub fn f(r: *std.Io.Reader) !u64 {\n    var v: u64 = 5;\n    v, _ = .{ try r.takeInt(u64, 0), 0 };\n    return v * 1000;\n}\n" },
@@ -8645,6 +8664,55 @@ test "A009 reads what input decides through a jump, a call's or a builtin's writ
         \\}
         \\pub fn f(r: *std.Io.Reader) !u8 {
         \\    return g(try r.takeByte(), "abcd");
+        \\}
+    , 0);
+}
+
+test "A009 reads a function the program hands std as called with anything: a sort's comparator indexes a table by an element" {
+    const head =
+        \\const std = @import("std");
+        \\const table: [16]u8 = @splat(0);
+        \\fn less(_: void, a: u32, b: u32) bool {
+        \\    return table[a] < table[b];
+        \\}
+        \\
+    ;
+    try expect(pack.untrusted_input, head ++
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    var items: [4]u32 = undefined;
+        \\    for (&items) |*it| it.* = try r.takeInt(u32, 0);
+        \\    std.mem.sort(u32, &items, {}, less);
+        \\}
+    , 2);
+    // Called only by the program, with its own values.
+    try expect(pack.untrusted_input, head ++
+        \\pub fn f() bool {
+        \\    return less({}, 1, 2);
+        \\}
+    , 0);
+}
+
+test "A010 reads a slice's length through a pointer as written by a callee handed the pointer between the check and the use" {
+    const head =
+        \\const std = @import("std");
+        \\fn drop(p: *[]const u8) void {
+        \\    p.* = p.*[0..0];
+        \\}
+        \\
+    ;
+    try expect(pack.integers, head ++
+        \\pub fn f(r: *std.Io.Reader, p: *[]const u8) !usize {
+        \\    const i: usize = try r.takeInt(u32, 0);
+        \\    if (i > p.len) return 0;
+        \\    drop(p);
+        \\    return p.len - i;
+        \\}
+    , 1);
+    try expect(pack.integers, head ++
+        \\pub fn f(r: *std.Io.Reader, p: *[]const u8) !usize {
+        \\    const i: usize = try r.takeInt(u32, 0);
+        \\    if (i > p.len) return 0;
+        \\    return p.len - i;
         \\}
     , 0);
 }

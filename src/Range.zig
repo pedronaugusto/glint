@@ -2911,7 +2911,10 @@ fn fieldFollows(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, nam
             if (!std.mem.eql(u8, name, "len") and !std.mem.eql(u8, name, "ptr")) break :blk true;
             break :blk switch (inner.*) {
                 .instance, .container => |k| c.facts.member(k, name) != null,
-                .primitive, .array, .pointer, .optional, .scalar => false,
+                // A pointer to a pointer is a slice of pointers or a single pointer to a slice
+                // (`p: *[]const u8`), whose `len` is read through it.
+                .pointer => true,
+                .primitive, .array, .optional, .scalar => false,
                 else => true,
             };
         },
