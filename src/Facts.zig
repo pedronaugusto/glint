@@ -2040,7 +2040,7 @@ pub fn memberField(self: *Facts, container: Container, decl: Decl) ResolveError!
 /// A member of `container`: a field of a container a type function made is of its declared
 /// type with the function's parameters read as the call's arguments, and a container declared
 /// inside the made one is made by the same call.
-fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
+pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Value {
     const made = container.made_by orelse return self.declaration(decl);
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const tree = &self.project.at(decl.file).file.tree;
@@ -2126,92 +2126,66 @@ fn storedFunctions(self: *Facts, container: Container, name: []const u8) Resolve
     if (self.storing.contains(field)) return null;
     try self.storing.put(self.gpa, field, {});
     defer _ = self.storing.remove(field);
-    const found = try self.storesOf(container, field, name);
+    const found = try self.storesOf(container, field);
     try self.stored.put(self.gpa, field, found);
     return found;
 }
 
-fn storesOf(self: *Facts, container: Container, field: Decl, name: []const u8) ResolveError!?Value {
-    var targets: std.ArrayList(Value) = .empty;
-    {
-        const tree = &self.project.at(field.file).file.tree;
-        const declared = tree.fullContainerField(self.project.at(field.file).model.declarations[@backingInt(field.index)].node) orelse return null;
-        if (declared.ast.value_expr.unwrap()) |default| if (!try self.stores(&targets, field.file, default)) return null;
-    }
-    const files = try self.compiledWith(container.file);
-    var each = files.keyIterator();
+/// What a call through the function-pointer field may reach, from its stores in the files
+/// that may share a compilation with its struct (`fieldStores`): one function, or a choice.
+fn storesOf(self: *Facts, container: Container, field: Decl) ResolveError!?Value {
+    var files: std.ArrayList(Project.FileId) = .empty;
+    var each = (try self.compiledWith(container.file)).keyIterator();
     while (each.next()) |key| {
-        const file = key.*;
-        if (self.project.at(file).file.status != .parsed or !try self.importsRead(file)) return null;
-        const tree = &self.project.at(file).file.tree;
-        const model = &self.project.at(file).model;
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            switch (tag) {
-                .field_access => {
-                    const object, const spelled = tree.nodeData(node).node_and_token;
-                    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(spelled)), name)) continue;
-                    const parent = model.parentOf(node) orelse continue;
-                    switch (tree.nodeTag(parent)) {
-                        .assign => if (tree.nodeData(parent).node_and_node[0] != node) continue,
-                        .address_of => {},
-                        else => continue,
-                    }
-                    if (!mayHold(container, try self.resolve(file, object))) continue;
-                    if (tree.nodeTag(parent) == .address_of) return null;
-                    if (!try self.stores(&targets, file, tree.nodeData(parent).node_and_node[1])) return null;
-                },
-                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-                    const builtin_name = tree.tokenSlice(tree.nodeMainToken(node));
-                    var buffer: [2]Ast.Node.Index = undefined;
-                    const args = builtinArgs(tree, node, &buffer);
-                    if (std.mem.eql(u8, builtin_name, "@field")) {
-                        if (args.len != 2) continue;
-                        // A name spelled out names this field or another; any other may be it.
-                        if (tree.nodeTag(args[1]) == .string_literal) {
-                            const spelled = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => name,
-                            };
-                            if (!std.mem.eql(u8, spelled, name)) continue;
-                        }
-                        const parent = model.parentOf(node) orelse continue;
-                        const set = switch (tree.nodeTag(parent)) {
-                            .assign => tree.nodeData(parent).node_and_node[0] == node,
-                            .address_of => true,
-                            else => false,
-                        };
-                        // `@field` of a type names a declaration of it (`&@field(cpus, name)` with
-                        // `comptime cpus: type`), no field of a value; a name that ranges over
-                        // another struct's fields (`for (@typeInfo(T).@"struct".field_names)`)
-                        // names this field only where that struct has one so named.
-                        if (try self.fieldNamesOf(file, args[1])) |other| if (!self.hasField(other, name)) continue;
-                        if (set and !try self.isType(file, args[0]) and mayHold(container, try self.resolve(file, args[0]))) return null;
-                    } else if (std.mem.eql(u8, builtin_name, "@ptrCast") or std.mem.eql(u8, builtin_name, "@bitCast")) {
-                        if (isOf(container, try self.literalType(file, node))) return null;
-                    }
-                },
-                else => {
-                    if (tree.fullVarDecl(node)) |variable| if (variable.extern_export_token) |token| if (tree.tokenTag(token) == .keyword_extern) {
-                        if (variable.ast.type_node.unwrap()) |kind| if (isOf(container, try self.resolve(file, kind))) return null;
-                    };
-                    var buffer: [2]Ast.Node.Index = undefined;
-                    const literal = tree.fullStructInit(&buffer, node) orelse continue;
-                    for (literal.ast.fields) |value| {
-                        const label = try self.memberName(tree.tokenSlice(Model.initName(tree, value) orelse continue));
-                        if (!std.mem.eql(u8, label, name)) continue;
-                        if (!mayHold(container, try self.literalType(file, node))) continue;
-                        if (!try self.stores(&targets, file, value)) return null;
-                    }
-                },
-            }
+        if (self.project.at(key.*).file.status != .parsed or !try self.importsRead(key.*)) return null;
+        try files.append(self.gpa, key.*);
+    }
+    const targets = (try self.fieldStores(field, files.items)) orelse return null;
+    return switch (targets.len) {
+        0 => null,
+        1 => targets[0],
+        else => .{ .alternatives = targets },
+    };
+}
+
+/// The functions each store in `files` that `accesses` finds may write the field gives it
+/// (`stores`). Null where one may give it any: its address taken, a store reading it first, a
+/// store with no one value, a computed `@field` that may name it, and memory a cast or an
+/// `extern` makes. A whole value copied over it carries what another store gave, and memory a
+/// function the program does not hold or `asm` writes holds no function the program declares
+/// that a store here did not give: neither adds one.
+pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) ResolveError!?[]const Value {
+    var targets: std.ArrayList(Value) = .empty;
+    for (try accesses.writesFor(self, .{ .field = field }, files, .{ .holders = false })) |site| {
+        const tree = &self.project.at(site.file).file.tree;
+        if (site.computed) {
+            const target = site.target orelse return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, target, &buffer);
+            if (args.len != 2) return null;
+            // `@field` of a type names a declaration of it (`&@field(cpus, name)` with
+            // `comptime cpus: type`), no field of a value; a name that ranges over another
+            // struct's fields (`for (@typeInfo(T).@"struct".field_names)`) names this field
+            // only where that struct has one so named.
+            if (try self.isType(site.file, args[0])) continue;
+            if (try self.fieldNamesOf(site.file, args[1])) |other| if (!self.hasField(other, self.project.at(field.file).model.declarations[@backingInt(field.index)].name)) continue;
+            return null;
+        }
+        switch (site.kind) {
+            .covered => switch (tree.nodeTag(site.node)) {
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return null,
+                else => if (tree.fullVarDecl(site.node) != null) return null,
+            },
+            .init, .set => switch (site.reach) {
+                .exact, .named => if (!try self.stores(&targets, site.file, site.value orelse return null)) return null,
+                .holder, .unresolved => {},
+            },
+            .update => if (site.reach == .exact or site.reach == .named) return null,
+            .address => if (site.reach == .exact or site.reach == .named) return null,
+            .read => {},
         }
     }
-    return switch (targets.items.len) {
-        0 => null,
-        1 => targets.items[0],
-        else => .{ .alternatives = targets.items },
-    };
+    return targets.items;
 }
 
 /// The struct whose field names `node` ranges over: a `for`'s only capture over
@@ -2284,21 +2258,6 @@ fn stores(self: *Facts, targets: *std.ArrayList(Value), file: Project.FileId, no
         } else try targets.append(self.gpa, one);
     }
     return true;
-}
-
-/// Whether a value of type `value` (or a type) may be `container`'s, or a pointer to one: it is,
-/// or it does not resolve.
-fn mayHold(container: Container, value: Value) bool {
-    return value == .unknown or isOf(container, value);
-}
-
-/// Whether `value` is `container`, a value of it, or a pointer to one.
-fn isOf(container: Container, value: Value) bool {
-    return switch (value) {
-        .container, .instance => |c| c.file == container.file and c.scope == container.scope,
-        .pointer => |to| isOf(container, to.*),
-        else => false,
-    };
 }
 
 /// Files by their ids.
@@ -4832,6 +4791,985 @@ pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.
     return tree.builtinCallParams(buffer, node) orelse &.{};
 }
 
+/// Where the program writes, reads and takes the address of each place: the one index every
+/// analysis asks "where is this written or read" (`Facts.accesses`). A place is a variable, a
+/// parameter or a capture by its declaration, or a container's field in every value of the
+/// container. Each file is walked once, the first time a query reaches it, and each site is
+/// classified to the place it reaches by meaning: the declaration a name refers to, the field a
+/// member or `@field` resolves to through its holder's type, never the spelling alone.
+///
+/// Writes: `x = v` (W1), `x op= v` (W2), a destructure's target (W3), `@field(h, "f") = v` and
+/// one with a computed name (W4), a pointer capture `|*p|` over an array (W5, its address), `&x`
+/// (W6, an address), a store through a pointer (`p.* = v`, `p.f = v`, W7), a whole value stored
+/// over the fields it holds (`s = t`, W8), the memory builtins (W9), a cast that makes a value of
+/// a type from other memory (W10), a pointer handed to a function whose body the program does
+/// not hold (W11), an element store (W12), one in a `defer` or `errdefer` (W13, marked) and `asm`
+/// (W14). Reads: a name (R1), `x.f` (R2), `@field` (R3), a by-value capture (R4), a copy or a
+/// value passed (R5), and `&x` (R6, an address).
+///
+/// A site whose place does not resolve is never skipped. A member written on a holder whose type
+/// does not resolve is kept by the member's name, and a query for a field so named gets it
+/// (`.named`); a store of a whole value whose type does not resolve, or of memory nothing names
+/// (`asm`, a pointer of an unknown type handed out, a computed `@field` on an unknown holder),
+/// is kept as unresolved, and every query for a place it may reach gets it (`.unresolved`). A
+/// file the front end refused gives one unresolved site.
+pub const accesses = struct {
+    pub const Place = union(enum) {
+        /// A variable, a parameter or a capture.
+        declaration: Facts.Decl,
+        /// A container's field, in every value of the container.
+        field: Facts.Decl,
+    };
+
+    pub const Kind = enum {
+        /// The place's first value: a variable's, a field's default, a literal's `.f = v` making a
+        /// value of the container.
+        init,
+        /// A store of `value` (`x = v`, a destructure's element, a memory builtin's), or of what the
+        /// site stores where no one expression is it.
+        set,
+        /// A store that reads the place first: `x op= v`, `@atomicRmw`.
+        update,
+        /// Memory written as bytes or by code the program does not hold: a cast's, `extern`'s, an
+        /// outside function's given a pointer, `asm`. What it stores is no value the program gives.
+        covered,
+        /// The place's address taken: `&x`, a slice of an array, a pointer capture over one, a
+        /// method's pointer receiver. A pointer that may write the place wherever it goes.
+        address,
+        /// A read.
+        read,
+    };
+
+    /// How a site reaches the place a query asks about.
+    pub const Reach = enum {
+        /// It names the place.
+        exact,
+        /// It names a member so spelled on a holder whose type does not resolve.
+        named,
+        /// It stores or reads a whole value of the place's container, or of one that holds it by
+        /// value.
+        holder,
+        /// Its memory does not resolve.
+        unresolved,
+    };
+
+    pub const Site = struct {
+        file: Project.FileId,
+        /// The node that accesses: the assignment, the destructure, the literal, the field's
+        /// declaration, the builtin call, the call, the `&`, the capture's loop or branch, the read.
+        node: Ast.Node.Index,
+        /// The expression that names the place at `node`, where one does.
+        target: ?Ast.Node.Index = null,
+        kind: Kind,
+        /// What the place takes, where one expression gives it.
+        value: ?Ast.Node.Index = null,
+        reach: Reach = .exact,
+        /// Part of the place (`x.f` of a struct `x`, `x[i]` of an array), not the whole.
+        part: bool = false,
+        /// Through a pointer, not by the memory's own name.
+        through: bool = false,
+        /// Run by a `defer` or an `errdefer`.
+        deferred: bool = false,
+        /// `@field` with a name computed as the program compiles: any field of the holder's type.
+        computed: bool = false,
+    };
+
+    /// A container by its identity.
+    const Shape = struct { file: Project.FileId, scope: Model.Scope.Id };
+    /// A container reached while collecting, and whether its own memory is written there.
+    const Seen = struct { shape: Shape, own: bool };
+
+    const Sites = std.ArrayList(Site);
+
+    /// One file's sites, of writes or of reads.
+    pub const File = struct {
+        places: std.AutoHashMapUnmanaged(Place, Sites) = .empty,
+        /// Stores and reads of a whole value of a container.
+        shapes: std.AutoHashMapUnmanaged(Shape, Sites) = .empty,
+        /// Members on holders whose type does not resolve, by the member's name.
+        named: std.StringHashMapUnmanaged(Sites) = .empty,
+        unresolved: Sites = .empty,
+        /// Of writes, each store once, by its target: an assignment's, an `op=`'s, a destructure's.
+        stores: Sites = .empty,
+    };
+
+    /// The run's index, kept in `Facts.memo`.
+    const State = struct {
+        writes: std.AutoHashMapUnmanaged(Project.FileId, *const File) = .empty,
+        reads: std.AutoHashMapUnmanaged(Project.FileId, *const File) = .empty,
+        /// Of each file, the write sites a query for a field of one name reads (`Filter`).
+        fields: std.HashMapUnmanaged(Narrow, *const File, Narrow.Context, std.hash_map.default_max_load_percentage) = .empty,
+    };
+
+    /// What a query for a field needs of a file's writes: the sites whose target or literal
+    /// names a member so spelled (resolved, they may be the field's), and with `holders`, every
+    /// whole value stored and what code the program does not hold writes. Sites of memory that
+    /// does not resolve, casts and `extern`s are read either way. A field's index is built only
+    /// of what may name it, so a query does not resolve every store of every file it reads.
+    const Filter = struct { name: []const u8, holders: bool };
+
+    const Narrow = struct {
+        file: Project.FileId,
+        filter: Filter,
+
+        const Context = struct {
+            pub fn hash(_: Context, key: Narrow) u64 {
+                var h: std.hash.Wyhash = .init(@intFromBool(key.filter.holders));
+                h.update(key.filter.name);
+                h.update(std.mem.asBytes(&key.file));
+                return h.final();
+            }
+            pub fn eql(_: Context, a: Narrow, b: Narrow) bool {
+                return a.file == b.file and a.filter.holders == b.filter.holders and std.mem.eql(u8, a.filter.name, b.filter.name);
+            }
+        };
+    };
+
+    /// What a query needs: for a field, whether the stores of whole values and the writes of
+    /// code the program does not hold (`holder` and `covered` sites a function pointer's stores,
+    /// which only carry or garble what other stores give, may leave out).
+    pub const Need = struct { holders: bool = true };
+
+    pub const Error = Facts.ResolveError;
+
+    /// Each site in `files` that may write `place`: one that names it, and for a field, a member so
+    /// named on a holder whose type does not resolve, a whole value stored over its container or
+    /// one that holds it by value, and memory that does not resolve. An address taken is a write wherever
+    /// the pointer goes, and is among them.
+    pub fn writes(facts: *Facts, place: Place, files: []const Project.FileId) Error![]const Site {
+        return writesFor(facts, place, files, .{});
+    }
+
+    /// `writes`, of what `need` asks.
+    pub fn writesFor(facts: *Facts, place: Place, files: []const Project.FileId, need: Need) Error![]const Site {
+        var out: Sites = .empty;
+        for (files) |file| try gather(facts, switch (place) {
+            .declaration => try writesOf(facts, file),
+            .field => |d| try fieldWritesOf(facts, file, .{ .name = facts.project.at(d.file).model.declarations[@backingInt(d.index)].name, .holders = need.holders }),
+        }, place, &out);
+        return out.items;
+    }
+
+    /// Each site in `files` that may read `place`, as `writes` finds them.
+    pub fn reads(facts: *Facts, place: Place, files: []const Project.FileId) Error![]const Site {
+        var out: Sites = .empty;
+        for (files) |file| try gather(facts, try readsOf(facts, file), place, &out);
+        return out.items;
+    }
+
+    fn gather(facts: *Facts, index: *const File, place: Place, out: *Sites) Error!void {
+        if (index.places.get(place)) |found| try out.appendSlice(facts.gpa, found.items);
+        const decl = switch (place) {
+            inline else => |d| d,
+        };
+        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        // A local is reached only by its name and the pointers its address gives.
+        if (place == .declaration and !global(facts, decl)) return;
+        if (index.named.get(record.name)) |found| try reached(facts, out, found.items, .named);
+        if (place == .field) if (index.shapes.get(.{ .file = decl.file, .scope = record.scope })) |found| try reached(facts, out, found.items, .holder);
+        try reached(facts, out, index.unresolved.items, .unresolved);
+    }
+
+    fn reached(facts: *Facts, out: *Sites, sites: []const Site, how: Reach) Error!void {
+        for (sites) |site| {
+            var one = site;
+            one.reach = how;
+            try out.append(facts.gpa, one);
+        }
+    }
+
+    /// Whether a declaration lives outside any function: in a file's or a container's scope.
+    fn global(facts: *Facts, decl: Facts.Decl) bool {
+        const model = &facts.project.at(decl.file).model;
+        const record = model.declarations[@backingInt(decl.index)];
+        return switch (model.scopes[@backingInt(record.scope)].kind) {
+            .file, .container => true,
+            else => false,
+        };
+    }
+
+    /// Each store in `file`, once, by its target: `x = v`, `x op= v`, a destructure's target
+    /// (with its element where the value is a literal).
+    pub fn storesIn(facts: *Facts, file: Project.FileId) Error![]const Site {
+        return (try writesOf(facts, file)).stores.items;
+    }
+
+    /// The write sites of `file`, found the first time a query reaches it.
+    pub fn writesOf(facts: *Facts, file: Project.FileId) Error!*const File {
+        const state = try facts.memo(State);
+        if (state.writes.get(file)) |kept| return kept;
+        const index = try facts.gpa.create(File);
+        index.* = .{};
+        var walk: Walk = .{ .facts = facts, .file = file, .index = index };
+        try walk.writes();
+        try state.writes.put(facts.gpa, file, index);
+        return index;
+    }
+
+    /// The write sites of `file` a query for a field `filter` names needs, found once.
+    fn fieldWritesOf(facts: *Facts, file: Project.FileId, filter: Filter) Error!*const File {
+        const state = try facts.memo(State);
+        const key: Narrow = .{ .file = file, .filter = filter };
+        if (state.fields.get(key)) |kept| return kept;
+        const index = try facts.gpa.create(File);
+        index.* = .{};
+        var walk: Walk = .{ .facts = facts, .file = file, .index = index, .filter = filter };
+        try walk.writes();
+        try state.fields.put(facts.gpa, key, index);
+        return index;
+    }
+
+    /// The read sites of `file`, found the first time a query reaches it.
+    pub fn readsOf(facts: *Facts, file: Project.FileId) Error!*const File {
+        const state = try facts.memo(State);
+        if (state.reads.get(file)) |kept| return kept;
+        const index = try facts.gpa.create(File);
+        index.* = .{};
+        var walk: Walk = .{ .facts = facts, .file = file, .index = index };
+        try walk.reads();
+        try state.reads.put(facts.gpa, file, index);
+        return index;
+    }
+
+    const Walk = struct {
+        facts: *Facts,
+        file: Project.FileId,
+        index: *File,
+        /// The declaration each declaring node makes, a variable's or a field's.
+        declarations: std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id) = .empty,
+        /// Null for every site; else only those a field query needs.
+        filter: ?Filter = null,
+
+        /// Whether the walk keeps whole values' stores and outside code's writes.
+        fn holders(w: *const Walk) bool {
+            return if (w.filter) |f| f.holders else true;
+        }
+
+        /// Whether the walk keeps the sites of a member spelled `name`.
+        fn names(w: *const Walk, name: []const u8) bool {
+            return if (w.filter) |f| std.mem.eql(u8, f.name, name) else true;
+        }
+
+        /// Whether a path may name a member the walk keeps: a member, or `@field`'s name, so
+        /// spelled, or a name `@field` computes, at any step.
+        fn mentions(w: *const Walk, target: Ast.Node.Index) Error!bool {
+            if (w.filter == null) return true;
+            const tree = w.syntax();
+            var node = target;
+            while (true) switch (tree.nodeTag(node)) {
+                .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+                .field_access => {
+                    const holder, const token = tree.nodeData(node).node_and_token;
+                    if (w.names(try Model.identifier(w.facts.gpa, tree.tokenSlice(token)))) return true;
+                    node = holder;
+                },
+                .array_access => node = tree.nodeData(node).node_and_node[0],
+                .unwrap_optional => node = tree.nodeData(node).node_and_token[0],
+                .deref, .address_of => node = tree.nodeData(node).node,
+                else => {
+                    if (!isField(tree, node)) return false;
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, node, &buffer);
+                    if (args.len != 2) return true;
+                    const name = try w.spelled(args[1]) orelse return true;
+                    if (w.names(name)) return true;
+                    node = args[0];
+                },
+            };
+        }
+
+        /// Whether the walk keeps a store to `target`: one that may name its member, or with
+        /// `holders` any.
+        fn wants(w: *const Walk, target: Ast.Node.Index) Error!bool {
+            return w.holders() or try w.mentions(target);
+        }
+
+        fn syntax(w: *const Walk) *const Ast {
+            return &w.facts.project.at(w.file).file.tree;
+        }
+
+        fn lexicon(w: *const Walk) *const Model {
+            return &w.facts.project.at(w.file).model;
+        }
+
+        fn put(w: *Walk, place: Place, site: Site) Error!void {
+            const entry = try w.index.places.getOrPut(w.facts.gpa, place);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(w.facts.gpa, site);
+        }
+
+        fn shape(w: *Walk, container: Facts.Container, site: Site) Error!void {
+            const entry = try w.index.shapes.getOrPut(w.facts.gpa, .{ .file = container.file, .scope = container.scope });
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(w.facts.gpa, site);
+        }
+
+        fn named(w: *Walk, name: []const u8, site: Site) Error!void {
+            const entry = try w.index.named.getOrPut(w.facts.gpa, name);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(w.facts.gpa, site);
+        }
+
+        fn unresolved(w: *Walk, site: Site) Error!void {
+            try w.index.unresolved.append(w.facts.gpa, site);
+        }
+
+        fn make(w: *const Walk, node: Ast.Node.Index, target: ?Ast.Node.Index, kind: Kind, value: ?Ast.Node.Index) Site {
+            return .{ .file = w.file, .node = node, .target = target, .kind = kind, .value = value, .deferred = deferred(w.syntax(), w.lexicon(), node) };
+        }
+
+        fn writes(w: *Walk) Error!void {
+            const facts = w.facts;
+            if (facts.project.at(w.file).file.status != .parsed) return w.unresolved(.{ .file = w.file, .node = .root, .kind = .covered });
+            const tree = w.syntax();
+            const own = try facts.program(w.file);
+            for (w.lexicon().declarations, 0..) |record, d| switch (record.kind) {
+                .variable, .field => try w.declarations.put(facts.gpa, record.node, @fromBackingInt(@intCast(d))),
+                else => {},
+            };
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                switch (tag) {
+                    .assign => {
+                        const target, const value = tree.nodeData(node).node_and_node;
+                        if (try w.wants(target)) try w.store(w.make(node, target, .set, value));
+                    },
+                    .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
+                        const target, const value = tree.nodeData(node).node_and_node;
+                        if (try w.wants(target)) try w.store(w.make(node, target, .update, value));
+                    },
+                    .assign_destructure => {
+                        const whole = tree.assignDestructure(node);
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&buffer, whole.ast.value_expr)) |literal| literal.ast.elements else null;
+                        for (whole.ast.variables, 0..) |target, k| {
+                            const value: ?Ast.Node.Index = if (elements) |each| (if (k < each.len) each[k] else null) else null;
+                            if (tree.fullVarDecl(target) != null) {
+                                if (w.filter != null) continue;
+                                const d = w.declared(target) orelse continue;
+                                try w.put(.{ .declaration = d }, w.make(node, target, .init, value));
+                            } else if (try w.wants(target)) try w.store(w.make(node, target, .set, value));
+                        }
+                    },
+                    .address_of => if (try w.mentions(tree.nodeData(node).node)) {
+                        _ = try w.path(w.make(node, tree.nodeData(node).node, .address, null));
+                    },
+                    .slice_open, .slice, .slice_sentinel => {
+                        const base = tree.fullSlice(node).?.ast.sliced; // unreachable: the tag is a slice's
+                        if (try w.mentions(base) and try w.byValue(base)) _ = try w.path(w.make(node, base, .address, null));
+                    },
+                    .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => try w.builtin(node, own),
+                    .call_one, .call_one_comma, .call, .call_comma => try w.call(node, own),
+                    .asm_simple, .@"asm" => try w.unresolved(w.make(node, null, .covered, null)),
+                    .for_simple, .@"for" => {
+                        const loop = tree.fullFor(node).?; // unreachable: the tag is a loop's
+                        var token = loop.payload_token;
+                        for (loop.ast.inputs) |input| {
+                            const pointer = tree.tokenTag(token) == .asterisk;
+                            if (pointer) token += 1;
+                            if (pointer and try w.mentions(input) and try w.byValue(input)) _ = try w.path(w.make(node, input, .address, null));
+                            token += 1;
+                            if (tree.tokenTag(token) == .comma) token += 1;
+                        }
+                    },
+                    .if_simple, .@"if", .while_simple, .while_cont, .@"while" => {
+                        const capture, const condition = if (tree.fullIf(node)) |branch| .{ branch.payload_token, branch.ast.cond_expr } else blk: {
+                            const loop = tree.fullWhile(node).?; // unreachable: the tag is a loop's
+                            break :blk .{ loop.payload_token, loop.ast.cond_expr };
+                        };
+                        if (capture) |token| if (tree.tokenTag(token) == .asterisk and try w.mentions(condition)) {
+                            _ = try w.path(w.make(node, condition, .address, null));
+                        };
+                    },
+                    .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
+                        const case = tree.fullSwitchCase(node).?; // unreachable: the tag is a case's
+                        const token = case.payload_token orelse continue;
+                        if (tree.tokenTag(token) != .asterisk) continue;
+                        const whole = w.lexicon().parentOf(node) orelse continue;
+                        const subject = (tree.fullSwitch(whole) orelse continue).ast.condition;
+                        if (try w.mentions(subject)) _ = try w.path(w.make(node, subject, .address, null));
+                    },
+                    .container_field_init, .container_field_align, .container_field => {
+                        const field = tree.fullContainerField(node).?; // unreachable: the tag is a field's
+                        const default = field.ast.value_expr.unwrap() orelse continue;
+                        const d = w.declared(node) orelse continue;
+                        if (!w.names(w.lexicon().declarations[@backingInt(d.index)].name)) continue;
+                        try w.put(.{ .field = d }, w.make(node, null, .init, default));
+                    },
+                    else => {
+                        if (tree.fullVarDecl(node)) |variable| try w.variableDecl(node, variable);
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        if (tree.fullStructInit(&buffer, node)) |made| try w.literalFields(node, made);
+                    },
+                }
+            }
+        }
+
+        /// The declaration a declaring node makes: a variable's, a field's.
+        fn declared(w: *const Walk, node: Ast.Node.Index) ?Facts.Decl {
+            return .{ .file = w.file, .index = w.declarations.get(node) orelse return null };
+        }
+
+        /// A variable's first value, and an `extern` or `export` one's memory, which code the
+        /// program does not hold writes.
+        fn variableDecl(w: *Walk, node: Ast.Node.Index, decl: Ast.full.VarDecl) Error!void {
+            const tree = w.syntax();
+            // A destructure's variables are its sites.
+            if (w.lexicon().parentOf(node)) |parent| if (tree.nodeTag(parent) == .assign_destructure) return;
+            const d = w.declared(node) orelse return;
+            if (w.filter == null) if (decl.ast.init_node.unwrap()) |value| try w.put(.{ .declaration = d }, w.make(node, null, .init, value));
+            if (decl.extern_export_token == null) return;
+            const covered = w.make(node, null, .covered, null);
+            try w.put(.{ .declaration = d }, covered);
+            try w.shapes(covered, try w.facts.declaration(d), true);
+        }
+
+        /// A struct literal's fields, each the first value of the field in the value it makes.
+        fn literalFields(w: *Walk, node: Ast.Node.Index, literal_init: Ast.full.StructInit) Error!void {
+            const tree = w.syntax();
+            var made: ?Facts.Value = null;
+            for (literal_init.ast.fields) |value| {
+                const name = try Model.identifier(w.facts.gpa, tree.tokenSlice(Model.initName(tree, value) orelse continue));
+                if (!w.names(name)) continue;
+                if (made == null) made = try w.facts.literalType(w.file, node);
+                try w.member(w.make(node, null, .init, value), made.?, name);
+            }
+        }
+
+        /// A store at `site` into its target: the place it names, every place it is part of up to
+        /// the first pointer the path goes through, and the containers the stored value holds: the
+        /// target's type, or where it does not resolve, the value's.
+        fn store(w: *Walk, at: Site) Error!void {
+            const tree = w.syntax();
+            const target = at.target.?;
+            if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return;
+            var whole = at;
+            whole.through = try w.path(at);
+            try w.index.stores.append(w.facts.gpa, whole);
+            if (!w.holders()) return;
+            const kind = try w.targetType(target) orelse return;
+            if (kind == .unknown) if (at.value) |value| return w.shapes(whole, try w.facts.resolve(w.file, value), false);
+            try w.shapes(whole, kind, false);
+        }
+
+        /// The type of what a store's target names: a field's that `@field` spells by its
+        /// declaration, as `resolve` reads other targets; null for `@field` with a computed name,
+        /// whose holder's type `path` takes whole.
+        fn targetType(w: *Walk, target: Ast.Node.Index) Error!?Facts.Value {
+            const tree = w.syntax();
+            if (!isField(tree, target)) return try w.facts.resolve(w.file, target);
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, target, &buffer);
+            if (args.len != 2) return .{ .unknown = .unsupported };
+            const name = try w.spelled(args[1]) orelse return null;
+            const container = switch (held(try w.facts.resolve(w.file, args[0]))) {
+                .instance, .container => |c| c,
+                else => return .{ .unknown = .unsupported },
+            };
+            const d = w.facts.member(container, name) orelse return .{ .unknown = .unsupported };
+            return try w.facts.declaration(d);
+        }
+
+        /// One step of a path, outermost first: a member, an element, a payload, a dereference,
+        /// `@field`, or the root.
+        const Step = struct { node: Ast.Node.Index, holder: ?Facts.Value = null, crosses: bool = false };
+
+        /// The places `at.target` names, its outermost first, each inner one written in part: a
+        /// name, a member, an element, an optional's payload, `@field`. A place past a pointer (a
+        /// dereference, a member or an element of one) is reached through it, and the places below
+        /// the pointer in the path are read, not written. Whether the target is reached through one.
+        fn path(w: *Walk, at: Site) Error!bool {
+            const tree = w.syntax();
+            var steps: std.ArrayList(Step) = .empty;
+            var node = at.target.?;
+            while (true) switch (tree.nodeTag(node)) {
+                .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+                .field_access => {
+                    const holder = tree.nodeData(node).node_and_token[0];
+                    const value = try w.facts.resolve(w.file, holder);
+                    try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) });
+                    node = holder;
+                },
+                .array_access => {
+                    const holder = tree.nodeData(node).node_and_node[0];
+                    try steps.append(w.facts.gpa, .{ .node = node, .crosses = !try w.byValue(holder) });
+                    node = holder;
+                },
+                .unwrap_optional => {
+                    try steps.append(w.facts.gpa, .{ .node = node });
+                    node = tree.nodeData(node).node_and_token[0];
+                },
+                .deref => {
+                    try steps.append(w.facts.gpa, .{ .node = node, .crosses = true });
+                    node = tree.nodeData(node).node;
+                },
+                else => {
+                    if (isField(tree, node)) {
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const args = Facts.builtinArgs(tree, node, &buffer);
+                        if (args.len == 2) {
+                            const value = try w.facts.resolve(w.file, args[0]);
+                            try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) });
+                            node = args[0];
+                            continue;
+                        }
+                    }
+                    try steps.append(w.facts.gpa, .{ .node = node });
+                    break;
+                },
+            };
+            // Each step's place is reached through a pointer where it or a step below crosses one.
+            const through = try w.facts.gpa.alloc(bool, steps.items.len);
+            var below = false;
+            var k = steps.items.len;
+            while (k > 0) {
+                k -= 1;
+                below = below or steps.items[k].crosses;
+                through[k] = below;
+            }
+            // Past a pointer the places below it in the path, the root's name among them, are read,
+            // their memory not written: `list.items[i] = v` writes neither `items` nor `list`.
+            var above = false;
+            for (steps.items, through, 0..) |step, reached_through, k_| {
+                if (above) break;
+                above = step.crosses;
+                var site = at;
+                site.part = k_ > 0;
+                site.through = reached_through;
+                const root = k_ + 1 == steps.items.len;
+                if (root) {
+                    switch (tree.nodeTag(step.node)) {
+                        .identifier => {
+                            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(step.node)), "_")) break;
+                            const reference = w.lexicon().reference(step.node) orelse {
+                                try w.unresolved(site);
+                                break;
+                            };
+                            const d = reference.declaration orelse {
+                                try w.unresolved(site);
+                                break;
+                            };
+                            try w.put(.{ .declaration = .{ .file = w.file, .index = d } }, site);
+                        },
+                        // A call's result, a literal: a value of its own.
+                        else => try w.unresolved(site),
+                    }
+                    break;
+                }
+                switch (tree.nodeTag(step.node)) {
+                    .field_access => try w.member(site, step.holder.?, try Model.identifier(w.facts.gpa, tree.tokenSlice(tree.nodeData(step.node).node_and_token[1]))),
+                    .array_access, .unwrap_optional, .deref => {},
+                    else => {
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const args = Facts.builtinArgs(tree, step.node, &buffer);
+                        if (try w.spelled(args[1])) |name| {
+                            try w.member(site, step.holder.?, name);
+                        } else {
+                            // A name computed as the program compiles: any field of the holder's type.
+                            var any = site;
+                            any.computed = true;
+                            any.part = true;
+                            try w.shapes(any, held(step.holder.?), false);
+                        }
+                    },
+                }
+            }
+            return below;
+        }
+
+        /// The name a string literal spells; null for any other node.
+        fn spelled(w: *const Walk, node: Ast.Node.Index) Error!?[]const u8 {
+            const tree = w.syntax();
+            if (tree.nodeTag(node) != .string_literal) return null;
+            return std.zig.string_literal.parseAlloc(w.facts.gpa, tree.tokenSlice(tree.nodeMainToken(node))) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => null,
+            };
+        }
+
+        /// The member `name` of what `holder` is, through pointers and optionals: a field, or a
+        /// container's variable; by its name where the holder's type does not resolve.
+        fn member(w: *Walk, site: Site, holder: Facts.Value, name: []const u8) Error!void {
+            switch (holder) {
+                .pointer, .optional => |inner| try w.member(site, inner.*, name),
+                .instance, .container => |container| {
+                    const d = w.facts.member(container, name) orelse return w.named(name, site);
+                    switch (w.facts.project.at(d.file).model.declarations[@backingInt(d.index)].kind) {
+                        .field => try w.put(.{ .field = d }, site),
+                        .variable => try w.put(.{ .declaration = d }, site),
+                        else => {},
+                    }
+                },
+                .alternatives => |each| for (each) |one| try w.member(site, one, name),
+                .unknown, .reified, .literal, .scalar => try w.named(name, site),
+                // A slice's `len` or `ptr`, an array's `len`: no container's field.
+                else => {},
+            }
+        }
+
+        /// The containers a value of `value`'s type holds by value, each stored or read whole at
+        /// `site`, through the fields of each in turn; with `behind`, also those its pointers reach.
+        /// Unresolved where a type on the way does not resolve.
+        fn shapes(w: *Walk, site: Site, value: Facts.Value, behind: bool) Error!void {
+            var seen: std.AutoHashMapUnmanaged(Seen, void) = .empty;
+            if (!try w.collect(site, value, behind, false, &seen, 0)) try w.unresolved(site);
+        }
+
+        fn collect(w: *Walk, site: Site, value: Facts.Value, behind: bool, past: bool, seen: *std.AutoHashMapUnmanaged(Seen, void), depth: u8) Error!bool {
+            if (depth >= 16) return false;
+            switch (value) {
+                .instance => |container| {
+                    const own = !behind or past;
+                    if ((try seen.getOrPut(w.facts.gpa, .{ .shape = .{ .file = container.file, .scope = container.scope }, .own = own })).found_existing) return true;
+                    if (own) try w.shape(container, site);
+                    // Each field's type, read with the arguments of the call that made a generic
+                    // container: by value the containers it holds are stored whole with it.
+                    const model = &w.facts.project.at(container.file).model;
+                    for (model.declarations, 0..) |record, d| {
+                        if (record.kind != .field or record.scope != container.scope) continue;
+                        const field = try w.facts.memberOf(container, .{ .file = container.file, .index = @fromBackingInt(@intCast(d)) });
+                        if (!try w.collect(site, field, behind, past, seen, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .array, .optional, .error_union => |inner| return w.collect(site, inner.*, behind, past, seen, depth + 1),
+                .pointer => |inner| return if (behind) w.collect(site, inner.*, behind, true, seen, depth + 1) else true,
+                .alternatives => |each| {
+                    for (each) |one| if (!try w.collect(site, one, behind, past, seen, depth + 1)) return false;
+                    return true;
+                },
+                .unknown, .reified, .literal => return false,
+                else => return true,
+            }
+        }
+
+        /// A value of the type `value` names: an instance of a container, through the pointers,
+        /// optionals, arrays and error unions around it.
+        fn valued(w: *Walk, value: Facts.Value) Error!Facts.Value {
+            const wrap = struct {
+                fn boxed(facts: *Facts, inner: Facts.Value) Error!*const Facts.Value {
+                    const one = try facts.gpa.create(Facts.Value);
+                    one.* = inner;
+                    return one;
+                }
+            };
+            return switch (value) {
+                .container => |c| .{ .instance = c },
+                .pointer => |inner| .{ .pointer = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                .optional => |inner| .{ .optional = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                .array => |inner| .{ .array = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                .error_union => |inner| .{ .error_union = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                else => value,
+            };
+        }
+
+        /// Whether `node`'s memory is its own (an array, a struct), so a pointer into it or a store
+        /// to part of it reaches its place: anything but a pointer, and what does not resolve.
+        fn byValue(w: *Walk, node: Ast.Node.Index) Error!bool {
+            return !pointing(try w.facts.resolve(w.file, node));
+        }
+
+        fn builtin(w: *Walk, node: Ast.Node.Index, own: bool) Error!void {
+            const tree = w.syntax();
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            const Store = struct { pointer: usize, kind: Kind, value: ?usize };
+            const writers = [_]struct { []const u8, Store }{
+                .{ "@memcpy", .{ .pointer = 0, .kind = .set, .value = null } },
+                .{ "@memmove", .{ .pointer = 0, .kind = .set, .value = null } },
+                .{ "@memset", .{ .pointer = 0, .kind = .set, .value = 1 } },
+                .{ "@atomicStore", .{ .pointer = 1, .kind = .set, .value = 2 } },
+                .{ "@atomicRmw", .{ .pointer = 1, .kind = .update, .value = 3 } },
+                .{ "@cmpxchgWeak", .{ .pointer = 1, .kind = .set, .value = 3 } },
+                .{ "@cmpxchgStrong", .{ .pointer = 1, .kind = .set, .value = 3 } },
+            };
+            for (writers) |entry| {
+                if (!std.mem.eql(u8, name, entry[0])) continue;
+                const pointer = if (entry[1].pointer < args.len) args[entry[1].pointer] else return;
+                const value: ?Ast.Node.Index = if (entry[1].value) |k| (if (k < args.len) args[k] else null) else null;
+                if (!try w.wants(pointer)) return;
+                return w.into(w.make(node, pointer, entry[1].kind, value));
+            }
+            if (std.mem.eql(u8, name, "@ptrCast") or std.mem.eql(u8, name, "@bitCast")) {
+                // A value of the result's type made of other memory's bits; for a pointer, the memory
+                // it points at, and the operand's, written through the other type.
+                const covered = w.make(node, null, .covered, null);
+                const made = try w.valued(try w.facts.literalType(w.file, node));
+                try w.shapes(covered, if (std.mem.eql(u8, name, "@ptrCast")) held(made) else made, false);
+                if (std.mem.eql(u8, name, "@ptrCast") and args.len == 1) try w.shapes(covered, held(try w.facts.resolve(w.file, uncast(tree, args[0]))), false);
+                return;
+            }
+            if (std.mem.eql(u8, name, "@call") and args.len == 3 and own and w.holders()) {
+                const callee = try w.facts.resolve(w.file, args[1]);
+                if (try w.holdsBody(callee)) return;
+                var tuple_buffer: [2]Ast.Node.Index = undefined;
+                const tuple = tree.fullArrayInit(&tuple_buffer, args[2]) orelse return w.unresolved(w.make(node, null, .covered, null));
+                for (tuple.ast.elements) |arg| try w.handed(node, arg);
+            }
+        }
+
+        /// A store at `at` into the memory its target points at, as `target.* = value` stores: the
+        /// pointee's containers, and where the pointer is an address taken or a slice of an array,
+        /// the place it is of, in part.
+        fn into(w: *Walk, at: Site) Error!void {
+            const tree = w.syntax();
+            const pointer = at.target.?;
+            var through = at;
+            through.through = true;
+            if (w.holders()) switch (try w.facts.resolve(w.file, pointer)) {
+                .pointer => |inner| try w.shapes(through, inner.*, false),
+                else => try w.unresolved(through),
+            };
+            var part = at;
+            part.part = true;
+            switch (tree.nodeTag(pointer)) {
+                .address_of => {
+                    part.target = tree.nodeData(pointer).node;
+                    _ = try w.path(part);
+                },
+                .slice_open, .slice, .slice_sentinel => {
+                    const base = tree.fullSlice(pointer).?.ast.sliced; // unreachable: the tag is a slice's
+                    if (!try w.byValue(base)) return;
+                    part.target = base;
+                    _ = try w.path(part);
+                },
+                else => {},
+            }
+        }
+
+        /// A call: a method's receiver whose address the call takes, and in the program's files,
+        /// each pointer handed to a function whose body the program does not hold.
+        fn call(w: *Walk, node: Ast.Node.Index, own: bool) Error!void {
+            const tree = w.syntax();
+            var buffer: [1]Ast.Node.Index = undefined;
+            const full = tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
+            const holder: ?Ast.Node.Index = if (tree.nodeTag(full.ast.fn_expr) == .field_access) tree.nodeData(full.ast.fn_expr).node_and_token[0] else null;
+            const receiving = if (holder) |h| try w.mentions(h) else false;
+            const handing = own and w.holders();
+            if (!receiving and !handing) return;
+            const callee = try w.facts.resolve(w.file, full.ast.fn_expr);
+            if (holder) |h| {
+                const receiver = try w.facts.resolve(w.file, h);
+                if (receiving) switch (receiver) {
+                    // A method of a value takes its address where its first parameter is a pointer.
+                    .instance, .unknown, .reified, .literal => if (try w.takesPointer(callee)) {
+                        _ = try w.path(w.make(node, h, .address, null));
+                    },
+                    else => {},
+                };
+                if (handing and receiver != .container and !try w.holdsBody(callee)) try w.handed(node, h);
+            }
+            if (!handing or try w.holdsBody(callee)) return;
+            for (full.ast.params) |arg| try w.handed(node, arg);
+        }
+
+        /// `arg` handed at `node` to code the program does not hold: what its pointers reach is
+        /// written as it may.
+        fn handed(w: *Walk, node: Ast.Node.Index, arg: Ast.Node.Index) Error!void {
+            try w.shapes(w.make(node, arg, .covered, null), try w.facts.resolve(w.file, arg), true);
+        }
+
+        /// Whether a callee is a function whose body the program holds: not `extern`, not a
+        /// pointer's, not one that does not resolve.
+        fn holdsBody(w: *Walk, callee: Facts.Value) Error!bool {
+            const function = switch (callee) {
+                .function => |f| f,
+                else => return false,
+            };
+            if (!try w.facts.program(function.file)) return false;
+            const model = &w.facts.project.at(function.file).model;
+            // A function's declaration is its prototype; one with a body is a `fn_decl`'s.
+            const whole = model.parentOf(model.declarations[@backingInt(function.index)].node) orelse return false;
+            return w.facts.project.at(function.file).file.tree.nodeTag(whole) == .fn_decl;
+        }
+
+        /// Whether a callee's first parameter is a pointer, or may be one: its type does not
+        /// resolve, it is `anytype`, or the callee does not.
+        fn takesPointer(w: *Walk, callee: Facts.Value) Error!bool {
+            const function = switch (callee) {
+                .function => |f| f,
+                else => return true,
+            };
+            const record = w.facts.project.at(function.file).model.declarations[@backingInt(function.index)];
+            const tree = &w.facts.project.at(function.file).file.tree;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buffer, switch (tree.nodeTag(record.node)) {
+                .fn_decl => tree.nodeData(record.node).node_and_node[0],
+                else => record.node,
+            }) orelse return true;
+            var params = proto.iterate(tree);
+            const first = params.next() orelse return false;
+            const kind = first.type_expr orelse return true;
+            return switch (try w.facts.resolve(function.file, kind)) {
+                .pointer, .unknown, .reified, .alternatives => true,
+                else => false,
+            };
+        }
+
+        fn reads(w: *Walk) Error!void {
+            const facts = w.facts;
+            if (facts.project.at(w.file).file.status != .parsed) return w.unresolved(.{ .file = w.file, .node = .root, .kind = .read });
+            const tree = w.syntax();
+            const model = w.lexicon();
+            for (tree.nodes.items(.tag), 0..) |tag, i| {
+                const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                switch (tag) {
+                    .identifier => {
+                        const reference = model.reference(node) orelse continue;
+                        const d = reference.declaration orelse continue;
+                        if (try w.written(node)) continue;
+                        try w.put(.{ .declaration = .{ .file = w.file, .index = d } }, .{ .file = w.file, .node = node, .target = node, .kind = .read, .part = w.inPath(node), .deferred = deferred(tree, model, node) });
+                        if (!w.inPath(node)) try w.readWhole(node);
+                    },
+                    .field_access => {
+                        if (try w.written(node)) continue;
+                        const holder, const token = tree.nodeData(node).node_and_token;
+                        const value = try facts.resolve(w.file, holder);
+                        // A call's callee is a method or a function pointer's field, read as named.
+                        try w.member(.{ .file = w.file, .node = node, .target = node, .kind = .read, .part = w.inPath(node), .deferred = deferred(tree, model, node) }, value, try Model.identifier(facts.gpa, tree.tokenSlice(token)));
+                        if (!w.inPath(node)) try w.readWhole(node);
+                    },
+                    .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+                        if (try w.written(node)) continue;
+                        var buffer: [2]Ast.Node.Index = undefined;
+                        const args = Facts.builtinArgs(tree, node, &buffer);
+                        if (args.len != 2) continue;
+                        const value = try facts.resolve(w.file, args[0]);
+                        const read: Site = .{ .file = w.file, .node = node, .target = node, .kind = .read, .part = w.inPath(node), .deferred = deferred(tree, model, node) };
+                        if (try w.spelled(args[1])) |name| try w.member(read, value, name) else {
+                            var any = read;
+                            any.computed = true;
+                            try w.shapes(any, value, false);
+                        }
+                        if (!w.inPath(node)) try w.readWhole(node);
+                    },
+                    .deref, .array_access, .unwrap_optional => if (!w.inPath(node) and !try w.written(node)) try w.readWhole(node),
+                    else => {},
+                }
+            }
+        }
+
+        /// Whether `node` is the holder in a longer path: a member's, an element's, a payload's,
+        /// `@field`'s.
+        fn inPath(w: *const Walk, node: Ast.Node.Index) bool {
+            const tree = w.syntax();
+            const parent = w.lexicon().parentOf(node) orelse return false;
+            return switch (tree.nodeTag(parent)) {
+                .field_access, .unwrap_optional => tree.nodeData(parent).node_and_token[0] == node,
+                .array_access => tree.nodeData(parent).node_and_node[0] == node,
+                .grouped_expression => w.inPath(parent),
+                else => isField(tree, parent) and holderOf(tree, parent) == node,
+            };
+        }
+
+        /// Whether `node` names memory a store writes without reading it: the target of `=` or of
+        /// a destructure, the operand of `&`, or a holder in such a path up to the first pointer.
+        /// A store's other operands, an `op=`'s target and a pointer stored through are read.
+        fn written(w: *Walk, node: Ast.Node.Index) Error!bool {
+            const tree = w.syntax();
+            var at = node;
+            while (true) {
+                const parent = w.lexicon().parentOf(at) orelse return false;
+                switch (tree.nodeTag(parent)) {
+                    .assign => return tree.nodeData(parent).node_and_node[0] == at,
+                    .assign_destructure => return true,
+                    .address_of => return true,
+                    .grouped_expression => at = parent,
+                    .field_access, .unwrap_optional => {
+                        if (tree.nodeData(parent).node_and_token[0] != at) return false;
+                        if (pointing(try w.facts.resolve(w.file, at))) return false;
+                        at = parent;
+                    },
+                    .array_access => {
+                        if (tree.nodeData(parent).node_and_node[0] != at) return false;
+                        if (!try w.byValue(at)) return false;
+                        at = parent;
+                    },
+                    else => {
+                        if (!isField(tree, parent) or holderOf(tree, parent) != at) return false;
+                        if (pointing(try w.facts.resolve(w.file, at))) return false;
+                        at = parent;
+                    },
+                }
+            }
+        }
+
+        /// A value read whole at `node` (copied, passed, compared): each field its type holds by
+        /// value is read.
+        fn readWhole(w: *Walk, node: Ast.Node.Index) Error!void {
+            const site: Site = .{ .file = w.file, .node = node, .target = node, .kind = .read, .deferred = deferred(w.syntax(), w.lexicon(), node) };
+            try w.shapes(site, try w.targetType(node) orelse return, false);
+        }
+    };
+
+    /// What a holder holds its members in: the value a pointer or an optional of it points at.
+    fn held(value: Facts.Value) Facts.Value {
+        return switch (value) {
+            .pointer, .optional => |inner| held(inner.*),
+            else => value,
+        };
+    }
+
+    /// Whether `node` is `@field(holder, name)`.
+    fn isField(tree: *const Ast, node: Ast.Node.Index) bool {
+        return switch (tree.nodeTag(node)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field"),
+            else => false,
+        };
+    }
+
+    /// A pointer past the casts that keep what it points at: `@alignCast`, `@constCast`,
+    /// `@volatileCast`, parentheses.
+    fn uncast(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+        var at = node;
+        while (true) switch (tree.nodeTag(at)) {
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .builtin_call_two, .builtin_call_two_comma => {
+                const name = tree.tokenSlice(tree.nodeMainToken(at));
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, at, &buffer);
+                if (args.len != 1) return at;
+                for ([_][]const u8{ "@alignCast", "@constCast", "@volatileCast" }) |keeping| {
+                    if (std.mem.eql(u8, name, keeping)) break;
+                } else return at;
+                at = args[0];
+            },
+            else => return at,
+        };
+    }
+
+    /// The holder `@field(holder, name)` names a member of.
+    fn holderOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        return if (args.len == 2) args[0] else null;
+    }
+
+    /// Whether a value is a pointer, or may be one: a member of it reaches through it.
+    fn pointing(value: Facts.Value) bool {
+        return switch (value) {
+            .pointer => true,
+            .alternatives => |each| for (each) |one| {
+                if (one == .pointer) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    /// Whether `node` runs in a `defer` or an `errdefer` of its function.
+    fn deferred(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+        var at = node;
+        while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+            .@"defer", .@"errdefer" => return true,
+            .fn_decl => return false,
+            else => {},
+        };
+        return false;
+    }
+};
+
 test "facts aliases cycles and absent module mappings stay unknown" {
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const A = B; const B = A; const dep = @import(\"missing\");" }}, &.{}, .{});
     defer project.deinit();
@@ -5266,6 +6204,13 @@ test "a call through a function-pointer field reaches the functions stored there
     // any other name, it may be.
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u32 };\npub fn g(o: *Ops) void { inline for (@typeInfo(Other).@\"struct\".field_names) |n| @field(o, n) = b; }\n", true));
     try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, comptime n: []const u8) void { @field(o, n) = &b; }\n", true));
+    // Stored by a destructure, each construct `Facts.accesses` reads: a function it may hold, or
+    // a value chosen at run time; and its struct's memory written through a cast of it.
+    try std.testing.expectEqual(.alternatives, try fieldRead(head ++ "pub fn g(o: *Ops) void { o.run, _ = .{ &b, 0 }; }\n", true));
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "pub fn g(o: *Ops) void { _, _ = .{ &b, 0 }; _ = o; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run, _ = .{ run, 0 }; }\n", true));
+    try std.testing.expectEqual(.pointer, try fieldRead(head ++ "pub fn g(o: *Ops) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(o: *Other) *[8]u8 { return @ptrCast(o); }\n", true));
 }
 
 test "a reading bound call by call reads a generic's value as the chain of calls passes it" {

@@ -29,6 +29,7 @@ test {
     _ = @import("Runner.zig");
     _ = Fix;
     _ = @import("Facts.zig");
+    _ = @import("accesses_test.zig");
     _ = @import("Taint.zig");
     _ = @import("Undefined.zig");
     _ = token;

@@ -482,6 +482,11 @@ test "A014 finds a pointer into the frame carried out of the call" {
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p = &x; return p; }", 1);
     try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; const a = &x; const b = a; return b; }", 1);
     try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T, ok: bool) void { var x: u32 = 1; x += 1; t.cur = &x; defer if (ok) { t.cur = null; }; }", 1);
+    // Stored by a destructure, into a field and into a `var` alias; and a defer that clears
+    // another object's field.
+    try expect(pack.lifetimes, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.p, _ = .{ &x, 0 }; }", 1);
+    try expect(pack.lifetimes, "pub fn f() *u32 { var x: u32 = 1; x += 1; var p: *u32 = undefined; p, _ = .{ &x, 0 }; return p; }", 1);
+    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T, u: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (u).cur = null; }", 1);
     // An intrusive waiter a deferred loop unlinks: what the loop removes is not read.
     try expect(pack.lifetimes,
         \\const W = struct { next: ?*W = null };
@@ -508,6 +513,10 @@ test "A014 leaves static storage, pointers, copies and a store a defer clears on
     try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer t.cur = null; }", 0);
     try expect(pack.lifetimes, "pub fn f() u32 { var x: u32 = 1; var p: *u32 = undefined; p = &x; p.* += 1; return x; }", 0);
     try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer { t.cur = null; } }", 0);
+    // Twins: a destructure that stores no pointer into the frame, and the clear spelled
+    // otherwise, naming the same memory.
+    try expect(pack.lifetimes, "const T = struct { p: ?*u32 = null }; pub fn f(t: *T, y: *u32) void { var x: u32 = 1; x += 1; t.p, _ = .{ y, x }; }", 0);
+    try expect(pack.lifetimes, "const T = struct { cur: ?*u32 = null }; pub fn f(t: *T) void { var x: u32 = 1; x += 1; t.cur = &x; defer (t).cur = null; }", 0);
 }
 
 test "the aegis escape covers the pack's findings on its line, is listed with them, and refuses glint-ignore" {

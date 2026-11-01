@@ -1796,6 +1796,12 @@ test "A006 strict: the depth is the one the cycle carries, passed on in its plac
     try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { @field(p, \"depth\") = 0; try p.value(); } };", pack.recursion, true, 1);
     try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { const q = p; q.* = .{ .bytes = q.bytes }; try p.value(); } };", pack.recursion, true, 1);
     try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n fn value(p: *Parser) error{TooDeep}!void { p.depth += 1; defer p.depth -= 2; if (p.depth > 64) return error.TooDeep; if (p.bytes.len == 0) return; p.bytes = p.bytes[1..]; try p.list(); }\n fn list(p: *Parser) error{TooDeep}!void { try p.value(); } };", pack.recursion, true, 1);
+    // Its address taken, and the field reset through it; the twin takes another field's.
+    try expectJudged(head ++ parser ++ "fn zero(d: *u8) void { d.* = 0; }\nconst Parser = struct { bytes: []const u8, depth: u8 = 0, other: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { zero(&p.depth); try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "fn zero(d: *u8) void { d.* = 0; }\nconst Parser = struct { bytes: []const u8, depth: u8 = 0, other: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { zero(&p.other); try p.value(); } };", pack.recursion, true, 0);
+    // Reset by a destructure.
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0, other: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { p.depth, p.other = .{ 0, 1 }; try p.value(); } };", pack.recursion, true, 1);
+    try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0, other: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { _, p.other = .{ 0, 1 }; try p.value(); } };", pack.recursion, true, 0);
     // Handed on through a second function, and called twice there.
     try expectJudged(head ++ parser ++ "const Parser = struct { bytes: []const u8, depth: u8 = 0,\n" ++ value ++ " fn list(p: *Parser) error{TooDeep}!void { try p.value(); try p.value(); } };", pack.recursion, true, 0);
 }
