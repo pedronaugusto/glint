@@ -1226,29 +1226,7 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
             if (!std.mem.eql(u8, tree.tokenSlice(method), "borrow")) return false;
             return try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .owned;
         },
-        .identifier => {
-            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
-            const reference = model.reference(node) orelse return false;
-            const d = reference.declaration orelse return false;
-            const record = model.declarations[@backingInt(d)];
-            // A parameter is a view in its own function; read through a call (`Binding`), it is
-            // what that call passes.
-            if (record.kind == .parameter) return argumentViewed(c, resources, file, record, next, bound);
-            // A capture holds what it binds: a view where that is one (an owner a call made,
-            // unwrapped, is handed over).
-            if (record.kind == .capture) {
-                const captured: ?Ast.Node.Index = if (tree.fullIf(record.node)) |branch| branch.ast.cond_expr else if (tree.fullWhile(record.node)) |loop| loop.ast.cond_expr else if (tree.fullFor(record.node)) |loop| (if (loop.ast.inputs.len == 1) loop.ast.inputs[0] else null) else if (tree.fullSwitchCase(record.node) != null) (if (tree.fullSwitch(model.parentOf(record.node) orelse return false)) |full| full.ast.condition else null) else null;
-                return viewed(c, resources, file, captured orelse return false, next, bound);
-            }
-            if (record.kind != .variable) return false;
-            const variable = tree.fullVarDecl(record.node) orelse return false;
-            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-            // A declared constant, or a local one made from what is already held.
-            return switch (model.scopes[@backingInt(record.scope)].kind) {
-                .file, .container => true,
-                else => try viewed(c, resources, file, variable.ast.init_node.unwrap() orelse return false, next, bound),
-            };
-        },
+        .identifier => return nameViewed(c, resources, file, node, next, bound),
         .@"switch", .switch_comma => {
             const full = tree.fullSwitch(node).?;
             for (full.ast.cases) |case| if (!try viewed(c, resources, file, tree.fullSwitchCase(case).?.ast.target_expr, next, bound)) return false;
@@ -1282,26 +1260,7 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
                 return try viewed(c, resources, file, branch.ast.then_expr, next, bound) and try viewed(c, resources, file, otherwise, next, bound);
             }
             var buffer: [1]Ast.Node.Index = undefined;
-            if (tree.fullCall(&buffer, node)) |call| {
-                // An `own.Lent`'s `get()`: a copy its owner lends.
-                if (call.ast.params.len == 0 and tree.nodeTag(call.ast.fn_expr) == .field_access) {
-                    const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
-                    if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .lent) return true;
-                }
-                const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-                    .function => |decl| (try c.facts.origin(decl)) orelse decl,
-                    else => return false,
-                };
-                // The program's function whose every return is a view returns one.
-                if (try c.facts.program(callee.file)) return views(c, resources, callee, next, &.{ .file = file, .call = call, .callee = callee, .outer = bound });
-                if (call.ast.params.len != 0) return false;
-                for ([_][]const u8{ "Io.File.stdin", "Io.File.stdout", "Io.File.stderr", "Io.Dir.cwd" }) |standard| {
-                    for ((try Governed.declarations(c, "std", standard)) orelse &.{}) |decl| {
-                        if (std.meta.eql((try c.facts.origin(decl)) orelse decl, callee)) return true;
-                    }
-                }
-                return false;
-            }
+            if (tree.fullCall(&buffer, node)) |call| return callViewed(c, resources, file, call, next, bound);
             var init_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullStructInit(&init_buffer, node)) |literal| {
                 // A std handle made from one it is given: the literal of a std resource type.
@@ -1316,6 +1275,58 @@ fn viewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
             return false;
         },
     }
+}
+
+/// What a name holds is a view: `null`, a parameter that is one (or what a call passes it,
+/// `Binding`), a capture of one, a declared constant, or a local constant made from one.
+fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, node: Ast.Node.Index, next: u8, bound: ?*const Binding) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null")) return true;
+    const reference = model.reference(node) orelse return false;
+    const d = reference.declaration orelse return false;
+    const record = model.declarations[@backingInt(d)];
+    // A parameter is a view in its own function; read through a call (`Binding`), it is
+    // what that call passes.
+    if (record.kind == .parameter) return argumentViewed(c, resources, file, record, next, bound);
+    // A capture holds what it binds: a view where that is one (an owner a call made,
+    // unwrapped, is handed over).
+    if (record.kind == .capture) {
+        const captured: ?Ast.Node.Index = if (tree.fullIf(record.node)) |branch| branch.ast.cond_expr else if (tree.fullWhile(record.node)) |loop| loop.ast.cond_expr else if (tree.fullFor(record.node)) |loop| (if (loop.ast.inputs.len == 1) loop.ast.inputs[0] else null) else if (tree.fullSwitchCase(record.node) != null) (if (tree.fullSwitch(model.parentOf(record.node) orelse return false)) |full| full.ast.condition else null) else null;
+        return viewed(c, resources, file, captured orelse return false, next, bound);
+    }
+    if (record.kind != .variable) return false;
+    const variable = tree.fullVarDecl(record.node) orelse return false;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+    // A declared constant, or a local one made from what is already held.
+    return switch (model.scopes[@backingInt(record.scope)].kind) {
+        .file, .container => true,
+        else => try viewed(c, resources, file, variable.ast.init_node.unwrap() orelse return false, next, bound),
+    };
+}
+
+/// What a call returns is a view: an `own.Lent`'s `get()`, the program's function whose every
+/// return is one, or std's handles to the process's own streams and directory.
+fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: Ast.full.Call, next: u8, bound: ?*const Binding) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    // An `own.Lent`'s `get()`: a copy its owner lends.
+    if (call.ast.params.len == 0 and tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+        if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .lent) return true;
+    }
+    const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        else => return false,
+    };
+    // The program's function whose every return is a view returns one.
+    if (try c.facts.program(callee.file)) return views(c, resources, callee, next, &.{ .file = file, .call = call, .callee = callee, .outer = bound });
+    if (call.ast.params.len != 0) return false;
+    for ([_][]const u8{ "Io.File.stdin", "Io.File.stdout", "Io.File.stderr", "Io.Dir.cwd" }) |standard| {
+        for ((try Governed.declarations(c, "std", standard)) orelse &.{}) |decl| {
+            if (std.meta.eql((try c.facts.origin(decl)) orelse decl, callee)) return true;
+        }
+    }
+    return false;
 }
 
 /// A021: lock order. A function that holds a guard of an aegis owner (`Guarded`,
