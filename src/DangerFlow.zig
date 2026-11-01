@@ -334,41 +334,9 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
     const io_type = container orelse return;
     const flow = try Taint.get(c, .input);
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    // Each function once, by the first parameter that holds its `Io` where it is read, else by
-    // the first that may hold one in a form it is not (`Held.unread`): that function's loops
-    // are undecided, never cleared. A function no parameter gives one may reach one through
-    // what it names outside itself (`containerIo`): a global, a global's field, a call.
     var given: std.AutoHashMapUnmanaged(Ast.Node.Index, usize) = .empty;
     var holders: std.ArrayList(Holding) = .empty;
-    for (model.declarations) |decl| {
-        if (decl.kind != .parameter or c.inTest(decl.token)) continue;
-        try hold(c, &given, &holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = try parameterIo(c, decl, io_type) });
-    }
-    // A function no parameter gives one may make one of its own: a local or a capture whose
-    // value holds an `Io` (`const w: *Worker = @ptrCast(raw)`), one in a form not read only
-    // where its declaration spells one.
-    for (model.declarations, 0..) |decl, d| {
-        if ((decl.kind != .variable and decl.kind != .capture) or c.inTest(decl.token)) continue;
-        if (decl.kind == .variable and containerLevel(c, decl)) continue;
-        const function = functionOf(c, decl.node) orelse continue;
-        if (given.get(function)) |entry| if (holders.items[entry].held == .at) continue;
-        var held = try heldIo(c, try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }), io_type, 1);
-        if (held == .unread and !try spellsIo(c, c.file, decl.node, io_type)) held = .none;
-        try hold(c, &given, &holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = held });
-    }
-    for (model.references) |ref| {
-        const id = ref.declaration orelse continue;
-        if (tree.nodeTag(ref.node) != .identifier or c.inTest(ref.token) or !containerLevel(c, model.declarations[@backingInt(id)])) continue;
-        // A prototype names types; the body reads values.
-        const function = functionOf(c, ref.node) orelse continue;
-        const body = tree.nodeData(function).node_and_node[1];
-        if (ref.token < tree.firstToken(body) or ref.token > tree.lastToken(body)) continue;
-        const entry = given.get(function);
-        if (entry != null and holders.items[entry.?].held == .at) continue;
-        const reached = try containerIo(c, ref.node, io_type);
-        try hold(c, &given, &holders, ref.node, .{ .at = ref.node, .name = tree.getNodeSource(reached.node), .held = reached.held });
-    }
+    try gatherHolders(c, io_type, &given, &holders);
     for (holders.items) |holding| {
         const unread = holding.held == .unread;
         const holder = switch (holding.held) {
@@ -613,6 +581,55 @@ fn samePlace(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.No
             return std.mem.eql(u8, tree.tokenSlice(a_name), tree.tokenSlice(b_name)) and samePlace(tree, model, a_lhs, b_lhs);
         },
         else => return false,
+    }
+}
+
+/// What gives each judged function its `Io`, into `given` (by function) and `holders`.
+fn gatherHolders(c: *Context, io_type: Facts.Container, given: *std.AutoHashMapUnmanaged(Ast.Node.Index, usize), holders: *std.ArrayList(Holding)) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    // Each function once, by the first parameter that holds its `Io` where it is read, else by
+    // the first that may hold one in a form it is not (`Held.unread`): that function's loops
+    // are undecided, never cleared. A function no parameter gives one may reach one through
+    // what it names outside itself (`containerIo`): a global, a global's field, a call.
+    for (model.declarations) |decl| {
+        if (decl.kind != .parameter or c.inTest(decl.token)) continue;
+        try hold(c, given, holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = try parameterIo(c, decl, io_type) });
+    }
+    // A function no parameter gives one may make one of its own: a local or a capture whose
+    // value holds an `Io` (`const w: *Worker = @ptrCast(raw)`), one in a form not read only
+    // where its declaration spells one.
+    for (model.declarations, 0..) |decl, d| {
+        if ((decl.kind != .variable and decl.kind != .capture) or c.inTest(decl.token)) continue;
+        if (decl.kind == .variable and containerLevel(c, decl)) continue;
+        const function = functionOf(c, decl.node) orelse continue;
+        if (given.get(function)) |entry| if (holders.items[entry].held == .at) continue;
+        var held = try heldIo(c, try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }), io_type, 1);
+        if (held == .unread and !try spellsIo(c, c.file, decl.node, io_type)) held = .none;
+        try hold(c, given, holders, decl.node, .{ .at = decl.node, .name = decl.name, .held = held });
+    }
+    for (model.references) |ref| {
+        const id = ref.declaration orelse continue;
+        if (tree.nodeTag(ref.node) != .identifier or c.inTest(ref.token)) continue;
+        const record = model.declarations[@backingInt(id)];
+        // An enclosing function's parameter (a type function's `comptime io: *Io`, closed over
+        // by the functions of the type it returns) holds what that function is given.
+        if (record.kind == .parameter) {
+            const function = functionOf(c, ref.node) orelse continue;
+            if (functionOf(c, record.node) == function) continue;
+            if (given.get(function)) |entry| if (holders.items[entry].held == .at) continue;
+            try hold(c, given, holders, ref.node, .{ .at = ref.node, .name = record.name, .held = try parameterIo(c, record, io_type) });
+            continue;
+        }
+        if (!containerLevel(c, record)) continue;
+        // A prototype names types; the body reads values.
+        const function = functionOf(c, ref.node) orelse continue;
+        const body = tree.nodeData(function).node_and_node[1];
+        if (ref.token < tree.firstToken(body) or ref.token > tree.lastToken(body)) continue;
+        const entry = given.get(function);
+        if (entry != null and holders.items[entry.?].held == .at) continue;
+        const reached = try containerIo(c, ref.node, io_type);
+        try hold(c, given, holders, ref.node, .{ .at = ref.node, .name = tree.getNodeSource(reached.node), .held = reached.held });
     }
 }
 
