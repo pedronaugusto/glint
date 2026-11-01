@@ -16,9 +16,17 @@
         .{ .rule = "A013", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A014", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
         .{ .rule = "A015", .no_hole = .{ .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A016", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A017", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
-        .{ .rule = "A018", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        .{
+            .rule = "A016",
+            .na = .{
+                // a defer runs statements at a scope's exit; it yields no type to a signature or a field
+                .deferred,
+                // a type is comptime-only: no builtin moves one through memory
+                .memory,
+            },
+        },
+        .{ .rule = "A017" },
+        .{ .rule = "A018" },
         .{ .rule = "A019", .no_hole = .{ .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch } },
         .{ .rule = "A020", .no_hole = .{ .field, .inline_loop, .operator, .conversion, .branch }, .no_twin = .{ .field, .deferred, .conversion, .memory } },
         .{ .rule = "A021", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
@@ -42,5 +50,99 @@
         "A020/jump/r5-a20-c07_cont_expr_point/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`
         "A020/jump/r6-a20-e25_flag_break_cond/hole.zig",
+        // matrix A016: an integer type that resolves to no primitive (here a type function's call) is dropped, never undecided
+        "A016/call/mx-type_function/hole.zig",
+        // matrix A016: a function-pointer field's signature is no public function declaration, so its two ids are not read
+        "A016/call/mx-fn_pointer_signature/hole.zig",
+        // matrix A016: `parentID` is not read as naming an id; only `Id` and `_id` spellings are
+        "A016/call/mx-camel_id/hole.zig",
+        // matrix A016: an `if` capture's type resolves to no primitive and is dropped
+        "A016/capture/mx-configured_type/hole.zig",
+        // matrix A016: a private struct made public by `pub const Link = Edge` is not read as public
+        "A016/address/mx-private_struct_reexported/hole.zig",
+        // matrix A016: a labeled block's type resolves to no primitive and is dropped
+        "A016/jump/mx-labeled_block_type/hole.zig",
+        // matrix A016: a struct a public generic returns is not read as public
+        "A016/jump/mx-returned_struct/hole.zig",
+        // matrix A016: the integer an inline loop picks resolves to no primitive and is dropped
+        "A016/inline_loop/mx-smallest_integer/hole.zig",
+        // matrix A016: two ids of one comptime type parameter are dropped, never undecided
+        "A016/compile_time/mx-generic_ids/hole.zig",
+        // matrix A016: `@Int` of a computed width resolves to no primitive and is dropped
+        "A016/operator/mx-width_product/hole.zig",
+        // matrix A016: an optional type's payload by `orelse` and `.?` resolves to no primitive and is dropped
+        "A016/unwrap/mx-optional_type/hole.zig",
+        // matrix A016: an anonymous struct type in a public signature is not read as a public struct
+        "A016/aggregate/mx-anonymous_struct_param/hole.zig",
+        // matrix A016: a type an `if` expression chooses resolves to no primitive and is dropped
+        "A016/branch/mx-chosen_width/hole.zig",
+        // matrix A017: a switch on a local copy of the state is no switch on the field
+        "A017/assignment/mx-state_copied_to_local/hole.zig",
+        // matrix A017: a destructure's write of the state is not read as a write
+        "A017/destructure/mx-destructured_write/hole.zig",
+        // matrix A017: a switch on an `if` capture of the state is no switch on the field
+        "A017/capture/mx-captured_optional_state/hole.zig",
+        // matrix A017: a write by `@field` is not read, which leaves one writer
+        "A017/field/mx-field_builtin_write/hole.zig",
+        // matrix A017: a write through a pointer to the state is not read, which leaves one writer
+        "A017/address/mx-write_through_pointer/hole.zig",
+        // matrix A017: a move through a transition table indexed by the state is under no condition on it
+        "A017/address/mx-transition_table/hole.zig",
+        // matrix A017: writers called as free functions under a switch are not followed; only method calls are
+        "A017/call/mx-writers_called_plainly/hole.zig",
+        // matrix A017: a callee writing through the state's address is not read as a writer
+        "A017/call/mx-write_through_callee/hole.zig",
+        // matrix A017: a switch on a getter's return of the state is no switch on the field
+        "A017/call/mx-switch_on_getter/hole.zig",
+        // matrix A017: a defer's write of the next state a switch chose is under no condition on it
+        "A017/deferred/mx-deferred_write/hole.zig",
+        // matrix A017: a write after a guard's `return` on the state is under no condition on it
+        "A017/jump/mx-guard_return/hole.zig",
+        // matrix A017: a move by arithmetic on the state's integer is under no condition on it
+        "A017/operator/mx-arith_advance/hole.zig",
+        // matrix A017: a state held as its enum's integer is no enum field, so it is not read
+        "A017/conversion/mx-state_as_integer/hole.zig",
+        // matrix A017: a switch on `state.?` is no switch on the field
+        "A017/unwrap/mx-unwrapped_optional_state/hole.zig",
+        // matrix A017: a whole-record literal's write of the state is not read as a write
+        "A017/aggregate/mx-whole_record_write/hole.zig",
+        // matrix A017: atomic loads and stores of the state are not read as uses or writes
+        "A017/memory/mx-atomic_state/hole.zig",
+        // matrix A017: a write of what a switch expression on the state chooses has the switch below it, not above
+        "A017/branch/mx-switch_expression/hole.zig",
+        // matrix A018: an error's name in a local before the write is not seen; only `@errorName` as the argument is
+        "A018/assignment/mx-name_in_local/hole.zig",
+        // matrix A018: an error's name destructured before the write is not seen
+        "A018/destructure/mx-destructured_name/hole.zig",
+        // matrix A018: an error's name's bytes, a loop's capture, are not seen
+        "A018/capture/mx-byte_capture/hole.zig",
+        // matrix A018: a write called through `@field` is no field-access call, so it is not read
+        "A018/field/mx-method_by_field/hole.zig",
+        // matrix A018: a slice of an error's name is not seen
+        "A018/address/mx-name_sliced/hole.zig",
+        // matrix A018: an error's name a helper returns is not seen
+        "A018/call/mx-name_from_helper/hole.zig",
+        // matrix A018: `{t}` prints an error's name with no `@errorName` in the file, which the rule needs to start
+        "A018/call/mx-format_t/hole.zig",
+        // matrix A018: `std.Io.Writer.writeAll(w, ...)` judges the namespace before the dot as the writer, not `w`
+        "A018/call/mx-namespaced_call/hole.zig",
+        // matrix A018: an error's name a labeled block breaks with is not seen
+        "A018/jump/mx-labeled_block_text/hole.zig",
+        // matrix A018: an error's name made under `comptime` is not seen
+        "A018/compile_time/mx-comptime_name/hole.zig",
+        // matrix A018: an error's name's bytes through a bit operator are not seen
+        "A018/operator/mx-name_lowercased/hole.zig",
+        // matrix A018: an error's name through `@as` is not seen
+        "A018/conversion/mx-as_slice/hole.zig",
+        // matrix A018: an error's name as an `orelse` fallback is not seen
+        "A018/unwrap/mx-orelse_name/hole.zig",
+        // matrix A018: an error's name in an array handed by address to `writeVecAll` is not seen
+        "A018/aggregate/mx-vector_parts/hole.zig",
+        // matrix A018: an error's name in a `++` concatenation is not seen
+        "A018/aggregate/mx-concat_name/hole.zig",
+        // matrix A018: an error's name copied by `@memcpy` into the bytes written is not seen
+        "A018/memory/mx-memcpy_name/hole.zig",
+        // matrix A018: an error's name an `if` expression chooses is not seen
+        "A018/branch/mx-if_name/hole.zig",
     },
 }
