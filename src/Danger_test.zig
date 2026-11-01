@@ -2925,6 +2925,12 @@ test "A009 and A010 read every file of the program, selected or not: a table's o
     ;
     const kept = try runWithOther(pack.integers, stored, "pub fn touch(c: anytype) void { c.limit = 7; }");
     try std.testing.expectEqual(@as(usize, 0), kept.findings);
+    // A type another file names alike and hands to a call is that file's own: this one's
+    // stores are still all shown. Its own name handed to a call may be filled by reflection.
+    const named = try runWithOther(pack.integers, stored, "const Config = struct { limit: u64 = 0 };\nfn fill(comptime T: type) void { _ = T; }\npub fn touch(c: anytype) void { c.limit = 7; fill(Config); }");
+    try std.testing.expectEqual(@as(usize, 0), named.findings);
+    const filled = try runWithOther(pack.integers, stored ++ "fn fill(comptime T: type) void { _ = T; }\npub fn show() void { fill(Config); }\n", "pub fn touch(c: anytype) void { c.limit = 7; }");
+    try std.testing.expectEqualSlices(u32, &.{8}, filled.lines[0..filled.findings]);
     const widened = try runWithOther(pack.integers, stored, "const std = @import(\"std\");\npub fn touch(c: anytype, r: *std.Io.Reader) void { c.limit = r.takeInt(u64, 0) catch 0; }");
     try std.testing.expectEqualSlices(u32, &.{8}, widened.lines[0..widened.findings]);
 }
@@ -6364,7 +6370,7 @@ test "A010 reads C integer types by their narrowest width where a value goes int
     , 0);
     // A guard only a 64-bit `c_ulong` holds, a byte into `c_char` (above 127 on a signed
     // target), a `c_char` that may be negative into `u8`, and a `c_ulong` read into a `u32`
-    // (64 bits where it is long), each stays a finding.
+    // (64 bits where it is long) by a function any caller may call, each stays a finding.
     const head =
         \\const std = @import("std");
         \\
@@ -6373,11 +6379,13 @@ test "A010 reads C integer types by their narrowest width where a value goes int
         "pub fn f(r: *std.Io.Reader) !c_ulong {\n    const v = try r.takeInt(u64, 0);\n    if (v > 0xffff_ffff_ffff) return 0;\n    return @intCast(v);\n}\n",
         "pub fn f(r: *std.Io.Reader) !c_char {\n    const b = try r.takeByte();\n    return @intCast(b);\n}\n",
         "fn narrow(ch: c_char) u8 {\n    return @intCast(ch);\n}\npub fn f(r: *std.Io.Reader) !u8 {\n    return narrow(@bitCast(try r.takeByte()));\n}\n",
-        "fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n",
+        "pub fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n",
     }) |body| expect(pack.integers, head ++ body, 1) catch |err| {
         std.debug.print("VARIANT<<{s}>>\n", .{body});
         return err;
     };
+    // Private, its one caller gives it a `u32`: the `c_ulong` holds no more (caller ranges).
+    try expect(pack.integers, head ++ "fn narrow(n: c_ulong) u32 {\n    return @intCast(n);\n}\npub fn f(r: *std.Io.Reader) !u32 {\n    return narrow(try r.takeInt(u32, 0));\n}\n", 0);
 }
 
 test "A009 reads the length of an array a field points to: a byte indexes 256 entries" {

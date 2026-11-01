@@ -890,9 +890,10 @@ fn assigned(c: *Context, decl: Facts.Decl, variable: Ast.full.VarDecl, pointer: 
 const Stores = struct {
     built: bool = false,
     sites: std.StringHashMapUnmanaged(std.ArrayList(Site)) = .empty,
-    /// The names given to a call as arguments: a type a function fills by reflection (`std.json`
-    /// parsing a `Config`, `bytesToValue(Header, …)`) has fields no store sets.
-    arguments: std.StringHashMapUnmanaged(void) = .empty,
+    /// The names given to a call as arguments, each where it is given: a type a function fills
+    /// by reflection (`std.json` parsing a `Config`, `bytesToValue(Header, …)`) has fields no
+    /// store sets. Matched by name, then by what each resolves to.
+    arguments: std.StringHashMapUnmanaged(std.ArrayList(Facts.Key)) = .empty,
     /// The structs whose bytes something may write that no store shows: a value of one viewed as
     /// bytes (`std.mem.asBytes`) or reinterpreted (`@ptrCast`, `@bitCast`, `@memcpy`), a pointer
     /// to one handed to a function outside the program (a reader, an `extern`), whose writes are
@@ -931,7 +932,9 @@ fn stores(c: *Context) Context.Error!*Stores {
                             .field_access => tree.nodeData(arg).node_and_token[1],
                             else => continue,
                         };
-                        try memo.arguments.put(c.allocator, tree.tokenSlice(last), {});
+                        const entry = try memo.arguments.getOrPut(c.allocator, tree.tokenSlice(last));
+                        if (!entry.found_existing) entry.value_ptr.* = .empty;
+                        try entry.value_ptr.append(c.allocator, .{ .file = file, .node = arg });
                     }
                     var buffer: [2]Ast.Node.Index = undefined;
                     const literal_init = tree.fullStructInit(&buffer, node) orelse continue;
@@ -1084,7 +1087,15 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
     const found = try stores(c);
     const type_name = containerName(c, decl.file, container_node) orelse return false;
-    if (found.arguments.contains(type_name)) return false;
+    // An argument of its name is this struct where it resolves to it, or may be where it does
+    // not resolve; one resolving to another type of that name is not.
+    if (found.arguments.get(type_name)) |given| for (given.items) |arg| {
+        switch (try c.facts.resolve(arg.file, arg.node)) {
+            .container, .instance => |k| if (k.file == decl.file and k.scope == record.scope) return false,
+            .unknown => |why| if (why != .std_internal and why != .absent) return false,
+            else => {},
+        }
+    };
     return !found.exposed.contains(.{ decl.file, record.scope });
 }
 
