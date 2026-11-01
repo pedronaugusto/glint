@@ -1,5 +1,7 @@
 //! glint's soundness suite: each case in `<rule>/<row>/<case>/` run under its rule, std and
-//! aegis real, every case its own program over one store that reads each file once. A
+//! aegis real, every case its own program. The cases are judged on a pool of workers, each with
+//! its own store that reads each file once, and their verdicts read in case order, so a run's
+//! output is the same at any number of workers. A
 //! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. The row is a
 //! `Constructs.Row`: how the case moves the value its rule judges. A case's `glint.json` is the
 //! policy its rule reads (P006's disallowed declarations, A018's peer writers): its options
@@ -12,7 +14,8 @@
 //! starts passing, or a cell that gains its hole or twin, fails the run until the list says so,
 //! as a new failure does.
 //!
-//! Usage: soundness SUITE ZIG_LIB AEGIS_ROOT
+//! Usage: soundness SUITE ZIG_LIB AEGIS_ROOT JOBS [RULES]: JOBS the workers (0, one per CPU);
+//! RULES the rules whose cases alone run, by comma (none, every rule's).
 const std = @import("std");
 const glint = @import("glint");
 const Row = glint.Constructs.Row;
@@ -39,23 +42,40 @@ const Column = struct {
     failing: usize = 0,
 };
 
+/// A case to judge, and what its verdict is read against.
+const Job = struct {
+    column: usize,
+    path: []const u8,
+    role: Role,
+    listed: bool,
+    policy: ?[]const u8,
+    absolute: []const u8,
+};
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(a);
-    if (args.len != 4) return error.Usage;
+    if (args.len != 5 and args.len != 6) return error.Usage;
     const suite_path, const lib, const aegis = .{ args[1], args[2], args[3] };
+    const jobs_asked = try std.fmt.parseInt(usize, args[4], 10);
+    var selected: std.ArrayList([]const u8) = .empty;
+    if (args.len == 6) {
+        var each = std.mem.tokenizeScalar(u8, args[5], ',');
+        while (each.next()) |rule| try selected.append(a, rule);
+    }
     var suite = try std.Io.Dir.cwd().openDir(io, suite_path, .{ .iterate = true });
     defer suite.close(io);
 
-    var store: glint.Project.Store = .init(init.gpa);
-    defer store.deinit();
     var failures: std.Io.Writer.Allocating = .init(a);
     const w = &failures.writer;
     var columns: std.ArrayList(Column) = .empty;
-    var cases: usize = 0;
+    var jobs: std.ArrayList(Job) = .empty;
 
-    for (try sortedEntries(a, io, suite, ".", .directory)) |rule| {
+    const rules = try sortedEntries(a, io, suite, ".", .directory);
+    for (selected.items) |rule| if (!contains(rules, rule)) try w.print("{s}: no such rule's cases\n", .{rule});
+    for (rules) |rule| {
+        if (selected.items.len != 0 and !contains(selected.items, rule)) continue;
         const column = try columns.addOne(a);
         column.* = .{ .rule = rule, .expected = try expectedOf(a, init.gpa, io, suite, rule) };
         var open: std.StringHashMapUnmanaged(void) = .empty;
@@ -83,27 +103,43 @@ pub fn main(init: std.process.Init) !void {
                         else => return err,
                     };
                     any = true;
-                    cases += 1;
                     switch (role) {
                         .hole => column.cells.getPtr(row).holes += 1,
                         .twin => column.cells.getPtr(row).twins += 1,
                     }
-                    const absolute = try std.Io.Dir.path.join(a, &.{ suite_path, rule, path });
-                    const verdict = try judge(init.gpa, io, &store, rule, lib, aegis, policy, absolute);
-                    const passes = switch (role) {
-                        .hole => verdict != .clean,
-                        .twin => verdict == .clean,
-                    };
-                    const listed = open.remove(path);
-                    if (!passes) column.failing += 1;
-                    if (passes and listed) try w.print("{s}/{s}: passes now; take it off {s}/expected.zon's open list\n", .{ rule, path, rule });
-                    if (!passes and !listed) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ rule, path, verdict, role, if (role == .hole) "flagged or undecided" else "clean" });
+                    try jobs.append(a, .{
+                        .column = columns.items.len - 1,
+                        .path = path,
+                        .role = role,
+                        .listed = open.remove(path),
+                        .policy = policy,
+                        .absolute = try std.Io.Dir.path.join(a, &.{ suite_path, rule, path }),
+                    });
                 }
                 if (!any) try w.print("{s}/{s}/: no hole.zig or twin.zig\n", .{ rule, case_path });
             }
         }
         var left = open.keyIterator();
         while (left.next()) |path| try w.print("{s}/{s}: on {s}/expected.zon's open list, and no such case\n", .{ rule, path.*, rule });
+    }
+
+    const verdicts = try a.alloc(anyerror!Verdict, jobs.items.len);
+    var pool: Pool = .{ .jobs = jobs.items, .columns = columns.items, .verdicts = verdicts, .lib = lib, .aegis = aegis };
+    const workers = @min(if (jobs_asked != 0) jobs_asked else std.Thread.getCpuCount() catch 1, @max(jobs.items.len, 1));
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, init.gpa, io });
+    try group.await(io);
+    for (jobs.items, verdicts) |job, result| {
+        const verdict = try result;
+        const column = &columns.items[job.column];
+        const passes = switch (job.role) {
+            .hole => verdict != .clean,
+            .twin => verdict == .clean,
+        };
+        if (!passes) column.failing += 1;
+        if (passes and job.listed) try w.print("{s}/{s}: passes now; take it off {s}/expected.zon's open list\n", .{ column.rule, job.path, column.rule });
+        if (!passes and !job.listed) try w.print("{s}/{s}: {t}, where a {t} must be {s}\n", .{ column.rule, job.path, verdict, job.role, if (job.role == .hole) "flagged or undecided" else "clean" });
     }
 
     // The matrix: per cell its holes and twins, `.` where it has neither.
@@ -145,13 +181,35 @@ pub fn main(init: std.process.Init) !void {
         failing += column.failing;
         if (column.failing != 0) try o.print(" {s} {d}", .{ column.rule, column.failing });
     }
-    try o.print("\n{d} cases, {d} open, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ cases, failing, empty });
+    try o.print("\n{d} cases, {d} open, {d} cells empty; a cell is holes+twins, . none yet, - none possible\n", .{ jobs.items.len, failing, empty });
     try o.flush();
     if (failures.written().len != 0) {
         std.debug.print("{s}", .{failures.written()});
         std.process.exit(1);
     }
 }
+
+/// The cases a run judges, shared by its workers: each takes the next case not yet taken and
+/// judges it over its own store, the verdict going to the case's slot.
+const Pool = struct {
+    jobs: []const Job,
+    columns: []const Column,
+    verdicts: []anyerror!Verdict,
+    lib: []const u8,
+    aegis: []const u8,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn work(pool: *Pool, gpa: std.mem.Allocator, io: std.Io) void {
+        var store: glint.Project.Store = .init(gpa);
+        defer store.deinit();
+        while (true) {
+            const index = pool.next.fetchAdd(1, .monotonic);
+            if (index >= pool.jobs.len) return;
+            const job = pool.jobs[index];
+            pool.verdicts[index] = judge(gpa, io, &store, pool.columns[job.column].rule, pool.lib, pool.aegis, job.policy, job.absolute);
+        }
+    }
+};
 
 /// The `expected.zon` of `rule`'s directory.
 fn expectedOf(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, suite: std.Io.Dir, rule: []const u8) !Expected {
@@ -197,6 +255,11 @@ fn sortedEntries(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []const
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
     return names.items;
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |each| if (std.mem.eql(u8, each, name)) return true;
+    return false;
 }
 
 fn lessThan(_: void, x: []const u8, y: []const u8) bool {

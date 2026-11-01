@@ -29,6 +29,8 @@ pub fn dev(b: *std.Build, tools: type) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const filter = b.option([]const u8, "test-filter", "Select tests by name");
+    const soundness_jobs = b.option(usize, "soundness-jobs", "The workers the soundness suite judges its cases on (default: one per CPU)") orelse 0;
+    const soundness_rules = b.option([]const u8, "soundness-rules", "The rules whose soundness cases alone run, by comma (default: every rule's)");
     const package = b.dependency("glint", .{ .target = target, .optimize = optimize });
     const p = package.builder;
     const module = package.module("glint");
@@ -66,6 +68,8 @@ pub fn dev(b: *std.Build, tools: type) void {
     soundness_run.addDirectoryArg2(p.path("test/soundness"), .{});
     soundness_run.addDirectoryArg2(.zig_lib, .{});
     soundness_run.addFileArg2(aegis_dependency.path("src/root.zig"), .{});
+    soundness_run.addArg(b.fmt("{d}", .{soundness_jobs}));
+    if (soundness_rules) |list| soundness_run.addArg(list);
     test_step.dependOn(&soundness_run.step);
     b.step("soundness", "Run the soundness suite alone").dependOn(&soundness_run.step);
     const project_linter = b.addExecutable(.{ .name = "glint-project-example", .root_module = b.createModule(.{
