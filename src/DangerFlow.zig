@@ -272,10 +272,10 @@ fn errorName(tree: *const Ast, node: Ast.Node.Index) bool {
 /// and whose body gives that `Io` to nothing: no `checkCancel`, no cancelable call, no read
 /// through a reader (whose refill is one), so the task cannot be canceled while it runs.
 pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
-    const io = (try Governed.declarations(c, "std", "Io")) orelse return;
+    const io = ((try Governed.declarations(c, "std", "Io")).orNull()) orelse return;
     var container: ?Facts.Container = null;
     for (io) |decl| {
-        const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
         if (value == .container) container = value.container;
     }
     const io_type = container orelse return;
@@ -400,8 +400,8 @@ fn lostCancel(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     var readers: [2]?Facts.Container = .{ null, null };
     for ([_][]const u8{ "Io.File.Reader", "Io.net.Stream.Reader" }, &readers) |path, *slot| {
-        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| {
-            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| {
+            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
             if (value == .container) slot.* = value.container;
         }
     }
@@ -893,7 +893,7 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
 fn passesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, position: usize) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
         else => return false,
     };
     if (!try Program.owns(c, callee.file)) return false;
@@ -1472,7 +1472,7 @@ fn canceling(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8)
             return false;
         },
         .identifier, .field_access => {
-            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.at(file).model.reference(node) orelse return false).declaration orelse return false) } else (try c.facts.definition(file, node)) orelse return false;
+            const decl: Facts.Decl = if (tree.nodeTag(node) == .identifier) .{ .file = file, .index = ((c.project.at(file).model.reference(node) orelse return false).declaration orelse return false) } else ((try c.facts.definition(file, node)).orNull()) orelse return false;
             const declared = &c.project.at(decl.file).file.tree;
             const variable = declared.fullVarDecl(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
             return canceling(c, decl.file, variable.ast.init_node.unwrap() orelse return false, depth + 1);
@@ -1584,7 +1584,7 @@ fn declaredSlice(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
         .identifier, .field_access => {},
         else => return false,
     }
-    const decl = (try c.facts.definition(file, base)) orelse return false;
+    const decl = ((try c.facts.definition(file, base)).orNull()) orelse return false;
     const written = &c.project.at(decl.file).file.tree;
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const type_node = switch (record.kind) {
@@ -1724,7 +1724,7 @@ fn predicate(c: *Context, call: Ast.full.Call, bound: ?*const Predicate, into: *
     const model = &c.project.at(c.file).model;
     if (depth >= 8) return unfollowed(into);
     const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
         else => return unfollowed(into),
     };
     if (callee.file != c.file) return unfollowed(into);
@@ -2159,7 +2159,7 @@ fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return true;
-    const allocators = (try Governed.declarations(c, "std", "mem.Allocator")) orelse &.{};
+    const allocators = ((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse &.{};
     var it = proto.iterate(tree);
     while (it.next()) |param| {
         const declared = param.type_expr orelse return true;
@@ -2171,7 +2171,7 @@ fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
             else => continue,
         };
         for (allocators) |each| {
-            const allocator_type = try c.facts.declaration((try c.facts.origin(each)) orelse each);
+            const allocator_type = try c.facts.declaration(((try c.facts.origin(each)).orNull()) orelse each);
             if (allocator_type == .container and allocator_type.container.file == k.file and allocator_type.container.scope == k.scope) return true;
         }
     }

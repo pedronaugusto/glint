@@ -513,7 +513,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
                 .unsized => return filled(pointer),
                 .field => {},
             }
-            const decl = (try c.facts.definition(file, node)) orelse return chosen(c, file, node, pointer, next);
+            const decl = ((try c.facts.definition(file, node)).orNull()) orelse return chosen(c, file, node, pointer, next);
             return constant(c, decl, pointer, next);
         },
         .grouped_expression, .unwrap_optional => return bound(c, file, tree.nodeData(node).node_and_token[0], pointer, next),
@@ -609,7 +609,7 @@ fn operation(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
 /// std.math.maxInt(u32)` bounds `x` as a literal would.
 fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call, pointer: u16) Context.Error!?Magnitude {
     if (call.ast.params.len != 1) return null;
-    for ((try Governed.declarations(c, "std", "math.maxInt")) orelse return null) |each| {
+    for (((try Governed.declarations(c, "std", "math.maxInt")).orNull()) orelse return null) |each| {
         if (each.file != decl.file or each.index != decl.index) continue;
         const int = (try named(c, file, call.ast.params[0], pointer)) orelse return null;
         if (int.bits == 0) return 0;
@@ -622,7 +622,7 @@ fn extreme(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.C
 /// buffer is an array of a length the program fixes (`&buf`, or a pointer to one).
 fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full.Call) Context.Error!?Magnitude {
     if (call.ast.params.len == 0) return null;
-    for ((try Governed.declarations(c, "std", "Io.Reader.readSliceShort")) orelse return null) |each| {
+    for (((try Governed.declarations(c, "std", "Io.Reader.readSliceShort")).orNull()) orelse return null) |each| {
         if (each.file != decl.file or each.index != decl.index) continue;
         const tree = &c.project.at(file).file.tree;
         var buffer = bare(tree, call.ast.params[call.ast.params.len - 1]);
@@ -1109,7 +1109,7 @@ pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
     for (sites.items) |site| {
         const site_tree = &c.project.at(site.file).file.tree;
         if (site.kind != .changes or site_tree.nodeTag(site.node) != .address_of) continue;
-        const reached = (try c.facts.definition(site.file, site_tree.nodeData(site.node).node)) orelse return false;
+        const reached = ((try c.facts.definition(site.file, site_tree.nodeData(site.node).node)).orNull()) orelse return false;
         if (std.meta.eql(reached, decl)) return false;
     }
     return true;
@@ -1159,7 +1159,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
             },
             .assign, .changes => {
                 const target = if (site_tree.nodeTag(site.node) == .address_of) site_tree.nodeData(site.node).node else site_tree.nodeData(site.node).node_and_node[0];
-                const reached = (try c.facts.definition(site.file, target)) orelse {
+                const reached = ((try c.facts.definition(site.file, target)).orNull()) orelse {
                     // A holder whose type is not known may be this one (a generic's `c.limit`):
                     // what it stores, the field may hold.
                     if (site_tree.nodeTag(target) != .field_access or !unknownHolder(try c.facts.resolve(site.file, site_tree.nodeData(target).node_and_token[0]))) continue;
@@ -1285,7 +1285,7 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
         },
         .identifier, .field_access => {
             if (try c.facts.memoryField(file, node) != .field) return .{ .int = .{ .bits = pointer, .signed = false } };
-            const decl = (try c.facts.definition(file, node)) orelse if (tree.nodeTag(node) == .identifier) blk: {
+            const decl = ((try c.facts.definition(file, node)).orNull()) orelse if (tree.nodeTag(node) == .identifier) blk: {
                 const ref = c.project.at(file).model.reference(node) orelse break :blk null;
                 break :blk if (ref.declaration) |d| Facts.Decl{ .file = file, .index = d } else null;
             } else null;
@@ -2181,7 +2181,7 @@ fn searchFacts(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), val
     if (!scalar and !std.mem.eql(u8, name, "find") and !std.mem.eql(u8, name, "findPos")) return;
     if (call.ast.params.len < (if (from) @as(usize, 4) else 3)) return;
     const path = try c.allocator.print("mem.{s}", .{name});
-    const std_search = for ((try Governed.declarations(c, "std", path)) orelse return) |each| {
+    const std_search = for (((try Governed.declarations(c, "std", path)).orNull()) orelse return) |each| {
         if (std.meta.eql(each, callee.function)) break true;
     } else false;
     if (!std_search) return;
@@ -2271,7 +2271,7 @@ fn readBuffers(c: *Context, file: Project.FileId, call_node: Ast.Node.Index, dep
     const call = tree.fullCall(&buffer, call_node) orelse return null;
     const callee = try c.facts.resolve(file, call.ast.fn_expr);
     if (callee != .function) return null;
-    const decl = (try c.facts.origin(callee.function)) orelse callee.function;
+    const decl = ((try c.facts.origin(callee.function)).orNull()) orelse callee.function;
     const param = (try readParam(c, decl, depth)) orelse return null;
     // A method call hands its receiver first.
     var skip: usize = 0;
@@ -2288,8 +2288,8 @@ fn readBuffers(c: *Context, file: Project.FileId, call_node: Ast.Node.Index, dep
 /// reads into, directly or through a constant (`const n = try f.readStreaming(io, buffers);
 /// if (n != 0) return n;`). An error it returns gives no count.
 fn readParam(c: *Context, decl: Facts.Decl, depth: u8) Context.Error!?usize {
-    for (std_reads) |each| for ((try Governed.declarations(c, "std", each.path)) orelse &.{}) |found| {
-        if (std.meta.eql((try c.facts.origin(found)) orelse found, decl)) return each.param;
+    for (std_reads) |each| for (((try Governed.declarations(c, "std", each.path)).orNull()) orelse &.{}) |found| {
+        if (std.meta.eql(((try c.facts.origin(found)).orNull()) orelse found, decl)) return each.param;
     };
     if (!try Program.owns(c, decl.file)) return null;
     const tree = &c.project.at(decl.file).file.tree;
@@ -2737,7 +2737,7 @@ fn varies(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
             };
             var constant_of_type = false;
             for ([_][]const u8{ "math.maxInt", "math.minInt" }) |path| {
-                for ((try Governed.declarations(c, "std", path)) orelse &.{}) |each| constant_of_type = constant_of_type or std.meta.eql(each, decl);
+                for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |each| constant_of_type = constant_of_type or std.meta.eql(each, decl);
             }
             if (!constant_of_type) return true;
         },
@@ -2819,8 +2819,8 @@ fn pure(c: *Context, decl: Facts.Decl) Context.Error!bool {
         memo.built = true;
         const namespaces = [_][2][]const u8{ .{ "std", "mem" }, .{ "std", "math" }, .{ "std", "ascii" }, .{ "std", "unicode" }, .{ "aegis", "assert" } };
         for (namespaces) |namespace| {
-            for ((try Governed.declarations(c, namespace[0], namespace[1])) orelse &.{}) |found| {
-                const value = try c.facts.declaration((try c.facts.origin(found)) orelse found);
+            for (((try Governed.declarations(c, namespace[0], namespace[1])).orNull()) orelse &.{}) |found| {
+                const value = try c.facts.declaration(((try c.facts.origin(found)).orNull()) orelse found);
                 if (value != .container) continue;
                 var next: std.ArrayList(Project.FileId) = .empty;
                 if (!(try memo.files.getOrPut(c.allocator, @backingInt(value.container.file))).found_existing) try next.append(c.allocator, value.container.file);
@@ -2831,7 +2831,7 @@ fn pure(c: *Context, decl: Facts.Decl) Context.Error!bool {
                 };
             }
         }
-        for ((try Governed.declarations(c, "std", "debug.assert")) orelse &.{}) |found| try memo.checks.put(c.allocator, (try c.facts.origin(found)) orelse found, {});
+        for (((try Governed.declarations(c, "std", "debug.assert")).orNull()) orelse &.{}) |found| try memo.checks.put(c.allocator, ((try c.facts.origin(found)).orNull()) orelse found, {});
     }
     return memo.files.contains(@backingInt(decl.file)) or memo.checks.contains(decl);
 }
@@ -3920,7 +3920,7 @@ fn valueOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) C
             };
         },
         .identifier, .field_access => {
-            const decl = (try c.facts.definition(file, at)) orelse return null;
+            const decl = ((try c.facts.definition(file, at)).orNull()) orelse return null;
             const model = &c.project.at(decl.file).model;
             const record = model.declarations[@backingInt(decl.index)];
             if (record.kind != .variable) return null;
@@ -4151,8 +4151,8 @@ fn allocator(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
         .instance => |k| k,
         else => return false,
     };
-    for ((try Governed.declarations(c, "std", "mem.Allocator")) orelse return false) |decl| {
-        const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+    for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse return false) |decl| {
+        const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
         if (value == .container and value.container.file == k.file and value.container.scope == k.scope) return true;
     }
     return false;
@@ -4185,7 +4185,7 @@ fn prongField(c: *Context, capture: Facts.Decl) Context.Error!?Facts.Decl {
 /// The declared length of the fixed array a name holds, or points to (`var buf: [256]u8`,
 /// `const t = [_]u8{ ... }`, a field `table: *const [256][4]u8`), its length a constant.
 fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?Magnitude {
-    var decl = (try c.facts.definition(file, memory)) orelse return null;
+    var decl = ((try c.facts.definition(file, memory)).orNull()) orelse return null;
     var record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     // A prong's capture of a union's field (`.set => |s|`) has that field's type.
     if (record.kind == .capture) {

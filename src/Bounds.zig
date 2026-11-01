@@ -1439,8 +1439,8 @@ const Frame = struct {
         if (f.tree.nodeTag(node) != .field_access) return null;
         const holder = f.tree.nodeData(node).node_and_token[0];
         const root = f.trackedName(holder) orelse return null;
-        const decl = (try f.c.facts.definition(f.file, node)) orelse return null;
-        const member = (try f.c.facts.origin(decl)) orelse decl;
+        const decl = ((try f.c.facts.definition(f.file, node)).orNull()) orelse return null;
+        const member = ((try f.c.facts.origin(decl)).orNull()) orelse decl;
         if (!try Range.placeable(f.c, member)) return null;
         return .{ .root = root, .field = member };
     }
@@ -1522,9 +1522,9 @@ const Frame = struct {
             .identifier => if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(target)), "_")) return s,
             .field_access => {
                 // A field that does not resolve (`p.at` of an `anytype` `p`) may be any place's.
-                const decl = (try f.c.facts.definition(f.file, target)) orelse return f.wrote(s, null, null);
+                const decl = ((try f.c.facts.definition(f.file, target)).orNull()) orelse return f.wrote(s, null, null);
                 const value = try f.c.facts.resolve(f.file, target);
-                if (value == .scalar or value == .pointer) return f.wrote(s, (try f.c.facts.origin(decl)) orelse decl, null);
+                if (value == .scalar or value == .pointer) return f.wrote(s, ((try f.c.facts.origin(decl)).orNull()) orelse decl, null);
             },
             // `@field(x, "at") = v`: a field by a name read as the program compiles.
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.wrote(s, null, null),
@@ -2987,7 +2987,7 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
             }
         },
         .field_access => {
-            const decl = (try c.facts.definition(file, node)) orelse return null;
+            const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             const field = c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return null;
             return .{ .file = decl.file, .node = field.ast.type_expr.unwrap() orelse return null };
@@ -3062,8 +3062,8 @@ fn payloadOf(c: *Context, t: TypeRef, depth: u8) Error!?TypeRef {
 
 /// The type a name for a type stands for (`const Bytes = []const u8;`).
 fn aliased(c: *Context, t: TypeRef) Error!?TypeRef {
-    const decl = (try c.facts.definition(t.file, t.node)) orelse return null;
-    const declared = (try c.facts.origin(decl)) orelse decl;
+    const decl = ((try c.facts.definition(t.file, t.node)).orNull()) orelse return null;
+    const declared = ((try c.facts.origin(decl)).orNull()) orelse decl;
     const tree = &c.project.at(declared.file).file.tree;
     const full = tree.fullVarDecl(c.project.at(declared.file).model.declarations[@backingInt(declared.index)].node) orelse return null;
     return .{ .file = declared.file, .node = full.ast.init_node.unwrap() orelse return null };
@@ -3085,19 +3085,19 @@ fn table(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Error!?Coef 
         node = holder;
     }
     if (tree.nodeTag(node) != .field_access) return null;
-    const decl = (try c.facts.definition(file, node)) orelse return null;
+    const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
     const tables = try c.facts.memo(Tables);
     if (!tables.found) {
         tables.found = true;
-        for ((try Governed.declarations(c, "std", "zig.Ast")) orelse &.{}) |ast| {
-            const value = try c.facts.declaration((try c.facts.origin(ast)) orelse ast);
+        for (((try Governed.declarations(c, "std", "zig.Ast")).orNull()) orelse &.{}) |ast| {
+            const value = try c.facts.declaration(((try c.facts.origin(ast)).orNull()) orelse ast);
             if (value != .container) continue;
             for ([_][]const u8{ "nodes", "tokens" }) |name| if (c.facts.member(value.container, name)) |field| {
                 try tables.fields.append(c.allocator, field);
             };
         }
     }
-    const field = (try c.facts.origin(decl)) orelse decl;
+    const field = ((try c.facts.origin(decl)).orNull()) orelse decl;
     for (tables.fields.items) |each| if (std.meta.eql(each, field)) return @as(Coef, std.math.maxInt(u32)) + 1;
     return null;
 }

@@ -87,17 +87,38 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
     return kept.items;
 }
 
-/// The declarations `path` names from module `source`, without reporting: null when no root
-/// imports the module or the path does not resolve. For facts that recognize a declaration and
-/// leave its absence to the rules that read them. The answer is the project's, read once per run
-/// for each source and path: a fact asks it at every place it reads, every round.
-pub fn declarations(self: *Context, source: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+/// What `declarations` finds: the declarations, none (no root imports the module, or the path
+/// names nothing), or unknown (the fact budget ran out on the walk, which may have missed one).
+pub const Declared = union(enum) {
+    decls: []const Facts.Decl,
+    none,
+    unknown: Facts.Unknown,
+
+    /// The declarations, or null for none and for unknown alike, as every caller read them
+    /// before `Declared`: each use drops an unknown. Every use is to become a switch that makes
+    /// `.unknown` undecided where it decides; `orNull_test` counts them, the count only falls,
+    /// and at none this goes.
+    pub fn orNull(self: Declared) ?[]const Facts.Decl {
+        return switch (self) {
+            .decls => |decls| decls,
+            .none, .unknown => null,
+        };
+    }
+};
+
+/// The declarations `path` names from module `source`, without reporting. For facts that
+/// recognize a declaration and leave its absence to the rules that read them. The answer is the
+/// project's, read once per run for each source and path: a fact asks it at every place it
+/// reads, every round.
+pub fn declarations(self: *Context, source: []const u8, path: []const u8) Context.Error!Declared {
     const memo = try self.facts.memo(Lookups);
     memo.asked += 1;
     if (memo.found.getPtr(source)) |paths| if (paths.get(path)) |known| return known;
-    const answer = try lookup(self, source, path);
-    // A walk the fact budget cut short may have missed a declaration: it is asked again.
-    if (self.facts.remaining == 0) return answer;
+    const found = try lookup(self, source, path);
+    // A walk the fact budget cut short may have missed a declaration: it is unknown, and asked
+    // again.
+    if (self.facts.remaining == 0) return if (found) |decls| .{ .decls = decls } else .{ .unknown = .budget };
+    const answer: Declared = if (found) |decls| .{ .decls = decls } else .none;
     const paths = try memo.found.getOrPut(self.allocator, source);
     if (!paths.found_existing) {
         paths.key_ptr.* = try self.allocator.dupe(u8, source);
@@ -109,7 +130,7 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
 
 /// Each `declarations` answer by its source, then its path, and how many times one was asked.
 pub const Lookups = struct {
-    found: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(?[]const Facts.Decl)) = .empty,
+    found: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(Declared)) = .empty,
     asked: usize = 0,
 };
 
@@ -126,13 +147,14 @@ fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!?[
 
 /// The declarations at `path` from the files of `package`, every one the run loaded, selected
 /// or not: a package's own declaration, where none of its files imports the package by name.
-pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const u8) Context.Error!Declared {
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (self.project.sources) |*source| {
         if (std.mem.eql(u8, source.input.package, package)) try roots.append(self.allocator, source.id);
     }
-    if (roots.items.len == 0) return null;
-    return walk(self, roots.items, path, true);
+    if (roots.items.len == 0) return .none;
+    if (try walk(self, roots.items, path, true)) |decls| return .{ .decls = decls };
+    return if (self.facts.remaining == 0) .{ .unknown = .budget } else .none;
 }
 
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
@@ -234,7 +256,7 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
                     else => continue,
                 }
                 const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
-                const origin = (try self.facts.origin(decl)) orelse continue;
+                const origin = ((try self.facts.origin(decl)).orNull()) orelse continue;
                 if (std.meta.eql(origin, decl)) continue;
                 const entry = try found.by_origin.getOrPut(self.allocator, origin);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -300,7 +322,7 @@ fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_
             // A field has no `pub`: every field of a container a program reaches is its to name.
             const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             if (public_only and !record.public and record.kind != .field) continue;
-            try found.append(self.allocator, (try self.facts.origin(decl)) orelse decl);
+            try found.append(self.allocator, ((try self.facts.origin(decl)).orNull()) orelse decl);
         }
         if (found.items.len == 0) return null;
         if (names.peek() == null) break;
@@ -326,11 +348,11 @@ const Reached = union(enum) { decls: []const Facts.Decl, unknown: Facts.Unknown 
 /// What a site refers to: its declaration through aliases, or the member of each container its
 /// receiver may be.
 fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!Reached {
-    const definition = if (tag == .identifier or tag == .field_access) try self.facts.definition(self.file, node) else try self.facts.reflected(self.file, node);
+    const definition = if (tag == .identifier or tag == .field_access) (try self.facts.definition(self.file, node)).orNull() else (try self.facts.reflected(self.file, node)).orNull();
     if (definition) |decl| {
         // An alias whose value does not resolve is the program's own declaration: its value is a
         // site of its own.
-        const origin = (try self.facts.origin(decl)) orelse decl;
+        const origin = ((try self.facts.origin(decl)).orNull()) orelse decl;
         return .{ .decls = try self.allocator.dupe(Facts.Decl, &.{ decl, origin }) };
     }
     if (tag == .identifier) {
@@ -350,7 +372,7 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
     for (options.items) |container| {
         const decl = self.facts.member(container, spelled) orelse continue;
         try decls.append(self.allocator, decl);
-        try decls.append(self.allocator, (try self.facts.origin(decl)) orelse return .{ .unknown = .cycle });
+        try decls.append(self.allocator, ((try self.facts.origin(decl)).orNull()) orelse return .{ .unknown = .cycle });
     }
     return .{ .decls = decls.items };
 }

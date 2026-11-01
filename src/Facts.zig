@@ -160,6 +160,29 @@ pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown };
 /// `std_internal`: std reads it from `root` or `builtin` (`root.std_options`, the target),
 /// which no library's reading binds, so it is a type or value std computes for itself.
 pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, std_internal };
+/// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
+/// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
+/// or unknown and why (a holder that does not resolve, a choice of holders, a computed name, a
+/// cycle). Unknown is never none: a rule reads it as undecided.
+pub const Named = union(enum) {
+    decl: Decl,
+    none,
+    unknown: Unknown,
+
+    pub fn of(found: ?Decl) Named {
+        return if (found) |decl| .{ .decl = decl } else .none;
+    }
+    /// The declaration, or null for none and for unknown alike, as every caller read it before
+    /// `Named`: each use drops an unknown. Every use is to become a switch that makes `.unknown`
+    /// undecided where it decides; `orNull_test` counts them, the count only falls, and at none
+    /// this goes.
+    pub fn orNull(self: Named) ?Decl {
+        return switch (self) {
+            .decl => |decl| decl,
+            .none, .unknown => null,
+        };
+    }
+};
 pub const Value = union(enum) {
     unknown: Unknown,
     primitive: []const u8,
@@ -1147,8 +1170,8 @@ fn passings(self: *Facts, function: Decl) ResolveError![]const Passing {
             passes = true;
         };
         if (!passes) continue;
-        const callee = (try self.definition(function.file, call.ast.fn_expr)) orelse continue;
-        const target = (try self.origin(callee)) orelse continue;
+        const callee = ((try self.definition(function.file, call.ast.fn_expr)).orNull()) orelse continue;
+        const target = ((try self.origin(callee)).orNull()) orelse continue;
         if (std.meta.eql(target, function)) continue;
         try found.append(self.gpa, .{ .node = node, .target = target });
     }
@@ -1265,8 +1288,8 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
         const inner = step_tree.fullCall(&step_buffer, step.node) orelse return .{ .unknown = .unsupported };
-        const callee = (try self.definition(step.file, inner.ast.fn_expr)) orelse return .{ .unknown = .unresolved };
-        const target = (try self.origin(callee)) orelse return .{ .unknown = .unresolved };
+        const callee = ((try self.definition(step.file, inner.ast.fn_expr)).orNull()) orelse return .{ .unknown = .unresolved };
+        const target = ((try self.origin(callee)).orNull()) orelse return .{ .unknown = .unresolved };
         var inner_args: std.ArrayList(Value) = .empty;
         if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
         for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
@@ -1758,7 +1781,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         }
     }
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
-        const target = (try self.reflected(file, node)) orelse return .{ .unknown = .comptime_dependent };
+        const target = ((try self.reflected(file, node)).orNull()) orelse return .{ .unknown = .comptime_dependent };
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
         return self.declaration(target);
     }
@@ -2545,8 +2568,8 @@ fn forwarded(self: *Facts, function: Decl) ResolveError!?struct { function: Decl
     const returned = finalReturn(tree, &self.project.at(function.file).model, record) orelse return null;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, returned) orelse return null;
-    const callee = (try self.definition(function.file, call.ast.fn_expr)) orelse return null;
-    const target = (try self.origin(callee)) orelse return null;
+    const callee = ((try self.definition(function.file, call.ast.fn_expr)).orNull()) orelse return null;
+    const target = ((try self.origin(callee)).orNull()) orelse return null;
     if (self.project.at(target.file).model.declarations[@backingInt(target.index)].kind != .function) return null;
     return .{ .function = target, .call = returned };
 }
@@ -2861,7 +2884,7 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
 /// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
 /// the pointer's function type returns.
 fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) ResolveError!?Value {
-    var decl = (try self.definition(file, callee)) orelse return null;
+    var decl = ((try self.definition(file, callee)).orNull()) orelse return null;
     var record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     // A local holding the field, unwrapped: `const f = x.handler orelse return;`.
     if (record.kind == .variable) {
@@ -2872,7 +2895,7 @@ fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) Re
             .unwrap_optional, .grouped_expression => local.nodeData(value).node_and_token[0],
             else => break,
         };
-        decl = (try self.definition(decl.file, value)) orelse return null;
+        decl = ((try self.definition(decl.file, value)).orNull()) orelse return null;
         record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     }
     if (record.kind != .field) return null;
@@ -3171,8 +3194,8 @@ fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
         // same template whatever arguments this one passes it.
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buffer, returned) orelse return null;
-        const callee = (try self.definition(decl.file, call.ast.fn_expr)) orelse return null;
-        const function = (try self.origin(callee)) orelse return null;
+        const callee = ((try self.definition(decl.file, call.ast.fn_expr)).orNull()) orelse return null;
+        const function = ((try self.origin(callee)).orNull()) orelse return null;
         if (self.project.at(function.file).model.declarations[@backingInt(function.index)].kind != .function) return null;
         return self.template(function);
     }
@@ -3465,65 +3488,82 @@ fn heldContainer(value: Value) ?Container {
     };
 }
 
-pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
+pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Named {
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(node) == .identifier or tree.nodeTag(node) == .test_decl) {
-        const ref = self.project.at(file).model.reference(node) orelse return null;
-        return if (ref.declaration) |decl| .{ .file = file, .index = decl } else null;
+        const ref = self.project.at(file).model.reference(node) orelse return .none;
+        if (ref.declaration) |decl| return .{ .decl = .{ .file = file, .index = decl } };
+        return switch (ref.unknown orelse .unresolved) {
+            // `u8`, `true`, `null`: the language's, no declaration.
+            .primitive => .none,
+            .invalid_lowering => .{ .unknown = .invalid_front_end },
+            .unresolved, .before_declaration, .literal_context => .{ .unknown = .unresolved },
+        };
     }
     if (tree.nodeTag(node) == .field_access) {
         const data = tree.nodeData(node).node_and_token;
         const value = try self.resolve(file, data[0]);
-        const container = switch (value) {
+        const holder = if (value == .pointer) value.pointer.* else value;
+        const container = switch (holder) {
             .container, .instance => |c| c,
-            .pointer => |p| switch (p.*) {
-                .container, .instance => |c| c,
-                else => return null,
-            },
-            else => return null,
+            .unknown => |why| return .{ .unknown = why },
+            // A number, a truth value, an error set: no declaration is a member of one.
+            .primitive, .scalar, .error_set => return .none,
+            // A choice of holders, each with its own member; any other value a member of which
+            // is not read here.
+            else => return .{ .unknown = .unsupported },
         };
-        return self.member(container, try self.memberName(tree.tokenSlice(data[1])));
+        return .of(self.member(container, try self.memberName(tree.tokenSlice(data[1]))));
     }
-    return null;
+    return .none;
 }
 
 /// Literal reflection binds a declaration only on a concrete, resolved container.
-pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
+pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Named {
     const tree = &self.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, node, &buffer);
-    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
+    if (args.len != 2) return .none;
+    // The one name it spells (`fieldName`): a string, a `const` holding one, an enum literal; a
+    // name it ranges over or computes is not one known here.
+    const name = switch (try self.fieldName(file, args[1])) {
+        .name => |name| name,
+        .each_of, .computed => return .{ .unknown = .comptime_dependent },
+    };
     // `@field(p, "name")` on a single pointer names its pointee's member.
     const resolved = try self.resolve(file, args[0]);
     const value = if (resolved == .pointer) resolved.pointer.* else resolved;
     const container = switch (value) {
         .container, .instance => |c| c,
-        else => return null,
+        .unknown => |why| return .{ .unknown = why },
+        .primitive, .scalar, .error_set => return .none,
+        else => return .{ .unknown = .unsupported },
     };
-    if (container.symbolic) return null;
-    const name = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    return self.member(container, name);
+    if (container.symbolic) return .{ .unknown = .comptime_dependent };
+    return .of(self.member(container, name));
 }
 
 /// Follows only declaration aliases, keeping the final declaration's provenance.
 /// Cycles, computed expressions and unsupported comptime retain uncertainty.
-pub fn origin(self: *Facts, start: Decl) ResolveError!?Decl {
+pub fn origin(self: *Facts, start: Decl) ResolveError!Named {
     var current = start;
     var visited: aegis.bounded.Array(Decl, 128) = .init;
     while (true) {
-        for (visited.constItems()) |earlier| if (std.meta.eql(earlier, current)) return null;
+        for (visited.constItems()) |earlier| if (std.meta.eql(earlier, current)) return .{ .unknown = .cycle };
         // More aliases than are followed: uncertain, as a cycle is.
-        visited.appendSlice(&.{current}) catch return null;
+        visited.appendSlice(&.{current}) catch return .{ .unknown = .budget };
         const record = self.project.at(current.file).model.declarations[@backingInt(current.index)];
-        if (record.kind != .variable) return current;
+        if (record.kind != .variable) return .{ .decl = current };
         const tree = &self.project.at(current.file).file.tree;
         const variable = tree.fullVarDecl(record.node).?;
-        const expr = variable.ast.init_node.unwrap() orelse return current;
-        if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) return current;
-        current = (try self.definition(current.file, expr)) orelse return null;
+        const expr = variable.ast.init_node.unwrap() orelse return .{ .decl = current };
+        if (tree.nodeTag(expr) != .identifier and tree.nodeTag(expr) != .field_access) return .{ .decl = current };
+        current = switch (try self.definition(current.file, expr)) {
+            .decl => |next| next,
+            // An alias of a primitive (`const Int = u8`) is its own origin.
+            .none => return .{ .decl = current },
+            .unknown => |why| return .{ .unknown = why },
+        };
     }
 }
 
@@ -4510,7 +4550,7 @@ fn closedField(self: *Facts, receiver: Key) ResolveError!bool {
     if (tree.nodeTag(receiver.node) == .identifier) return self.closedLocal(receiver);
     if (tree.nodeTag(receiver.node) != .field_access) return false;
     // A member of a value whose type is closed is that type's, and so closed itself.
-    const decl = (try self.definition(receiver.file, receiver.node)) orelse
+    const decl = ((try self.definition(receiver.file, receiver.node)).orNull()) orelse
         return self.closedField(.{ .file = receiver.file, .node = tree.nodeData(receiver.node).node_and_token[0] });
     if (try self.program(decl.file)) return false;
     const source = self.project.at(decl.file);
@@ -5916,8 +5956,8 @@ pub const calls = struct {
     fn memberNamed(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Facts.Decl {
         const tree = &facts.project.at(file).file.tree;
         return switch (tree.nodeTag(node)) {
-            .field_access => facts.definition(file, node),
-            else => facts.reflected(file, node),
+            .field_access => (try facts.definition(file, node)).orNull(),
+            else => (try facts.reflected(file, node)).orNull(),
         };
     }
 
@@ -5966,7 +6006,7 @@ pub const calls = struct {
             },
             .field_access => {
                 const holder, const name = tree.nodeData(node).node_and_token;
-                const decl = (try facts.definition(file, node)) orelse {
+                const decl = (try facts.definition(file, node)).orNull() orelse {
                     // A member of a literal with no type of its own: the value it gives.
                     if (try literalMember(facts, file, holder, try facts.memberName(tree.tokenSlice(name)), depth)) |value|
                         return gather(facts, value.file, value.node, depth + 1, found);
@@ -5986,7 +6026,7 @@ pub const calls = struct {
                     if (std.mem.eql(u8, name, cast) and args.len == 1) return gather(facts, file, args[0], depth + 1, found);
                 }
                 if (std.mem.eql(u8, name, "@field") and args.len == 2) {
-                    const decl = (try facts.reflected(file, node)) orelse return .comptime_dependent;
+                    const decl = (try facts.reflected(file, node)).orNull() orelse return .comptime_dependent;
                     return memberCallee(facts, file, args[0], decl, depth, found);
                 }
                 return .unsupported;

@@ -95,8 +95,8 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
     if (tree.fullContainerDecl(&buffer, node) != null) return true;
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, node)) |call| {
-        const decl = (try self.facts.definition(self.file, call.ast.fn_expr)) orelse return false;
-        const function = (try self.facts.origin(decl)) orelse return false;
+        const decl = ((try self.facts.definition(self.file, call.ast.fn_expr)).orNull()) orelse return false;
+        const function = ((try self.facts.origin(decl)).orNull()) orelse return false;
         const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
         if (record.kind != .function) return false;
         const written = &self.project.at(function.file).file.tree;

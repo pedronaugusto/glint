@@ -183,7 +183,7 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
         const callee: ?Facts.Decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| (try c.facts.origin(decl)) orelse decl,
+            .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
             .unknown => null,
             else => continue,
         };
@@ -296,8 +296,8 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
         var call_buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&call_buffer, node) orelse continue;
         if (c.inTest(tree.nodeMainToken(node))) continue;
-        const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
-        const function = (try c.facts.origin(callee)) orelse continue;
+        const callee = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse continue;
+        const function = ((try c.facts.origin(callee)).orNull()) orelse continue;
         const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
         if (record.kind != .function or !record.public or !c.facts.hasGenericParameter(function)) continue;
         // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
@@ -480,7 +480,7 @@ fn keptBy(c: *Context, resources: []const ?Facts.Container, file: Project.FileId
 /// value that does not resolve) may do anything with what it is given.
 fn eachCallee(c: *Context, file: Project.FileId, call: Ast.full.Call, context: anytype, comptime by: fn (@TypeOf(context), *Context, Project.FileId, Ast.full.Call, Facts.Decl) Context.Error!Stored) Context.Error!Stored {
     switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| return by(context, c, file, call, (try c.facts.origin(decl)) orelse decl),
+        .function => |decl| return by(context, c, file, call, ((try c.facts.origin(decl)).orNull()) orelse decl),
         .alternatives => |choices| {
             var result: Stored = .no;
             for (choices) |choice| {
@@ -488,7 +488,7 @@ fn eachCallee(c: *Context, file: Project.FileId, call: Ast.full.Call, context: a
                     .function => |decl| decl,
                     else => return .unknown,
                 };
-                result = join(result, try by(context, c, file, call, (try c.facts.origin(decl)) orelse decl));
+                result = join(result, try by(context, c, file, call, ((try c.facts.origin(decl)).orNull()) orelse decl));
                 if (result == .yes) return .yes;
             }
             return result;
@@ -1075,7 +1075,7 @@ pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Err
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse return false;
         const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| (try c.facts.origin(decl)) orelse decl,
+            .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
             else => return false,
         };
         const target = &c.project.at(callee.file).file.tree;
@@ -1315,15 +1315,15 @@ fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
         if (std.mem.eql(u8, tree.tokenSlice(method), "get") and try c.role(Contract.library, try c.facts.resolve(file, receiver)) == .lent) return true;
     }
     const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
         else => return false,
     };
     // The program's function whose every return is a view returns one.
     if (try c.facts.program(callee.file)) return views(c, resources, callee, next, &.{ .file = file, .call = call, .callee = callee, .outer = bound });
     if (call.ast.params.len != 0) return false;
     for ([_][]const u8{ "Io.File.stdin", "Io.File.stdout", "Io.File.stderr", "Io.Dir.cwd" }) |standard| {
-        for ((try Governed.declarations(c, "std", standard)) orelse &.{}) |decl| {
-            if (std.meta.eql((try c.facts.origin(decl)) orelse decl, callee)) return true;
+        for (((try Governed.declarations(c, "std", standard)).orNull()) orelse &.{}) |decl| {
+            if (std.meta.eql(((try c.facts.origin(decl)).orNull()) orelse decl, callee)) return true;
         }
     }
     return false;
@@ -1851,7 +1851,7 @@ fn containersOf(c: *Context, rule: Rule, paths: []const []const u8) Context.Erro
     for (try Governed.resolve(c, rule, targets, indexes)) |found| {
         var container: ?Facts.Container = null;
         for (found.decls) |decl| {
-            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
             if (value == .container) container = value.container;
         }
         // Kept in the order of `paths`, an unresolved one as null.

@@ -234,8 +234,8 @@ const Walk = struct {
                 return left == right;
             },
             .field_access => {
-                const left = try self.c.facts.definition(self.c.file, a);
-                const right = try self.c.facts.definition(self.c.file, b);
+                const left = (try self.c.facts.definition(self.c.file, a)).orNull();
+                const right = (try self.c.facts.definition(self.c.file, b)).orNull();
                 if (left != null or right != null) {
                     if (!std.meta.eql(left, right)) return false;
                 } else if (!std.mem.eql(u8, try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(a).node_and_token[1])), try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(b).node_and_token[1])))) return false;

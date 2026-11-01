@@ -101,8 +101,8 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         const spelled = tree.tokenSlice(site);
         if (!std.mem.eql(u8, spelled, "SecretKey") and !std.mem.eql(u8, spelled, "KeyPair") and !named(renamed.items, spelled)) continue;
         if (c.inTest(site)) continue;
-        const decl = (try c.facts.definition(c.file, node)) orelse continue;
-        const origin = (try c.facts.origin(decl)) orelse decl;
+        const decl = ((try c.facts.definition(c.file, node)).orNull()) orelse continue;
+        const origin = ((try c.facts.origin(decl)).orNull()) orelse decl;
         var secret = false;
         for (keys) |key| secret = secret or std.meta.eql(key, decl) or std.meta.eql(key, origin);
         if (!secret or (!std.meta.eql(decl, origin) and c.project.at(decl.file).input.selected)) continue;
@@ -135,7 +135,7 @@ fn secretKeys(c: *Context) Context.Error![]const Facts.Decl {
     var files: std.ArrayList(Project.FileId) = .empty;
     for (roots.items) |root| {
         const crypto = c.facts.member(c.facts.rootOf(root), "crypto") orelse continue;
-        const value = try c.facts.declaration((try c.facts.origin(crypto)) orelse crypto);
+        const value = try c.facts.declaration(((try c.facts.origin(crypto)).orNull()) orelse crypto);
         if (value != .container) continue;
         try files.append(c.allocator, value.container.file);
     }
@@ -389,8 +389,8 @@ fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayLi
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse continue;
-        const origin = (try c.facts.origin(callee)) orelse continue;
+        const callee = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse continue;
+        const origin = ((try c.facts.origin(callee)).orNull()) orelse continue;
         if (std.meta.eql(callee, origin)) continue;
         for (assert_decls) |each| if (std.meta.eql(each, origin)) {
             try calls.append(c.allocator, node);
@@ -702,7 +702,7 @@ fn namedOutside(c: *Context, node: Ast.Node.Index) Context.Error!bool {
             .optional_type => at = tree.nodeData(at).node,
             .error_union => at = tree.nodeData(at).node_and_node[1],
             .identifier, .field_access => {
-                const decl = (try c.facts.definition(c.file, at)) orelse return false;
+                const decl = ((try c.facts.definition(c.file, at)).orNull()) orelse return false;
                 return !c.project.at(decl.file).input.selected;
             },
             else => return false,
@@ -729,7 +729,7 @@ fn syncType(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
                 const whole = model.parentOf(record.node) orelse record.node;
                 const scope = model.scopes[@backingInt(held.scope)];
                 if (scope.first >= tree.firstToken(whole) and scope.last <= tree.lastToken(whole)) return g.index;
-            } else switch (try c.facts.declaration((try c.facts.origin(decl)) orelse decl)) {
+            } else switch (try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl)) {
                 .container => |sync| if (sync.file == held.file and sync.scope == held.scope) return g.index,
                 else => {},
             }

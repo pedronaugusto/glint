@@ -354,7 +354,7 @@ fn checkWholeAddress(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
         }
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return;
         const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| (try c.facts.origin(decl)) orelse decl,
+            .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
             else => return c.undecided(access, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a public source's address handed to a call that does not resolve, which may write it"),
         };
         if (try c.inLibrary(Contract.library, callee.file)) return;
@@ -970,8 +970,8 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         else => return,
     };
     if (!try c.facts.mayCopy(try Model.identifier(c.allocator, tree.tokenSlice(name_token)))) return;
-    const decl = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return;
-    const function = (try c.facts.origin(decl)) orelse return;
+    const decl = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse return;
+    const function = ((try c.facts.origin(decl)).orNull()) orelse return;
     const made = try c.facts.parameterCopies(function);
     if (made.len == 0) return;
     const written = &c.project.at(function.file).file.tree;
@@ -1657,8 +1657,8 @@ fn heldBy(c: *Context, reference: Ast.Node.Index) Context.Error!Hold {
 /// Whether the method `member` names (`r.release`, `r.a.release`) takes its receiver by
 /// pointer. One that does not resolve, or takes `anytype`, may do either.
 fn pointerReceiver(c: *Context, member: Ast.Node.Index) Context.Error!bool {
-    const decl = (try c.facts.definition(c.file, member)) orelse return false;
-    const origin = (try c.facts.origin(decl)) orelse return false;
+    const decl = ((try c.facts.definition(c.file, member)).orNull()) orelse return false;
+    const origin = ((try c.facts.origin(decl)).orNull()) orelse return false;
     const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
     if (record.kind != .function) return false;
     const written = &c.project.at(origin.file).file.tree;
@@ -1778,8 +1778,8 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
         .call_one, .call_one_comma, .call, .call_comma => {
             var buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node).?;
-            const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
-            const origin = (try c.facts.origin(decl)) orelse return false;
+            const decl = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return false;
+            const origin = ((try c.facts.origin(decl)).orNull()) orelse return false;
             const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
             if (record.kind != .function) return false;
             const written = &c.project.at(origin.file).file.tree;
@@ -2219,8 +2219,8 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
 /// opened scope), or a function of the program's own that returns one held, the caller's to
 /// release (Flow's `return`).
 fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context.Error!bool {
-    const decl = (try c.facts.definition(c.file, callee)) orelse return false;
-    const function = (try c.facts.origin(decl)) orelse return false;
+    const decl = ((try c.facts.definition(c.file, callee)).orNull()) orelse return false;
+    const function = ((try c.facts.origin(decl)).orNull()) orelse return false;
     if (c.project.at(function.file).model.declarations[@backingInt(function.index)].kind != .function) return false;
     const result = switch (try c.facts.resolve(c.file, call)) {
         .error_union => |payload| payload.*,
@@ -3167,7 +3167,7 @@ const Flow = struct {
             if (f.mine(param)) given += 1;
         }
         if (given != 1) return false;
-        const callee = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return false;
+        const callee = ((try f.c.facts.definition(f.c.file, call.ast.fn_expr)).orNull()) orelse return false;
         if (try Program.owns(f.c, callee.file)) return false;
         const first = f.tree.firstToken(stmt);
         const last = f.tree.lastToken(stmt);
@@ -3208,8 +3208,8 @@ const Flow = struct {
             if (main >= first and main <= last and f.mine(candidate)) named += 1;
         }
         if (named != 1) return null;
-        const decl = (try f.c.facts.definition(f.c.file, call.ast.fn_expr)) orelse return null;
-        const function = (try f.c.facts.origin(decl)) orelse return null;
+        const decl = ((try f.c.facts.definition(f.c.file, call.ast.fn_expr)).orNull()) orelse return null;
+        const function = ((try f.c.facts.origin(decl)).orNull()) orelse return null;
         if (!try Program.owns(f.c, function.file)) return null;
         const model = &f.c.project.at(function.file).model;
         const record = model.declarations[@backingInt(function.index)];
@@ -3410,8 +3410,8 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
         if (std.mem.eql(u8, name, "init") and try Contract.kind(c, file, data[0], 0) == .bytes_writer) return true;
     }
     if (depth == 8) return false;
-    const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return false;
-    const function = (try c.facts.origin(decl)) orelse return false;
+    const decl = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return false;
+    const function = ((try c.facts.origin(decl)).orNull()) orelse return false;
     if (try c.inLibrary(Contract.library, function.file)) return false;
     const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
     if (record.kind != .function) return false;
@@ -3696,7 +3696,7 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 fn rawCall(c: *Context, callee: Ast.Node.Index, params: []const Ast.Node.Index, token: Ast.TokenIndex) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     const method = tree.nodeTag(callee) == .field_access and params.len == 0;
-    const named = if (try c.facts.definition(c.file, callee)) |decl| if (try c.facts.origin(decl)) |target| std.mem.eql(u8, c.project.at(target.file).model.declarations[@backingInt(target.index)].name, "raw") else false else false;
+    const named = if ((try c.facts.definition(c.file, callee)).orNull()) |decl| if ((try c.facts.origin(decl)).orNull()) |target| std.mem.eql(u8, c.project.at(target.file).model.declarations[@backingInt(target.index)].name, "raw") else false else false;
     // Unresolved: the call's own spelling.
     const spelled = tree.nodeTag(callee) == .field_access and std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(callee).node_and_token[1])), "raw");
     if (!named and !spelled) return false;
@@ -3730,11 +3730,11 @@ fn rawBytes(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
 /// Whether a call reaches std's declaration at `path` (`mem.asBytes`), by what it names.
 fn stdCall(c: *Context, call: Ast.full.Call, path: []const u8) Context.Error!bool {
     const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-        .function => |decl| (try c.facts.origin(decl)) orelse decl,
+        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
         else => return false,
     };
-    for ((try Governed.declarations(c, "std", path)) orelse &.{}) |found| {
-        if (std.meta.eql((try c.facts.origin(found)) orelse found, callee)) return true;
+    for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |found| {
+        if (std.meta.eql(((try c.facts.origin(found)).orNull()) orelse found, callee)) return true;
     }
     return false;
 }
@@ -4196,8 +4196,8 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
     }
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
-    const callee = (try c.facts.definition(c.file, call.ast.fn_expr)) orelse return false;
-    const function = (try c.facts.origin(callee)) orelse return false;
+    const callee = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse return false;
+    const function = ((try c.facts.origin(callee)).orNull()) orelse return false;
     // std's allocator by its declarations: a byte allocation, a copy of bytes or printed text.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
@@ -4349,8 +4349,8 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, parent) orelse return .{ .unknown = parent };
     if (call.ast.fn_expr == view) return .{ .unknown = parent };
-    const callee = (try c.facts.definition(file, call.ast.fn_expr)) orelse return .{ .unknown = parent };
-    const function = (try c.facts.origin(callee)) orelse return .{ .unknown = parent };
+    const callee = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return .{ .unknown = parent };
+    const function = ((try c.facts.origin(callee)).orNull()) orelse return .{ .unknown = parent };
     // Given back to its allocator, or to another owner.
     const frees = [_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy", "mem.Allocator.realloc", "mem.Allocator.resize", "mem.Allocator.remap" };
     for (frees) |path| if (try allocates(c, function, path)) return .{ .spoiled = .{ .at = parent, .what = "freed or resized" } };
@@ -4379,8 +4379,8 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
 
 /// Whether `function` is std's declaration at `path`.
 fn allocates(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!bool {
-    for ((try Governed.declarations(c, "std", path)) orelse &.{}) |each| {
-        if (std.meta.eql((try c.facts.origin(each)) orelse each, function)) return true;
+    for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |each| {
+        if (std.meta.eql(((try c.facts.origin(each)).orNull()) orelse each, function)) return true;
     }
     return false;
 }

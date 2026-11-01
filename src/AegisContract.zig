@@ -207,7 +207,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             // A member reached through a module import or another file's alias names its own
             // declaration: its type expression is read where it is written, which a value
             // resolved through a type function's call cannot always be.
-            const decl = (try c.facts.definition(file, node)) orelse return null;
+            const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             const written = &c.project.at(decl.file).file.tree;
             if (record.kind == .field) {
@@ -231,8 +231,8 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
                 if (acquisition(name) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             }
-            const decl = (try c.facts.definition(file, call.ast.fn_expr)) orelse return null;
-            const origin = (try c.facts.origin(decl)) orelse return null;
+            const decl = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return null;
+            const origin = ((try c.facts.origin(decl)).orNull()) orelse return null;
             if (try c.role(library, .{ .function = origin })) |k| return k;
             // A function of the program's own is what its declared result says, whether it is
             // an ordinary function or a method of a type a type function returns.

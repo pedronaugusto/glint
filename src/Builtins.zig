@@ -153,7 +153,7 @@ fn unusedImports(self: *Context) RunError!void {
         const pair = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
         if (!candidates.contains(name)) continue;
-        if (try self.facts.definition(self.file, node)) |definition| {
+        if ((try self.facts.definition(self.file, node)).orNull()) |definition| {
             if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
         } else {
             const receiver = try self.facts.resolve(self.file, pair[0]);
@@ -184,7 +184,7 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
             else => return,
         };
         if (!candidates.contains(name.?)) return;
-        if (try self.facts.reflected(self.file, node)) |definition| {
+        if ((try self.facts.reflected(self.file, node)).orNull()) |definition| {
             if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
             return;
         }
@@ -224,7 +224,7 @@ fn priorityRules(self: *Context) RunError!void {
         const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n));
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (try self.facts.definition(self.file, call.ast.fn_expr)) |definition| {
+        if ((try self.facts.definition(self.file, call.ast.fn_expr)).orNull()) |definition| {
             var deprecated_definition: ?Facts.Decl = if (deprecated(self, definition)) definition else null;
             if (deprecated_definition == null) {
                 const value = try self.facts.resolve(self.file, call.ast.fn_expr);
@@ -286,7 +286,7 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
     if (tree.fullPtrType(node)) |pointer| return privateType(self, pointer.ast.child_type, site, depth + 1);
     switch (tree.nodeTag(node)) {
         .identifier, .field_access => {
-            const definition = (try self.facts.definition(self.file, node)) orelse {
+            const definition = ((try self.facts.definition(self.file, node)).orNull()) orelse {
                 const value = try self.facts.resolve(self.file, node);
                 if (value == .unknown) try unknown(self, .Z012, node, value.unknown);
                 return;
@@ -298,7 +298,7 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
             // A primitive alias can be named as the primitive; error-set policy is not Z012.
             if (value != .container) return;
             if (value.container.scope == decl.scope) return; // An enclosing @This receiver is nameable through its public owner.
-            if (try self.facts.origin(definition)) |origin| {
+            if ((try self.facts.origin(definition)).orNull()) |origin| {
                 const original = self.project.at(origin.file).model.declarations[@backingInt(origin.index)]; // safe: resolved alias provenance.
                 if (original.public or original.exported) return;
             }

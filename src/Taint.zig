@@ -377,29 +377,29 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
     const paths = [_][]const u8{ "Io.Reader", "Io.File", "Io.Dir", "Io.net.Stream" };
     var found: [paths.len]?Facts.Container = @splat(null);
     for (paths, &found) |path, *slot| {
-        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| {
-            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| {
+            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
             if (value == .container) slot.* = value.container;
         }
     }
     flow.reader, flow.file, flow.dir, flow.stream = found;
     for (c.config.peer_writers) |declared| {
-        const found_writers = (try Governed.declarations(c, declared.module, declared.declaration)) orelse (try Governed.declarationsOfPackage(c, declared.module, declared.declaration)) orelse &.{};
-        for (found_writers) |decl| try flow.peer_writers.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+        const found_writers = ((try Governed.declarations(c, declared.module, declared.declaration)).orNull()) orelse ((try Governed.declarationsOfPackage(c, declared.module, declared.declaration)).orNull()) orelse &.{};
+        for (found_writers) |decl| try flow.peer_writers.append(c.allocator, ((try c.facts.origin(decl)).orNull()) orelse decl);
     }
-    for ((try Governed.declarations(c, "std", "process.run")) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
-    for (zig_text) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| try flow.zig_text.put(c.allocator, decl, {});
-    for ((try Governed.declarations(c, "std", "zig.Ast.parse")) orelse &.{}) |decl| {
+    for (((try Governed.declarations(c, "std", "process.run")).orNull()) orelse &.{}) |decl| try flow.reads.append(c.allocator, ((try c.facts.origin(decl)).orNull()) orelse decl);
+    for (zig_text) |path| for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| try flow.zig_text.put(c.allocator, decl, {});
+    for (((try Governed.declarations(c, "std", "zig.Ast.parse")).orNull()) orelse &.{}) |decl| {
         try flow.zig_parse.put(c.allocator, decl, {});
         flow.zig_ast = decl.file;
     }
-    for (zig_index) |path| for ((try Governed.declarations(c, "std", path)) orelse &.{}) |decl| try flow.zig_index.put(c.allocator, decl, {});
+    for (zig_index) |path| for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| try flow.zig_index.put(c.allocator, decl, {});
     for ([_][]const u8{ "own.readFile", "own.readFileSentinel" }) |path| {
-        for ((try Governed.declarations(c, "aegis", path)) orelse &.{}) |decl| try flow.reads.append(c.allocator, (try c.facts.origin(decl)) orelse decl);
+        for (((try Governed.declarations(c, "aegis", path)).orNull()) orelse &.{}) |decl| try flow.reads.append(c.allocator, ((try c.facts.origin(decl)).orNull()) orelse decl);
     }
     for ([_][]const u8{ "mem", "fmt", "ascii", "unicode", "math", "base64" }) |namespace| {
-        for ((try Governed.declarations(c, "std", namespace)) orelse &.{}) |decl| {
-            const value = try c.facts.declaration((try c.facts.origin(decl)) orelse decl);
+        for (((try Governed.declarations(c, "std", namespace)).orNull()) orelse &.{}) |decl| {
+            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
             if (value != .container) continue;
             // The namespace's own file and the files it reaches by its relative imports.
             try flow.data_files.put(c.allocator, @backingInt(value.container.file), {});
@@ -741,7 +741,7 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             // The program's own field holds the fact by its declaration; a field of a type
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
             // the store reaches only the value it belongs to.
-            if (try c.facts.definition(f.file, target)) |decl| {
+            if ((try c.facts.definition(f.file, target)).orNull()) |decl| {
                 if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and flow.own(decl.file)) return addPlace(c, out, .{ .global = decl });
             }
             return places(c, flow, function, tree.nodeData(target).node_and_token[0], out);
@@ -990,7 +990,7 @@ fn parsed(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, d
 
 /// The program's function an `Untrusted.parse(context, parser)` call hands its value to.
 fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Call, decl: Facts.Decl) Context.Error!?Function.Id {
-    const origin = (try c.facts.origin(decl)) orelse decl;
+    const origin = ((try c.facts.origin(decl)).orNull()) orelse decl;
     const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
     if (!std.mem.eql(u8, record.name, "parse") or call.ast.params.len == 0) return null;
     const container: Facts.Value = .{ .container = .{ .file = origin.file, .scope = record.scope } };
@@ -1130,7 +1130,7 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, call: Ast.full.Ca
     out.decl = decl;
     if (flow.program.aegis_files.contains(@backingInt(decl.file))) {
         // aegis's whole-file reads give a file's bytes, as std's do.
-        const origin = (try c.facts.origin(decl)) orelse decl;
+        const origin = ((try c.facts.origin(decl)).orNull()) orelse decl;
         for (flow.reads.items) |read| if (std.meta.eql(read, origin)) {
             out.kind = .source;
             return out;
@@ -1240,7 +1240,7 @@ pub fn fixedBytes(c: *Context, flow: *const Flow, file: Project.FileId, receiver
             else => false,
         },
         else => switch (try c.facts.resolve(file, made.ast.fn_expr)) {
-            .function => |decl| std.meta.eql((try c.facts.origin(decl)) orelse decl, fixed),
+            .function => |decl| std.meta.eql(((try c.facts.origin(decl)).orNull()) orelse decl, fixed),
             else => false,
         },
     };
@@ -1406,7 +1406,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         return try (try memory.held().narrowed(c.allocator)).join(c.allocator, memory.measured());
     }
     var out = try dep(c, flow, function, receiver);
-    if (try c.facts.definition(f.file, node)) |decl| {
+    if ((try c.facts.definition(f.file, node)).orNull()) |decl| {
         if (decl.file == flow.zig_ast) if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) {
             const field = c.project.at(decl.file).file.tree.fullContainerField(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
             return treeDep(c, flow, decl.file, field.ast.type_expr.unwrap());
@@ -1952,7 +1952,7 @@ fn treeValue(c: *Context, flow: *const Flow, file: Project.FileId, type_node: As
         .error_union => return treeValue(c, flow, file, tree.nodeData(type_node).node_and_node[1]),
         .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return treeValue(c, flow, file, tree.fullPtrType(type_node).?.ast.child_type),
         .identifier, .field_access => {
-            const decl = (try c.facts.definition(file, type_node)) orelse return .data;
+            const decl = ((try c.facts.definition(file, type_node)).orNull()) orelse return .data;
             if (flow.zig_index.contains(decl)) return .index;
             if (decl.file != flow.zig_ast) return .data;
             const model = &c.project.at(decl.file).model;
@@ -2066,7 +2066,7 @@ const Walk = struct {
             return w.local(function, d, depth);
         }
         // A field holds what the program stores in it anywhere, by its declaration.
-        if (tree.nodeTag(node) == .field_access) if (try w.c.facts.definition(f.file, node)) |decl| {
+        if (tree.nodeTag(node) == .field_access) if ((try w.c.facts.definition(f.file, node)).orNull()) |decl| {
             if ((w.flow.globals.get(decl) orelse .clean) != .clean) if (try w.stored(decl, depth)) |found| return found;
         };
         // Memory's length holds what was written to it (`s.len = n`), where its contents carry
@@ -2310,7 +2310,7 @@ fn storedDecl(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
     var at = node;
     while (true) switch (tree.nodeTag(at)) {
         .field_access => {
-            const decl = (try c.facts.definition(file, at)) orelse return null;
+            const decl = ((try c.facts.definition(file, at)).orNull()) orelse return null;
             const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
             return if (kind == .field or kind == .variable) decl else null;
         },

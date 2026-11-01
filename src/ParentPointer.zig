@@ -415,7 +415,7 @@ fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenI
         switch (tag) {
             .identifier => if ((model.reference(node) orelse continue).declaration != decl) continue,
             .field_access => {
-                const found = (try c.facts.definition(c.file, node)) orelse continue;
+                const found = ((try c.facts.definition(c.file, node)).orNull()) orelse continue;
                 if (found.file != c.file or found.index != decl) continue;
                 // Called on a value, it is handed that value first: no helper's call.
                 if (try c.facts.resolve(c.file, tree.nodeData(node).node_and_token[0]) != .container) return false;
@@ -455,7 +455,7 @@ fn namedOnlyInstalling(c: *Context, decl: Model.Declaration.Id, field: Field, th
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const refers = switch (tag) {
             .identifier => if (model.reference(node)) |ref| ref.declaration == decl else false,
-            .field_access => if (try c.facts.definition(c.file, node)) |found| found.file == c.file and found.index == decl else false,
+            .field_access => if ((try c.facts.definition(c.file, node)).orNull()) |found| found.file == c.file and found.index == decl else false,
             else => false,
         };
         if (!refers) continue;
@@ -725,7 +725,7 @@ const Follow = struct {
             var callee = call.ast.fn_expr;
             if (tree.nodeTag(callee) == .unwrap_optional) callee = tree.nodeData(callee).node_and_token[0];
             if (capturedRead(tree, model, callee)) |read| callee = read;
-            if (tree.nodeTag(callee) == .field_access) if (try c.facts.definition(file, callee)) |slot| {
+            if (tree.nodeTag(callee) == .field_access) if ((try c.facts.definition(file, callee)).orNull()) |slot| {
                 const record = c.project.at(slot.file).model.declarations[@backingInt(slot.index)];
                 if (record.kind == .field) {
                     const slot_tree = &c.project.at(slot.file).file.tree;
@@ -744,7 +744,7 @@ const Follow = struct {
                 .function => |function| function,
                 else => return false,
             };
-            return f.handed((try c.facts.origin(decl)) orelse decl, index);
+            return f.handed(((try c.facts.origin(decl)).orNull()) orelse decl, index);
         }
         if (tree.fullVarDecl(parent)) |variable| {
             if (variable.ast.init_node.unwrap() != node) return false;
@@ -797,14 +797,14 @@ const Follow = struct {
         const c = f.c;
         const tree = &c.project.at(file).file.tree;
         const model = &c.project.at(file).model;
-        const decl = (try c.facts.definition(file, access)) orelse return false;
+        const decl = ((try c.facts.definition(file, access)).orNull()) orelse return false;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind == .field) return true;
         if (record.kind != .function) return false;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, model.parentOf(access) orelse return false) orelse return false;
         if (call.ast.fn_expr != access) return false;
-        return f.handed((try c.facts.origin(decl)) orelse decl, 0);
+        return f.handed(((try c.facts.origin(decl)).orNull()) orelse decl, 0);
     }
 
     /// Whether the function `decl` given the pointer as its parameter `index` keeps it one:
@@ -856,7 +856,7 @@ const Follow = struct {
         const c = f.c;
         const tree = &c.project.at(file).file.tree;
         if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return true;
-        const decl = (try c.facts.definition(file, target)) orelse return false;
+        const decl = ((try c.facts.definition(file, target)).orNull()) orelse return false;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         return switch (record.kind) {
             .variable => {
@@ -880,7 +880,7 @@ const Follow = struct {
         // A field others outside the program can read may carry it anywhere.
         if (record.public) return false;
         for (try c.facts.memberUses(record.name)) |use| {
-            const found = (try c.facts.definition(use.file, use.node)) orelse {
+            const found = ((try c.facts.definition(use.file, use.node)).orNull()) orelse {
                 const tree = &c.project.at(use.file).file.tree;
                 const receiver = tree.nodeData(use.node).node_and_token[0];
                 if (try namesType(c, use.file, receiver)) continue;
@@ -913,7 +913,7 @@ const Follow = struct {
             const each: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const refers = switch (tag) {
                 .identifier => if (model.reference(each)) |ref| ref.declaration == index else false,
-                .field_access => if (try c.facts.definition(file, each)) |found| found.file == file and found.index == index else false,
+                .field_access => if ((try c.facts.definition(file, each)).orNull()) |found| found.file == file and found.index == index else false,
                 else => false,
             };
             if (!refers) continue;
@@ -1036,7 +1036,7 @@ const Carry = struct {
             .function => |function| function,
             else => return .undecided,
         };
-        const decl = (try c.facts.origin(found)) orelse found;
+        const decl = ((try c.facts.origin(found)).orNull()) orelse found;
         // std's `Io.async` and `Io.concurrent`, a `Group`'s and a `Select`'s, call `function`
         // with `args`, the tuple they copy whole: a carrier in a tuple written there is handed
         // to `function` where it stands in it.
@@ -1057,7 +1057,7 @@ const Carry = struct {
             .function => |each| each,
             else => return .undecided,
         };
-        const decl = (try c.facts.origin(found)) orelse found;
+        const decl = ((try c.facts.origin(found)).orNull()) orelse found;
         var verdict: Verdict = .shown;
         for (args, 0..) |argument, at| {
             const shape = (try k.carries(file, argument, 0)) orelse continue;
@@ -1289,7 +1289,7 @@ const Carry = struct {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, k.c.project.at(file).model.parentOf(parent) orelse return .open) orelse return .open;
                 if (call.ast.fn_expr != parent) return .open;
-                return if (try k.follow.handed((try c.facts.origin(decl)) orelse decl, 0)) .shown else .open;
+                return if (try k.follow.handed(((try c.facts.origin(decl)).orNull()) orelse decl, 0)) .shown else .open;
             },
             .assign => return if (tree.nodeData(parent).node_and_node[0] == access) .shown else .open,
             else => return .open,
@@ -1301,7 +1301,7 @@ const Carry = struct {
 fn allocatorMethod(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (!try c.facts.standard(decl.file)) return false;
     const scope = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope;
-    for ((try Governed.declarations(c, "std", "mem.Allocator")) orelse &.{}) |found| {
+    for (((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse &.{}) |found| {
         const allocator = held(try c.facts.declaration(found)) orelse continue;
         if (allocator.file == decl.file and allocator.scope == scope) return true;
     }
@@ -1313,7 +1313,7 @@ fn allocatorMethod(c: *Context, decl: Facts.Decl) Context.Error!bool {
 /// with: `function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))`, in std's Io.
 fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!bool {
     if (index == 0 or !try c.facts.standard(decl.file)) return false;
-    const io = for ((try Governed.declarations(c, "std", "Io")) orelse &.{}) |found| {
+    const io = for (((try Governed.declarations(c, "std", "Io")).orNull()) orelse &.{}) |found| {
         if (held(try c.facts.declaration(found))) |container| break container;
     } else return false;
     if (io.file != decl.file) return false;
@@ -1403,7 +1403,7 @@ pub fn contract(c: *Context, rule: Rule) Context.Error!void {
 /// field of a struct its functions recover, so a copy of it breaks nothing. The copy that put
 /// an installed interface there was flagged where it was made.
 fn ownStorage(c: *Context, node: Ast.Node.Index) Context.Error!bool {
-    const decl = (try c.facts.definition(c.file, node)) orelse return false;
+    const decl = ((try c.facts.definition(c.file, node)).orNull()) orelse return false;
     return switch (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind) {
         .variable, .parameter, .capture => true,
         .function, .field => false,
@@ -1419,7 +1419,7 @@ fn interfaces(c: *Context) Context.Error![]const Facts.Container {
     if (known.kinds) |kinds| return kinds;
     var kinds: std.ArrayList(Facts.Container) = .empty;
     for ([_][]const u8{ "Io.Writer", "Io.Reader" }) |path| {
-        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |found| {
+        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |found| {
             if (held(try c.facts.declaration(found))) |kind| if (interfaceOf(kinds.items, kind) == null) try kinds.append(c.allocator, kind);
         }
     }
@@ -1588,12 +1588,12 @@ fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Cont
     var index: usize = 0;
     if (tree.nodeTag(parent) == .field_access) {
         if (tree.nodeData(parent).node_and_token[0] != node) return true;
-        const found = (try c.facts.definition(c.file, parent)) orelse return true;
+        const found = ((try c.facts.definition(c.file, parent)).orNull()) orelse return true;
         if (c.project.at(found.file).model.declarations[@backingInt(found.index)].kind != .function) return true;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, model.parentOf(parent) orelse return true) orelse return true;
         if (call.ast.fn_expr != parent) return true;
-        decl = (try c.facts.origin(found)) orelse found;
+        decl = ((try c.facts.origin(found)).orNull()) orelse found;
     } else {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, parent) orelse return true;
@@ -1603,7 +1603,7 @@ fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Cont
         // and the read is judged where it is, by `readInPlace`, whatever the field may hold.
         const callee = strip(tree, call.ast.fn_expr);
         const read = if (tree.nodeTag(callee) == .unwrap_optional) strip(tree, tree.nodeData(callee).node_and_token[0]) else callee;
-        if (tree.nodeTag(read) == .field_access) if (try c.facts.definition(c.file, read)) |member| {
+        if (tree.nodeTag(read) == .field_access) if ((try c.facts.definition(c.file, read)).orNull()) |member| {
             if (c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field) return true;
         };
         if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
@@ -1611,7 +1611,7 @@ fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Cont
             else => {},
         };
         decl = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |function| (try c.facts.origin(function)) orelse function,
+            .function => |function| ((try c.facts.origin(function)).orNull()) orelse function,
             else => return true,
         };
     }
@@ -1659,7 +1659,7 @@ fn listNode(c: *Context, pointer: Ast.Node.Index, field: Field, kind: Facts.Cont
 fn stdList(c: *Context, container: Facts.Container, member: []const u8) Context.Error!?List {
     for ([_]struct { List, []const u8 }{ .{ .doubly, "DoublyLinkedList" }, .{ .singly, "SinglyLinkedList" } }) |each| {
         const path = if (member.len == 0) each[1] else try c.allocator.print("{s}.{s}", .{ each[1], member });
-        for ((try Governed.declarations(c, "std", path)) orelse &.{}) |found| {
+        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |found| {
             if (held(try c.facts.declaration(found))) |known| if (same(known, container)) return each[0];
         }
     }
@@ -1771,7 +1771,7 @@ fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: Lis
         else => return null,
     };
     if (try stdList(c, container, "") != list) return null;
-    const decl = (try c.facts.definition(file, receiver)) orelse return null;
+    const decl = ((try c.facts.definition(file, receiver)).orNull()) orelse return null;
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     if (record.kind != .field and record.kind != .variable) return null;
     return .{ .list = decl };
@@ -1963,7 +1963,7 @@ fn receiverKind(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, lis
 /// Whether the list expression `receiver` may be `source`'s list: it is, or it names no other
 /// field or variable.
 fn mayBe(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, source: Source) Context.Error!bool {
-    const decl = (try c.facts.definition(file, receiver)) orelse return true;
+    const decl = ((try c.facts.definition(file, receiver)).orNull()) orelse return true;
     const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     if (record.kind != .field and record.kind != .variable) return true;
     // A local holding a list's address names that list, which this does not follow.
@@ -2131,7 +2131,7 @@ fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
     for (0..8) |_| {
         const tree = &c.project.at(at_file).file.tree;
         const decl = switch (tree.nodeTag(at)) {
-            .identifier, .field_access => (try c.facts.definition(at_file, at)) orelse return false,
+            .identifier, .field_access => ((try c.facts.definition(at_file, at)).orNull()) orelse return false,
             else => return false,
         };
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
@@ -2158,7 +2158,7 @@ fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
 
 /// Whether `callee` names a function declared to return `type`.
 fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Context.Error!bool {
-    const found = (try c.facts.definition(file, callee)) orelse return false;
+    const found = ((try c.facts.definition(file, callee)).orNull()) orelse return false;
     const function = c.project.at(found.file).model.declarations[@backingInt(found.index)];
     if (function.kind != .function) return false;
     const tree = &c.project.at(found.file).file.tree;
