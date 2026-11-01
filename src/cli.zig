@@ -250,13 +250,13 @@ pub const Arguments = struct {
         .name = "glint",
         .version = release.version,
         .about = "A linter for Zig on Zig's own parser and semantic form",
-        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed, --aegis or --config; --report, --gate and --disable then set a rule's level. The aegis pack is on wherever a file's import of aegis resolves to it. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
+        .description = "Explicit files only: no path patterns, no build.zig execution. The rules start from Z003 and Z013, or from --only, --reviewed, --aegis or --config (--only beside --config runs only its rules under the configuration's policy); --report, --gate and --disable then set a rule's level. The aegis pack is on wherever a file's import of aegis resolves to it. A caller that wants the run's record names it first: --result FILE --run-id ID. Suppress one site with // glint-ignore: Z013 -- written reason. Exit: 0 complete and clean; 1 findings; 2 input, tool or incomplete analysis.",
         .options = .{
             .files = .{ .positional = true, .value_name = "FILE", .hint = .file, .help = "A file to check" },
             .only = .{ .value_name = "ID", .section = "Rules", .help = "Check only this rule, repeated, at report level" },
             .reviewed = .{ .negatable = false, .section = "Rules", .help = "Every retained rule, at report level" },
             .aegis = .{ .negatable = false, .section = "Rules", .help = "Every retained rule and the aegis pack, at report level, whatever the files import" },
-            .config = .{ .value_name = "FILE", .hint = .file, .section = "Rules", .help = "A JSON policy: its profile, rule levels and code options" },
+            .config = .{ .value_name = "FILE", .hint = .file, .section = "Rules", .help = "A JSON policy: its profile, rule levels and code options; beside --only, its options alone" },
             .report = .{ .value_name = "ID", .section = "Rules", .help = "Report this rule, repeated" },
             .gate = .{ .value_name = "ID", .section = "Rules", .help = "Gate on this rule, repeated: a finding fails the run" },
             .disable = .{ .value_name = "ID", .section = "Rules", .help = "Leave this rule out, repeated" },
@@ -276,7 +276,7 @@ pub const Arguments = struct {
             .input_directory = .{ .value_name = "DIR", .hint = .directory, .hidden = true, .help = "A directory the caller's build reads; never a selection of files" },
         },
         // A run of some rules sees only what they cover: it never names an older escape.
-        .conflicts = &.{ &.{ .only, .reviewed, .aegis, .config }, &.{ .only, .escapes_before } },
+        .conflicts = &.{ &.{ .only, .reviewed, .aegis }, &.{ .only, .escapes_before } },
     };
 };
 
@@ -295,9 +295,13 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
         result.config = Rule.Config.reviewed();
         try packOn(a, &result.config, definitions);
         result.aegis = .forced;
-    } else if (arguments.only.len != 0) {
+    }
+    // --only names the rules that run; a configuration beside it lends only its options (the
+    // declarations a project disallows, its peer writers, its limits), never its rules.
+    if (arguments.only.len != 0) {
         result.aegis = .selected;
-        result.config = Rule.Config.none();
+        result.config.enabled = Rule.Config.none().enabled;
+        result.config.selections = &.{};
         for (arguments.only) |id| try select(a, &result.config, Rule.parseConfigured(id, definitions) orelse return error.UnknownRule, .report);
     }
     const levels = [_]struct { []const []const u8, Rule.Config.Level }{ .{ arguments.report, .report }, .{ arguments.gate, .gate }, .{ arguments.disable, .off } };

@@ -263,6 +263,33 @@ test "a package directory names its files' package, the innermost one winning" {
     try std.testing.expectError(error.InvalidPackage, cli.execute(a, std.testing.io, &.{ "glint", "--package", "=dir", joined[3] }, &output.writer, &quiet.writer));
 }
 
+test "--only beside --config runs only its rules, under the configuration's options and never its rules" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const unused = @import(\"std\");\nextern \"c\" fn fsync(fd: c_int) c_int;\npub fn f() void {\n    _ = fsync(0);\n}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"profile": "reviewed", "rules": [{"id": "Z013", "level": "gate"}],
+        \\ "disallowed": [{"declaration": "fsync", "reason": "durability belongs to airlock", "replacement": "airlock.syncFile", "owners": ["airlock"]}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const file = try std.Io.Dir.path.join(a, &.{ root, "a.zig" });
+    defer a.free(file);
+    const config = try std.Io.Dir.path.join(a, &.{ root, "config.json" });
+    defer a.free(config);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const status = try cli.execute(a, std.testing.io, &.{ "glint", "--only", "P006", "--config", config, file }, &output.writer, &quiet.writer);
+    try std.testing.expectEqual(@as(u8, 1), status); // safe: findings exit.
+    try std.testing.expect(std.mem.find(u8, output.written(), "P006: ") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "Z013") == null);
+    // Without the configuration P006 has no declaration to keep out.
+    output.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli.execute(a, std.testing.io, &.{ "glint", "--only", "P006", file }, &output.writer, &quiet.writer));
+    try std.testing.expect(std.mem.find(u8, output.written(), "P006: ") == null);
+}
+
 /// The run's output on `file` under `tmp`, with `options` before it; its status in `status`.
 fn runOn(a: std.mem.Allocator, tmp: *std.testing.TmpDir, options: []const []const u8, file: []const u8, status: *u8) ![]u8 {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);

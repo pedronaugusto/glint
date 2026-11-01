@@ -1,0 +1,10 @@
+{
+ "disallowed": [
+  {
+   "source": "std",
+   "declaration": "debug.print",
+   "reason": "a program reports through its log",
+   "replacement": "std.log"
+  }
+ ]
+}

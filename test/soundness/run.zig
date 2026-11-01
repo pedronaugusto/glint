@@ -1,7 +1,9 @@
 //! glint's soundness suite: each case in `<rule>/<row>/<case>/` run under its rule, std and
 //! aegis real, every case its own program over one store that reads each file once. A
 //! `hole.zig` must flag or be left undecided; a `twin.zig` must be clean. The row is a
-//! `Constructs.Row`: how the case moves the value its rule judges.
+//! `Constructs.Row`: how the case moves the value its rule judges. A case's `glint.json` is the
+//! policy its rule reads (P006's disallowed declarations, A018's peer writers): its options
+//! alone, since the case's rule is the one that runs.
 //!
 //! `expected.zon` names the rules (the matrix's columns), the cases glint does not pass yet
 //! (`open`), and per rule the rows with no hole or no twin yet (`no_hole`, `no_twin`) and the
@@ -68,6 +70,11 @@ pub fn main(init: std.process.Init) !void {
             const row_path = try std.Io.Dir.path.join(a, &.{ rule, row_name });
             for (try sortedEntries(a, io, suite, row_path, .directory)) |case| {
                 const case_path = try std.Io.Dir.path.join(a, &.{ row_path, case });
+                const policy_path = try std.Io.Dir.path.join(a, &.{ case_path, "glint.json" });
+                const policy: ?[]const u8 = if (suite.access(io, policy_path, .{})) try std.Io.Dir.path.join(a, &.{ suite_path, policy_path }) else |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
                 var any = false;
                 for ([_]Role{ .hole, .twin }) |role| {
                     const path = try std.fmt.allocPrint(a, "{s}/{t}.zig", .{ case_path, role });
@@ -82,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
                         .twin => cell.value_ptr.getPtr(row).twins += 1,
                     }
                     const absolute = try std.Io.Dir.path.join(a, &.{ suite_path, path });
-                    const verdict = try judge(init.gpa, io, &store, rule, lib, aegis, absolute);
+                    const verdict = try judge(init.gpa, io, &store, rule, lib, aegis, policy, absolute);
                     const passes = switch (role) {
                         .hole => verdict != .clean,
                         .twin => verdict == .clean,
@@ -137,15 +144,19 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// What glint says of the file at `path` under `rule` alone.
-fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, path: []const u8) !Verdict {
+/// What glint says of the file at `path` under `rule` alone, with the case's policy if it has one.
+fn judge(gpa: std.mem.Allocator, io: std.Io, store: *glint.Project.Store, rule: []const u8, lib: []const u8, aegis: []const u8, policy: ?[]const u8, path: []const u8) !Verdict {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const module = try std.fmt.allocPrint(a, "aegis={s}", .{aegis});
     var output: std.Io.Writer.Allocating = .init(a);
     var problems: std.Io.Writer.Allocating = .init(a);
-    _ = try glint.cli.executeStored(gpa, io, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module, path }, &output.writer, &problems.writer, store);
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(a, &.{ "glint", "--only", rule, "--zig-lib-path", lib, "--module", module });
+    if (policy) |config| try args.appendSlice(a, &.{ "--config", config });
+    try args.append(a, path);
+    _ = try glint.cli.executeStored(gpa, io, args.items, &output.writer, &problems.writer, store);
     var verdict: Verdict = .clean;
     var lines = std.mem.splitScalar(u8, output.written(), '\n');
     while (lines.next()) |line| {

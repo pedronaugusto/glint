@@ -110,7 +110,9 @@
                 .memory,
             },
         },
-        .{ .rule = "P006", .no_hole = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch }, .no_twin = .{ .assignment, .destructure, .capture, .field, .address, .call, .deferred, .jump, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .memory, .branch } },
+        // A declaration is reached by a name, and memory holds none: a pointer copied through bytes
+        // was made by a reference that is P006's site.
+        .{ .rule = "P006", .na = .{.memory} },
     },
     // Cases glint does not pass yet, each with what it shows.
     .open = .{
