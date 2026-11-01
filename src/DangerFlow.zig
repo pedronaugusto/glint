@@ -326,10 +326,16 @@ fn errorName(tree: *const Ast, node: Ast.Node.Index) bool {
 /// and whose body gives that `Io` to nothing: no `checkCancel`, no cancelable call, no read
 /// through a reader (whose refill is one), so the task cannot be canceled while it runs.
 pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
-    const io = ((try Governed.declarations(c, "std", "Io")).orNull()) orelse return;
+    // Where std's Io is not known, no loop's cancellation can be judged.
+    const io = switch (try Governed.declarations(c, "std", "Io")) {
+        .decls => |decls| decls,
+        .none => return,
+        .unknown => return c.undecided(rule, 0, .unresolved, "std's Io does not resolve: no loop's cancellation point is judged"),
+    };
     var container: ?Facts.Container = null;
     for (io) |decl| {
-        const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
+        const origin = (try originKnown(c, decl)) orelse return c.undecided(rule, 0, .unresolved, "std's Io does not resolve: no loop's cancellation point is judged");
+        const value = try c.facts.declaration(origin);
         if (value == .container) container = value.container;
     }
     const io_type = container orelse return;
@@ -406,6 +412,15 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         }
     }
     try Streams.lost(c, rule);
+}
+
+/// `decl`'s origin, itself where it is its own; null where which it is is not known.
+fn originKnown(c: *Context, decl: Facts.Decl) Context.Error!?Facts.Decl {
+    return switch (try c.facts.origin(decl)) {
+        .decl => |found| found,
+        .none => decl,
+        .unknown => null,
+    };
 }
 
 /// What gives each judged function its `Io`, into `given` (by function) and `holders`.
@@ -790,8 +805,9 @@ fn passedOn(c: *Context, file: Project.FileId, call: Ast.Node.Index) Context.Err
 /// handler whose path for it returns it (`handled`).
 fn passesParameter(c: *Context, file: Project.FileId, call: Ast.full.Call, position: usize) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
+    // One that does not resolve passes nothing on that is followed: no point.
     const callee = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
-        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
+        .function => |decl| (try originKnown(c, decl)) orelse return false,
         else => return false,
     };
     if (!try Program.owns(c, callee.file)) return false;
@@ -1622,7 +1638,7 @@ fn predicate(c: *Context, call: Ast.full.Call, bound: ?*const Predicate, into: *
     const model = &c.project.at(c.file).model;
     if (depth >= 8) return unfollowed(into);
     const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
+        .function => |decl| (try originKnown(c, decl)) orelse return unfollowed(into),
         else => return unfollowed(into),
     };
     if (callee.file != c.file) return unfollowed(into);
@@ -2057,7 +2073,12 @@ fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return true;
-    const allocators = ((try Governed.declarations(c, "std", "mem.Allocator")).orNull()) orelse &.{};
+    // Where std's Allocator is not known, any parameter may be one.
+    const allocators = switch (try Governed.declarations(c, "std", "mem.Allocator")) {
+        .decls => |decls| decls,
+        .none => &.{},
+        .unknown => return true,
+    };
     var it = proto.iterate(tree);
     while (it.next()) |param| {
         const declared = param.type_expr orelse return true;
@@ -2069,7 +2090,7 @@ fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
             else => continue,
         };
         for (allocators) |each| {
-            const allocator_type = try c.facts.declaration(((try c.facts.origin(each)).orNull()) orelse each);
+            const allocator_type = try c.facts.declaration((try originKnown(c, each)) orelse return true);
             if (allocator_type == .container and allocator_type.container.file == k.file and allocator_type.container.scope == k.scope) return true;
         }
     }
