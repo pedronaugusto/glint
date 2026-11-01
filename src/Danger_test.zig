@@ -234,6 +234,8 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 3, .spelling = "crypto/timing_safe.zig", .target = 4 },
     .{ .from = 3, .spelling = "crypto/ed25519.zig", .target = 5 },
     .{ .from = 1, .spelling = "Io/File.zig", .target = 7 },
+    // File.Reader's `interface`, the reader it reads through.
+    .{ .from = 7, .spelling = "Reader.zig", .target = 12 },
     .{ .from = 0, .spelling = "process.zig", .target = 8 },
     .{ .from = 0, .spelling = "array_list.zig", .target = 9 },
     .{ .from = 0, .spelling = "hash_map.zig", .target = 10 },
@@ -6036,6 +6038,7 @@ test "A010 reads a plain struct's field by every value the program stores in it,
 }
 
 test "A020 counts no read as a cancellation point whose error set holds no error.Canceled: a file reader's refill reports a cancel as ReadFailed" {
+    // Both loops, and the read in drain that drops reader.err: its cancel is lost.
     try expect(pack.cancellation,
         \\const std = @import("std");
         \\pub fn drain(io: std.Io, file: std.Io.File, buffer: []u8) void {
@@ -6048,7 +6051,7 @@ test "A020 counts no read as a cancellation point whose error set holds no error
         \\    var fixed: std.Io.Reader = .fixed(bytes);
         \\    while (true) _ = fixed.takeByte() catch return;
         \\}
-    , 2);
+    , 3);
 }
 
 test "A020 reads a call of a function or method chosen per target as a cancellation point where every choice is one" {

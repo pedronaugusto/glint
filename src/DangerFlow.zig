@@ -14,6 +14,7 @@ const Range = @import("Range.zig");
 const Proof = @import("Proof.zig");
 const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
+const Streams = @import("Streams.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -404,184 +405,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a loop {s} with no cancellation point: nothing it calls returns error.Canceled to it, so its task runs until the loop ends; call {s}.checkCancel() or a cancelable operation in it and pass the error on", .{ if (unbounded) "with no bound" else "bound by input", holder }));
         }
     }
-    try lostCancel(c, rule);
-}
-
-/// A020, the cancel a read loses: a std reader that keeps the cause of its `ReadFailed`
-/// (`Io.File.Reader`, `Io.net.Stream.Reader`, whose `err` holds `error.Canceled` when the task
-/// was canceled inside the read) read by a call on its `interface`, or by a call given
-/// `&r.interface`, where the read's `ReadFailed` is passed on (`try`) or handled by a `catch`
-/// or an `else |e|` that neither reads `r.err` nor hands `r` to a call. A reader the function
-/// makes (a local) is a finding: no caller can ask it what failed. One it is given (a
-/// parameter) is its caller's to ask, as std's convention has it. One held in a field or a
-/// global is undecided: who else can ask it is not followed here. An error union kept for later
-/// is undecided.
-fn lostCancel(c: *Context, rule: Rule) Context.Error!void {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    var readers: [2]?Facts.Container = .{ null, null };
-    for ([_][]const u8{ "Io.File.Reader", "Io.net.Stream.Reader" }, &readers) |path, *slot| {
-        for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| {
-            const value = try c.facts.declaration(((try c.facts.origin(decl)).orNull()) orelse decl);
-            if (value == .container) slot.* = value.container;
-        }
-    }
-    if (readers[0] == null and readers[1] == null) return;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        const reader = readThrough(tree, call) orelse continue;
-        if (!site(c, node)) continue;
-        // A read gives an error union; `r.interface.limited(...)` makes a reader and reads nothing.
-        switch (try c.facts.resolve(c.file, node)) {
-            .error_union, .unknown => {},
-            else => continue,
-        }
-        // The reader itself, by its type: a pointer to one reads the same.
-        var value = try c.facts.resolve(c.file, reader);
-        if (value == .pointer) value = value.pointer.*;
-        const held = switch (value) {
-            .instance, .container => |k| k,
-            else => continue,
-        };
-        const which = for (readers, 0..) |each, at| {
-            const k = each orelse continue;
-            if (k.file == held.file and k.scope == held.scope) break at;
-        } else continue;
-        const made = switch (tree.nodeTag(reader)) {
-            .identifier => made: {
-                const declared = (model.reference(reader) orelse continue).declaration orelse continue;
-                const record = model.declarations[@backingInt(declared)];
-                if (record.kind == .parameter) continue;
-                break :made record.kind == .variable and switch (model.scopes[@backingInt(record.scope)].kind) {
-                    .file, .container => false,
-                    else => true,
-                };
-            },
-            else => false,
-        };
-        switch (try handling(c, node, reader)) {
-            .asked, .discarded => continue,
-            .kept => {
-                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a read of a std reader whose error union is kept for later: whether its ReadFailed is asked of the reader's err is not followed");
-                continue;
-            },
-            .passed, .mapped => |how| {
-                if (!made) {
-                    try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a read of a std reader held in a field or a global whose ReadFailed is passed on, mapped or dropped without its err: whoever else may ask it what failed is not followed, and a cancel inside the read may be lost");
-                    continue;
-                }
-                const name = tree.getNodeSource(reader);
-                try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a read of a {s} this function makes whose error.ReadFailed is {s} without its err: a cancel inside the read is on {s}.err, and no caller can ask it, so the cancel is lost; on error.ReadFailed return {s}.err (error.Canceled among it)", .{ if (which == 0) "std.Io.File.Reader" else "std.Io.net.Stream.Reader", if (how == .passed) "passed on" else "mapped or dropped", name, name }));
-            },
-        }
-    }
-}
-
-/// The reader a call reads: `r` of `r.interface.take(...)`, or of an argument `&r.interface`.
-fn readThrough(tree: *const Ast, call: Ast.full.Call) ?Ast.Node.Index {
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const receiver = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-        if (interfaceOf(tree, receiver)) |reader| return reader;
-    }
-    for (call.ast.params) |argument| {
-        if (tree.nodeTag(argument) != .address_of) continue;
-        if (interfaceOf(tree, tree.nodeData(argument).node)) |reader| return reader;
-    }
-    return null;
-}
-
-/// `r` of `r.interface`.
-fn interfaceOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (tree.nodeTag(node) != .field_access) return null;
-    const reader, const name = tree.nodeData(node).node_and_token;
-    return if (std.mem.eql(u8, tree.tokenSlice(name), "interface")) reader else null;
-}
-
-/// What becomes of a read's error: asked of the reader (a handler reads `reader.err`, or hands
-/// the reader to a call, which may), passed on (`try`, or returned as it is), mapped or dropped
-/// by a handler that does neither, or kept as an error union. A call whose value is discarded
-/// (a statement, a loop's body) gives none: Zig discards no error union, so it is no read; an
-/// `if`'s branch is read where the `if`'s value goes.
-fn handling(c: *Context, call: Ast.Node.Index, reader: Ast.Node.Index) Context.Error!enum { asked, passed, mapped, kept, discarded } {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    var at = call;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression => continue,
-            .@"try", .@"return" => return .passed,
-            .@"catch" => {
-                const lhs, const rhs = tree.nodeData(parent).node_and_node;
-                if (lhs != at) return .kept;
-                return if (asks(c, rhs, reader)) .asked else .mapped;
-            },
-            else => {
-                if (tree.fullIf(parent)) |branch| {
-                    if (branch.ast.cond_expr == at and branch.error_token != null) {
-                        return if (asks(c, branch.ast.else_expr.unwrap() orelse return .mapped, reader)) .asked else .mapped;
-                    }
-                    // A branch's value is the `if`'s: read where that goes.
-                    if (branch.ast.cond_expr != at) continue;
-                }
-                if (tree.fullWhile(parent)) |loop| {
-                    if (loop.ast.cond_expr == at and loop.error_token != null) {
-                        return if (asks(c, loop.ast.else_expr.unwrap() orelse return .mapped, reader)) .asked else .mapped;
-                    }
-                    if (loop.ast.cond_expr != at) return .discarded;
-                }
-                if (tree.fullFor(parent)) |loop| if (loop.ast.then_expr == at) return .discarded;
-                var buffer: [2]Ast.Node.Index = undefined;
-                if (tree.blockStatements(&buffer, parent) != null) return .discarded;
-                return .kept;
-            },
-        }
-    }
-    return .kept;
-}
-
-/// Whether a handler asks the reader what failed: it reads `reader.err`, or hands the reader
-/// (or its address) to a call, which may.
-fn asks(c: *Context, handler: Ast.Node.Index, reader: Ast.Node.Index) bool {
-    const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
-    const first = tree.firstToken(handler);
-    const last = tree.lastToken(handler);
-    for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
-        if (token < first or token > last) continue;
-        if (!samePlace(tree, model, node, reader)) continue;
-        const parent = model.parentOf(node) orelse continue;
-        var above = parent;
-        if (tree.nodeTag(parent) == .address_of) above = model.parentOf(parent) orelse continue;
-        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "err")) return true;
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, above)) |handed| {
-            for (handed.ast.params) |argument| if (argument == node or argument == parent) return true;
-        }
-    }
-    return false;
-}
-
-/// Whether two expressions name the same place: one declaration, or the same field of the same
-/// place.
-fn samePlace(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-    if (tree.nodeTag(a) != tree.nodeTag(b)) return false;
-    switch (tree.nodeTag(a)) {
-        .identifier => {
-            const x = (model.reference(a) orelse return false).declaration orelse return false;
-            const y = (model.reference(b) orelse return false).declaration orelse return false;
-            return x == y;
-        },
-        .field_access => {
-            const a_lhs, const a_name = tree.nodeData(a).node_and_token;
-            const b_lhs, const b_name = tree.nodeData(b).node_and_token;
-            return std.mem.eql(u8, tree.tokenSlice(a_name), tree.tokenSlice(b_name)) and samePlace(tree, model, a_lhs, b_lhs);
-        },
-        else => return false,
-    }
+    try Streams.lost(c, rule);
 }
 
 /// What gives each judged function its `Io`, into `given` (by function) and `holders`.
@@ -852,8 +676,12 @@ fn cancels(c: *Context, file: Project.FileId, body: Ast.Node.Index, depth: u8, e
         if (token < first or token > last) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (!try passedOn(c, file, node)) continue;
+        // An operation on a std stream whose failure returns the stream's cause (`r.err`,
+        // `error.Canceled` among it) is one as `Io`'s own operations are.
+        const stream = try Streams.point(c, file, node);
+        if (!stream and !try passedOn(c, file, node)) continue;
         if (!try always(c, file, node, body, .{ .every_so_often = depth == 0, .ending = ending, .through_loops = true, .depth = depth })) continue;
+        if (stream) return true;
         // Whether an error the callee returns ends the loop: in the loop judged, by what the call
         // does with it; in a function's body, by going on out of it to a call that does.
         // What ends the loop past the callee's point: in the loop judged, by what the call does
