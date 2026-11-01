@@ -5390,7 +5390,9 @@ test "A009 reads a callee's check of its receiver only while the rest of the cal
         \\};
     ;
     try expect(pack.untrusted_input, entered, 0);
-    try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 1);
+    try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at > 200) return;\n"), 1);
+    // Every way the call succeeds read: one that returns early at a position within holds too.
+    try expect(pack.untrusted_input, comptime edited(entered, "        self.at += 1;\n", "        self.at += 1;\n        if (self.at == 3) return;\n"), 0);
 }
 
 test "A009 reads a callee's check only where nothing after it, its defers included, may write what the caller sees, by any name" {
@@ -5425,8 +5427,10 @@ test "A009 reads a callee's check only where nothing after it, its defers includ
     };
     inline for (writes) |write| try expect(pack.untrusted_input, comptime edited(program, "_ = other;", "_ = other;\n        " ++ write), 1);
     try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        defer self.at = self.table.len;\n        if (self.at >= self.table.len) return error.Range;\n"), 1);
-    // A condition naming a local of the callee says nothing of the caller's value of that name.
-    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        const at = self.at + 0;\n        if (at >= self.table.len) return error.Range;\n"), 1);
+    // A condition naming a local of the callee says nothing of the caller's value of that name,
+    // but what the local is made of.
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        const at = self.at / 2;\n        if (at >= self.table.len) return error.Range;\n"), 1);
+    try expect(pack.untrusted_input, comptime edited(program, "        if (self.at >= self.table.len) return error.Range;\n", "        const at = self.at + 0;\n        if (at >= self.table.len) return error.Range;\n"), 0);
 }
 
 test "A009 judges a slice's bounds in order: each at most the length leaves the start past the end a peer may choose" {
@@ -9223,6 +9227,69 @@ test "a flow finding names each read once, and names a call it went through only
     );
     defer std.testing.allocator.free(back);
     try std.testing.expect(std.mem.endsWith(u8, back, "(input from consumer:4 `std.process.run`)"));
+}
+
+test "A009 reads a callee's summary of the places a pointer it is given holds: what the callee leaves in them, and that it writes no other field" {
+    // A cursor a callee steps once, checked two short of the end, indexes within (9), and the
+    // callee writes no other field, so the length checked holds. Each stays a finding where the
+    // callee steps another cursor that may be the same (14), where its failure is caught and
+    // its success read later (28), and where it stores input in the place (36). `try` reads
+    // the success at once (23); a callee given a copy writes none of the caller's (46).
+    const found = try run(pack.untrusted_input,
+        \\const std = @import("std");
+        \\const Cursor = struct { buf: []const u8, at: usize };
+        \\fn advance(c: *Cursor) void {
+        \\    c.at += 1;
+        \\}
+        \\fn stepped(c: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    advance(c);
+        \\    return c.buf[c.at];
+        \\}
+        \\fn other(c: *Cursor, d: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    advance(d);
+        \\    return c.buf[c.at];
+        \\}
+        \\fn tryAdvance(c: *Cursor) !void {
+        \\    if (c.at > 100) return error.Far;
+        \\    c.at += 1;
+        \\}
+        \\fn tried(c: *Cursor) !u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    try tryAdvance(c);
+        \\    return c.buf[c.at];
+        \\}
+        \\fn caught(c: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    tryAdvance(c) catch {};
+        \\    return c.buf[c.at];
+        \\}
+        \\fn reset(c: *Cursor, r: *std.Io.Reader) !void {
+        \\    c.at = try r.takeInt(u32, .little);
+        \\}
+        \\fn read(c: *Cursor, r: *std.Io.Reader) !u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    try reset(c, r);
+        \\    return c.buf[c.at];
+        \\}
+        \\fn copy(c: Cursor) u8 {
+        \\    var d = c;
+        \\    d.at += 9;
+        \\    return @truncate(d.at);
+        \\}
+        \\fn copied(c: *Cursor) u8 {
+        \\    if (c.at + 2 > c.buf.len) return 0;
+        \\    _ = copy(c.*);
+        \\    return c.buf[c.at];
+        \\}
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    var c: Cursor = .{ .buf = buf, .at = try r.takeInt(u32, .little) };
+        \\    var d: Cursor = .{ .buf = buf, .at = try r.takeInt(u32, .little) };
+        \\    return stepped(&c) +% other(&c, &d) +% try tried(&c) +% caught(&c) +% try read(&c, r) +% copied(&c);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 14, 28, 36 }, found.lines[0..found.findings]);
 }
 
 test "A009 reads a field of a struct the function holds as it stores it: a cursor stepped past its check stays within it, unless another pointer or a call may store to it" {
