@@ -178,9 +178,12 @@ const std_halving = [_]struct { path: []const u8, param: usize, input: usize }{
 
 /// How deep the program's callees are read, each handing the memory to the next.
 const depth_limit = 8;
-/// How deep `undefines` follows what a function hands its parameter to: std's writers reach
-/// past `depth_limit` (`Writer.print`'s formatting), where a cut would leave all of it undefined.
+/// How deep one reading of `undefines` follows what a function hands its parameter to before
+/// it takes a function at what it is assumed to leave, read from the top after (`readDeferred`).
 const undefines_depth_limit = 16;
+/// How many times a call is asked again while those assumptions grow; one still growing after
+/// leaves the call undecided.
+const undefines_rounds = 32;
 
 /// `follows`: whether another rule follows a local from its acquisition through its cleanup
 /// (A003), and reads a use of it after a call that gives it `undefined` in this one's place.
@@ -259,21 +262,24 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
             var cuts = memo.cuts;
             walk.unknown = false;
             var left = try walk.undoneBy(call);
-            // A reading cut short at the depth answered all of it without reading it. The
-            // functions it left unread are read from the top (`readDeferred`), whose answers
-            // hold for any caller, and the call is asked again; one still cut leaves a read
-            // after it undecided, never a finding.
+            // A reading cut at the depth took each function it left unread at what it is
+            // assumed to leave, from nothing. Those are read from the top (`readDeferred`),
+            // whose answers hold for any caller, and the call is asked again until every
+            // assumption holds: the least answer, as a recursion's. One that does not settle
+            // leaves all of it, so a read after it is undecided, never clean.
             var rounds: usize = 0;
-            while (memo.cuts != cuts and rounds < 8 and try readDeferred(c)) : (rounds += 1) {
+            const settled = while (memo.cuts != cuts) : (rounds += 1) {
+                if (rounds == undefines_rounds) break false;
+                const grew = (try readDeferred(c)) orelse break false;
+                if (!grew) break true;
                 cuts = memo.cuts;
                 walk.unknown = false;
                 left = try walk.undoneBy(call);
-            }
+            } else true;
             memo.deferred.clearRetainingCapacity();
-            memo.seen.clearRetainingCapacity();
+            if (!settled) left = std.math.maxInt(u64);
             const unknown = walk.unknown;
             if (left == 0) continue;
-            const cut = memo.cuts != cuts;
             const line = tree.tokenLocation(0, tree.nodeMainToken(call)).line + 1;
             if (try walk.aliasAfter(call, block)) |alias| {
                 try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unsupported, try c.allocator.print("'{s}' is given `undefined` here by the call, and an alias of it taken at line {d} may read it after: no read of it through that alias is followed", .{ decl.name, tree.tokenLocation(0, alias).line + 1 }));
@@ -288,8 +294,8 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
                 try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unsupported, try c.allocator.print("'{s}' is handed here to a call that reaches a function not known here (a function pointer, a field its callers fill): whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, tree.tokenLocation(0, token).line + 1 }));
                 continue;
             }
-            if (cut) {
-                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .budget_exhausted, try c.allocator.print("'{s}' is handed to a call here whose calls run deeper than {d} are read: whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, undefines_depth_limit, tree.tokenLocation(0, token).line + 1 }));
+            if (!settled) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .budget_exhausted, try c.allocator.print("'{s}' is handed to a call here whose calls' readings did not settle within {d} rounds: whether it gives it `undefined` before the read at line {d} is not known", .{ decl.name, undefines_rounds, tree.tokenLocation(0, token).line + 1 }));
                 continue;
             }
             found = token;
@@ -3760,7 +3766,12 @@ const Calls = struct {
     lowest: usize = std.math.maxInt(usize),
     /// What a reading that leaned on one above it showed, kept for that one's pass (`head`, its
     /// place in `reading`): read again only when that one is.
-    provisional: std.AutoHashMapUnmanaged(Key, struct { left: Left, head: usize }) = .empty,
+    /// One that leaned on what a function past the depth is assumed to leave is `assumed`: kept
+    /// while a pass of `readDeferred` holds its assumptions (`holding`), past the reading from
+    /// the top (`top`) that showed it, and never kept past the pass.
+    provisional: std.AutoHashMapUnmanaged(Key, struct { left: Left, head: usize, assumed: bool, top: usize }) = .empty,
+    holding: bool = false,
+    top: usize = 0,
     /// How many functions' parameters `undefines` has read, for the test that keeps it linear.
     reads: usize = 0,
     /// What readings cut short (a cycle back to a function being read, or one past the depth)
@@ -3771,45 +3782,75 @@ const Calls = struct {
     remembered_reads: usize = 0,
     active: std.AutoHashMapUnmanaged(Key, void) = .empty,
     cuts: usize = 0,
-    /// The `undefines` readings cut at the depth, unread, deepest last (`readDeferred`).
+    /// The `undefines` readings cut at the depth, unread, deepest last (`readDeferred`), and
+    /// what each is taken to leave meanwhile: from nothing, then what its reading from the top
+    /// showed, which only grows.
     deferred: std.ArrayList(Key) = .empty,
-    /// What the call's own walk read, whether a reading from the top is under way, and whether
-    /// one came back to what the walk read without keeping it: a cycle longer than the depth,
-    /// which no reading from the top settles.
-    seen: std.AutoHashMapUnmanaged(Key, void) = .empty,
-    topping: bool = false,
-    wrapped: bool = false,
+    assumed: std.AutoHashMapUnmanaged(Key, Left) = .empty,
+    /// The readings from the top made since the assumptions last grew: each holds for them.
+    fresh: std.AutoHashMapUnmanaged(Key, void) = .empty,
 };
 
-/// Reads each function a reading cut at the depth left unread, from the top, deepest first:
-/// what a function leaves undefined does not depend on who asks, so its answer, kept, settles
-/// the readings above it the next time they ask, and a chain of any length is read a stretch
-/// at a time. A function is read again only where an answer was kept since its last reading,
-/// all it leans on; a reading that comes back to what the call's walk read is in a cycle longer
-/// than the depth, and ends them. False where no answer was kept, the readings came back, or
-/// `budget` readings did not settle them.
-fn readDeferred(c: *Context) Context.Error!bool {
+/// Reads each function a reading cut at the depth took at what it is assumed to leave, from the
+/// top: what a function leaves undefined does not depend on who asks. Each read grows its
+/// assumption to what it showed; those its reading took are read after it, deeper first, and
+/// what the readings showed under the assumptions is kept for the pass. An assumption that
+/// grows drops that, and each function read is read again; one read since the last growth is
+/// not. True where an assumption grew, so what leaned on it is to be asked again; false where
+/// every one held, the least answer, as a recursion's is; null where `budget` readings did not
+/// end the pass.
+fn readDeferred(c: *Context) Context.Error!?bool {
     const memo = try c.facts.memo(Calls);
-    const before = memo.left.count();
-    var tried: std.AutoHashMapUnmanaged(Calls.Key, usize) = .empty;
-    defer tried.deinit(c.allocator);
-    var budget: usize = 1024;
-    memo.topping = true;
-    memo.wrapped = false;
-    defer memo.topping = false;
-    while (memo.deferred.pop()) |key| {
-        if (memo.left.contains(key)) continue;
-        if (tried.get(key)) |kept| if (kept == memo.left.count()) continue;
-        if (budget == 0) return false;
-        budget -= 1;
-        try tried.put(c.allocator, key, memo.left.count());
-        const mark = memo.deferred.items.len;
-        _ = try undefines(c, key.decl, key.index, 0);
-        if (memo.wrapped) return false;
-        // Cut again below it: the deeper ones first, then it once more.
-        if (!memo.left.contains(key)) try memo.deferred.insert(c.allocator, mark, key);
+    memo.holding = true;
+    defer {
+        memo.holding = false;
+        dropAssumed(c.allocator, memo);
     }
-    return memo.left.count() != before;
+    var queued: std.AutoHashMapUnmanaged(Calls.Key, void) = .empty;
+    defer queued.deinit(c.allocator);
+    var work: std.ArrayList(Calls.Key) = .empty;
+    defer work.deinit(c.allocator);
+    var done: std.ArrayList(Calls.Key) = .empty;
+    defer done.deinit(c.allocator);
+    var budget: usize = 4096;
+    var grew = false;
+    while (true) {
+        while (memo.deferred.pop()) |key| if (!memo.fresh.contains(key) and !queued.contains(key)) {
+            try queued.put(c.allocator, key, {});
+            try work.append(c.allocator, key);
+        };
+        const key = work.pop() orelse return grew;
+        _ = queued.remove(key);
+        if (budget == 0) return null;
+        budget -= 1;
+        memo.top += 1;
+        const shown = try undefines(c, key.decl, key.index, 0);
+        try memo.fresh.put(c.allocator, key, {});
+        try done.append(c.allocator, key);
+        const before = memo.assumed.get(key) orelse Left{ .mask = 0, .owner = null };
+        const after: Left = .{ .mask = before.mask | shown.mask, .owner = shown.owner, .failing = before.failing | shown.failing, .known = before.known and shown.known };
+        if (after.mask == before.mask and after.failing == before.failing and after.known == before.known) continue;
+        try memo.assumed.put(c.allocator, key, after);
+        grew = true;
+        // What was read under the smaller assumption is read again.
+        dropAssumed(c.allocator, memo);
+        memo.fresh.clearRetainingCapacity();
+        try memo.deferred.appendSlice(c.allocator, done.items);
+        done.clearRetainingCapacity();
+    }
+}
+
+/// Drops what readings that leaned on an assumption showed.
+fn dropAssumed(gpa: std.mem.Allocator, memo: *Calls) void {
+    var each = memo.provisional.iterator();
+    var stale: std.ArrayList(Calls.Key) = .empty;
+    defer stale.deinit(gpa);
+    while (each.next()) |entry| if (entry.value_ptr.assumed) stale.append(gpa, entry.key_ptr.*) catch {
+        // Out of memory: drop every one, assumed or not, which only reads them again.
+        memo.provisional.clearRetainingCapacity();
+        return;
+    };
+    for (stale.items) |key| _ = memo.provisional.remove(key);
 }
 
 /// What of a parameter's memory a function may read before writing it: the parts in `mask`, of
@@ -3850,36 +3891,31 @@ fn remembered(comptime T: type, c: *Context, key: Calls.Key, depth: u8, comptime
 /// (`self.* = undefined`, a field, `@memset(…, undefined)`), or handing it, or a field of it,
 /// to such a function (`self.list.deinit(gpa)`), with nothing after writing it again on that
 /// path. An error's `return` is such a path: a caller's `catch` goes on from it. The parts are
-/// of what the parameter points at (`owner`); a reading cut short leaves all of it.
+/// of what the parameter points at (`owner`).
 /// A function reached again while it is being read (recursion) is taken at what its reading
 /// has shown so far, from nothing, and read again until that holds still: what some path of it
 /// gives `undefined`, whatever the recursion. Only what such a reading showed of itself is
-/// kept; a reading past the depth leaves all of it.
+/// kept; a function past the depth is taken at what it is assumed to leave (`readDeferred`).
 fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
     const memo = try c.facts.memo(Calls);
     const key: Calls.Key = .{ .decl = decl, .index = index, .question = .undefines };
     if (memo.left.get(key)) |known| return known;
     if (memo.provisional.get(key)) |kept| {
         memo.lowest = @min(memo.lowest, kept.head);
+        // Shown under an assumption: so is what leans on it.
+        if (kept.assumed) memo.cuts += 1;
         return kept.left;
     }
     for (memo.reading.items, 0..) |each, at| if (std.meta.eql(each.key, key)) {
         memo.lowest = @min(memo.lowest, at);
         return each.sofar;
     };
-    const cut: Left = .{ .mask = std.math.maxInt(u64), .owner = null, .failing = std.math.maxInt(u64) };
-    // Once one comes back, the rest of the reading from the top is cut with it.
-    if (memo.topping and (memo.wrapped or memo.seen.contains(key))) {
-        memo.cuts += 1;
-        memo.wrapped = true;
-        return cut;
-    }
+    // Past the depth: what it is assumed to leave, which `readDeferred` reads it for.
     if (depth > undefines_depth_limit) {
         memo.cuts += 1;
         try memo.deferred.append(c.allocator, key);
-        return cut;
+        return memo.assumed.get(key) orelse .{ .mask = 0, .owner = null };
     }
-    if (!memo.topping) try memo.seen.put(c.allocator, key, {});
     const at = memo.reading.items.len;
     const lowest = memo.lowest;
     try memo.reading.append(c.allocator, .{ .key = key, .sofar = .{ .mask = 0, .owner = null } });
@@ -3894,13 +3930,13 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
             const above = memo.lowest < at;
             // Leaning on a reading above it, it is kept for that one's pass; cut short, for the
             // outermost reading's: read once a pass either way, and never kept past it.
-            const head: ?usize = if (above) memo.lowest else if (memo.cuts != cuts and at > 0) 0 else null;
+            const head: ?usize = if (above) memo.lowest else if (memo.cuts != cuts and (at > 0 or memo.holding)) 0 else null;
             if (head) |outer| {
                 var each = memo.provisional.iterator();
                 while (each.next()) |entry| if (entry.value_ptr.head >= at) {
                     entry.value_ptr.head = outer;
                 };
-                try memo.provisional.put(c.allocator, key, .{ .left = settled, .head = outer });
+                try memo.provisional.put(c.allocator, key, .{ .left = settled, .head = outer, .assumed = memo.cuts != cuts, .top = memo.top });
             } else {
                 try settle(c.allocator, memo, at, memo.cuts == cuts);
                 if (memo.cuts == cuts) try memo.left.put(c.allocator, key, settled);
@@ -3914,15 +3950,17 @@ fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
     }
 }
 
-/// Ends the pass of the reading at `head` in `reading`: what leaned on it is kept where `keep`,
-/// and dropped either way from what is provisional.
+/// Ends the pass of the reading at `head` in `reading`: what leaned on it is kept where `keep`
+/// and it leaned on no assumption, and dropped either way from what is provisional. What an
+/// earlier reading from the top showed under the assumptions a pass holds stays.
 fn settle(gpa: std.mem.Allocator, memo: *Calls, head: usize, keep: bool) Context.Error!void {
     var done: std.ArrayList(Calls.Key) = .empty;
     defer done.deinit(gpa);
     var each = memo.provisional.iterator();
     while (each.next()) |entry| if (entry.value_ptr.head >= head) {
+        if (memo.holding and entry.value_ptr.assumed and entry.value_ptr.top != memo.top) continue;
         try done.append(gpa, entry.key_ptr.*);
-        if (keep) try memo.left.put(gpa, entry.key_ptr.*, entry.value_ptr.left);
+        if (keep and !entry.value_ptr.assumed) try memo.left.put(gpa, entry.key_ptr.*, entry.value_ptr.left);
     };
     for (done.items) |key| _ = memo.provisional.remove(key);
 }

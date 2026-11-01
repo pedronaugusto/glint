@@ -15,8 +15,6 @@
         "call/mx-z11-parameter/hole.zig",
         // matrix Z011: the same, an if's payload
         "capture/mx-z11-optional_payload/hole.zig",
-        // matrix Z011: the same, a comptime parameter
-        "compile_time/mx-z11-comptime_parameter/hole.zig",
         // matrix Z011: the same, a pointer @ptrCast converts
         "conversion/mx-z11-ptrcast/hole.zig",
         // matrix Z011: the same, an inline loop's capture
