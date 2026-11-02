@@ -1986,9 +1986,11 @@ fn typeOnly(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 const Acquisition = union(enum) { no, lock: Lock, unknown: Facts.Unknown };
 
 /// Whether a call acquires a lock: a callee that is an aegis owner's acquire, by its
-/// declaration; another of the owner's methods, or a function outside the program, whose value
-/// is a guard (`guardValue`); a function of the program that returns holding a guard it took
-/// (`leavesHeld`), however it hands the guard back. Of a choice, any.
+/// declaration; a function of the program with a body, by that body (`leavesHeld`: it returns
+/// holding a guard it took, however it hands the guard back); std's other functions take none;
+/// another of the owner's methods, or another function outside the program, whose value is a
+/// guard (`guardValue`). One that does not resolve takes none where its value is known no guard
+/// and it is given no guard's address (`guardGiven`). Of a choice, any.
 fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call, depth: u8) Context.Error!Acquisition {
     // A call made a statement gives nothing (Zig refuses to drop a value that is not void):
     // it takes a guard only where it leaves one held through a pointer or its receiver.
@@ -2001,6 +2003,7 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
     var lock: ?Lock = null;
     var unknown: ?Facts.Unknown = null;
     var other = choices.len == 0;
+    const program = try Program.get(c);
     for (choices) |choice| {
         const decl = (try originKnown(c, choice)) orelse {
             other = true;
@@ -2015,7 +2018,10 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
             lock = found;
             continue;
         }
-        other = true;
+        if (program.std_files.contains(@backingInt(decl.file))) continue;
+        // One of the program's with a body is read by its body alone.
+        const body = record.kind == .function and program.own(decl.file) and if (c.project.at(decl.file).model.parentOf(record.node)) |parent| c.project.at(decl.file).file.tree.nodeTag(parent) == .fn_decl else false;
+        if (!body) other = true;
         if (record.kind != .function) continue;
         switch (try leavesHeld(c, decl, depth)) {
             .no => {},
@@ -2046,9 +2052,32 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
         // A helper's ranked guard was ranked through a context of its own, which its arguments
         // need not name: no context is known.
         .ranked => .{ .lock = .{ .ranked = if (lock) |earlier| earlier.ranked else true } },
-        .no => if (lock) |found| .{ .lock = found } else if (unknown) |why| .{ .unknown = why } else .no,
+        .no => if (lock) |found| .{ .lock = found } else if (unknown) |why| .{ .unknown = why } else if (call.callee == .any) try guardGiven(c, file, call.node) else .no,
         .unknown => |why| if (lock) |found| .{ .lock = found } else .{ .unknown = why },
     };
+}
+
+/// Whether a call that does not resolve, whose value is no guard, may take one all the same
+/// into what it is given: an address, as written, of a guard or of what does not resolve
+/// (`lockInto(a, &g)`), or a receiver that is one.
+fn guardGiven(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Acquisition {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return .{ .unknown = .unresolved };
+    for (call.ast.params) |arg| {
+        if (tree.nodeTag(arg) != .address_of) continue;
+        switch (try guardValue(c, file, tree.nodeData(arg).node)) {
+            .no => {},
+            .unknown => |why| return .{ .unknown = why },
+            .plain, .ranked => return .{ .unknown = .unresolved },
+        }
+    }
+    if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try guardValue(c, file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
+        .no => {},
+        .unknown => |why| return .{ .unknown = why },
+        .plain, .ranked => return .{ .unknown = .unresolved },
+    };
+    return .no;
 }
 
 /// Whether a function of the program returns holding a guard it took: one bound by no local or
