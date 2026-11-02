@@ -308,17 +308,18 @@ fn bindings(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths:
     const tree = &c.project.at(c.file).file.tree;
     for (try Facts.calls.in(c.facts, c.file)) |*call| {
         if (c.inTest(tree.nodeMainToken(call.node))) continue;
-        switch (try c.facts.definition(c.file, call.callee_expr)) {
-            .decl => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
-            .none => {},
-            // A call on a value of a generic's type parameter is judged at the generic's
-            // bindings, with the type each gives.
-            .unknown => |why| if (why != .generic) switch (call.callee) {
-                // A choice of holders' members: each function the call may call, judged as one
-                // it does.
-                .function => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
-                .choice => |each| try bindingOf(c, rule, resources, paths, call, each),
-                .any => try unnamedBinding(c, rule, resources, call.node),
+        switch (call.callee) {
+            .function => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
+            // A choice of holders' members: each function the call may call, judged as one it
+            // does.
+            .choice => |each| try bindingOf(c, rule, resources, paths, call, each),
+            // A callee Facts.calls does not read may still name its declaration (an alias of
+            // std's). A call on a value of a generic's type parameter is judged at the
+            // generic's bindings, with the type each gives.
+            .any => |why| if (why != .generic) switch (try c.facts.definition(c.file, call.callee_expr)) {
+                .decl => |*one| try bindingOf(c, rule, resources, paths, call, one[0..1]),
+                .none => {},
+                .unknown => |cause| if (cause != .generic) try unnamedBinding(c, rule, resources, call.node),
             },
         }
     }
