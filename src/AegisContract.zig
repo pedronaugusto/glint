@@ -264,7 +264,7 @@ pub fn guardType(name: []const u8) bool {
 /// The operations by which a guarded owner gives a guard: every acquire, blocking or
 /// spinning, cancelable or not, tried or waited for, and a reader's or a writer's.
 pub fn acquisition(name: []const u8) bool {
-    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "read", "write", "readUncancelable", "writeUncancelable", "acquireOrdered", "acquireOrderedUncancelable", "readOrdered", "writeOrdered", "readOrderedUncancelable", "writeOrderedUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "acquire", "acquireUncancelable", "acquireScheduling", "acquireYielding", "acquireYieldingUncancelable", "tryAcquire", "tryRead", "tryWrite", "read", "write", "readUncancelable", "writeUncancelable", "acquireOrdered", "acquireOrderedUncancelable", "readOrdered", "writeOrdered", "readOrderedUncancelable", "writeOrderedUncancelable" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 

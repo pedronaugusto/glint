@@ -1,10 +1,4 @@
 .{
     .open = .{
-        // matrix A021 precision: `@field(L, "acquire")(a)` does not resolve as a call of L.acquire, so its guard is undecided in a function that takes another
-        "field/mx-a21-field_named_acquire/twin.zig",
-        // matrix A021 precision: a lock read by @atomicLoad does not resolve
-        "memory/mx-a21-atomic_lock_pointer/twin.zig",
-        // matrix A021 precision: a lock reached by pointer arithmetic does not resolve
-        "operator/mx-a21-pointer_arithmetic/twin.zig",
     },
 }
