@@ -137,20 +137,18 @@ fn unusedImports(self: *Context) RunError!void {
         const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
         // An `@import` written there is one, whatever module it names; any other value is one
         // by meaning: what it holds is another file's root, however it is reached (an alias of
-        // one, a type function or `@as` given one, a block's `break`). One that does not resolve
-        // is undecided.
+        // one, a type function or `@as` given one, a block's `break`), or a choice of such
+        // roots (one per target). One that does not resolve, or a choice of a root and
+        // something else, is undecided.
         var buffer: [2]Ast.Node.Index = undefined;
         const written = Facts.builtinArgs(tree, value, &buffer).len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import");
-        if (!written) switch (try self.facts.declaration(.{ .file = self.file, .index = @fromBackingInt(@intCast(index)) })) {
-            .container => |container| {
-                if (container.file == self.file) continue;
-                if (self.project.at(container.file).model.scopes[@backingInt(container.scope)].kind != .file) continue;
-            },
+        if (!written) switch (importOf(self, try self.facts.declaration(.{ .file = self.file, .index = @fromBackingInt(@intCast(index)) }))) {
+            .yes => {},
+            .no => continue,
             .unknown => |why| {
                 try unknown(self, .Z013, decl.node, why);
                 continue;
             },
-            else => continue,
         };
         try candidates.put(self.allocator, decl.name, {});
         try indexes.append(self.allocator, @fromBackingInt(@intCast(index)));
@@ -182,6 +180,25 @@ fn unusedImports(self: *Context) RunError!void {
     for (indexes.items) |index| {
         const decl = declarations[@backingInt(index)];
         if (!used.contains(index) and !undecided.contains(decl.name)) try self.at(.Z013, decl.token, try self.allocator.print("unused private import '{s}'", .{decl.name}));
+    }
+}
+
+/// Whether `value` is another file's root, or a choice of nothing but such roots.
+fn importOf(self: *const Context, value: Facts.Value) Governed.Is {
+    switch (value) {
+        .container => |container| return if (container.file != self.file and self.project.at(container.file).model.scopes[@backingInt(container.scope)].kind == .file) .yes else .no,
+        .unknown => |why| return .{ .unknown = why },
+        .alternatives => |each| {
+            var roots: usize = 0;
+            for (each) |one| switch (importOf(self, one)) {
+                .yes => roots += 1,
+                .no => {},
+                .unknown => |why| return .{ .unknown = why },
+            };
+            if (roots == 0) return .no;
+            return if (roots == each.len) .yes else .{ .unknown = .comptime_dependent };
+        },
+        else => return .no,
     }
 }
 
@@ -927,7 +944,9 @@ fn unknownCoverage(self: *Context) RunError!void {
         const args = Facts.builtinArgs(tree, node, &b);
         if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
         const value = try self.facts.resolve(self.file, node);
-        if (value == .unknown) try self.sink.coverage(self.sink, .{ .file = self.file, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = .unresolved, .detail = @tagName(value.unknown) });
+        // Zig's own per-build file is no file glint lacks: what is read of it stays unknown
+        // where it is read.
+        if (value == .unknown and value.unknown != .zig_own) try self.sink.coverage(self.sink, .{ .file = self.file, .start = tree.tokenStart(tree.nodeMainToken(node)), .reason = .unresolved, .detail = @tagName(value.unknown) });
     }
 }
 

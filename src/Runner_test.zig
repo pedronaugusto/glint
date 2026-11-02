@@ -275,6 +275,25 @@ test "Z016 reads std's assert by meaning: a choice of callees one of which is it
     try std.testing.expect(undecided != 0);
 }
 
+test "an import of Zig's own builtin is no file glint lacks; a missing one is" {
+    const chosen = "const builtin = @import(\"builtin\"); pub const Hidden = if (builtin.is_test) struct { x: u8 } else struct { y: u8 }; pub fn make() Hidden { return undefined; }";
+    for ([_]struct { []const u8, usize }{ .{ chosen, 0 }, .{ "const lib = @import(\"lib\"); pub fn f() void { _ = lib; }", 1 } }) |each| {
+        var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "fixture", .bytes = each[0] }}, &.{}, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.set(.Z012, true);
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len); // safe: expected count fits usize.
+        // The file notes of imports that do not resolve: no rule's, unresolved.
+        var imports: usize = 0;
+        for (report.coverage) |item| {
+            if (item.rule == null and item.reason == .unresolved) imports += 1;
+        }
+        try std.testing.expectEqual(each[1], imports);
+    }
+}
+
 test "Z012 judges the whole public surface: constants' types, reached fields, aliases of functions" {
     // A public constant's type, written or inferred, and a public alias of a private function.
     try check(.Z012, "const Hidden = struct { x: u8 }; pub const default: Hidden = .{ .x = 1 };", 1);

@@ -919,7 +919,7 @@ fn typeArgument(c: *Context, memo: *Given, file: Project.FileId, callee: Ast.Nod
     switch (value) {
         .container, .alternatives, .reified => return typeShapes(c, memo, value, 0),
         .unknown => |why| switch (why) {
-            .std_internal, .absent => return,
+            .zig_own, .absent => return,
             else => {},
         },
         // A value is no type: one handed over by a pointer is a write `Facts.accesses` finds.

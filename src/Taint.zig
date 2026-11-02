@@ -1741,7 +1741,7 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
         const container = switch (held) {
             .container, .instance => |k| k,
             .unknown => |why| {
-                if (why != .std_internal and why != .absent) for (try fieldsNamed(c, flow, name)) |decl| {
+                if (why != .zig_own and why != .absent) for (try fieldsNamed(c, flow, name)) |decl| {
                     out = out.join(flow.globals.get(decl) orelse .clean);
                 };
                 continue;
@@ -1761,7 +1761,7 @@ fn unresolvedHolder(value: Facts.Value) bool {
     var current = value;
     while (true) current = switch (current) {
         .pointer, .optional, .error_union => |inner| inner.*,
-        .unknown => |why| return why != .std_internal and why != .absent,
+        .unknown => |why| return why != .zig_own and why != .absent,
         else => return false,
     };
 }

@@ -162,9 +162,11 @@ pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown, roo
 /// `generic`: it depends on a type or `anytype` parameter that calls from outside the
 /// project's reading bind (a consumer's, or a use other than a call), so each binding decides
 /// it where it is made; what is read of it (its type information, its parts) stays so.
-/// `std_internal`: std reads it from `root` or `builtin` (`root.std_options`, the target),
-/// which no library's reading binds, so it is a type or value std computes for itself.
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, std_internal };
+/// `zig_own`: it is Zig's own per-build file: the compiler's `builtin` (the target, the
+/// optimize mode, the build's options) any file imports, or the `root` std reads
+/// (`root.std_options`), which no library's reading binds; a type or value the compiler
+/// computes for each build, holding no store and none of the program's types.
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own };
 /// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
 /// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
 /// or unknown and why (a holder that does not resolve, a choice of holders, a computed name, a
@@ -745,10 +747,13 @@ fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
     return &self.project.at(file).file.tree;
 }
 
-/// Whether `spelling` is Zig's own `root` or `builtin` imported by one of std's files: what
-/// std computes from the program it is in and the target it is built for.
+/// Whether an import no mapping gives is Zig's own per-build file: `builtin`, which the
+/// compiler gives every module (the target and build options it is built for), or `root` as
+/// one of std's files reads it (the program std is in; a program's own `root` is a file the
+/// build maps).
 fn zigOwn(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError!bool {
-    if (!std.mem.eql(u8, spelling, "root") and !std.mem.eql(u8, spelling, "builtin")) return false;
+    if (std.mem.eql(u8, spelling, "builtin")) return true;
+    if (!std.mem.eql(u8, spelling, "root")) return false;
     return (try self.outside()).std_files.contains(@backingInt(file));
 }
 
@@ -1876,7 +1881,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         const target = self.project.imported(file, spelling) orelse return .{ .unknown = if (self.project.absent(file, spelling))
             .absent
         else if (try self.zigOwn(file, spelling))
-            .std_internal
+            .zig_own
         else
             .missing_mapping };
         return .{ .container = self.rootOf(target) };
@@ -2545,8 +2550,8 @@ fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
 }
 
 /// Whether every `@import` `file` makes names a file the program holds: one of a computed name,
-/// or a name no mapping gives (the compiler's `builtin`, std's own internals and names the
-/// build declares absent aside), may hold a store the program does not show.
+/// or a name no mapping gives (Zig's own per-build files and names the build declares absent
+/// aside), may hold a store the program does not show.
 fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
     if (self.imports_read.get(file)) |known| return known;
     const tree = &self.project.at(file).file.tree;
@@ -2554,11 +2559,9 @@ fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
         .builtin_call_two, .builtin_call_two_comma => {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
-            // The compiler's `builtin` holds the target and build options, never a store.
-            if (std.mem.eql(u8, tree.getNodeSource(node), "@import(\"builtin\")")) continue;
             switch (try self.resolve(file, node)) {
                 .unknown => |why| switch (why) {
-                    .absent, .std_internal => {},
+                    .absent, .zig_own => {},
                     else => break false,
                 },
                 else => {},
@@ -6931,6 +6934,29 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(project.sources[0].id, first)).unknown);
     const dep = project.sources[0].file.tree.fullVarDecl(project.sources[0].model.declarations[2].node).?.ast.init_node.unwrap().?;
     try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(project.sources[0].id, dep)).unknown);
+}
+
+test "a program's builtin is Zig's own per-build file, its root a mapping the build gives" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const builtin = @import(\"builtin\"); const root = @import(\"root\"); const tag = builtin.os.tag;" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const source = &project.sources[0];
+    const init = struct {
+        fn of(s: *const Project.Source, i: usize) Ast.Node.Index {
+            return s.file.tree.fullVarDecl(s.model.declarations[i].node).?.ast.init_node.unwrap().?;
+        }
+    }.of;
+    try std.testing.expectEqual(Unknown.zig_own, (try facts.resolve(source.id, init(source, 0))).unknown);
+    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(source.id, init(source, 1))).unknown);
+    // A file whose one import is the compiler's `builtin` reads every file it imports.
+    var alone = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const builtin = @import(\"builtin\"); pub const debug = builtin.mode == .Debug;" }}, &.{}, .{});
+    defer alone.deinit();
+    var alone_facts: Facts = .{ .project = &alone, .gpa = arena.allocator() };
+    defer alone_facts.deinit();
+    try std.testing.expect(try alone_facts.importsRead(alone.sources[0].id));
 }
 
 test "a call that passes what a module the build does not have gives binds nothing" {

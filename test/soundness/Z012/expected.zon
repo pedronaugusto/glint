@@ -12,9 +12,4 @@
         // program compiles.
         .memory,
     },
-    .open = .{
-        // `@import("builtin")` has no mapping in the run: its file note leaves the twin undecided.
-        "branch/sw-z012-comptime_choice/twin.zig",
-        "branch/sw-z012-switch_choice/twin.zig",
-    },
 }

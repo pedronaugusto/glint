@@ -1,5 +1,7 @@
 .{
     .open = .{
+        // per-build choice soundness: `T = if (builtin.mode == .Debug) Small else Large` makes `T.n` 4 or 64, one build overflowing; Range does not judge each build (undecided before only through the `@import("builtin")` file note)
+        "call/r5-b-b22b_choice_array_builtin/hole.zig",
         // matrix precision: Range does not count an inline for's passes, so a u8 and a u16 summed into a u64 read as able to overflow
         "inline_loop/m-a10-inline_sum/twin.zig",
     },

@@ -20,8 +20,4 @@
         // @memcpy, @memset and atomics move run-time values; an import is a comptime type.
         .memory,
     },
-    .open = .{
-        // glint-b precision: an import chosen per platform resolves to a choice of roots and none, undecided
-        "branch/mx-z13-platform_choice/twin.zig",
-    },
 }

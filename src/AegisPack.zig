@@ -932,7 +932,7 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         // What std computes from the program and target it is in is std's own: std declares
         // no aegis type, so it plays no aegis role. Code the build does not compile holds none.
         .unknown => |why| switch (why) {
-            .std_internal, .absent => .other,
+            .zig_own, .absent => .other,
             else => .unknown,
         },
         .pointer, .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),

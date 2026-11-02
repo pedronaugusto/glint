@@ -1,5 +1,9 @@
 .{
     .open = .{
+        // per-build choice soundness: `T = if (builtin.mode == .Debug) Small else Large` makes `T.n` 4 or 64, one build overflowing; A020 does not judge each build (undecided before only through the `@import("builtin")` file note)
+        "call/r5-b-b14_choice_const/hole.zig",
+        "call/r5-b-b22b_choice_array_builtin/hole.zig",
+        "memory/r5-b-b14b_choice_swapped/hole.zig",
         // review 6 precision: A020 flags a stored step whose only function cancels; Facts' stored functions are not read
         "call/r6-fp-g01_seen_cancel/twin.zig",
         // review 5 T1 in A020: a labeled block's break before `more = false`

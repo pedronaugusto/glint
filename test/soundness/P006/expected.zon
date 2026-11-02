@@ -2,8 +2,4 @@
 // was made by a reference that is P006's site.
 .{
     .na = .{.memory},
-    .open = .{
-        // P006 precision: an if between two of std's namespaces is not resolved, so the member it reaches is undecided
-        "branch/p06-15_namespace_chosen/twin.zig",
-    },
 }
