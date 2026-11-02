@@ -26,9 +26,10 @@
 //! A branch that writes it on some paths only, a write in a part of an expression that runs on
 //! some paths only, and a loop that may run no pass, leave it unwritten for what follows; a
 //! branch that leaves (`return`, `unreachable`) reaches nothing after it, a `break` or
-//! `continue` reaches the end of where it goes with what it holds, and a `for` over a range of
-//! literals runs at least once. A deferred statement reads it as at its place: it runs at the
-//! scope's exits, where the local may be as unwritten as it is there.
+//! `continue` reaches the end of where it goes with what it holds, and a `for` over a range or
+//! memory of a known length above zero runs at least once. A deferred statement runs where its
+//! block is left after it: at its end, at a `return` or a failing `try` (an `errdefer` there
+//! only), at a jump out of it; it reads the local as it is there, and what it writes holds past.
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
@@ -39,6 +40,7 @@ const Danger = @import("Danger.zig");
 const ParentPointer = @import("ParentPointer.zig");
 const CContract = @import("CContract.zig");
 const Program = @import("Program.zig");
+const Range = @import("Range.zig");
 const Rule = @import("Rule.zig").Rule;
 const Ast = std.zig.Ast;
 
@@ -231,7 +233,7 @@ pub fn reads(c: *Context, rule: Rule, follows: *const fn (*Context, Model.Declar
         try walk.collect();
         var found: ?Ast.TokenIndex = null;
         if (declared) {
-            _ = try walk.sequence(statements[start + 1 ..], .{ .at = .unwritten, .parts = walk.everyPart() & ~walk.undefinedIn(init) });
+            _ = try walk.sequence(block, statements[start + 1 ..], .{ .at = .unwritten, .parts = walk.everyPart() & ~walk.undefinedIn(init) });
             if (walk.read) |token| {
                 found = token;
                 try c.at(rule, token, if (walk.handed)
@@ -401,6 +403,9 @@ const Walk = struct {
     shape: Shape = .none,
     /// The call read as succeeding, where its success is what a branch takes.
     succeeding: ?Ast.Node.Index = null,
+    /// The deferred statements that mention the local, met on the path being walked, each with
+    /// the block whose exits run it, outermost first (`ended`, `exiting`).
+    deferred: std.ArrayList(struct { block: Ast.Node.Index, node: Ast.Node.Index }) = .empty,
     /// The `bool` constants walked, each with what the local holds where it is true.
     flags: std.ArrayList(struct { decl: Model.Declaration.Id, state: State }) = .empty,
     /// What the parts are of: the struct, or the array's length.
@@ -552,10 +557,25 @@ const Walk = struct {
             if (isBlock(tree, each)) break i;
         } else return start;
         const statement_at = if (inner == 0) mention else around.items[inner - 1];
+        // What each block around it deferred before it runs where that block is left.
+        var j = around.items.len;
+        while (j > inner) {
+            j -= 1;
+            if (!isBlock(tree, around.items[j])) continue;
+            const holder = if (j == inner) statement_at else around.items[j - 1];
+            var buffer: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, around.items[j]).?;
+            for (statements[0..std.mem.findScalar(Ast.Node.Index, statements, holder).?]) |each| switch (tree.nodeTag(each)) {
+                .@"defer", .@"errdefer" => if (w.mentioned(each)) try w.deferred.append(w.c.allocator, .{ .block = around.items[j], .node = each }),
+                else => {},
+            };
+        }
         // A `return` that holds it (`orelse return giveUp(&x)`) leaves with it so: nothing after
-        // it is reached.
+        // it is reached but what it runs.
         for (around.items[0..inner]) |each| if (tree.nodeTag(each) == .@"return") {
-            if (w.param and w.exitsBy(each)) w.exited(each);
+            const past = try w.exiting(each, start);
+            if (past.at == .done) return .done;
+            if (w.param and past.at == .unwritten and w.exitsBy(each)) w.exited(each);
             return .left;
         };
         // The constructs a jump from the rest may go to, outermost first.
@@ -578,11 +598,12 @@ const Walk = struct {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const statements = tree.blockStatements(&buffer, up).?;
                 const position = std.mem.findScalar(Ast.Node.Index, statements, child).?;
-                // A deferred one runs at the block's end, after what follows it.
-                switch (tree.nodeTag(child)) {
-                    .@"defer", .@"errdefer" => {},
-                    else => state = try w.sequence(statements[position + 1 ..], state),
-                }
+                // A deferred one runs at the block's end, after what follows it, before what was
+                // deferred ahead of it.
+                state = try w.sequence(up, switch (tree.nodeTag(child)) {
+                    .@"defer", .@"errdefer" => &.{},
+                    else => statements[position + 1 ..],
+                }, state);
                 if (blockLabel(tree, up) != null) state = w.leave(state);
             } else if (tree.fullWhile(up)) |loop| {
                 state = w.leave(state);
@@ -1008,13 +1029,83 @@ const Walk = struct {
         return full.ast.fn_expr == up;
     }
 
-    fn sequence(w: *Walk, statements: []const Ast.Node.Index, state: State) Context.Error!State {
+    /// The state past `statements`, `block`'s or the rest of them, and past the deferred
+    /// statements its end runs.
+    fn sequence(w: *Walk, block: Ast.Node.Index, statements: []const Ast.Node.Index, state: State) Context.Error!State {
         var now = state;
         for (statements) |each| {
-            if (now.at != .unwritten) return now;
+            if (now.at != .unwritten) break;
             now = try w.statement(each, now);
         }
+        return w.ended(block, now);
+    }
+
+    /// The state past `block`'s end, reached with `state`: its deferred statements run there,
+    /// the last met first, but an `errdefer`, which runs where it is left by an error only. They
+    /// are dropped, every exit of the block past.
+    fn ended(w: *Walk, block: Ast.Node.Index, state: State) Context.Error!State {
+        var now = state;
+        while (w.deferred.items.len > 0) {
+            const last = w.deferred.items[w.deferred.items.len - 1];
+            if (last.block != block) break;
+            _ = w.deferred.pop();
+            if (now.at != .unwritten or w.tree.nodeTag(last.node) == .@"errdefer") continue;
+            now = try w.statement(w.tree.nodeData(last.node).node, now);
+        }
         return now;
+    }
+
+    /// The state an exit at `node` leaves with, past the deferred statements it runs, reached
+    /// with `state`: each one met for a `return` or a failing `try`, an `errdefer`'s too (read,
+    /// not taken as written: the exit may be no error's); those of the blocks a `break` or
+    /// `continue` leaves. They stay for the walk's other paths.
+    fn exiting(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!State {
+        const tree = w.tree;
+        const goes: ?Ast.Node.Index = switch (tree.nodeTag(node)) {
+            .@"break", .@"continue" => jumpTarget(tree, w.model, node),
+            else => null,
+        };
+        var now = state;
+        var i = w.deferred.items.len;
+        while (i > 0 and now.at == .unwritten) {
+            i -= 1;
+            const entry = w.deferred.items[i];
+            const errors = tree.nodeTag(entry.node) == .@"errdefer";
+            if (goes) |target| {
+                if (tree.firstToken(entry.block) < tree.firstToken(target) or tree.lastToken(entry.block) > tree.lastToken(target)) break;
+                if (errors) continue;
+            }
+            const past = try w.statement(tree.nodeData(entry.node).node, now);
+            if (past.at == .done) return .done;
+            if (!errors) now = past;
+        }
+        return now;
+    }
+
+    /// Whether a deferred statement reads the local undefined at an exit inside `node` (a
+    /// `return`, a `try`, a jump out; not `node` as a `return` or jump, which `statement` takes),
+    /// for a statement the walk does not follow to it: what the exit leaves with is no less than
+    /// `state`.
+    fn readAtExits(w: *Walk, node: Ast.Node.Index, state: State) Context.Error!bool {
+        if (w.deferred.items.len == 0 or state.at != .unwritten) return false;
+        const tree = w.tree;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        var token = first;
+        while (token <= last) : (token += 1) switch (tree.tokenTag(token)) {
+            .keyword_return, .keyword_try, .keyword_break, .keyword_continue => break,
+            else => {},
+        } else return false;
+        for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+            .@"return", .@"try", .@"break", .@"continue" => {
+                const each: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                const at = tree.nodeMainToken(each);
+                if ((each == node and tag != .@"try") or at < first or at > last) continue;
+                if ((try w.exiting(each, state)).at == .done) return true;
+            },
+            else => {},
+        };
+        return false;
     }
 
     /// The state past `node`, reading it in the order Zig evaluates it.
@@ -1025,7 +1116,10 @@ const Walk = struct {
         // takes what it holds to where it goes.
         switch (tree.nodeTag(node)) {
             .@"return", .@"break", .@"continue", .unreachable_literal => {
-                const past = if (w.mentioned(node)) try w.simple(node, state) else state;
+                const reached = if (w.mentioned(node)) try w.simple(node, state) else state;
+                if (reached.at == .done) return .done;
+                // The deferred statements it leaves by run before it goes.
+                const past = if (tree.nodeTag(node) == .unreachable_literal) reached else try w.exiting(node, reached);
                 if (past.at == .done) return .done;
                 if (tree.nodeTag(node) == .@"return" and past.at == .unwritten and w.exitsBy(node)) w.exited(node);
                 w.jump(node, past);
@@ -1035,26 +1129,26 @@ const Walk = struct {
         }
         // An `if` may test a guard's result, or a flag that says more of the local.
         if (!w.mentioned(node) and !w.returnsIn(node) and !w.tests(node, state) and (w.flags.items.len == 0 or tree.fullIf(node) == null)) {
-            // It leaves the local as it is, for what follows and for where a jump in it goes;
-            // one that never goes on reaches nothing after it.
+            // It leaves the local as it is, for what follows, for where a jump in it goes and
+            // for what an exit in it runs; one that never goes on reaches nothing after it.
+            if (try w.readAtExits(node, state)) return .done;
             w.jumpsIn(node, state);
             return if (leavesAlways(tree, node)) .left else state;
         }
         switch (tree.nodeTag(node)) {
             .@"defer", .@"errdefer" => {
-                // Run at the scope's exits, where the local may be as unwritten as here; what it
-                // writes holds before none of them.
-                const past = try w.statement(tree.nodeData(node).node, state);
-                return if (past.at == .done) .done else state;
+                // Run where its block is left after it (`ended`, `exiting`), not here.
+                try w.deferred.append(w.c.allocator, .{ .block = w.model.parentOf(node).?, .node = node });
+                return state;
             },
             // What runs as the program compiles runs in its place all the same.
             .@"comptime" => return w.statement(tree.nodeData(node).node, state),
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const statements = tree.blockStatements(&buffer, node).?;
-                if (blockLabel(tree, node) == null) return w.sequence(statements, state);
+                if (blockLabel(tree, node) == null) return w.sequence(node, statements, state);
                 try w.enter(node);
-                return w.leave(try w.sequence(statements, state));
+                return w.leave(try w.sequence(node, statements, state));
             },
             else => {},
         }
@@ -1103,9 +1197,10 @@ const Walk = struct {
                 if ((try w.statement(e, state)).at == .done) return .done;
                 return state;
             }
-            // A range of literals with passes in it runs the body, and its first pass is as read;
+            // A loop over what has passes in it runs the body, and its first pass is as read;
             // what reaches the loop's end is what its passes end with and what jumps there take.
-            return if (passes(tree, loop.ast.inputs[0])) body else state;
+            for (loop.ast.inputs) |input| if (try passes(w.c, w.file, input)) return body;
+            return state;
         }
         // A `bool` constant keeps what its being true shows: `const ok = n == 64 and if
         // (fill(&buf)) |_| true else |_| false`.
@@ -1645,6 +1740,7 @@ const Walk = struct {
             if (token >= first and token <= last) w.exited(each);
         };
         w.jumpsIn(node, state);
+        if (try w.readAtExits(node, state)) return .done;
         const Found = struct {
             use: Use,
             token: Ast.TokenIndex,
@@ -3747,7 +3843,7 @@ fn writesWholeRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Conte
     const statements = c.project.at(decl.file).file.tree.blockStatements(&buffer, found.body) orelse return false;
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
     try walk.collect();
-    const end = try walk.sequence(statements, .unwritten);
+    const end = try walk.sequence(found.body, statements, .unwritten);
     if (walk.read != null or walk.exit_unwritten or (end.at != .written and end.at != .left)) return false;
     // Given `undefined` again, it must be written whole again before every return.
     for (try walk.undefinings()) |again| {
@@ -4035,7 +4131,7 @@ fn needsRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Err
     walk.needing = true;
     try walk.collect();
     const owner = walk.owner orelse return null;
-    _ = try walk.sequence(statements, .unwritten);
+    _ = try walk.sequence(found.body, statements, .unwritten);
     if (walk.read != null) return null;
     return .{ .mask = walk.needed, .owner = owner };
 }
@@ -4388,12 +4484,22 @@ fn strideAt(tree: *const Ast, start: Ast.Node.Index, stride: u64, index: []const
     return literalValue(tree, n) == count and literalValue(tree, one) == 1;
 }
 
-fn passes(tree: *const Ast, input: Ast.Node.Index) bool {
-    if (tree.nodeTag(input) != .for_range) return false;
-    const start, const end = tree.nodeData(input).node_and_opt_node;
-    const from = literalValue(tree, start) orelse return false;
-    const to = literalValue(tree, end.unwrap() orelse return false) orelse return false;
-    return to > from;
+/// Whether a loop over `input` runs a pass: a range whose end is past its start, each a constant
+/// (`0..n`), or memory of a known length above zero, a literal's elements (`.{ a, b }`) or an
+/// array's (`Range.memoryLength`). Every input of one loop has the same length.
+fn passes(c: *Context, file: Project.FileId, input: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const at = ungrouped(tree, input);
+    if (tree.nodeTag(at) == .for_range) {
+        const start, const end = tree.nodeData(at).node_and_opt_node;
+        const from = try Range.constantValue(c, file, start) orelse return false;
+        const to = try Range.constantValue(c, file, end.unwrap() orelse return false) orelse return false;
+        return to > from;
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, at)) |literal| return literal.ast.elements.len > 0;
+    const length = try Range.memoryLength(c, file, at) orelse return false;
+    return length > 0;
 }
 
 /// `node` without the parentheses around it.

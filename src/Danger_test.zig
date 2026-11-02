@@ -1144,12 +1144,12 @@ test "A019 reads a local handed to a call as written only where the call writes 
     // Written whole (no finding): fillAll (line 13), fillTry under `try` (16), fillSet (18),
     // @memset (21), a `for` setting each element (23, 24), a field read once set and every
     // field set (26, 28), readSliceAll under `try` and under `catch return` (29, 30), a file's
-    // writer and a fixed writer keep the buffer (31, 32), io.random (34) and writeInt (35).
+    // writer and a fixed writer keep the buffer (31, 32), io.random (34), writeInt (35), and a
+    // `defer` that reads it at the return, after the write (36).
     // Findings: fillOne sets a part (14), fillSome returns first (15), fillTry's failure caught
     // (17, the read), fillCatch returns from a `catch` (19), readsFirst reads first (20),
     // @memset of a part (22, the read), a `for` that reads the element (25), a field never set
-    // read (27), std's fixed reader reads its bytes (33), a `defer` reads before the write
-    // (36), and a pointer kept in a local (37).
+    // read (27), std's fixed reader reads its bytes (33), and a pointer kept in a local (37).
     const found = try run(pack.unsafe_set,
         \\const std = @import("std");
         \\const P = struct { a: u8, b: u8 };
@@ -1189,7 +1189,7 @@ test "A019 reads a local handed to a call as written only where the call writes 
         \\pub fn e1() u8 { var x: u8 = undefined; defer print(x); x = 1; return x; }
         \\pub fn e2() u8 { var b: [4]u8 = undefined; const p = &b; p.* = @splat(0); return b[0]; }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 17, 19, 20, 22, 25, 27, 33, 36, 37 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 17, 19, 20, 22, 25, 27, 33, 37 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads the program's function that only hands a buffer to std's keeps as keeping it, a declaration literal by its result location, and a `for` over several inputs that sets each element first" {

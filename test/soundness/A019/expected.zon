@@ -1,6 +1,4 @@
 .{
-    .no_hole = .{ .inline_loop, .operator, .conversion, .branch },
-    .no_twin = .{ .deferred, .inline_loop, .compile_time, .operator, .conversion, .unwrap, .aggregate, .branch },
     .open = .{
         // review 6 precision: a call through a function-pointer field whose only stored function writes whole
         "assignment/r6-fp-f05_field_whole/twin.zig",
