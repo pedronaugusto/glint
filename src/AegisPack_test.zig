@@ -1045,16 +1045,52 @@ test "a guard through a loop is decided by the states its back edge and its exit
 }
 
 test "a guard's release handed off is a declared transfer" {
-    const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn park(_: anytype) void {}\n";
-    // Handed to a callback's context: decided, as a futex wait parks its task.
+    const head = "const G = @import(\"aegis\").Guarded;\nfn ready() bool { return true; }\nfn park(handoff: anytype) void { handoff.release(); }\n";
+    // Handed to a callback's context that releases it: decided, as a futex wait parks its task.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) { held.deinit(); return; } held.value().* += 1; var handoff = held.handOff(); park(&handoff); if (ready()) return; }", pack.cleanup, true, 0);
     // Handed off in one branch, released in the other.
-    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff: G(u32).Handoff = undefined; if (ready()) { handoff = held.handOff(); park(&handoff); } else held.deinit(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); if (ready()) { var handoff = held.handOff(); park(&handoff); } else held.deinit(); }", pack.cleanup, true, 0);
+    // A hand-off assigned to a local declared before is not followed, as no acquisition
+    // assigned so is: undecided, never clear.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff: G(u32).Handoff = undefined; if (ready()) { handoff = held.handOff(); park(&handoff); } else held.deinit(); }", pack.cleanup, false, 0);
     // Released after the hand-off, or handed off after release: a witness each.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff = held.handOff(); park(&handoff); held.deinit(); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); held.deinit(); var handoff = held.handOff(); park(&handoff); }", pack.cleanup, true, 1);
-    // A hand-off thrown away hands nothing: the lock reaches the block's end held.
+    // A hand-off thrown away is never released: the lock stays held, one finding at the discard.
     try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); _ = held.handOff(); }", pack.cleanup, true, 1);
+    // A hand-off is released exactly once: one kept and never released holds the lock.
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff = held.handOff(); _ = &handoff; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(g: *G(u32)) void { var held = g.acquire(); var handoff = held.handOff(); handoff.release(); }", pack.cleanup, true, 0);
+    // Returned, it is the caller's to release.
+    try expectJudged(head ++ "fn give(g: *G(u32)) G(u32).Handoff { var held = g.acquire(); return held.handOff(); }\npub fn f(g: *G(u32)) void { var handoff = give(g); handoff.release(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn give(g: *G(u32)) G(u32).Handoff { var held = g.acquire(); return held.handOff(); }\npub fn f(g: *G(u32)) void { var handoff = give(g); _ = &handoff; }", pack.cleanup, true, 1);
+}
+
+test "an owner a helper gives through an optional, a comptime choice or an array is owed" {
+    const head = "const G = @import(\"aegis\").Guarded;\nconst RW = @import(\"aegis\").RwGuarded(u32);\n";
+    try expectJudged(head ++ "fn lock(g: *G(u32), busy: bool) ?G(u32).Guard { if (busy) return null; return g.acquire(); }\npub fn f(g: *G(u32), busy: bool) void { var held = lock(g, busy) orelse return; held.value().* += 1; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "fn lock(g: *G(u32), busy: bool) ?G(u32).Guard { if (busy) return null; return g.acquire(); }\npub fn f(g: *G(u32), busy: bool) void { var held = lock(g, busy) orelse return; defer held.deinit(); held.value().* += 1; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "fn both(a: *G(u32), b: *G(u32)) [2]G(u32).Guard { return .{ a.acquire(), b.acquire() }; }\npub fn f(a: *G(u32), b: *G(u32)) void { var held = both(a, b); held[0].value().* += 1; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "fn both(a: *G(u32), b: *G(u32)) [2]G(u32).Guard { return .{ a.acquire(), b.acquire() }; }\npub fn f(a: *G(u32), b: *G(u32)) void { var held = both(a, b); defer for (&held) |*one| one.deinit(); held[0].value().* += 1; }", pack.cleanup, true, 0);
+    // One element released is not the array's release: undecided, never clear.
+    try expectJudged(head ++ "fn both(a: *G(u32), b: *G(u32)) [2]G(u32).Guard { return .{ a.acquire(), b.acquire() }; }\npub fn f(a: *G(u32), b: *G(u32)) void { var held = both(a, b); held[0].deinit(); }", pack.cleanup, false, 0);
+    // A method on a comptime choice of receivers reads each receiver's bindings: plain data
+    // either way (glint's own memo of a call's reading, Undefined.remembered).
+    try expectJudged("fn Map(comptime V: type) type { return struct { v: V, pub fn get(m: *const @This()) ?V { return m.v; } }; }\nconst Needs = struct { mask: u64 };\nconst Memo = struct { found: Map(bool), needed: Map(Needs) };\nfn remembered(comptime T: type, memo: *Memo) ?T { const map = if (T == bool) &memo.found else &memo.needed; if (map.get()) |known| return known; return null; }\npub fn f(memo: *Memo) void { _ = remembered(bool, memo); _ = remembered(Needs, memo); }", pack.cleanup, true, 0);
+}
+
+test "a capture of what a call reaches copies it; a generic's returns and stores copy its parameter" {
+    const head = "const G = @import(\"aegis\").Guarded;\n";
+    const state = "const State = struct { guard: ?G(u32).Guard, guards: [2]G(u32).Guard, fn slot(s: *State) *?G(u32).Guard { return &s.guard; } fn held(s: *State) []G(u32).Guard { return s.guards[0..]; } };\n";
+    try expectJudged(head ++ state ++ "pub fn f(s: *State) void { if (s.slot().*) |g| { var copy = g; copy.deinit(); } }", pack.copies, true, 1);
+    try expectJudged(head ++ state ++ "pub fn f(s: *State) void { for (s.held()) |g| { var copy = g; copy.deinit(); } }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(l: *G(u32)) void { if (l.tryAcquire()) |g| { var copy = g; copy.deinit(); } }", pack.copies, true, 0);
+    try expectJudged(head ++ "fn dup(x: anytype) [2]@TypeOf(x) { return .{ x, x }; }\npub fn f(l: *G(u32)) void { var both = dup(l.acquire()); both[0].deinit(); both[1].deinit(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn dup(x: anytype, out: *[2]@TypeOf(x)) void { out[0] = x; out[1] = x; }\npub fn f(l: *G(u32)) void { var both: [2]G(u32).Guard = undefined; dup(l.acquire(), &both); both[0].deinit(); }", pack.copies, true, 1);
+    try expectJudged(head ++ "fn fill(x: anytype, out: []@TypeOf(x)) void { for (out) |*o| o.* = x; }\npub fn f(l: *G(u32)) void { var both: [2]G(u32).Guard = undefined; fill(l.acquire(), &both); both[0].deinit(); }", pack.copies, true, 1);
+    // Written once and read nowhere else, the parameter is moved.
+    try expectJudged(head ++ "fn one(x: anytype) [1]@TypeOf(x) { return .{x}; }\npub fn f(l: *G(u32)) void { var held = one(l.acquire()); held[0].deinit(); }", pack.copies, true, 0);
+    try expectJudged(head ++ "fn put(x: anytype, out: *@TypeOf(x)) void { out.* = x; }\npub fn f(l: *G(u32)) void { var held: G(u32).Guard = undefined; put(l.acquire(), &held); held.deinit(); }", pack.copies, true, 0);
 }
 
 test "an owner stored where the function does not hold it is transferred" {

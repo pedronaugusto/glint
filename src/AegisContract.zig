@@ -13,6 +13,8 @@ pub const Kind = enum {
     bytes_writer,
     guarded,
     guard,
+    /// A guard's release handed past its frame, `Guard.handOff`'s `Handoff`: released once.
+    handoff,
     scalar,
     condition,
     once,

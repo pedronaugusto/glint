@@ -798,6 +798,7 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
     return switch (k) {
         .secret, .bytes => &.{ "deinit", "moveInto" },
         .guard, .buffer, .slots, .table => &.{"deinit"},
+        .handoff => &.{"release"},
         .reservation => &.{ "release", "consume", "moveInto" },
         .owned => &.{ "deinit", "take", "moveInto" },
         // A std resource held raw: `close`, a child's `kill` or `wait`.
@@ -955,6 +956,8 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             const outer = (try enclosingPublished(c, container)) orelse break :blk .other;
             // A guarded owner's guard, reached by its resolved type rather than its acquisition.
             if (outer == .guarded and Contract.guardType(containerName(c, container) orelse "")) break :blk .{ .owner = .guard };
+            // A guard's release handed past its frame, released once as the guard is.
+            if (outer == .guarded and std.mem.eql(u8, containerName(c, container) orelse "", "Handoff")) break :blk .{ .owner = .handoff };
             break :blk .other;
         },
         else => .other,
@@ -1565,7 +1568,7 @@ fn scalarShaped(c: *Context, value: Facts.Value) bool {
 /// reservations point at, an owner bound to its address in Debug).
 fn movable(k: Contract.Kind) bool {
     return switch (k) {
-        .guard, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
+        .guard, .handoff, .shared, .reservation, .buffer, .slots, .table, .machine, .must_use, .stage, .issuer, .atomic, .context => true,
         else => false,
     };
 }
@@ -1642,8 +1645,9 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bo
 
 /// Whether a capture's value is moved into it: the value of a call or other value made in
 /// place (`if (b.take()) |r|`), or a local nothing reads again after the capture copies it. A
-/// capture of a place (`if (h.maybe) |r|`, `for (h.list) |r|`, a switch's operand) copies what
-/// stays there.
+/// capture of a place (`if (h.maybe) |r|`, `for (h.list) |r|`, a switch's operand), or of what
+/// a call's pointer or slice reaches (`if (s.slot().*) |r|`, `for (s.held()) |r|`), copies
+/// what stays there.
 fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
@@ -1673,7 +1677,17 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
             .@"try", .@"comptime" => tree.nodeData(value).node,
             else => break,
         };
-        if (placeRoot(tree, value) == null) continue;
+        if (placeRoot(tree, value) == null) {
+            // What a pointer a call gives points at (`s.slot().*`), or the elements of a
+            // slice one gives (`for (s.held()) |g|`), stays where it is: the capture copies it.
+            if (try sharedReturn(c, tree, value) != null) return .no;
+            if (tree.fullFor(holder) != null) switch (try c.facts.resolve(c.file, value)) {
+                .pointer => return .no,
+                .unknown => |why| unknown = why,
+                else => {},
+            };
+            continue;
+        }
         // A local moved by the capture: nothing reads it again (a loop's condition reads it
         // each time round).
         if (tree.nodeTag(value) != .identifier) return .no;
@@ -2302,9 +2316,9 @@ fn acquiring(c: *Context, site: Facts.Key) Context.Error!bool {
     return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
 }
 
-/// Whether `call` gives a value of a type the library declares and the contract does not list
-/// (a guard's `Handoff`), a guard aside: the contract names every type that carries an
-/// obligation, so such a result owes no release here.
+/// Whether `call` gives a value of a type the library declares and the contract does not list,
+/// a guard and its `Handoff` aside: the contract names every type that carries an obligation,
+/// so such a result owes no release here.
 fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
     if (try Contract.owner(c, call) != null) return false;
     const value = switch (try c.facts.resolve(c.file, call)) {
@@ -2316,6 +2330,7 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
         else => return false,
     };
     if (try c.role(Contract.library, value) != null) return false;
+    if (try typed(c, value, 0) == .owner) return false;
     return c.inLibrary(Contract.library, container.file);
 }
 
@@ -2336,13 +2351,30 @@ fn givesOwner(c: *Context, call: Ast.Node.Index) Context.Error!Is {
         },
         .unknown => {},
     };
-    const result = switch (resolved) {
-        .error_union => |payload| payload.*,
-        else => |value| value,
-    };
-    return switch (result) {
-        .instance => .yes,
+    return switch (heldInstance(resolved)) {
+        .yes => .yes,
+        .no => .no,
         .unknown => |why| if (try stdTyped(c, call)) .no else .{ .unknown = why },
+    };
+}
+
+/// Whether a value holds an instance by value, an owner it may be: through an error union, an
+/// optional and an array (`?Guard`, `[2]Guard`), or as any of a choice of types (`if (shared)
+/// ReadGuard else WriteGuard`).
+fn heldInstance(value: Facts.Value) Is {
+    return switch (value) {
+        .instance => .yes,
+        .error_union, .optional, .array => |inner| heldInstance(inner.*),
+        .alternatives => |each| {
+            var out: Is = .no;
+            for (each) |one| switch (heldInstance(one)) {
+                .yes => return .yes,
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
+            return out;
+        },
+        .unknown => |why| .{ .unknown = why },
         else => .no,
     };
 }
@@ -2553,6 +2585,8 @@ const Flow = struct {
             }
             if (try f.handedOff(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local capability is handed off after its cleanup or transfer on this straight-line path");
+                // Returned, the path ends there.
+                if (f.tree.nodeTag(stmt) == .@"return") return .{ .paths = out };
                 state = .released;
                 continue;
             }
@@ -3316,8 +3350,15 @@ const Flow = struct {
                 found = .members;
                 continue;
             }
-            if (f.tree.nodeTag(parent) != .field_access or f.tree.nodeData(parent).node_and_token[0] != candidate) return .other;
-            const member = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(parent).node_and_token[1]));
+            // An element of an array of owners (`owners[0].value()`) is used as the owner is.
+            var reached = candidate;
+            var holder = parent;
+            if (f.tree.nodeTag(parent) == .array_access and f.tree.nodeData(parent).node_and_node[0] == candidate) {
+                reached = parent;
+                holder = f.model.parentOf(parent) orelse return .other;
+            }
+            if (f.tree.nodeTag(holder) != .field_access or f.tree.nodeData(holder).node_and_token[0] != reached) return .other;
+            const member = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(holder).node_and_token[1]));
             // A move hands the owner on, as a release ends it (`kept`).
             if (releaseName(f.kind, member) or (f.kind == .owned and std.mem.eql(u8, member, "move"))) return .other;
             found = .members;
@@ -3341,14 +3382,13 @@ const Flow = struct {
         return givesOwner(f.c, value);
     }
 
-    /// `owner.handOff()` kept in a local or assigned: the guard's release passes to the code
-    /// the hand-off is given, a transfer declared where it happens, so the walk need not
-    /// follow it there. Discarded (`_ = owner.handOff()`), it releases nothing.
+    /// `owner.handOff()` kept in a local, assigned or returned: the guard's release passes to
+    /// the hand-off, an owner of its own, released once by its `release` (a local of it is
+    /// walked from its acquisition as any owner is, the caller's where it is returned).
+    /// Discarded (`_ = owner.handOff()`), the hand-off is the leak, reported there.
     fn handedOff(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        const value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) blk: {
-            const data = f.tree.nodeData(stmt).node_and_node;
-            if (f.tree.nodeTag(data[0]) == .identifier and std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(data[0])), "_")) return false;
-            break :blk data[1];
+        const value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .@"return") f.tree.nodeData(stmt).opt_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) blk: {
+            break :blk f.tree.nodeData(stmt).node_and_node[1];
         } else return false;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return false;
@@ -3885,7 +3925,27 @@ fn endsInExit(tree: *const Ast, stmt: Ast.Node.Index) bool {
 }
 /// `owner.<release>(...)`: the call that ends the obligation of an owner of kind `k`.
 fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract.Kind) Context.Error!bool {
+    if (try releasedEach(c, node, token, k)) return true;
     return releaseName(k, (try ownerCall(c, node, token)) orelse return false);
+}
+/// `for (&owners) |*owner| owner.deinit();`: a loop over the local array `token` declares,
+/// whose one statement releases each element through its pointer capture.
+fn releasedEach(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract.Kind) Context.Error!bool {
+    const tree = try c.project.syntax(try c.source());
+    const loop = tree.fullFor(node) orelse return false;
+    if (loop.ast.inputs.len != 1 or loop.ast.else_expr != .none or loop.label_token != null) return false;
+    const input = loop.ast.inputs[0];
+    if (tree.nodeTag(input) != .address_of) return false;
+    const index = Contract.local(c, tree.nodeData(input).node) orelse return false;
+    if (c.project.at(c.file).model.declarations[@backingInt(index)].token != token) return false;
+    if (tree.tokenTag(loop.payload_token) != .asterisk) return false;
+    var body = loop.ast.then_expr;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, body)) |statements| {
+        if (statements.len != 1) return false;
+        body = statements[0];
+    }
+    return releaseName(k, (try ownerCall(c, body, loop.payload_token + 1)) orelse return false);
 }
 /// The member `node` calls on the local `token` declares, if it is such a call.
 fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!?[]const u8 {

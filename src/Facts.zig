@@ -916,7 +916,111 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
         }
     }
+    try self.storedCopies(function, out);
     try self.scalarCasts(function, out);
+}
+
+/// What `function`'s own `return`s and assignments write of a generic parameter's value, as
+/// `directCopies` reads a local's initializer: the parameter or a part of it (`return .{ x, x }`,
+/// `out[0] = x;`). The parameter itself written once, in no loop, where nothing else in the body
+/// may hold it (`holdingReads`), is moved there (`out.* = x;`); else each such write is a copy.
+fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const whole = self.scopeNode(function);
+    const body = t.nodeData(whole).node_and_node[1];
+    const first = t.firstToken(body);
+    const last = t.lastToken(body);
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const value = switch (tag) {
+            .@"return" => t.nodeData(node).opt_node.unwrap() orelse continue,
+            .assign => blk: {
+                const sides = t.nodeData(node).node_and_node;
+                if (t.nodeTag(sides[0]) == .identifier and std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(sides[0])), "_")) continue;
+                break :blk sides[1];
+            },
+            else => continue,
+        };
+        // The function's own statement, run as it runs: not a nested function's or a
+        // `comptime` block's.
+        if (self.innermostFunction(function.file, model.scopeOf(at)) != whole or inComptime(t, model, node)) continue;
+        var looped = false;
+        var up = model.parentOf(node);
+        while (up) |parent| : (up = model.parentOf(parent)) {
+            if (parent == body) break;
+            if (t.fullWhile(parent) != null or t.fullFor(parent) != null) looped = true;
+        }
+        const parts = try self.copiedParts(function.file, value);
+        for (parts.places) |place| {
+            const position = self.runtimeParameter(function, place, 0) orelse continue;
+            const named: ?Model.Declaration.Id = if (t.nodeTag(place) == .identifier) if (model.reference(place)) |ref| ref.declaration else null else null;
+            // The parameter itself is its argument, read as written where it is bound; a part
+            // whose value resolves where it is written is the same copy in every binding.
+            const itself = if (named) |index| self.valueOfParameter(function, index) != null else false;
+            if (!itself and try self.resolve(function.file, place) != .unknown) continue;
+            if (itself and !looped and self.holdingReads(function, named.?) == 1) continue;
+            const site: Key = .{ .file = function.file, .node = node };
+            try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
+            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
+        }
+    }
+}
+
+/// The function node of the innermost function `scope` is in, if any.
+fn innermostFunction(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id) ?Ast.Node.Index {
+    const scopes = self.project.at(file).model.scopes;
+    var at: ?Model.Scope.Id = scope;
+    while (at) |s| : (at = scopes[@backingInt(s)].parent) {
+        if (scopes[@backingInt(s)].kind == .function) return scopes[@backingInt(s)].node;
+    }
+    return null;
+}
+
+/// How many reads in `function`'s body may hold the value of the declaration `index`, whole or
+/// a part (`mayHold`).
+fn holdingReads(self: *const Facts, function: Decl, index: Model.Declaration.Id) usize {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const body = t.nodeData(self.scopeNode(function)).node_and_node[1];
+    const first = t.firstToken(body);
+    const last = t.lastToken(body);
+    var count: usize = 0;
+    for (t.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != index) continue;
+        if (mayHold(t, model, node)) count += 1;
+    }
+    return count;
+}
+
+/// Whether the read `node` may hold the value it names, whole or a part: not an operand of an
+/// arithmetic, bit, comparison or boolean operator, nor of a builtin that makes a number or a
+/// pointer of it (`@intCast(x)`), nor of a type query (`@TypeOf(x)`); none of those holds an
+/// owner.
+fn mayHold(t: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) switch (t.nodeTag(parent)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (unevaluated(t.tokenSlice(t.nodeMainToken(parent)))) return false,
+        .fn_decl => break,
+        else => {},
+    };
+    const parent = model.parentOf(node) orelse return true;
+    return switch (t.nodeTag(parent)) {
+        .add, .sub, .mul, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .bool_not, .negation, .negation_wrap, .bit_not => false,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
+            const name = t.tokenSlice(t.nodeMainToken(parent));
+            for ([_][]const u8{ "@as", "@bitCast", "@field", "@unionInit" }) |through| if (std.mem.eql(u8, name, through)) break :blk true;
+            break :blk false;
+        },
+        else => true,
+    };
 }
 
 /// The integers made into a type, or read out of a value, by the type of `function`'s generic
@@ -1906,6 +2010,7 @@ fn callValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
 /// What `call`, the call at `node` (`f(a)`, or `@call`'s callee and tuple), gives.
 fn calledValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call) ResolveError!Value {
     const callee = try self.resolve(file, call.ast.fn_expr);
+    if (callee == .alternatives or callee == .function) if (try self.eachReceiver(file, call)) |value| return value;
     if (callee == .alternatives) return self.map(callee, {}, callResult);
     if (callee == .function) {
         if (try self.typeArgument(file, call, callee.function)) |result| return result;
@@ -2775,7 +2880,39 @@ fn written(self: *Facts, generic: Generic, node: Ast.Node.Index, depth: usize) R
 fn madeResult(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-    const receiver = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+    return self.madeResultOn(try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]), decl);
+}
+
+/// A method called on one of several receivers, each a made container's (`if (T == bool)
+/// &memo.found else &memo.needed`): what each one's method gives, read with that receiver's
+/// bindings. Null where a receiver is no made container's or its method does not resolve so.
+fn eachReceiver(self: *Facts, file: Project.FileId, call: Ast.full.Call) ResolveError!?Value {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    const data = tree.nodeData(call.ast.fn_expr).node_and_token;
+    const receiver = try self.resolve(file, data[0]);
+    if (receiver != .alternatives) return null;
+    const name = tree.tokenSlice(data[1]);
+    const each = try self.gpa.alloc(Value, receiver.alternatives.len);
+    for (receiver.alternatives, each) |one, *out| {
+        const container = switch (one) {
+            .instance, .container => |c| c,
+            .pointer => |p| switch (p.*) {
+                .instance, .container => |c| c,
+                else => return null,
+            },
+            else => return null,
+        };
+        const method = self.member(container, name) orelse return null;
+        if (self.project.at(method.file).model.declarations[@backingInt(method.index)].kind != .function) return null;
+        out.* = (try self.madeResultOn(one, method)) orelse return null;
+        if (unknownWithin(out.*)) return null;
+    }
+    return try self.choose(each);
+}
+
+/// `madeResult` of the method `decl` called on `receiver`.
+fn madeResultOn(self: *Facts, receiver: Value, decl: Decl) ResolveError!?Value {
     // A method called on a value of it, or a function called through the made type itself
     // (`Held.initFrom(source)` of `const Held = Owned(Payload, release)`).
     const container = switch (receiver) {
