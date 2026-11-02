@@ -243,9 +243,8 @@ fn arithmeticBuiltin(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.I
 /// A012: work sized by a number from input without a stated limit: an allocation, a
 /// container's growth or a read sized by one, and any read with `.unlimited`.
 pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
-    const flow = try Taint.get(c, Danger.peer_input);
+    const flow = try Taint.get(c, Danger.bounded_input);
     const tree = &c.project.at(c.file).file.tree;
-    const sizes = [_][]const u8{ "n", "len", "new_len", "new_n", "new_capacity", "additional_count", "num", "capacity", "count", "new_size", "size" };
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
@@ -253,35 +252,53 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         if (!site(c, node)) continue;
         const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
         const decl = reached.decl orelse continue;
-        if (!reached.std) continue;
+        if (!reached.std or !fromReader(flow, decl) or try ownReader(c, flow, call)) continue;
         const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
-        const from_reader = if (Taint.readerType(flow.flow)) |r| r.file == decl.file else false;
-        // A reader over the program's own bytes (`Reader.fixed`) reads no peer's size.
-        const own = from_reader and tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
-        if (from_reader and !own and std.mem.find(u8, name, "Unlimited") != null) {
+        if (std.mem.find(u8, name, "Unlimited") != null) {
             try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
             continue;
         }
-        for (call.ast.params) |arg| if (from_reader and !own and tree.nodeTag(arg) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "unlimited")) {
+        for (call.ast.params) |arg| if (tree.nodeTag(arg) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "unlimited")) {
             try c.at(rule, tree.nodeMainToken(arg), try c.allocator.print("{s}(.unlimited): a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
         };
-        const names = try parameters(c, decl);
-        // A fixed reader's take, peek or discard views or skips bytes the program already
-        // holds and fails past them: no work a peer sizes, unless the read allocates.
-        if (own and !try allocates(c, decl)) continue;
-        for (reached.args, 0..) |arg, position| {
-            if (position >= names.len) break;
-            var sized = false;
-            for (sizes) |size| sized = sized or std.mem.eql(u8, names[position], size);
-            if (!sized) continue;
-            // A size checked against the program's own limit (`if (size > max) return`) is
-            // bounded by it.
-            if (try capped(c, flow, arg)) continue;
-            // A size the callee only moves a position by (`Reader.toss`) takes no work.
-            if (try constant(c, decl, position)) continue;
-            try judged(c, flow, rule, arg, try ranged(c, flow, arg), .number, try c.allocator.print("{s} sized by a number from input: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{name}));
-        }
     }
+    // What the program hands std that std sizes memory or work by (Taint.sinkSites).
+    for (try Taint.sinkSites(c, flow, c.file)) |sized| {
+        if (!site(c, sized.at)) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, sized.at);
+        if (sized.callee) |decl| {
+            // A fixed reader's take, peek or discard views or skips bytes the program already
+            // holds and fails past them: no work a peer sizes, unless the read allocates.
+            if (fromReader(flow, decl) and call != null and try ownReader(c, flow, call.?) and !try allocates(c, decl)) continue;
+        }
+        const read = if (sized.length) try Taint.lengthAt(c, flow, c.file, sized.value) else try ranged(c, flow, sized.value);
+        // What std takes only kept to a range is data, a peer's number or not.
+        const level: Taint.Level = if (sized.narrowed and read == .number) .data else read;
+        if (level != .unknown and !level.reaches(flow.spec.reaches)) continue;
+        // A size checked against the program's own limit (`if (size > max) return`) is
+        // bounded by it.
+        if (!sized.length and try capped(c, flow, sized.value)) continue;
+        const name = if (sized.callee) |decl| c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name else tree.tokenSlice(tree.lastToken(call.?.ast.fn_expr)); // unreachable: a sink's site is a call
+        if (!sized.decided and level.reaches(flow.spec.reaches)) {
+            try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(sized.value)), .unresolved, try c.allocator.print("{s} is given a number from input through a call that does not resolve: what it sizes by it is not known", .{name}));
+            continue;
+        }
+        const what = if (sized.length) "the length of memory from input" else "a number from input";
+        try judged(c, flow, rule, sized.value, level, flow.spec.reaches, try c.allocator.print("{s} sized by {s}: a peer chooses how much memory or work it takes; bound it with aegis bounded.Limit or Budget first", .{ name, what }));
+    }
+}
+
+/// Whether std's function `decl` is a reader's.
+fn fromReader(flow: Taint.Fact, decl: Facts.Decl) bool {
+    return if (Taint.readerType(flow.flow)) |r| r.file == decl.file else false;
+}
+
+/// Whether a reader's method is called on a reader over the program's own bytes
+/// (`Reader.fixed`), which reads no peer's size.
+fn ownReader(c: *Context, flow: Taint.Fact, call: Ast.full.Call) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    return tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
 }
 
 /// A018: an error's name written where a peer reads it: internal text crossing to the peer.
@@ -1430,101 +1447,6 @@ fn within(c: *Context, node: Ast.Node.Index, param: Ast.Node.Index) bool {
 /// cannot tell.
 fn sink(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, comptime message: []const u8) Context.Error!void {
     try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
-}
-
-/// Per std function and parameter, whether the work it does stays the same whatever the
-/// parameter's value.
-const Constant = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, usize }, bool) = .empty };
-
-/// Whether std's function `decl` does the same work whatever its parameter at `position`: the
-/// parameter is only added to a field or compared (`r.seek += n; assert(r.seek <= r.end)`), and
-/// never passed to a call, made a loop's bound, held in a local or returned, where it could size
-/// work. A function without a body (a pointer's, a vtable's) may do anything.
-fn constant(c: *Context, decl: Facts.Decl, position: usize) Context.Error!bool {
-    const memo = try c.facts.memo(Constant);
-    if (memo.map.get(.{ decl, position })) |known| return known;
-    const tree = &c.project.at(decl.file).file.tree;
-    const model = &c.project.at(decl.file).model;
-    const names = try parameters(c, decl);
-    const result = done: {
-        if (position >= names.len or names[position].len == 0) break :done false;
-        const function = model.parentOf(model.declarations[@backingInt(decl.index)].node) orelse break :done false;
-        if (tree.nodeTag(function) != .fn_decl) break :done false;
-        const body = tree.nodeData(function).node_and_node[1];
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-        for (tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = tree.nodeMainToken(node);
-            if (token < first or token > last or !std.mem.eql(u8, tree.tokenSlice(token), names[position])) continue;
-            if (try grows(c, decl.file, node, body)) break :done false;
-        }
-        break :done true;
-    };
-    try memo.map.put(c.allocator, .{ decl, position }, result);
-    return result;
-}
-
-/// Whether the use `node` of a parameter can size work before the walk up reaches `body`: an
-/// argument of a call (not `assert`'s) or a builtin, a loop's bound, a local's value or what
-/// the function returns.
-fn grows(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        if (at == body) return false;
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| {
-            if (at == call.ast.fn_expr) continue;
-            const callee = tree.nodeMainToken(call.ast.fn_expr);
-            const name = if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.tokenSlice(callee + 1) else tree.tokenSlice(callee);
-            return !std.mem.eql(u8, name, "assert");
-        }
-        // A length that slices a slice (`s[a..][0..len]`) views no more than the slice holds:
-        // what is done over the view is sized by memory already there.
-        if (tree.fullSlice(parent)) |slice| if (slice.ast.end.unwrap() == at and try declaredSlice(c, file, slice.ast.sliced)) return false;
-        if (tree.fullWhile(parent)) |loop| if (at == loop.ast.cond_expr) return true;
-        if (tree.fullFor(parent)) |loop| for (loop.ast.inputs) |each| if (at == each) return true;
-        if (tree.fullVarDecl(parent)) |local| if (local.ast.init_node.unwrap() == at) return true;
-        switch (tree.nodeTag(parent)) {
-            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma, .@"return" => return true,
-            .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
-                const target = tree.nodeData(parent).node_and_node[0];
-                if (at != target and tree.nodeTag(target) == .identifier and !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-/// Whether `node`, peeled of the slices taken of it, is a field, local or parameter declared a
-/// slice (`[]T`): what it views is checked against the memory it holds, where a many-item
-/// pointer's is not.
-fn declaredSlice(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    var base = node;
-    while (tree.fullSlice(base)) |slice| base = slice.ast.sliced;
-    switch (tree.nodeTag(base)) {
-        .identifier, .field_access => {},
-        else => return false,
-    }
-    // One this does not name is no slice: the length it is sliced by stays judged.
-    const decl = switch (try c.facts.definition(file, base)) {
-        .decl => |found| found,
-        .none, .unknown => return false,
-    };
-    const written = &c.project.at(decl.file).file.tree;
-    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-    const type_node = switch (record.kind) {
-        .field => (written.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap(),
-        .variable => (written.fullVarDecl(record.node) orelse return false).ast.type_node.unwrap(),
-        else => null,
-    } orelse return false;
-    const pointer = written.fullPtrType(type_node) orelse return false;
-    return pointer.size == .slice;
 }
 
 /// Whether a comparison holding where `node` is read puts it at most a clean value.

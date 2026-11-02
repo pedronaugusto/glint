@@ -76,7 +76,7 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input used before a parser refines it", .exception = .aegis }, .check = checkInput, .facts = &.{Danger.peer_input} },
     .{ .definition = .{ .id = integers, .name = "A010", .group = .family_policy, .purpose = "integer conversion or arithmetic on input that a peer can make fail", .exception = .aegis }, .check = checkIntegers, .facts = &.{Danger.peer_input} },
     .{ .definition = .{ .id = units, .name = "A011", .group = .family_policy, .purpose = "time crossing to std as a raw integer", .exception = .aegis }, .check = checkUnits },
-    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork, .facts = &.{Danger.peer_input} },
+    .{ .definition = .{ .id = bounded_work, .name = "A012", .group = .family_policy, .purpose = "work sized by input without a stated limit", .exception = .aegis }, .check = checkBoundedWork, .facts = &.{Danger.bounded_input} },
     .{ .definition = .{ .id = contracts, .name = "A013", .group = .family_policy, .purpose = "contract that is undefined behaviour when false in a release build", .exception = .aegis }, .check = checkContracts, .facts = &.{Danger.peer_input} },
     .{ .definition = .{ .id = lifetimes, .name = "A014", .group = .family_policy, .purpose = "pointer that outlives what it points into", .exception = .aegis }, .check = checkLifetimes },
     .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },

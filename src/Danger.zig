@@ -25,6 +25,9 @@ const Rule = @import("Rule.zig").Rule;
 /// The facts the pack's flow rules ask of the program's values (`Taint.Spec`): input a peer
 /// gives, which aegis's parse answers, and the writers that reach a peer.
 pub const peer_input: Taint.Spec = .{ .source = .{ .input = .{ .peer = true, .operator = false } }, .control = true, .answers = .{ .aegis = true } };
+/// A012's: peer input, and the sizes the program hands std (`Taint.sinkSites`), judged where
+/// they are a number.
+pub const bounded_input: Taint.Spec = .{ .source = peer_input.source, .control = peer_input.control, .answers = peer_input.answers, .sinks = .{ .size = true }, .reaches = .number };
 pub const peer_writer: Taint.Spec = .{ .source = .peer_writer, .control = true };
 const Ast = std.zig.Ast;
 

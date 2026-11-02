@@ -117,7 +117,7 @@ const std_files = [_]sources.Extra{
     \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
     \\pub fn limited(r: *@This(), limit: Limit, buffer: []u8) @This() { _ = r; _ = limit; _ = buffer; return .{}; }
     \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
-    \\pub fn readAlloc(r: *@This(), gpa: anytype, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
+    \\pub fn readAlloc(r: *@This(), gpa: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
     .{ .name = "std/mem.zig", .bytes = "pub fn asBytes(ptr: anytype) []u8 { _ = ptr; return &.{}; }\npub fn sort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void { _ = items; _ = lessThan; }\npub fn eql(comptime T: type, a: []const T, b: []const T) bool { _ = a; _ = b; return false; }\npub fn writeInt(comptime T: type, buffer: *[4]u8, value: T, endian: anytype) void { _ = buffer; _ = value; _ = endian; }\npub fn readInt(comptime T: type, buffer: anytype, endian: anytype) T { _ = buffer; _ = endian; return 0; }\npub fn findScalar(comptime T: type, s: []const T, v: T) ?usize { _ = s; _ = v; return null; }\npub fn total(items: anytype) usize { return items.count(); }\npub fn findScalarPos(comptime T: type, s: []const T, start: usize, v: T) ?usize { for (s[start..], start..) |x, i| if (x == v) return i; return null; }\npub const Allocator = struct { ptr: *anyopaque, pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { _ = self.rawAlloc(n * @sizeOf(T)); return &.{}; } pub fn create(self: Allocator, comptime T: type) !*T { _ = self.rawAlloc(@sizeOf(T)); return undefined; } pub fn destroy(self: Allocator, ptr: anytype) void { const bytes: [*]u8 = @ptrCast(@constCast(ptr)); _ = self; _ = bytes; } pub fn rawAlloc(self: Allocator, len: usize) ?[*]u8 { _ = self; _ = len; return null; } };" },
@@ -236,6 +236,8 @@ const std_imports = [_]sources.ExtraImport{
     .{ .from = 1, .spelling = "Io/File.zig", .target = 7 },
     // File.Reader's `interface`, the reader it reads through.
     .{ .from = 7, .spelling = "Reader.zig", .target = 12 },
+    // The reader's allocating reads take std's Allocator.
+    .{ .from = 12, .spelling = "../mem.zig", .target = 13 },
     .{ .from = 0, .spelling = "process.zig", .target = 8 },
     .{ .from = 0, .spelling = "array_list.zig", .target = 9 },
     .{ .from = 0, .spelling = "hash_map.zig", .target = 10 },
@@ -3385,20 +3387,22 @@ test "A012 finds work sized by a number from input and reads with no limit" {
     try expect(pack.bounded_work, input_program, 2);
 }
 
-test "A012 leaves a size std only moves a position by, and finds one it passes on" {
+test "A012 leaves a size std only moves a position by or compares, and finds one it allocates by" {
+    // `toss` adds it to a position and `take`'s fill compares it: neither sizes work by it.
     try expect(pack.bounded_work,
         \\const std = @import("std");
-        \\pub fn f(r: *std.Io.Reader) !void {
+        \\pub fn f(r: *std.Io.Reader, gpa: std.mem.Allocator) !void {
         \\    const n = try r.takeInt(u32, 0);
         \\    r.toss(n);
         \\    _ = try r.take(n);
+        \\    _ = try r.readAlloc(gpa, n);
         \\}
     , 1);
 }
 
-test "A012 reads a length that views a slice std holds as no work: what is done over the view is sized by memory already there" {
-    // std's `slice` views its declared slice (clean); `raw` views a many-item pointer, which
-    // no length check bounds (6).
+test "A012 reads a view std makes as no work, of a slice or a many-item pointer: what is done over it is the program's" {
+    // std's `slice` views its declared slice and `raw` a many-item pointer: neither allocates
+    // or counts a loop by the length (whether `raw`'s view is in bounds is A009's).
     const held: sources.Extra = .{ .name = "std/held.zig", .bytes =
         \\pub const Held = struct {
         \\    extra: []u32,
@@ -3416,7 +3420,8 @@ test "A012 reads a length that views a slice std holds as no work: what is done 
         \\    return viewed + h.raw(n).len;
         \\}
     , &(std_files ++ [_]sources.Extra{held}), &(std_imports ++ [_]sources.ExtraImport{ .{ .from = 0, .spelling = "held.zig", .target = std_files.len }, .{ .spelling = "held.zig", .target = std_files.len } }));
-    try std.testing.expectEqualSlices(u32, &.{6}, found.lines[0..found.findings]);
+    try std.testing.expectEqual(0, found.findings);
+    try std.testing.expectEqual(0, found.undecided);
 }
 
 test "A009 reads an array literal's memory by the type it names: one with a sentinel reads it at its length, as a typed one does" {
@@ -6577,14 +6582,13 @@ test "A012 reads a take, peek or discard on a fixed reader as no work a peer siz
         \\    return r.take(size);
         \\}
     , 0);
-    // A stream's take is a peer's size, and so is a fixed reader's read that allocates.
+    // A stream's read that allocates is a peer's size, and so is a fixed reader's.
     try expect(pack.bounded_work,
         \\const std = @import("std");
         \\pub fn f(in: *std.Io.Reader, body: []const u8, gpa: std.mem.Allocator) ![]u8 {
         \\    var r: std.Io.Reader = .fixed(body);
         \\    const size = try in.takeInt(u32, 0);
-        \\    _ = try in.take(size);
-        \\    _ = gpa;
+        \\    _ = try in.readAlloc(gpa, size);
         \\    return r.take(0);
         \\}
     , 1);

@@ -30,7 +30,7 @@ pub const Spec = struct {
     control: bool,
     answers: Answers = .{},
     sinks: Sinks = .{},
-    /// The least level a sink site reaches the sink at (`Taint.SinkSite.verdict`).
+    /// The least level at which a sink site's value reaches the sink (`Taint.sinkSites`).
     reaches: Level = .data,
 };
 
