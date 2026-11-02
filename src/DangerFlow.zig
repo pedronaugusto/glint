@@ -377,7 +377,10 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             // nothing in it can change that (`invariant`); a `for` by each range's end.
             var decided: Decided = .{ .loop = node };
             var unbounded = false;
+            // A while's continue expression runs before each next pass, as its body does.
+            var after: ?Ast.Node.Index = null;
             const body = if (tree.fullWhile(node)) |loop| body: {
+                after = loop.ast.cont_expr.unwrap();
                 unbounded = forever(tree, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
                 if (!unbounded) try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 break :body loop.ast.then_expr;
@@ -400,6 +403,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             }
             if (!unbounded and !by_input and !unknown) continue;
             if (try cancels(c, c.file, body, 0, .{})) continue;
+            if (after) |each| if (try cancels(c, c.file, each, 0, .{})) continue;
             // A bound the input fact cannot read may be one a peer sets: never cleared.
             if (unread or (!unbounded and !by_input)) {
                 if (unread) {
