@@ -128,7 +128,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
                 if (args.len != 2) continue;
-                switch (try placeInSecret(c, types, try Governed.bytesPlace(c, tree, args[0]))) {
+                switch (try placeInSecret(c, types, (try Facts.accesses.sideOf(c.facts, c.file, args[0])).node())) {
                     .no => {},
                     .unknown => |why| if (why != .generic) try c.undecided(rule, tree.tokenStart(token), .unresolved, "memory written by hand whose holder does not resolve may be std's secret material"),
                     .yes => |held| try c.at(rule, token, try c.allocator.print("{s}: std.crypto {s} written by hand, a store the optimizer may drop; aegis Secret wipes it", .{ name, held })),
@@ -582,10 +582,10 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     if (times.items.len == 0) return;
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const copy = (try Governed.byteCopy(c, tree, node)) orelse continue;
+        const copy = (try Facts.accesses.copyAt(c.facts, c.file, node)) orelse continue;
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
-        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.into))) {
+        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.into.node()))) {
             .no => continue,
             .unknown => {
                 try c.undecided(rule, tree.tokenStart(token), .unresolved, "a byte copy into memory whose type does not resolve may write std's time raw");
@@ -593,7 +593,7 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
             },
             .yes => {},
         }
-        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.from))) {
+        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.from.node()))) {
             .yes => {},
             .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a byte copy into std's time from memory whose type does not resolve may be a raw count"),
             .no => try c.at(rule, token, "std's time written as raw bytes; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration"),

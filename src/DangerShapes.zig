@@ -779,8 +779,8 @@ fn writeOf(c: *Context, resources: []const ?Facts.Container, file: Project.FileI
     }
 }
 
-/// How the field whose address `address` takes is written through it: by `@memcpy` or
-/// `@memmove` into its bytes (`std.mem.asBytes(&s.f)` the destination), as `=` of the source's
+/// How the field whose address `address` takes is written through it: by a copy of memory into
+/// it (`@memcpy(std.mem.asBytes(&s.f), ...)`, `Facts.accesses.copyAt`), as `=` of the source's
 /// value; through a constant local that keeps the pointer, by each use of it (`p.* = v`,
 /// `p.handle = h`; a read of a member or of `p.*` writes nothing); handed anywhere else, it may
 /// be written through.
@@ -788,21 +788,15 @@ fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     const parent = model.parentOf(address) orelse return .address;
-    if (bytesOf(tree, parent) == address) {
-        const copy = model.parentOf(parent) orelse return .address;
-        var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, copy, &buffer);
-        const name = switch (tree.nodeTag(copy)) {
-            .builtin_call_two, .builtin_call_two_comma => tree.tokenSlice(tree.nodeMainToken(copy)),
-            else => return .address,
-        };
-        if (!std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) return .address;
-        if (args.len != 2) return .address;
+    if (try enclosingCopy(c, file, address)) |copy| {
+        const place = tree.nodeData(address).node;
         // The field's bytes as the source are read, not written.
-        if (args[0] != parent) return .none;
-        const source = bytesOf(tree, args[1]) orelse return .unknown;
-        const value = if (tree.nodeTag(source) == .address_of) tree.nodeData(source).node else return .unknown;
-        return if (try filled(c, resources, file, value)) .none else .owner;
+        if (copy.from == .place and copy.from.place == place) return .none;
+        if (copy.into != .place or copy.into.place != place) return .address;
+        return switch (copy.from) {
+            .place => |value| if (try filled(c, resources, file, value)) .none else .owner,
+            .pointer => .unknown,
+        };
     }
     const variable = tree.fullVarDecl(parent) orelse return .address;
     if (variable.ast.init_node.unwrap() != address or tree.tokenTag(variable.ast.mut_token) != .keyword_const) return .address;
@@ -829,18 +823,20 @@ fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.
     return out;
 }
 
-/// The operand of `std.mem.asBytes(x)` at `node`, if it is one.
-fn bytesOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return null;
-    if (call.ast.params.len != 1) return null;
-    const callee = switch (tree.nodeTag(call.ast.fn_expr)) {
-        .field_access => tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]),
-        .identifier => tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr)),
-        else => return null,
-    };
-    if (!std.mem.eql(u8, callee, "asBytes")) return null;
-    return call.ast.params[0];
+/// The copy of memory the expression `node` is part of, within its statement: the first builtin
+/// copy (`Facts.accesses.copyAt`) among the nodes around it.
+fn enclosingCopy(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.accesses.Copy {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (try Facts.accesses.copyAt(c.facts, file, parent)) |copy| return copy;
+        switch (tree.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon, .fn_decl => return null,
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Whether `parent` (an `if`, `while` or `for`) captures `node` by pointer (`|*p|`).

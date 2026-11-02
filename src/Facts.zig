@@ -5622,14 +5622,87 @@ pub const accesses = struct {
         return index;
     }
 
-    /// The pointer whose memory `pointer` points at, through each call of a view (`viewOf`): the
+    const BuiltinStore = struct { pointer: usize, kind: Kind, value: ?usize };
+    /// The memory builtins that write through a pointer: the argument that is the pointer, the
+    /// store's kind, and the argument it stores where one does.
+    const writer_builtins = [_]struct { []const u8, BuiltinStore }{
+        .{ "@memcpy", .{ .pointer = 0, .kind = .set, .value = null } },
+        .{ "@memmove", .{ .pointer = 0, .kind = .set, .value = null } },
+        .{ "@memset", .{ .pointer = 0, .kind = .set, .value = 1 } },
+        .{ "@atomicStore", .{ .pointer = 1, .kind = .set, .value = 2 } },
+        .{ "@atomicRmw", .{ .pointer = 1, .kind = .update, .value = 3 } },
+        .{ "@cmpxchgWeak", .{ .pointer = 1, .kind = .set, .value = 3 } },
+        .{ "@cmpxchgStrong", .{ .pointer = 1, .kind = .set, .value = 3 } },
+    };
+    /// The memory builtins that read through a pointer, by the argument that is the pointer.
+    const reader_builtins = [_]struct { []const u8, usize }{
+        .{ "@memcpy", 1 },    .{ "@memmove", 1 },     .{ "@atomicLoad", 1 },
+        .{ "@atomicRmw", 1 }, .{ "@cmpxchgWeak", 1 }, .{ "@cmpxchgStrong", 1 },
+    };
+
+    /// A copy of memory a builtin makes: what it writes and what it reads.
+    pub const Copy = struct { into: Side, from: Side };
+
+    /// One side of a copy: the place its pointer points at (`pointed`), or where that names
+    /// none, the pointer through its views (`viewed`), whose pointee no place here names.
+    pub const Side = union(enum) {
+        place: Ast.Node.Index,
+        pointer: Ast.Node.Index,
+
+        pub fn node(self: Side) Ast.Node.Index {
+            return switch (self) {
+                inline else => |n| n,
+            };
+        }
+    };
+
+    /// The copy `node` makes, if it is a builtin that writes through one pointer what it reads
+    /// through another, no value of its own (`@memcpy`, `@memmove`).
+    pub fn copyAt(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Copy {
+        const tree = &facts.project.at(file).file.tree;
+        switch (tree.nodeTag(node)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => return null,
+        }
+        const name = tree.tokenSlice(tree.nodeMainToken(node));
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        const into = for (writer_builtins) |entry| {
+            if (std.mem.eql(u8, name, entry[0]) and entry[1].value == null and entry[1].kind == .set) break entry[1].pointer;
+        } else return null;
+        const from = for (reader_builtins) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) break entry[1];
+        } else return null;
+        if (into >= args.len or from >= args.len) return null;
+        return .{ .into = try sideOf(facts, file, args[into]), .from = try sideOf(facts, file, args[from]) };
+    }
+
+    /// The side a pointer a builtin writes or reads through is: the place it points at, or itself
+    /// through its views.
+    pub fn sideOf(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!Side {
+        if (try pointed(facts, file, pointer)) |place| return .{ .place = place };
+        return .{ .pointer = try viewed(facts, file, pointer) };
+    }
+
+    /// The pointer whose memory `pointer` points at, through what keeps it: the casts that keep
+    /// an address (`throughCasts`), a slice of a pointer, and each call of a view (`viewOf`), the
     /// argument it is a view of (`std.mem.asBytes(&x)` points at what `&x` does). A call of a
     /// choice of functions is followed where each is a view of the same argument.
     pub fn viewed(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!Ast.Node.Index {
         const tree = &facts.project.at(file).file.tree;
         var at = pointer;
         for (0..16) |_| {
-            at = uncast(tree, at);
+            at = try facts.throughCasts(file, at);
+            switch (tree.nodeTag(at)) {
+                // A slice of an array is the array's memory: its place (`pointed`).
+                .slice_open, .slice, .slice_sentinel => {
+                    const base = tree.fullSlice(at).?.ast.sliced; // unreachable: the tag is a slice's
+                    if (!pointing(try facts.resolve(file, base))) return at;
+                    at = base;
+                    continue;
+                },
+                else => {},
+            }
             var buffer: [1]Ast.Node.Index = undefined;
             if (tree.fullCall(&buffer, at) == null) return at;
             const call = (try calls.at(facts, file, at)) orelse return at;
@@ -6134,17 +6207,7 @@ pub const accesses = struct {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            const Store = struct { pointer: usize, kind: Kind, value: ?usize };
-            const writers = [_]struct { []const u8, Store }{
-                .{ "@memcpy", .{ .pointer = 0, .kind = .set, .value = null } },
-                .{ "@memmove", .{ .pointer = 0, .kind = .set, .value = null } },
-                .{ "@memset", .{ .pointer = 0, .kind = .set, .value = 1 } },
-                .{ "@atomicStore", .{ .pointer = 1, .kind = .set, .value = 2 } },
-                .{ "@atomicRmw", .{ .pointer = 1, .kind = .update, .value = 3 } },
-                .{ "@cmpxchgWeak", .{ .pointer = 1, .kind = .set, .value = 3 } },
-                .{ "@cmpxchgStrong", .{ .pointer = 1, .kind = .set, .value = 3 } },
-            };
-            for (writers) |entry| {
+            for (writer_builtins) |entry| {
                 if (!std.mem.eql(u8, name, entry[0])) continue;
                 const pointer = if (entry[1].pointer < args.len) args[entry[1].pointer] else return;
                 const value: ?Ast.Node.Index = if (entry[1].value) |k| (if (k < args.len) args[k] else null) else null;
@@ -6323,11 +6386,7 @@ pub const accesses = struct {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
-            const readers = [_]struct { []const u8, usize }{
-                .{ "@memcpy", 1 },    .{ "@memmove", 1 },     .{ "@atomicLoad", 1 },
-                .{ "@atomicRmw", 1 }, .{ "@cmpxchgWeak", 1 }, .{ "@cmpxchgStrong", 1 },
-            };
-            for (readers) |entry| {
+            for (reader_builtins) |entry| {
                 if (!std.mem.eql(u8, name, entry[0])) continue;
                 if (entry[1] >= args.len) return;
                 return w.pointee(w.make(node, args[entry[1]], .read, null));

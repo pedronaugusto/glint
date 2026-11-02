@@ -11,7 +11,6 @@ const Danger = @import("Danger.zig");
 const stdCall = Governed.stdCall;
 const Is = Governed.Is;
 const isStd = Governed.isStd;
-const byteCopy = Governed.byteCopy;
 const Shapes = @import("DangerShapes.zig");
 const Undefined = @import("Undefined.zig");
 const Flows = @import("DangerFlow.zig");
@@ -1124,7 +1123,7 @@ fn checkCopies(c: *Context) Context.Error!void {
         // A destructure copies what its value reads, as a declaration does; a copy of bytes
         // copies the memory it reads (`@memcpy(dst, std.mem.asBytes(&owner))`).
         if (tag == .assign_destructure) try checkCopy(c, tree, node, tree.assignDestructure(node).ast.value_expr, null);
-        if (try byteCopy(c, tree, node)) |copy| try checkCopy(c, tree, node, copy.from, null);
+        if (try Facts.accesses.copyAt(c.facts, c.file, node)) |copy| try checkCopy(c, tree, node, copy.from.node(), null);
         if (tag == .assign) {
             const sides = tree.nodeData(node).node_and_node;
             // `_ = x` discards the value: no second holder.
@@ -4073,10 +4072,10 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
                     }
                     continue;
                 }
-                if (try byteCopy(c, tree, at)) |copy| {
-                    const root = placeRoot(tree, copy.into) orelse continue;
+                if (try Facts.accesses.copyAt(c.facts, c.file, at)) |copy| {
+                    const root = placeRoot(tree, copy.into.node()) orelse continue;
                     if (Contract.local(c, root) != index) continue;
-                    if (try rawValue(c, copy.from, followed) or try requiredOwner(c, copy.from, scalar, tree.nodeMainToken(at)) == .scalar) return true;
+                    if (try rawValue(c, copy.from.node(), followed) or try requiredOwner(c, copy.from.node(), scalar, tree.nodeMainToken(at)) == .scalar) return true;
                     continue;
                 }
                 if (!assigning(tag)) continue;
