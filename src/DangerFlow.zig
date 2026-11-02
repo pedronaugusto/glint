@@ -63,7 +63,6 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 const parent = c.project.at(c.file).model.parentOf(node) orelse continue;
                 const loop = tree.fullFor(parent) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                if (try Proof.passes(c, c.file, parent)) continue;
                 try judged(c, flow, rule, end, try loopOperand(c, flow, parent, end), .number, loop_message);
             },
             // What decides the condition (`decides`): each comparison it joins by `and`, `or` and
@@ -71,8 +70,6 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             .@"while", .while_simple, .while_cont => {
                 const loop = tree.fullWhile(node) orelse continue;
                 if (try consumes(c, flow, loop.ast.then_expr)) continue;
-                // Passes shown within memory the function holds are no more than the work a peer sent.
-                if (try Proof.passes(c, c.file, node)) continue;
                 var decided: Decided = .{ .loop = node };
                 try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 for (decided.compared.items) |condition| {

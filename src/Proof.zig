@@ -40,10 +40,3 @@ pub fn notAfter(c: *Context, file: Project.FileId, start: Ast.Node.Index, end: A
 pub fn counts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     return try Range.small(c, file, node) or try Bounds.cleared(c, file, node, .count);
 }
-
-/// A loop's passes at most a short's count, or the length of memory the function holds that the
-/// loop leaves alone, on every path to each pass: a peer chooses no more passes than the work it
-/// already sent, whatever decides them.
-pub fn passes(c: *Context, file: Project.FileId, loop: Ast.Node.Index) Context.Error!bool {
-    return Bounds.cleared(c, file, loop, .passes);
-}

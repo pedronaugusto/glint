@@ -2134,10 +2134,14 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
 /// its type), or by a struct literal of its type assigned over a value
 /// (`x.* = .{ .state = .done }`); a whole copy of a holder is none (`stateWrites`). A move is a
 /// write under a switch or a condition on the field
-/// (`switch (f.state) { .start => f.state = .value, ... }`), or one whose
-/// value reads it (`f.state = if (f.state == .a) .b else f.state`, its integer plus one), there
-/// or where the function that writes it is called; each function that calls a writer writes it
-/// too. A switch on it reads past `orelse`, `.?` and parentheses. A kind set where its value is
+/// (`switch (f.state) { .start => f.state = .value, ... }`) or after a guard on it in its block
+/// (`if (f.state != .idle) return;`), or one whose value reads it
+/// (`f.state = if (f.state == .a) .b else f.state`, its integer plus one), there or where the
+/// function that writes it is called; each function that calls a writer writes it too, where
+/// the writer gives no state fixed where it is made (`fixedState`). A read
+/// is carried by a local it initializes, an `if` capture of it and a getter's calls (`carried`).
+/// A switch on it reads past `orelse`, `.?` and parentheses; an integer field is a state where
+/// a switch reads it as its enum (`@enumFromInt`). A kind set where its value is
 /// built or read (a table's layout, a date's kind) is data. A field moved on the records a loop
 /// walks is moved on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
@@ -2146,24 +2150,26 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     for (model.declarations, 0..) |decl, index| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
         const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-        const state = byValue(try c.facts.resolve(c.file, written)) orelse continue;
-        if (!isEnum(c, state)) continue;
+        const resolved = try c.facts.resolve(c.file, written);
+        // An integer is a state where a switch reads it as its enum (`@enumFromInt(x.state)`).
+        const integral = integer(resolved) != null;
+        if (!integral and !isEnum(c, byValue(resolved) orelse continue)) continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
         var writes: std.ArrayList(StateWrite) = .empty;
-        var switched = false;
         for (try fieldUses(c, decl.name)) |use| {
-            const use_tree = &c.project.at(use.file).file.tree;
-            const use_model = &c.project.at(use.file).model;
             const owner = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
             if (owner.file != holder.file or owner.scope != holder.scope) continue;
             try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
-            switched = switched or switchedOn(use_tree, use_model, use.node);
         }
+        try carried(c, &uses);
+        var switched = false;
+        for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, integral);
+        if (!switched) continue;
         try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, &writes);
         var writers: std.ArrayList(Facts.Key) = .empty;
         for (writes.items) |write| try writersOf(c, write, &writers, 0);
-        if (writers.items.len < 2 or !switched) continue;
+        if (writers.items.len < 2) continue;
         switch (try moved(c, uses.items, writes.items)) {
             .no => continue,
             .maybe => {
@@ -2174,6 +2180,62 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         }
         try c.at(rule, decl.token, try c.allocator.print("'{s}' is a state machine kept by hand: written in {d} functions, moved on its own value and switched on; aegis state.Machine states which transitions there are", .{ decl.name, writers.items.len }));
     }
+}
+
+/// Adds to `uses` the reads that carry a read of the state on: each reference to a local it
+/// initializes (`const now = j.state;`), to what an `if` or a `while` captures of it
+/// (`if (j.state) |now|`), and each call of a function that returns it (a getter), read past
+/// `orelse`'s left side, `.?`, parentheses and `@as`, and from those in turn.
+fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
+    var next: usize = 0;
+    while (next < uses.items.len and uses.items.len < 256) : (next += 1) {
+        const use = uses.items[next];
+        const tree = &c.project.at(use.file).file.tree;
+        const model = &c.project.at(use.file).model;
+        var at = use.node;
+        const parent = while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+            .unwrap_optional, .grouped_expression => {},
+            .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) break null,
+            .builtin_call_two, .builtin_call_two_comma => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) break null,
+            else => break parent,
+        } else null;
+        const node = parent orelse continue;
+        var local: ?Model.Declaration.Id = null;
+        if (tree.fullVarDecl(node)) |variable| {
+            if (variable.ast.init_node.unwrap() != at) continue;
+            for (model.declarations, 0..) |record, i| if (record.kind == .variable and record.node == node) {
+                local = @fromBackingInt(@intCast(i));
+            };
+        } else if (captureOf(tree, node, at)) |token| {
+            for (model.declarations, 0..) |record, i| if (record.kind == .capture and record.token == token) {
+                local = @fromBackingInt(@intCast(i));
+            };
+        } else if (tree.nodeTag(node) == .@"return") {
+            const function = enclosingFunction(model, tree, node) orelse continue;
+            for (try callsOf(c, use.file, function)) |call| try carry(c, uses, call);
+            continue;
+        }
+        const d = local orelse continue;
+        for (model.references) |reference| if (reference.declaration == d) try carry(c, uses, .{ .file = use.file, .node = reference.node });
+    }
+}
+
+/// The name token an `if` or a `while` captures its condition `condition` as, past `*`.
+fn captureOf(tree: *const Ast, node: Ast.Node.Index, condition: Ast.Node.Index) ?Ast.TokenIndex {
+    const cond, const payload = if (tree.fullIf(node)) |branch|
+        .{ branch.ast.cond_expr, branch.payload_token }
+    else if (tree.fullWhile(node)) |loop|
+        .{ loop.ast.cond_expr, loop.payload_token }
+    else
+        return null;
+    if (cond != condition) return null;
+    const token = payload orelse return null;
+    return if (tree.tokenTag(token) == .asterisk) token + 1 else token;
+}
+
+fn carry(c: *Context, uses: *std.ArrayList(Facts.Key), use: Facts.Key) Context.Error!void {
+    for (uses.items) |seen| if (seen.file == use.file and seen.node == use.node) return;
+    try uses.append(c.allocator, use);
 }
 
 /// A write of a state field: the node it is made at, the value it writes where one is read, and
@@ -2232,16 +2294,21 @@ fn recordLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
 }
 
 /// Whether the field read at `node` is a switch's operand, read past `orelse`'s left side, `.?`,
-/// parentheses and `@as`.
-fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+/// parentheses and `@as`; an integer's (`integral`) only where it is made its enum on the way
+/// (`@enumFromInt`, `@fromBackingInt`).
+fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, integral: bool) bool {
     var at = node;
+    var converted = !integral;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at;
+        if (tree.fullSwitch(parent)) |choice| return converted and choice.ast.condition == at;
         switch (tree.nodeTag(parent)) {
             .unwrap_optional, .grouped_expression, .address_of => {},
             .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
             .builtin_call_two, .builtin_call_two_comma => {
-                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return false;
+                const name = tree.tokenSlice(tree.nodeMainToken(parent));
+                if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) {
+                    converted = true;
+                } else if (!std.mem.eql(u8, name, "@as")) return false;
             },
             // `@atomicLoad(T, &x.state, order)`: the state, loaded.
             .builtin_call, .builtin_call_comma => {
@@ -2256,7 +2323,8 @@ fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool 
 }
 
 /// Adds to `writers` the function a write is made in, and, through calls of the program, each
-/// function that calls one that writes (a setter's callers write it too).
+/// function that calls one that writes (a setter's callers write it too), unless the write
+/// gives a state fixed where it is made (`.done`, `Phase.done`): its callers choose none.
 fn writersOf(c: *Context, write: StateWrite, writers: *std.ArrayList(Facts.Key), depth: u8) Context.Error!void {
     const tree = &c.project.at(write.file).file.tree;
     const model = &c.project.at(write.file).model;
@@ -2266,7 +2334,30 @@ fn writersOf(c: *Context, write: StateWrite, writers: *std.ArrayList(Facts.Key),
     }
     try writers.append(c.allocator, .{ .file = write.file, .node = function });
     if (depth == 4) return;
+    if (write.value) |value| if (try fixedState(c, write.file, value)) return;
     for (try callsOf(c, write.file, function)) |call| try writersOf(c, .{ .file = call.file, .node = call.node, .value = null }, writers, depth + 1);
+}
+
+/// Whether `node` gives one state whoever calls the function it is in: an enum literal
+/// (`.done`), a member of an enum type (`Phase.done`), or the integer of one
+/// (`@backingInt(Phase.done)`).
+fn fixedState(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .enum_literal => return true,
+        .grouped_expression => return fixedState(c, file, tree.nodeData(node).node_and_token[0]),
+        .field_access => {
+            const held = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
+            return held == .container and isEnum(c, held.container);
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (!std.mem.eql(u8, name, "@backingInt") and !std.mem.eql(u8, name, "@intFromEnum")) return false;
+            const operand = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return false;
+            return fixedState(c, file, operand);
+        },
+        else => return false,
+    }
 }
 
 /// The calls of the program that call the function declared by `function` in `file`, as
@@ -2328,6 +2419,15 @@ fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, f
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == function) return false;
+        // A guard before it in its block (`if (j.state != .idle) return;`) chooses it as a
+        // condition around it does.
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.blockStatements(&buffer, parent)) |statements| for (statements) |statement| {
+            if (statement == at) break;
+            const guard = tree.fullIf(statement) orelse continue;
+            if (guard.ast.else_expr != .none or !leaves(tree, guard.ast.then_expr)) continue;
+            if (reads(tree, uses, file, guard.ast.cond_expr)) return true;
+        };
         const condition = if (tree.fullSwitch(parent)) |s|
             s.ast.condition
         else if (tree.fullIf(parent)) |branch|
@@ -2337,15 +2437,32 @@ fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, f
         else
             continue;
         if (condition == at) continue;
-        const first = tree.firstToken(condition);
-        const last = tree.lastToken(condition);
-        for (uses) |use| {
-            if (use.file != file) continue;
-            const token = tree.nodeMainToken(use.node);
-            if (token >= first and token <= last) return true;
-        }
+        if (reads(tree, uses, file, condition)) return true;
     }
     return false;
+}
+
+/// Whether one of `uses` is within `node`.
+fn reads(tree: *const Ast, uses: []const Facts.Key, file: Project.FileId, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    for (uses) |use| {
+        if (use.file != file) continue;
+        const token = tree.nodeMainToken(use.node);
+        if (token >= first and token <= last) return true;
+    }
+    return false;
+}
+
+/// Whether `node` never goes on to the statement after it: a `return`, `break`, `continue` or
+/// `unreachable`, or a block ending in one.
+fn leaves(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| return statements.len != 0 and leaves(tree, statements[statements.len - 1]);
+    return switch (tree.nodeTag(node)) {
+        .@"return", .@"break", .@"continue", .unreachable_literal => true,
+        else => false,
+    };
 }
 
 fn isEnum(c: *Context, value: Facts.Container) bool {

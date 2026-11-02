@@ -331,8 +331,6 @@ fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, value, &buffer);
             if (std.mem.eql(u8, name, "@abs")) return true;
-            // A count of bits, or a bool's 0 or 1.
-            for ([_][]const u8{ "@ctz", "@clz", "@popCount", "@intFromBool" }) |count| if (std.mem.eql(u8, name, count)) return true;
             if (args.len == 1 and std.mem.eql(u8, name, "@intCast")) return nonnegativeIn(c, file, args[0], at, pointer, next, assumed);
             if (args.len != 2) return false;
             if (std.mem.eql(u8, name, "@as")) return nonnegativeIn(c, file, args[1], at, pointer, next, assumed);
@@ -1159,17 +1157,8 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
             } else null;
             // A constant with no type of its own has its initializer's: a number literal's
             // comptime type, which takes the other operand's.
-            if (decl) |d| {
-                if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
-                // A variable with no type of its own has its initializer's, which no assignment
-                // changes (`var i = at + 1` is a `usize` where `at` is): a runtime one, as Zig
-                // takes no comptime number for a `var`.
-                if (try inferred(c, d)) |init| switch (try typeOf(c, d.file, init, pointer, next)) {
-                    .int => |int| return .{ .int = int },
-                    else => {},
-                };
-                if (try element(c, d, pointer)) |typed| return typed;
-            }
+            if (decl) |d| if (try untyped(c, d)) |init| return typeOf(c, d.file, init, pointer, next);
+            if (decl) |d| if (try element(c, d, pointer)) |typed| return typed;
         },
         else => {},
     }
@@ -1380,16 +1369,6 @@ fn untyped(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
     const tree = &c.project.at(decl.file).file.tree;
     const variable = tree.fullVarDecl(record.node) orelse return null;
     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.type_node.unwrap() != null) return null;
-    return variable.ast.init_node.unwrap();
-}
-
-/// A variable's initializer, where it spells no type: the variable is of the initializer's type.
-fn inferred(c: *Context, decl: Facts.Decl) Context.Error!?Ast.Node.Index {
-    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-    if (record.kind != .variable) return null;
-    const tree = &c.project.at(decl.file).file.tree;
-    const variable = tree.fullVarDecl(record.node) orelse return null;
-    if (tree.tokenTag(variable.ast.mut_token) != .keyword_var or variable.ast.type_node.unwrap() != null) return null;
     return variable.ast.init_node.unwrap();
 }
 
@@ -4134,13 +4113,6 @@ pub fn memoryLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) C
 /// The greatest length of memory at a pointer width (Bounds).
 pub fn longest(pointer: u16) Magnitude {
     return length(pointer);
-}
-
-/// The greatest value `node` can have where it is never below zero, read as a step a loop
-/// takes (Bounds): null where either is not shown.
-pub fn stepMost(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Magnitude {
-    if (!try nonnegative(c, file, node, pointer)) return null;
-    return bound(c, file, node, pointer, 0);
 }
 
 /// The pointer widths a range is read at (Bounds).
