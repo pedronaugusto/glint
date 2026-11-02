@@ -1556,99 +1556,491 @@ fn calleeViewed(c: *Context, resources: []const ?Facts.Container, file: Project.
 }
 
 /// A021: lock order. A function that holds a guard of an aegis owner (`Guarded`,
-/// `BlockingGuarded`, `RwGuarded`, `SpinRwGuarded`, `Order.Ordered`) while it acquires another:
-/// two tasks that take two locks in two orders deadlock. The site is the second acquisition,
-/// unless both are ranked (`acquireOrdered`, `readOrdered`, `writeOrdered`, their forms), which
-/// `Order` checks in Debug. A guard is held from its acquisition to a `deinit` or `release` of it
-/// that is a statement of its own block (one under a branch may not run), or to the block's end
-/// when that is deferred, or when the guard is bound by no declaration of its own. An acquisition
-/// on a receiver that does not resolve is undecided in a function that takes a guard. One
-/// function's own acquisitions only: a call made while holding a guard is not followed.
+/// `BlockingGuarded`, `RwGuarded`, `SpinRwGuarded`, `Order.Ordered`) while it acquires another,
+/// or the same one again: two tasks that take two locks in two orders deadlock. The site is the
+/// later acquisition, unless both are ranked through one `Order.Context` (`acquireOrdered`,
+/// `readOrdered`, `writeOrdered`, their forms), which `Order` checks in Debug; ranked through
+/// two contexts, which may be two Orders' that rank nothing against each other, it is
+/// undecided. An acquisition is a call by meaning (Facts.calls): of an owner's acquire however
+/// it is named (`@call`, `@field`, an alias), or of a function whose value is a guard (a helper
+/// that returns one); a call whose value does not resolve is undecided in a function that
+/// takes a guard. What `@TypeOf` reads is never taken.
+///
+/// A guard is held from the statement that binds it, a local's declaration or assignment
+/// (through `try`, `catch`, `orelse`, a branch, a labeled block's `break`), to its release: a
+/// `deinit` or `release` of it, or an `if (g) |*h|` that releases `h`, as a later statement of
+/// its block or of one around it up to its declaration's; or such a `defer`, run at its block's
+/// exit in the reverse order of the defers there. A guard no statement binds, one used any
+/// other way (copied, stored, its address taken) or never so released, is held to the
+/// function's end; one held past a loop's pass is held through each pass of that loop, against
+/// itself too. A `break` or `continue` between a guard and its release may skip it: held to the
+/// end; past a `return` or `try` there, what the defers run on the way out runs holding it. A
+/// deferred acquisition runs at its block's exit. One function's own acquisitions only: a call
+/// made while holding a guard is not followed.
 pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const Held = struct { first: Ast.TokenIndex, last: Ast.TokenIndex, ranked: bool };
-    var held: std.ArrayList(Held) = .empty;
-    var acquisitions: std.ArrayList(struct { node: Ast.Node.Index, ranked: bool }) = .empty;
+    var taken: std.ArrayList(Taken) = .empty;
     var unresolved: std.ArrayList(struct { node: Ast.Node.Index, why: Facts.Unknown }) = .empty;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
-        const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
-        const method = tree.tokenSlice(method_token);
-        var acquires = false;
-        for ([_][]const u8{ "acquire", "read", "write", "tryAcquire", "tryRead", "tryWrite" }) |prefix| acquires = acquires or std.mem.startsWith(u8, method, prefix);
-        if (!acquires or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
-        const owner = try c.facts.resolve(c.file, receiver);
-        if (owner == .unknown) {
-            try unresolved.append(c.allocator, .{ .node = node, .why = owner.unknown });
-            continue;
-        }
-        if (try c.role(Contract.library, owner) != .guarded) continue;
-        const ranked = std.mem.find(u8, method, "Ordered") != null;
-        try acquisitions.append(c.allocator, .{ .node = node, .ranked = ranked });
-        // The guard's local, and how long it is held.
-        const parent = model.parentOf(node) orelse continue;
-        var at = parent;
-        while (tree.nodeTag(at) == .@"try" or tree.nodeTag(at) == .@"catch" or tree.nodeTag(at) == .grouped_expression) at = model.parentOf(at) orelse break;
-        const block = enclosingBlock(tree, model, at) orelse continue;
-        const variable = tree.fullVarDecl(at) orelse {
-            try held.append(c.allocator, .{ .first = tree.lastToken(node), .last = tree.lastToken(block), .ranked = ranked });
-            continue;
+    for (try Facts.calls.in(c.facts, c.file)) |*call| {
+        if (c.inTest(tree.nodeMainToken(call.node)) or !Danger.atRuntime(c, call.node) or typeOnly(tree, model, call.node)) continue;
+        const function = enclosingFunction(model, tree, call.node) orelse continue;
+        const lock = switch (try acquisitionOf(c, call)) {
+            .no => continue,
+            .unknown => |why| {
+                try unresolved.append(c.allocator, .{ .node = call.node, .why = why });
+                continue;
+            },
+            .lock => |lock| lock,
         };
-        const name = tree.tokenSlice(variable.ast.mut_token + 1);
-        const end = releaseOf(tree, block, at, name);
-        try held.append(c.allocator, .{ .first = tree.lastToken(at), .last = end, .ranked = ranked });
+        try taken.append(c.allocator, .{
+            .node = call.node,
+            .function = function,
+            .lock = lock,
+            .at = try timeOf(c, tree, model, tree.nodeMainToken(call.node), call.node),
+            .held = try heldSpan(c, tree, model, function, call.node),
+        });
     }
     // What does not resolve may be a guard where the function takes one.
-    for (unresolved.items) |each| for (acquisitions.items) |known| {
-        if (enclosingFunction(model, tree, known.node) != enclosingFunction(model, tree, each.node)) continue;
+    for (unresolved.items) |each| for (taken.items) |known| {
+        if (known.function != enclosingFunction(model, tree, each.node)) continue;
         try c.unknown(rule, each.node, each.why);
         break;
     };
-    for (acquisitions.items) |second| {
-        const token = tree.nodeMainToken(second.node);
-        for (held.items) |first| {
-            if (token <= first.first or token > first.last) continue;
-            if (first.ranked and second.ranked) continue;
-            try c.at(rule, tree.firstToken(second.node), "a second lock taken while a guard is held, not both ranked: two tasks taking them in two orders deadlock; aegis Order ranks them and checks the order in Debug");
+    for (taken.items) |second| for (taken.items) |first| {
+        if (first.function != second.function or !first.held.holds(second.at)) continue;
+        if (first.lock.ranked and second.lock.ranked) {
+            if (first.lock.context != null and first.lock.context == second.lock.context) continue;
+            try c.undecided(rule, tree.tokenStart(tree.firstToken(second.node)), .unresolved, "two locks ranked through two contexts: one Order's checks them, two Orders' may take them in two orders");
             break;
         }
-    }
+        try c.at(rule, tree.firstToken(second.node), "a second lock taken while a guard is held, not both ranked: two tasks taking them in two orders deadlock; aegis Order ranks them and checks the order in Debug");
+        break;
+    };
 }
 
-/// The block a statement stands in.
-fn enclosingBlock(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
+/// An acquisition A021 judges: the call, its function, the lock, when it runs and how long its
+/// guard is held.
+const Taken = struct { node: Ast.Node.Index, function: Ast.Node.Index, lock: Lock, at: Time, held: Held };
+
+/// A lock an acquisition takes: whether an Order ranks it, and the local or parameter that is
+/// its `Order.Context`, where one names it.
+const Lock = struct { ranked: bool, context: ?Model.Declaration.Id = null };
+
+/// When code runs within its function, compared in order: for each `defer` it is under,
+/// outermost first, its block's exit and then the reverse of the order the defers there are
+/// written in; then its own token.
+const Time = struct {
+    levels: []const Level,
+
+    const Level = struct { at: Ast.TokenIndex, order: u32 };
+
+    fn before(a: Time, b: Time) bool {
+        for (a.levels, 0..) |level, i| {
+            if (i == b.levels.len) return false;
+            const other = b.levels[i];
+            if (level.at != other.at) return level.at < other.at;
+            if (level.order != other.order) return level.order < other.order;
+        }
+        return false;
+    }
+
+    fn deferred(time: Time) bool {
+        return time.levels.len > 1;
+    }
+};
+
+/// How long a guard is held: after `start` and before `end`; what a defer runs, before `exit`,
+/// which a `return` or `try` between the guard and its release leaves at the function's end.
+const Held = struct {
+    start: Time,
+    end: Time,
+    exit: Time,
+
+    fn holds(held: Held, at: Time) bool {
+        return held.start.before(at) and at.before(if (at.deferred()) held.exit else held.end);
+    }
+};
+
+/// When the code at `token`, within `node`, runs (`Time`).
+fn timeOf(c: *Context, tree: *const Ast, model: *const Model, token: Ast.TokenIndex, node: Ast.Node.Index) Context.Error!Time {
+    var levels: std.ArrayList(Time.Level) = .empty;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
-            .block, .block_semicolon, .block_two, .block_two_semicolon => return parent,
-            .fn_decl => return null,
+            .@"defer", .@"errdefer" => {
+                const block = model.parentOf(parent) orelse break;
+                try levels.insert(c.allocator, 0, .{ .at = tree.lastToken(block), .order = std.math.maxInt(u32) - tree.firstToken(parent) });
+            },
+            .fn_decl => break,
             else => {},
+        }
+    }
+    try levels.append(c.allocator, .{ .at = token, .order = 0 });
+    return .{ .levels = levels.items };
+}
+
+/// How long the guard the acquisition `node` gives is held (`lockOrder`).
+fn heldSpan(c: *Context, tree: *const Ast, model: *const Model, function: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Held {
+    const body = tree.nodeData(function).node_and_node[1];
+    const last: Time = .{ .levels = try c.allocator.dupe(Time.Level, &.{.{ .at = tree.lastToken(body) + 1, .order = 0 }}) };
+    const bound = boundBy(tree, model, node);
+    const found = if (bound.declaration != null) releaseOf(tree, model, bound) else null;
+    const release = found orelse {
+        // Held to the end: through each pass of every loop around it.
+        const from = outermostLoop(tree, model, bound.statement, function);
+        const start = if (from) |loop| try timeOf(c, tree, model, tree.firstToken(loop), loop) else try timeOf(c, tree, model, tree.lastToken(bound.from), bound.from);
+        return .{ .start = start, .end = last, .exit = last };
+    };
+    const start = if (release.loop) |loop| try timeOf(c, tree, model, tree.firstToken(loop), loop) else try timeOf(c, tree, model, tree.lastToken(bound.from), bound.from);
+    const end = try timeOf(c, tree, model, tree.firstToken(release.call), release.call);
+    // What runs between the guard and a release written after it may leave without it.
+    var exits = false;
+    if (tree.firstToken(release.statement) > tree.lastToken(bound.statement)) {
+        for (tree.lastToken(bound.statement)..tree.firstToken(release.statement)) |token| switch (tree.tokenTag(@intCast(token))) {
+            .keyword_break, .keyword_continue => {
+                const from = outermostLoop(tree, model, bound.statement, function);
+                return .{ .start = if (from) |loop| try timeOf(c, tree, model, tree.firstToken(loop), loop) else start, .end = last, .exit = last };
+            },
+            .keyword_return, .keyword_try => exits = true,
+            else => {},
+        };
+    }
+    return .{ .start = start, .end = end, .exit = if (exits) last else end };
+}
+
+/// The outermost loop around `node` within `function`.
+fn outermostLoop(tree: *const Ast, model: *const Model, node: Ast.Node.Index, function: Ast.Node.Index) ?Ast.Node.Index {
+    var found: ?Ast.Node.Index = null;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (parent == function) break;
+        if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) found = parent;
+    }
+    return found;
+}
+
+/// A guard's binding (`boundBy`): the statement, the local, and the member of it that holds the
+/// guard where a record literal's field does; and the node after which it is held: the statement,
+/// or the acquisition where a literal holds others made after it.
+const Bound = struct { statement: Ast.Node.Index, declaration: ?Model.Declaration.Id, member: ?[]const u8 = null, from: Ast.Node.Index };
+
+/// The statement that binds the guard an acquisition gives, and the local it binds: a
+/// declaration's or an assignment's, its value reached through `try`, `catch`'s and `orelse`'s
+/// left side, parentheses, a branch's value and a labeled block's `break`; a record literal's
+/// field (`.{ .guard = l.acquire() }`, the local's member) and a tuple's element a destructure
+/// takes apart (`g, n = .{ l.acquire(), 1 }`) among them. Bound by no statement, the
+/// acquisition is its own.
+fn boundBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bound {
+    const unbound: Bound = .{ .statement = node, .declaration = null, .from = node };
+    var at = node;
+    while (model.parentOf(at)) |parent| {
+        const next: ?Ast.Node.Index = switch (tree.nodeTag(parent)) {
+            .@"try", .grouped_expression => parent,
+            .@"catch", .@"orelse" => if (tree.nodeData(parent).node_and_node[0] == at) parent else null,
+            .@"break" => labeled(tree, model, parent),
+            else => if (tree.fullIf(parent)) |branch| (if (branch.ast.cond_expr != at) parent else null) else if (tree.fullSwitchCase(parent)) |case| (if (case.ast.target_expr == at) parent else null) else if (tree.fullSwitch(parent)) |choice| (if (choice.ast.condition != at) parent else null) else null,
+        };
+        at = next orelse break;
+    }
+    var parent = model.parentOf(at) orelse return unbound;
+    var member: ?[]const u8 = null;
+    var from: ?Ast.Node.Index = null;
+    var fields: [2]Ast.Node.Index = undefined;
+    var elements: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&fields, parent)) |record| {
+        if (std.mem.findScalar(Ast.Node.Index, record.ast.fields, at) == null) return unbound;
+        // `.name = value`: the name two tokens before the value.
+        member = tree.tokenSlice(tree.firstToken(at) - 2);
+        from = node;
+        at = parent;
+        parent = model.parentOf(at) orelse return unbound;
+    } else if (tree.fullArrayInit(&elements, parent)) |tuple| {
+        const position = std.mem.findScalar(Ast.Node.Index, tuple.ast.elements, at) orelse return unbound;
+        const statement = model.parentOf(parent) orelse return unbound;
+        if (tree.nodeTag(statement) != .assign_destructure) return unbound;
+        const full = tree.assignDestructure(statement);
+        if (full.ast.value_expr != parent or position >= full.ast.variables.len) return unbound;
+        return .{ .statement = statement, .declaration = localOf(tree, model, full.ast.variables[position]) orelse return unbound, .from = node };
+    }
+    if (tree.fullVarDecl(parent)) |variable| {
+        if (variable.ast.init_node.unwrap() != at) return unbound;
+        return .{ .statement = parent, .declaration = localOf(tree, model, parent) orelse return unbound, .member = member, .from = from orelse parent };
+    }
+    if (tree.nodeTag(parent) != .assign) return unbound;
+    const target, const value = tree.nodeData(parent).node_and_node;
+    if (value != at) return unbound;
+    return .{ .statement = parent, .declaration = localOf(tree, model, target) orelse return unbound, .member = member, .from = from orelse parent };
+}
+
+/// The local variable `node` declares (`var g = ...`, a destructure's `var g`) or names (`g`).
+fn localOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
+    if (tree.fullVarDecl(node) != null) {
+        for (model.declarations, 0..) |record, i| {
+            if (record.kind == .variable and record.node == node) return @fromBackingInt(@intCast(i));
+        }
+        return null;
+    }
+    if (tree.nodeTag(node) != .identifier) return null;
+    const d = (model.reference(node) orelse return null).declaration orelse return null;
+    return if (model.declarations[@backingInt(d)].kind == .variable) d else null;
+}
+
+/// The labeled block a `break :label value` leaves with its value; null for a plain `break`,
+/// one that leaves a loop, and one with no value.
+fn labeled(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
+    const label, const value = tree.nodeData(jump).opt_token_and_opt_node;
+    const name = tree.tokenSlice(label.unwrap() orelse return null);
+    _ = value.unwrap() orelse return null;
+    var at = jump;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                const brace = tree.nodeMainToken(parent);
+                if (brace < 2 or tree.tokenTag(brace - 1) != .colon) continue;
+                if (std.mem.eql(u8, tree.tokenSlice(brace - 2), name)) return parent;
+            },
+            .fn_decl => return null,
+            else => if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) {
+                const keyword = tree.firstToken(parent);
+                if (keyword >= 2 and tree.tokenTag(keyword - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(keyword - 2), name)) return null;
+            },
         }
     }
     return null;
 }
 
-/// Where a guard named `name`, declared by the statement `declared` of `block`, is released: the
-/// first later statement of the block that is its `deinit(` or `release(` call, or the block's
-/// end (a deferred release runs there, and one under a branch may not run at all).
-fn releaseOf(tree: *const Ast, block: Ast.Node.Index, declared: Ast.Node.Index, name: []const u8) Ast.TokenIndex {
-    var buffer: [2]Ast.Node.Index = undefined;
-    const statements = tree.blockStatements(&buffer, block) orelse return tree.lastToken(block);
-    const start = std.mem.findScalar(Ast.Node.Index, statements, declared) orelse return tree.lastToken(block);
-    for (statements[start + 1 ..]) |statement| {
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&call_buffer, statement) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
-        const receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (tree.nodeTag(receiver) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(receiver)), name)) continue;
-        const spelled = tree.tokenSlice(method);
-        if (std.mem.eql(u8, spelled, "deinit") or std.mem.eql(u8, spelled, "release")) return tree.firstToken(statement);
+/// A guard's release (`releaseOf`): its statement, the call, and the outermost loop between
+/// the guard and the release, whose next pass the guard outlives.
+const Release = struct { statement: Ast.Node.Index, call: Ast.Node.Index, loop: ?Ast.Node.Index };
+
+/// Where the guard `decl` holds from `statement` is released: a later statement that releases
+/// it in `statement`'s block or one around it, up to its declaration's, or a `defer` of one
+/// there. Null where the guard is used any other way (`onlyHeld`) or no such release is found.
+fn releaseOf(tree: *const Ast, model: *const Model, bound: Bound) ?Release {
+    const statement = bound.statement;
+    const decl = bound.declaration.?; // unreachable: heldSpan asks only of a bound guard.
+    if (!onlyHeld(tree, model, decl, statement)) return null;
+    const declared = model.declarations[@backingInt(decl)].node;
+    var loop: ?Ast.Node.Index = null;
+    var at = statement;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) loop = parent;
+        switch (tree.nodeTag(parent)) {
+            .@"defer", .@"errdefer", .fn_decl => return null,
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => continue,
+        }
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = tree.blockStatements(&buffer, parent) orelse return null;
+        const own = std.mem.findScalar(Ast.Node.Index, statements, at) orelse return null;
+        for (statements, 0..) |each, i| {
+            if (tree.nodeTag(each) == .@"defer") {
+                if (releases(tree, model, tree.nodeData(each).node, decl, bound.member)) |call| return .{ .statement = each, .call = call, .loop = loop };
+                continue;
+            }
+            if (i <= own) continue;
+            if (releases(tree, model, each, decl, bound.member)) |call| return .{ .statement = each, .call = call, .loop = loop };
+        }
+        if (std.mem.findScalar(Ast.Node.Index, statements, declared) != null) return null;
     }
-    return tree.lastToken(block);
+    return null;
+}
+
+/// The call by which `node`, a statement or a `defer`'s expression, releases the guard `decl`:
+/// its `deinit(` or `release(` (of its `member`, where a record holds it), one of a block's
+/// statements, or one of what an `if (g) |*h|` with no `else` captures.
+fn releases(tree: *const Ast, model: *const Model, node: Ast.Node.Index, decl: Model.Declaration.Id, member: ?[]const u8) ?Ast.Node.Index {
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| {
+        for (statements) |each| if (releases(tree, model, each, decl, member)) |call| return call;
+        return null;
+    }
+    if (tree.fullIf(node)) |branch| {
+        if (branch.ast.else_expr != .none or tree.nodeTag(branch.ast.cond_expr) != .identifier) return null;
+        const reference = model.reference(branch.ast.cond_expr) orelse return null;
+        if (reference.declaration != decl) return null;
+        const payload = branch.payload_token orelse return null;
+        if (tree.tokenTag(payload) != .asterisk) return null;
+        for (model.declarations, 0..) |record, i| {
+            if (record.kind != .capture or record.token != payload + 1) continue;
+            return releases(tree, model, branch.ast.then_expr, @fromBackingInt(@intCast(i)), member);
+        }
+        return null;
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, node) orelse return null;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+    var receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+    if (member) |name| {
+        if (tree.nodeTag(receiver) != .field_access) return null;
+        const holder, const field = tree.nodeData(receiver).node_and_token;
+        if (!std.mem.eql(u8, tree.tokenSlice(field), name)) return null;
+        receiver = holder;
+    }
+    if (tree.nodeTag(receiver) != .identifier) return null;
+    const reference = model.reference(receiver) orelse return null;
+    if (reference.declaration != decl) return null;
+    const spelled = tree.tokenSlice(method);
+    return if (std.mem.eql(u8, spelled, "deinit") or std.mem.eql(u8, spelled, "release")) node else null;
+}
+
+/// Whether the guard local `decl` is only held: each use of it a member's (`g.value()`,
+/// `g.deinit()`), the statement that binds it, or an `if (g) |*h|`, which copies
+/// nothing. A copy, a store, its address taken may keep it past its release.
+fn onlyHeld(tree: *const Ast, model: *const Model, decl: Model.Declaration.Id, statement: Ast.Node.Index) bool {
+    for (model.references) |reference| {
+        if (reference.declaration != decl) continue;
+        const parent = model.parentOf(reference.node) orelse return false;
+        if (parent == statement) continue;
+        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == reference.node) continue;
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.cond_expr == reference.node) if (branch.payload_token) |payload| if (tree.tokenTag(payload) == .asterisk) continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Whether `node` is read by `@TypeOf`, which never runs it.
+fn typeOnly(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        switch (tree.nodeTag(parent)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@TypeOf")) return true,
+            .fn_decl => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// What a call takes (`lockOrder`): no lock, one, or what does not resolve.
+const Acquisition = union(enum) { no, lock: Lock, unknown: Facts.Unknown };
+
+/// Whether a call acquires a lock: a callee that is an aegis owner's acquire, by its
+/// declaration, or a value that is a guard (`guardValue`) for one that is not. Of a choice,
+/// any.
+fn acquisitionOf(c: *Context, call: *const Facts.calls.Call) Context.Error!Acquisition {
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => &.{},
+    };
+    var lock: ?Lock = null;
+    var other = choices.len == 0;
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse {
+            other = true;
+            continue;
+        };
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        const owner: Facts.Value = .{ .container = .{ .file = decl.file, .scope = record.scope } };
+        if (record.kind != .function or try c.role(Contract.library, owner) != .guarded) {
+            other = true;
+            continue;
+        }
+        if (!Contract.acquisition(record.name)) continue;
+        const ranked = std.mem.find(u8, record.name, "Ordered") != null;
+        // Of a choice, ranked only where each is; read before `lock` is written.
+        const found: Lock = .{ .ranked = ranked and (if (lock) |earlier| earlier.ranked else true), .context = if (ranked) contextOf(c, call) else null };
+        lock = found;
+    }
+    if (!other) return if (lock) |found| .{ .lock = found } else .no;
+    return switch (try guardValue(c, call.node)) {
+        .plain => .{ .lock = .{ .ranked = false } },
+        .ranked => .{ .lock = .{ .ranked = if (lock) |earlier| earlier.ranked else true, .context = contextOf(c, call) } },
+        .no => if (lock) |found| .{ .lock = found } else .no,
+        .unknown => |why| if (lock) |found| .{ .lock = found } else .{ .unknown = why },
+    };
+}
+
+/// The local or parameter a ranked acquisition's `Order.Context` argument names, `&` or not.
+fn contextOf(c: *Context, call: *const Facts.calls.Call) ?Model.Declaration.Id {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => return null,
+    };
+    // The receiver, the Io, the context.
+    if (args.len != 3) return null;
+    var at = args[2];
+    while (tree.nodeTag(at) == .address_of or tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node;
+    if (tree.nodeTag(at) != .identifier) return null;
+    return (model.reference(at) orelse return null).declaration;
+}
+
+/// Whether a value is a guard (`guardValue`), and an Order's ranked one.
+const Guard = union(enum) { no, plain, ranked, unknown: Facts.Unknown };
+
+/// Whether what a call gives, through its error union and optional, is a guard: a type
+/// declared in an aegis owner (`Guard`, `ReadGuard`, `WriteGuard`) or an Order's ranked
+/// capability. One that does not resolve is a guard where its declared result names one.
+fn guardValue(c: *Context, node: Ast.Node.Index) Context.Error!Guard {
+    var value = try c.facts.resolve(c.file, node);
+    while (true) switch (value) {
+        .error_union, .optional => |inner| value = inner.*,
+        else => break,
+    };
+    const each: []const Facts.Value = switch (value) {
+        .alternatives => |all| all,
+        else => (&value)[0..1],
+    };
+    var guard: Guard = .no;
+    for (each) |one| switch (one) {
+        .unknown => |why| {
+            if (try Contract.kind(c, c.file, node, 0) != .guard) return .{ .unknown = why };
+            return if (rankedForm(&c.project.at(c.file).file.tree, node)) .ranked else .plain;
+        },
+        .instance, .container => |held| switch (try guardType(c, held)) {
+            .no => {},
+            // Of a choice, ranked only where each is.
+            .plain => guard = .plain,
+            .ranked => if (guard == .no) {
+                guard = .ranked;
+            },
+            .unknown => |why| return .{ .unknown = why },
+        },
+        else => {},
+    };
+    return guard;
+}
+
+/// Whether a call is an owner's ranked acquisition by its form (`acquireOrdered`, `readOrdered`,
+/// ...), as AegisContract.kind reads an acquisition whose value does not resolve.
+fn rankedForm(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return false;
+    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+    const name = tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]);
+    return Contract.acquisition(name) and std.mem.find(u8, name, "Ordered") != null;
+}
+
+/// Whether a container is a guard's: declared within an aegis owner, or an Order's
+/// `Capability`.
+fn guardType(c: *Context, held: Facts.Container) Context.Error!Guard {
+    const model = &c.project.at(held.file).model;
+    var scope = model.scopes[@backingInt(held.scope)].parent;
+    while (scope) |s| : (scope = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind != .container) continue;
+        if (try c.role(Contract.library, .{ .container = .{ .file = held.file, .scope = s } }) == .guarded) return .plain;
+    }
+    const orders = switch (try Governed.declarations(c, "aegis", "Order")) {
+        .decls => |decls| decls,
+        .none => return .no,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    for (orders) |order| {
+        const decl = (try originKnown(c, order)) orelse return .{ .unknown = .unresolved };
+        if (decl.file != held.file) continue;
+        const capability = model.scopes[@backingInt(model.root())].names.get("Capability") orelse continue;
+        const tree = &c.project.at(held.file).file.tree;
+        const function = model.parentOf(model.declarations[@backingInt(capability)].node) orelse continue;
+        const first = model.scopes[@backingInt(held.scope)].first;
+        if (first >= tree.firstToken(function) and first <= tree.lastToken(function)) return .ranked;
+    }
+    return .no;
 }
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
