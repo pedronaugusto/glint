@@ -3,7 +3,7 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Front = struct { line: usize };
 fn parseZig(gpa: std.mem.Allocator, source: []const u8) error{OutOfMemory}!Front {
-    const tree = try std.zig.Ast.parse(gpa, @ptrCast(source), .zig);
+    const tree = try std.zig.Ast.parse(gpa, @ptrCast(source), .{});
     return .{ .line = tree.tokenLocation(0, 3).line };
 }
 pub fn f(gpa: std.mem.Allocator, r: *std.Io.Reader) !u8 {

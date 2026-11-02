@@ -7,7 +7,7 @@ pub fn spin(io: std.Io, r: *std.Io.Reader) !u64 {
     var t: u64 = 0;
     var i: u64 = 0;
     while (i < n) : (i += 1) {
-        if (builtin.mode == .Debug) try io.checkCancel();
+        if (builtin.mode == .debug) try io.checkCancel();
         t +%= i;
     }
     return t;

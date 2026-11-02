@@ -7,7 +7,7 @@ const Small = struct {
 const Large = struct {
     pub const n = 64;
 };
-const T = if (builtin.mode == .Debug) Large else Small;
+const T = if (builtin.mode == .debug) Large else Small;
 pub fn f(r: *std.Io.Reader) !u8 {
     const buf: [T.n]u8 = @splat(0);
     const i: usize = try r.takeInt(u32, .little);

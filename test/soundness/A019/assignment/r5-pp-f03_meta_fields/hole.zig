@@ -17,8 +17,8 @@ pub fn use() !usize {
     var s: Sink = .init();
     try s.interface.writeAll("x");
     var total: usize = 0;
-    inline for (std.meta.fields(Sink)) |field| {
-        var copy = @field(s, field.name);
+    inline for (@typeInfo(Sink).@"struct".field_names) |name| {
+        var copy = @field(s, name);
         if (@TypeOf(copy) == std.Io.Writer) {
             try copy.writeAll("y");
             total += copy.end;

@@ -1,8 +1,5 @@
 .{
     .open = .{
-        // per-build choice soundness: `T = if (builtin.mode == .Debug) Small else Large` makes `T.n` 4 or 64, one build overflowing; Bounds does not judge each build (undecided before only through the `@import("builtin")` file note)
-        "call/r5-b-b14_choice_const/hole.zig",
-        "memory/r5-b-b14b_choice_swapped/hole.zig",
         // matrix precision: Bounds does not carry a checked value through a struct literal's field to its read (`h.at`)
         "aggregate/m-a09-struct_literal/twin.zig",
         // matrix hole: a sink in a file the run does not select is judged nowhere; the flow engine reports it at the selected call (M6)
