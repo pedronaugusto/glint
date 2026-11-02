@@ -10,6 +10,7 @@ const Context = @import("RuleContext.zig");
 const Report = @import("Report.zig");
 const DeadDeclarations = @import("DeadDeclarations.zig");
 const Disallowed = @import("Disallowed.zig");
+const Governed = @import("Governed.zig");
 const RunError = Context.Error;
 
 pub fn check(context: *Context) RunError!void {
@@ -523,17 +524,6 @@ fn deprecated(self: *const Context, definition: Facts.Decl) bool {
     return false;
 }
 
-fn standardContainer(self: *Context, root: Facts.Container, path_parts: []const []const u8) RunError!?Facts.Container {
-    var c = root;
-    for (path_parts) |name| {
-        const decl = self.facts.member(c, name) orelse return null;
-        const v = try self.facts.declaration(decl);
-        if (v != .container) return null;
-        c = v.container;
-    }
-    return c;
-}
-
 fn lineLength(self: *Context) RunError!void {
     const file = self.project.at(self.file).file;
     if (self.config.has(.Z024)) for (file.lines, 0..) |_, l| {
@@ -674,26 +664,29 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
     return false;
 }
 
+/// Z016: each call by meaning (`Facts.calls`) that may be std's `debug.assert` and asserts a
+/// conjunction; one whose callee may be any function, or whose arguments are not known, is
+/// undecided.
 fn contextRules(self: *Context) RunError!void {
     if (!self.config.has(.Z016)) return;
     const tree = &self.project.at(self.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-        var cb: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&cb, node)) |call| {
-            if (self.config.has(.Z016) and call.ast.params.len != 0 and tree.nodeTag(call.ast.params[0]) == .bool_and) {
-                const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-                if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
-                if (value == .function) for (self.project.imports) |mapping| {
-                    if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
-                    const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
-                    const assertion = self.facts.member(debug, "assert") orelse continue;
-                    if (std.meta.eql(assertion, value.function)) {
-                        try self.at(.Z016, tree.nodeMainToken(node), "consider separate assertions only when evaluation and short circuit effects are preserved");
-                        break;
-                    }
-                };
-            }
+    for (try Facts.calls.in(self.facts, self.file)) |call| {
+        const first: ?Ast.Node.Index = switch (call.args) {
+            .known => |args| first: {
+                const written = if (call.receiver == .bound) args[@min(args.len, 1)..] else args;
+                if (written.len == 0) continue;
+                break :first written[0];
+            },
+            .unknown => null,
+        };
+        if (first) |arg| if (tree.nodeTag(arg) != .bool_and) continue;
+        switch (try Governed.mayCallStd(self, call.node, "debug.assert")) {
+            .no => {},
+            .yes => if (first == null)
+                try self.unknown(.Z016, call.node, call.args.unknown)
+            else
+                try self.at(.Z016, tree.nodeMainToken(call.node), "consider separate assertions only when evaluation and short circuit effects are preserved"),
+            .unknown => |why| try self.unknown(.Z016, call.callee_expr, why),
         }
     }
 }
@@ -715,64 +708,15 @@ fn unknownCoverage(self: *Context) RunError!void {
 fn sourcePolicies(self: *Context) RunError!void {
     if (!self.config.has(.P005)) return;
     const tree = &self.project.at(self.file).file.tree;
-    const found = try debugPrint(self);
-    if (found == .none) return;
     for (try Facts.calls.in(self.facts, self.file)) |call| {
         const token = tree.nodeMainToken(call.node);
         if (self.inTest(token)) continue;
-        // std's print not followed to its declaration: any call may be it.
-        const print = switch (found) {
-            .decl => |print| print,
-            .none => return,
-            .unknown => |why| {
-                try self.unknown(.P005, call.callee_expr, why);
-                continue;
-            },
-        };
-        const prints = switch (call.callee) {
-            .function => |function| try samePrint(self, function, print),
-            .choice => |each| for (each) |function| {
-                const same = try samePrint(self, function, print);
-                if (same != .no) break same;
-            } else .no,
-            .any => |why| Same{ .unknown = why },
-        };
-        const known = switch (prints) {
-            .yes => true,
-            .no => false,
-            .unknown => |why| {
-                try self.unknown(.P005, call.callee_expr, why);
-                continue;
-            },
-        };
-        if (known) try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
+        switch (try Governed.mayCallStd(self, call.node, "debug.print")) {
+            .no => {},
+            .yes => try self.at(.P005, token, "production debug print; use the project's output/logging contract"),
+            .unknown => |why| try self.unknown(.P005, call.callee_expr, why),
+        }
     }
-}
-/// std's `debug.print`, from any file's mapping of std: none where the project maps no std,
-/// unknown where its alias is not followed.
-fn debugPrint(self: *Context) RunError!Facts.Named {
-    for (self.project.imports) |mapping| {
-        if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
-        const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
-        const print = self.facts.member(debug, "print") orelse continue;
-        return switch (try self.facts.origin(print)) {
-            .decl => |origin| .{ .decl = origin },
-            .none => .{ .decl = print },
-            .unknown => |why| .{ .unknown = why },
-        };
-    }
-    return .none;
-}
-const Same = union(enum) { yes, no, unknown: Facts.Unknown };
-/// Whether `function` is std's print, followed through its aliases; unknown where an alias is
-/// not followed.
-fn samePrint(self: *Context, function: Facts.Decl, print: Facts.Decl) RunError!Same {
-    const origin = switch (try self.facts.origin(function)) {
-        .decl => |origin| origin,
-        .none => function,
-        .unknown => |why| return .{ .unknown = why },
-    };
-    return if (std.meta.eql(origin, print)) .yes else .no;
 }
 fn functionLengths(self: *Context) RunError!void {
     if (!self.config.has(.P003)) return;

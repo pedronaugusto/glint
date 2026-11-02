@@ -240,6 +240,41 @@ test "G2 Z026 family reason policy includes cleanup and distinguishes handled er
     try std.testing.expectEqual(glint.RuleGroup.correctness, glint.Rule.Z026.group());
 }
 
+/// A run of `rule` on `root`, which imports a fixture std whose `debug` has `assert` and `print`.
+fn withStd(rule: glint.Rule, root: []const u8) !glint.Report {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "standard", .bytes = "pub const debug = struct { pub fn assert(ok: bool) void { _ = ok; } pub fn print(comptime f: []const u8, a: anytype) void { _ = f; _ = a; } };", .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "std" }}, .{}); // safe: fixture constants fit the asserted integer widths.
+    defer project.deinit();
+    var config = glint.Config.none();
+    config.set(rule, true);
+    return glint.run(std.testing.allocator, &project, config);
+}
+
+test "Z016 reads std's assert by meaning: a choice of callees one of which is it, an unknown under its own rule" {
+    // A mutable local holding std's assert in one path calls it.
+    const chosen = "const std = @import(\"std\"); fn mine(ok: bool) void { _ = ok; } pub fn f(a: bool, b: bool, other: bool) void { var check: *const fn (bool) void = std.debug.assert; if (other) check = mine; check(a and b); }";
+    var assert_choice = try withStd(.Z016, chosen);
+    defer assert_choice.deinit();
+    try std.testing.expectEqual(@as(usize, 1), assert_choice.diagnostics.len); // safe: expected count fits usize.
+    const neither = "const std = @import(\"std\"); fn mine(ok: bool) void { _ = ok; } fn yours(ok: bool) void { _ = ok; } pub fn f(a: bool, b: bool, other: bool) void { var check: *const fn (bool) void = yours; if (other) check = mine; check(a and b); }";
+    var no_assert = try withStd(.Z016, neither);
+    defer no_assert.deinit();
+    try std.testing.expectEqual(@as(usize, 0), no_assert.diagnostics.len); // safe: expected count fits usize.
+    try std.testing.expect(no_assert.complete);
+    // A callee that may be any function, named as std's assert is: undecided under Z016.
+    var unknown = try withStd(.Z016, "pub fn f(a: bool, b: bool, g: anytype) void { g.assert(a and b); }");
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unknown.diagnostics.len); // safe: expected count fits usize.
+    var undecided: usize = 0;
+    for (unknown.coverage) |item| if (item.rule) |rule| {
+        try std.testing.expectEqual(glint.Rule.Z016, rule);
+        undecided += 1;
+    };
+    try std.testing.expect(undecided != 0);
+}
+
 test "G2 Z012 family API report respects public aliases receivers and suppression" {
     try check(.Z012, "const Hidden = struct {}; pub fn create() Hidden { return .{}; }", 1);
     try check(.Z012, "const Hidden = struct {}; pub fn create() ?*Hidden { return null; }", 1);

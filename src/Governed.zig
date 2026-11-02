@@ -622,16 +622,40 @@ pub fn isStd(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!
 /// spells neither the declaration's nor an alias's of it, or its parameters refuse the
 /// arguments.
 pub fn stdCall(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Error!Is {
-    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return .no;
+    return switch (try stdCallees(c, node, path)) {
+        .none => .no,
+        .every => .yes,
+        // One of them only: the call may be it or another.
+        .some => .{ .unknown = .unsupported },
+        .unknown => |why| .{ .unknown = why },
+    };
+}
+
+/// Whether the call at `node` may call std's declaration at `path` (`debug.print`): yes where
+/// some function it may call is that one, as a per-build choice among them is in the build that
+/// takes it; no where none is. A callee that does not resolve is read as `stdCall` reads it.
+pub fn mayCallStd(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Error!Is {
+    return switch (try stdCallees(c, node, path)) {
+        .none => .no,
+        .every, .some => .yes,
+        .unknown => |why| .{ .unknown = why },
+    };
+}
+
+/// How many of the functions the call at `node` may call are std's declaration at `path`.
+const Callees = union(enum) { none, some, every, unknown: Facts.Unknown };
+
+fn stdCallees(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Error!Callees {
+    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return .none;
     const decls = switch (try declarations(c, "std", path)) {
         .decls => |decls| decls,
-        .none => return .no,
+        .none => return .none,
         .unknown => |why| return .{ .unknown = why },
     };
     const callees: []const Facts.Decl = switch (call.callee) {
         .function => |function| &.{function},
         .choice => |each| each,
-        .any => |why| return if (try notCalled(c, call, decls, path)) .no else .{ .unknown = why },
+        .any => |why| return if (try notCalled(c, call, decls, path)) .none else .{ .unknown = why },
     };
     var found: usize = 0;
     for (callees) |callee| for (decls) |decl| {
@@ -640,10 +664,8 @@ pub fn stdCall(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Erro
             break;
         }
     };
-    if (found == 0) return .no;
-    if (found == callees.len) return .yes;
-    // One of them only: the call may be it or another.
-    return .{ .unknown = .unsupported };
+    if (found == 0) return .none;
+    return if (found == callees.len) .every else .some;
 }
 
 /// Whether a call whose callee does not resolve cannot call any of `decls`: none takes its
