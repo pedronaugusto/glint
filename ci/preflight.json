@@ -42,9 +42,7 @@
         "A019": 4
       }
     },
-    "unresolved": {
-      "A008": 3
-    }
+    "unresolved": {}
   },
   "fuzz": {
     "trusted": {

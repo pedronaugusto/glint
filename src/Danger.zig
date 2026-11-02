@@ -103,6 +103,9 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     for (model.declarations, 0..) |decl, d| {
         if (c.inTest(decl.token)) continue;
+        // A block's local or a capture that exists only as the program compiles (in a type
+        // function, a `comptime` block) holds no material, as A007 reads it.
+        if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !atRuntime(c, decl.node)) continue;
         // A module or file `@import` gives: a namespace, a type, which holds no material.
         if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (imported(tree, init)) continue;
         const value: Facts.Value = switch (decl.kind) {
@@ -112,7 +115,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         };
         switch (try heldSecret(c, types, value)) {
             .no => {},
-            .unknown => |why| if (why != .generic and why != .comptime_dependent) try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a value whose type does not resolve may be std's secret material held by value"),
+            .unknown => |why| if (!bindingsJudge(c, why, decl.node) and (why != .comptime_dependent or runtimeState(c, decl))) try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a value whose type does not resolve may be std's secret material held by value"),
             .yes => |held| try c.at(rule, decl.token, try c.allocator.print("std.crypto {s} held by value outside aegis Secret: its bytes are copied and never wiped", .{held})),
         }
     }
@@ -151,24 +154,17 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
     switch (value) {
         .instance => |found| {
             for (types) |t| if (found.file == t.container.file and found.scope == t.container.scope) return .{ .yes = t.name };
-            if (found.made_by == null) return .no;
             // aegis's Secret, SecretBytes and Choice seal what they hold.
             if (try c.role(Contract.library, value)) |role| switch (role) {
                 .secret, .bytes, .choice => return .no,
                 else => {},
             };
-            const model = &c.project.at(found.file).model;
             var out: Secret = .no;
-            for (model.declarations, 0..) |d, i| {
-                if (d.kind != .field or d.scope != found.scope) continue;
-                const field: Facts.Decl = .{ .file = found.file, .index = @fromBackingInt(@intCast(i)) };
-                if (!unjudged(try c.facts.declaration(field))) continue;
-                switch (try heldSecret(c, types, try c.facts.memberOf(found, field))) {
-                    .yes => |held| return .{ .yes = held },
-                    .unknown => |why| out = .{ .unknown = why },
-                    .no => {},
-                }
-            }
+            for (try unjudgedFields(c, found)) |field| switch (try heldSecret(c, types, field)) {
+                .yes => |held| return .{ .yes = held },
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
             return out;
         },
         .array, .optional, .error_union => |inner| return heldSecret(c, types, inner.*),
@@ -178,7 +174,7 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
         .alternatives, .literal => {
             const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Secret = .no;
-            for (each) |one| switch (try heldSecret(c, types, one)) {
+            for (each, 0..) |one, i| switch (if (value == .literal and enumLiteralPart(c, value.literal, i)) .no else try heldSecret(c, types, one)) {
                 .yes => |held| return .{ .yes = held },
                 .unknown => |why| if (why != .comptime_dependent) {
                     out = .{ .unknown = .unresolved };
@@ -189,6 +185,8 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
             };
             return out;
         },
+        // A type built from its fields' types (`@Struct`): a value of it holds each.
+        .reified => |built| return if (built.value) heldSecret(c, types, try c.facts.reifiedParts(built)) else .no,
         .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set => return .no,
         .unknown => |why| return .{ .unknown = why },
         else => return .{ .unknown = .unsupported },
@@ -204,6 +202,99 @@ fn unjudged(value: Facts.Value) bool {
         .unknown => |why| return why == .generic,
         else => return false,
     };
+}
+
+/// Whether a value left unknown at `node` is judged where a call binds what it depends on: a
+/// generic's parameter (`.generic`), or what only the program's compiling settles inside a
+/// generic or a type function (`std.meta.Child(T)`), whose bindings are judged. Known only as
+/// the program compiles elsewhere (`std.meta.Child(*const Lock)` that does not evaluate), it
+/// is undecided.
+fn bindingsJudge(c: *Context, why: Facts.Unknown, node: Ast.Node.Index) bool {
+    return why == .generic or (why == .comptime_dependent and inGenericCode(c, node));
+}
+
+/// Whether a declaration holds state as the program runs: a field, a parameter, a function's
+/// result, a `var`, a local or a capture where it runs. A container-level constant is settled as
+/// the program compiles.
+fn runtimeState(c: *Context, decl: Model.Declaration) bool {
+    return switch (decl.kind) {
+        .field, .parameter, .function => true,
+        .capture => atRuntime(c, decl.node),
+        .variable => atRuntime(c, decl.node) or c.project.at(c.file).file.tree.tokenTag((c.project.at(c.file).file.tree.fullVarDecl(decl.node) orelse return true).ast.mut_token) == .keyword_var,
+    };
+}
+
+/// Whether part `index` of an anonymous literal is an enum literal (`.{ "pointer", .pointer }`):
+/// a value only the compiling program holds, which no lock or key is.
+fn enumLiteralPart(c: *Context, literal: Facts.Key, index: usize) bool {
+    const tree = &c.project.at(literal.file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const nodes = if (tree.fullStructInit(&buffer, literal.node)) |full| full.ast.fields else if (tree.fullArrayInit(&buffer, literal.node)) |full| full.ast.elements else return false;
+    return index < nodes.len and tree.nodeTag(nodes[index]) == .enum_literal;
+}
+
+/// Whether `node` lies in a function with a `comptime`, type or `anytype` parameter, or one
+/// returning `type`, or in a container one of those declares.
+fn inGenericCode(c: *Context, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) != .fn_decl) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse continue;
+        if (proto.ast.return_type.unwrap()) |result| if (tree.nodeTag(result) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(result)), "type")) return true;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            if (param.anytype_ellipsis3 != null) return true;
+            if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
+            if (param.type_expr) |type_expr| if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) return true;
+        }
+    }
+    return false;
+}
+
+/// What an instance holds by value that no declaration of this run judges where it is
+/// written, read with the instance's bindings: a tuple's field (`struct { Key, u8 }`, which
+/// declares none); a field a type function's parameters type (`unjudged`); and every field of
+/// the program's record in a file the run does not select (a dependency's). std's and the
+/// known libraries' records are judged by their types alone.
+fn unjudgedFields(c: *Context, found: Facts.Container) Context.Error![]const Facts.Value {
+    const unselected = !c.project.at(found.file).input.selected and try c.facts.program(found.file);
+    if (found.made_by == null and !unselected and !try hasTupleField(c, found)) return &.{};
+    var out: std.ArrayList(Facts.Value) = .empty;
+    for (try c.facts.heldFields(found)) |field| {
+        // A made field's type its template reads only with bindings (`value: T`,
+        // `std.meta.Child(T)`) is judged here, with this instance's.
+        if (field.decl) |decl| if (!unselected and !madeField(found, try c.facts.declaration(decl))) continue;
+        try out.append(c.allocator, field.value);
+    }
+    return out.items;
+}
+
+/// Whether a field of a made container is typed only with its call's bindings: its template
+/// reads it as a generic's, or as known only as the program compiles.
+fn madeField(found: Facts.Container, declared: Facts.Value) bool {
+    if (found.made_by == null) return false;
+    var current = declared;
+    while (true) current = switch (current) {
+        .array, .optional, .error_union => |inner| inner.*,
+        .unknown => |why| return why == .generic or why == .comptime_dependent,
+        else => return false,
+    };
+}
+
+/// Whether a container declares a tuple's field, which no declaration judges.
+fn hasTupleField(c: *Context, found: Facts.Container) Context.Error!bool {
+    const tree = &c.project.at(found.file).file.tree;
+    const node = c.project.at(found.file).model.scopes[@backingInt(found.scope)].node;
+    if (node == .root) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, node) orelse return false;
+    // An enum's or a union's bare name is a tag, no tuple's field.
+    if (tree.tokenTag(container.ast.main_token) != .keyword_struct) return false;
+    for (container.ast.members) |item| if (tree.fullContainerField(item)) |field| if (field.ast.tuple_like) return true;
+    return false;
 }
 
 /// A008 at a binding: a call that binds a generic's parameter no call it judges binds
@@ -262,7 +353,12 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                     switch (kept) {
                         .yes => try boundSecret(c, rule, types, argument, bound),
                         .no => {},
-                        .unknown => if (try heldSecret(c, types, bound) != .no) try c.undecided(rule, tree.tokenStart(tree.firstToken(argument)), .unsupported, "a generic names its type parameter where A008 does not read whether it holds a value of it: binding it to std's secret material may hold that by value"),
+                        // The enclosing generic's own parameter is judged at its bindings.
+                        .unknown => if (switch (try heldSecret(c, types, bound)) {
+                            .no => false,
+                            .unknown => |why| !bindingsJudge(c, why, argument),
+                            .yes => true,
+                        }) try c.undecided(rule, tree.tokenStart(tree.firstToken(argument)), .unsupported, "a generic names its type parameter where A008 does not read whether it holds a value of it: binding it to std's secret material may hold that by value"),
                     }
                     continue;
                 }
@@ -365,7 +461,7 @@ fn boundSecret(c: *Context, rule: Rule, types: []const SecretType, node: Ast.Nod
     switch (try heldSecret(c, types, value)) {
         .yes => |held| try c.at(rule, tree.firstToken(node), try c.allocator.print("std.crypto {s} bound to a generic's parameter, held by value there outside aegis Secret: its bytes are copied and never wiped", .{held})),
         .no => {},
-        .unknown => |why| if (why != .generic and why != .comptime_dependent) try c.undecided(rule, tree.tokenStart(tree.firstToken(node)), .unresolved, "a binding of a generic's parameter that does not resolve may make it std's secret material held by value"),
+        .unknown => |why| if (!bindingsJudge(c, why, node)) try c.undecided(rule, tree.tokenStart(tree.firstToken(node)), .unresolved, "a binding of a generic's parameter that does not resolve may make it std's secret material held by value"),
     }
 }
 
@@ -751,10 +847,14 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
             try calls.append(c.allocator, parent);
             continue;
         };
-        // An alias's declaration is no call; the assert taken as a value is called where it
-        // goes, which this reading does not follow.
-        if (tree.fullVarDecl(parent)) |variable| if (variable.ast.init_node.unwrap() == site.node) continue;
-        if (atRuntime(c, site.node)) try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
+        // An alias's declaration is no call, nor is a constant pointer to it (`const check:
+        // *const fn (bool) void = &std.debug.assert;`): `aliasCalls` reads the calls through
+        // either. The assert taken as a value anywhere else (a field's default, a variable)
+        // is called where it goes, which this reading does not follow, at run time or not.
+        const held = if (tree.nodeTag(parent) == .address_of) model.parentOf(parent) orelse parent else parent;
+        const value = if (held == parent) site.node else parent;
+        if (tree.fullVarDecl(held)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) continue;
+        try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
         if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
@@ -788,16 +888,29 @@ fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayLi
             .decl => |decl| decl,
             .none, .unknown => continue,
         };
-        const origin = switch (try c.facts.origin(callee)) {
-            .decl => |reached| reached,
-            .none, .unknown => continue,
+        // std's assert called by its own name is a site `Governed.sites` gives.
+        if (isAssert(assert_decls, callee)) continue;
+        const reached: ?Facts.Decl = switch (try c.facts.origin(callee)) {
+            .decl => |found| if (std.meta.eql(callee, found)) null else found,
+            .none, .unknown => null,
         };
-        if (std.meta.eql(callee, origin)) continue;
-        for (assert_decls) |each| if (std.meta.eql(each, origin)) {
+        // A constant pointer to it (`const check: *const fn (bool) void = &std.debug.assert;`,
+        // a dependency's among them): each function the call may reach through it.
+        const origins: []const Facts.Decl = if (reached) |found| &.{found} else switch ((try Facts.calls.at(c.facts, c.file, node) orelse continue).callee) {
+            .function => |function| &.{function},
+            .choice => |each| each,
+            .any => continue,
+        };
+        for (origins) |one| if (isAssert(assert_decls, one)) {
             try calls.append(c.allocator, node);
             break;
         };
     }
+}
+
+fn isAssert(assert_decls: []const Facts.Decl, decl: Facts.Decl) bool {
+    for (assert_decls) |each| if (std.meta.eql(each, decl)) return true;
+    return false;
 }
 
 /// The edits that make the call at `node` (`f(c)`) `aegis.assert.invariant(c, "c")`, the
@@ -1025,10 +1138,12 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
         switch (try heldSync(c, found.found, value)) {
             .no => {},
             .unknown => |why| {
-                if (why == .generic or why == .comptime_dependent) continue;
+                if (bindingsJudge(c, why, decl.node) or (why == .comptime_dependent and !runtimeState(c, decl))) continue;
                 // A variable given only enum literals holds an enum's tag (or a union's with no
-                // payload): no synchronization (`const w: std.meta.Tag(V) = .a`).
-                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (enumLiterals(tree, init)) continue;
+                // payload): no synchronization (`const w: std.meta.Tag(V) = .a`). Not where one
+                // names a member of a synchronization type: a decl literal (`.init`) makes one,
+                // and `std.Io.Event` is an enum.
+                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (enumLiterals(tree, init) and !try namesSyncMember(c, found.found, init)) continue;
                 try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a value whose type does not resolve may hold std's synchronization");
             },
             .yes => |index| {
@@ -1083,7 +1198,18 @@ const Sync = union(enum) { yes: usize, no, unknown: Facts.Unknown };
 /// unknown (`Facts.resolve`'s contract).
 fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) Context.Error!Sync {
     switch (value) {
-        .instance => |inner| return if (try syncType(c, found, .{ .container = inner })) |index| .{ .yes = index } else .no,
+        .instance => |inner| {
+            if (try syncType(c, found, .{ .container = inner })) |index| return .{ .yes = index };
+            // aegis's types hold std's synchronization as their internals.
+            if (try c.inLibrary(Contract.library, inner.file)) return .no;
+            var out: Sync = .no;
+            for (try unjudgedFields(c, inner)) |field| switch (try heldSync(c, found, field)) {
+                .yes => |index| return .{ .yes = index },
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
+            return out;
+        },
         .array, .optional, .error_union => |inner| return heldSync(c, found, inner.*),
         // A tuple or struct literal with no type of its own holds each part by value; a part
         // known only as the program compiles (an enum literal, `.{ "pointer", .pointer }`, or
@@ -1091,7 +1217,7 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
         .alternatives, .literal => {
             const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Sync = .no;
-            for (each) |one| switch (try heldSync(c, found, one)) {
+            for (each, 0..) |one, i| switch (if (value == .literal and enumLiteralPart(c, value.literal, i)) .no else try heldSync(c, found, one)) {
                 .yes => |index| return .{ .yes = index },
                 .unknown => |why| if (why != .comptime_dependent) {
                     out = .{ .unknown = .unresolved };
@@ -1102,6 +1228,8 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
             };
             return out;
         },
+        // A type built from its fields' types (`@Struct`): a value of it holds each.
+        .reified => |built| return if (built.value) heldSync(c, found, try c.facts.reifiedParts(built)) else .no,
         .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set => return .no,
         .unknown => |why| return .{ .unknown = why },
         else => return .{ .unknown = .unsupported },
@@ -1123,6 +1251,37 @@ fn enumLiterals(tree: *const Ast, node: Ast.Node.Index) bool {
             const branch = tree.fullIf(node) orelse return false;
             const otherwise = branch.ast.else_expr.unwrap() orelse return false;
             return enumLiterals(tree, branch.ast.then_expr) and enumLiterals(tree, otherwise);
+        },
+    }
+}
+
+/// Whether an enum literal `node` gives (`enumLiterals`' shapes) names a declaration or a tag
+/// of one of std's synchronization types, or of the type a governed type function makes.
+fn namesSyncMember(c: *Context, found: []const Governed.Governed, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .enum_literal => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            for (found) |g| for (g.decls) |decl| {
+                const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                const held = if (record.kind == .function) try c.facts.template(decl) orelse continue else try c.facts.declaration(decl);
+                const container = switch (held) {
+                    .container => |each| each,
+                    else => continue,
+                };
+                if (c.facts.member(container, name) != null or c.facts.declaresTag(container, name)) return true;
+            };
+            return false;
+        },
+        .grouped_expression => return namesSyncMember(c, found, tree.nodeData(node).node_and_token[0]),
+        .@"switch", .switch_comma => {
+            for (tree.fullSwitch(node).?.ast.cases) |case| if (try namesSyncMember(c, found, tree.fullSwitchCase(case).?.ast.target_expr)) return true; // unreachable: tagged a switch, whose cases are cases
+            return false;
+        },
+        else => {
+            const branch = tree.fullIf(node) orelse return false;
+            if (try namesSyncMember(c, found, branch.ast.then_expr)) return true;
+            return namesSyncMember(c, found, branch.ast.else_expr.unwrap() orelse return false);
         },
     }
 }

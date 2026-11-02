@@ -432,6 +432,77 @@ test "A007 and A008 read a tuple by its parts, a chain of orelse to its payload,
     , 2);
 }
 
+/// A dependency's records and type functions: what it holds is the program's, judged where the
+/// program holds it, since no run selecting the program judges the dependency's fields.
+const held_dependency: sources.Extra = .{ .name = "dep/root.zig", .bytes =
+    \\const std = @import("std");
+    \\const Ed25519 = std.crypto.sign.Ed25519;
+    \\pub const Shared = struct { lock: std.Io.Mutex = .init, count: u32 = 0 };
+    \\pub const Plain = struct { count: u32 = 0 };
+    \\pub fn Box(comptime T: type) type { return struct { value: T, tag: u8 = 0 }; }
+    \\pub const Locked = Box(std.Io.Mutex);
+    \\pub const Counted = Box(u32);
+    \\pub const Kind = enum { a, init };
+    \\pub const types = [_]type{ std.Io.Mutex, Kind };
+    \\pub fn Pick(comptime n: usize) type { return types[n]; }
+    \\pub fn make() std.Io.Mutex { return .init; }
+    \\pub const Wallet = struct { key: Ed25519.SecretKey, label: u8 };
+    \\pub const Shown = struct { key: Ed25519.PublicKey, label: u8 };
+};
+
+/// The program's import of `held_dependency`, and the dependency's of std.
+const held_imports = [_]sources.ExtraImport{ .{ .spelling = "dep", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } };
+
+test "A007 and A008 read a value's type by its meaning: a type function's result, a tuple type, a dependency's record, and a decl literal" {
+    // Findings: a dependency's record holding a lock by value and one its generic makes over a
+    // lock; a tuple type holding one (a parameter); a local typed by the program's type
+    // function reading `@typeInfo` (as std.meta.Child does) and one a dependency picks from a
+    // table, each given the decl literal `.init`. Clean: the same over a number, a table's
+    // enum given its tag `.init`, a record holding none.
+    const program =
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\fn Child(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .pointer => |info| info.child,
+        \\        .optional => |info| info.child,
+        \\        else => @compileError("no child"),
+        \\    };
+        \\}
+        \\pub const Server = struct { a: dep.Shared = .{}, b: dep.Locked = undefined, c: dep.Counted = undefined, d: dep.Plain = .{} };
+        \\pub fn run(p: struct { @TypeOf(dep.make()), u32 }, q: struct { u32, u8 }) u32 {
+        \\    var m: Child(*const std.Io.Mutex) = .init;
+        \\    var n: Child(*const u32) = 0;
+        \\    var picked: dep.Pick(0) = .init;
+        \\    const kind: dep.Pick(1) = .init;
+        \\    _ = .{ &m, &n, &picked, kind, q };
+        \\    return p[1];
+        \\}
+    ;
+    const found = try runWith(pack.shared_state, program, &(std_files ++ [_]sources.Extra{held_dependency}), &(std_imports ++ held_imports));
+    try std.testing.expectEqual(@as(usize, 0), found.undecided);
+    try std.testing.expectEqual(@as(usize, 5), found.findings);
+    // Findings: a dependency's record holding a key by value, a tuple type holding one, and a
+    // key typed by a type function; clean: the public key in each.
+    const keys =
+        \\const std = @import("std");
+        \\const dep = @import("dep");
+        \\const Ed25519 = std.crypto.sign.Ed25519;
+        \\fn Child(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .pointer => |info| info.child,
+        \\        else => @compileError("no child"),
+        \\    };
+        \\}
+        \\pub fn a(w: dep.Wallet, s: dep.Shown) void { _ = .{ w, s }; }
+        \\pub fn b(k: struct { Ed25519.SecretKey, u8 }, p: struct { Ed25519.PublicKey, u8 }) void { _ = .{ k, p }; }
+        \\pub fn c(k: Child(*const Ed25519.SecretKey), p: Child(*const Ed25519.PublicKey)) void { _ = .{ k, p }; }
+    ;
+    const secret = try runWith(pack.secrets, keys, &(std_files ++ [_]sources.Extra{held_dependency}), &(std_imports ++ held_imports));
+    try std.testing.expectEqual(@as(usize, 0), secret.undecided);
+    try std.testing.expectEqual(@as(usize, 3), secret.findings);
+}
+
 test "A011 finds time crossing as a raw integer and units converted by hand wherever a constant goes and as the program compiles, not raw nanoseconds compared or subtracted" {
     try expect(pack.units,
         \\const std = @import("std");

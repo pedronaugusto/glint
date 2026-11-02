@@ -116,6 +116,8 @@ fn shapeOf(self: *Present, function: Facts.Decl) Context.Error!?Reading {
         .function => |each| each,
         .choice, .any => return null,
     };
+    // Only std's own tag read is pure: the program's of that name may move what it reads.
+    if (try Governed.isStd(self.c, read_function, "zig.Ast.nodeTag") != .yes) return null;
     const read_args = switch (read.args) {
         .known => |known| known,
         .unknown => return null,
@@ -404,17 +406,22 @@ fn unwritten(self: *Present, goal: Goal, from: Ast.TokenIndex, use: Ast.Node.Ind
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == top) break;
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) try spans.append(self.c.allocator, .{ tree.firstToken(parent), tree.lastToken(parent) + 1 });
+        // A deferred use runs as its block ends: after every statement written below it.
+        if (tree.nodeTag(parent) == .@"defer" or tree.nodeTag(parent) == .@"errdefer") {
+            const block = model.parentOf(parent) orelse parent;
+            try spans.append(self.c.allocator, .{ tree.firstToken(parent), tree.lastToken(block) + 1 });
+        }
     }
     return switch (goal) {
-        .some => |place_node| self.kept(place_node, spans.items, null),
-        .tag => |tagged| try self.kept(tagged.tree, spans.items, tagged.read) and try self.kept(tagged.node, spans.items, tagged.read),
+        .some => |place_node| self.kept(place_node, spans.items, null, true),
+        .tag => |tagged| try self.kept(tagged.tree, spans.items, tagged.read, false) and try self.kept(tagged.node, spans.items, tagged.read, false),
     };
 }
 
 /// Whether no effect within `spans` may write `place_node`: none for a constant by value; for
 /// a local variable whose address is never taken, no assignment to it; else no call (but a
 /// call of `read`, which writes nothing) and no assignment.
-fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenIndex, read: ?Facts.Decl) Context.Error!bool {
+fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenIndex, read: ?Facts.Decl, some: bool) Context.Error!bool {
     const tree = &self.c.project.at(self.c.file).file.tree;
     const model = &self.c.project.at(self.c.file).model;
     if (try self.constant(place_node)) return true;
@@ -439,6 +446,9 @@ fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenI
                 const declared = if (tree.nodeTag(root) == .identifier) if (model.reference(root)) |reference| reference.declaration else null else null;
                 if (local) |own| {
                     if (declared) |other| if (other != own) continue;
+                    // A presence written whole with a value that is never null stays present
+                    // (`found = 0`); a tag changes with any write.
+                    if (some and target == root and tree.nodeTag(effect.node) == .assign and try self.present(tree.nodeData(effect.node).node_and_node[1])) continue;
                     return false;
                 }
                 // Another local variable written whole leaves any other place as it was.
@@ -448,6 +458,17 @@ fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenI
         }
     }
     return true;
+}
+
+/// Whether `value` is never null: of a type that is no optional (a number, a struct), by what
+/// it resolves to. `null`, an optional and what does not resolve may be.
+fn present(self: *Present, value: Ast.Node.Index) Context.Error!bool {
+    const tree = &self.c.project.at(self.c.file).file.tree;
+    if (isNull(tree, value)) return false;
+    return switch (try self.c.facts.resolve(self.c.file, value)) {
+        .optional, .unknown, .alternatives => false,
+        else => true,
+    };
 }
 
 /// Whether `place_node` cannot be written at all: a parameter, a capture or a constant, and
@@ -555,10 +576,40 @@ fn exits(tree: *const Ast, node: Ast.Node.Index) bool {
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, node) orelse return false;
             if (statements.len == 0) return false;
-            return exits(tree, statements[statements.len - 1]);
+            return exits(tree, statements[statements.len - 1]) and !landsWithin(tree, node);
         },
         else => false,
     };
+}
+
+/// Whether a `break` or `continue` in `node` lands inside it: one naming a label `node` or
+/// what it holds declares (`blk: { if (c) break :blk; return; }` goes on past the block), or
+/// one of no label in a loop `node` holds.
+fn landsWithin(tree: *const Ast, node: Ast.Node.Index) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    // A labeled block's label stands before its first token.
+    const from = if (first >= 2 and tree.tokenTag(first - 1) == .colon and tree.tokenTag(first - 2) == .identifier) first - 2 else first;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .@"break" and tag != .@"continue") continue;
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(jump);
+        if (token < first or token > last) continue;
+        if (tree.nodeData(jump).opt_token_and_opt_node[0].unwrap()) |label| {
+            const name = tree.tokenSlice(label);
+            var at = from;
+            while (at + 1 <= last) : (at += 1) {
+                if (tree.tokenTag(at) == .identifier and tree.tokenTag(at + 1) == .colon and at != label and std.mem.eql(u8, tree.tokenSlice(at), name)) return true;
+            }
+        } else for (tree.nodes.items(.tag), 0..) |loop_tag, j| switch (loop_tag) {
+            .@"while", .while_simple, .while_cont, .@"for", .for_simple => {
+                const loop: Ast.Node.Index = @fromBackingInt(@intCast(j));
+                if (tree.firstToken(loop) >= first and tree.lastToken(loop) <= last and tree.firstToken(loop) < token and token <= tree.lastToken(loop)) return true;
+            },
+            else => {},
+        };
+    }
+    return false;
 }
 
 /// A name, or a member of one (`x`, `x.f.g`): what a check and a read can share.

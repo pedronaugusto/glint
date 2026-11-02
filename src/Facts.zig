@@ -227,6 +227,11 @@ pub const ResolveError = Model.InitError;
 /// `instance` are.
 pub const Reified = struct { fields: *const Value, value: bool = false };
 
+/// What a value of a type built from its fields' types holds: a value of each of them.
+pub fn reifiedParts(self: *Facts, built: Reified) ResolveError!Value {
+    return self.instance(built.fields.*);
+}
+
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.active.deinit(self.gpa);
@@ -1741,7 +1746,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         .error_set_decl, .merge_error_sets => return .error_set,
         .enum_literal => return self.declarationLiteral(file, node),
-        .number_literal, .string_literal, .char_literal => return .scalar,
+        .number_literal, .string_literal, .multiline_string_literal, .char_literal => return .scalar,
         else => {},
     }
     if (try self.typeWritten(file, node)) |value| return value;
@@ -1756,7 +1761,12 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         .array_init_one, .array_init_one_comma, .array_init, .array_init_comma => {
             const value = tree.fullArrayInit(&buffer, node).?;
-            if (value.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(file, t));
+            if (value.ast.type_expr.unwrap()) |t| {
+                const typed = try self.resolve(file, t);
+                // A table of types (`[_]type{ A, B }`): each element its own, as a tuple's parts.
+                if (typed == .array and typed.array.* == .primitive and std.mem.eql(u8, typed.array.primitive, "type")) return .{ .literal = .{ .file = file, .node = node } };
+                return self.instance(typed);
+            }
             return .{ .unknown = .unsupported };
         },
         // A tuple with no type of its own (`.{ sha2.Sha256, .sha256 }`), as a struct literal is.
@@ -1787,7 +1797,7 @@ fn calledValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: A
         // generic parameters leave the result unknown, the call's reading of them.
         const made = try self.madeResult(file, call, callee.function);
         if (made) |value| if (!unknownWithin(value)) return value;
-        if (try self.evaluateCall(null, file, call, callee.function)) |value| return value;
+        if (try self.evaluateCall(null, file, call, callee.function)) |value| return self.attachMade(value, .{ .function = callee.function, .file = file, .call = node, .assumed = self.assumed });
         if (made) |value| return value;
         var result = try self.callResult(callee, {});
         if (result == .container and result.container.symbolic) {
@@ -1809,6 +1819,41 @@ fn typeWritten(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buffer, node) != null) {
         for (self.project.at(file).model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @fromBackingInt(@intCast(s)) } };
+    }
+    return null;
+}
+
+/// `@field(holder, name)` by a name that is no one spelled: one an inline for ranges over (each
+/// member so named, one per pass), or over a typeless literal by a name it ranges over or
+/// computes (any of its parts). Null where the one name is spelled, for `reflected`.
+fn rangedField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!?Value {
+    // A name ranging over a list written in place (`inline for (.{ "lin", "length" })
+    // |part|`): each member so named, one per pass.
+    switch (try self.fieldName(file, args[1])) {
+        .name => {},
+        // Of a typeless literal, by a name it ranges over or computes (`inline for` over
+        // its own `field_names`): any of its parts.
+        .each_of, .computed => {
+            const resolved = try self.resolve(file, args[0]);
+            const held = if (resolved == .pointer) resolved.pointer.* else resolved;
+            if (held == .literal) return try self.choose(try self.literalParts(held.literal));
+        },
+        .names => |names| {
+            const resolved = try self.resolve(file, args[0]);
+            const held = if (resolved == .pointer) resolved.pointer.* else resolved;
+            const each = try self.gpa.alloc(Value, names.len);
+            if (held == .literal) {
+                for (names, each) |one, *out| out.* = try self.literalField(held.literal, one);
+                return try self.choose(each);
+            }
+            const holder = switch (held) {
+                .container, .instance => |c| c,
+                else => return .{ .unknown = .comptime_dependent },
+            };
+            if (holder.symbolic and holder.made_by == null) return .{ .unknown = .comptime_dependent };
+            for (names, each) |one, *out| out.* = try self.memberOf(holder, self.member(holder, one) orelse return .{ .unknown = .unresolved });
+            return try self.choose(each);
+        },
     }
     return null;
 }
@@ -1846,6 +1891,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
         // `@hasDecl` is a `bool` whatever it names.
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
+        if (try self.rangedField(file, args)) |value| return value;
         return switch (try self.reflected(file, node)) {
             .decl => |target| self.declaration(target),
             .none => .{ .unknown = .unresolved },
@@ -2064,9 +2110,11 @@ fn rangedNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
         if (tree.fullFor(at)) |found| break found;
         at = model.parentOf(at) orelse return null;
     };
-    if (loop.ast.inputs.len != 1 or loop.payload_token != record.token) return null;
+    // The input the capture takes, of several (`inline for (.{ "a", "b" }, 0..) |name, i|`).
+    const position = Model.capturePosition(tree, loop, record.token) orelse return null;
+    if (position >= loop.ast.inputs.len) return null;
     var buffer: [2]Ast.Node.Index = undefined;
-    const list = tree.fullArrayInit(&buffer, loop.ast.inputs[0]) orelse return null;
+    const list = tree.fullArrayInit(&buffer, loop.ast.inputs[position]) orelse return null;
     var names: std.ArrayList([]const u8) = .empty;
     for (list.ast.elements) |item| try names.append(self.gpa, (try self.nameIn(null, file, item, 0)) orelse return null);
     return names.items;
@@ -2100,6 +2148,43 @@ fn fieldTypes(self: *Facts, container: Container) ResolveError!Value {
     return self.choose(each.items);
 }
 
+/// A field an instance holds: what `memberOf` reads it as, and its declaration, null for a
+/// tuple's, which declares none.
+pub const HeldField = struct { value: Value, decl: ?Decl };
+
+/// Each field an instance of `container` holds by value: a named one as `memberOf` reads it,
+/// then a tuple's (`struct { Key, u8 }`) by its type, with a made container's bindings.
+pub fn heldFields(self: *Facts, container: Container) ResolveError![]const HeldField {
+    const model = &self.project.at(container.file).model;
+    const tree = self.syntaxOf(container.file);
+    var out: std.ArrayList(HeldField) = .empty;
+    for (model.declarations, 0..) |d, i| {
+        if (d.kind != .field or d.scope != container.scope) continue;
+        const decl: Decl = .{ .file = container.file, .index = @fromBackingInt(@intCast(i)) };
+        // A field with no type holds `void`.
+        const typed = (tree.fullContainerField(d.node) orelse continue).ast.type_expr != .none;
+        try out.append(self.gpa, .{ .value = if (typed) try self.memberOf(container, decl) else .scalar, .decl = decl });
+    }
+    const node = model.scopes[@backingInt(container.scope)].node;
+    if (node == .root) return out.items;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = tree.fullContainerDecl(&buffer, node) orelse return out.items;
+    // An enum's or a union's bare name (`none,`) is a tag, holding nothing or `void`, and no
+    // tuple's field.
+    if (tree.tokenTag(full.ast.main_token) != .keyword_struct) return out.items;
+    for (full.ast.members) |item| {
+        const field = tree.fullContainerField(item) orelse continue;
+        if (!field.ast.tuple_like) continue;
+        const type_node = field.ast.type_expr.unwrap() orelse continue;
+        const value = if (container.made_by) |made| blk: {
+            const bound = try self.substituted(container.file, type_node, made);
+            break :blk if (bound == .unknown) bound else try self.valueOf(try self.madeWithin(bound, container, made));
+        } else try self.instance(try self.resolve(container.file, type_node));
+        try out.append(self.gpa, .{ .value = value, .decl = null });
+    }
+    return out.items;
+}
+
 /// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
 /// integers, bit counts, arithmetic and the queries that answer yes or no.
 const numeric_builtins = [_][]const u8{
@@ -2108,6 +2193,8 @@ const numeric_builtins = [_][]const u8{
     "@divFloor",     "@divTrunc",      "@mod",          "@rem",          "@shlExact",    "@shrExact",   "@min",         "@max",
     "@abs",          "@sqrt",          "@floor",        "@ceil",         "@trunc",       "@round",      "@hasDecl",     "@hasField",
     "@inComptime",   "@returnAddress", "@frameAddress", "@floatFromInt", "@mulAdd",      "@sin",        "@cos",         "@exp",
+    // An enum's or a packed struct's backing integer.
+    "@backingInt",
 };
 
 fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
@@ -2136,7 +2223,7 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
 
 /// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags. An
 /// enum's field is written as a bare name, which Zig's syntax tree reads as a tuple's field.
-fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
+pub fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
     const node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return false;
     const tree = self.syntaxOf(container.file);
@@ -2211,7 +2298,8 @@ pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Val
     // one made elsewhere (`const Record = State.Record;`) is read with the call's bindings, as
     // a field's type is, the template's reading standing where that reading is unknown.
     if (record.kind != .field) {
-        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.type_node == .none) if (variable.ast.init_node.unwrap()) |init| {
+        // One typed `type` (`pub const Key: type = E;`) names a type as an untyped one does.
+        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.type_node == .none or namesType(tree, variable.ast.type_node.unwrap().?)) if (variable.ast.init_node.unwrap()) |init| {
             const value = try self.substituted(decl.file, init, made);
             if (value != .unknown) return self.madeWithin(value, container, made);
         };
@@ -2227,6 +2315,11 @@ pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Val
         return if (template_value == .alternatives) value else template_value;
     }
     return self.valueOf(try self.madeWithin(value, container, made));
+}
+
+/// Whether a type expression is `type`.
+fn namesType(tree: *const Ast, node: Ast.Node.Index) bool {
+    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// A member read through a value (`x.name`). Called through a field that holds a function
@@ -2879,7 +2972,7 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
             try values.append(self.gpa, try self.resolveIn(env, file, branch));
         }
     } else return null;
-    return try self.peered(try self.choose(values.items), peers);
+    return try self.peeredChoice(values.items, peers);
 }
 
 /// The prong a `switch` on type information takes where the type is one container: the one
@@ -2890,15 +2983,21 @@ fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.f
     if (!isTypeInfo(tree, whole.ast.condition)) return null;
     const subject = try self.resolveIn(env, file, whole.ast.condition);
     if (subject != .reflected or subject.reflected.at != .info) return null;
-    const container = switch (subject.reflected.of.*) {
-        .container => |c| c,
-        else => return null,
-    };
-    const kind: []const u8 = switch (self.kindOf(container) orelse return null) {
-        .keyword_struct => "struct",
-        .keyword_union => "union",
-        .keyword_enum => "enum",
-        .keyword_opaque => "opaque",
+    // A pointer (a slice among them), an optional, an error union or a function type is of
+    // its kind whatever it holds (`std.meta.Child(*const T)`). An array is not: a vector reads
+    // as one.
+    const kind: []const u8 = switch (subject.reflected.of.*) {
+        .container => |container| switch (self.kindOf(container) orelse return null) {
+            .keyword_struct => "struct",
+            .keyword_union => "union",
+            .keyword_enum => "enum",
+            .keyword_opaque => "opaque",
+            else => return null,
+        },
+        .pointer => "pointer",
+        .optional => "optional",
+        .error_union => "error_union",
+        .fn_type => "fn",
         else => return null,
     };
     var otherwise: ?usize = null;
@@ -2926,6 +3025,7 @@ fn isTypeInfo(tree: *const Ast, node: Ast.Node.Index) bool {
 const Peers = struct {
     nullable: bool = false,
     fallible: bool = false,
+    tagged: bool = false,
 
     /// Whether `node` is `null` or an error value, noted as such.
     fn literal(peers: *Peers, tree: *const Ast, node: Ast.Node.Index) bool {
@@ -2937,9 +3037,22 @@ const Peers = struct {
             peers.fallible = true;
             return true;
         }
+        // An enum literal coerces to its peers' type (`if (c) .no else try f()`, a loop's
+        // `else .no`).
+        if (tree.nodeTag(node) == .enum_literal) {
+            peers.tagged = true;
+            return true;
+        }
         return false;
     }
 };
+
+/// The values chosen as one with what their literals add; enum literals alone are the
+/// program's to type, known only as it compiles.
+fn peeredChoice(self: *Facts, values: []const Value, peers: Peers) ResolveError!Value {
+    if (values.len == 0 and peers.tagged) return .{ .unknown = .comptime_dependent };
+    return self.peered(try self.choose(values), peers);
+}
 fn peered(self: *Facts, chosen: Value, peers: Peers) ResolveError!Value {
     if (chosen == .unknown) return chosen;
     const optional: Value = if (!peers.nullable) chosen else switch (chosen) {
@@ -2978,7 +3091,7 @@ fn breaks(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
         if (peers.literal(tree, operand)) continue;
         try values.append(self.gpa, try self.resolveIn(env, file, operand));
     }
-    return try self.peered(try self.choose(values.items), peers);
+    return try self.peeredChoice(values.items, peers);
 }
 
 /// A loop used as a value (`const e = for (xs) |x| { if (p(x)) break x; } else null;`): what
@@ -3025,7 +3138,7 @@ fn loopValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveEr
     }
     if (otherwise) |value| if (!peers.literal(tree, value) and !never(tree, value)) try values.append(self.gpa, try self.resolve(file, value));
     if (values.items.len == 0) return null;
-    return try self.peered(try self.choose(values.items), peers);
+    return try self.peeredChoice(values.items, peers);
 }
 
 /// A call through a field that holds a function pointer (`read: *const fn (...) R`): what
@@ -3132,8 +3245,18 @@ fn conditional(self: *Facts, env: ?*const Env, file: Project.FileId, payload_tok
     if (error_token) |token| if (token == name) return .error_set;
     const first = payload_token orelse return .{ .unknown = .unsupported };
     if (first != name and first + 1 != name) return .{ .unknown = .unsupported };
-    const value = try self.resolveIn(env, file, condition);
+    return self.unwrappedCondition(try self.resolveIn(env, file, condition));
+}
+
+/// What a condition `value` captures: the payload of an optional or an error union, each of
+/// a choice's (`if (@field(v, name)) |part|` over fields of several types).
+fn unwrappedCondition(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
+        .alternatives => |each| blk: {
+            const parts = try self.gpa.alloc(Value, each.len);
+            for (each, parts) |one, *part| part.* = try self.unwrappedCondition(one);
+            break :blk self.choose(parts);
+        },
         .optional, .error_union => |inner| inner.*,
         // Zig unwraps only an optional or an error union: a condition read as a payload is one
         // whose wrapper a peer with `null` adds, which this reading keeps no record of (`const
@@ -4107,7 +4230,8 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
     const unsupported: Value = .{ .unknown = .unsupported };
     switch (r.at) {
         .info => {
-            const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "error_union", .error_union }, .{ "fn", .function }, .{ "struct", .structure }, .{ "union", .tagged }, .{ "enum", .enumeration } };
+            // A vector reads as an array of its lanes (`@Vector`), its child an element.
+            const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "vector", .array }, .{ "error_union", .error_union }, .{ "fn", .function }, .{ "struct", .structure }, .{ "union", .tagged }, .{ "enum", .enumeration } };
             inline for (kinds) |kind| if (std.mem.eql(u8, name, kind[0])) return .{ .reflected = .{ .of = r.of, .at = kind[1] } };
             return .{ .reflected = .{ .of = r.of, .at = .part } };
         },
@@ -4322,9 +4446,11 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     const result_tree = target_tree;
     if (returns_type) {
         const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
-        // A container is the template's, which the call makes: read by the existing means.
+        // A container is the template's, which the call makes: read by the existing means. A
+        // function returning one of several (`EnumIndexer`, one per kind of enum) has no one
+        // template: each it may return, as `everyReturn` reads them.
         var container_buffer: [2]Ast.Node.Index = undefined;
-        if (result_tree.fullContainerDecl(&container_buffer, returned) != null) return null;
+        if (result_tree.fullContainerDecl(&container_buffer, returned) != null) return if (try self.template(decl) != null) null else self.everyReturn(bound, decl, record);
         const value = try self.resolveIn(bound, decl.file, returned);
         return if (value == .unknown) null else value;
     }
@@ -4511,6 +4637,12 @@ fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declar
         break :found list.items;
     };
     var values: std.ArrayList(Value) = .empty;
+    // Each return a container written in place (`EnumIndexer`'s): one the call makes. One
+    // that returns another's call besides is read only by its template.
+    const written_only = for (returns) |returned| {
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&buffer, returned) == null) break false;
+    } else true;
     each: for (returns) |returned| {
         // One in a prong of a switch on type information this type does not take.
         var child = returned;
@@ -4527,8 +4659,9 @@ fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declar
         var container_buffer: [2]Ast.Node.Index = undefined;
         const value = if (tree.fullContainerDecl(&container_buffer, returned) != null)
             // A container it declares is the template's, the same in every call where it
-            // names nothing the function declares (`return struct {};`).
-            if (self.namesNothingOf(decl, returned)) try self.resolve(decl.file, returned) else return null
+            // names nothing the function declares (`return struct {};`); of a function with no
+            // one template, one the call makes, read with its bindings (`attachMade`).
+            if (self.namesNothingOf(decl, returned)) try self.resolve(decl.file, returned) else if (written_only and try self.template(decl) == null) (try self.symbolicAt(decl.file, returned)) orelse return null else return null
         else
             try self.resolveIn(bound, decl.file, returned);
         if (value == .unknown) return null;
@@ -4536,6 +4669,31 @@ fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declar
     }
     if (values.items.len == 0) return null;
     return try self.choose(values.items);
+}
+
+/// The container a type function declares at `node`, as one its calls make (symbolic, made by
+/// none until `attachMade` gives it the call).
+fn symbolicAt(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
+    for (self.project.at(file).model.scopes, 0..) |scope, s| if (scope.kind == .container and scope.node == node) return .{ .container = .{ .file = file, .scope = @fromBackingInt(@intCast(s)), .symbolic = true } };
+    return null;
+}
+
+/// `value`, a call's, with each container the call makes (symbolic, made by none) made by it.
+fn attachMade(self: *Facts, value: Value, made: Made) ResolveError!Value {
+    switch (value) {
+        .container => |c| if (c.symbolic and c.made_by == null) {
+            var out = c;
+            out.made_by = try self.making(made);
+            return .{ .container = out };
+        },
+        .alternatives => |each| {
+            const mapped = try self.gpa.alloc(Value, each.len);
+            for (each, mapped) |one, *out| out.* = try self.attachMade(one, made);
+            return .{ .alternatives = mapped };
+        },
+        else => {},
+    }
+    return value;
 }
 
 /// Whether the expression `node` in function `decl` names none of the function's parameters
@@ -4623,6 +4781,8 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .array_access => {
             const operands = tree.nodeData(node).node_and_node;
             const base = try self.resolveIn(env, file, operands[0]);
+            // A literal indexed by a parameter the call binds to a number: that part.
+            if (base == .literal) if (self.boundNumber(env, file, operands[1])) |position| return self.destructuredAt(base, position);
             return self.elementOf(base, tree, operands[1]);
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(env, file, node),
@@ -4635,7 +4795,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             const call = tree.fullCall(&call_buffer, node).?;
             const callee = try self.resolveIn(env, file, call.ast.fn_expr);
             if (callee != .function) return self.callResult(callee, {});
-            if (try self.evaluateCall(env, file, call, callee.function)) |value| return value;
+            if (try self.evaluateCall(env, file, call, callee.function)) |value| return self.attachMade(value, .{ .function = callee.function, .file = file, .call = node, .env = e, .assumed = self.assumed });
             var result = try self.callResult(callee, {});
             // A container a type function makes here is made with this reading's bindings.
             if (result == .container and result.container.symbolic) {
@@ -4660,6 +4820,24 @@ fn enclosed(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id, fun
         if (scopes[@backingInt(s)].kind == .function and scopes[@backingInt(s)].node == function_node) return true;
     }
     return false;
+}
+
+/// The number a parameter named at `node` is bound to by `env`'s call, written there as a
+/// literal (`Pick(1)`).
+fn boundNumber(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ?usize {
+    const e = env orelse return null;
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .identifier) return null;
+    const model = &self.project.at(file).model;
+    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(index)];
+    if (record.kind != .parameter or file != e.function.file or model.scopes[@backingInt(record.scope)].node != self.scopeNode(e.function)) return null;
+    const position = self.parameterPosition(file, e.function, record.token) orelse return null;
+    if (position >= e.sources.len) return null;
+    const source = e.sources[position] orelse return null;
+    const at = &self.project.at(source.file).file.tree;
+    if (at.nodeTag(source.node) != .number_literal) return null;
+    return std.fmt.parseInt(usize, at.tokenSlice(at.nodeMainToken(source.node)), 0) catch null;
 }
 
 /// The position of the parameter named by `token` in `function`'s list.
@@ -6655,6 +6833,26 @@ pub const calls = struct {
         const value = try facts.resolve(file, holder);
         // A type's member, or a typeless literal's field, binds nothing.
         if (value == .container or value == .literal) return .none;
+        // A choice of holders (`if (T == bool) &memo.found else &memo.needed`): bound where
+        // each is a value whose member so named is a method, as one holder is.
+        if (value == .alternatives) {
+            if (tree.nodeTag(callee) != .field_access) return .{ .unknown = .unsupported };
+            const name = try facts.memberName(tree.tokenSlice(tree.nodeData(callee).node_and_token[1]));
+            for (value.alternatives) |one| {
+                const container = switch (one) {
+                    .instance => |c| c,
+                    .pointer, .optional => |inner| switch (inner.*) {
+                        .instance => |c| c,
+                        else => return .{ .unknown = .unsupported },
+                    },
+                    .unknown => |why| return .{ .unknown = why },
+                    else => return .{ .unknown = .unsupported },
+                };
+                const decl = facts.member(container, name) orelse return .{ .unknown = .unresolved };
+                if (facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .function) return .{ .unknown = .unsupported };
+            }
+            return .{ .bound = holder };
+        }
         // A field holds what it is given, and a call through it binds nothing.
         const decl = switch (try memberNamed(facts, file, callee)) {
             .decl => |d| d,
