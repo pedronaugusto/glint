@@ -1,6 +1,2 @@
 .{
-    .open = .{
-        // glint-b precision: a tuple literal of a dependency's value resolves to no value (Facts.resolve models no anonymous tuple), so the safe twin is undecided
-        "aggregate/mx-a08-14_tuple_dep_value/twin.zig",
-    },
 }

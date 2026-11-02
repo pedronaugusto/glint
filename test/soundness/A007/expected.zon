@@ -2,8 +2,4 @@
 // A007's value (a sync type held, a raw atomic) cannot pass through one.
 .{
     .na = .{.operator},
-    .open = .{
-        // glint-b precision: a tuple literal of a dependency's value resolves to no value (Facts.resolve models no anonymous tuple), so the safe twin is undecided
-        "aggregate/mx-a07-13_tuple_dep_value/twin.zig",
-    },
 }

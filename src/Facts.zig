@@ -1691,26 +1691,15 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         .field_access => return self.fieldValue(file, node),
         .optional_type => return .{ .optional = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
-        // A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the
-        // payload's type, as `x.?` has, where the other side coerces to it; the peer type of
-        // both where the other side wraps the payload itself (`opt orelse f()` with `f`
-        // returning `E!T` is an `E!T`, `x catch null` a `?T`).
-        .@"catch", .@"orelse" => {
-            const sides = tree.nodeData(node).node_and_node;
-            const wrapper: std.meta.Tag(Value) = if (tag == .@"catch") .error_union else .optional;
-            const inner = try self.payload(try self.resolve(file, sides[0]), wrapper);
-            if (inner == .unknown or never(tree, sides[1])) return inner;
-            const other = try self.resolve(file, sides[1]);
-            return switch (other) {
-                .error_union => if (tag == .@"orelse") .{ .error_union = try self.boxed(inner) } else inner,
-                .optional => if (tag == .@"catch") .{ .optional = try self.boxed(inner) } else inner,
-                // A function or a pointer to one: either side's.
-                else => if (!callable(inner)) inner else self.identity(try self.erased(inner), &.{ inner, other }),
-            };
-        },
+        .@"catch", .@"orelse" => return self.unwrapped(null, file, node),
         .unwrap_optional => return self.payload(try self.resolve(file, tree.nodeData(node).node_and_token[0]), .optional),
         .@"switch", .switch_comma, .@"if" => if (try self.branches(null, file, node)) |value| return value,
-        .block, .block_semicolon, .block_two, .block_two_semicolon => if (try self.breaks(null, file, node)) |value| return value,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            if (try self.breaks(null, file, node)) |value| return value;
+            // `{}`: void's one value, as a value of a primitive type is that type.
+            var buffer: [2]Ast.Node.Index = undefined;
+            if (tree.blockStatements(&buffer, node)) |statements| if (statements.len == 0) return .{ .primitive = "void" };
+        },
         .for_simple, .@"for", .while_simple, .while_cont, .@"while" => if (try self.loopValue(file, node)) |value| return value,
         .grouped_expression => return self.resolve(file, tree.nodeData(node).node_and_token[0]),
         // `comptime x` and `nosuspend x` have `x`'s type.
@@ -2785,6 +2774,26 @@ pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
 }
 
 /// The payload of an optional or error union `value` is.
+/// A payload seen through what wraps it: `x catch ...` and `x orelse ...` have the payload's
+/// type, as `x.?` has, where the other side coerces to it; the peer type of both where the other
+/// side wraps the payload itself (`opt orelse f()` with `f` returning `E!T` is an `E!T`, `x catch
+/// null` a `?T`, `a orelse b` with `b` a `?T` another `?T`, as a chain `a orelse b orelse return`
+/// unwraps). Both sides are read with `env`'s bindings.
+fn unwrapped(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    const sides = tree.nodeData(node).node_and_node;
+    const wrapper: std.meta.Tag(Value) = if (tree.nodeTag(node) == .@"catch") .error_union else .optional;
+    const inner = try self.payload(try self.resolveIn(env, file, sides[0]), wrapper);
+    if (inner == .unknown or never(tree, sides[1])) return inner;
+    const other = try self.resolveIn(env, file, sides[1]);
+    return switch (other) {
+        .error_union => .{ .error_union = try self.boxed(inner) },
+        .optional => .{ .optional = try self.boxed(inner) },
+        // A function or a pointer to one: either side's.
+        else => if (!callable(inner)) inner else self.identity(try self.erased(inner), &.{ inner, other }),
+    };
+}
+
 fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveError!Value {
     return switch (value) {
         .optional => |inner| if (wrapper == .optional) inner.* else .{ .unknown = .unsupported },
@@ -2817,8 +2826,11 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
         .array => |inner| inner.*,
         .pointer => |inner| switch (inner.*) {
             .array => |elements| elements.*,
+            .literal => |literal| self.choose(try self.literalParts(literal)),
             else => inner.*,
         },
+        // A tuple of no type of its own, named (`inline for (kinds) |kind|`): one of its parts.
+        .literal => |literal| self.choose(try self.literalParts(literal)),
         .alternatives => self.map(value, {}, indexed),
         .unknown => value,
         else => .{ .unknown = .unsupported },
@@ -3123,6 +3135,10 @@ fn conditional(self: *Facts, env: ?*const Env, file: Project.FileId, payload_tok
     const value = try self.resolveIn(env, file, condition);
     return switch (value) {
         .optional, .error_union => |inner| inner.*,
+        // Zig unwraps only an optional or an error union: a condition read as a payload is one
+        // whose wrapper a peer with `null` adds, which this reading keeps no record of (`const
+        // a, const b = cut(x) orelse .{ x, null }` makes `b` optional), and captures that payload.
+        .pointer, .instance, .array, .scalar => value,
         .unknown => value,
         else => .{ .unknown = .unsupported },
     };
@@ -3999,9 +4015,29 @@ fn choose(self: *Facts, values: []const Value) ResolveError!Value {
             } else try kept.append(self.gpa, part);
         }
     }
+    // An empty literal (`.{}`, `&.{}`) coerces to the type of a peer it is chosen with: a slice's,
+    // a struct's with defaults (`if (found) |list| list.items else &.{}`).
+    if (kept.items.len > 1) {
+        var peers: usize = 0;
+        for (kept.items) |part| if (!self.emptyLiteralValue(part)) {
+            kept.items[peers] = part;
+            peers += 1;
+        };
+        if (peers != 0) kept.items.len = peers;
+    }
     if (kept.items.len == 0) return .{ .unknown = .unsupported };
     if (kept.items.len == 1) return kept.items[0];
     return .{ .alternatives = kept.items };
+}
+
+/// Whether a value is a literal with no type of its own and nothing in it, or a pointer to one.
+fn emptyLiteralValue(self: *const Facts, value: Value) bool {
+    const literal = switch (value) {
+        .literal => |literal| literal,
+        .pointer => |inner| if (inner.* == .literal) inner.literal else return false,
+        else => return false,
+    };
+    return emptyLiteral(&self.project.at(literal.file).file.tree, literal.node);
 }
 
 /// `f(value)` for each alternative of `value`, chosen as one.
@@ -4092,9 +4128,10 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
         // enum's or a tagged union's tag type. A type of another kind is a prong Zig does not
         // analyse for it.
         .structure, .tagged, .enumeration => {
+            // Names are strings whatever the type is (a typeless literal's among them).
+            if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return .{ .pointer = try self.boxed(.{ .pointer = try self.boxed(.{ .primitive = "u8" }) }) };
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return .{ .pointer = try self.boxed(try self.fieldTypes(container)) };
-            if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return .{ .pointer = try self.boxed(.{ .pointer = try self.boxed(.{ .primitive = "u8" }) }) };
             if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return .{ .pointer = try self.boxed(.scalar) };
             if (std.mem.eql(u8, name, "is_tuple") and r.at == .structure) return .scalar;
             if (std.mem.eql(u8, name, "tag_type") and r.at != .structure) return self.tagType(container, r.at == .tagged);
@@ -4592,8 +4629,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
         .address_of => return .{ .pointer = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
         .deref => return self.pointee(try self.resolveIn(env, file, tree.nodeData(node).node), {}),
         .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolveIn(env, file, tree.fullSlice(node).?.ast.sliced), {}), // unreachable: a slice node is a full slice
-        .@"catch" => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[0]), .error_union),
-        .@"orelse" => return self.payload(try self.resolveIn(env, file, tree.nodeData(node).node_and_node[0]), .optional),
+        .@"catch", .@"orelse" => return self.unwrapped(env, file, node),
         .call_one, .call_one_comma, .call, .call_comma => {
             var call_buffer: [1]Ast.Node.Index = undefined;
             const call = tree.fullCall(&call_buffer, node).?;

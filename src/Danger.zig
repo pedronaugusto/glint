@@ -103,6 +103,8 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     for (model.declarations, 0..) |decl, d| {
         if (c.inTest(decl.token)) continue;
+        // A module or file `@import` gives: a namespace, a type, which holds no material.
+        if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (imported(tree, init)) continue;
         const value: Facts.Value = switch (decl.kind) {
             .variable, .parameter, .capture, .field => try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }),
             // What calling it gives, as Zig reads its result type (`!T`, a made type).
@@ -141,7 +143,7 @@ const Secret = union(enum) { yes: []const u8, no, unknown: Facts.Unknown };
 
 /// Whether a value is secret material by value: an instance of one of `types`, or an array, an
 /// optional or an error union of one; a choice of them is if one is. A pointer borrows it; a
-/// type, a number, a function hold none. Any other value is unknown (`Facts.resolve`'s contract).
+/// type, a number, a function, an error hold none. Any other value is unknown (`Facts.resolve`'s contract).
 /// An instance of a container a type function made holds what a field holds that the function's
 /// parameters type and no call it judges binds (`unjudged`): that field is read with this
 /// instance's bindings, as nowhere else. aegis's Secret, SecretBytes and Choice hold it sealed.
@@ -170,16 +172,24 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
             return out;
         },
         .array, .optional, .error_union => |inner| return heldSecret(c, types, inner.*),
-        .alternatives => |each| {
+        // A tuple or struct literal with no type of its own holds each part by value; a part
+        // known only as the program compiles (an enum literal, `.{ "pointer", .pointer }`, or
+        // one of a choice of such tuples) leaves it so, as such a declaration is.
+        .alternatives, .literal => {
+            const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Secret = .no;
             for (each) |one| switch (try heldSecret(c, types, one)) {
                 .yes => |held| return .{ .yes = held },
-                .unknown => out = .{ .unknown = .unresolved },
+                .unknown => |why| if (why != .comptime_dependent) {
+                    out = .{ .unknown = .unresolved };
+                } else if (out == .no) {
+                    out = .{ .unknown = why };
+                },
                 .no => {},
             };
             return out;
         },
-        .pointer, .container, .primitive, .scalar, .function, .fn_type => return .no,
+        .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set => return .no,
         .unknown => |why| return .{ .unknown = why },
         else => return .{ .unknown = .unsupported },
     }
@@ -1075,11 +1085,19 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
     switch (value) {
         .instance => |inner| return if (try syncType(c, found, .{ .container = inner })) |index| .{ .yes = index } else .no,
         .array, .optional, .error_union => |inner| return heldSync(c, found, inner.*),
-        .alternatives => |each| {
+        // A tuple or struct literal with no type of its own holds each part by value; a part
+        // known only as the program compiles (an enum literal, `.{ "pointer", .pointer }`, or
+        // one of a choice of such tuples) leaves it so, as such a declaration is.
+        .alternatives, .literal => {
+            const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Sync = .no;
             for (each) |one| switch (try heldSync(c, found, one)) {
                 .yes => |index| return .{ .yes = index },
-                .unknown => out = .{ .unknown = .unresolved },
+                .unknown => |why| if (why != .comptime_dependent) {
+                    out = .{ .unknown = .unresolved };
+                } else if (out == .no) {
+                    out = .{ .unknown = why };
+                },
                 .no => {},
             };
             return out;

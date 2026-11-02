@@ -372,6 +372,66 @@ test "A008 leaves borrowed keys, sealed keys, public keys and compared key types
     , 0);
 }
 
+test "A007 and A008 read a tuple by its parts, a chain of orelse to its payload, and errors, error sets and imports as holding none" {
+    // A tuple holding a lock or a key a call gives is a finding, as the call's result is; an error
+    // set, an error capture, an enum literal in a tuple and `a orelse b orelse return` hold none,
+    // and a capture of a value a peer with `null` made optional, an element of a choice of a
+    // slice and `&.{}` or of a named tuple, holds what the value does; a typeless literal's
+    // field names are strings, and `{}` bound to an `anytype` is void.
+    try expect(pack.shared_state,
+        \\const std = @import("std");
+        \\const Error = error{Gone};
+        \\const Failure = Error || error{Lost};
+        \\fn first(m: *std.Io.Mutex) ?*std.Io.Mutex { return m; }
+        \\fn second(m: *std.Io.Mutex) ?*std.Io.Mutex { return m; }
+        \\fn make() std.Io.Mutex { return .init; }
+        \\fn g() Error!void {}
+        \\pub fn f(m: *std.Io.Mutex, n: u32) Failure!u32 {
+        \\    const p = first(m) orelse second(m) orelse return error.Gone;
+        \\    _ = p;
+        \\    g() catch |err| return err;
+        \\    const key = .{ n, .tag, "name" };
+        \\    const both = .{ n, make() };
+        \\    _ = .{ key, both };
+        \\    return n;
+        \\}
+        \\fn cut(s: []const u8) ?struct { []const u8, []const u8 } { return .{ s, s }; }
+        \\pub fn h(s: []const u8, found: ?[]const u32) void {
+        \\    const name, const place = cut(s) orelse .{ s, null };
+        \\    _ = name;
+        \\    if (place) |words| _ = words;
+        \\    for (if (found) |list| list else &.{}) |each| _ = each;
+        \\}
+        \\fn apply(v: u32, context: anytype) u32 {
+        \\    _ = context;
+        \\    return v;
+        \\}
+        \\pub fn k(v: u32) u32 {
+        \\    const record = .{ .a = v };
+        \\    inline for (@typeInfo(@TypeOf(record)).@"struct".field_names) |name| _ = name;
+        \\    const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional } };
+        \\    inline for (kinds) |kind| if (kind[0].len == 1) return 0;
+        \\    return apply(v, {});
+        \\}
+    , 2);
+    try expect(pack.secrets,
+        \\const std = @import("std");
+        \\const zon = @import("build.zig.zon");
+        \\const Error = error{Gone};
+        \\const Failure = Error || error{Lost};
+        \\const Ed25519 = std.crypto.sign.Ed25519;
+        \\fn make() Ed25519.KeyPair { return Ed25519.KeyPair.generate(); }
+        \\fn g() Error!void {}
+        \\pub fn f(n: u32) Failure!u32 {
+        \\    g() catch |err| return err;
+        \\    const key = .{ n, .tag };
+        \\    const both = .{ n, make() };
+        \\    _ = .{ key, both };
+        \\    return n;
+        \\}
+    , 2);
+}
+
 test "A011 finds time crossing as a raw integer and units converted by hand wherever a constant goes and as the program compiles, not raw nanoseconds compared or subtracted" {
     try expect(pack.units,
         \\const std = @import("std");
