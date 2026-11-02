@@ -572,11 +572,9 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
         if (sameUnit(tree, model, counts.items, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
     }
-    // A copy of memory between std's time and anything else, by what it does
-    // (`Facts.accesses.copyAt`: `@memcpy(std.mem.asBytes(&d), std.mem.asBytes(&ns))`,
-    // std.mem.copyForwards, `std.mem.bytesToValue(std.Io.Duration, bytes)`, a store through
-    // `@ptrCast(&d)`), writes a raw count past the door, or reads one out of it; a copy of one
-    // of its values into another is none. A side whose type does not resolve is undecided.
+    // A byte copy into std's time from anything else (`@memcpy(std.mem.asBytes(&d),
+    // std.mem.asBytes(&ns))`) writes a raw count past the door; a copy of one of its values is
+    // none. A destination or a source whose type does not resolve is undecided.
     var times: std.ArrayList(Facts.Container) = .empty;
     for (found) |g| if (std.mem.endsWith(u8, paths[g.index], ".nanoseconds")) for (g.decls) |decl| {
         try times.append(c.allocator, .{ .file = decl.file, .scope = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope });
@@ -587,16 +585,19 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
         const copy = (try Facts.accesses.copyAt(c.facts, c.file, node)) orelse continue;
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
-        const into = try heldTime(c, times.items, try c.facts.resolve(c.file, copy.into.node()));
-        const from = try heldTime(c, times.items, try c.facts.resolve(c.file, copy.from.node()));
-        if (into == from) continue;
-        if (into == .unknown or from == .unknown) {
-            try c.undecided(rule, tree.tokenStart(token), .unresolved, "a copy of memory one side of which does not resolve to a type may move std's time as a raw count");
-            continue;
+        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.into.node()))) {
+            .no => continue,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(token), .unresolved, "a byte copy into memory whose type does not resolve may write std's time raw");
+                continue;
+            },
+            .yes => {},
         }
-        if (into == .yes) {
-            try c.at(rule, token, "std's time written as raw bytes; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration");
-        } else try c.at(rule, token, "std's time read out as raw bytes; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration");
+        switch (try heldTime(c, times.items, try c.facts.resolve(c.file, copy.from.node()))) {
+            .yes => {},
+            .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a byte copy into std's time from memory whose type does not resolve may be a raw count"),
+            .no => try c.at(rule, token, "std's time written as raw bytes; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration"),
+        }
     }
 }
 

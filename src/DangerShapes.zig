@@ -794,7 +794,7 @@ fn addressWrite(c: *Context, resources: []const ?Facts.Container, file: Project.
         if (copy.from == .place and copy.from.place == place) return .none;
         if (copy.into != .place or copy.into.place != place) return .address;
         return switch (copy.from) {
-            .place, .value => |value| if (try filled(c, resources, file, value)) .none else .owner,
+            .place => |value| if (try filled(c, resources, file, value)) .none else .owner,
             .pointer => .unknown,
         };
     }
