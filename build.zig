@@ -63,12 +63,16 @@ pub fn dev(b: *std.Build, tools: type) void {
     const library_tests = b.addTest(.{ .root_module = module, .filters = if (filter) |f| &.{f} else &.{} });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     // The soundness suite: every case under test/soundness/ on the glint just built, std from
-    // this Zig and aegis as glint pins it.
+    // this Zig and aegis as glint pins it. Its glint is ReleaseSafe whatever `-Doptimize` says:
+    // the suite runs glint over every case, which costs about 8 times the CPU in Debug, and
+    // ReleaseSafe keeps every safety check.
+    const soundness_optimize = b.option(std.lang.Optimize, "soundness-optimize", "The mode the soundness suite's glint is built in (default: ReleaseSafe)") orelse .safe;
+    const soundness_package = b.dependency("glint", .{ .target = target, .optimize = soundness_optimize });
     const soundness = b.addExecutable(.{ .name = "glint-soundness", .root_module = b.createModule(.{
         .root_source_file = p.path("test/soundness/run.zig"),
         .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "glint", .module = module }},
+        .optimize = soundness_optimize,
+        .imports = &.{.{ .name = "glint", .module = soundness_package.module("glint") }},
     }) });
     const soundness_run = b.addRunArtifact(soundness);
     soundness_run.addDirectoryArg2(p.path("test/soundness"), .{});
