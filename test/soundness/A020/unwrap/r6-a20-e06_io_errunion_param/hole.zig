@@ -5,6 +5,6 @@ pub fn spin(io: anyerror!std.Io, r: *std.Io.Reader) !u64 {
     var t: u64 = 0;
     var i: u64 = 0;
     while (i < n) : (i += 1) t +%= i;
-    _ = io;
+    if (io) |_| {} else |_| {}
     return t;
 }

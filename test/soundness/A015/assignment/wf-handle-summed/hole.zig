@@ -7,6 +7,6 @@ pub fn store(s: *Stored, f: std.Io.File) void {
 pub fn drop(s: *Stored, io: std.Io) void {
     var fd: std.Io.File.Handle = 0;
     fd += s.file.handle;
-    const g: std.Io.File = .{ .handle = fd };
+    const g: std.Io.File = .{ .handle = fd, .flags = s.file.flags };
     g.close(io);
 }
