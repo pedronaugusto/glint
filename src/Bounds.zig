@@ -320,6 +320,10 @@ pub const Kind = enum {
     /// function holds: no more passes than the work a peer already sent. Keyed by the operand
     /// of a `while` condition's comparison or a `for` range's end.
     count,
+    /// A loop's passes at most a short's count, or the length of memory the function holds that
+    /// the loop does not change: no more passes than the work a peer already sent, whatever
+    /// decides them. Keyed by the loop.
+    passes,
 };
 
 const Site = struct { node: Ast.Node.Index, kind: Kind };
@@ -741,6 +745,8 @@ const Key = union(enum) {
     passes: Ast.Node.Index,
     /// A variable a loop steps, as it was when the loop was entered.
     entry: struct { loop: Ast.Node.Index, d: Model.Declaration.Id },
+    /// A place a loop steps, as it was when the loop was entered.
+    place_step: struct { loop: Ast.Node.Index, place: Place },
     /// A `for` loop's count of passes, as its inputs gave it when the loop was entered: an input
     /// the body shrinks (`s = s[1..]`) does not change how many passes run.
     count: Ast.Node.Index,
@@ -2080,11 +2086,12 @@ const Frame = struct {
             return f.fresh(out, node, 0);
         }
         if (is(which, "@intFromBool")) {
-            const made = try f.fresh(out, node, 0);
-            const t = made.v.lin orelse return made;
-            var bounded = try assume(f.a, made.s, try atLeast(f.a, t, constant(0)));
+            // A `u1`, whatever type it is read in.
+            const made = try f.temp(out, node, 0);
+            const t = try single(f.a, made[1]);
+            var bounded = try assume(f.a, made[0], try atLeast(f.a, t, constant(0)));
             bounded = try assume(f.a, bounded, try atLeast(f.a, constant(1), t));
-            return .{ .s = bounded, .v = made.v };
+            return .{ .s = bounded, .v = .{ .lin = t } };
         }
         if (is(which, "@min") or is(which, "@max")) {
             const made = try f.fresh(out, node, 0);
@@ -2383,7 +2390,25 @@ const Frame = struct {
         const final = try f.passOf(invariant, node, label, t[1], form);
         var out = final.exit;
         for (final.breaks) |state| out = try f.join(out, state);
-        return .{ .s = out, .v = .{ .lin = try single(f.a, t[1]) } };
+        return .{ .s = try f.leftLoop(out, node), .v = .{ .lin = try single(f.a, t[1]) } };
+    }
+
+    /// `s` past the loop `node`, without the variables only its passes read (its count of
+    /// passes, its `for` count and counter, what its steps entered with): what they gave the
+    /// variables that live on stays, and they take none of the room a state keeps for those.
+    fn leftLoop(f: *Frame, s: State, node: Ast.Node.Index) Error!State {
+        var out = s;
+        for (f.vars.keys(), f.vars.values()) |key, v| {
+            const own = switch (key) {
+                .passes, .count => |at| at == node,
+                .entry => |e| e.loop == node,
+                .place_step => |e| e.loop == node,
+                .temp => |t| t.node == node and t.part == 6,
+                else => false,
+            };
+            if (own) out = try forget(f.a, out, v);
+        }
+        return out;
     }
 
     /// `s` with what it implies among the variables the loop `node` leaves alone: a value or
@@ -2392,26 +2417,13 @@ const Frame = struct {
     fn fixedOver(f: *Frame, s: State, node: Ast.Node.Index) Error!State {
         const first = f.tree.firstToken(node);
         const last = f.tree.lastToken(node);
-        var assigned: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty;
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            switch (tag) {
-                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {},
-                .assign_destructure => return s,
-                else => continue,
-            }
-            const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const token = f.tree.nodeMainToken(inner);
-            if (token < first or token > last) continue;
-            const target = f.tree.nodeData(inner).node_and_node[0];
-            // `s.len = n` and `@field(s, …) = v` assign `s`'s length.
-            const d = f.trackedName(target) orelse (try f.lengthStored(target)) orelse continue;
-            try assigned.put(f.a, d, {});
-        }
+        const assigned = (try f.assignedIn(node)) orelse return s;
         var kept = s;
         for (f.vars.keys(), f.vars.values()) |key, v| {
             const fixed = switch (key) {
                 .value, .length => |d| !assigned.contains(d) and outside(f.model.declarations[@backingInt(d)].token, first, last),
                 .entry => |e| e.loop == node,
+                .place_step => |e| e.loop == node,
                 .count => |counted_loop| counted_loop == node,
                 else => false,
             };
@@ -2422,12 +2434,74 @@ const Frame = struct {
         return out;
     }
 
-    /// Each variable the loop `node` only steps one way, by an amount of at most `D` each time
-    /// (`n += 1`, `total += byte`, `at = at - 2`): kept as it entered, with the candidates
-    /// `0 <= v - v0 <= D·p` (or the same downward) over the passes `p`. A candidate a pass
-    /// does not keep (two steps in one pass) is dropped like any other.
+    /// The tracked declarations the loop `node` assigns, a length stored among them (`s.len =
+    /// n`, `@field(s, …) = v`); null where a destructure in it may assign any.
+    fn assignedIn(f: *Frame, node: Ast.Node.Index) Error!?std.AutoHashMapUnmanaged(Model.Declaration.Id, void) {
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        var assigned: std.AutoHashMapUnmanaged(Model.Declaration.Id, void) = .empty;
+        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
+            switch (tag) {
+                .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => {},
+                .assign_destructure => return null,
+                else => continue,
+            }
+            const inner: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const token = f.tree.nodeMainToken(inner);
+            if (token < first or token > last) continue;
+            const target = f.tree.nodeData(inner).node_and_node[0];
+            const d = f.trackedName(target) orelse (try f.lengthStored(target)) orelse continue;
+            try assigned.put(f.a, d, {});
+        }
+        return assigned;
+    }
+
+    /// Records whether the pass of the loop `node` about to run in `s` is within a short's count
+    /// of passes, or within the length of memory the function holds that the loop leaves alone:
+    /// a slice declared before it and not assigned in it, whose length is its memory's, not a
+    /// claim (`Value.claimed`). Where every pass is, the loop runs no more passes than that
+    /// length, whatever its condition reads.
+    fn passesHeld(f: *Frame, s: State, node: Ast.Node.Index) Error!void {
+        if (f.trial > 0) return;
+        const ran = shiftedBy(try single(f.a, try f.variable(.{ .passes = node })), 1).?; // unreachable: a variable's constant is 0
+        if (try f.holds(s, try atLeast(f.a, constant(std.math.maxInt(u16)), ran))) return f.record(node, .passes, true);
+        const assigned = (try f.assignedIn(node)) orelse return f.record(node, .passes, false);
+        const first = f.tree.firstToken(node);
+        const last = f.tree.lastToken(node);
+        for (f.vars.keys(), f.vars.values()) |key, v| {
+            const d = switch (key) {
+                .length => |d| d,
+                else => continue,
+            };
+            if (f.claimed.contains(v) or assigned.contains(d) or !outside(f.model.declarations[@backingInt(d)].token, first, last)) continue;
+            if (try f.holds(s, try atLeast(f.a, try single(f.a, v), ran))) return f.record(node, .passes, true);
+        }
+        try f.record(node, .passes, false);
+    }
+
+    /// What a loop's assignment steps: a tracked variable, or a place (`s.at`).
+    const Stepped = union(enum) { decl: Model.Declaration.Id, place: Place };
+
+    /// The variable or place `node` names, as a step may assign it.
+    fn steppedBy(f: *Frame, node: Ast.Node.Index) Error!?Stepped {
+        if (f.trackedName(node)) |d| return .{ .decl = d };
+        if (try f.placeOf(node)) |p| return .{ .place = p };
+        return null;
+    }
+
+    fn sameStepped(f: *Frame, node: Ast.Node.Index, target: Stepped) Error!bool {
+        const named = (try f.steppedBy(node)) orelse return false;
+        return std.meta.eql(named, target);
+    }
+
+    /// Each variable or place the loop `node` steps, by an amount of at most `U` up and `D` down
+    /// each time (`n += 1`, `total += byte`, `at = at - 2`, `depth -= 1`): kept as it entered,
+    /// with the candidates `v - v0 <= U·p` and `v0 - v <= D·p` over the passes `p`, and, where
+    /// it goes one way only, `v0 <= v` (or `v <= v0`). A candidate a pass does not keep (two
+    /// steps in one pass) is dropped like any other: the loop's invariant keeps only what every
+    /// pass preserves.
     fn stepCandidates(f: *Frame, s: State, node: Ast.Node.Index, p: Var, out: *std.ArrayList(Lin)) Error!State {
-        const Step = struct { d: Model.Declaration.Id, up: bool, most: Coef, least: ?Coef = null, mixed: bool = false };
+        const Step = struct { target: Stepped, at: Ast.Node.Index, up: Coef = 0, down: Coef = 0, least: ?Coef = null, way: ?bool = null, other: bool = false };
         var steps: std.ArrayList(Step) = .empty;
         const first = f.tree.firstToken(node);
         const last = f.tree.lastToken(node);
@@ -2439,55 +2513,70 @@ const Frame = struct {
                 .assign, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor => f.tree.nodeData(inner).node_and_node,
                 else => continue,
             };
-            const d = f.trackedName(target) orelse continue;
+            const stepped = (try f.steppedBy(target)) orelse continue;
             const found = for (steps.items) |*step| {
-                if (step.d == d) break step;
+                if (std.meta.eql(step.target, stepped)) break step;
             } else blk: {
-                try steps.append(f.a, .{ .d = d, .up = true, .most = 0 });
+                try steps.append(f.a, .{ .target = stepped, .at = target });
                 break :blk &steps.items[steps.items.len - 1];
             };
-            const way = try f.stepOf(d, tag, value) orelse {
-                found.mixed = true;
+            const way = try f.stepOf(stepped, tag, value) orelse {
+                found.other = true;
                 continue;
             };
-            if (found.most != 0 and found.up != way.up) found.mixed = true;
-            found.up = way.up;
-            found.most = @max(found.most, way.most);
+            if (way.up) found.up = @max(found.up, way.most) else found.down = @max(found.down, way.most);
+            // A step at least `k` counts only where every step goes the same way.
+            if (found.way) |w| {
+                if (w != way.up) found.least = 0;
+            }
+            found.way = way.up;
             found.least = @min(found.least orelse way.least, way.least);
         }
         var entry = s;
         for (steps.items) |step| {
-            if (step.mixed or step.most == 0) continue;
-            const v = try single(f.a, try f.variable(.{ .value = step.d }));
-            const v0_var = try f.variable(.{ .entry = .{ .loop = node, .d = step.d } });
+            if (step.other or (step.up == 0 and step.down == 0)) continue;
+            const v: Lin = switch (step.target) {
+                .decl => |d| try single(f.a, try f.variable(.{ .value = d })),
+                .place => |place| read: {
+                    // Read as the loop's body reads it: within its type, and what it held at
+                    // entry where nothing has stored a place yet.
+                    const e = try f.placeValue(entry, step.at, place);
+                    entry = e.s;
+                    break :read e.v.lin orelse continue;
+                },
+            };
+            const v0_var = try f.variable(switch (step.target) {
+                .decl => |d| .{ .entry = .{ .loop = node, .d = d } },
+                .place => |place| .{ .place_step = .{ .loop = node, .place = place } },
+            });
             entry = try forget(f.a, entry, v0_var);
             entry = try f.equal(entry, v0_var, v);
             const v0 = try single(f.a, v0_var);
-            const reach = (try scaled(f.a, try single(f.a, p), step.most)) orelse continue;
-            if (step.up) {
-                if (try atLeast(f.a, v, v0)) |row| try out.append(f.a, row);
+            if (step.up > 0) {
+                const reach = (try scaled(f.a, try single(f.a, p), step.up)) orelse continue;
                 if (try plus(f.a, v0, reach)) |top| if (try atLeast(f.a, top, v)) |row| try out.append(f.a, row);
-            } else {
-                if (try atLeast(f.a, v0, v)) |row| try out.append(f.a, row);
+            } else if (try atLeast(f.a, v0, v)) |row| try out.append(f.a, row);
+            if (step.down > 0) {
+                const reach = (try scaled(f.a, try single(f.a, p), step.down)) orelse continue;
                 if (try plus(f.a, v, reach)) |bottom| if (try atLeast(f.a, bottom, v0)) |row| try out.append(f.a, row);
-            }
+            } else if (try atLeast(f.a, v, v0)) |row| try out.append(f.a, row);
             // A step of at least `k` on each path through a pass (`: (i += 1)`) goes at least
             // `k·p`: the count of passes is then bounded by how far the variable may go.
             const least = step.least orelse 0;
             if (least == 0) continue;
             const gone = (try scaled(f.a, try single(f.a, p), least)) orelse continue;
-            if (step.up) {
+            if (step.down == 0) {
                 if (try plus(f.a, v0, gone)) |bottom| if (try atLeast(f.a, v, bottom)) |row| try out.append(f.a, row);
-            } else {
+            } else if (step.up == 0) {
                 if (try plus(f.a, v, gone)) |top| if (try atLeast(f.a, v0, top)) |row| try out.append(f.a, row);
             }
         }
         return entry;
     }
 
-    /// An assignment to `d` as a step: which way and by at most how much, or null where it is
-    /// no step (a wrapping one, a product, a value of its own).
-    fn stepOf(f: *Frame, d: Model.Declaration.Id, tag: Ast.Node.Tag, value: Ast.Node.Index) Error!?struct { up: bool, most: Coef, least: Coef } {
+    /// An assignment to `target` as a step: which way and by at most how much, or null where it
+    /// is no step (a wrapping one, a product, a value of its own).
+    fn stepOf(f: *Frame, target: Stepped, tag: Ast.Node.Tag, value: Ast.Node.Index) Error!?struct { up: bool, most: Coef, least: Coef } {
         const up, const amount = switch (tag) {
             .assign_add, .assign_add_sat => .{ true, value },
             .assign_sub, .assign_sub_sat => .{ false, value },
@@ -2495,23 +2584,29 @@ const Frame = struct {
                 .add, .add_sat, .sub, .sub_sat => blk: {
                     const lhs, const rhs = f.tree.nodeData(value).node_and_node;
                     const sum = f.tree.nodeTag(value) == .add or f.tree.nodeTag(value) == .add_sat;
-                    if (f.trackedName(lhs) == d) break :blk .{ sum, rhs };
-                    if (sum and f.trackedName(rhs) == d) break :blk .{ true, lhs };
+                    if (try f.sameStepped(lhs, target)) break :blk .{ sum, rhs };
+                    if (sum and try f.sameStepped(rhs, target)) break :blk .{ true, lhs };
                     return null;
                 },
                 else => return null,
             },
             else => return null,
         };
-        if (f.trackedName(amount) == d) return null;
+        if (try f.sameStepped(amount, target)) return null;
         if (f.tree.nodeTag(amount) == .number_literal) switch (std.zig.parseNumberLiteral(f.tree.tokenSlice(f.tree.nodeMainToken(amount)))) {
             .int => |k| return .{ .up = up, .most = k, .least = k },
             else => return null,
         };
-        const int = (try f.intOf(amount)) orelse return null;
-        if (int.signed) return null;
-        const most = (try f.range(int, true)).high orelse return null;
-        return .{ .up = up, .most = most, .least = 0 };
+        if (try f.intOf(amount)) |int| {
+            if (int.signed) return null;
+            const most = (try f.range(int, true)).high orelse return null;
+            return .{ .up = up, .most = most, .least = 0 };
+        }
+        // An amount of no integer type of its own (`@intFromBool(b)`, `@popCount(x)`): at most
+        // what Range shows it, where it shows it never below zero.
+        const most = (try Range.stepMost(f.c, f.file, amount, f.width)) orelse return null;
+        if (most > std.math.maxInt(Coef)) return null;
+        return .{ .up = up, .most = @intCast(most), .least = 0 };
     }
 
     fn passOf(f: *Frame, invariant: State, node: Ast.Node.Index, label: ?[]const u8, value: Var, form: Form) RunError!Pass {
@@ -2551,6 +2646,7 @@ const Frame = struct {
             payload = .{ .lin = e.v.lin, .length = e.v.length };
             try f.counted(e.s, full.ast.cond_expr, e.v.lin);
         } else split = try f.cond(s, full.ast.cond_expr);
+        try f.passesHeld(split.yes, node);
         const entered = try f.capture(split.yes, full.payload_token, payload, try f.intOf(full.ast.cond_expr));
         const ran = try f.exec(entered, full.ast.then_expr);
         var exit = split.no;
@@ -2628,11 +2724,15 @@ const Frame = struct {
                 if (count) |n| out = try f.same(out, n, l) else count = l;
             }
         }
+        const at_entry = try f.variable(.{ .count = node });
         if (count) |n| {
-            const at_entry = try f.variable(.{ .count = node });
             out = try f.assign(out, at_entry, n, null);
-            count = try single(f.a, at_entry);
+        } else {
+            // A count no input shows is still a length or a range's: a `usize`, so a loop
+            // makes fewer passes than `usize` counts.
+            out = try f.assign(out, at_entry, null, .{ .bits = f.width, .signed = false });
         }
+        count = try single(f.a, at_entry);
         try f.for_counts.put(f.a, node, count);
         const result = try f.loop(out, node, label, &.{}, .@"for");
         // Its `else` runs where the passes ran out.
@@ -2650,6 +2750,7 @@ const Frame = struct {
         if (count) |n| entered = try assume(f.a, entered, try above(f.a, n, k));
         // The counter is the passes run before this one.
         entered = try f.same(entered, k, try single(f.a, try f.variable(.{ .passes = node })));
+        try f.passesHeld(entered, node);
         // Captures: a range's is its start plus the counter; an element's, nothing known.
         var token = full.payload_token;
         for (full.ast.inputs) |input| {
