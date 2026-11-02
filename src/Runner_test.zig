@@ -275,6 +275,32 @@ test "Z016 reads std's assert by meaning: a choice of callees one of which is it
     try std.testing.expect(undecided != 0);
 }
 
+test "Z012 judges the whole public surface: constants' types, reached fields, aliases of functions" {
+    // A public constant's type, written or inferred, and a public alias of a private function.
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub const default: Hidden = .{ .x = 1 };", 1);
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub const default = Hidden{ .x = 1 };", 1);
+    try check(.Z012, "pub const Hidden = struct { x: u8 }; pub const default = Hidden{ .x = 1 };", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; fn makeHidden() Hidden { return .{ .x = 1 }; } pub const make = makeHidden;", 1);
+    try check(.Z012, "pub const Hidden = struct { x: u8 }; fn makeHidden() Hidden { return .{ .x = 1 }; } pub const make = makeHidden;", 0);
+    // A field of a container the surface reaches; one nothing public reaches is not surface.
+    try check(.Z012, "const Hidden = struct { x: u8 }; pub const Api = struct { inner: Hidden };", 1);
+    try check(.Z012, "const Hidden = struct { x: u8 }; const Api = struct { inner: Hidden }; pub fn use() void { _ = Api; }", 0);
+    // A container is held by the declaration around it, whatever expression writes it.
+    try check(.Z012, "const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 1);
+    try check(.Z012, "pub const Hidden = (struct { x: u8 }); pub fn make() Hidden { return .{ .x = 1 }; }", 0);
+    // A type function's argument named by a private declaration, a function or a value.
+    try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 1);
+    try check(.Z012, "pub fn Wrap(comptime g: fn () u8) type { return struct { pub fn get() u8 { return g(); } }; } pub fn helper() u8 { return 1; } pub fn make() Wrap(helper) { return .{}; }", 0);
+    // What a generic's parameter gives is the caller's: a part of it, `@TypeOf` of it.
+    try check(.Z012, "pub fn Gen(comptime h: anytype) type { return struct { pub const n = h.n; }; }", 0);
+    try check(.Z012, "pub fn get(x: anytype) @TypeOf(x) { return x; }", 0);
+    // A public constant holding a type function's call names the type.
+    try check(.Z012, "fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(u8);", 0);
+    // A private alias whose value does not resolve is read as what it is written as.
+    try check(.Z012, "fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 1);
+    try check(.Z012, "pub fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 0);
+}
+
 test "G2 Z012 family API report respects public aliases receivers and suppression" {
     try check(.Z012, "const Hidden = struct {}; pub fn create() Hidden { return .{}; }", 1);
     try check(.Z012, "const Hidden = struct {}; pub fn create() ?*Hidden { return null; }", 1);

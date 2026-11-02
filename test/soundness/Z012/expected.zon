@@ -1,0 +1,20 @@
+.{
+    .no_hole = .{ .inline_loop, .operator, .unwrap },
+    .no_twin = .{ .inline_loop, .operator, .unwrap },
+    .na = .{
+        // A destructure writes places in a body; no public declaration takes its type from one.
+        .destructure,
+        // A capture binds a payload inside a body, where nothing is public.
+        .capture,
+        // A deferred statement runs at a scope's exit and gives no type.
+        .deferred,
+        // Memory builtins move values at run time; a public declaration's type is fixed as the
+        // program compiles.
+        .memory,
+    },
+    .open = .{
+        // `@import("builtin")` has no mapping in the run: its file note leaves the twin undecided.
+        "branch/sw-z012-comptime_choice/twin.zig",
+        "branch/sw-z012-switch_choice/twin.zig",
+    },
+}
