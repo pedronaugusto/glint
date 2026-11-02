@@ -252,6 +252,32 @@ test "G2 Z012 family API report respects public aliases receivers and suppressio
     try check(.Z012, "const Hidden = struct {};\n// glint-ignore: Z012 -- inference-only factory intentionally hides representation\npub fn create() Hidden { return .{}; }", 0);
 }
 
+test "Z012 reads the type a signature names by what it is, each type a caller has to name" {
+    // An array's element, through an alias or written in place.
+    try check(.Z012, "const Hidden = struct {}; pub fn all() [4]Hidden { return undefined; }", 1);
+    try check(.Z012, "pub const Hidden = struct {}; pub fn all() [4]Hidden { return undefined; }", 0);
+    try check(.Z012, "const Hidden = struct {}; const Four = [4]Hidden; pub fn all() Four { return undefined; }", 1);
+    try check(.Z012, "const Four = [4]u8; pub fn all() Four { return undefined; }", 0);
+    // A function type's parameters and result.
+    try check(.Z012, "const Hidden = struct {}; pub fn on(callback: *const fn (Hidden) void) void { _ = callback; }", 1);
+    try check(.Z012, "pub fn on(callback: *const fn (u8) void) void { _ = callback; }", 0);
+    // A container written in the signature: its fields' types.
+    try check(.Z012, "const Hidden = struct {}; pub fn pair() struct { h: Hidden } { return undefined; }", 1);
+    try check(.Z012, "pub fn pair() struct { h: u8 } { return undefined; }", 0);
+    // A public declaration inside a private container is named by nobody outside.
+    try check(.Z012, "const Sink = struct { pub const Item = struct {}; }; pub fn get() Sink.Item { return .{}; }", 1);
+    try check(.Z012, "pub const Sink = struct { pub const Item = struct {}; }; pub fn get() Sink.Item { return .{}; }", 0);
+    // A builtin's type, as Zig computes it.
+    try check(.Z012, "const Hidden = struct {}; const h: Hidden = .{}; pub fn get() @TypeOf(h) { return h; }", 1);
+    try check(.Z012, "pub const Hidden = struct {}; const h: Hidden = .{}; pub fn get() @TypeOf(h) { return h; }", 0);
+    // A made container is named by its type function's call.
+    try check(.Z012, "fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(u8) { return undefined; }", 1);
+    try check(.Z012, "const Hidden = struct {}; pub fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(Hidden) { return undefined; }", 1);
+    try check(.Z012, "pub const Hidden = struct {}; pub fn Box(comptime T: type) type { return struct { t: T }; } pub fn get() Box(Hidden) { return undefined; }", 0);
+    // A generic's own container is named through the call that names its function.
+    try check(.Z012, "pub fn List(comptime T: type) type { return struct { const Self = @This(); items: []T, pub fn init() Self { return .{ .items = &.{} }; } }; }", 0);
+}
+
 test "G2 amended policies are explicit family choices and count suppressed sites" {
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z012)); // safe: select the default configuration type for this policy assertion.
     try std.testing.expect(!(@as(glint.Config, .{})).has(.Z026)); // safe: select the default configuration type for this policy assertion.
