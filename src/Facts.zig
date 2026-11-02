@@ -1062,7 +1062,7 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
         .@"if", .if_simple => {
             const branch = t.fullIf(node).?; // unreachable: the tag is an `if`'s
             // A condition known as the program compiles: Zig analyses only the branch it takes.
-            if (branch.payload_token == null and branch.error_token == null) if (try self.comptimeTruth(null, file, branch.ast.cond_expr)) |taken| {
+            if (branch.payload_token == null and branch.error_token == null) if (try self.comptimeTruth(file, branch.ast.cond_expr)) |taken| {
                 const chosen = if (taken) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return;
                 return self.copiedWalk(file, chosen, depth + 1, places, rest, results, deep);
             };
@@ -1620,12 +1620,10 @@ fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.N
     return null;
 }
 
-/// A condition known as the program compiles on the reading `env` binds: `truth`'s, `and` and
-/// `or` of known ones, `==` and `!=` of two types each side names (`T == Plain`, `namedType`)
-/// known the same or different, and `@hasDecl(T, "name")` where `T` is a container that
-/// resolves (a module a driver is built against).
-fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
-    if (self.truth(env, file, node)) |known| return known;
+/// A condition known as the program compiles: `truth`'s, and `@hasDecl(T, "name")` where `T`
+/// is a container that resolves (a module a driver is built against).
+fn comptimeTruth(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    if (self.truth(null, file, node)) |known| return known;
     const tree = &self.project.at(file).file.tree;
     var at = node;
     while (true) at = switch (tree.nodeTag(at)) {
@@ -1634,22 +1632,6 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         else => break,
     };
     switch (tree.nodeTag(at)) {
-        .bool_and, .bool_or => {
-            const left, const right = tree.nodeData(at).node_and_node;
-            const one = try self.comptimeTruth(env, file, left);
-            const other = try self.comptimeTruth(env, file, right);
-            // Either side alone decides `false and` and `true or`.
-            const deciding = tree.nodeTag(at) == .bool_or;
-            if (one == deciding or other == deciding) return deciding;
-            return if (one != null and other != null) !deciding else null;
-        },
-        .equal_equal, .bang_equal => {
-            const left, const right = tree.nodeData(at).node_and_node;
-            const one = try self.namedType(env, file, left) orelse return null;
-            const other = try self.namedType(env, file, right) orelse return null;
-            const one_type = sameType(one, other) orelse return null;
-            return if (tree.nodeTag(at) == .equal_equal) one_type else !one_type;
-        },
         .builtin_call_two, .builtin_call_two_comma => {},
         else => return null,
     }
@@ -1657,7 +1639,7 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, at, &buffer);
     if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
-    const container = switch (try self.resolveIn(env, file, args[0])) {
+    const container = switch (try self.resolve(file, args[0])) {
         .container => |c| c,
         else => return null,
     };
@@ -1668,99 +1650,6 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     };
     const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
     return self.project.at(container.file).model.declarations[@backingInt(decl)].kind != .field;
-}
-
-/// The type `node` names on the reading `env` binds, where it names one: a container, a
-/// primitive type by its name, a `comptime` parameter of type `type` as the reading binds it,
-/// `@TypeOf` of a value. Null for a value, whose own value a primitive's would read as.
-fn namedType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
-    const tree = &self.project.at(file).file.tree;
-    const model = &self.project.at(file).model;
-    var at = node;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    const value = try self.resolveIn(env, file, at);
-    if (value == .container) return value;
-    if (value != .primitive) return null;
-    switch (tree.nodeTag(at)) {
-        .identifier => {
-            const reference = model.reference(at) orelse return null;
-            const decl = reference.declaration orelse return if (std.zig.primitives.isPrimitive(tree.tokenSlice(tree.nodeMainToken(at)))) value else null;
-            const kind = self.parameterTypeNode(.{ .file = file, .index = decl }) orelse return null;
-            if (tree.nodeTag(kind) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type")) return null;
-            return value;
-        },
-        .builtin_call_two, .builtin_call_two_comma => return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@TypeOf")) value else null,
-        else => return null,
-    }
-}
-
-/// Whether two types are one: containers by their declaration, primitives by their names, a
-/// container never a primitive. Null where it is not known: a symbolic container, or one
-/// declaration's containers where a type function made either (`List(u8)` and `List(u16)`).
-fn sameType(one: Value, other: Value) ?bool {
-    switch (one) {
-        .container => |a| switch (other) {
-            .container => |b| {
-                if (a.symbolic or b.symbolic) return null;
-                if (a.file != b.file or a.scope != b.scope) return false;
-                return if (a.made_by == null and b.made_by == null) true else null;
-            },
-            .primitive => return if (a.symbolic) null else false,
-            else => return null,
-        },
-        .primitive => |a| switch (other) {
-            .primitive => |b| return std.mem.eql(u8, a, b),
-            .container => return sameType(other, one),
-            else => return null,
-        },
-        else => return null,
-    }
-}
-
-/// Whether `node` may run on the reading `env` binds (a generic's call): no `if` around it
-/// within its function takes the other branch on a condition the bindings decide
-/// (`comptimeTruth`: `if (T == Plain)`), no `switch` on type information takes another prong
-/// (`takenProng`), and no statement before it in a block around it leaves on one
-/// (`if (T == Plain) return;`). What the bindings do not decide is reachable, never cleared.
-pub fn reachedUnder(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    const tree = &self.project.at(file).file.tree;
-    const model = &self.project.at(file).model;
-    var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.nodeTag(parent) == .fn_decl) return true;
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.payload_token != null or branch.error_token != null or at == branch.ast.cond_expr) continue;
-            const taken = try self.comptimeTruth(env, file, branch.ast.cond_expr) orelse continue;
-            if (at == branch.ast.then_expr and !taken) return false;
-            if (branch.ast.else_expr.unwrap() == at and taken) return false;
-            continue;
-        }
-        if (tree.fullSwitch(parent)) |choice| {
-            if (at == choice.ast.condition) continue;
-            const taken = try self.takenProng(env, file, choice) orelse continue;
-            if (choice.ast.cases[taken] != at) return false;
-            continue;
-        }
-        var buffer: [2]Ast.Node.Index = undefined;
-        const statements = tree.blockStatements(&buffer, parent) orelse continue;
-        for (statements) |statement| {
-            if (statement == at) break;
-            if (try self.leavesUnder(env, file, statement)) return false;
-        }
-    }
-    return true;
-}
-
-/// Whether a statement never completes on the reading `env` binds: it never does at all
-/// (`completesNever`), or it is an `if` whose branch the bindings take never completes.
-fn leavesUnder(self: *Facts, env: ?*const Env, file: Project.FileId, statement: Ast.Node.Index) ResolveError!bool {
-    const tree = &self.project.at(file).file.tree;
-    if (completesNever(tree, statement)) return true;
-    const branch = tree.fullIf(statement) orelse return false;
-    if (branch.payload_token != null or branch.error_token != null) return false;
-    const taken = try self.comptimeTruth(env, file, branch.ast.cond_expr) orelse return false;
-    if (taken) return completesNever(tree, branch.ast.then_expr);
-    return completesNever(tree, branch.ast.else_expr.unwrap() orelse return false);
 }
 
 /// Whether a branch never completes: a jump or a stop, or a block whose last statement is one.
@@ -7753,85 +7642,4 @@ test "a library's call through a field whose type names none of its generic's pa
     }
     try std.testing.expect(!try facts.handedOut(load.?));
     try std.testing.expect(try facts.handedOut(hash.?));
-}
-
-test "reachedUnder: a site past a condition a binding decides is no site of that binding" {
-    const source =
-        \\const Plain = struct { v: u32 };
-        \\const Id = enum(u32) { _ };
-        \\fn value(comptime T: type, v: u32) T {
-        \\    if (T == Plain) return .{ .v = v };
-        \\    return @enumFromInt(v);
-        \\}
-        \\fn other(comptime T: type, v: u32) T {
-        \\    if (T != u32 and T != Plain) {
-        \\        return @enumFromInt(v);
-        \\    }
-        \\    return undefined;
-        \\}
-        \\fn kind(comptime T: type) T {
-        \\    switch (@typeInfo(T)) {
-        \\        .@"struct" => return undefined,
-        \\        else => return @enumFromInt(0),
-        \\    }
-        \\}
-        \\fn values(comptime T: type, a: u32, b: u32) T {
-        \\    if (a == b) return undefined;
-        \\    return @enumFromInt(a);
-        \\}
-    ;
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
-    defer project.deinit();
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
-    defer facts.deinit();
-    const file = project.sources[0].id;
-    const tree = &project.sources[0].file.tree;
-    const model = &project.sources[0].model;
-    const named = struct {
-        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
-            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind != .parameter) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
-            unreachable; // unreachable: the source declares each name asked
-        }
-    };
-    const plain = try facts.declaration(named.decl(model, file, "Plain"));
-    const id = try facts.declaration(named.decl(model, file, "Id"));
-    const int: Value = .{ .primitive = "u32" };
-    // Each `@enumFromInt`, in the order the functions declare them.
-    var casts: std.ArrayList(Ast.Node.Index) = .empty;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if ((tag == .builtin_call_two or tag == .builtin_call_two_comma) and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@enumFromInt")) try casts.append(arena.allocator(), node);
-    }
-    std.mem.sort(Ast.Node.Index, casts.items, tree, struct {
-        fn less(t: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
-            return t.nodeMainToken(a) < t.nodeMainToken(b);
-        }
-    }.less);
-    try std.testing.expectEqual(4, casts.items.len);
-    const Row = struct { function: []const u8, cast: usize, bound: Value, reached: bool };
-    const unknown: Value = .{ .unknown = .unsupported };
-    const rows = [_]Row{
-        // `if (T == Plain) return`: past it, only another type's binding.
-        .{ .function = "value", .cast = 0, .bound = plain, .reached = false },
-        .{ .function = "value", .cast = 0, .bound = id, .reached = true },
-        // A type the binding does not name decides nothing.
-        .{ .function = "value", .cast = 0, .bound = unknown, .reached = true },
-        // `and` of `!=`, with a primitive.
-        .{ .function = "other", .cast = 1, .bound = int, .reached = false },
-        .{ .function = "other", .cast = 1, .bound = plain, .reached = false },
-        .{ .function = "other", .cast = 1, .bound = id, .reached = true },
-        // The prong a switch on type information takes.
-        .{ .function = "kind", .cast = 2, .bound = plain, .reached = false },
-        .{ .function = "kind", .cast = 2, .bound = id, .reached = true },
-        // Values compared are no types: no binding decides them.
-        .{ .function = "values", .cast = 3, .bound = plain, .reached = true },
-    };
-    for (rows) |row| {
-        const env: Env = .{ .function = named.decl(model, file, row.function), .args = &.{ row.bound, int, int }, .depth = 0 };
-        try std.testing.expectEqual(row.reached, try facts.reachedUnder(&env, file, casts.items[row.cast]));
-    }
-    // With no binding, every site is reached.
-    for (casts.items) |cast| try std.testing.expect(try facts.reachedUnder(null, file, cast));
 }
