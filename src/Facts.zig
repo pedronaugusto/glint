@@ -1031,18 +1031,20 @@ pub fn rawAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Re
 /// every way a value is chosen or wrapped (a branch, a prong, a `break`, `orelse`, `catch`,
 /// `try`, `@as`, `@bitCast`, `@unionInit`, `++`, a literal's parts); and the values of other
 /// shapes, decided by their type. A call's result, a literal of plain data, a pointer and a
-/// branch that leaves are no copy of a place. `deep` is a value nested past what is followed.
-pub const Copied = struct { places: []const Ast.Node.Index, rest: []const Ast.Node.Index, deep: ?Ast.Node.Index };
+/// branch that leaves are no copy of a place; `results` are the calls (`@call` among them)
+/// whose results it copies, each a temporary. `deep` is a value nested past what is followed.
+pub const Copied = struct { places: []const Ast.Node.Index, rest: []const Ast.Node.Index, results: []const Ast.Node.Index, deep: ?Ast.Node.Index };
 
 pub fn copiedParts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Copied {
     var places: std.ArrayList(Ast.Node.Index) = .empty;
     var rest: std.ArrayList(Ast.Node.Index) = .empty;
+    var results: std.ArrayList(Ast.Node.Index) = .empty;
     var deep: ?Ast.Node.Index = null;
-    try self.copiedWalk(file, node, 0, &places, &rest, &deep);
-    return .{ .places = places.items, .rest = rest.items, .deep = deep };
+    try self.copiedWalk(file, node, 0, &places, &rest, &results, &deep);
+    return .{ .places = places.items, .rest = rest.items, .results = results.items, .deep = deep };
 }
 
-fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize, places: *std.ArrayList(Ast.Node.Index), rest: *std.ArrayList(Ast.Node.Index), deep: *?Ast.Node.Index) ResolveError!void {
+fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize, places: *std.ArrayList(Ast.Node.Index), rest: *std.ArrayList(Ast.Node.Index), results: *std.ArrayList(Ast.Node.Index), deep: *?Ast.Node.Index) ResolveError!void {
     if (depth == 64) {
         if (deep.* == null) deep.* = node;
         return;
@@ -1050,46 +1052,46 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
     const t = self.syntaxOf(file);
     switch (t.nodeTag(node)) {
         .identifier, .field_access, .deref, .array_access, .unwrap_optional => return places.append(self.gpa, node),
-        .grouped_expression => return self.copiedWalk(file, t.nodeData(node).node_and_token[0], depth + 1, places, rest, deep),
-        .@"try", .@"comptime", .@"nosuspend" => return self.copiedWalk(file, t.nodeData(node).node, depth + 1, places, rest, deep),
+        .grouped_expression => return self.copiedWalk(file, t.nodeData(node).node_and_token[0], depth + 1, places, rest, results, deep),
+        .@"try", .@"comptime", .@"nosuspend" => return self.copiedWalk(file, t.nodeData(node).node, depth + 1, places, rest, results, deep),
         .@"orelse", .@"catch", .array_cat => {
             const sides = t.nodeData(node).node_and_node;
-            try self.copiedWalk(file, sides[0], depth + 1, places, rest, deep);
-            return self.copiedWalk(file, sides[1], depth + 1, places, rest, deep);
+            try self.copiedWalk(file, sides[0], depth + 1, places, rest, results, deep);
+            return self.copiedWalk(file, sides[1], depth + 1, places, rest, results, deep);
         },
         .@"if", .if_simple => {
             const branch = t.fullIf(node).?; // unreachable: the tag is an `if`'s
             // A condition known as the program compiles: Zig analyses only the branch it takes.
             if (branch.payload_token == null and branch.error_token == null) if (try self.comptimeTruth(file, branch.ast.cond_expr)) |taken| {
                 const chosen = if (taken) branch.ast.then_expr else branch.ast.else_expr.unwrap() orelse return;
-                return self.copiedWalk(file, chosen, depth + 1, places, rest, deep);
+                return self.copiedWalk(file, chosen, depth + 1, places, rest, results, deep);
             };
-            try self.copiedWalk(file, branch.ast.then_expr, depth + 1, places, rest, deep);
-            if (branch.ast.else_expr.unwrap()) |otherwise| try self.copiedWalk(file, otherwise, depth + 1, places, rest, deep);
+            try self.copiedWalk(file, branch.ast.then_expr, depth + 1, places, rest, results, deep);
+            if (branch.ast.else_expr.unwrap()) |otherwise| try self.copiedWalk(file, otherwise, depth + 1, places, rest, results, deep);
             return;
         },
         .@"switch", .switch_comma => {
-            for (t.fullSwitch(node).?.ast.cases) |case| try self.copiedWalk(file, t.fullSwitchCase(case).?.ast.target_expr, depth + 1, places, rest, deep); // unreachable: the tag is a switch's, its cases are cases
+            for (t.fullSwitch(node).?.ast.cases) |case| try self.copiedWalk(file, t.fullSwitchCase(case).?.ast.target_expr, depth + 1, places, rest, results, deep); // unreachable: the tag is a switch's, its cases are cases
             return;
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             // A block with no label gives `void`.
             const brace = t.nodeMainToken(node);
             if (brace < 2 or t.tokenTag(brace - 1) != .colon or t.tokenTag(brace - 2) != .identifier) return;
-            for (try self.blockBreaks(file, node, t.tokenSlice(brace - 2))) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            for (try self.blockBreaks(file, node, t.tokenSlice(brace - 2))) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             return;
         },
         // A loop's value: each `break` out of it, and its `else`.
         .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
             const start = t.firstToken(node);
             const label: ?[]const u8 = if (start >= 2 and t.tokenTag(start) != .identifier and t.tokenTag(start - 1) == .colon and t.tokenTag(start - 2) == .identifier) t.tokenSlice(start - 2) else null;
-            for (try self.loopBreaks(file, node, label)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            for (try self.loopBreaks(file, node, label)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             const otherwise = if (t.fullFor(node)) |loop| loop.ast.else_expr else t.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
-            if (otherwise.unwrap()) |value| try self.copiedWalk(file, value, depth + 1, places, rest, deep);
+            if (otherwise.unwrap()) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             return;
         },
         // What a call returns is the callee's, its `return` checked there.
-        .call_one, .call_one_comma, .call, .call_comma => return,
+        .call_one, .call_one_comma, .call, .call_comma => return results.append(self.gpa, node),
         // No value: control leaves.
         .@"return", .@"break", .@"continue", .unreachable_literal => return,
         // A pointer, or a slice of what it points at: an alias.
@@ -1102,21 +1104,22 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
             var buffer: [2]Ast.Node.Index = undefined;
             const args = builtinArgs(t, node, &buffer);
             if (std.mem.eql(u8, name, "@field")) return places.append(self.gpa, node);
-            if (args.len != 0 and (std.mem.eql(u8, name, "@as") or std.mem.eql(u8, name, "@bitCast"))) return self.copiedWalk(file, args[args.len - 1], depth + 1, places, rest, deep);
-            if (args.len == 3 and std.mem.eql(u8, name, "@unionInit")) return self.copiedWalk(file, args[2], depth + 1, places, rest, deep);
+            if (args.len != 0 and (std.mem.eql(u8, name, "@as") or std.mem.eql(u8, name, "@bitCast"))) return self.copiedWalk(file, args[args.len - 1], depth + 1, places, rest, results, deep);
+            if (args.len == 3 and std.mem.eql(u8, name, "@unionInit")) return self.copiedWalk(file, args[2], depth + 1, places, rest, results, deep);
+            if (std.mem.eql(u8, name, "@call")) return results.append(self.gpa, node);
             // Every other builtin gives no owner's copy: a number, an enum, a pointer, a
             // vector, a type, text, an error or nothing (`@intCast`, `@fromBackingInt`,
-            // `@ptrCast`, `@splat`, `@This`, `@tagName`, `@memcpy`); `@call` calls.
+            // `@ptrCast`, `@splat`, `@This`, `@tagName`, `@memcpy`).
             return;
         },
         else => {
             var buffer: [2]Ast.Node.Index = undefined;
             if (t.fullStructInit(&buffer, node)) |literal| {
-                for (literal.ast.fields) |field| try self.copiedWalk(file, field, depth + 1, places, rest, deep);
+                for (literal.ast.fields) |field| try self.copiedWalk(file, field, depth + 1, places, rest, results, deep);
                 return;
             }
             if (t.fullArrayInit(&buffer, node)) |literal| {
-                for (literal.ast.elements) |item| try self.copiedWalk(file, item, depth + 1, places, rest, deep);
+                for (literal.ast.elements) |item| try self.copiedWalk(file, item, depth + 1, places, rest, results, deep);
                 return;
             }
             return rest.append(self.gpa, node);
@@ -1897,6 +1900,12 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (std.mem.eql(u8, name, "@Enum")) return .{ .primitive = "@Enum" };
     if (std.mem.eql(u8, name, "@FieldType") and args.len == 2) return self.fieldType(try self.resolveIn(env, file, args[0]), try self.nameIn(env, file, args[1], 0));
     if (std.mem.eql(u8, name, "@TypeOf") and args.len == 1) return self.map(try self.resolveIn(env, file, args[0]), {}, typeOf);
+    // `@call(modifier, f, args)`: what calling `f` gives, as its result type reads.
+    if (std.mem.eql(u8, name, "@call") and args.len == 3) {
+        const callee = try self.resolveIn(env, file, args[1]);
+        if (callee == .alternatives) return self.map(callee, {}, callResult);
+        return self.callResult(callee, {});
+    }
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
     for ([_][]const u8{ "@errorName", "@tagName", "@typeName", "@embedFile" }) |bytes| if (std.mem.eql(u8, name, bytes)) return .{ .pointer = try self.boxed(.{ .primitive = "u8" }) };
@@ -2002,6 +2011,13 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
         .enum_literal => return try self.memberName(tree.tokenSlice(tree.nodeMainToken(node))),
         .grouped_expression => return self.nameIn(env, file, tree.nodeData(node).node_and_token[0], depth + 1),
         .@"comptime" => return self.nameIn(env, file, tree.nodeData(node).node, depth + 1),
+        // Two names joined as the program compiles (`"Key" ++ "Pair"`).
+        .array_cat => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const left = (try self.nameIn(env, file, lhs, depth + 1)) orelse return null;
+            const right = (try self.nameIn(env, file, rhs, depth + 1)) orelse return null;
+            return try std.mem.concat(self.gpa, u8, &.{ left, right });
+        },
         .builtin_call_two, .builtin_call_two_comma => {
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@tagName")) return null;
             var buffer: [2]Ast.Node.Index = undefined;
@@ -2035,18 +2051,46 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
 
 /// What `@field`'s name names: the one name it spells (a string literal with its escapes read,
 /// a `const` that holds one, an enum literal, `@tagName` of one), each field of a struct whose
-/// `field_names` it ranges over, or a name it computes, not known here.
-pub const FieldName = union(enum) { name: []const u8, each_of: Container, computed };
+/// `field_names` it ranges over, each name of a list written in place it ranges over
+/// (`inline for (.{ "a", "b" }) |name|`), or a name it computes, not known here.
+pub const FieldName = union(enum) { name: []const u8, each_of: Container, names: []const []const u8, computed };
 pub fn fieldName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!FieldName {
     if (try self.nameIn(null, file, node, 0)) |name| return .{ .name = name };
     if (try self.fieldNamesOf(file, node)) |container| return .{ .each_of = container };
+    if (try self.rangedNames(file, node)) |names| return .{ .names = names };
     return .computed;
 }
-/// Whether a `@field` name may be `name`: it spells it, or ranges over a struct that has it.
+
+/// The names a capture takes from a list written in place that a `for` ranges over alone, each
+/// element one name spells (`nameIn`); null where one does not.
+fn rangedNames(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?[]const []const u8 {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    if (tree.nodeTag(node) != .identifier) return null;
+    const decl = (model.reference(node) orelse return null).declaration orelse return null;
+    const record = model.declarations[@backingInt(decl)];
+    if (record.kind != .capture) return null;
+    var at = record.node;
+    const loop = while (true) {
+        if (tree.fullFor(at)) |found| break found;
+        at = model.parentOf(at) orelse return null;
+    };
+    if (loop.ast.inputs.len != 1 or loop.payload_token != record.token) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const list = tree.fullArrayInit(&buffer, loop.ast.inputs[0]) orelse return null;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (list.ast.elements) |item| try names.append(self.gpa, (try self.nameIn(null, file, item, 0)) orelse return null);
+    return names.items;
+}
+/// Whether a `@field` name may be `name`: it spells it, or ranges over a struct that has it or
+/// a list that names it.
 pub fn mayName(self: *Facts, field_name: FieldName, name: []const u8) bool {
     return switch (field_name) {
         .name => |spelled| std.mem.eql(u8, spelled, name),
         .each_of => |container| self.hasField(container, name),
+        .names => |each| for (each) |one| {
+            if (std.mem.eql(u8, one, name)) break true;
+        } else false,
         .computed => true,
     };
 }
@@ -2702,7 +2746,7 @@ fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveE
 }
 
 /// What calling `callee` returns: its declared result, or the container a type function makes.
-fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
+pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
     if (callee == .function) {
         const decl = callee.function;
         const declaration_record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
@@ -2724,10 +2768,16 @@ fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
         }
         return self.instance(result);
     }
-    // A value of a function type (`comptime read: fn (u8) T`): what the type declares it
+    // A value of a function type (`comptime read: fn (u8) T`) or a pointer to one (a
+    // vtable's `*const fn (...) T`, which a call reads through): what the type declares it
     // returns, whichever function is passed.
-    if (callee == .fn_type) {
-        const result = try self.resultOf(callee.fn_type);
+    const fn_type: ?Key = switch (callee) {
+        .fn_type => |key| key,
+        .pointer => |to| if (to.* == .fn_type) to.fn_type else null,
+        else => null,
+    };
+    if (fn_type) |key| {
+        const result = try self.resultOf(key);
         if (result == .unknown or (result == .primitive and std.mem.eql(u8, result.primitive, "type"))) return .{ .unknown = .comptime_dependent };
         return self.instance(result);
     }
@@ -3690,7 +3740,7 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
     if (depth > 4) return false;
     switch (value) {
         .primitive => |p| {
-            if (p.len > 1 and (p[0] == 'u' or p[0] == 'i')) if (std.fmt.parseInt(u16, p[1..], 10)) |bits| return bits > 0 else |_| {};
+            if (p.len > 1 and (p[0] == 'u' or p[0] == 'i')) if (std.fmt.parseInt(u16, p[1..], 10)) |bits| return bits > 0 else |_| {}; // glint-ignore: Z026 -- no integer type's name (usize, isize): the names below decide it
             for ([_][]const u8{ "bool", "usize", "isize", "f16", "f32", "f64", "f80", "f128", "c_char", "c_short", "c_ushort", "c_int", "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong", "c_longdouble", "anyerror" }) |one| if (std.mem.eql(u8, p, one)) return true;
             return false;
         },
@@ -3721,7 +3771,8 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
 /// The container whose declaration a declaration literal at `node` names (`.init(...)`): the
 /// one its result location gives it, through `try` and the error union or optional around it.
 /// A variable's declared type, a returned value's function result, a struct literal's field's
-/// type, an assignment's target. Null where nothing written there names one.
+/// type, an assignment's target, an argument's parameter's type (`parameterType`). Null where
+/// nothing written there names one.
 pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
     var at = node;
     // Each step is one parent outward; a struct literal's own location is the next.
@@ -3745,11 +3796,39 @@ pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index)
                 const target, const value = tree.nodeData(parent).node_and_node;
                 return if (value == at) heldContainer(try self.resolve(file, target)) else null;
             },
+            // What `orelse` or `catch` gives otherwise is the whole's value.
+            .@"orelse", .@"catch" => {
+                if (tree.nodeData(parent).node_and_node[1] != at) return null;
+                at = parent;
+                continue;
+            },
+            // A prong's value is the switch's: the case, then the switch, one step each.
+            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
+                if (tree.fullSwitchCase(parent).?.ast.target_expr != at) return null; // unreachable: tagged a case
+                at = parent;
+                continue;
+            },
+            .@"switch", .switch_comma => {
+                if (tree.fullSwitch(parent).?.ast.condition == at) return null; // unreachable: tagged a switch
+                at = parent;
+                continue;
+            },
             else => {},
+        }
+        // An `if`'s branch is the `if`'s value.
+        if (tree.fullIf(parent)) |branch| {
+            if (branch.ast.then_expr != at and branch.ast.else_expr.unwrap() != at) return null;
+            at = parent;
+            continue;
         }
         if (tree.fullVarDecl(parent)) |variable| {
             if (variable.ast.init_node.unwrap() != at) return null;
             return heldContainer(try self.resolve(file, variable.ast.type_node.unwrap() orelse return null));
+        }
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&call_buffer, parent)) |call| {
+            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, at) orelse return null;
+            return heldContainer(try self.parameterType(file, parent, call, position));
         }
         var buffer: [2]Ast.Node.Index = undefined;
         const literal = tree.fullStructInit(&buffer, parent) orelse return null;
@@ -3816,7 +3895,7 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     // name it ranges over or computes is not one known here.
     const name = switch (try self.fieldName(file, args[1])) {
         .name => |name| name,
-        .each_of, .computed => return .{ .unknown = .comptime_dependent },
+        .each_of, .names, .computed => return .{ .unknown = .comptime_dependent },
     };
     // `@field(p, "name")` on a single pointer names its pointee's member.
     const resolved = try self.resolve(file, args[0]);
@@ -3828,6 +3907,34 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
         else => return .{ .unknown = .unsupported },
     };
     if (container.symbolic) return .{ .unknown = .comptime_dependent };
+    return .of(self.member(container, name));
+}
+
+/// What a decl literal names (`.fromMilliseconds(ms)`, `.zero`, a literal's `.{ .f = v }`
+/// field): the member so named of the type its place gives it, through an optional, an error
+/// union and a pointer. None where that type has none; unknown where it does not resolve.
+pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8) ResolveError!Named {
+    const tree = &self.project.at(file).file.tree;
+    var holder: Value = blk: {
+        if (tree.nodeTag(node) == .enum_literal) if (self.project.at(file).model.parentOf(node)) |parent| {
+            var buffer: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == node) {
+                const container = (try self.resultContainer(file, parent)) orelse break :blk Value{ .unknown = .unresolved };
+                break :blk Value{ .container = container };
+            };
+        };
+        break :blk try self.literalType(file, node);
+    };
+    while (true) holder = switch (holder) {
+        .optional, .error_union, .pointer => |inner| inner.*,
+        else => break,
+    };
+    const container = switch (holder) {
+        .container, .instance => |c| c,
+        .unknown => |why| return .{ .unknown = why },
+        // No type a declaration could be a member of: an anonymous literal, a number.
+        else => return .none,
+    };
     return .of(self.member(container, name));
 }
 
@@ -6182,7 +6289,8 @@ pub const accesses = struct {
 };
 
 /// Every call by meaning: `f(a)`, a method's `x.f(a)`, `@call(modifier, f, .{a})`, a callee
-/// named through `@field`, a constant bound to a function or its address, a function pointer.
+/// named through `@field`, a decl literal (`.init(n)`), a constant bound to a function or its
+/// address, a function pointer.
 /// Each with the function it calls, a choice of them, or `any`: a rule asks here what a call
 /// calls, and reads `any` as undecided, never as a call of none.
 pub const calls = struct {

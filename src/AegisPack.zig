@@ -8,6 +8,10 @@ const Context = @import("RuleContext.zig");
 const Contract = @import("AegisContract.zig");
 const Ids = @import("AegisRules.zig");
 const Danger = @import("Danger.zig");
+const stdCall = Governed.stdCall;
+const Is = Governed.Is;
+const isStd = Governed.isStd;
+const byteCopy = Governed.byteCopy;
 const Shapes = @import("DangerShapes.zig");
 const Undefined = @import("Undefined.zig");
 const Flows = @import("DangerFlow.zig");
@@ -197,7 +201,7 @@ fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
     const named = try c.facts.fieldName(c.file, args[1]);
     switch (named) {
         .name => |name| if (!backingName(name)) return,
-        .each_of => {
+        .each_of, .names => {
             if (!backingNamed(c, named, null)) return;
         },
         .computed => {},
@@ -216,7 +220,7 @@ fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
     switch (named) {
         .name => |name| return if (k) |kind| backing(kind, name) else backingName(name),
         .computed => return true,
-        .each_of => {
+        .each_of, .names => {
             for (candidates) |name| if (c.facts.mayName(named, name) and (if (k) |kind| backing(kind, name) else true)) return true;
             for (std.enums.values(Contract.Kind)) |each| {
                 if (k) |kind| if (each != kind) continue;
@@ -230,8 +234,10 @@ fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
 /// The bytes of a published owner read outside aegis: a std byte view of it
 /// (`std.mem.asBytes(s)`, `toBytes`, `sliceAsBytes`) or `@bitCast` of it reads every field
 /// it keeps behind its operations at once. A byte view of what does not resolve is undecided
-/// where it may be an owner.
+/// where it may be an owner, as is an owner given to a call that may be a byte view.
 fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
+    // Why the call may be a byte view or not, where it is not known to be one.
+    var maybe: ?Facts.Unknown = null;
     const operand: Ast.Node.Index = blk: {
         switch (tree.nodeTag(node)) {
             .builtin_call_two, .builtin_call_two_comma => {
@@ -245,9 +251,15 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
                 var buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&buffer, node) orelse return;
                 if (call.ast.params.len != 1) return;
-                for ([_][]const u8{ "mem.asBytes", "mem.toBytes", "mem.sliceAsBytes" }) |path| {
-                    if (try stdCall(c, call, path)) break :blk call.ast.params[0];
-                }
+                for ([_][]const u8{ "mem.asBytes", "mem.toBytes", "mem.sliceAsBytes" }) |path| switch (try stdCall(c, node, path)) {
+                    .yes => {
+                        maybe = null;
+                        break :blk call.ast.params[0];
+                    },
+                    .no => {},
+                    .unknown => |why| maybe = why,
+                };
+                if (maybe != null) break :blk call.ast.params[0];
                 return;
             },
         }
@@ -261,7 +273,10 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
     if (try typeValue(c, place)) return;
     const token = tree.nodeMainToken(node);
     switch (try ownerKind(c, place, access)) {
-        .owner => |k| if (anyBacking(k)) try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations"),
+        .owner => |k| if (anyBacking(k)) {
+            if (maybe) |why| return c.unknown(access, node, why);
+            try c.at(access, token, "the bytes of a published aegis owner read whole bypass its exposure/guard/ownership contract; use its operations");
+        },
         .other, .unknown => {},
     }
 }
@@ -349,12 +364,15 @@ fn checkWholeAddress(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
     const rewritten = "a public source's bytes handed where they are written keep a classification that no longer describes them; make a new one with err.PublicSource.classify(reason, bytes)";
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, parent)) |call| {
-        for ([_][]const u8{ "mem.asBytes", "mem.sliceAsBytes", "mem.swap", "mem.copyForwards", "mem.copyBackwards" }) |path| {
-            if (try stdCall(c, call, path)) return c.at(access, tree.nodeMainToken(parent), rewritten);
-        }
+        for ([_][]const u8{ "mem.asBytes", "mem.sliceAsBytes", "mem.swap", "mem.copyForwards", "mem.copyBackwards" }) |path| switch (try stdCall(c, parent, path)) {
+            .yes => return c.at(access, tree.nodeMainToken(parent), rewritten),
+            .no => {},
+            .unknown => |why| return c.unknown(access, node, why),
+        };
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return;
         const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-            .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
+            // A function: no alias, its own origin.
+            .function => |decl| decl,
             else => return c.undecided(access, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a public source's address handed to a call that does not resolve, which may write it"),
         };
         if (try c.inLibrary(Contract.library, callee.file)) return;
@@ -970,20 +988,39 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         else => return,
     };
     if (!try c.facts.mayCopy(try Model.identifier(c.allocator, tree.tokenSlice(name_token)))) return;
-    const decl = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse return;
-    const function = ((try c.facts.origin(decl)).orNull()) orelse return;
+    // Each function it may call is bound by it; a callee spelled as a copying generic that
+    // does not resolve may be one.
+    const functions: []const Facts.Decl = switch ((try Facts.calls.at(c.facts, c.file, node) orelse return).callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => {
+            // A call through a function pointer (`rule.check(&context)`): no generic, whose
+            // parameters a runtime function's type cannot take, is called there.
+            const callee = try c.facts.resolve(c.file, call.ast.fn_expr);
+            if (callee == .fn_type or (callee == .pointer and callee.pointer.* == .fn_type)) return;
+            return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call spelled as a generic that copies its parameters does not resolve: its binding may copy an owner");
+        },
+    };
+    for (functions) |function| if (try boundBy(c, tree, node, call, rule, function, name_token)) return;
+}
+
+/// `checkBinding` of `function`, one the call at `node` may call: whether it reported a copy.
+fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, call: Ast.full.Call, rule: Rule, function: Facts.Decl, name_token: Ast.TokenIndex) Context.Error!bool {
     const made = try c.facts.parameterCopies(function);
-    if (made.len == 0) return;
+    if (made.len == 0) return false;
     const written = &c.project.at(function.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = written.fullFnProto(&proto_buffer, c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return;
+    const proto = written.fullFnProto(&proto_buffer, c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
     // Which parameters take a type: a binding of one is a type the call writes.
     var types: [64]bool = @splat(false);
     var values: [64]bool = @splat(false);
     var count: usize = 0;
     var it = proto.iterate(written);
     while (it.next()) |param| : (count += 1) {
-        if (count == types.len) return;
+        if (count == types.len) {
+            try c.undecided(rule, tree.tokenStart(name_token), .unsupported, "a generic of more parameters than are read here copies some: its binding may copy an owner");
+            return false;
+        }
         types[count] = if (param.type_expr) |t| written.nodeTag(t) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(t)), "type") else false;
         values[count] = param.anytype_ellipsis3 != null;
     }
@@ -1049,13 +1086,13 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
                 const site = c.project.at(copy.site.file).file;
                 const detail = try c.allocator.print("this binding makes a recognized owner of a generic's parameter, which {s}:{d} copies; a duplicated owner requires explicit transfer", .{ c.project.at(copy.site.file).input.name, site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1 });
                 try c.at(copies, tree.nodeMainToken(node), detail);
-                return;
+                return true;
             },
             .other => {},
             .unknown => if (!bindingTyped(bound)) try c.undecided(copies, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that copies its parameter is bound to a type that does not resolve"),
         }
     }
-    if (casts.items.len == 0) return;
+    if (casts.items.len == 0) return false;
     var named: std.ArrayList(u8) = .empty;
     for (casts.items, 0..) |span, i| {
         if (i != 0) try named.appendSlice(c.allocator, if (i + 1 == casts.items.len) " and " else ", ");
@@ -1067,6 +1104,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         try c.allocator.print("this binding makes the integers {s} make or read by the generic's type aegis scalars', outside their checked construction and arithmetic", .{named.items});
     const at = tree.tokenToSpan(tree.nodeMainToken(node));
     try c.emitRelated(scalar, at.start, at.end, message, casts.items);
+    return true;
 }
 
 fn checkCopies(c: *Context) Context.Error!void {
@@ -1152,7 +1190,13 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     };
     // A `return` of the function's own local moves it, whatever it holds.
     const returned = tree.nodeTag(copy) == .@"return";
-    if (returned and tree.nodeTag(node) == .identifier and try moved(c, copy, node, true)) return;
+    // Why the copy may be a move, where it is not known to be one.
+    var unmoved: ?Facts.Unknown = null;
+    if (returned and tree.nodeTag(node) == .identifier) switch (try moved(c, copy, node, true)) {
+        .yes => return,
+        .no => {},
+        .unknown => |why| unmoved = why,
+    };
     // A value of a generic's parameter, or read from one: each binding's copy, checked at
     // the binding, where every binding is a call a run judges.
     if (root == node and try c.facts.parameterAtBinding(c.file, node)) return;
@@ -1186,7 +1230,12 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     // duplicated: `var guard = free;` out of an `if` capture. A `return` ends the function's
     // locals, of any kind: what it gives is moved unless a deferred read or a copy made before
     // it holds the owner too.
-    if (!returned and movable(k) and tree.nodeTag(node) == .identifier and try moved(c, copy, node, false)) return;
+    if (!returned and movable(k) and tree.nodeTag(node) == .identifier) switch (try moved(c, copy, node, false)) {
+        .yes => return,
+        .no => {},
+        .unknown => |why| unmoved = why,
+    };
+    if (unmoved) |why| return c.unknown(copies, node, why);
     const at = if (node == init) tree.nodeMainToken(copy) else tree.firstToken(node);
     try c.at(copies, at, "copy of a recognized live owner/capability requires explicit transfer; lifetime and publication are undecided");
 }
@@ -1334,13 +1383,17 @@ fn heldAs(value: Facts.Value) Held {
 fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Context.Error!void {
     const root = placeRoot(tree, target) orelse return;
     const model = &c.project.at(c.file).model;
-    const index = (model.reference(root) orelse return).declaration orelse return;
-    const decl = model.declarations[@backingInt(index)];
-    const outer = decl.kind == .parameter or (decl.kind == .variable and containerLevel(c, tree, decl.node));
+    const ref = model.reference(root) orelse return;
+    // A root whose declaration does not resolve may be a parameter's or a container's memory.
+    const outer = if (ref.declaration) |index| blk: {
+        const decl = model.declarations[@backingInt(index)];
+        break :blk decl.kind == .parameter or (decl.kind == .variable and containerLevel(c, tree, decl.node));
+    } else true;
     // A local's own storage, unless it holds a pointer the store goes through.
     if (!outer and (root == target or !pointerShaped(try c.facts.resolve(c.file, root)))) return;
     var walk: Exposure = .{ .c = c };
     if (try walk.carries(value, 0)) {
+        if (ref.declaration == null) return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unresolved, "a secret/guard borrow stored where the place does not resolve may outlive its capability");
         if (outer) return c.at(copies, tree.nodeMainToken(store), "stored secret/guard borrow can outlive its capability; caller lifetime is undecided");
         return c.undecided(copies, tree.tokenStart(tree.nodeMainToken(store)), .unsupported, "a secret/guard borrow stored through a pointer a local holds may outlive its capability");
     }
@@ -1528,15 +1581,21 @@ fn movable(k: Contract.Kind) bool {
 /// before (it may be kept, and reach the source after), and no loop runs the copy again without
 /// declaring the source again. For a `return`, the function's locals end with it: a later read
 /// is on another path, unless a loop the return is in runs it first.
-fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bool) Context.Error!bool {
+fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bool) Context.Error!Is {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
-    const index = Contract.local(c, source) orelse return false;
+    const index = Contract.local(c, source) orelse return .no;
     const decl = model.declarations[@backingInt(index)];
+    // Why it may be held beside the copy, where nothing is known to hold it.
+    var unknown: ?Facts.Unknown = null;
     switch (decl.kind) {
-        .variable => if (model.scopes[@backingInt(decl.scope)].kind != .block) return false,
-        .capture => if (!try capturedMoved(c, decl.node)) return false,
-        else => return false,
+        .variable => if (model.scopes[@backingInt(decl.scope)].kind != .block) return .no,
+        .capture => switch (try capturedMoved(c, decl.node)) {
+            .yes => {},
+            .no => return .no,
+            .unknown => |why| unknown = why,
+        },
+        else => return .no,
     }
     const at = tree.lastToken(copy);
     // The outermost loop the copy is in that the source is declared outside: it runs what
@@ -1547,7 +1606,7 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bo
         if (tree.firstToken(parent) <= decl.token and decl.token <= tree.lastToken(parent)) break;
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) loop = parent;
     }
-    if (loop != null and !returned) return false;
+    if (loop != null and !returned) return .no;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .identifier) continue;
         const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
@@ -1562,30 +1621,31 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bo
                 else => {},
             }
         }
-        if (deferred) return false;
+        if (deferred) return .no;
         const token = tree.nodeMainToken(candidate);
         if (token > at) {
-            if (!returned) return false;
+            if (!returned) return .no;
             // After a `return`: another path, unless a loop the return is in runs it before.
             const outer = loop orelse continue;
             if (token > tree.lastToken(outer)) continue;
         }
         switch (try heldBy(c, candidate)) {
             .read => {},
-            .copy => return false,
+            .copy => return .no,
             // An address taken before a declaration's copy may be kept; a `return` ends what
             // it points at, which A014 reads.
-            .address => if (!returned) return false,
+            .address => if (!returned) return .no,
+            .unknown => |why| unknown = why,
         }
     }
-    return true;
+    return if (unknown) |why| .{ .unknown = why } else .yes;
 }
 
 /// Whether a capture's value is moved into it: the value of a call or other value made in
 /// place (`if (b.take()) |r|`), or a local nothing reads again after the capture copies it. A
 /// capture of a place (`if (h.maybe) |r|`, `for (h.list) |r|`, a switch's operand) copies what
 /// stays there.
-fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!bool {
+fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
     var operands: []const Ast.Node.Index = &.{};
@@ -1599,13 +1659,14 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!bool {
     } else if (tree.fullFor(holder)) |loop| {
         operands = loop.ast.inputs;
     } else if (tree.fullSwitchCase(holder) != null) {
-        const choice = tree.fullSwitch(model.parentOf(holder) orelse return false) orelse return false;
+        const choice = tree.fullSwitch(model.parentOf(holder) orelse return .no) orelse return .no;
         single = .{choice.ast.condition};
         operands = &single;
     } else if (tree.nodeTag(holder) == .@"catch") {
         single = .{tree.nodeData(holder).node_and_node[0]};
         operands = &single;
-    } else return false;
+    } else return .no;
+    var unknown: ?Facts.Unknown = null;
     for (operands) |operand| {
         var value = operand;
         while (true) value = switch (tree.nodeTag(value)) {
@@ -1616,18 +1677,23 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!bool {
         if (placeRoot(tree, value) == null) continue;
         // A local moved by the capture: nothing reads it again (a loop's condition reads it
         // each time round).
-        if (tree.nodeTag(value) != .identifier or !try moved(c, value, value, false)) return false;
+        if (tree.nodeTag(value) != .identifier) return .no;
+        switch (try moved(c, value, value, false)) {
+            .yes => {},
+            .no => return .no,
+            .unknown => |why| unknown = why,
+        }
     }
-    return true;
+    return if (unknown) |why| .{ .unknown = why } else .yes;
 }
 
-const Hold = enum { read, copy, address };
+const Hold = union(enum) { read, copy, address, unknown: Facts.Unknown };
 
 /// What a reference to a local, read before a copy of it, does with it: `.read` a plain part
 /// or a discard (`r.amount`, `_ = r`, `@TypeOf(r)`); `.address` its address or a part's
 /// (`&r`, `&r.amount`), or a method's receiver that takes `*Self`; `.copy` anything else, a
 /// copy of all of it or of a part that may be an owner (an argument, a literal's part, a
-/// method's receiver by value, one that does not resolve).
+/// method's receiver by value); `.unknown` a method's receiver whose method does not resolve.
 fn heldBy(c: *Context, reference: Ast.Node.Index) Context.Error!Hold {
     const tree = try c.project.syntax(try c.source());
     const model = &c.project.at(c.file).model;
@@ -1660,7 +1726,11 @@ fn heldBy(c: *Context, reference: Ast.Node.Index) Context.Error!Hold {
     if (tree.nodeTag(part) == .field_access) {
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == part) {
-            return if (try pointerReceiver(c, part)) .address else .copy;
+            return switch (try pointerReceiver(c, parent)) {
+                .yes => .address,
+                .no => .copy,
+                .unknown => |why| .{ .unknown = why },
+            };
         };
     }
     if (part == reference) return .copy;
@@ -1672,20 +1742,33 @@ fn heldBy(c: *Context, reference: Ast.Node.Index) Context.Error!Hold {
     };
 }
 
-/// Whether the method `member` names (`r.release`, `r.a.release`) takes its receiver by
-/// pointer. One that does not resolve, or takes `anytype`, may do either.
-fn pointerReceiver(c: *Context, member: Ast.Node.Index) Context.Error!bool {
-    const decl = ((try c.facts.definition(c.file, member)).orNull()) orelse return false;
-    const origin = ((try c.facts.origin(decl)).orNull()) orelse return false;
+/// Whether the method the call at `call` calls (`r.release()`, `r.a.release()`) takes its
+/// receiver by pointer: no where it takes it by value or `anytype` (a value); unknown where it
+/// may call another (`calledFunction`).
+fn pointerReceiver(c: *Context, call: Ast.Node.Index) Context.Error!Is {
+    const origin = switch (try calledFunction(c, c.file, call)) {
+        .function => |function| function,
+        .unknown => |why| return .{ .unknown = why },
+    };
     const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
-    if (record.kind != .function) return false;
     const written = &c.project.at(origin.file).file.tree;
     var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
+    const proto = written.fullFnProto(&proto_buffer, record.node) orelse return .no;
     var it = proto.iterate(written);
-    const first = it.next() orelse return false;
-    const kind = first.type_expr orelse return false;
-    return written.fullPtrType(kind) != null;
+    const first = it.next() orelse return .no;
+    const kind = first.type_expr orelse return .no;
+    return if (written.fullPtrType(kind) != null) .yes else .no;
+}
+
+/// The function the call at `node` calls (`Facts.calls`): unknown and why where it may call
+/// another, one of a choice or any.
+fn calledFunction(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!union(enum) { function: Facts.Decl, unknown: Facts.Unknown } {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return .{ .unknown = .unsupported };
+    return switch (call.callee) {
+        .function => |function| .{ .function = function },
+        .choice => .{ .unknown = .unsupported },
+        .any => |why| .{ .unknown = why },
+    };
 }
 
 /// Whether a type expression is plain data: a primitive type (`usize`, `bool`, `type`), or an array,
@@ -1794,12 +1877,13 @@ fn plainValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: us
             return plainValue(c, file, init, depth + 1);
         },
         .call_one, .call_one_comma, .call, .call_comma => {
-            var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node).?;
-            const decl = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return false;
-            const origin = ((try c.facts.origin(decl)).orNull()) orelse return false;
+            // A call that may be of another function is not known plain here: its value's type
+            // decides it where this is read.
+            const origin = switch (try calledFunction(c, file, node)) {
+                .function => |function| function,
+                .unknown => return false,
+            };
             const record = c.project.at(origin.file).model.declarations[@backingInt(origin.index)];
-            if (record.kind != .function) return false;
             const written = &c.project.at(origin.file).file.tree;
             var proto_buffer: [1]Ast.Node.Index = undefined;
             const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
@@ -1948,6 +2032,9 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
     if (try followedAt(c, tree, model, parent, at)) return;
     const discarded = switch (tree.nodeTag(parent)) {
         .@"return" => return,
+        // A block's statement: Zig refuses to ignore a value that is not `void`, so it gives
+        // none, an owner least of all.
+        .block, .block_semicolon, .block_two, .block_two_semicolon => return,
         .assign => blk: {
             if (tree.nodeData(parent).node_and_node[1] != at) break :blk false;
             const target = tree.nodeData(parent).node_and_node[0];
@@ -2153,7 +2240,8 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
         const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
         break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
     };
-    if (!named and !try givesOwner(c, acquisition, acquired.ast.fn_expr)) return null;
+    // One that may give an owner is read by its type below, undecided where that does not resolve.
+    if (!named and try givesOwner(c, acquisition) == .no) return null;
     if (try unlisted(c, acquisition)) return null;
     const k = if (report)
         (try requiredOwner(c, acquisition, cleanup, tree.nodeMainToken(acquired.ast.fn_expr))) orelse return null
@@ -2235,16 +2323,108 @@ fn unlisted(c: *Context, call: Ast.Node.Index) Context.Error!bool {
 /// Whether `call` gives an owner itself, not a pointer to one: an operation of a published type
 /// whose result is a new owner by value (a budget's reservation, a shared value's handle, an
 /// opened scope), or a function of the program's own that returns one held, the caller's to
-/// release (Flow's `return`).
-fn givesOwner(c: *Context, call: Ast.Node.Index, callee: Ast.Node.Index) Context.Error!bool {
-    const decl = ((try c.facts.definition(c.file, callee)).orNull()) orelse return false;
-    const function = ((try c.facts.origin(decl)).orNull()) orelse return false;
-    if (c.project.at(function.file).model.declarations[@backingInt(function.index)].kind != .function) return false;
-    const result = switch (try c.facts.resolve(c.file, call)) {
+/// release (Flow's `return`). By its result's type, whatever it calls: unknown where that does
+/// not resolve.
+fn givesOwner(c: *Context, call: Ast.Node.Index) Context.Error!Is {
+    var resolved = try c.facts.resolve(c.file, call);
+    // A call whose value does not resolve where the function it calls does (a decl literal's,
+    // `.of(gpa, n)`): what that function declares it returns.
+    if (resolved == .unknown) switch (try calledFunction(c, c.file, call)) {
+        .function => |function| {
+            // A result written as a pointer (`*T`, `[]T`, through `!` and `?`) borrows: no owner.
+            if (pointerResult(c, function)) return .no;
+            resolved = try c.facts.callResult(.{ .function = function }, {});
+        },
+        .unknown => {},
+    };
+    const result = switch (resolved) {
         .error_union => |payload| payload.*,
         else => |value| value,
     };
-    return result == .instance;
+    return switch (result) {
+        .instance => .yes,
+        .unknown => |why| if (try stdTyped(c, call)) .no else .{ .unknown = why },
+        else => .no,
+    };
+}
+
+/// Whether `function` declares its result a pointer or a slice, through an error union and an
+/// optional.
+fn pointerResult(c: *Context, function: Facts.Decl) bool {
+    const source = c.project.at(function.file);
+    const tree = &source.file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
+    var at = proto.ast.return_type.unwrap() orelse return false;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .error_union => tree.nodeData(at).node_and_node[1],
+        .optional_type => tree.nodeData(at).node,
+        else => return tree.fullPtrType(at) != null,
+    };
+}
+
+/// Whether the call at `call` gives a value of one of std's types, which declare no aegis owner:
+/// a function of std's whose result is one type at every call (`fixedType`), or a decl literal
+/// (`.limited(n)`), of the type its place gives it, passed where such a function's parameter
+/// is.
+fn stdTyped(c: *Context, call: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    switch (try calledFunction(c, c.file, call)) {
+        .function => |function| if (try c.facts.standard(function.file)) {
+            const source = c.project.at(function.file);
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = source.file.tree.fullFnProto(&buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
+            return fixedType(c, function.file, proto.ast.return_type.unwrap() orelse return false);
+        },
+        .unknown => {},
+    }
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    if (tree.nodeTag((tree.fullCall(&call_buffer, call) orelse return false).ast.fn_expr) != .enum_literal) return false;
+    const parent = c.project.at(c.file).model.parentOf(call) orelse return false;
+    const outer = (try Facts.calls.at(c.facts, c.file, parent)) orelse return false;
+    const position = std.mem.findScalar(Ast.Node.Index, switch (outer.args) {
+        .known => |known| known,
+        .unknown => return false,
+    }, call) orelse return false;
+    const function = switch (try calledFunction(c, c.file, parent)) {
+        .function => |function| function,
+        .unknown => return false,
+    };
+    if (!try c.facts.standard(function.file)) return false;
+    const source = c.project.at(function.file);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = source.file.tree.fullFnProto(&buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
+    var it = proto.iterate(&source.file.tree);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) if (at == position) return fixedType(c, function.file, param.type_expr orelse return false);
+    return false;
+}
+
+/// Whether the type written at `node` in `file` is one type wherever it is read: it names no
+/// parameter, a function's or a type function's around it, no declaration a function's body
+/// makes (a generic's `Self`), and no builtin (`@TypeOf(x)`).
+fn fixedType(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
+    const source = c.project.at(file);
+    const tree = &source.file.tree;
+    var token = tree.firstToken(node);
+    while (token <= tree.lastToken(node)) : (token += 1) switch (tree.tokenTag(token)) {
+        .builtin => return false,
+        .identifier => {
+            // A member's name is its holder's to give.
+            if (token > 0 and tree.tokenTag(token - 1) == .period) continue;
+            const name = tree.tokenSlice(token);
+            if (Model.primitive(name)) continue;
+            const found = source.model.lookup(source.model.scopeOf(token), name, token) orelse return false;
+            const record = source.model.declarations[@backingInt(found)];
+            if (record.kind == .parameter) return false;
+            var scope: ?Model.Scope.Id = record.scope;
+            while (scope) |id| : (scope = source.model.scopes[@backingInt(id)].parent) {
+                if (source.model.scopes[@backingInt(id)].kind == .function) return false;
+            }
+        },
+        else => {},
+    };
+    return true;
 }
 
 /// The paths of a block after a local acquisition, statement by statement. The owner is live
@@ -2348,9 +2528,13 @@ const Flow = struct {
         var out: Paths = .{};
         for (statements, 0..) |stmt, at| {
             if (state == .passed) {
-                if (try f.reacquired(stmt)) {
-                    state = .live;
-                    continue;
+                switch (try f.reacquired(stmt)) {
+                    .yes => {
+                        state = .live;
+                        continue;
+                    },
+                    .no => {},
+                    .unknown => return .uncertain,
                 }
                 if (try f.uses(stmt) != .none) return .uncertain;
             }
@@ -2409,10 +2593,14 @@ const Flow = struct {
             }
             // After the discharge, the check that it came is no use of the owner.
             if (state == .released and try f.tornDown(stmt)) continue;
-            if (state == .released and try f.reacquired(stmt)) {
-                state = .live;
-                continue;
-            }
+            if (state == .released) switch (try f.reacquired(stmt)) {
+                .yes => {
+                    state = .live;
+                    continue;
+                },
+                .no => {},
+                .unknown => return .uncertain,
+            };
             const next = switch (try f.step(stmt, state)) {
                 .paths => |paths| paths,
                 .split => |split| return f.apart(split, statements[at + 1 ..], out),
@@ -3138,18 +3326,20 @@ const Flow = struct {
         return found;
     }
 
-    /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again.
-    fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        if (f.tree.nodeTag(stmt) != .assign) return false;
+    /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again;
+    /// unknown where what the call gives does not resolve.
+    fn reacquired(f: Flow, stmt: Ast.Node.Index) Context.Error!Is {
+        if (f.tree.nodeTag(stmt) != .assign) return .no;
         const data = f.tree.nodeData(stmt).node_and_node;
-        const index = Contract.local(f.c, data[0]) orelse return false;
-        if (f.model.declarations[@backingInt(index)].token != f.token) return false;
+        const index = Contract.local(f.c, data[0]) orelse return .no;
+        if (f.model.declarations[@backingInt(index)].token != f.token) return .no;
         var call_buffer: [1]Ast.Node.Index = undefined;
         const value = if (f.tree.nodeTag(data[1]) == .@"try") f.tree.nodeData(data[1]).node else data[1];
-        const call = f.tree.fullCall(&call_buffer, value) orelse return false;
-        if (f.tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
+        const call = f.tree.fullCall(&call_buffer, value) orelse return .no;
+        if (f.tree.nodeTag(call.ast.fn_expr) != .field_access) return .no;
         const operation = try Model.identifier(f.c.allocator, f.tree.tokenSlice(f.tree.nodeData(call.ast.fn_expr).node_and_token[1]));
-        return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation) or try givesOwner(f.c, value, call.ast.fn_expr);
+        if (std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation)) return .yes;
+        return givesOwner(f.c, value);
     }
 
     /// `owner.handOff()` kept in a local or assigned: the guard's release passes to the code
@@ -3185,7 +3375,11 @@ const Flow = struct {
             if (f.mine(param)) given += 1;
         }
         if (given != 1) return false;
-        const callee = ((try f.c.facts.definition(f.c.file, call.ast.fn_expr)).orNull()) orelse return false;
+        // One that may call another function is read as the program's: undecided.
+        const callee = switch (try calledFunction(f.c, f.c.file, value)) {
+            .function => |function| function,
+            .unknown => return false,
+        };
         if (try Program.owns(f.c, callee.file)) return false;
         const first = f.tree.firstToken(stmt);
         const last = f.tree.lastToken(stmt);
@@ -3226,8 +3420,12 @@ const Flow = struct {
             if (main >= first and main <= last and f.mine(candidate)) named += 1;
         }
         if (named != 1) return null;
-        const decl = ((try f.c.facts.definition(f.c.file, call.ast.fn_expr)).orNull()) orelse return null;
-        const function = ((try f.c.facts.origin(decl)).orNull()) orelse return null;
+        // One that may call another function does not take it: the address handed on is
+        // undecided.
+        const function = switch (try calledFunction(f.c, f.c.file, value)) {
+            .function => |called| called,
+            .unknown => return null,
+        };
         if (!try Program.owns(f.c, function.file)) return null;
         const model = &f.c.project.at(function.file).model;
         const record = model.declarations[@backingInt(function.index)];
@@ -3428,8 +3626,11 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
         if (std.mem.eql(u8, name, "init") and try Contract.kind(c, file, data[0], 0) == .bytes_writer) return true;
     }
     if (depth == 8) return false;
-    const decl = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return false;
-    const function = ((try c.facts.origin(decl)).orNull()) orelse return false;
+    // One that may call another function does not lend it: a use the walk leaves undecided.
+    const function = switch (try calledFunction(c, file, call_node)) {
+        .function => |called| called,
+        .unknown => return false,
+    };
     if (try c.inLibrary(Contract.library, function.file)) return false;
     const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
     if (record.kind != .function) return false;
@@ -3710,17 +3911,39 @@ fn raw(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 }
 
 /// Whether calling `callee` with `params` gives a scalar's raw integer: a method call on a
-/// scalar, or the function given the scalar first.
+/// scalar, or the function given the scalar first. A callee that does not resolve, on a
+/// scalar or given one, is undecided at the callee unless it is spelled `raw`.
 fn rawCall(c: *Context, callee: Ast.Node.Index, params: []const Ast.Node.Index, token: Ast.TokenIndex) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     const method = tree.nodeTag(callee) == .field_access and params.len == 0;
-    const named = if ((try c.facts.definition(c.file, callee)).orNull()) |decl| if ((try c.facts.origin(decl)).orNull()) |target| std.mem.eql(u8, c.project.at(target.file).model.declarations[@backingInt(target.index)].name, "raw") else false else false;
+    const named: Is = switch (try c.facts.definition(c.file, callee)) {
+        .decl => |decl| switch (try c.facts.origin(decl)) {
+            .decl => |target| if (std.mem.eql(u8, c.project.at(target.file).model.declarations[@backingInt(target.index)].name, "raw")) .yes else .no,
+            .none => .no,
+            .unknown => |why| .{ .unknown = why },
+        },
+        // A name of no declaration (`u8`) calls none; any other callee (`f()(s)`) is not read.
+        .none => switch (tree.nodeTag(callee)) {
+            .identifier, .field_access => .no,
+            else => .{ .unknown = .unsupported },
+        },
+        .unknown => |why| .{ .unknown = why },
+    };
     // Unresolved: the call's own spelling.
     const spelled = tree.nodeTag(callee) == .field_access and std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(callee).node_and_token[1])), "raw");
-    if (!named and !spelled) return false;
-    if (method) return try requiredOwner(c, tree.nodeData(callee).node_and_token[0], scalar, token) == .scalar;
-    if (params.len != 1 or !named) return false;
-    return try requiredOwner(c, params[0], scalar, token) == .scalar;
+    // Spelled `raw` but known another: only a method on a scalar is read by its spelling.
+    if (named == .no and !(spelled and method)) return false;
+    const given = if (method) tree.nodeData(callee).node_and_token[0] else if (params.len == 1) params[0] else return false;
+    if (try requiredOwner(c, given, scalar, token) != .scalar) return false;
+    switch (named) {
+        .yes => return true,
+        .no => return true,
+        .unknown => |why| {
+            if (method and spelled) return true;
+            try c.unknown(scalar, callee, why);
+            return false;
+        },
+    }
 }
 /// std's reinterpreting reads, by meaning: the bytes of what they are given (`asBytes`,
 /// `toBytes`, `sliceAsBytes`) and a value read out of bytes (`readInt`, `readVarInt`,
@@ -3738,62 +3961,19 @@ fn rawBytes(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
     const call = tree.fullCall(&buffer, node) orelse return false;
     for (reinterpreting) |each| {
         const path, const position = each;
-        if (position >= call.ast.params.len or !try stdCall(c, call, path)) continue;
+        if (position >= call.ast.params.len) continue;
         const given = call.ast.params[position];
-        return try rawValue(c, given, seen) or try requiredOwner(c, given, scalar, tree.nodeMainToken(node)) == .scalar;
-    }
-    return false;
-}
-
-/// Whether a call reaches std's declaration at `path` (`mem.asBytes`), by what it names.
-fn stdCall(c: *Context, call: Ast.full.Call, path: []const u8) Context.Error!bool {
-    const callee = switch (try c.facts.resolve(c.file, call.ast.fn_expr)) {
-        .function => |decl| ((try c.facts.origin(decl)).orNull()) orelse decl,
-        else => return false,
-    };
-    for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |found| {
-        if (std.meta.eql(((try c.facts.origin(found)).orNull()) orelse found, callee)) return true;
-    }
-    return false;
-}
-
-/// A copy of bytes `node` makes (`@memcpy` or `@memmove`): the places whose memory it writes
-/// and reads, each read through std's byte views (`std.mem.asBytes(&x)`, `sliceAsBytes`), a
-/// slice of it, or its address (`bytesPlace`).
-fn byteCopy(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?struct { into: Ast.Node.Index, from: Ast.Node.Index } {
-    switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => {},
-        else => return null,
-    }
-    const name = tree.tokenSlice(tree.nodeMainToken(node));
-    if (!std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) return null;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = Facts.builtinArgs(tree, node, &buffer);
-    if (args.len != 2) return null;
-    return .{ .into = try bytesPlace(c, tree, args[0]), .from = try bytesPlace(c, tree, args[1]) };
-}
-
-/// The place whose memory a byte copy's argument names: through std's byte views, a slice and
-/// an address taken (`std.mem.asBytes(&x)[0..n]` is `x`), else the argument itself.
-fn bytesPlace(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!Ast.Node.Index {
-    var at = node;
-    var depth: usize = 0;
-    while (depth < 8) : (depth += 1) {
-        switch (tree.nodeTag(at)) {
-            .address_of => at = tree.nodeData(at).node,
-            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-            .slice_open => at = tree.nodeData(at).node_and_node[0],
-            .slice, .slice_sentinel => at = tree.nodeData(at).node_and_extra[0],
-            else => {
-                var call_buffer: [1]Ast.Node.Index = undefined;
-                const call = tree.fullCall(&call_buffer, at) orelse return at;
-                if (call.ast.params.len != 1) return at;
-                if (!try stdCall(c, call, "mem.asBytes") and !try stdCall(c, call, "mem.sliceAsBytes")) return at;
-                at = call.ast.params[0];
+        switch (try stdCall(c, node, path)) {
+            .no => continue,
+            .yes => return try rawValue(c, given, seen) or try requiredOwner(c, given, scalar, tree.nodeMainToken(node)) == .scalar,
+            // A call that may be the read, given a scalar's integer: undecided at the call.
+            .unknown => |why| {
+                if (try rawValue(c, given, seen) or try requiredOwner(c, given, scalar, tree.nodeMainToken(node)) == .scalar) try c.unknown(scalar, node, why);
+                return false;
             },
         }
     }
-    return at;
+    return false;
 }
 
 /// Whether `node` may give what a scalar's `raw()` returned: the call itself, or that value
@@ -3995,12 +4175,20 @@ fn checkScalar(c: *Context) Context.Error!void {
             .call_one, .call_one_comma, .call, .call_comma => {
                 var call_buffer: [1]Ast.Node.Index = undefined;
                 const call = tree.fullCall(&call_buffer, node).?; // unreachable: the tag is a call's
-                const made = for ([_][]const u8{ "mem.bytesToValue", "mem.bytesAsValue", "mem.bytesAsSlice", "enums.fromInt" }) |path| {
-                    if (try stdCall(c, call, path)) break true;
+                // Why the call may be one of them, where it is not known to be.
+                var maybe: ?Facts.Unknown = null;
+                const made = for ([_][]const u8{ "mem.bytesToValue", "mem.bytesAsValue", "mem.bytesAsSlice", "enums.fromInt" }) |path| switch (try stdCall(c, node, path)) {
+                    .yes => break true,
+                    .no => {},
+                    .unknown => |why| maybe = why,
                 } else false;
-                if (!made or call.ast.params.len == 0) continue;
+                if ((!made and maybe == null) or call.ast.params.len == 0) continue;
                 switch (try perBuild(c, try instanceOf(c, try c.facts.resolve(c.file, call.ast.params[0])))) {
-                    .owner => |k| if (k == .scalar) try c.at(scalar, tree.nodeMainToken(node), "an aegis scalar made out of bytes or an integer by std skips its checked construction; use the scalar's checked constructor or justify the boundary"),
+                    .owner => |k| if (k == .scalar) {
+                        if (made) {
+                            try c.at(scalar, tree.nodeMainToken(node), "an aegis scalar made out of bytes or an integer by std skips its checked construction; use the scalar's checked constructor or justify the boundary");
+                        } else if (maybe) |why| try c.unknown(scalar, node, why);
+                    },
                     .other => {},
                     .unknown => try c.undecided(scalar, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "the type std makes here does not resolve: it may be an aegis scalar made without its checked construction"),
                 }
@@ -4214,15 +4402,19 @@ fn wholeBytes(c: *Context, node: Ast.Node.Index, want: ?Path, frames: []const Fr
     }
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return false;
-    const callee = ((try c.facts.definition(c.file, call.ast.fn_expr)).orNull()) orelse return false;
-    const function = ((try c.facts.origin(callee)).orNull()) orelse return false;
+    // A call that may be of another function, or of std's allocator that is not known, is no
+    // whole allocation shown: the adoption stays a review site.
+    const function = switch (try calledFunction(c, c.file, node)) {
+        .function => |called| called,
+        .unknown => return false,
+    };
     // std's allocator by its declarations: a byte allocation, a copy of bytes or printed text.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        const made = if (try allocates(c, function, "mem.Allocator.alloc") or try allocates(c, function, "mem.Allocator.dupe"))
+        const made = if (try isStd(c, function, "mem.Allocator.alloc") == .yes or try isStd(c, function, "mem.Allocator.dupe") == .yes)
             call.ast.params.len == 2 and isByte(c, call.ast.params[0])
         else
-            try allocates(c, function, "mem.Allocator.print") and call.ast.params.len == 2;
+            try isStd(c, function, "mem.Allocator.print") == .yes and call.ast.params.len == 2;
         if (made) {
             const expected = want orelse return true;
             const giver = (try pathOf(c, data[0])) orelse return false;
@@ -4367,11 +4559,17 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&call_buffer, parent) orelse return .{ .unknown = parent };
     if (call.ast.fn_expr == view) return .{ .unknown = parent };
-    const callee = ((try c.facts.definition(file, call.ast.fn_expr)).orNull()) orelse return .{ .unknown = parent };
-    const function = ((try c.facts.origin(callee)).orNull()) orelse return .{ .unknown = parent };
+    const function = switch (try calledFunction(c, file, parent)) {
+        .function => |called| called,
+        .unknown => return .{ .unknown = parent },
+    };
     // Given back to its allocator, or to another owner.
     const frees = [_][]const u8{ "mem.Allocator.free", "mem.Allocator.destroy", "mem.Allocator.realloc", "mem.Allocator.resize", "mem.Allocator.remap" };
-    for (frees) |path| if (try allocates(c, function, path)) return .{ .spoiled = .{ .at = parent, .what = "freed or resized" } };
+    for (frees) |path| switch (try isStd(c, function, path)) {
+        .yes => return .{ .spoiled = .{ .at = parent, .what = "freed or resized" } },
+        .no => {},
+        .unknown => return .{ .unknown = parent },
+    };
     if (file == c.file and tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const data = tree.nodeData(call.ast.fn_expr).node_and_token;
         if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") and try requiredOwner(c, data[0], capacity, data[1]) == .bytes) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
@@ -4393,14 +4591,6 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
         .spoiled => |found| return .{ .spoiled = .{ .at = parent, .what = found.what } },
         .unknown => return .{ .unknown = parent },
     }
-}
-
-/// Whether `function` is std's declaration at `path`.
-fn allocates(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!bool {
-    for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |each| {
-        if (std.meta.eql(((try c.facts.origin(each)).orNull()) orelse each, function)) return true;
-    }
-    return false;
 }
 
 /// Whether `node` never completes with a value: `return`, `unreachable`, a `break` or

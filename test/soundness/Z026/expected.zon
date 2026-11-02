@@ -19,20 +19,4 @@
         // Atomics and @memcpy store an error into memory, keeping it.
         .memory,
     },
-    .open = .{
-        // matrix Z026: only a catch whose handler is a block of no statements is judged
-        "branch/mx-z26-switch_else_empty/hole.zig",
-        // matrix Z026: the same, a handler that hands the error to a callee that drops it
-        "call/mx-z26-callee_drops/hole.zig",
-        // matrix Z026: the same, an if's error captured by _ with an empty branch
-        "capture/mx-z26-if_else_discard/hole.zig",
-        // matrix Z026: the same, a while's else
-        "capture/mx-z26-while_else_discard/hole.zig",
-        // matrix Z026: the same, an errdefer's if
-        "deferred/mx-z26-errdefer_discard/hole.zig",
-        // matrix Z026: the same, @intFromError discarded
-        "conversion/mx-z26-int_from_error/hole.zig",
-        // matrix Z026: the same, an empty block in parentheses
-        "unwrap/mx-z26-grouped_empty_handler/hole.zig",
-    },
 }

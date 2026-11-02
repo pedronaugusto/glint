@@ -21,17 +21,7 @@
         .memory,
     },
     .open = .{
-        // matrix Z013: an import binding is one spelled `= @import(...)`: a dead alias of an import is none
-        "assignment/mx-z13-alias/hole.zig",
-        // matrix Z013: the same, an import through a type function
-        "call/mx-z13-type_function/hole.zig",
-        // matrix Z013: the same, an import through @as
-        "conversion/mx-z13-as_type/hole.zig",
-        // matrix Z013: the same, an import carried out of a labeled block
-        "jump/mx-z13-label_break/hole.zig",
-        // matrix Z013: @hasDecl counts as a use, though it sees no private declaration
-        "compile_time/mx-z13-hasdecl/hole.zig",
-        // matrix Z013 precision: a binding of an import chosen by a comptime if, used, is undecided
+        // glint-b precision: an import chosen per platform resolves to a choice of roots and none, undecided
         "branch/mx-z13-platform_choice/twin.zig",
     },
 }

@@ -724,7 +724,7 @@ fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: 
 }
 /// A std of the parts a rule names by declaration (std's allocator), beside aegis.
 const std_fixture = [_]aegis_sources.Extra{
-    .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");" },
+    .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\npub const Io = struct { pub const File = struct {}; pub const Dir = struct {}; pub const net = struct { pub const Stream = struct {}; pub const Server = struct {}; }; };\npub const process = struct { pub const Child = struct {}; };" },
     .{ .name = "std/mem.zig", .bytes = "pub const Allocator = @import(\"mem/Allocator.zig\");" },
     .{ .name = "std/mem/Allocator.zig", .bytes = "const Allocator = @This();\nptr: *anyopaque,\npub const Error = error{OutOfMemory};\npub fn alloc(a: Allocator, comptime T: type, n: usize) Error![]T { _ = a; _ = n; return &.{}; }\npub fn dupe(a: Allocator, comptime T: type, m: []const T) Error![]T { _ = a; _ = m; return &.{}; }\npub fn print(a: Allocator, comptime format: []const u8, args: anytype) Error![]u8 { _ = a; _ = args; return &.{}; }\npub fn free(a: Allocator, memory: anytype) void { _ = a; _ = memory; }" },
 };
@@ -1520,7 +1520,7 @@ test "owners, result obligations and shared values are released once and never c
     try expectJudged(head ++ "pub fn f(o: *O, m: *M, s: *S) void { _ = o.data; _ = o.state; _ = m.pending; _ = s.block; }", pack.access, true, 4);
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); defer o.deinit(); const copy = o; _ = copy; }", pack.copies, true, 1);
     // A shared value's copy with `=` instead of `retain`.
-    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); const copy = s; _ = copy; }", pack.copies, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); const copy = s; _ = copy; }", pack.copies, true, 1);
     // Owned: released, taken out or moved; left live it is a finding.
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); _ = o.borrow(); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); defer o.deinit(); _ = o.borrow(); }", pack.cleanup, true, 0);
@@ -1531,8 +1531,8 @@ test "owners, result obligations and shared values are released once and never c
     // Its deinit after the discharge is the check that the discharge came.
     try expectJudged(head ++ "pub fn f(out: *u32) void { var m = M.init(1); m.take(out); m.deinit(); }", pack.cleanup, true, 0);
     // Shared: each handle, the created one and each retained one, is released.
-    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); _ = other.get(); }", pack.cleanup, true, 1);
-    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); defer other.release(); }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); _ = other.get(); }", pack.cleanup, true, 1);
+    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); defer other.release(); }", pack.cleanup, true, 0);
 }
 
 test "generational storage, staged payloads, machines, scopes, unparsed input and decisions keep their contracts" {
@@ -1702,9 +1702,9 @@ test "an owner moved into a local aggregate is that aggregate's obligation" {
 
 test "a reservation consumed is discharged" {
     const head = "const std = @import(\"std\");\nconst Budget = @import(\"aegis\").bounded.Budget(usize);\n";
-    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
     // Kept past its success, the reservation leaves with the result: no claim either way.
-    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
+    try expectJudgedStd(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
 }
 
 test "the private fields of staged payloads, machines, scopes, references, secondary maps and unparsed input" {

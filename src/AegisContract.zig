@@ -236,13 +236,9 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
                 if (std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "fromRaw") or std.mem.eql(u8, name, "adopt")) return kind(c, file, data[0], depth + 1);
                 if (acquisition(name) and try kind(c, file, data[0], depth + 1) == .guarded) return .guard;
             }
-            const decl = switch (try c.facts.definition(file, call.ast.fn_expr)) {
-                .decl => |found| found,
-                .none, .unknown => return null,
-            };
-            const origin = switch (try c.facts.origin(decl)) {
-                .decl => |found| found,
-                .none, .unknown => return null,
+            const origin = switch ((try Facts.calls.at(c.facts, file, node) orelse return null).callee) {
+                .function => |function| function,
+                .choice, .any => return null,
             };
             if (try c.role(library, .{ .function = origin })) |k| return k;
             // A function of the program's own is what its declared result says, whether it is

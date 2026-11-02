@@ -1,8 +1,2 @@
 .{
-    .open = .{
-        // matrix A013: `.?` on an optional input chooses is `orelse unreachable` and not read
-        "unwrap/mx-optional_unwrap/hole.zig",
-        // matrix A013: std's assert by @field with a name held in a constant is skipped, neither resolved nor undecided
-        "field/mx-computed_assert_name/hole.zig",
-    },
 }

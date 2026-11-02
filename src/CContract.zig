@@ -125,9 +125,11 @@ pub fn find(c: *Context, decl: Facts.Decl, index: usize) Context.Error!?*const E
             if (symbol) |name| if (std.mem.eql(u8, name, entry.name)) return entry;
             continue;
         }
-        for (((try Governed.declarations(c, "std", entry.name)).orNull()) orelse &.{}) |found| {
-            const origin = ((try c.facts.origin(found)).orNull()) orelse found;
-            if (std.meta.eql(origin, decl)) return entry;
+        switch (try Governed.isStd(c, decl, entry.name)) {
+            .yes => return entry,
+            // A std declaration not known here writes nothing known: what it is given stays
+            // unwritten.
+            .no, .unknown => {},
         }
     }
     return null;

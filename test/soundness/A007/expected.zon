@@ -3,15 +3,7 @@
 .{
     .na = .{.operator},
     .open = .{
-        // matrix: a dependency's lock held in a tuple literal; a value of a lock type is not matched, only the type
-        "aggregate/mx-a07-13_tuple_dep_value/hole.zig",
-        // matrix: a futex wake through Io's vtable; only Io's futex functions are governed, not VTable's fields
-        "call/mx-a07-06b_vtable_futex/hole.zig",
-        // matrix: a variable typed @TypeOf a borrowed lock's value; @TypeOf is not resolved
-        "compile_time/mx-a07-10_typeof_deref/hole.zig",
-        // matrix: a field typed @field(std.Io, "Mu" ++ "tex"); only a string literal's @field name is read
-        "field/mx-a07-04_field_computed_name/hole.zig",
-        // matrix: an inline for over a dependency's cell types; the loop's capture is not resolved to them
-        "inline_loop/mx-a07-09_inline_for_types/hole.zig",
+        // glint-b precision: a tuple literal of a dependency's value resolves to no value (Facts.resolve models no anonymous tuple), so the safe twin is undecided
+        "aggregate/mx-a07-13_tuple_dep_value/twin.zig",
     },
 }

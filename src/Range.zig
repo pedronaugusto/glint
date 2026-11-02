@@ -1103,13 +1103,6 @@ fn containerName(c: *Context, file: Project.FileId, container_node: Ast.Node.Ind
     return tree.tokenSlice(variable.ast.mut_token + 1);
 }
 
-/// Whether `node` is a name for the declaration `decl`.
-fn namesDecl(model: anytype, tree: *const Ast, node: Ast.Node.Index, decl: Facts.Decl) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const ref = model.reference(node) orelse return false;
-    return ref.declaration == decl.index;
-}
-
 /// Whether a value is `null` or `undefined`: no number.
 fn empty(tree: *const Ast, node: Ast.Node.Index) bool {
     if (tree.nodeTag(node) != .identifier) return false;

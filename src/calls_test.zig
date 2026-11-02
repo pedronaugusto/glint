@@ -17,6 +17,7 @@ const Row = struct {
 const fns = "fn a() void {}\nfn b() void {}\n";
 const method = "const S = struct {\n    fn m(self: S, x: u8) void {\n        _ = self;\n        _ = x;\n    }\n};\n";
 const vtable = "const V = struct { f: *const fn () void };\n";
+const typed = "const T = struct {\n    fn init(n: u8) T {\n        _ = n;\n        return .{};\n    }\n    fn take(self: T, t: T) void {\n        _ = self;\n        _ = t;\n    }\n};\n";
 
 const rows = [_]Row{
     .{ .name = "direct", .source = fns ++ "fn w() void {\n    a();\n}\n", .expected = &.{"4 a 0"} },
@@ -59,6 +60,11 @@ const rows = [_]Row{
     .{ .name = "an element", .source = fns ++ "var fs = [_]*const fn () void{ &a, &b };\nfn w() void {\n    fs[0]();\n}\n", .expected = &.{"5 any unresolved 0"} },
     .{ .name = "a call's result", .source = fns ++ "fn get() *const fn () void {\n    return &a;\n}\nfn w() void {\n    get()();\n}\n", .expected = &.{ "7 any unresolved 0", "7 get 0" } },
     .{ .name = "a member of a holder that does not resolve", .source = "fn w(s: anytype) void {\n    s.m();\n}\n", .expected = &.{"2 any generic ? generic"} },
+    .{ .name = "a decl literal, its place a variable's type", .source = typed ++ "fn w() void {\n    const t: T = .init(1);\n    _ = t;\n}\n", .expected = &.{"12 init 1"} },
+    .{ .name = "a decl literal, its place a parameter's type", .source = typed ++ "fn put(t: T) void {\n    _ = t;\n}\nfn w() void {\n    put(.init(1));\n}\n", .expected = &.{ "15 init 1", "15 put 1" } },
+    .{ .name = "a decl literal, its place a parameter past a bound receiver", .source = typed ++ "fn w(s: T) void {\n    s.take(.init(1));\n}\n", .expected = &.{ "12 init 1", "12 take r2" } },
+    .{ .name = "a decl literal, its place a field of a prong's literal, an if's branch and orelse's other value", .source = typed ++ "const H = struct { t: T };\nfn w(c: bool, o: ?T, u: union(enum) { a, b }) void {\n    const h: H = switch (u) {\n        .a => .{ .t = .init(1) },\n        .b => .{ .t = if (c) .init(2) else o orelse .init(3) },\n    };\n    _ = h;\n}\n", .expected = &.{ "14 init 1", "15 init 1", "15 init 1" } },
+    .{ .name = "a decl literal, its place a generic's parameter, which gives it no type", .source = typed ++ "fn put(t: anytype) void {\n    _ = t;\n}\nfn w() void {\n    put(.init(1));\n}\n", .expected = &.{ "15 any comptime_dependent 1", "15 put 1" } },
 };
 
 fn name(project: *const Project, decl: Facts.Decl) []const u8 {

@@ -49,7 +49,7 @@ const std_files = [_]sources.Extra{
     \\pub const Mutex = extern struct { state: u32 = 0, pub const init: Mutex = .{}; pub fn lock(m: *Mutex) void { _ = m; } };
     \\pub const RwLock = struct { state: u32 = 0 };
     \\pub const Handle = @import("root").Handle;
-    \\pub const VTable = struct { close: *const fn (?*anyopaque, Handle) void, write: *const fn (?*anyopaque, Handle, []const u8) void, processSpawn: *const fn (?*anyopaque) void };
+    \\pub const VTable = struct { close: *const fn (?*anyopaque, Handle) void, write: *const fn (?*anyopaque, Handle, []const u8) void, processSpawn: *const fn (?*anyopaque) void, futexWait: *const fn (?*anyopaque, *const u32, u32) error{Canceled}!void, futexWaitUncancelable: *const fn (?*anyopaque, *const u32, u32) void, futexWake: *const fn (?*anyopaque, *const u32, u32) void };
     \\pub const Condition = struct { state: u32 = 0 };
     \\pub const Semaphore = struct { permits: usize = 0 };
     \\pub const Event = enum(u32) { unset, set };
@@ -8688,6 +8688,8 @@ test "A007 finds std's synchronization a dependency names under its own name, he
         \\    _ = &lock;
         \\}
     , dependency);
+    // `dep.Elsewhere` spells the name of the dependency's lock alias (`Lock`): each value it
+    // types is judged once, by what it holds.
     try std.testing.expectEqual(@as(usize, 2), unknown.undecided); // safe: fixture counts are representable.
     try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }

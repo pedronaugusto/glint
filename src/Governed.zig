@@ -76,9 +76,12 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
             if (!module) try self.undecided(rule, 0, .unresolved, "governed declaration source is not a project input");
             continue;
         }
-        g.decls = (try walk(self, roots.items, target.declaration, module)) orelse {
-            try self.undecided(rule, 0, .unresolved, try self.allocator.print("governed declaration {s}.{s} could not be resolved", .{ source, target.declaration }));
-            continue;
+        g.decls = switch (try walk(self, roots.items, target.declaration, module)) {
+            .decls => |decls| decls,
+            .none, .unknown => {
+                try self.undecided(rule, 0, .unresolved, try self.allocator.print("governed declaration {s}.{s} could not be resolved", .{ source, target.declaration }));
+                continue;
+            },
         };
         for (g.decls) |decl| if (externSymbol(self.project, decl)) |symbol| {
             g.symbol = symbol;
@@ -117,8 +120,8 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
     const found = try lookup(self, source, path);
     // A walk the fact budget cut short may have missed a declaration: it is unknown, and asked
     // again.
-    if (self.facts.remaining == 0) return if (found) |decls| .{ .decls = decls } else .{ .unknown = .budget };
-    const answer: Declared = if (found) |decls| .{ .decls = decls } else .none;
+    if (self.facts.remaining == 0 and found != .decls) return .{ .unknown = .budget };
+    const answer = found;
     const paths = try memo.found.getOrPut(self.allocator, source);
     if (!paths.found_existing) {
         paths.key_ptr.* = try self.allocator.dupe(u8, source);
@@ -134,14 +137,14 @@ pub const Lookups = struct {
     asked: usize = 0,
 };
 
-fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!?[]const Facts.Decl {
+fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!Declared {
     var roots: std.ArrayList(Project.FileId) = .empty;
     for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
         for (roots.items) |seen| {
             if (seen == mapping.target) break;
         } else try roots.append(self.allocator, mapping.target);
     };
-    if (roots.items.len == 0) return null;
+    if (roots.items.len == 0) return .none;
     return walk(self, roots.items, path, true);
 }
 
@@ -153,13 +156,22 @@ pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const 
         if (std.mem.eql(u8, source.input.package, package)) try roots.append(self.allocator, source.id);
     }
     if (roots.items.len == 0) return .none;
-    if (try walk(self, roots.items, path, true)) |decls| return .{ .decls = decls };
-    return if (self.facts.remaining == 0) .{ .unknown = .budget } else .none;
+    const found = try walk(self, roots.items, path, true);
+    return if (self.facts.remaining == 0 and found != .decls) .{ .unknown = .budget } else found;
 }
 
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a
 /// reference spelling a governed name that does not resolve is undecided for `rule`.
 pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site)) Context.Error!void {
+    return sitesLeaving(self, rule, governed, out, null);
+}
+
+/// A reference spelling a governed name that does not resolve, and why.
+pub const Unread = struct { node: Ast.Node.Index, why: Facts.Unknown };
+
+/// `sites`, a reference that does not resolve given to `unread` where there is one, for the
+/// caller to judge, instead of undecided.
+pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out: *std.ArrayList(Site), unread: ?*std.ArrayList(Unread)) Context.Error!void {
     if (governed.len == 0) return;
     // What each target is also called, by an alias whose own site this run does not report.
     const renamed = try self.allocator.alloc([]const []const u8, governed.len);
@@ -184,14 +196,29 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
-                if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) continue;
-                const name = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => continue,
-                };
-                break :blk .{ tree.nodeMainToken(args[1]), name };
+                if (args.len != 2) continue;
+                const named = try self.facts.fieldName(self.file, args[1]);
+                switch (named) {
+                    .name => |name| break :blk .{ tree.nodeMainToken(node), name },
+                    // A name it ranges over or computes: each governed name it may be.
+                    .each_of, .names, .computed => {
+                        try fieldSites(self, rule, governed, renamed, node, args[0], named, out);
+                        continue;
+                    },
+                }
             },
-            else => continue,
+            // A decl literal (`.fromMilliseconds(ms)`, `.zero`): a member of the type its place
+            // gives it.
+            .enum_literal => .{ tree.nodeMainToken(node), try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeMainToken(node))) },
+            else => {
+                // A literal's field (`.{ .nanoseconds = x }`): the member of the type it makes.
+                var buffer: [2]Ast.Node.Index = undefined;
+                if (tree.fullStructInit(&buffer, node)) |literal| for (literal.ast.fields) |value| {
+                    const label = Model.initName(tree, value) orelse continue;
+                    try literalSite(self, rule, governed, renamed, node, value, label, out);
+                };
+                continue;
+            },
         };
         var applies = false;
         const testing = self.inTest(site);
@@ -208,24 +235,78 @@ pub fn sites(self: *Context, rule: Rule, governed: []const Governed, out: *std.A
                 // method of its own: the binding reaches one only through an alias its type
                 // declares, which is that alias's site.
                 if (why == .generic and tag == .field_access and methodCall(self, node) and free(self, governed, spelled)) continue;
-                try self.unknown(rule, node, why);
+                if (unread) |list| try list.append(self.allocator, .{ .node = node, .why = why }) else try self.unknown(rule, node, why);
                 continue;
             },
             .decls => |decls| decls,
         };
-        found: for (decls, 0..) |decl, d| for (governed, renamed) |g, names| {
-            if (!spells(g, names, spelled) or (testing and g.target.production) or !matches(self, g, decl)) continue;
-            // `reach` gives a definition first and its origin second: a match on the origin of
-            // a different declaration came through the program's alias.
-            const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.at(decls[d - 1].file).input.selected;
-            const declared = alias and switch (self.project.at(decls[d - 1].file).model.scopes[@backingInt(self.project.at(decls[d - 1].file).model.declarations[@backingInt(decls[d - 1].index)].scope)].kind) {
-                .file, .container => true,
-                else => false,
-            };
-            try out.append(self.allocator, .{ .token = site, .node = node, .index = g.index, .decl = decl, .through_alias = alias, .alias_declared = declared });
-            break :found;
+        // `reach` gives a definition first and its origin second.
+        try append(self, governed, renamed, site, node, spelled, decls, out);
+    }
+}
+
+/// A literal field's name spelling a governed member: a site where the literal's type has it.
+fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, literal: Ast.Node.Index, value: Ast.Node.Index, label: Ast.TokenIndex, out: *std.ArrayList(Site)) Context.Error!void {
+    const tree = &self.project.at(self.file).file.tree;
+    const spelled = try Model.identifier(self.allocator, tree.tokenSlice(label));
+    if (!spelledAny(self, governed, renamed, spelled, label)) return;
+    switch (try self.facts.literalDeclaration(self.file, literal, spelled)) {
+        .unknown => |why| try self.unknown(rule, value, why),
+        .none => {},
+        .decl => |decl| switch (try paired(self, decl)) {
+            .pair => |pair| try append(self, governed, renamed, label, value, spelled, &pair, out),
+            .unknown => |why| try self.unknown(rule, value, why),
+        },
+    }
+}
+
+/// `@field` by a name it ranges over or computes: each governed member its holder has that the
+/// name may be is a site; a holder that does not resolve is undecided where a governed name may
+/// be named.
+fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, holder: Ast.Node.Index, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
+    const tree = &self.project.at(self.file).file.tree;
+    const site = tree.nodeMainToken(node);
+    const value = try self.facts.resolve(self.file, holder);
+    for (governed, renamed) |g, names| {
+        for ([_][]const []const u8{ &.{g.name}, names }) |list| for (list) |name| {
+            if (!self.facts.mayName(named, name) or (self.inTest(site) and g.target.production)) continue;
+            if (value == .unknown) return self.unknown(rule, node, value.unknown);
+            var options: std.ArrayList(Facts.Container) = .empty;
+            try containers(self, value, &options);
+            for (options.items) |container| {
+                const decl = self.facts.member(container, name) orelse continue;
+                if (named == .computed) return self.undecided(rule, tree.tokenStart(site), .unresolved, "a name @field computes may name a governed declaration");
+                switch (try paired(self, decl)) {
+                    .pair => |pair| try append(self, governed, renamed, site, node, name, &pair, out),
+                    .unknown => |why| return self.unknown(rule, node, why),
+                }
+            }
         };
     }
+}
+
+/// Whether a governed declaration is spelled `spelled` where `site` is.
+fn spelledAny(self: *Context, governed: []const Governed, renamed: []const []const []const u8, spelled: []const u8, site: Ast.TokenIndex) bool {
+    const testing = self.inTest(site);
+    for (governed, renamed) |g, names| if (spells(g, names, spelled) and !(testing and g.target.production)) return true;
+    return false;
+}
+
+/// The site at `site` for the first governed declaration among `decls`, a definition and its
+/// origin in pairs (`reach`).
+fn append(self: *Context, governed: []const Governed, renamed: []const []const []const u8, site: Ast.TokenIndex, node: Ast.Node.Index, spelled: []const u8, decls: []const Facts.Decl, out: *std.ArrayList(Site)) Context.Error!void {
+    const testing = self.inTest(site);
+    for (decls, 0..) |decl, d| for (governed, renamed) |g, names| {
+        if (!spells(g, names, spelled) or (testing and g.target.production) or !matches(self, g, decl)) continue;
+        // A match on the origin of a different declaration came through the program's alias.
+        const alias = d % 2 == 1 and !std.meta.eql(decls[d - 1], decl) and self.project.at(decls[d - 1].file).input.selected;
+        const declared = alias and switch (self.project.at(decls[d - 1].file).model.scopes[@backingInt(self.project.at(decls[d - 1].file).model.declarations[@backingInt(decls[d - 1].index)].scope)].kind) {
+            .file, .container => true,
+            else => false,
+        };
+        try out.append(self.allocator, .{ .token = site, .node = node, .index = g.index, .decl = decl, .through_alias = alias, .alias_declared = declared });
+        return;
+    };
 }
 
 /// Whether `spelled` names `g`: its own name, or one of `names`, its aliases'.
@@ -238,7 +319,10 @@ fn spells(g: Governed, names: []const []const u8, spelled: []const u8) bool {
 /// The names the program's files the run does not select give `decls` (or a function of the
 /// extern `symbol`) under another name: `pub const zero = std.crypto.secureZero;`. A use that
 /// spells one reaches the declaration, and the alias's own site is not reported in this run,
-/// so the use is the site. Each alias is found once, by the declaration its value reaches.
+/// so the use is the site. Each alias is found once, by the declaration its value reaches. One
+/// whose value does not resolve reaches what the name it spells last may (`h.sync`, `T.sync`):
+/// it is also called so where that name is a declaration's or its aliases' (a use of it is
+/// then unknown, `paired`); a name `@field` computes may be any.
 pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8, out: *std.ArrayList([]const u8)) Context.Error!void {
     const found = try self.facts.memo(Aliases);
     if (!found.built) {
@@ -256,7 +340,18 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
                     else => continue,
                 }
                 const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
-                const origin = ((try self.facts.origin(decl)).orNull()) orelse continue;
+                const origin = switch (try self.facts.origin(decl)) {
+                    .decl => |reached| reached,
+                    .none => continue,
+                    .unknown => {
+                        try found.unknown.append(self.allocator, .{ .name = d.name, .spells = switch (tree.nodeTag(init)) {
+                            .identifier => tree.tokenSlice(tree.nodeMainToken(init)),
+                            .field_access => try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeData(init).node_and_token[1])),
+                            else => null,
+                        } });
+                        continue;
+                    },
+                };
                 if (std.meta.eql(origin, decl)) continue;
                 const entry = try found.by_origin.getOrPut(self.allocator, origin);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -264,16 +359,43 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
             }
         }
     }
+    const start = out.items.len;
     for (decls) |decl| if (found.by_origin.get(decl)) |names| try out.appendSlice(self.allocator, names.items);
-    const wanted = symbol orelse return;
-    var each = found.by_origin.iterator();
-    while (each.next()) |entry| if (externSymbol(self.project, entry.key_ptr.*)) |own| if (std.mem.eql(u8, own, wanted)) {
-        try out.appendSlice(self.allocator, entry.value_ptr.items);
-    };
+    if (symbol) |wanted| {
+        var each = found.by_origin.iterator();
+        while (each.next()) |entry| if (externSymbol(self.project, entry.key_ptr.*)) |own| if (std.mem.eql(u8, own, wanted)) {
+            try out.appendSlice(self.allocator, entry.value_ptr.items);
+        };
+    }
+    // The aliases whose value does not resolve that spell one of these names, or of theirs.
+    var spelled: std.ArrayList([]const u8) = .empty;
+    for (decls) |decl| try spelled.append(self.allocator, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name);
+    if (symbol) |wanted| try spelled.append(self.allocator, wanted);
+    try spelled.appendSlice(self.allocator, out.items[start..]);
+    var grew = true;
+    while (grew) {
+        grew = false;
+        for (found.unknown.items) |alias| {
+            const named = for (spelled.items) |name| {
+                if (std.mem.eql(u8, name, alias.name)) break true;
+            } else false;
+            if (named) continue;
+            const reaches = if (alias.spells) |last| for (spelled.items) |name| {
+                if (std.mem.eql(u8, name, last)) break true;
+            } else false else true;
+            if (!reaches) continue;
+            try spelled.append(self.allocator, alias.name);
+            try out.append(self.allocator, alias.name);
+            grew = true;
+        }
+    }
 }
 const Aliases = struct {
     built: bool = false,
     by_origin: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList([]const u8)) = .empty,
+    /// The aliases whose value does not resolve: each name, and the name its value spells
+    /// last (null for `@field`'s, which may be any).
+    unknown: std.ArrayList(struct { name: []const u8, spells: ?[]const u8 }) = .empty,
 };
 
 /// Whether every governed declaration named `name` is a function of a namespace: a container
@@ -308,9 +430,10 @@ fn matches(self: *Context, g: Governed, decl: Facts.Decl) bool {
 }
 
 /// The declarations a path names from its roots: through every alternative of a per-build
-/// choice (`c.F` is a different struct per target), public ones only from a module. Null when
-/// no alternative has it.
-fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_only: bool) Context.Error!?[]const Facts.Decl {
+/// choice (`c.F` is a different struct per target), public ones only from a module, each through
+/// its aliases. None when no alternative has it; unknown where an alias on the way does not
+/// resolve.
+fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_only: bool) Context.Error!Declared {
     var current: std.ArrayList(Facts.Container) = .empty;
     for (roots) |root| try current.append(self.allocator, self.facts.rootOf(root));
     var found: std.ArrayList(Facts.Decl) = .empty;
@@ -322,14 +445,18 @@ fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_
             // A field has no `pub`: every field of a container a program reaches is its to name.
             const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             if (public_only and !record.public and record.kind != .field) continue;
-            try found.append(self.allocator, ((try self.facts.origin(decl)).orNull()) orelse decl);
+            try found.append(self.allocator, switch (try self.facts.origin(decl)) {
+                .decl => |origin| origin,
+                .none => decl,
+                .unknown => |why| return .{ .unknown = why },
+            });
         }
-        if (found.items.len == 0) return null;
+        if (found.items.len == 0) return .none;
         if (names.peek() == null) break;
         current.clearRetainingCapacity();
         for (found.items) |decl| try containers(self, try self.facts.declaration(decl), &current);
     }
-    return try found.toOwnedSlice(self.allocator);
+    return .{ .decls = try found.toOwnedSlice(self.allocator) };
 }
 
 /// The containers a value names, each alternative of a choice its own.
@@ -348,12 +475,22 @@ const Reached = union(enum) { decls: []const Facts.Decl, unknown: Facts.Unknown 
 /// What a site refers to: its declaration through aliases, or the member of each container its
 /// receiver may be.
 fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []const u8, governed: []const Governed) Context.Error!Reached {
-    const definition = if (tag == .identifier or tag == .field_access) (try self.facts.definition(self.file, node)).orNull() else (try self.facts.reflected(self.file, node)).orNull();
-    if (definition) |decl| {
-        // An alias whose value does not resolve is the program's own declaration: its value is a
-        // site of its own.
-        const origin = ((try self.facts.origin(decl)).orNull()) orelse decl;
-        return .{ .decls = try self.allocator.dupe(Facts.Decl, &.{ decl, origin }) };
+    if (tag == .enum_literal) switch (try self.facts.literalDeclaration(self.file, node, spelled)) {
+        .unknown => |why| return .{ .unknown = why },
+        .none => return .{ .decls = &.{} },
+        .decl => |decl| return switch (try paired(self, decl)) {
+            .pair => |pair| .{ .decls = try self.allocator.dupe(Facts.Decl, &pair) },
+            .unknown => |why| .{ .unknown = why },
+        },
+    };
+    const definition = if (tag == .identifier or tag == .field_access) try self.facts.definition(self.file, node) else try self.facts.reflected(self.file, node);
+    switch (definition) {
+        .decl => |decl| return switch (try paired(self, decl)) {
+            .pair => |pair| .{ .decls = try self.allocator.dupe(Facts.Decl, &pair) },
+            .unknown => |why| .{ .unknown = why },
+        },
+        // Named by no declaration, or by one not known: read by the value and the receiver below.
+        .none, .unknown => {},
     }
     if (tag == .identifier) {
         const value = try self.facts.resolve(self.file, node);
@@ -371,10 +508,23 @@ fn reach(self: *Context, node: Ast.Node.Index, tag: Ast.Node.Tag, spelled: []con
     var decls: std.ArrayList(Facts.Decl) = .empty;
     for (options.items) |container| {
         const decl = self.facts.member(container, spelled) orelse continue;
-        try decls.append(self.allocator, decl);
-        try decls.append(self.allocator, ((try self.facts.origin(decl)).orNull()) orelse return .{ .unknown = .cycle });
+        switch (try paired(self, decl)) {
+            .pair => |pair| try decls.appendSlice(self.allocator, &pair),
+            .unknown => |why| return .{ .unknown = why },
+        }
     }
     return .{ .decls = decls.items };
+}
+
+/// A declaration and its origin, the pair `append` reads. An alias in a selected file whose
+/// value does not resolve is its own site: its value is a site of its own where it is written.
+/// One in a file the run does not check is unknown: what it names is checked nowhere.
+fn paired(self: *Context, decl: Facts.Decl) Context.Error!union(enum) { pair: [2]Facts.Decl, unknown: Facts.Unknown } {
+    return switch (try self.facts.origin(decl)) {
+        .decl => |origin| .{ .pair = .{ decl, origin } },
+        .none => .{ .pair = .{ decl, decl } },
+        .unknown => |why| if (self.project.at(decl.file).input.selected) .{ .pair = .{ decl, decl } } else .{ .unknown = why },
+    };
 }
 
 /// The symbol an `extern` function binds: its name.
@@ -450,4 +600,107 @@ fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) 
         if (model.declarations[@backingInt(index)].node == parent) return true;
     }
     return false;
+}
+
+/// Whether something is so: yes, no, or unknown and why.
+pub const Is = union(enum) { yes, no, unknown: Facts.Unknown };
+
+/// Whether `function` is std's declaration at `path` (`mem.Allocator.free`), through aliases.
+pub fn isStd(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!Is {
+    const decls = switch (try declarations(c, "std", path)) {
+        .decls => |decls| decls,
+        .none => return .no,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    for (decls) |decl| if (std.meta.eql(decl, function)) return .yes;
+    return .no;
+}
+
+/// Whether the call at `node` calls std's declaration at `path` (`mem.asBytes`): yes where
+/// every function it may call is that one, no where none is. A callee that does not resolve is
+/// unknown, unless it cannot be that declaration by what Zig allows: its name (as written)
+/// spells neither the declaration's nor an alias's of it, or its parameters refuse the
+/// arguments.
+pub fn stdCall(c: *Context, node: Ast.Node.Index, path: []const u8) Context.Error!Is {
+    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return .no;
+    const decls = switch (try declarations(c, "std", path)) {
+        .decls => |decls| decls,
+        .none => return .no,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    const callees: []const Facts.Decl = switch (call.callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => |why| return if (try notCalled(c, call, decls, path)) .no else .{ .unknown = why },
+    };
+    var found: usize = 0;
+    for (callees) |callee| for (decls) |decl| {
+        if (std.meta.eql(decl, callee)) {
+            found += 1;
+            break;
+        }
+    };
+    if (found == 0) return .no;
+    if (found == callees.len) return .yes;
+    // One of them only: the call may be it or another.
+    return .{ .unknown = .unsupported };
+}
+
+/// Whether a call whose callee does not resolve cannot call any of `decls`: none takes its
+/// arguments, as a method or as a namespace's function; or it calls a member whose name spells
+/// neither theirs (`path`'s last) nor an alias's in the program (`aliasNames`). A local's name
+/// says nothing: it may hold any of them.
+fn notCalled(c: *Context, call: Facts.calls.Call, decls: []const Facts.Decl, path: []const u8) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    var full_buffer: [1]Ast.Node.Index = undefined;
+    const full = tree.fullCall(&full_buffer, call.node) orelse return false;
+    var takes = false;
+    for (decls) |decl| takes = takes or try c.accepts(decl, full, 1) or try c.accepts(decl, full, 0);
+    if (!takes) return true;
+    if (tree.nodeTag(call.callee_expr) != .field_access) return false;
+    const spelled = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.callee_expr).node_and_token[1]));
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(c.allocator, if (std.mem.findScalarLast(u8, path, '.')) |dot| path[dot + 1 ..] else path);
+    try aliasNames(c, decls, null, &names);
+    for (names.items) |name| if (std.mem.eql(u8, name, spelled)) return false;
+    return true;
+}
+
+/// A copy of bytes `node` makes (`@memcpy` or `@memmove`): the places whose memory it writes
+/// and reads, each read through std's byte views (`std.mem.asBytes(&x)`, `sliceAsBytes`), a
+/// slice of it, or its address (`bytesPlace`).
+pub fn byteCopy(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?struct { into: Ast.Node.Index, from: Ast.Node.Index } {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    if (!std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, node, &buffer);
+    if (args.len != 2) return null;
+    return .{ .into = try bytesPlace(c, tree, args[0]), .from = try bytesPlace(c, tree, args[1]) };
+}
+
+/// The place whose memory a byte copy's argument names: through std's byte views, a slice and
+/// an address taken (`std.mem.asBytes(&x)[0..n]` is `x`), else the argument itself.
+pub fn bytesPlace(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!Ast.Node.Index {
+    var at = node;
+    var depth: usize = 0;
+    while (depth < 8) : (depth += 1) {
+        switch (tree.nodeTag(at)) {
+            .address_of => at = tree.nodeData(at).node,
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .slice_open => at = tree.nodeData(at).node_and_node[0],
+            .slice, .slice_sentinel => at = tree.nodeData(at).node_and_extra[0],
+            else => {
+                var call_buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, at) orelse return at;
+                if (call.ast.params.len != 1) return at;
+                if (try stdCall(c, at, "mem.asBytes") != .yes and try stdCall(c, at, "mem.sliceAsBytes") != .yes) return at;
+                at = call.ast.params[0];
+            },
+        }
+    }
+    return at;
 }

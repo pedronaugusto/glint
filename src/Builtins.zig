@@ -133,9 +133,23 @@ fn unusedImports(self: *Context) RunError!void {
     for (declarations, 0..) |decl, index| {
         if (decl.kind != .variable or decl.public or decl.exported or decl.references != 0) continue;
         const value = tree.fullVarDecl(decl.node).?.ast.init_node.unwrap() orelse continue;
+        // An `@import` written there is one, whatever module it names; any other value is one
+        // by meaning: what it holds is another file's root, however it is reached (an alias of
+        // one, a type function or `@as` given one, a block's `break`). One that does not resolve
+        // is undecided.
         var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, value, &buffer);
-        if (args.len != 1 or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import")) continue;
+        const written = Facts.builtinArgs(tree, value, &buffer).len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "@import");
+        if (!written) switch (try self.facts.declaration(.{ .file = self.file, .index = @fromBackingInt(@intCast(index)) })) {
+            .container => |container| {
+                if (container.file == self.file) continue;
+                if (self.project.at(container.file).model.scopes[@backingInt(container.scope)].kind != .file) continue;
+            },
+            .unknown => |why| {
+                try unknown(self, .Z013, decl.node, why);
+                continue;
+            },
+            else => continue,
+        };
         try candidates.put(self.allocator, decl.name, {});
         try indexes.append(self.allocator, @fromBackingInt(@intCast(index)));
     }
@@ -153,12 +167,14 @@ fn unusedImports(self: *Context) RunError!void {
         const pair = tree.nodeData(node).node_and_token;
         const name = try Model.identifier(self.allocator, tree.tokenSlice(pair[1]));
         if (!candidates.contains(name)) continue;
-        if ((try self.facts.definition(self.file, node)).orNull()) |definition| {
-            if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
-        } else {
-            const receiver = try self.facts.resolve(self.file, pair[0]);
-            try unknown(self, .Z013, node, if (receiver == .unknown) receiver.unknown else .unsupported);
-            try undecided.put(self.allocator, name, {});
+        switch (try self.facts.definition(self.file, node)) {
+            .decl => |definition| if (definition.file == self.file) try used.put(self.allocator, definition.index, {}),
+            // A member its holder does not declare, or of a number: no import of this file.
+            .none => {},
+            .unknown => |why| {
+                try unknown(self, .Z013, node, why);
+                try undecided.put(self.allocator, name, {});
+            },
         }
     }
     for (indexes.items) |index| {
@@ -176,7 +192,9 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return;
     const builtin = tree.tokenSlice(tree.nodeMainToken(node));
-    if (!std.mem.eql(u8, builtin, "@field") and !std.mem.eql(u8, builtin, "@hasDecl")) return;
+    // `@field` reads a private declaration of its own file; `@hasDecl` sees none, even of
+    // its own file, so it never uses a private import.
+    if (!std.mem.eql(u8, builtin, "@field")) return;
     var name: ?[]const u8 = null;
     if (tree.nodeTag(args[1]) == .string_literal) {
         name = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
@@ -184,9 +202,13 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
             else => return,
         };
         if (!candidates.contains(name.?)) return;
-        if ((try self.facts.reflected(self.file, node)).orNull()) |definition| {
-            if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
-            return;
+        switch (try self.facts.reflected(self.file, node)) {
+            .decl => |definition| {
+                if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
+                return;
+            },
+            // Read by its holder below.
+            .none, .unknown => {},
         }
     }
     const value = try self.facts.resolve(self.file, args[0]);
@@ -216,24 +238,29 @@ fn unknown(self: *Context, rule: rules.Rule, node: Ast.Node.Index, reason: Facts
     return self.unknown(rule, node, reason);
 }
 
+/// Z011: each call by meaning (`Facts.calls`: a direct call, a method's, `@call`, a callee
+/// through `@field` or a function pointer) of a deprecated declaration, or through an alias
+/// that is one; one whose callee may be any function is undecided.
 fn priorityRules(self: *Context) RunError!void {
     if (!self.config.has(.Z011)) return;
     const tree = &self.project.at(self.file).file.tree;
-    // Node-table enumeration covers every expression position exactly once.
-    for (tree.nodes.items(.tag), 0..) |_, n| {
-        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(n));
-        var buffer: [1]std.zig.Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        if ((try self.facts.definition(self.file, call.ast.fn_expr)).orNull()) |definition| {
-            var deprecated_definition: ?Facts.Decl = if (deprecated(self, definition)) definition else null;
-            if (deprecated_definition == null) {
-                const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-                if (value == .function and deprecated(self, value.function)) deprecated_definition = value.function;
-            }
-            if (deprecated_definition) |resolved| try self.atDefinition(.Z011, if (tree.nodeTag(call.ast.fn_expr) == .field_access) tree.nodeData(call.ast.fn_expr).node_and_token[1] else tree.nodeMainToken(call.ast.fn_expr), "call uses a deprecated declaration", resolved);
-        } else {
-            const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-            try unknown(self, .Z011, call.ast.fn_expr, if (value == .unknown) value.unknown else .unsupported);
+    for (try Facts.calls.in(self.facts, self.file)) |call| {
+        const token = if (tree.nodeTag(call.callee_expr) == .field_access) tree.nodeData(call.callee_expr).node_and_token[1] else tree.nodeMainToken(call.callee_expr);
+        // An alias that is itself deprecated; one not followed leaves the callee to decide.
+        switch (try self.facts.definition(self.file, call.callee_expr)) {
+            .decl => |alias| if (deprecated(self, alias)) {
+                try self.atDefinition(.Z011, token, "call uses a deprecated declaration", alias);
+                continue;
+            },
+            .none, .unknown => {},
+        }
+        switch (call.callee) {
+            .function => |function| if (deprecated(self, function)) try self.atDefinition(.Z011, token, "call uses a deprecated declaration", function),
+            .choice => |each| for (each) |function| if (deprecated(self, function)) {
+                try self.atDefinition(.Z011, token, "call uses a deprecated declaration", function);
+                break;
+            },
+            .any => |why| try unknown(self, .Z011, call.callee_expr, why),
         }
     }
 }
@@ -252,13 +279,87 @@ fn amendedPolicies(self: *Context) RunError!void {
         while (it.next()) |param| if (param.type_expr) |t| try privateType(self, t, decl.token, 0);
     };
     if (self.config.has(.Z026)) for (tree.nodes.items(.tag), 0..) |tag, n| {
-        if (tag != .@"catch") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
-        var buffer: [2]Ast.Node.Index = undefined;
-        if (tree.blockStatements(&buffer, tree.nodeData(node).node_and_node[1])) |statements| {
-            if (statements.len == 0) try self.at(.Z026, tree.nodeMainToken(node), "empty catch discards an error; write a reason at this site");
-        }
+        // Each handler of an error: `catch`'s, and an `if`'s or a `while`'s `else |err|`.
+        const handler = if (tag == .@"catch")
+            tree.nodeData(node).node_and_node[1]
+        else if (tree.fullIf(node)) |branch|
+            (if (branch.error_token != null) branch.ast.else_expr.unwrap() orelse continue else continue)
+        else if (tree.fullWhile(node)) |loop|
+            (if (loop.error_token != null) loop.ast.else_expr.unwrap() orelse continue else continue)
+        else
+            continue;
+        if (try discards(self, handler, 0)) try self.at(.Z026, tree.nodeMainToken(node), "an error handler that discards the error; write a reason at this site");
     };
+}
+
+/// Whether an error's handler does nothing with it: an empty block, or one whose every
+/// statement is a discard (`_ = err`, `_ = @intFromError(err)`), a grouping of one, a `switch`
+/// whose every prong is one, or a call of the program's function whose body is empty
+/// (`ignore(err)`). A call whose callee may be any function does something, as it may.
+fn discards(self: *Context, node: Ast.Node.Index, depth: usize) RunError!bool {
+    if (depth == 8) return false;
+    const tree = &self.project.at(self.file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| {
+        for (statements) |statement| if (!try discards(self, statement, depth + 1)) return false;
+        return true;
+    }
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return discards(self, tree.nodeData(node).node_and_token[0], depth + 1),
+        .assign => {
+            const target, const value = tree.nodeData(node).node_and_node;
+            if (tree.nodeTag(target) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return false;
+            return inert(tree, value, 0);
+        },
+        .@"switch", .switch_comma => {
+            const whole = tree.fullSwitch(node).?; // unreachable: tagged a switch
+            for (whole.ast.cases) |case| if (!try discards(self, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false; // unreachable: a switch's cases are cases
+            return true;
+        },
+        else => {},
+    }
+    const call = (try Facts.calls.at(self.facts, self.file, node)) orelse return false;
+    const function = switch (call.callee) {
+        .function => |function| function,
+        .choice, .any => return false,
+    };
+    const callee_tree = &self.project.at(function.file).file.tree;
+    const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
+    if (record.kind != .function or !self.project.at(function.file).input.selected) return false;
+    // A function's declaration is its prototype; its body is the `fn_decl` around it.
+    const declared = self.project.at(function.file).model.parentOf(record.node) orelse return false;
+    if (callee_tree.nodeTag(declared) != .fn_decl) return false;
+    var body_buffer: [2]Ast.Node.Index = undefined;
+    const body = callee_tree.blockStatements(&body_buffer, callee_tree.nodeData(declared).node_and_node[1]) orelse return false;
+    if (body.len != 0) return false;
+    const args = switch (call.args) {
+        .known => |known| known,
+        .unknown => return false,
+    };
+    for (args) |arg| if (!inert(tree, arg, 0)) return false;
+    return true;
+}
+
+/// Whether an expression only reads: a name, a member, a number, or a builtin of them
+/// (`@intFromError(err)`, `@errorName(err)`), with no call and no store.
+fn inert(tree: *const Ast, node: Ast.Node.Index, depth: usize) bool {
+    if (depth == 8) return false;
+    switch (tree.nodeTag(node)) {
+        .identifier, .number_literal, .enum_literal, .string_literal, .char_literal => return true,
+        .field_access => return inert(tree, tree.nodeData(node).node_and_token[0], depth + 1),
+        .grouped_expression => return inert(tree, tree.nodeData(node).node_and_token[0], depth + 1),
+        .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            for ([_][]const u8{ "@intFromError", "@errorName", "@errorCast", "@as" }) |pure| if (std.mem.eql(u8, name, pure)) {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (Facts.builtinArgs(tree, node, &buffer)) |arg| if (!inert(tree, arg, depth + 1)) return false;
+                return true;
+            };
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// Whether a caller outside the file can name what is declared in `scope`: each container around
@@ -286,10 +387,11 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
     if (tree.fullPtrType(node)) |pointer| return privateType(self, pointer.ast.child_type, site, depth + 1);
     switch (tree.nodeTag(node)) {
         .identifier, .field_access => {
-            const definition = ((try self.facts.definition(self.file, node)).orNull()) orelse {
-                const value = try self.facts.resolve(self.file, node);
-                if (value == .unknown) try unknown(self, .Z012, node, value.unknown);
-                return;
+            const definition = switch (try self.facts.definition(self.file, node)) {
+                .decl => |decl| decl,
+                // A primitive, or a member no holder declares: no private type.
+                .none => return,
+                .unknown => |why| return unknown(self, .Z012, node, why),
             };
             const decl = self.project.at(definition.file).model.declarations[@backingInt(definition.index)];
             if (decl.kind == .parameter or decl.public or decl.exported) return;
@@ -298,9 +400,13 @@ fn privateType(self: *Context, node: Ast.Node.Index, site: Ast.TokenIndex, depth
             // A primitive alias can be named as the primitive; error-set policy is not Z012.
             if (value != .container) return;
             if (value.container.scope == decl.scope) return; // An enclosing @This receiver is nameable through its public owner.
-            if ((try self.facts.origin(definition)).orNull()) |origin| {
-                const original = self.project.at(origin.file).model.declarations[@backingInt(origin.index)]; // safe: resolved alias provenance.
-                if (original.public or original.exported) return;
+            switch (try self.facts.origin(definition)) {
+                .decl => |origin| {
+                    const original = self.project.at(origin.file).model.declarations[@backingInt(origin.index)]; // safe: resolved alias provenance.
+                    if (original.public or original.exported) return;
+                },
+                .none => {},
+                .unknown => |why| return unknown(self, .Z012, node, why),
             }
             // A public alias to this same concrete container makes the type nameable.
             for (self.project.at(definition.file).model.declarations, 0..) |alias, i| {
@@ -519,27 +625,70 @@ fn unknownCoverage(self: *Context) RunError!void {
     }
 }
 
+/// P005: each call by meaning (`Facts.calls`) of std's `debug.print`, wherever the file reaches
+/// it from (std imported here, or through another file's alias); a call of a choice one of
+/// which is it is one; one whose callee may be any function is undecided.
 fn sourcePolicies(self: *Context) RunError!void {
     if (!self.config.has(.P005)) return;
     const tree = &self.project.at(self.file).file.tree;
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(node);
+    const found = try debugPrint(self);
+    if (found == .none) return;
+    for (try Facts.calls.in(self.facts, self.file)) |call| {
+        const token = tree.nodeMainToken(call.node);
         if (self.inTest(token)) continue;
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&call_buffer, node) orelse continue;
-        const value = try self.facts.resolve(self.file, call.ast.fn_expr);
-        if (value == .unknown) try self.unknown(.P005, call.ast.fn_expr, value.unknown);
-        if (value == .function) for (self.project.imports) |mapping| {
-            if (mapping.from != self.file or !std.mem.eql(u8, mapping.spelling, "std")) continue;
-            const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
-            const print = self.facts.member(debug, "print") orelse continue;
-            if (std.meta.eql(print, value.function)) {
-                try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
-                break;
-            }
+        // std's print not followed to its declaration: any call may be it.
+        const print = switch (found) {
+            .decl => |print| print,
+            .none => return,
+            .unknown => |why| {
+                try self.unknown(.P005, call.callee_expr, why);
+                continue;
+            },
+        };
+        const prints = switch (call.callee) {
+            .function => |function| try samePrint(self, function, print),
+            .choice => |each| for (each) |function| {
+                const same = try samePrint(self, function, print);
+                if (same != .no) break same;
+            } else .no,
+            .any => |why| Same{ .unknown = why },
+        };
+        const known = switch (prints) {
+            .yes => true,
+            .no => false,
+            .unknown => |why| {
+                try self.unknown(.P005, call.callee_expr, why);
+                continue;
+            },
+        };
+        if (known) try self.atDefinition(.P005, token, "production debug print; use the project's output/logging contract", print);
+    }
+}
+/// std's `debug.print`, from any file's mapping of std: none where the project maps no std,
+/// unknown where its alias is not followed.
+fn debugPrint(self: *Context) RunError!Facts.Named {
+    for (self.project.imports) |mapping| {
+        if (!std.mem.eql(u8, mapping.spelling, "std")) continue;
+        const debug = (try standardContainer(self, self.facts.rootOf(mapping.target), &.{"debug"})) orelse continue;
+        const print = self.facts.member(debug, "print") orelse continue;
+        return switch (try self.facts.origin(print)) {
+            .decl => |origin| .{ .decl = origin },
+            .none => .{ .decl = print },
+            .unknown => |why| .{ .unknown = why },
         };
     }
+    return .none;
+}
+const Same = union(enum) { yes, no, unknown: Facts.Unknown };
+/// Whether `function` is std's print, followed through its aliases; unknown where an alias is
+/// not followed.
+fn samePrint(self: *Context, function: Facts.Decl, print: Facts.Decl) RunError!Same {
+    const origin = switch (try self.facts.origin(function)) {
+        .decl => |origin| origin,
+        .none => function,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    return if (std.meta.eql(origin, print)) .yes else .no;
 }
 fn functionLengths(self: *Context) RunError!void {
     if (!self.config.has(.P003)) return;

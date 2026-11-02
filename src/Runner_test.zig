@@ -500,7 +500,8 @@ test "G2 policy configuration rejects blank reasons empty qualifiers and stale e
 
 test "private import references through reflection strings preserve declaration identity" {
     try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @field(Self, \"dep\"); }", 0);
-    try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @hasDecl(Self, \"dep\"); }", 0);
+    // `@hasDecl` sees no private declaration, even of its own file: the import is unused.
+    try check(.Z013, "const Self = @This(); const dep = @import(\"dep\"); pub fn run() void { _ = @hasDecl(Self, \"dep\"); }", 1);
     try check(.Z013, "const dep = @import(\"dep\"); const Other = struct { pub const dep = 1; }; pub fn run() void { _ = @field(Other, \"dep\"); }", 1);
 }
 
