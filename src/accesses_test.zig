@@ -94,6 +94,17 @@ const rows = [_]Row{
     .{ .name = "R7 memcpy through a view", .source = "fn bytes(p: anytype) *const [4]u8 {\n    return @ptrCast(p);\n}\nfn w(d: *[4]u8) void {\n    const v: u32 = 1;\n    @memcpy(d, bytes(&v));\n}\n", .place = "v", .decl = true, .query = .reads, .expected = &.{ "6 address exact", "6 read exact" } },
     .{ .name = "R7 view twin", .source = "const table: [4]u8 = .{ 0, 0, 0, 0 };\nfn bytes(p: anytype) *const [4]u8 {\n    _ = p;\n    return &table;\n}\nfn w(d: *[4]u8) void {\n    const v: u32 = 1;\n    @memcpy(d, bytes(&v));\n}\n", .place = "v", .decl = true, .query = .reads, .expected = &.{"8 address exact"} },
     .{ .name = "W9 memcpy through a view", .source = "fn bytes(p: anytype) *[4]u8 {\n    return @ptrCast(p);\n}\nfn w(s: *const [4]u8) void {\n    var v: u32 = 1;\n    @memcpy(bytes(&v), s);\n}\n", .place = "v", .decl = true, .expected = &.{ "5 init exact", "6 address exact", "6 set exact" } },
+    // A store through a view's result writes the memory it views, in part, as bytes: no one
+    // value of its fields.
+    .{ .name = "W7 store through a view", .source = shapes ++ "fn bytes(p: anytype) *[24]u8 {\n    return @ptrCast(p);\n}\nfn w(s: *S) void {\n    bytes(s)[0] = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder", "7 set holder part through" } },
+    .{ .name = "W7 view twin", .source = shapes ++ "fn bytes(p: anytype) *[16]u8 {\n    return @ptrCast(p);\n}\nfn w(t: *T) void {\n    bytes(t)[0] = 1;\n}\n", .place = "f", .expected = &.{"1 init exact"} },
+    .{ .name = "W7 store through a constant view", .source = shapes ++ "fn bytes(p: anytype) *[24]u8 {\n    return @ptrCast(p);\n}\nfn w(s: *S) void {\n    const b = bytes(s);\n    b[0] = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder", "8 set holder part through" } },
+    // A function returning a view's call is a view itself.
+    .{ .name = "W9 memcpy through a composed view", .source = shapes ++ "fn bytes(p: anytype) *[24]u8 {\n    return @ptrCast(p);\n}\nfn view(s: *S) *[24]u8 {\n    return bytes(s);\n}\nfn w(s: *S, from: *const [24]u8) void {\n    @memcpy(view(s), from);\n}\n", .place = "f", .expected = &.{ "1 init exact", "10 set holder through", "4 covered holder" } },
+    .{ .name = "W9 composed view's local", .source = "fn bytes(p: anytype) *[4]u8 {\n    return @ptrCast(p);\n}\nfn view(p: *u32) *[4]u8 {\n    return bytes(p);\n}\nfn w(s: *const [4]u8) void {\n    var v: u32 = 1;\n    @memcpy(view(&v), s);\n}\n", .place = "v", .decl = true, .expected = &.{ "8 init exact", "9 address exact", "9 set exact" } },
+    // A typeless literal handed to code the program does not hold holds what its parts do.
+    .{ .name = "W11 literal handed out", .source = shapes ++ "fn w(s: *S, f: anytype) void {\n    f(.{s});\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
+    .{ .name = "W11 literal twin", .source = shapes ++ "fn w(s: *S, f: anytype) void {\n    f(.{s.g});\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "R7 atomic load twin", .source = shapes ++ "fn w(s: *S) u32 {\n    return @atomicLoad(u32, &s.g, .seq_cst);\n}\n", .place = "f", .query = .reads, .expected = &.{} },
 };
 
@@ -151,4 +162,50 @@ test "accesses: each construct's probe is found and its twin is not" {
         std.debug.print("\n", .{});
     }
     try std.testing.expect(!failed);
+}
+
+test "accesses: a function copies memory between its parameters, or reads one's as another type" {
+    const source =
+        \\fn copy(dest: []u8, source: []const u8) void {
+        \\    for (dest[0..source.len], source) |*d, s| d.* = s;
+        \\}
+        \\fn back(dest: []u8, source: []const u8) void {
+        \\    var i = source.len;
+        \\    while (i > 0) {
+        \\        i -= 1;
+        \\        dest[i] = source[i];
+        \\    }
+        \\}
+        \\fn swap(a: *u32, b: *u32) void {
+        \\    const tmp = a.*;
+        \\    a.* = b.*;
+        \\    b.* = tmp;
+        \\}
+        \\fn read(bytes: *const [4]u8) u32 {
+        \\    return @as(*const u32, @ptrCast(bytes)).*;
+        \\}
+        \\fn get(p: *const u32) u32 {
+        \\    return p.*;
+        \\}
+        \\
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const function = struct {
+        fn named(p: *const Project, name: []const u8) Facts.Decl {
+            for (p.sources[0].model.declarations, 0..) |d, i| {
+                if (d.kind == .function and std.mem.eql(u8, d.name, name)) return .{ .file = p.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+            }
+            unreachable; // each name is declared above
+        }
+    };
+    try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "copy"))).?);
+    try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "back"))).?);
+    try std.testing.expectEqual(null, try facts.copierOf(function.named(&project, "swap")));
+    try std.testing.expectEqual(0, (try facts.readOf(function.named(&project, "read"))).?);
+    try std.testing.expectEqual(null, try facts.readOf(function.named(&project, "get")));
 }

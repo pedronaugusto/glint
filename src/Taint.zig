@@ -673,7 +673,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                 if (std.mem.eql(u8, tree.tokenSlice(tree.lastToken(target)), "len") and try c.facts.memoryField(f.file, target) != .field) {
                     held = if (tree.nodeTag(node) == .assign_sub) try ruled.sizing(c.allocator) else try (try given.written(c.allocator)).join(c.allocator, try ruled.sizing(c.allocator));
                 }
-                try store(c, flow, function, target, held);
+                try storeAt(c, flow, function, node, target, value, held);
             },
             .assign_mul, .assign_shl, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => {
                 const target, const value = tree.nodeData(node).node_and_node;
@@ -735,7 +735,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                                 break :combine try (try operand.join(c.allocator, try whole(c, flow, function, destination))).widened(c.allocator);
                             },
                         };
-                        try store(c, flow, function, destination, try value.join(c.allocator, try control(c, flow, function, node, destination)));
+                        try storeAt(c, flow, function, node, destination, null, try value.join(c.allocator, try control(c, flow, function, node, destination)));
                     }
                 }
             },
@@ -1061,6 +1061,27 @@ fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index
     var found: std.ArrayList(Place) = .empty;
     try places(c, flow, function, target, &found);
     for (found.items) |place| try raise(c, flow, function, place, value);
+}
+
+/// The store at `node` of `value` into `target`, which `given` gives where one expression
+/// does: the places `store` names, and where none is a field or a container-level variable,
+/// the fields of the memory it writes through a pointer as a whole value or as bytes
+/// (`Facts.accesses.fieldsThrough`: `h.* = v`, `@memcpy(std.mem.asBytes(h), bytes)`): the
+/// place's other names reach that memory by those fields alone. A struct literal's fields
+/// are given each its own.
+fn storeAt(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, target: Ast.Node.Index, given: ?Ast.Node.Index, value: Dep) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
+    var found: std.ArrayList(Place) = .empty;
+    try places(c, flow, function, target, &found);
+    for (found.items) |place| try raise(c, flow, function, place, value);
+    for (found.items) |place| if (place == .global) return;
+    if (given) |one| {
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (c.project.at(f.file).file.tree.fullStructInit(&buffer, one) != null) return;
+    }
+    for (try Facts.accesses.fieldsThrough(c.facts, f.file, node)) |field| {
+        if (flow.own(field.file)) try raise(c, flow, function, .{ .global = field }, value);
+    }
 }
 
 /// `value` into one place, read in `function`.
@@ -2493,7 +2514,7 @@ const Walk = struct {
             const function = owner(w.flow, site.file, site.node) orelse continue;
             switch (site.kind) {
                 .init, .set, .update => {
-                    const value = site.value orelse continue;
+                    const value = site.value orelse writtenFrom(&w.c.project.at(site.file).file.tree, site.node) orelse continue;
                     if (!try w.carries(function, value)) continue;
                     if (try w.from(function, value, depth + 1)) |found| return found;
                 },
@@ -2502,6 +2523,22 @@ const Walk = struct {
             }
         }
         return null;
+    }
+
+    /// What a store with no one value of its place reads what it writes from: a copy's or a
+    /// fill's source (`@memcpy(std.mem.asBytes(h), bytes)`), an assignment's value written
+    /// through a view (`std.mem.asBytes(h)[0] = b`), a destructure's value.
+    fn writtenFrom(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+        if (filler(tree, node)) |writes| {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = Facts.builtinArgs(tree, node, &buffer);
+            return if (writes.value < args.len) args[writes.value] else null;
+        }
+        return switch (tree.nodeTag(node)) {
+            .assign => tree.nodeData(node).node_and_node[1],
+            .assign_destructure => tree.assignDestructure(node).ast.value_expr,
+            else => null,
+        };
     }
 
     /// The call of a source `node` is an argument of, or an element of a vector argument of.
