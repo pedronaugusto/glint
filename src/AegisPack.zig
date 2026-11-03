@@ -350,7 +350,7 @@ fn checkWholeAddress(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
         .owner => |k| if (k != .public_source) return,
         .other, .unknown => return,
     }
-    if (!writable(c, tree, operand)) return;
+    if (!try writable(c, tree, operand)) return;
     const model = &c.project.at(c.file).model;
     const parent = model.parentOf(node) orelse return;
     const rewritten = "a public source's bytes handed where they are written keep a classification that no longer describes them; make a new one with err.PublicSource.classify(reason, bytes)";
@@ -385,26 +385,38 @@ fn checkWholeAddress(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
 
 /// Whether a place can be written: a `var`, a part of one, or what a pointer points at; a
 /// `const` and a parameter held by value cannot.
-fn writable(c: *Context, tree: *const Ast, place: Ast.Node.Index) bool {
-    const root = placeRoot(tree, place) orelse return true;
-    if (root != place) {
-        // Through a pointer: what it points at, whatever holds the pointer.
-        var at = place;
-        while (at != root) : (at = switch (tree.nodeTag(at)) {
-            .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(at).node_and_token[0],
-            .deref => return true,
-            .array_access, .slice_open => tree.nodeData(at).node_and_node[0],
-            else => return true,
-        }) {}
-    }
+fn writable(c: *Context, tree: *const Ast, place: Ast.Node.Index) Context.Error!bool {
+    const path = try Facts.accesses.pathOf(c.facts, c.file, place);
+    // Through a pointer: what it points at. The pointer crossed nearest the place decides:
+    // nothing is written through a name declared a pointer to `const`; any other pointer's
+    // memory, whatever holds the pointer, can be.
+    for (path.steps[0 .. path.steps.len - 1], path.steps[1..]) |step, below| if (step.crosses) return !constPointerName(c, tree, below.node);
     const model = &c.project.at(c.file).model;
-    const index = (model.reference(root) orelse return true).declaration orelse return true;
+    const root = path.steps[path.steps.len - 1].node;
+    if (!isName(model, root)) return true;
+    const index = model.reference(root).?.declaration orelse return true; // unreachable: a name has the model's reference
     const decl = model.declarations[@backingInt(index)];
     return switch (decl.kind) {
         .variable => tree.tokenTag((tree.fullVarDecl(decl.node) orelse return true).ast.mut_token) == .keyword_var,
         .parameter => false,
         else => true,
     };
+}
+
+/// Whether `node` names a parameter or a variable declared with a pointer-to-`const` type
+/// (`p: *const T`, `const b: []const u8 = ...`), through which nothing is written.
+fn constPointerName(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
+    const model = &c.project.at(c.file).model;
+    if (!isName(model, node)) return false;
+    const index = model.reference(node).?.declaration orelse return false; // unreachable: a name has the model's reference
+    const decl = model.declarations[@backingInt(index)];
+    const written = switch (decl.kind) {
+        .parameter => c.facts.parameterTypeNode(.{ .file = c.file, .index = index }),
+        .variable => (tree.fullVarDecl(decl.node) orelse return false).ast.type_node.unwrap(),
+        else => null,
+    } orelse return false;
+    const pointer = tree.fullPtrType(written) orelse return false;
+    return pointer.const_token != null;
 }
 
 /// Whether `function`'s parameter at `position` is a pointer to `const` (`*const T`,
@@ -1251,10 +1263,16 @@ fn copiedValue(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     }
 }
 
+/// Whether `node` is a name (the model's reference), never a decl literal's (`.init`).
+fn isName(model: *const Model, node: Ast.Node.Index) bool {
+    const ref = model.reference(node) orelse return false;
+    return ref.unknown != .literal_context;
+}
+
 /// A copy of the value read from a place: a name, a field, `@field`, what a pointer points at,
 /// an element or an optional's payload.
 fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.Node.Index, node: Ast.Node.Index) Context.Error!void {
-    const root = placeRoot(tree, node) orelse try sharedReturn(c, tree, node) orelse return;
+    const root = (try placeRoot(c, node)) orelse try sharedReturn(c, tree, node) orelse return;
     const model = &c.project.at(c.file).model;
     // `undefined`, `true`, `false` and `null` are values, not references to an owner.
     if (root == node and model.reference(node) == null) return;
@@ -1265,10 +1283,10 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
         if (decl.kind == .variable and tree.tokenTag(tree.fullVarDecl(decl.node).?.ast.mut_token) == .keyword_const and containerLevel(c, tree, decl.node)) return; // unreachable: a variable's node is its declaration
     };
     // A `return` of the function's own local moves it, whatever it holds.
-    const returned = tree.nodeTag(copy) == .@"return";
+    const returned = Facts.accesses.formOf(tree.nodeTag(copy)) == .@"return";
     // Why the copy may be a move, where it is not known to be one.
     var unmoved: ?Facts.Unknown = null;
-    if (returned and tree.nodeTag(node) == .identifier) switch (try moved(c, copy, node, true)) {
+    if (returned and isName(model, node)) switch (try moved(c, copy, node, true)) {
         .yes => return,
         .no => {},
         .unknown => |why| unmoved = why,
@@ -1306,7 +1324,7 @@ fn copiedPlace(c: *Context, tree: *const Ast, copy: Ast.Node.Index, init: Ast.No
     // duplicated: `var guard = free;` out of an `if` capture. A `return` ends the function's
     // locals, of any kind: what it gives is moved unless a deferred read or a copy made before
     // it holds the owner too.
-    if (!returned and movable(k) and tree.nodeTag(node) == .identifier) switch (try moved(c, copy, node, false)) {
+    if (!returned and movable(k) and isName(model, node)) switch (try moved(c, copy, node, false)) {
         .yes => return,
         .no => {},
         .unknown => |why| unmoved = why,
@@ -1370,21 +1388,10 @@ fn containerLevel(c: *Context, tree: *const Ast, node: Ast.Node.Index) bool {
 /// The name a place is read through (`s` of `s`, `h.s`, `@field(h, "s")`, `p.*`, `a[0]`,
 /// `a[0..1].*`, `o.?`), or null for a value made in place (a call, a literal, an operator),
 /// which no other holder shares.
-fn placeRoot(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
-    var current = node;
-    while (true) current = switch (tree.nodeTag(current)) {
-        .identifier => return current,
-        .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(current).node_and_token[0],
-        .deref => tree.nodeData(current).node,
-        .array_access, .slice_open => tree.nodeData(current).node_and_node[0],
-        .slice => tree.nodeData(current).node_and_extra[0],
-        .slice_sentinel => tree.nodeData(current).node_and_extra[0],
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(current)), "@field")) return null;
-            break :blk tree.nodeData(current).opt_node_and_opt_node[0].unwrap() orelse return null;
-        },
-        else => return null,
-    };
+fn placeRoot(c: *Context, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const path = try Facts.accesses.pathOf(c.facts, c.file, node);
+    const root = path.steps[path.steps.len - 1].node;
+    return if (isName(&c.project.at(c.file).model, root)) root else null;
 }
 
 /// What a place read off a call's result is read through, where the call gives a pointer
@@ -1392,31 +1399,20 @@ fn placeRoot(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 /// the place's root. Null where every step reads the value the call makes, which no other
 /// holder shares; a step whose operand does not resolve may be through a pointer.
 fn sharedReturn(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const path = try Facts.accesses.pathOf(c.facts, c.file, node);
     var shared = false;
-    var current = node;
-    while (true) {
-        const operand = switch (tree.nodeTag(current)) {
-            .deref => {
-                shared = true;
-                current = tree.nodeData(current).node;
-                continue;
-            },
-            .unwrap_optional, .grouped_expression, .field_access => tree.nodeData(current).node_and_token[0],
-            .array_access, .slice_open => tree.nodeData(current).node_and_node[0],
-            .slice, .slice_sentinel => tree.nodeData(current).node_and_extra[0],
-            // A type's member (`@TypeOf(x).Role`): no value is read.
-            else => return if (shared and !typeBuiltin(tree, current)) current else null,
-        };
+    for (path.steps[0 .. path.steps.len - 1], path.steps[1..]) |place, below| switch (place.kind) {
+        .deref => shared = true,
         // A field or an element read through a pointer dereferences it.
-        switch (tree.nodeTag(current)) {
-            .field_access, .array_access, .slice_open, .slice, .slice_sentinel => switch (try c.facts.resolve(c.file, operand)) {
-                .pointer, .unknown => shared = true,
-                else => {},
-            },
+        .field, .index, .slice => switch (try c.facts.resolve(c.file, below.node)) {
+            .pointer, .unknown => shared = true,
             else => {},
-        }
-        current = operand;
-    }
+        },
+        .unwrap, .root => {},
+    };
+    // A type's member (`@TypeOf(x).Role`): no value is read.
+    const root = path.steps[path.steps.len - 1].node;
+    return if (shared and !typeBuiltin(tree, root)) root else null;
 }
 
 /// Whether `node` is a builtin call that gives a type.
@@ -1453,7 +1449,7 @@ fn heldAs(value: Facts.Value) Held {
 /// variable reaches, or through a pointer a local holds. A local's own value, whole or in a
 /// part, is followed where it is returned.
 fn checkStoredBorrow(c: *Context, tree: *const Ast, store: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Context.Error!void {
-    const root = placeRoot(tree, target) orelse return;
+    const root = (try placeRoot(c, target)) orelse return;
     const model = &c.project.at(c.file).model;
     const ref = model.reference(root) orelse return;
     // A root whose declaration does not resolve may be a parameter's or a container's memory.
@@ -1734,7 +1730,7 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
         const parts = try c.facts.copiedParts(c.file, operand);
         if (parts.deep != null) unknown = .unsupported;
         for (parts.places) |value| {
-            if (placeRoot(tree, value) == null) {
+            if ((try placeRoot(c, value)) == null) {
                 // What a pointer a call gives points at (`s.slot().*`) stays where it is: the
                 // capture copies it.
                 if (try sharedReturn(c, tree, value) != null) return .no;
@@ -4279,20 +4275,20 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
                 if (tag == .assign_destructure) {
                     const destructure = tree.assignDestructure(at);
                     for (destructure.ast.variables) |target| {
-                        const root = placeRoot(tree, target) orelse continue;
+                        const root = (try placeRoot(c, target)) orelse continue;
                         if (Contract.local(c, root) == index and try rawValue(c, destructure.ast.value_expr, followed)) return true;
                     }
                     continue;
                 }
                 if (try Facts.accesses.copyAt(c.facts, c.file, at)) |copy| {
-                    const root = placeRoot(tree, copy.into.node()) orelse continue;
+                    const root = (try placeRoot(c, copy.into.node())) orelse continue;
                     if (Contract.local(c, root) != index) continue;
                     if (try rawValue(c, copy.from.node(), followed) or try requiredOwner(c, copy.from.node(), scalar, tree.nodeMainToken(at)) == .scalar) return true;
                     continue;
                 }
                 if (!assigning(tag)) continue;
                 const sides = tree.nodeData(at).node_and_node;
-                const root = placeRoot(tree, sides[0]) orelse continue;
+                const root = (try placeRoot(c, sides[0])) orelse continue;
                 if (Contract.local(c, root) != index) continue;
                 if (try rawValue(c, sides[1], followed)) return true;
             }
