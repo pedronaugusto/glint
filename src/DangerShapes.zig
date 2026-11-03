@@ -3649,9 +3649,16 @@ fn fixedFunctions(c: *Context, writes: []const StateWrite) Context.Error![]const
 
 /// The state `node` gives whoever calls the function it is in, by its name: an enum literal
 /// (`.done`), a member of an enum type (`Phase.done`), the integer of one
-/// (`@backingInt(Phase.done)`), a number or a character; null for another value.
+/// (`@backingInt(Phase.done)`), a number or a character, a tagged union's literal by the one
+/// field it names (`.{ .lent = dir }`: its tag is the state, its payload what the state
+/// holds); null for another value.
 fn fixedState(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?[]const u8 {
     const tree = &c.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |literal| {
+        if (literal.ast.fields.len != 1) return null;
+        return tree.tokenSlice(tree.firstToken(literal.ast.fields[0]) - 2);
+    }
     switch (tree.nodeTag(node)) {
         .enum_literal, .number_literal, .char_literal => return tree.tokenSlice(tree.nodeMainToken(node)),
         .grouped_expression => return fixedState(c, file, tree.nodeData(node).node_and_token[0]),
