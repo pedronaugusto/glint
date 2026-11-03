@@ -1,2 +1,7 @@
 .{
+    .open = .{
+        // glint-b precision: std's assert or an alias of it taken as a value (a field's function pointer, a table's element) is called where it goes, which A013 does not follow (undecided, never clear), as `&std.debug.assert` there is
+        "address/ps2-a13-alias_in_table/twin.zig",
+        "field/ps2-a13-alias_in_field/twin.zig",
+    },
 }

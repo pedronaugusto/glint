@@ -912,35 +912,77 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     // A call through an alias the program declares is read by what its callee reaches.
     try aliasCalls(c, found[0].decls, &calls);
     for (sites.items) |site| {
-        if (site.through_alias or c.inTest(site.token)) continue;
+        if (c.inTest(site.token)) continue;
         const parent = model.parentOf(site.node) orelse continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == site.node) {
-            try calls.append(c.allocator, parent);
+        // A call of it (`std.debug.assert(c)`, `@call(.auto, check, .{c})`), by `Facts.calls`;
+        // one through an alias `aliasCalls` reads by what its callee reaches.
+        if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == site.node) {
+            if (!site.through_alias) try calls.append(c.allocator, parent);
             continue;
         };
         // An alias's declaration is no call, nor is a constant pointer to it (`const check:
         // *const fn (bool) void = &std.debug.assert;`): `aliasCalls` reads the calls through
-        // either. The assert taken as a value anywhere else (a field's default, a variable)
-        // is called where it goes, which this reading does not follow, at run time or not.
+        // either. The assert or an alias of it taken as a value anywhere else (a field's
+        // default, a table's element, a variable) is called where it goes, which this reading
+        // does not follow, at run time or not.
         const held = if (tree.nodeTag(parent) == .address_of) model.parentOf(parent) orelse parent else parent;
         const value = if (held == parent) site.node else parent;
-        if (tree.fullVarDecl(held)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) continue;
+        if (tree.fullVarDecl(held)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+            try aliasValues(c, rule, held, 0);
+            continue;
+        };
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
         if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node).?;
-        if (call.ast.params.len != 1) continue;
+        const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: each is a call `Facts.calls` read
+        const args = switch (call.args) {
+            .known => |each| each,
+            .unknown => {
+                try c.undecided(rule, tree.tokenStart(tree.firstToken(node)), .unresolved, "a call of std.debug.assert whose condition is not known");
+                continue;
+            },
+        };
+        if (args.len != 1) continue;
         const token = tree.firstToken(node);
-        switch (try Taint.conditionAt(c, flow, c.file, call.ast.params[0])) {
+        switch (try Taint.conditionAt(c, flow, c.file, args[0])) {
             .clean => {},
             .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a condition that passed through a call that does not resolve may hold input"),
             .data, .number => {
                 var edits: std.ArrayList(Report.Edit) = .empty;
                 if (try invariant(c, node, &edits)) try c.fixedAt(rule, token, message, edits.items) else try c.at(rule, token, message);
             },
+        }
+    }
+}
+
+/// The alias of std's assert this file declares at `declaration` (`const check =
+/// std.debug.assert;`) taken as a value in this file (`.{ .each = &check }`, a table's
+/// element), by `accesses`: called where it goes, which A013 does not follow, so undecided. A
+/// call of it is `aliasCalls`'s, an alias of it is read as this one is; another file's use of
+/// the alias is a site `Governed.sites` gives there.
+fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, depth: usize) Context.Error!void {
+    if (depth == 8) return c.undecided(rule, c.project.at(c.file).file.tree.tokenStart(c.project.at(c.file).file.tree.firstToken(declaration)), .unsupported, "an alias of std.debug.assert past the depth A013 follows");
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    const index = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .variable and d.node == declaration) break i;
+    } else return;
+    const place: Facts.accesses.Place = .{ .declaration = .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) } };
+    for ([_]Facts.accesses.Each{ Facts.accesses.reads(c.facts, place, &.{c.file}), Facts.accesses.writes(c.facts, place, &.{c.file}) }) |start| {
+        var found = start;
+        while (try found.next()) |site| {
+            if (site.kind != .read and site.kind != .address) continue;
+            const target = site.target orelse site.node;
+            if (c.inTest(tree.firstToken(target))) continue;
+            const parent = model.parentOf(site.node) orelse continue;
+            if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == target) continue;
+            const value = if (site.kind == .address) site.node else target;
+            if (tree.fullVarDecl(parent)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+                try aliasValues(c, rule, parent, depth + 1);
+                continue;
+            };
+            try c.undecided(rule, tree.tokenStart(tree.firstToken(target)), .unresolved, "an alias of std.debug.assert taken as a value: its calls are not read");
         }
     }
 }
@@ -952,11 +994,10 @@ fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayLi
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
+        const call = (try Facts.calls.at(c.facts, c.file, node)) orelse continue;
         // A callee that does not resolve, or an alias whose value does not, is read by
         // `Governed.sites`: by its spelling, undecided where it may reach the assert.
-        const callee = switch (try c.facts.definition(c.file, call.ast.fn_expr)) {
+        const callee = switch (try c.facts.definition(c.file, call.callee_expr)) {
             .decl => |decl| decl,
             .none, .unknown => continue,
         };
@@ -968,15 +1009,22 @@ fn aliasCalls(c: *Context, assert_decls: []const Facts.Decl, calls: *std.ArrayLi
         };
         // A constant pointer to it (`const check: *const fn (bool) void = &std.debug.assert;`,
         // a dependency's among them): each function the call may reach through it.
-        const origins: []const Facts.Decl = if (reached) |found| &.{found} else switch ((try Facts.calls.at(c.facts, c.file, node) orelse continue).callee) {
+        const origins: []const Facts.Decl = if (reached) |found| &.{found} else switch (call.callee) {
             .function => |function| &.{function},
             .choice => |each| each,
             .any => continue,
         };
-        for (origins) |one| if (isAssert(assert_decls, one)) {
+        // A function pointer's stored function may be an alias (`.{ .each = &check }`): what
+        // the alias reaches.
+        for (origins) |one| {
+            const ends = switch (try c.facts.origin(one)) {
+                .decl => |found| found,
+                .none, .unknown => one,
+            };
+            if (!isAssert(assert_decls, one) and !isAssert(assert_decls, ends)) continue;
             try calls.append(c.allocator, node);
             break;
-        };
+        }
     }
 }
 
@@ -1289,8 +1337,10 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
     switch (value) {
         .instance => |inner| {
             if (try syncType(c, found, .{ .container = inner })) |index| return .{ .yes = index };
-            // aegis's types hold std's synchronization as their internals.
-            if (try c.inLibrary(Contract.library, inner.file)) return .no;
+            // aegis's types hold std's synchronization as their internals; one aegis makes of
+            // the program's type (`bounded.Array(dep.Shared, 4)`, `Guarded(dep.Shared)`) holds
+            // what its binding gives in the fields typed by it (`unjudgedFields`).
+            if (inner.made_by == null and try c.inLibrary(Contract.library, inner.file)) return .no;
             var out: Sync = .no;
             for (try unjudgedFields(c, inner)) |field| switch (try heldSync(c, found, field)) {
                 .yes => |index| return .{ .yes = index },
