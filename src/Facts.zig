@@ -1555,15 +1555,14 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
     return false;
 }
 
-/// What a copy `function` makes holds at the binding `call` in `file`: the binding's argument
+/// What a copy `function` makes holds at a binding in `file` of arguments `bound`, in its
+/// parameter order with a bound receiver first (`calls.Args.known`): the binding's argument
 /// read through the copy's `path` to its `source`, each call's arguments read with the bindings
-/// of the one before. `receiver` is whether the call passes a value as the first parameter.
-pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiver: bool, function: Decl, copy: ParameterCopy) ResolveError!Value {
+/// of the one before.
+pub fn boundCopy(self: *Facts, file: Project.FileId, bound: []const Ast.Node.Index, function: Decl, copy: ParameterCopy) ResolveError!Value {
     const source = copy.source.?;
-    const tree = self.syntaxOf(file);
     var args: std.ArrayList(Value) = .empty;
-    if (receiver) try args.append(self.gpa, try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]));
-    for (call.ast.params) |arg| try args.append(self.gpa, try self.resolve(file, arg));
+    for (bound) |arg| try args.append(self.gpa, try self.resolve(file, arg));
     var env = try self.keptReading(.{ .function = function, .args = args.items, .depth = 0 });
     for (copy.path) |step| {
         const step_tree = self.syntaxOf(step.file);
