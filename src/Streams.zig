@@ -711,7 +711,7 @@ fn causeOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.I
             const id = (model.reference(node) orelse return false).declaration orelse return false;
             const record = model.declarations[@backingInt(id)];
             switch (record.kind) {
-                .capture => return causeOf(c, ks, file, c.facts.captureSource(file, record.node) orelse return false, stream),
+                .capture => return causeOf(c, ks, file, c.facts.captureSource(file, record) orelse return false, stream),
                 .variable => {
                     const variable = tree.fullVarDecl(record.node) orelse return false;
                     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;

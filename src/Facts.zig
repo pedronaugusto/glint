@@ -1666,7 +1666,7 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         if (!self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
         const source: Ast.Node.Index = switch (record.kind) {
             .variable => (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue,
-            .capture => self.captureSource(function.file, record.node) orelse continue,
+            .capture => self.captureSource(function.file, record) orelse continue,
             else => continue,
         };
         if (source == node) continue;
@@ -1755,14 +1755,19 @@ fn lexical(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id, name
     return null;
 }
 
-/// What a capture is read from: a switch's subject, a loop's inputs, an `if`'s condition.
-pub fn captureSource(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
+/// What the capture `capture` declares is read from: a switch's subject, the loop's input at
+/// its position, an `if`'s condition.
+pub fn captureSource(self: *const Facts, file: Project.FileId, capture: Model.Declaration) ?Ast.Node.Index {
     const t = self.syntaxOf(file);
+    const node = capture.node;
     if (t.fullSwitchCase(node) != null) {
         const parent = self.project.at(file).model.parentOf(node) orelse return null;
         return (t.fullSwitch(parent) orelse return null).ast.condition;
     }
-    if (t.fullFor(node)) |loop| return if (loop.ast.inputs.len != 0) loop.ast.inputs[0] else null;
+    if (t.fullFor(node)) |loop| {
+        const position = Model.capturePosition(t, loop, capture.token) orelse return null;
+        return if (position < loop.ast.inputs.len) loop.ast.inputs[position] else null;
+    }
     if (t.fullIf(node)) |branch| return branch.ast.cond_expr;
     if (t.fullWhile(node)) |loop| return loop.ast.cond_expr;
     return null;

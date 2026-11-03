@@ -1545,7 +1545,7 @@ const Exposure = struct {
                 const decl = model.declarations[@backingInt(index)];
                 if ((try e.seen.getOrPut(c.allocator, index)).found_existing) return false;
                 // A capture: of what the `if`, loop or `switch` reads.
-                if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl.node)) |source| e.carries(source, depth + 1) else false;
+                if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl)) |source| e.carries(source, depth + 1) else false;
                 if (decl.kind != .variable) return false;
                 const v = tree.fullVarDecl(decl.node) orelse return false;
                 if (v.ast.init_node.unwrap()) |init| if (try e.carries(init, depth + 1)) return true;
@@ -1986,6 +1986,19 @@ fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u
         found = true;
     }
     return found;
+}
+
+/// The local a write to `place` lands in: its root's, or, through a pointer capture over a
+/// local's bytes (`for (std.mem.asBytes(&v)) |*d| d.* = s`), that local's.
+fn writtenLocal(c: *Context, place: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    const root = (try placeRoot(c, place)) orelse return null;
+    const local = Contract.local(c, root) orelse return null;
+    const decl = c.project.at(c.file).model.declarations[@backingInt(local)];
+    if (decl.kind != .capture) return local;
+    const source = c.facts.captureSource(c.file, decl) orelse return local;
+    const bytes = (try addressed(c, source)) orelse return local;
+    const inner = (try placeRoot(c, bytes)) orelse return local;
+    return Contract.local(c, inner) orelse local;
 }
 
 /// The place `std.mem.asBytes(&x)` names: `x`.
@@ -4258,7 +4271,7 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
             const decl = model.declarations[@backingInt(index)];
             const followed = try std.mem.concat(c.allocator, Model.Declaration.Id, &.{ seen, &.{index} });
             // A capture: of what the `if`, loop or `switch` reads.
-            if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl.node)) |source| rawValue(c, source, followed) else false;
+            if (decl.kind == .capture) return if (c.facts.captureSource(c.file, decl)) |source| rawValue(c, source, followed) else false;
             if (decl.kind != .variable) return false;
             const v = tree.fullVarDecl(decl.node) orelse return false;
             if (v.ast.init_node.unwrap()) |init| {
@@ -4275,21 +4288,18 @@ fn rawValue(c: *Context, node: Ast.Node.Index, seen: []const Model.Declaration.I
                 if (tag == .assign_destructure) {
                     const destructure = tree.assignDestructure(at);
                     for (destructure.ast.variables) |target| {
-                        const root = (try placeRoot(c, target)) orelse continue;
-                        if (Contract.local(c, root) == index and try rawValue(c, destructure.ast.value_expr, followed)) return true;
+                        if (try writtenLocal(c, target) == index and try rawValue(c, destructure.ast.value_expr, followed)) return true;
                     }
                     continue;
                 }
                 if (try Facts.accesses.copyAt(c.facts, c.file, at)) |copy| {
-                    const root = (try placeRoot(c, copy.into.node())) orelse continue;
-                    if (Contract.local(c, root) != index) continue;
+                    if (try writtenLocal(c, copy.into.node()) != index) continue;
                     if (try rawValue(c, copy.from.node(), followed) or try requiredOwner(c, copy.from.node(), scalar, tree.nodeMainToken(at)) == .scalar) return true;
                     continue;
                 }
                 if (!assigning(tag)) continue;
                 const sides = tree.nodeData(at).node_and_node;
-                const root = (try placeRoot(c, sides[0])) orelse continue;
-                if (Contract.local(c, root) != index) continue;
+                if (try writtenLocal(c, sides[0]) != index) continue;
                 if (try rawValue(c, sides[1], followed)) return true;
             }
             return false;

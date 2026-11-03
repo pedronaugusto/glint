@@ -1652,7 +1652,7 @@ fn capturedField(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     if (record.kind != .capture) return false;
     const payload = if (tree.fullIf(record.node)) |branch| branch.payload_token else if (tree.fullWhile(record.node)) |loop| loop.payload_token else return false;
     if (payload != record.token) return false;
-    const source = Facts.ungrouped(tree, c.facts.captureSource(c.file, record.node) orelse return false);
+    const source = Facts.ungrouped(tree, c.facts.captureSource(c.file, record) orelse return false);
     if (tree.nodeTag(source) != .field_access) return false;
     return switch (try c.facts.definition(c.file, source)) {
         .decl => |member| c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field,
