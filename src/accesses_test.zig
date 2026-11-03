@@ -325,14 +325,20 @@ test "accesses: what an expression's value does where it stands" {
             continue;
         };
         const use = try accesses.useOf(&facts, file, node);
-        const got = switch (use) {
-            .carried => |carried| try std.fmt.allocPrint(a, "carried {s}", .{@tagName(carried.how)}),
-            .typed => |typed| try std.fmt.allocPrint(a, "typed {s}", .{@tagName(typed.part)}),
-            .logic => |logic| try std.fmt.allocPrint(a, "logic {s}", .{@tagName(logic.side)}),
-            else => @tagName(use),
+        // A use with a part is written with it: `carried grouped`.
+        const kind = @tagName(use);
+        const detail: []const u8 = switch (use) {
+            .carried => |carried| @tagName(carried.how),
+            .typed => |typed| @tagName(typed.part),
+            .logic => |logic| @tagName(logic.side),
+            else => "",
         };
-        if (std.mem.eql(u8, got, want)) continue;
-        std.debug.print("{s}: '{s}' expected {s}, found {s}\n", .{ source, needle, want, got });
+        const matches = if (detail.len == 0)
+            std.mem.eql(u8, want, kind)
+        else
+            want.len == kind.len + 1 + detail.len and std.mem.startsWith(u8, want, kind) and want[kind.len] == ' ' and std.mem.endsWith(u8, want, detail);
+        if (matches) continue;
+        std.debug.print("{s}: '{s}' expected {s}, found {s} {s}\n", .{ source, needle, want, kind, detail });
         failed = true;
     }
     try std.testing.expect(!failed);
@@ -351,7 +357,7 @@ fn spelledNode(tree: *const std.zig.Ast, needle: []const u8, skip: usize) ?std.z
 }
 
 test "accesses: a place's path, whether two name one place, a discarded value, a carried one" {
-    const S = "const U = union { a: u32, b: u32 }; const S = struct { a: u32, b: [4]u32, u: U, p: *S };\n";
+    const place_types = "const U = union { a: u32, b: u32 }; const S = struct { a: u32, b: [4]u32, u: U, p: *S };\n";
     // A source, two expressions (the second's occurrence), and samePlace's answer.
     const pairs = [_]struct { []const u8, []const u8, []const u8, usize, []const u8 }{
         .{ "fn f() void { var s: S = undefined; s.a = 1; s.a = 2; }", "s.a", "s.a", 1, "yes" },
@@ -369,7 +375,7 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     var failed = false;
     for (pairs) |row| {
         const body, const first, const second, const skip, const want = row;
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ S, body });
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ place_types, body });
         defer std.testing.allocator.free(source);
         var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
         defer project.deinit();
@@ -387,7 +393,7 @@ test "accesses: a place's path, whether two name one place, a discarded value, a
     }
     try std.testing.expect(!failed);
 
-    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = S ++ "fn f(s: *S, o: ?u32, d: u32) u32 { _ = d; s.b[1..][0] = 2; return (o.?); }" }}, &.{}, .{});
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = place_types ++ "fn f(s: *S, o: ?u32, d: u32) u32 { _ = d; s.b[1..][0] = 2; return (o.?); }" }}, &.{}, .{});
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

@@ -7272,50 +7272,7 @@ pub const accesses = struct {
         const parent = model.parentOf(node) orelse return .statement;
         switch (formOf(tree.nodeTag(parent))) {
             .body, .deferred => return .statement,
-            .optional_type => return typed(parent, .optional_child),
-            .anyframe_type => return typed(parent, .frame_result),
-            .merged_errors => return typed(parent, .error_set),
-            .error_union => return typed(parent, if (tree.nodeData(parent).node_and_node[0] == node) .error_set else .error_payload),
-            .array_type => {
-                const array = tree.fullArrayType(parent).?; // unreachable: the form is an array type's
-                if (array.ast.elem_type == node) return typed(parent, .array_element);
-                return typed(parent, if (array.ast.sentinel.unwrap() == node) .sentinel else .length);
-            },
-            .pointer_type => {
-                const pointer = tree.fullPtrType(parent).?; // unreachable: the form is a pointer type's
-                if (pointer.ast.child_type == node) return typed(parent, .pointer_child);
-                if (pointer.ast.sentinel.unwrap() == node) return typed(parent, .sentinel);
-                if (pointer.ast.align_node.unwrap() == node) return typed(parent, .alignment);
-                if (pointer.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
-                return typed(parent, .bit_range);
-            },
-            .prototype => {
-                var buffer: [1]Ast.Node.Index = undefined;
-                const proto = tree.fullFnProto(&buffer, parent).?; // unreachable: the form is a prototype's
-                if (proto.ast.return_type.unwrap() == node) return typed(parent, .result);
-                if (proto.ast.align_expr.unwrap() == node) return typed(parent, .alignment);
-                if (proto.ast.addrspace_expr.unwrap() == node) return typed(parent, .address_space);
-                if (proto.ast.section_expr.unwrap() == node) return typed(parent, .section);
-                if (proto.ast.callconv_expr.unwrap() == node) return typed(parent, .calling_convention);
-                var it = proto.iterate(tree);
-                while (it.next()) |param| if (param.type_expr == node) return typed(parent, .parameter);
-                return .{ .unknown = .unsupported };
-            },
-            .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else typed(parent, .signature),
-            .variable => {
-                const variable = tree.fullVarDecl(parent).?; // unreachable: the form is a variable's
-                if (variable.ast.init_node.unwrap() == node) return .{ .initializes = parent };
-                if (variable.ast.type_node.unwrap() == node) return typed(parent, .declared);
-                if (variable.ast.align_node.unwrap() == node) return typed(parent, .alignment);
-                if (variable.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
-                return typed(parent, .section);
-            },
-            .field_declaration => {
-                const field = model.containerField(tree, parent).?; // unreachable: the form is a field's
-                if (field.ast.value_expr.unwrap() == node) return .{ .initializes = parent };
-                if (field.ast.type_expr.unwrap() == node) return typed(parent, .declared);
-                return typed(parent, .alignment);
-            },
+            .optional_type, .anyframe_type, .merged_errors, .error_union, .array_type, .pointer_type, .prototype, .fn_decl, .variable, .field_declaration => return declarationUse(tree, model, parent, node),
             .assign => {
                 const target = tree.nodeData(parent).node_and_node[0];
                 const site = (try storeInto(facts, file, target)) orelse return if (discard(tree, target)) .discarded else .{ .unknown = .unsupported };
@@ -7399,6 +7356,58 @@ pub const accesses = struct {
             .@"nosuspend" => return .{ .carried = .{ .into = parent, .how = .@"nosuspend" } },
             .@"asm" => return .{ .in_asm = parent },
             .frame, .leaf => return .{ .unknown = .unsupported },
+        }
+    }
+
+    /// What a part of a type expression or a declaration does (`useOf`): which part of which
+    /// type or declaration it is, a variable's or field's first value, or a function's body.
+    fn declarationUse(tree: *const Ast, model: *const Model, parent: Ast.Node.Index, node: Ast.Node.Index) Use {
+        switch (formOf(tree.nodeTag(parent))) {
+            .optional_type => return typed(parent, .optional_child),
+            .anyframe_type => return typed(parent, .frame_result),
+            .merged_errors => return typed(parent, .error_set),
+            .error_union => return typed(parent, if (tree.nodeData(parent).node_and_node[0] == node) .error_set else .error_payload),
+            .array_type => {
+                const array = tree.fullArrayType(parent).?; // unreachable: the form is an array type's
+                if (array.ast.elem_type == node) return typed(parent, .array_element);
+                return typed(parent, if (array.ast.sentinel.unwrap() == node) .sentinel else .length);
+            },
+            .pointer_type => {
+                const pointer = tree.fullPtrType(parent).?; // unreachable: the form is a pointer type's
+                if (pointer.ast.child_type == node) return typed(parent, .pointer_child);
+                if (pointer.ast.sentinel.unwrap() == node) return typed(parent, .sentinel);
+                if (pointer.ast.align_node.unwrap() == node) return typed(parent, .alignment);
+                if (pointer.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
+                return typed(parent, .bit_range);
+            },
+            .prototype => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buffer, parent).?; // unreachable: the form is a prototype's
+                if (proto.ast.return_type.unwrap() == node) return typed(parent, .result);
+                if (proto.ast.align_expr.unwrap() == node) return typed(parent, .alignment);
+                if (proto.ast.addrspace_expr.unwrap() == node) return typed(parent, .address_space);
+                if (proto.ast.section_expr.unwrap() == node) return typed(parent, .section);
+                if (proto.ast.callconv_expr.unwrap() == node) return typed(parent, .calling_convention);
+                var it = proto.iterate(tree);
+                while (it.next()) |param| if (param.type_expr == node) return typed(parent, .parameter);
+                return .{ .unknown = .unsupported };
+            },
+            .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else typed(parent, .signature),
+            .variable => {
+                const variable = tree.fullVarDecl(parent).?; // unreachable: the form is a variable's
+                if (variable.ast.init_node.unwrap() == node) return .{ .initializes = parent };
+                if (variable.ast.type_node.unwrap() == node) return typed(parent, .declared);
+                if (variable.ast.align_node.unwrap() == node) return typed(parent, .alignment);
+                if (variable.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
+                return typed(parent, .section);
+            },
+            .field_declaration => {
+                const field = model.containerField(tree, parent).?; // unreachable: the form is a field's
+                if (field.ast.value_expr.unwrap() == node) return .{ .initializes = parent };
+                if (field.ast.type_expr.unwrap() == node) return typed(parent, .declared);
+                return typed(parent, .alignment);
+            },
+            else => return .{ .unknown = .unsupported },
         }
     }
 
