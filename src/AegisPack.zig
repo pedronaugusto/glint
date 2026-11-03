@@ -2017,30 +2017,34 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     var init = v.ast.init_node.unwrap() orelse return false;
     if (Contract.local(c, init) != null) return ownedValue(c, init, depth + 1);
     while (Facts.accesses.carriedFrom(tree, init)) |inner| init = inner;
-    return try publishedCall(c, init, &.{ "init", "adopt", "acquire" }) != null;
+    const published = (try publishedCall(c, c.file, init)) orelse return false;
+    return among(&.{ "init", "adopt", "acquire" }, published.name);
 }
 
-/// The published aegis function among `names` a call may call, by its name: a callee known by
-/// its declaration (`Facts.calls`) that is a function of a type aegis publishes; or, where the
-/// callee is not known, a member of that name of whatever its holder is (`v.expose()` of an
-/// `anytype` is whatever `v`'s type declares by that name). Null for any other call.
+/// The published aegis function a call in `file` may call, by its name: a callee known by its
+/// declaration (`Facts.calls`) that is a function of a type aegis publishes; or, where the callee
+/// is not known, a member of whatever its holder is, which Zig finds by that name (`v.expose()`
+/// of an `anytype` is whatever `v`'s type declares as `expose`). Null for any other call.
 const Published = struct { name: []const u8, known: bool };
-fn publishedCall(c: *Context, node: Ast.Node.Index, names: []const []const u8) Context.Error!?Published {
-    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return null;
+fn publishedCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Published {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
     const function = switch (call.callee) {
         .function => |function| function,
         .choice, .any => {
-            const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
-            const name = path.steps[0].name orelse return null;
-            if (path.steps[0].kind != .field or !among(names, name)) return null;
-            return .{ .name = name, .known = false };
+            const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
+            if (path.steps[0].kind != .field) return null;
+            return .{ .name = path.steps[0].name orelse return null, .known = false };
         },
     };
     const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
-    if (!among(names, record.name)) return null;
     const holder: Facts.Container = .{ .file = function.file, .scope = record.scope };
     if (try c.role(Contract.library, .{ .container = holder }) == null) return null;
     return .{ .name = record.name, .known = true };
+}
+
+/// Whether a published operation's name gives an owner: a constructor or an acquisition.
+fn acquires(name: []const u8) bool {
+    return among(&.{ "init", "adopt" }, name) or Contract.acquisition(name);
 }
 
 /// Whether `name` is one of a catalogue's `names`.
@@ -2051,7 +2055,8 @@ fn among(names: []const []const u8, name: []const u8) bool {
 
 fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    const published = (try publishedCall(c, node, &.{ "expose", "exposeMut", "value" })) orelse return false;
+    const published = (try publishedCall(c, c.file, node)) orelse return false;
+    if (!among(&.{ "expose", "exposeMut", "value" }, published.name)) return false;
     const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: publishedCall found its callee
     // What it is called on: the member's holder (`s.expose()`'s `s`), a receiver or not.
     const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
@@ -2342,10 +2347,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
     if (c.facts.madeByParameter(c.file, acquisition) != null) return null;
     // A std handle acquired raw (`dir.openFile`): released by its `close`.
     if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
-    const named = tree.nodeTag(acquired.ast.fn_expr) == .field_access and named: {
-        const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(acquired.ast.fn_expr).node_and_token[1]));
-        break :named std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
-    };
+    const named = if (try publishedCall(c, c.file, acquisition)) |published| acquires(published.name) else false;
     // One that may give an owner is read by its type below, undecided where that does not resolve.
     if (!named and try givesOwner(c, acquisition) == .no) return null;
     if (try unlisted(c, acquisition)) return null;
@@ -2397,16 +2399,10 @@ fn acquiring(c: *Context, site: Facts.Key) Context.Error!bool {
     const tree = &c.project.at(site.file).file.tree;
     const v = tree.fullVarDecl(site.node) orelse return false;
     const init = v.ast.init_node.unwrap() orelse return false;
-    const value = switch (tree.nodeTag(init)) {
-        .@"try" => tree.nodeData(init).node,
-        .@"catch" => tree.nodeData(init).node_and_node[0],
-        else => init,
-    };
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, value) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const operation = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
-    return std.mem.eql(u8, operation, "init") or std.mem.eql(u8, operation, "adopt") or Contract.acquisition(operation);
+    var value = init;
+    while (Facts.accesses.carriedFrom(tree, value)) |inner| value = inner;
+    const published = (try publishedCall(c, site.file, value)) orelse return false;
+    return acquires(published.name);
 }
 
 /// Whether `call` gives a value of a type the library declares and the contract does not list,
