@@ -3439,6 +3439,36 @@ test "A012 reads a view std makes as no work, of a slice or a many-item pointer:
     try std.testing.expectEqual(0, found.undecided);
 }
 
+test "A012 gives a function handed out no length for a parameter whose type has none" {
+    // std sums the key's bytes, as many as they are: a `u32` key's are `@sizeOf(u32)`,
+    // whatever code outside gives `number`; a slice key's are as many as `bytes` is given.
+    const keys: sources.Extra = .{ .name = "std/keys.zig", .bytes =
+        \\pub fn sum(input: []const u8) u64 {
+        \\    var t: u64 = 0;
+        \\    for (input) |b| t +%= b;
+        \\    return t;
+        \\}
+        \\pub fn asBytes(ptr: *const u32) *const [4]u8 {
+        \\    return @ptrCast(ptr);
+        \\}
+        \\pub fn hashKey(key: u32) u64 {
+        \\    return sum(asBytes(&key));
+        \\}
+    };
+    const found = try runWith(pack.bounded_work,
+        \\const keys = @import("keys.zig");
+        \\fn number(k: u32) u64 {
+        \\    return keys.hashKey(k);
+        \\}
+        \\fn bytes(k: []const u8) u64 {
+        \\    return keys.sum(k);
+        \\}
+        \\pub const handed = .{ &number, &bytes };
+    , &(std_files ++ [_]sources.Extra{keys}), &(std_imports ++ [_]sources.ExtraImport{ .{ .from = 0, .spelling = "keys.zig", .target = std_files.len }, .{ .spelling = "keys.zig", .target = std_files.len } }));
+    try std.testing.expectEqual(1, found.findings);
+    try std.testing.expectEqual(0, found.undecided);
+}
+
 test "A009 reads an array literal's memory by the type it names: one with a sentinel reads it at its length, as a typed one does" {
     // `z[z.len]` reads the sentinel of a literal whose type has one, written there (8) or by
     // its name (15), as of a typed declaration (22): the path is live, and `i` unchecked on it.
