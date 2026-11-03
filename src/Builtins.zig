@@ -291,7 +291,7 @@ fn amendedPolicies(self: *Context) RunError!void {
     // variable's type, written or inferred, and a field of a container the surface reaches.
     if (self.config.has(.Z012)) for (source.model.declarations, 0..) |decl, i| {
         if (decl.kind != .field and !decl.public and !decl.exported) continue;
-        if (!reachable(&source.model, decl.scope)) continue;
+        if (!try reached(self, self.file, decl.scope)) continue;
         const signature: Signature = .{ .site = decl.token, .scope = decl.scope };
         switch (decl.kind) {
             .function => {
@@ -393,6 +393,34 @@ fn reachable(model: *const Model, scope: Model.Scope.Id) bool {
     return privateHolder(model, scope) == null;
 }
 
+/// Whether a caller outside the file can name what is declared in `scope`: `reachable`, or a
+/// container a private declaration holds that a public constant the surface reaches names
+/// (`pub const Api = Impl;`, or a labeled block's container a public constant holds): the
+/// alias is its name, and its fields and methods are the alias's.
+fn reached(self: *Context, file: Project.FileId, scope: Model.Scope.Id) RunError!bool {
+    const model = &self.project.at(file).model;
+    var at: ?Model.Scope.Id = scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind != .container) continue;
+        const holder = holderOf(model, model.scopes[@backingInt(s)].node) orelse continue;
+        const decl = model.declarations[@backingInt(holder)];
+        if (decl.public or decl.exported) continue;
+        return aliased(self, file, s);
+    }
+    return true;
+}
+
+/// Whether a public constant the surface reaches holds the container whose scope is `scope`.
+fn aliased(self: *Context, file: Project.FileId, scope: Model.Scope.Id) RunError!bool {
+    const model = &self.project.at(file).model;
+    for (model.declarations, 0..) |alias, i| {
+        if (!alias.public or alias.kind != .variable or !reachable(model, alias.scope)) continue;
+        const named = try self.facts.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
+        if (named == .container and named.container.file == file and named.container.scope == scope and !named.container.symbolic) return true;
+    }
+    return false;
+}
+
 /// The first declaration, from `scope` outward, that holds a container around it and is neither
 /// public nor exported: what keeps callers outside the file from naming the scope.
 fn privateHolder(model: *const Model, scope: Model.Scope.Id) ?Model.Declaration.Id {
@@ -457,8 +485,10 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, writt
         if (container.ast.arg.unwrap()) |tag| try privateType(self, signature, file, tag, depth + 1);
         const model = &self.project.at(file).model;
         const scope = scopeOf(model, node) orelse return undecidedType(self, signature, file, node, .unsupported);
-        if (reachable(model, scope)) return;
+        // A tuple's fields are no declarations: they are read here, reached or not.
+        const named = try reached(self, file, scope);
         for (container.ast.members) |member| if (model.containerField(tree, member)) |field| {
+            if (named and !field.ast.tuple_like) continue;
             if (field.ast.type_expr.unwrap()) |t| try privateType(self, signature, file, t, depth + 1);
         };
         return;
@@ -500,12 +530,20 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, writt
 fn eachBranch(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
     const tree = &self.project.at(file).file.tree;
     if (tree.fullIf(node)) |branch| {
-        try privateType(self, signature, file, branch.ast.then_expr, depth);
-        if (branch.ast.else_expr.unwrap()) |other| try privateType(self, signature, file, other, depth);
+        try chosen(self, signature, file, branch.ast.then_expr, depth);
+        if (branch.ast.else_expr.unwrap()) |other| try chosen(self, signature, file, other, depth);
         return;
     }
     const choice = tree.fullSwitch(node) orelse return undecidedType(self, signature, file, node, .unsupported);
-    for (choice.ast.cases) |case| try privateType(self, signature, file, tree.fullSwitchCase(case).?.ast.target_expr, depth);
+    for (choice.ast.cases) |case| try chosen(self, signature, file, tree.fullSwitchCase(case).?.ast.target_expr, depth);
+}
+
+/// One branch of a comptime choice: a type is read as written, a value by its type
+/// (`if (builtin.is_test) u8 else Hidden{ .x = 1 }` gives a Hidden in every other build).
+fn chosen(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
+    const value = try self.facts.resolve(file, node);
+    if (value == .unknown or isType(value)) return privateType(self, signature, file, node, depth);
+    try exposedInferred(self, signature, file, node, value, depth);
 }
 
 /// Z012 over a type `node` of `file` resolves to: the containers a caller has to name to use it.
@@ -544,12 +582,7 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
     }
     if (container.symbolic) return undecidedType(self, signature, file, node, .comptime_dependent);
     const holder = privateHolder(model, container.scope) orelse return;
-    // A public alias to this same container makes it nameable.
-    for (model.declarations, 0..) |alias, i| {
-        if (!alias.public or alias.kind != .variable or !reachable(model, alias.scope)) continue;
-        const exposed = try self.facts.declaration(.{ .file = container.file, .index = @fromBackingInt(@intCast(i)) });
-        if (exposed == .container and exposed.container.file == container.file and exposed.container.scope == container.scope and !exposed.container.symbolic) return;
-    }
+    if (try aliased(self, container.file, container.scope)) return;
     const decl = model.declarations[@backingInt(holder)];
     const message = if (decl.kind == .function)
         try self.allocator.print("public signature exposes a type private function '{s}' writes", .{decl.name})
@@ -642,15 +675,17 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
     const init = variable.ast.init_node.unwrap() orelse return;
     // A part of a parameter (a generic's `h.n`) has the type the caller gave it.
     if (try fromParameter(self, self.file, init)) return;
+    // A choice is one of its branches, each a type or a value of one.
+    switch (source.file.tree.nodeTag(init)) {
+        .@"if", .if_simple, .@"switch", .switch_comma => return eachBranch(self, signature, self.file, init, 0),
+        else => {},
+    }
     const value = try self.facts.declaration(.{ .file = self.file, .index = index });
-    // A public constant holding a type is a name for it.
-    if (value != .unknown and isType(value)) return;
+    // A public constant holding a type is a name for it: what the type is written as is read
+    // (a slice or a function type of a private type, a tuple's fields, a type function's
+    // arguments), and a container it names is reached through it.
+    if (value != .unknown and isType(value)) return privateType(self, signature, self.file, init, 0);
     if (value == .unknown) {
-        // A choice that does not resolve is one of its branches, each a type or a value of one.
-        switch (source.file.tree.nodeTag(init)) {
-            .@"if", .if_simple, .@"switch", .switch_comma => return eachBranch(self, signature, self.file, init, 0),
-            else => {},
-        }
         // What a call gives is of the type its callee declares it returns.
         var buffer: [1]Ast.Node.Index = undefined;
         const call = source.file.tree.fullCall(&buffer, init) orelse return exposedInferred(self, signature, self.file, init, value, 0);
