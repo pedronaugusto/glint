@@ -506,6 +506,71 @@ test "A007 and A008 read a value's type by its meaning: a type function's result
     try std.testing.expectEqual(@as(usize, 3), secret.findings);
 }
 
+test "A007 and A008 judge a local known only as the program compiles at each call's bindings, and read std.meta.Child of an array (sweep 2 class 4)" {
+    // Findings: a local typed by Child of an array of locks in a function with a comptime
+    // parameter it does not depend on, one bound to an array of locks by a call, and that call's
+    // type argument. Clean: the same bound to an array of counters. Undecided: a public function
+    // nothing here calls.
+    const program =
+        \\const std = @import("std");
+        \\fn Child(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .array => |info| info.child,
+        \\        .vector => |info| info.child,
+        \\        else => @compileError("no child"),
+        \\    };
+        \\}
+        \\fn step(comptime by: u32, counter: *u32) void {
+        \\    var lock: Child([1]std.Io.Mutex) = undefined;
+        \\    _ = &lock;
+        \\    counter.* += by;
+        \\}
+        \\fn hold(comptime T: type, counter: *u32) void {
+        \\    var held: Child(T) = undefined;
+        \\    _ = &held;
+        \\    counter.* += 1;
+        \\}
+        \\pub fn open(comptime T: type) void {
+        \\    var held: Child(T) = undefined;
+        \\    _ = &held;
+        \\}
+        \\pub fn run(counter: *u32) void {
+        \\    step(2, counter);
+        \\    hold([1]std.Io.Mutex, counter);
+        \\    hold([1]u32, counter);
+        \\}
+    ;
+    const found = try runWith(pack.shared_state, program, &std_files, &std_imports);
+    try std.testing.expectEqual(@as(usize, 1), found.undecided);
+    try std.testing.expectEqual(@as(usize, 3), found.findings);
+    const keys =
+        \\const std = @import("std");
+        \\const Ed25519 = std.crypto.sign.Ed25519;
+        \\fn Child(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .array => |info| info.child,
+        \\        .vector => |info| info.child,
+        \\        else => @compileError("no child"),
+        \\    };
+        \\}
+        \\fn hold(comptime T: type) void {
+        \\    var held: Child(T) = undefined;
+        \\    _ = &held;
+        \\}
+        \\pub fn open(comptime T: type) void {
+        \\    var held: Child(T) = undefined;
+        \\    _ = &held;
+        \\}
+        \\pub fn run() void {
+        \\    hold([1]Ed25519.SecretKey);
+        \\    hold([1]Ed25519.PublicKey);
+        \\}
+    ;
+    const secret = try runWith(pack.secrets, keys, &std_files, &std_imports);
+    try std.testing.expectEqual(@as(usize, 1), secret.undecided);
+    try std.testing.expectEqual(@as(usize, 1), secret.findings);
+}
+
 test "A011 finds time crossing as a raw integer and units converted by hand wherever a constant goes and as the program compiles, not raw nanoseconds compared or subtracted" {
     try expect(pack.units,
         \\const std = @import("std");

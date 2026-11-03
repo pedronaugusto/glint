@@ -41,6 +41,9 @@ publications: std.AutoHashMapUnmanaged(usize, *const Publication) = .empty,
 /// Each module's roots, by the address of its members.
 module_roots: std.AutoHashMapUnmanaged(usize, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
+/// What each declaration known only as the program compiles reads as with each call's
+/// bindings, found once (`atBindings`).
+at_bindings: std.AutoHashMapUnmanaged(Decl, ?[]const Value) = .empty,
 /// The values a function's own `return`s give, by function, found once (`ownReturns`).
 type_returns: std.AutoHashMapUnmanaged(Decl, []const Ast.Node.Index) = .empty,
 /// What each generic parameter binds when the project's own calls are the only ones: the
@@ -274,6 +277,7 @@ pub fn deinit(self: *Facts) void {
     self.module_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
+    self.at_bindings.deinit(self.gpa);
     self.callers.deinit(self.gpa);
     if (self.comptime_fields) |*names| names.deinit(self.gpa);
     self.dereferences.deinit(self.gpa);
@@ -6459,6 +6463,62 @@ fn callArguments(self: *Facts, function: Decl, position: usize) ResolveError!?[]
         }
         if (position - site.receiver >= site.params.len) return null;
         try values.append(self.gpa, try self.resolve(site.file, site.params[position - site.receiver]));
+    }
+    return values.items;
+}
+
+/// What a declaration of a function holds on each call of the function, read with that call's
+/// bindings (`var lock: std.meta.Child(T) = .init` on `bump(Locks, …)`): a local's written
+/// type's instance, else its initializer's value; a parameter's type's instance; the function's
+/// own result. A declaration known only as the program compiles is judged so, never by its
+/// function's signature. Null where a call of the function is none the program shows
+/// (`escapes`), or the declaration is none of those.
+pub fn atBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
+    if (self.at_bindings.get(decl)) |found| return found;
+    const found = try self.readAtBindings(decl);
+    try self.at_bindings.put(self.gpa, decl, found);
+    return found;
+}
+
+fn readAtBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
+    const model = &self.project.at(decl.file).model;
+    const tree = &self.project.at(decl.file).file.tree;
+    const record = model.declarations[@backingInt(decl.index)];
+    const Read = enum { instance, value, result };
+    const function: Decl, const node: Ast.Node.Index, const read: Read = switch (record.kind) {
+        .variable => blk: {
+            const variable = tree.fullVarDecl(record.node) orelse return null;
+            const body = self.innermostFunction(decl.file, record.scope) orelse return null;
+            const function = for (model.declarations, 0..) |d, i| {
+                const candidate: Decl = .{ .file = decl.file, .index = @fromBackingInt(@intCast(i)) };
+                if (d.kind == .function and self.scopeNode(candidate) == body) break candidate;
+            } else return null;
+            if (variable.ast.type_node.unwrap()) |t| break :blk .{ function, t, .instance };
+            break :blk .{ function, variable.ast.init_node.unwrap() orelse return null, .value };
+        },
+        .parameter => .{ self.functionOf(decl) orelse return null, record.node, .instance },
+        .function => blk: {
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buffer, record.node) orelse return null;
+            break :blk .{ decl, proto.ast.return_type.unwrap() orelse return null, .result };
+        },
+        else => return null,
+    };
+    const sites = (try self.callSites(function)) orelse return null;
+    var values: std.ArrayList(Value) = .empty;
+    for (sites) |site| {
+        var args: std.ArrayList(Value) = .empty;
+        if (site.receiver != 0) try args.append(self.gpa, try self.resolve(site.file, site.holder));
+        for (site.params) |arg| try args.append(self.gpa, try self.resolve(site.file, arg));
+        const env = try self.gpa.create(Env);
+        env.* = .{ .function = function, .args = args.items, .depth = 0 };
+        const found = try self.resolveIn(env, decl.file, node);
+        try values.append(self.gpa, switch (read) {
+            .value => found,
+            .instance => try self.instance(found),
+            // `!T`: an error union whose error set the body infers, as `callResult` reads it.
+            .result => if (Model.inferredErrors(tree, node) and found != .unknown) .{ .error_union = try self.boxed(try self.instance(found)) } else try self.instance(found),
+        });
     }
     return values.items;
 }
