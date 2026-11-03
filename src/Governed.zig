@@ -64,11 +64,7 @@ pub fn resolve(self: *Context, rule: Rule, targets: []const Target, indexes: []c
         // As `@import` reads its operand: a path ending in `.zig` is a file, anything else a module.
         const module = !std.mem.endsWith(u8, source, ".zig");
         var roots: std.ArrayList(Project.FileId) = .empty;
-        if (module) for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
-            for (roots.items) |seen| {
-                if (seen == mapping.target) break;
-            } else try roots.append(self.allocator, mapping.target);
-        };
+        if (module) try roots.appendSlice(self.allocator, try moduleRoots(self, source));
         if (!module) for (self.project.sources) |*each| if (std.mem.eql(u8, each.input.name, source)) {
             try roots.append(self.allocator, each.id);
         };
@@ -141,14 +137,21 @@ pub const Lookups = struct {
 };
 
 fn lookup(self: *Context, source: []const u8, path: []const u8) Context.Error!Declared {
+    const roots = try moduleRoots(self, source);
+    if (roots.len == 0) return .none;
+    return walk(self, roots, path, true);
+}
+
+/// The files the program's imports of module `source` reach. A governed declaration is a
+/// library's, and a library's modules are the program's: a build script's import of the same
+/// name is that dependency's build script, as the build runner names it.
+fn moduleRoots(self: *Context, source: []const u8) Context.Error![]const Project.FileId {
     var roots: std.ArrayList(Project.FileId) = .empty;
-    for (self.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, source)) {
-        for (roots.items) |seen| {
-            if (seen == mapping.target) break;
-        } else try roots.append(self.allocator, mapping.target);
-    };
-    if (roots.items.len == 0) return .none;
-    return walk(self, roots.items, path, true);
+    for (self.project.imports) |mapping| {
+        if (!std.mem.eql(u8, mapping.spelling, source) or !mapping.in.inProgram()) continue;
+        if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) == null) try roots.append(self.allocator, mapping.target);
+    }
+    return roots.items;
 }
 
 /// The declarations at `path` from the files of `package`, every one the run loaded, selected

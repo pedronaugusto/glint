@@ -148,9 +148,11 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
 /// A required library member that did not resolve, at the first import in this file of the
 /// root that lacks it, under whatever name and however spelled: the import is the root where
 /// Facts resolves it to that root. Recognition of that library is incomplete here, so a rule
-/// reports it as coverage.
+/// reports it as coverage. A library's modules are the program's: a file only a build script's
+/// compilation compiles imports none of them, whatever it names.
 pub const Drift = struct { module: []const u8, path: []const u8, why: Facts.Unknown, start: u32 };
 pub fn drift(self: *RuleContext, library: anytype) Error!?Drift {
+    if (!self.project.at(self.file).input.compilations.inProgram()) return null;
     const found = try self.facts.publication(library);
     const tree = try self.project.syntax(try self.source());
     const model = &self.project.at(self.file).model;

@@ -374,7 +374,9 @@ const flat_bytes =
 const flat_int = scalarFile(&.{ "Checked", "Saturating", "Ranged" });
 const flat_id = scalarFile(&.{ "Id", "NonZero", "Counter" });
 const flat_units = scalarFile(&.{ "Count", "Bytes", "Bits", "Duration", "Instant" });
-const Flat = struct { root: []const u8 = flat_root, vault: []const u8 = "", library_selected: bool = false };
+/// `build_scripts`: where set, a build script importing aegis's build script by aegis's name, as
+/// the build runner names it, both stated compiled as this says.
+const Flat = struct { root: []const u8 = flat_root, vault: []const u8 = "", library_selected: bool = false, build_scripts: ?P.Compilations = null };
 fn flatFixture(bytes: []const u8, options: Flat) !P {
     const selected = options.library_selected;
     // aegis's sources, stated as its package as a caller states them; the vault is no package.
@@ -389,8 +391,11 @@ fn flatFixture(bytes: []const u8, options: Flat) !P {
         .{ .name = "id.zig", .bytes = flat_id, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
         .{ .name = "units.zig", .bytes = flat_units, .selected = selected, .package = own.name, .fingerprint = own.fingerprint },
         .{ .name = "vault.zig", .bytes = options.vault, .selected = false },
+        .{ .name = "build.zig", .bytes = "const aegis = @import(\"aegis\");\npub fn build() void {}\n", .compilations = options.build_scripts orelse .build },
+        .{ .name = "aegis/build.zig", .bytes = "pub fn build() void {}\n", .selected = selected, .package = own.name, .fingerprint = own.fingerprint, .compilations = options.build_scripts orelse .build },
     };
     const imports = [_]P.Import{
+        .{ .from = 9, .spelling = "aegis", .target = 10 },
         .{ .from = 0, .spelling = "aegis", .target = 1 },
         .{ .from = 0, .spelling = "vault", .target = 8 },
         .{ .from = 1, .spelling = "Secret.zig", .target = 2 },
@@ -400,6 +405,8 @@ fn flatFixture(bytes: []const u8, options: Flat) !P {
         .{ .from = 1, .spelling = "id.zig", .target = 6 },
         .{ .from = 1, .spelling = "units.zig", .target = 7 },
     };
+    // Without build scripts, the last two inputs and the first import are left out.
+    if (options.build_scripts == null) return P.init(std.testing.allocator, inputs[0..9], imports[1..], .{});
     return P.init(std.testing.allocator, &inputs, &imports, .{});
 }
 const every_site =
@@ -502,6 +509,34 @@ test "a published member that disappears is reported where aegis is imported, ne
         detail = entry.detail;
     };
     try std.testing.expectEqualStrings("published member Guarded of aegis does not resolve (unresolved); its operations are not recognized in this file", detail.?);
+}
+test "a build script's import of aegis's name is aegis's build script, never its module: the program's aegis does not drift" {
+    const consumer = "const S = @import(\"aegis\").Secret; pub fn f(s: *S(u32)) void { _ = s.material; }";
+    // What drifts with no build script at all: the fixture's root lacks members the contract
+    // has grown since, each reported at the consumer's import.
+    const alone = try driftReport(consumer, null);
+    defer std.testing.allocator.free(alone);
+    // Twins: the build runner's scripts drift nothing more, neither in the consumer nor in the
+    // script; the same files stated as the program's are an `@import("aegis")` reaching a file
+    // that publishes none of aegis, which is aegis drifted.
+    for ([_]struct { P.Compilations, bool }{ .{ .build, true }, .{ .program, false } }) |case| {
+        const found = try driftReport(consumer, case[0]);
+        defer std.testing.allocator.free(found);
+        try std.testing.expectEqual(case[1], std.mem.eql(u8, alone, found));
+    }
+}
+/// The run's drift of aegis, each entry as "file: detail" on a line of its own, with
+/// `build_scripts` as `Flat` has it.
+fn driftReport(consumer: []const u8, build_scripts: ?P.Compilations) ![]const u8 {
+    var project = try flatFixture(consumer, .{ .build_scripts = build_scripts });
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: the secret's backing access.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer out.deinit();
+    for (report.coverage) |entry| if (entry.rule != null) try out.writer.print("{s}: {s}\n", .{ project.at(entry.file).input.name, entry.detail });
+    return out.toOwnedSlice();
 }
 test "aegis's own files are its safe-type internals" {
     var project = try flatFixture(every_site, .{ .library_selected = true });

@@ -460,6 +460,68 @@ test "G2 disallowed policy follows qualified declaration identity and aliases" {
     try std.testing.expectEqual(@as(usize, 0), missing.diagnostics.len); // safe: no invented missing declaration.
 }
 
+test "a disallowed declaration is the program's module's, never a build script's of the same name and path" {
+    const P = glint.Project;
+    // Twins: the build runner's scripts, whose `lib` is the dependency's build script, and the
+    // same files stated as the program's, where both `lib`s are the module and both calls reach it.
+    for ([_]struct { P.Compilations, usize }{ .{ .build, 1 }, .{ .program, 2 } }) |case| {
+        const inputs = [_]P.Input{
+            .{ .name = "program.zig", .bytes = "const lib = @import(\"lib\");\npub fn main() void { lib.sync(); }\n" },
+            .{ .name = "lib/root.zig", .bytes = "pub fn sync() void {}\n", .selected = false },
+            .{ .name = "build.zig", .bytes = "const lib = @import(\"lib\");\npub fn build() void { lib.sync(); }\n", .compilations = case[0] },
+            .{ .name = "lib/build.zig", .bytes = "pub fn sync() void {}\n", .selected = false, .compilations = case[0] },
+        };
+        const imports = [_]P.Import{ .{ .from = 0, .spelling = "lib", .target = 1 }, .{ .from = 2, .spelling = "lib", .target = 3 } };
+        var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.selections = &.{.{ .rule = .P006, .level = .gate }};
+        config.disallowed = &.{.{ .source = "lib", .declaration = "sync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" }};
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(case[1], report.diagnostics.len);
+    }
+}
+
+test "a file both compilations compile reads a name each binds apart as both: a finding stands where either side's member flags" {
+    const P = glint.Project;
+    // The program's `lib` and the build's each declare `sync`; only the program's is disallowed.
+    // Twins: both declare it (the program's flags, the build's clears: the finding stands); only
+    // the program's does (the build's side lacks it and never runs the call); a member both
+    // declare and neither flags (clear).
+    for ([_]struct { []const u8, []const u8, usize }{
+        .{ "pub fn sync() void {}\npub fn flush() void {}\n", "lib.sync();", 1 },
+        .{ "pub fn flush() void {}\n", "lib.sync();", 1 },
+        .{ "pub fn sync() void {}\npub fn flush() void {}\n", "lib.flush();", 0 },
+    }) |case| {
+        const shared = try std.mem.concat(std.testing.allocator, u8, &.{ "const lib = @import(\"lib\");\npub fn run() void { ", case[1], " }\n" });
+        defer std.testing.allocator.free(shared);
+        const inputs = [_]P.Input{
+            .{ .name = "program.zig", .bytes = "const shared = @import(\"shared.zig\");\npub fn main() void { shared.run(); }\n" },
+            .{ .name = "shared.zig", .bytes = shared, .compilations = .both },
+            .{ .name = "lib/root.zig", .bytes = "pub fn sync() void {}\npub fn flush() void {}\n", .selected = false },
+            .{ .name = "build.zig", .bytes = "const shared = @import(\"src/shared.zig\");\npub fn build() void { shared.run(); }\n", .compilations = .build },
+            .{ .name = "lib/build.zig", .bytes = case[0], .selected = false, .compilations = .build },
+        };
+        const imports = [_]P.Import{
+            .{ .from = 0, .spelling = "shared.zig", .target = 1 },
+            .{ .from = 3, .spelling = "src/shared.zig", .target = 1 },
+            .{ .from = 1, .spelling = "lib", .target = 2, .compilation = .program },
+            .{ .from = 1, .spelling = "lib", .target = 4, .compilation = .build },
+        };
+        var project = try P.init(std.testing.allocator, &inputs, &imports, .{});
+        defer project.deinit();
+        var config = glint.Config.none();
+        config.selections = &.{.{ .rule = .P006, .level = .gate }};
+        config.disallowed = &.{.{ .source = "lib", .declaration = "sync", .reason = "durability belongs to airlock", .replacement = "airlock.syncFile" }};
+        var report = try glint.run(std.testing.allocator, &project, config);
+        defer report.deinit();
+        try std.testing.expect(report.complete);
+        try std.testing.expectEqual(case[2], report.diagnostics.len);
+    }
+}
+
 /// A program, a `lib` module standing for std, and its per-target namespace.
 fn ownershipRun(program: []const u8, disallowed: []const glint.Config.Disallowed) !glint.Report {
     return ownershipRunIn(program, "", disallowed);

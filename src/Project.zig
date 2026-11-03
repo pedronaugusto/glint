@@ -57,12 +57,49 @@ pub const Input = struct {
     /// it. Null when unknown. A library the analyses know (aegis) is known by its name and
     /// this, under whatever name a program imports it.
     fingerprint: ?u64 = null,
+    /// The compilations that compile this file, as the caller's build has them. Each names its
+    /// modules apart: a build script's `@import("aegis")` is the aegis dependency's build
+    /// script, the program's is aegis's module. An import is read in the compilations of the
+    /// file that makes it, never by its spelling in another.
+    compilations: Compilations = .program,
+};
+/// The compilations that compile a file.
+pub const Compilations = enum {
+    /// The program's alone: its modules and their tests.
+    program,
+    /// The build runner's alone: a build script and the files it imports.
+    build,
+    /// Both: a file a build script imports that the program's modules compile too.
+    both,
+
+    /// Whether the program's compilation compiles the file.
+    pub fn inProgram(self: Compilations) bool {
+        return self != .build;
+    }
+    /// Whether every compilation that compiles a file of `self` compiles one of `other`: what
+    /// a file's import reaches, each compilation compiling the file compiles too.
+    pub fn within(self: Compilations, other: Compilations) bool {
+        return self == other or other == .both;
+    }
+    /// Whether no compilation compiles a file of both.
+    pub fn apart(self: Compilations, other: Compilations) bool {
+        return self != other and self != .both and other != .both;
+    }
 };
 /// A module edge selected and resolved by the caller, never by a path hash: `from` and `target`
 /// are positions in the inputs given to `init`.
-pub const Import = struct { from: usize, spelling: []const u8, target: usize };
-/// An import checked against the inputs.
-const Edge = struct { from: FileId, spelling: []const u8, target: FileId };
+pub const Import = struct {
+    from: usize,
+    spelling: []const u8,
+    target: usize,
+    /// The one compilation the edge holds in, where a file both compile binds the name apart in
+    /// each (`aegis`: the library in the program's, the dependency's build script in the build
+    /// runner's): an edge for each, and the name reaches both. Null: every compilation that
+    /// compiles `from`.
+    compilation: ?Compilations = null,
+};
+/// An import checked against the inputs, and the compilations it holds in.
+const Edge = struct { from: FileId, spelling: []const u8, target: FileId, in: Compilations };
 /// Per-source limits for front-end work.
 pub const Options = struct {
     lowering: bool = true,
@@ -163,8 +200,13 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     const mappings = try a.alloc(Edge, imports.len);
     for (mappings, imports, 0..) |*mapping, import, index| {
         if (import.from >= sources.len or import.target >= sources.len) return error.InvalidMapping;
-        mapping.* = .{ .from = sources[import.from].id, .spelling = try a.dupe(u8, import.spelling), .target = sources[import.target].id };
-        for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling)) return error.DuplicateMapping;
+        // An import is made in each compilation it holds in, all that compile its file unless it
+        // names one of them; each compiles its target.
+        const in = import.compilation orelse inputs[import.from].compilations;
+        if (!in.within(inputs[import.from].compilations) or !in.within(inputs[import.target].compilations)) return error.InvalidMapping;
+        mapping.* = .{ .from = sources[import.from].id, .spelling = try a.dupe(u8, import.spelling), .target = sources[import.target].id, .in = in };
+        // A name has one binding in each compilation: two edges hold in one apiece.
+        for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling) and !mapping.in.apart(earlier.in)) return error.DuplicateMapping;
     }
     const identity = try nextIdentity();
     return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity, .own = own };
@@ -227,10 +269,26 @@ pub fn source(self: *const Project, source_handle: Handle) QueryError![]const u8
     return (try self.checked(source_handle)).input.bytes;
 }
 
-/// Returns the explicit module target, or unknown when no mapping was supplied.
+/// The file an import of `spelling` in `from` reaches in the program's compilation, or in the
+/// only one that compiles `from`; null when no mapping was supplied. `importedAll` gives each.
 pub fn imported(self: *const Project, from: FileId, spelling: []const u8) ?FileId {
-    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) return mapping.target;
-    return null;
+    var buffer: [2]FileId = undefined;
+    const all = self.importedAll(from, spelling, &buffer);
+    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling) and mapping.in.inProgram()) return mapping.target;
+    return if (all.len == 0) null else all[0];
+}
+
+/// The files an import of `spelling` in `from` reaches, as the caller mapped it: one, or one in
+/// each compilation where a file both compile binds the name apart; none when no mapping was
+/// supplied.
+pub fn importedAll(self: *const Project, from: FileId, spelling: []const u8, buffer: *[2]FileId) []const FileId {
+    var found: usize = 0;
+    for (self.imports) |mapping| if (mapping.from == from and std.mem.eql(u8, mapping.spelling, spelling)) {
+        buffer[found] = mapping.target;
+        found += 1;
+        if (found == buffer.len) break;
+    };
+    return buffer[0..found];
 }
 
 /// Whether the build binds no module named `spelling` for `from` (its input's `absent`).
@@ -312,6 +370,59 @@ test "project maps opaque module identities without filesystem access" {
     defer project.deinit();
     try std.testing.expectEqual(@as(?FileId, try project.fileAt(1)), project.imported(try project.fileAt(0), "dep"));
     try std.testing.expect(project.imported(try project.fileAt(0), "missing") == null);
+}
+
+test "a name a file both compilations compile binds apart reaches each compilation's target" {
+    const inputs = [_]Input{
+        .{ .name = "shared", .bytes = "const dep = @import(\"dep\");", .compilations = .both },
+        .{ .name = "dep/root", .bytes = "pub const value = 1;" },
+        .{ .name = "dep/build", .bytes = "pub fn build() void {}", .compilations = .build },
+        .{ .name = "dep/both", .bytes = "pub const value = 1;", .compilations = .both },
+    };
+    var project = try init(std.testing.allocator, &inputs, &.{
+        .{ .from = 0, .spelling = "dep", .target = 1, .compilation = .program },
+        .{ .from = 0, .spelling = "dep", .target = 2, .compilation = .build },
+    }, .{});
+    defer project.deinit();
+    var buffer: [2]FileId = undefined;
+    try std.testing.expectEqualSlices(FileId, &.{ try project.fileAt(1), try project.fileAt(2) }, project.importedAll(try project.fileAt(0), "dep", &buffer));
+    try std.testing.expectEqual(@as(?FileId, try project.fileAt(1)), project.imported(try project.fileAt(0), "dep"));
+    // Two bindings in one compilation, an edge in every compilation beside one in a single one,
+    // and an edge in a compilation that does not compile its file or its target, are refused.
+    try std.testing.expectError(error.DuplicateMapping, init(std.testing.allocator, &inputs, &.{
+        .{ .from = 0, .spelling = "dep", .target = 1, .compilation = .program },
+        .{ .from = 0, .spelling = "dep", .target = 1, .compilation = .program },
+    }, .{}));
+    try std.testing.expectError(error.DuplicateMapping, init(std.testing.allocator, &inputs, &.{
+        .{ .from = 0, .spelling = "dep", .target = 3 },
+        .{ .from = 0, .spelling = "dep", .target = 2, .compilation = .build },
+    }, .{}));
+    try std.testing.expectError(error.InvalidMapping, init(std.testing.allocator, &inputs, &.{.{ .from = 1, .spelling = "dep", .target = 2, .compilation = .build }}, .{}));
+    try std.testing.expectError(error.InvalidMapping, init(std.testing.allocator, &inputs, &.{.{ .from = 0, .spelling = "dep", .target = 1, .compilation = .build }}, .{}));
+}
+
+test "an import reaches only a file each compilation of its own compiles" {
+    // A build script's import of its dependency's script, and a program file both compile.
+    for ([_]struct { Compilations, Compilations, bool }{
+        .{ .build, .build, true },
+        .{ .program, .both, true },
+        .{ .both, .both, true },
+        .{ .program, .build, false },
+        .{ .build, .program, false },
+        .{ .both, .program, false },
+    }) |case| {
+        const inputs = [_]Input{
+            .{ .name = "from", .bytes = "const dep = @import(\"dep\");", .compilations = case[0] },
+            .{ .name = "dep", .bytes = "pub const value = 1;", .compilations = case[1] },
+        };
+        var project = init(std.testing.allocator, &inputs, &.{.{ .from = 0, .spelling = "dep", .target = 1 }}, .{}) catch |err| {
+            try std.testing.expectEqual(error.InvalidMapping, err);
+            try std.testing.expect(!case[2]);
+            continue;
+        };
+        defer project.deinit();
+        try std.testing.expect(case[2]);
+    }
 }
 
 test "project stale handles survive allocator address reuse without aliasing" {

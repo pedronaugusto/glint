@@ -289,6 +289,9 @@ pub fn moduleRoots(self: *Facts, module: anytype) ResolveError![]const Project.F
     var other: FileSet = .empty;
     for (self.project.imports) |mapping| {
         if (std.mem.findScalar(Project.FileId, roots.items, mapping.target) != null) continue;
+        // A library's modules are the program's: a build script's import of the library's name
+        // is the library's build script, as the build runner names it.
+        if (!mapping.in.inProgram()) continue;
         // The library's own import of its parts is no program's import of a module.
         if (self.knownFile(mapping.from) and self.knownFile(mapping.target)) continue;
         // The library's own file is it under any name (a second revision imported as
@@ -2095,13 +2098,19 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidLiteral => return .{ .unknown = .computed_import },
         };
-        const target = self.project.imported(file, spelling) orelse return .{ .unknown = if (self.project.absent(file, spelling))
+        var reached: [2]Project.FileId = undefined;
+        const targets = self.project.importedAll(file, spelling, &reached);
+        if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
             .absent
         else if (try self.zigOwn(file, spelling))
             .zig_own
         else
             .missing_mapping };
-        return .{ .container = self.rootOf(target) };
+        // A file both compilations compile, each binding the name apart: either root, as each
+        // reads it, a member read in both.
+        const roots = try self.gpa.alloc(Value, targets.len);
+        for (targets, roots) |target, *root| root.* = .{ .container = self.rootOf(target) };
+        return if (roots.len == 1) roots[0] else self.choose(roots);
     }
     if (std.mem.eql(u8, name, "@This")) {
         var scope: ?Model.Scope.Id = model.scopeOf(tree.nodeMainToken(node));
