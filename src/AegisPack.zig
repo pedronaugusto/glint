@@ -1126,7 +1126,8 @@ fn checkCopies(c: *Context) Context.Error!void {
         // A destructure copies what its value reads, as a declaration does; a copy of bytes
         // copies the memory it reads (`@memcpy(dst, std.mem.asBytes(&owner))`).
         if (tag == .assign_destructure) try checkCopy(c, tree, node, tree.assignDestructure(node).ast.value_expr, null);
-        if (try Facts.accesses.copyAt(c.facts, c.file, node)) |copy| try checkCopy(c, tree, node, copy.from.node(), null);
+        // An exchange (`std.mem.swap`) moves each into the other: no second holder.
+        if (try Facts.accesses.copyAt(c.facts, c.file, node)) |copy| if (!copy.exchange) try checkCopy(c, tree, node, copy.from.node(), null);
         if (tag == .assign) {
             const sides = tree.nodeData(node).node_and_node;
             // `_ = x` discards the value: no second holder.

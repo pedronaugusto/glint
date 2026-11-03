@@ -168,7 +168,7 @@ test "accesses: each construct's probe is found and its twin is not" {
     try std.testing.expect(!failed);
 }
 
-test "accesses: a function copies memory between its parameters, or reads one's as another type" {
+test "accesses: a function copies memory between its parameters, or a value into one's, or reads one's out" {
     const source =
         \\fn copy(dest: []u8, source: []const u8) void {
         \\    for (dest[0..source.len], source) |*d, s| d.* = s;
@@ -191,6 +191,16 @@ test "accesses: a function copies memory between its parameters, or reads one's 
         \\fn get(p: *const u32) u32 {
         \\    return p.*;
         \\}
+        \\fn put(buffer: *[4]u8, value: u32, big: bool) void {
+        \\    buffer.* = if (big) @bitCast(@byteSwap(value)) else @bitCast(value);
+        \\}
+        \\fn take(buffer: *const [4]u8, big: bool) u32 {
+        \\    const raw: u32 = @bitCast(buffer.*);
+        \\    return if (big) @byteSwap(raw) else raw;
+        \\}
+        \\fn wrap(d: []u8, s: []const u8) void {
+        \\    copy(d, s);
+        \\}
         \\
     ;
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
@@ -209,9 +219,12 @@ test "accesses: a function copies memory between its parameters, or reads one's 
     };
     try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "copy"))).?);
     try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "back"))).?);
-    try std.testing.expectEqual(null, try facts.copierOf(function.named(&project, "swap")));
-    try std.testing.expectEqual(0, (try facts.readOf(function.named(&project, "read"))).?);
-    try std.testing.expectEqual(null, try facts.readOf(function.named(&project, "get")));
+    try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1, .exchange = true }, (try facts.copierOf(function.named(&project, "swap"))).?);
+    try std.testing.expectEqual(Facts.Reader{ .from = 0, .recast = true }, (try facts.readOf(function.named(&project, "read"))).?);
+    try std.testing.expectEqual(Facts.Reader{ .from = 0, .recast = false }, (try facts.readOf(function.named(&project, "get"))).?);
+    try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "put"))).?);
+    try std.testing.expectEqual(Facts.Reader{ .from = 0, .recast = true }, (try facts.readOf(function.named(&project, "take"))).?);
+    try std.testing.expectEqual(Facts.Copier{ .into = 0, .from = 1 }, (try facts.copierOf(function.named(&project, "wrap"))).?);
 }
 
 test "accesses: each syntax form that holds an expression is in a construct matrix row its use is read as" {

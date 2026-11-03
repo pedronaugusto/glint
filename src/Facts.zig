@@ -6430,6 +6430,10 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
         // What it returns, through what keeps an address: a cast, a slice, a constant holding
         // it, a call of a view (`return std.mem.asBytes(p);` is a view of `p` as asBytes is).
         var at = tree.nodeData(node).opt_node.unwrap() orelse return null;
+        // The address of an empty literal, through casts, is no memory at all (`bytesAsSlice`'s
+        // `&[0]T{}`); its parameters give it no part, so it is read before handsParameter.
+        const bare = try self.throughCasts(function.file, at);
+        if (tree.nodeTag(bare) == .address_of and emptyLiteral(tree, tree.nodeData(bare).node)) continue;
         // A value its parameters give no part of is no view of one: read by its spelling first,
         // so a call's callee is resolved only where the call is handed one of them.
         if (!self.handsParameter(function, whole, at, 0)) return null;
@@ -6440,7 +6444,6 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
                 else => break,
             }
         }
-        if (tree.nodeTag(at) == .address_of and emptyLiteral(tree, tree.nodeData(at).node)) continue;
         if (tree.nodeTag(at) != .identifier) return null;
         const named = (model.reference(at) orelse return null).declaration orelse return null;
         const record = model.declarations[@backingInt(named)];
@@ -6452,12 +6455,19 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
     return position;
 }
 
-const Readers = struct { found: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty };
+const Readers = struct { found: std.AutoHashMapUnmanaged(Decl, ?Reader) = .empty };
 
-/// The position of the parameter whose memory every value `function` returns is read out of as
-/// another type: each `return` dereferences a pointer that reinterprets it
-/// (`std.mem.bytesToValue`'s `bytesAsValue(T, bytes).*`, `toBytes`'s `asBytes(&value).*`).
-pub fn readOf(self: *Facts, function: Decl) ResolveError!?usize {
+/// The parameter whose memory every value a function returns is read out of, and whether the
+/// function reads it as another type itself (`recast`).
+pub const Reader = struct { from: usize, recast: bool };
+
+/// How `function` reads memory out: each `return` gives a value read through a pointer its
+/// parameter at one position gives, an element of it or what it points at, through what keeps
+/// the value (`@byteSwap`, `@as`, each prong of a `switch` or an `if`, a constant holding it)
+/// and what reads it as another type (`@bitCast`; a pointer that reinterprets the memory):
+/// `std.mem.bytesToValue`'s `bytesAsValue(T, bytes).*`, `toBytes`'s `asBytes(&value).*`,
+/// `readInt`'s `@bitCast(buffer.*)`, a getter's `p.*`. Null where one gives anything else.
+pub fn readOf(self: *Facts, function: Decl) ResolveError!?Reader {
     const readers = try self.memo(Readers);
     if (readers.found.get(function)) |kept| return kept;
     try readers.found.put(self.gpa, function, null);
@@ -6466,41 +6476,110 @@ pub fn readOf(self: *Facts, function: Decl) ResolveError!?usize {
     return found;
 }
 
-fn findReader(self: *Facts, function: Decl) ResolveError!?usize {
+fn findReader(self: *Facts, function: Decl) ResolveError!?Reader {
     const tree = self.syntaxOf(function.file);
     const whole = self.scopeNode(function);
     if (tree.nodeTag(whole) != .fn_decl) return null;
     const body = tree.nodeData(whole).node_and_node[1];
-    var position: ?usize = null;
+    var found: ?Reader = null;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"return") continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (!self.ownStatement(function.file, whole, body, node)) continue;
-        const value = try self.throughCasts(function.file, tree.nodeData(node).opt_node.unwrap() orelse return null);
-        if (tree.nodeTag(value) != .deref) return null;
-        const pointer = tree.nodeData(value).node;
-        if (!try accesses.reinterprets(self, function.file, pointer)) return null;
-        var memory = try accesses.viewed(self, function.file, pointer);
-        if (tree.nodeTag(memory) == .address_of) memory = tree.nodeData(memory).node;
-        const here = try self.reachedParameter(function, whole, memory) orelse return null;
-        if (position) |other| if (other != here) return null;
-        position = here;
+        const here = try self.readFrom(function, whole, tree.nodeData(node).opt_node.unwrap() orelse return null, 0) orelse return null;
+        if (found) |other| {
+            if (other.from != here.from) return null;
+            found = .{ .from = here.from, .recast = other.recast or here.recast };
+        } else found = here;
     }
-    return position;
+    return found;
+}
+
+/// The memory the value `node` is read out of (`readOf`): through `@byteSwap`, `@as`, a
+/// constant, each prong of a `switch` or an `if`; `@bitCast` and a reinterpreting pointer read
+/// it as another type.
+fn readFrom(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast.Node.Index, depth: u8) ResolveError!?Reader {
+    if (depth >= 16) return null;
+    const tree = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const at = try self.throughCasts(function.file, node);
+    switch (tree.nodeTag(at)) {
+        .deref, .array_access => {
+            const pointer = if (tree.nodeTag(at) == .deref) tree.nodeData(at).node else tree.nodeData(at).node_and_node[0];
+            // `.*` reads through a pointer whatever its type resolves to; an element, only where
+            // what it indexes is one, not an array held by value.
+            if (tree.nodeTag(at) == .array_access and !accesses.pointing(try self.resolve(function.file, pointer))) return null;
+            var memory = try accesses.viewed(self, function.file, pointer);
+            if (tree.nodeTag(memory) == .address_of) memory = tree.nodeData(memory).node;
+            const from = try self.reachedParameter(function, whole, memory) orelse return null;
+            return .{ .from = from, .recast = try accesses.reinterprets(self, function.file, pointer) };
+        },
+        .identifier => {
+            const d = (model.reference(at) orelse return null).declaration orelse return null;
+            const record = model.declarations[@backingInt(d)];
+            if (record.kind != .variable) return null;
+            const variable = tree.fullVarDecl(record.node) orelse return null;
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+            return self.readFrom(function, whole, variable.ast.init_node.unwrap() orelse return null, depth + 1);
+        },
+        else => {},
+    }
+    if (valueKept(tree, at)) |kept| {
+        const inner = try self.readFrom(function, whole, kept.operand, depth + 1) orelse return null;
+        return .{ .from = inner.from, .recast = inner.recast or kept.recast };
+    }
+    var found: ?Reader = null;
+    for (try self.prongs(tree, at) orelse return null) |value| {
+        const here = try self.readFrom(function, whole, value, depth + 1) orelse return null;
+        if (found) |other| {
+            if (other.from != here.from) return null;
+            found = .{ .from = here.from, .recast = other.recast or here.recast };
+        } else found = here;
+    }
+    return found;
+}
+
+/// The operand a builtin gives the value of, as the same bits (`@byteSwap`, `@bitReverse`) or
+/// as another type (`@bitCast`: `recast`).
+fn valueKept(tree: *const Ast, node: Ast.Node.Index) ?struct { operand: Ast.Node.Index, recast: bool } {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return null;
+    if (std.mem.eql(u8, name, "@bitCast")) return .{ .operand = args[0], .recast = true };
+    if (std.mem.eql(u8, name, "@byteSwap") or std.mem.eql(u8, name, "@bitReverse")) return .{ .operand = args[0], .recast = false };
+    return null;
+}
+
+/// The values a `switch` or an `if` gives, one per prong; null for anything else, and for an
+/// `if` with no `else`.
+fn prongs(self: *Facts, tree: *const Ast, node: Ast.Node.Index) ResolveError!?[]const Ast.Node.Index {
+    if (tree.fullIf(node)) |full| return try self.gpa.dupe(Ast.Node.Index, &.{ full.ast.then_expr, full.ast.else_expr.unwrap() orelse return null });
+    const full = tree.fullSwitch(node) orelse return null;
+    const out = try self.gpa.alloc(Ast.Node.Index, full.ast.cases.len);
+    for (full.ast.cases, out) |case, *value| value.* = tree.fullSwitchCase(case).?.ast.target_expr; // unreachable: a switch's cases are cases
+    return out;
 }
 
 const Copiers = struct { found: std.AutoHashMapUnmanaged(Decl, ?Copier) = .empty };
 
 /// The parameters a function copies memory between: what `from` points at or holds into what
-/// `into` points at.
-pub const Copier = struct { into: usize, from: usize };
+/// `into` points at; where `exchange`, each into the other (a swap, which duplicates nothing).
+pub const Copier = struct { into: usize, from: usize, exchange: bool = false };
 
 /// How `function` copies memory, where every store its body makes writes, through what one
-/// parameter points at, a value read from what another points at or holds, and it makes one:
-/// `std.mem.copyForwards` (`for (dest[0..source.len], source) |*d, s| d.* = s;`),
-/// copyBackwards (`dest[i] = source[i]`), a function around `@memcpy`. Null where a store
-/// writes other memory or what no one parameter gives, or two pair other parameters (a swap
-/// through a local, which duplicates nothing).
+/// parameter points at, a value read from what another points at or holds, through what keeps
+/// the value (`@bitCast`, `@byteSwap`, each prong of a `switch` or an `if`, a constant), and it
+/// makes one: `std.mem.copyForwards` (`for (dest[0..source.len], source) |*d, s| d.* = s;`),
+/// copyBackwards (`dest[i] = source[i]`), a function around `@memcpy`, `writeInt`'s
+/// `buffer.* = @bitCast(value)`, a setter's `raw.* = v`; a call of a copier copies as it does,
+/// between what its arguments give (a function around `copyForwards`). Two stores each way
+/// between the same two are an exchange (`std.mem.swap`). Null where a store writes other
+/// memory or what no one parameter gives, or two pair other parameters.
 pub fn copierOf(self: *Facts, function: Decl) ResolveError!?Copier {
     const copiers = try self.memo(Copiers);
     if (copiers.found.get(function)) |kept| return kept;
@@ -6518,14 +6597,14 @@ fn findCopier(self: *Facts, function: Decl) ResolveError!?Copier {
     var found: ?Copier = null;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const into_node: Ast.Node.Index, const from_node: Ast.Node.Index = switch (tag) {
+        const into_node: Ast.Node.Index, const from_node: Ast.Node.Index, const exchange: bool = switch (tag) {
             // A store to a local of its own (`i -= 1`) is its bookkeeping, no memory it is given.
             .assign, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => blk: {
                 if (!self.ownStatement(function.file, whole, body, node)) continue;
                 const target, const value = tree.nodeData(node).node_and_node;
                 if (self.ownLocal(function.file, whole, target)) continue;
                 if (tag != .assign) return null;
-                break :blk .{ target, value };
+                break :blk .{ target, value, false };
             },
             .assign_destructure, .asm_simple, .@"asm" => if (self.ownStatement(function.file, whole, body, node)) return null else continue,
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
@@ -6533,20 +6612,68 @@ fn findCopier(self: *Facts, function: Decl) ResolveError!?Copier {
                 const name = tree.tokenSlice(tree.nodeMainToken(node));
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = builtinArgs(tree, node, &buffer);
-                if ((std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memmove")) and args.len == 2) break :blk .{ args[0], args[1] };
+                if ((std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memmove")) and args.len == 2) break :blk .{ args[0], args[1], false };
                 for (accesses.writer_builtins) |entry| if (std.mem.eql(u8, name, entry[0])) return null;
                 continue;
             },
+            // A copier's call copies between what its arguments give.
+            .call_one, .call_one_comma, .call, .call_comma => blk: {
+                if (!self.ownStatement(function.file, whole, body, node)) continue;
+                const call = (try calls.at(self, function.file, node)) orelse continue;
+                const args = switch (call.args) {
+                    .known => |each| each,
+                    .unknown => continue,
+                };
+                const inner = switch (call.callee) {
+                    .function => |callee| try self.copierOf(callee) orelse continue,
+                    else => continue,
+                };
+                if (inner.into >= args.len or inner.from >= args.len) continue;
+                break :blk .{ args[inner.into], args[inner.from], inner.exchange };
+            },
             else => continue,
         };
-        if (!self.ownStatement(function.file, whole, body, node)) continue;
         const into = try self.reachedParameter(function, whole, into_node) orelse return null;
-        const from = try self.reachedParameter(function, whole, from_node) orelse return null;
+        const from = try self.givenParameter(function, whole, from_node, 0) orelse return null;
         if (into == from) return null;
-        if (found) |other| if (other.into != into or other.from != from) return null;
-        found = .{ .into = into, .from = from };
+        const one: Copier = .{ .into = into, .from = from, .exchange = exchange };
+        found = if (found) |other| (copierJoin(other, one) orelse return null) else one;
     }
     return found;
+}
+
+/// Two copies one body makes as one: the same, or each way between the same two (an exchange).
+fn copierJoin(a: Copier, b: Copier) ?Copier {
+    if (a.into == b.into and a.from == b.from) return .{ .into = a.into, .from = a.from, .exchange = a.exchange or b.exchange };
+    if (a.into == b.from and a.from == b.into) return .{ .into = a.into, .from = a.from, .exchange = true };
+    return null;
+}
+
+/// The parameter whose memory or value the value `node` gives (`reachedParameter`), through
+/// what keeps the value: `@bitCast`, `@byteSwap`, a constant, each prong of a `switch` or an
+/// `if`, all the same one.
+fn givenParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast.Node.Index, depth: u8) ResolveError!?usize {
+    if (depth >= 16) return null;
+    const tree = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const at = try self.throughCasts(function.file, node);
+    if (valueKept(tree, at)) |kept| return self.givenParameter(function, whole, kept.operand, depth + 1);
+    if (try self.prongs(tree, at)) |each| {
+        var found: ?usize = null;
+        for (each) |value| {
+            const here = try self.givenParameter(function, whole, value, depth + 1) orelse return null;
+            if (found) |other| if (other != here) return null;
+            found = here;
+        }
+        return found;
+    }
+    if (tree.nodeTag(at) == .identifier) if (model.reference(at)) |reference| if (reference.declaration) |d| {
+        const record = model.declarations[@backingInt(d)];
+        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| {
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) return self.givenParameter(function, whole, variable.ast.init_node.unwrap() orelse return null, depth + 1);
+        };
+    };
+    return self.reachedParameter(function, whole, at);
 }
 
 /// Whether `target` names a variable the function `whole` declares, by its name.
@@ -6574,8 +6701,8 @@ fn ownStatement(self: *Facts, file: Project.FileId, whole: Ast.Node.Index, body:
 }
 
 /// The parameter of `function` whose memory `node` names, through a dereference, an element,
-/// a member, a payload, a slice, a cast, a `for` capture of an input (`|*d|` over
-/// `dest[0..n]`) and a constant's initializer.
+/// a member, a payload, a slice, an address, a cast, a view's call, a `for` capture of an input
+/// (`|*d|` over `dest[0..n]`) and a constant's initializer.
 fn reachedParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast.Node.Index) ResolveError!?usize {
     const tree = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
@@ -6587,6 +6714,13 @@ fn reachedParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: A
             .array_access => at = tree.nodeData(at).node_and_node[0],
             .field_access, .unwrap_optional => at = tree.nodeData(at).node_and_token[0],
             .slice_open, .slice, .slice_sentinel => at = tree.fullSlice(at).?.ast.sliced, // unreachable: the tag is a slice's
+            .address_of => at = tree.nodeData(at).node,
+            .call_one, .call_one_comma, .call, .call_comma => {
+                // A view's call: the memory of what it views (`std.mem.asBytes(p)`).
+                const through = try accesses.viewed(self, function.file, at);
+                if (through == at) return null;
+                at = through;
+            },
             .identifier => {
                 const d = (model.reference(at) orelse return null).declaration orelse return null;
                 const record = model.declarations[@backingInt(d)];
@@ -7556,8 +7690,9 @@ pub const accesses = struct {
         .{ "@atomicRmw", 1 }, .{ "@cmpxchgWeak", 1 }, .{ "@cmpxchgStrong", 1 },
     };
 
-    /// A copy of memory a builtin makes: what it writes and what it reads.
-    pub const Copy = struct { into: Side, from: Side };
+    /// A copy of memory: what it writes and what it reads; where `exchange`, each side is also
+    /// written with what the other held (a swap, which duplicates nothing).
+    pub const Copy = struct { into: Side, from: Side, exchange: bool = false };
 
     /// One side of a copy: the place its pointer points at (`pointed`), or where that names
     /// none, the pointer through its views (`viewed`), whose pointee no place here names; or a
@@ -7577,18 +7712,24 @@ pub const accesses = struct {
 
     /// The copy of memory `node` makes, by what it does: a builtin that writes through one
     /// pointer what it reads through another (`@memcpy`, `@memmove`); a call of a function that
-    /// does (`Facts.copierOf`: `std.mem.copyForwards`); a value read out of other memory as
-    /// another type, through a pointer that reinterprets it (`std.mem.asBytes(&k).*`) or a call
-    /// of a function that returns one (`Facts.readOf`: `std.mem.bytesToValue`, `toBytes`); a
-    /// store through such a pointer (`raw.* = v` with `raw = @ptrCast(&d)`,
-    /// `std.mem.asBytes(&d)[0] = b`).
+    /// does (`Facts.copierOf`: `std.mem.copyForwards`, `std.mem.swap`), or that stores a value
+    /// it is given through a pointer that reinterprets the memory (`std.mem.writeInt` into
+    /// `std.mem.asBytes(&d)[0..12]`, a setter handed `@ptrCast(&d)`); a value read out of other
+    /// memory as another type, through a pointer that reinterprets it (`std.mem.asBytes(&k).*`,
+    /// `std.mem.bytesAsSlice(T, b)[0]`) or a call of a function that reads one out
+    /// (`Facts.readOf`: `std.mem.bytesToValue`, `toBytes`, `readInt`; a getter handed a
+    /// reinterpreting pointer); a store through such a pointer (`raw.* = v` with
+    /// `raw = @ptrCast(&d)`, `std.mem.asBytes(&d)[0] = b`). A place a store writes is not read.
     pub fn copyAt(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Copy {
         const tree = &facts.project.at(file).file.tree;
         switch (tree.nodeTag(node)) {
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
             .call_one, .call_one_comma, .call, .call_comma => return copyByCall(facts, file, node),
-            .deref => {
-                const pointer = tree.nodeData(node).node;
+            .deref, .array_access => {
+                if (stored(facts, file, node)) return null;
+                const pointer = if (tree.nodeTag(node) == .deref) tree.nodeData(node).node else tree.nodeData(node).node_and_node[0];
+                // An element of an array held by value is its own memory, not read through one.
+                if (tree.nodeTag(node) == .array_access and !try pointerArgument(facts, file, pointer)) return null;
                 if (!try reinterprets(facts, file, pointer)) return null;
                 return .{ .into = .{ .value = node }, .from = try sideOf(facts, file, pointer) };
             },
@@ -7613,8 +7754,9 @@ pub const accesses = struct {
         return .{ .into = try sideOf(facts, file, args[into]), .from = try sideOf(facts, file, args[from]) };
     }
 
-    /// The copy a call makes: a copier's, from one argument's memory into another's; a reader's,
-    /// its result read out of an argument's memory as another type.
+    /// The copy a call makes: a copier's, from one argument's memory into another's, or of a
+    /// value into memory its pointer reads as another type; a reader's, its result read out of
+    /// an argument's memory, as another type by the reader or by the pointer it is handed.
     fn copyByCall(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!?Copy {
         const call = (try calls.at(facts, file, node)) orelse return null;
         const args = switch (call.args) {
@@ -7627,7 +7769,7 @@ pub const accesses = struct {
             .any => return null,
         };
         var copier: ?Facts.Copier = null;
-        var reader: ?usize = null;
+        var reader: ?Facts.Reader = null;
         for (functions, 0..) |function, k| {
             const one = try facts.copierOf(function);
             const read = try facts.readOf(function);
@@ -7636,26 +7778,47 @@ pub const accesses = struct {
                 reader = read;
                 continue;
             }
-            if (copier) |c| if (one == null or one.?.into != c.into or one.?.from != c.from) {
+            if (copier) |c| if (one == null or !std.meta.eql(one.?, c)) {
                 copier = null;
             };
-            if (reader) |r| if (read != r) {
+            if (reader) |r| if (read == null or !std.meta.eql(read.?, r)) {
                 reader = null;
             };
         }
-        // Memory copied between what two pointers point at; a value passed is a copy the call
-        // makes as any argument is.
-        if (copier) |c| if (c.into < args.len and c.from < args.len) {
-            if (pointing(try facts.resolve(file, args[c.into])) and pointing(try facts.resolve(file, args[c.from]))) return .{ .into = try sideOf(facts, file, args[c.into]), .from = try sideOf(facts, file, args[c.from]) };
+        if (copier) |c| if (c.into < args.len and c.from < args.len and try pointerArgument(facts, file, args[c.into])) {
+            // Memory copied between what two pointers point at.
+            if (try pointerArgument(facts, file, args[c.from])) return .{ .into = try sideOf(facts, file, args[c.into]), .from = try sideOf(facts, file, args[c.from]), .exchange = c.exchange };
+            // A value stored through a pointer that reads the memory as another type; one
+            // stored as the memory's own is a store, as any argument passed is a copy.
+            if (!c.exchange and try reinterprets(facts, file, args[c.into])) return .{ .into = try sideOf(facts, file, args[c.into]), .from = .{ .value = args[c.from] } };
         };
-        if (reader) |r| if (r < args.len) return .{ .into = .{ .value = node }, .from = try readSide(facts, file, args[r]) };
+        if (reader) |r| if (r.from < args.len) {
+            const recast = r.recast or (try pointerArgument(facts, file, args[r.from]) and try reinterprets(facts, file, args[r.from]));
+            if (recast) return .{ .into = .{ .value = node }, .from = try readSide(facts, file, args[r.from]) };
+        };
         return null;
+    }
+
+    /// Whether a call's argument is a pointer: its value resolves to one, or it keeps one (a
+    /// cast or a view of a pointer, `viewed`: `@ptrCast(d)` handed to a `*T` whose type comes
+    /// from where it goes).
+    fn pointerArgument(facts: *Facts, file: Project.FileId, arg: Ast.Node.Index) Error!bool {
+        if (pointing(try facts.resolve(file, arg))) return true;
+        const memory = try viewed(facts, file, arg);
+        return memory != arg and pointing(try facts.resolve(file, memory));
+    }
+
+    /// Whether `node` is the place an assignment stores into, which it does not read.
+    fn stored(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+        const tree = &facts.project.at(file).file.tree;
+        const parent = facts.project.at(file).model.parentOf(node) orelse return false;
+        return tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == node;
     }
 
     /// What a reader's argument gives it: memory it points at, or a value it reads the bytes of
     /// (`std.mem.toBytes(x)` reads `x`).
     fn readSide(facts: *Facts, file: Project.FileId, arg: Ast.Node.Index) Error!Side {
-        if (pointing(try facts.resolve(file, arg))) return sideOf(facts, file, arg);
+        if (try pointerArgument(facts, file, arg)) return sideOf(facts, file, arg);
         return .{ .place = arg };
     }
 

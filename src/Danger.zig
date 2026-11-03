@@ -705,18 +705,35 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     }
 }
 
-/// Whether a value is or holds by value one of std's time types (`times`): itself, or an
-/// array's elements, or what a pointer or an optional holds.
+/// Whether a value is or holds by value one of std's time types (`times`): itself, an array's
+/// elements, what a pointer or an optional holds, or a field of a struct or a union it is (a
+/// record copied as bytes copies its fields; a pointer a field holds is no time by value). An
+/// enum holds none; a container whose kind or fields do not resolve, or past sixteen levels,
+/// may hold one.
 const TimeHeld = enum { yes, no, unknown };
 fn heldTime(c: *Context, times: []const Facts.Container, value: Facts.Value) Context.Error!TimeHeld {
+    return timeHeld(c, times, value, true, 0);
+}
+
+fn timeHeld(c: *Context, times: []const Facts.Container, value: Facts.Value, side: bool, depth: u8) Context.Error!TimeHeld {
+    if (depth >= 16) return .unknown;
     return switch (value) {
-        .instance, .container => |found| for (times) |time| {
-            if (found.file == time.file and found.scope == time.scope) break .yes;
-        } else .no,
-        .array, .pointer, .optional => |inner| heldTime(c, times, inner.*),
+        .instance, .container => |found| blk: {
+            for (times) |time| if (found.file == time.file and found.scope == time.scope) break :blk .yes;
+            if (found.symbolic and found.made_by == null) break :blk .unknown;
+            switch (c.facts.kindOf(found) orelse break :blk .unknown) {
+                .keyword_enum => break :blk .no,
+                .keyword_struct, .keyword_union => {},
+                else => break :blk .unknown,
+            }
+            break :blk fieldsTime(c, times, try c.facts.heldFields(found), depth);
+        },
+        // The side of a copy is what its pointer points at; a pointer a record holds is its own.
+        .pointer => |inner| if (side) timeHeld(c, times, inner.*, true, depth + 1) else .no,
+        .array, .optional => |inner| timeHeld(c, times, inner.*, side, depth + 1),
         .alternatives => |each| blk: {
             var out: TimeHeld = .no;
-            for (each) |one| switch (try heldTime(c, times, one)) {
+            for (each) |one| switch (try timeHeld(c, times, one, side, depth + 1)) {
                 .yes => out = .yes,
                 .unknown => break :blk .unknown,
                 .no => {},
@@ -726,6 +743,18 @@ fn heldTime(c: *Context, times: []const Facts.Container, value: Facts.Value) Con
         .primitive, .scalar => .no,
         else => .unknown,
     };
+}
+
+/// Whether the fields of a record hold a time by value: yes where one does, unknown where one
+/// may.
+fn fieldsTime(c: *Context, times: []const Facts.Container, fields: []const Facts.HeldField, depth: u8) Context.Error!TimeHeld {
+    var out: TimeHeld = .no;
+    for (fields) |field| switch (try timeHeld(c, times, field.value, false, depth + 1)) {
+        .yes => return .yes,
+        .unknown => out = .unknown,
+        .no => {},
+    };
+    return out;
 }
 
 /// Whether a raw `.nanoseconds` read meets only another one, or zero, in a comparison or a
