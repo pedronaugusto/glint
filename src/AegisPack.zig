@@ -1180,13 +1180,14 @@ fn checkCopies(c: *Context) Context.Error!void {
         }
         // A destructure copies what its value reads, as a declaration does; a copy of bytes
         // copies the memory it reads (`@memcpy(dst, std.mem.asBytes(&owner))`).
-        if (tag == .assign_destructure) try checkCopy(c, tree, node, tree.assignDestructure(node).ast.value_expr, null);
+        const form = Facts.accesses.formOf(tag);
+        if (form == .destructure) try checkCopy(c, tree, node, tree.assignDestructure(node).ast.value_expr, null);
         // An exchange (`std.mem.swap`) moves each into the other: no second holder.
         if (try Facts.accesses.copyAt(c.facts, c.file, node)) |copy| if (!copy.exchange) try checkCopy(c, tree, node, copy.from.node(), null);
-        if (tag == .assign) {
+        if (form == .assign) {
             const sides = tree.nodeData(node).node_and_node;
             // `_ = x` discards the value: no second holder.
-            if (tree.nodeTag(sides[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(sides[0])), "_")) continue;
+            if (try Facts.accesses.discardedBy(c.facts, c.file, node) != null) continue;
             try checkCopy(c, tree, node, sides[1], null);
             try checkStoredBorrow(c, tree, node, sides[0], sides[1]);
         }
@@ -1514,23 +1515,14 @@ const Exposure = struct {
             .slice, .slice_open, .slice_sentinel => return e.carries(tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the tag is a slice's
             // An address of a part read through a borrow points into what it borrows.
             .address_of => {
-                var place = tree.nodeData(node).node;
-                while (true) place = switch (tree.nodeTag(place)) {
-                    .field_access, .unwrap_optional, .grouped_expression => tree.nodeData(place).node_and_token[0],
-                    .deref => tree.nodeData(place).node,
-                    .array_access => tree.nodeData(place).node_and_node[0],
-                    else => break,
-                };
-                return e.carries(place, depth + 1);
+                const path = try Facts.accesses.pathOf(c.facts, c.file, tree.nodeData(node).node);
+                return e.carries(path.steps[path.steps.len - 1].node, depth + 1);
             },
             // A part of what carries a borrow carries it where the part may be a pointer, or a
             // value holding one; a number, a truth value or an enum's tag holds none.
             .field_access, .unwrap_optional, .deref, .array_access => {
-                const whole = switch (tree.nodeTag(node)) {
-                    .field_access, .unwrap_optional => tree.nodeData(node).node_and_token[0],
-                    .deref => tree.nodeData(node).node,
-                    else => tree.nodeData(node).node_and_node[0],
-                };
+                const path = try Facts.accesses.pathOf(c.facts, c.file, node);
+                const whole = path.steps[1].node;
                 if (try plainValue(c, c.file, node, 0)) return false;
                 if (scalarShaped(c, try c.facts.resolve(c.file, node))) return false;
                 return e.carries(whole, depth + 1);
@@ -1545,12 +1537,15 @@ const Exposure = struct {
                 const v = tree.fullVarDecl(decl.node) orelse return false;
                 if (v.ast.init_node.unwrap()) |init| if (try e.carries(init, depth + 1)) return true;
                 // Anything put in it later, whole or in a part (`r.v = s.expose()`).
-                for (tree.nodes.items(.tag), 0..) |tag, i| {
-                    if (tag != .assign) continue;
-                    const sides = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_node;
-                    const root = placeRoot(tree, sides[0]) orelse continue;
-                    if (Contract.local(c, root) != index) continue;
-                    if (try e.carries(sides[1], depth + 1)) return true;
+                for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
+                    const value = site.value orelse continue;
+                    const into = try Facts.accesses.pathOf(c.facts, c.file, site.target orelse continue);
+                    const root = switch (into.root) {
+                        .decl => |root| root,
+                        .none, .unknown => continue,
+                    };
+                    if (root.file != c.file or root.index != index) continue;
+                    if (try e.carries(value, depth + 1)) return true;
                 }
                 return false;
             },
@@ -1571,7 +1566,8 @@ const Exposure = struct {
         var call_buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullCall(&call_buffer, node)) |call| {
             var given = false;
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) given = try e.carries(tree.nodeData(call.ast.fn_expr).node_and_token[0], depth + 1);
+            const callee = try Facts.accesses.pathOf(c.facts, c.file, call.ast.fn_expr);
+            if (callee.steps.len >= 2 and callee.steps[0].kind == .field) given = try e.carries(callee.steps[1].node, depth + 1);
             for (call.ast.params) |arg| given = given or try e.carries(arg, depth + 1);
             if (given and !scalarShaped(c, try c.facts.resolve(c.file, node))) e.unknown = e.unknown orelse node;
         }
@@ -1765,42 +1761,36 @@ const Hold = union(enum) { read, copy, address, unknown: Facts.Unknown };
 /// method's receiver by value); `.unknown` a method's receiver whose method does not resolve.
 fn heldBy(c: *Context, reference: Ast.Node.Index) Context.Error!Hold {
     const tree = try c.project.syntax(try c.source());
-    const model = &c.project.at(c.file).model;
     // The part of the local read: `r`, `r.a`, `r.a[0]`, `r.?`.
     var part = reference;
-    while (model.parentOf(part)) |parent| {
-        switch (tree.nodeTag(parent)) {
-            .field_access, .unwrap_optional, .grouped_expression => if (tree.nodeData(parent).node_and_token[0] != part) break,
-            .array_access => if (tree.nodeData(parent).node_and_node[0] != part) break,
+    var use = try Facts.accesses.useOf(c.facts, c.file, part);
+    while (true) {
+        part = switch (use) {
+            .member => |read| read,
+            .element => |indexed| indexed,
+            .carried => |carry| switch (carry.how) {
+                .grouped, .unwrapped => carry.into,
+                else => break,
+            },
             else => break,
-        }
-        part = parent;
+        };
+        use = try Facts.accesses.useOf(c.facts, c.file, part);
     }
-    const parent = model.parentOf(part) orelse return .copy;
-    switch (tree.nodeTag(parent)) {
-        .address_of => return .address,
-        .assign => {
-            const target = tree.nodeData(parent).node_and_node[0];
-            // Written over, not read.
-            if (target == part and part == reference) return .read;
-            if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return .read;
+    switch (use) {
+        .address => return .address,
+        // Written over, not read.
+        .written => if (part == reference) return .read,
+        .discarded => return .read,
+        .builtin_argument => |at| for ([_][]const u8{ "@TypeOf", "@sizeOf", "@alignOf" }) |each| {
+            if (Facts.isBuiltin(tree, at.call, each)) return .read;
         },
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(parent));
-            if (std.mem.eql(u8, name, "@TypeOf") or std.mem.eql(u8, name, "@sizeOf") or std.mem.eql(u8, name, "@alignOf")) return .read;
+        // A method called on it, or on a part: its receiver.
+        .callee => |call| if (Facts.accesses.formOf(tree.nodeTag(part)) == .member) return switch (try pointerReceiver(c, call)) {
+            .yes => .address,
+            .no => .copy,
+            .unknown => |why| .{ .unknown = why },
         },
         else => {},
-    }
-    // A method called on it, or on a part: its receiver.
-    if (tree.nodeTag(part) == .field_access) {
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == part) {
-            return switch (try pointerReceiver(c, parent)) {
-                .yes => .address,
-                .no => .copy,
-                .unknown => |why| .{ .unknown = why },
-            };
-        };
     }
     if (part == reference) return .copy;
     // A part read: plain data copies no owner.
