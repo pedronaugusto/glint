@@ -10,8 +10,6 @@
         "capture/mx-optional_pointer_capture/hole.zig",
         // matrix A014: a for loop's pointer capture into a local array is no alias the rule follows
         "capture/mx-for_pointer_capture/hole.zig",
-        // matrix A014: `&@field(s, "a")` is no path into the local the rule reads
-        "field/mx-field_builtin_address/hole.zig",
         // matrix A014: `&p.*` is no path into the local the rule reads
         "address/mx-address_of_deref/hole.zig",
         // matrix A014: a slice's `.ptr` is no pointer into the local the rule reads

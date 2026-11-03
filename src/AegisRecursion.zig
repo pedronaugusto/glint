@@ -60,17 +60,27 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (!try takesUntrusted(c, tree, decl.node)) continue;
         try entry(&walk, .{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }, decl.token);
     }
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access or call.ast.params.len != 2) continue;
-        const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "parse")) continue;
-        if (try c.role(Contract.library, try c.facts.resolve(c.file, data[0])) != .untrusted) continue;
-        const parser = try c.facts.resolve(c.file, call.ast.params[1]);
+    // Each call of an untrusted value's own `parse` (`u.parse(bytes, parser)`, or through its
+    // type), by its callee: the parser it is given runs on input.
+    for (try Facts.calls.in(c.facts, c.file)) |call| {
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => continue,
+        };
+        const callee = switch (call.callee) {
+            .function => |function| function,
+            .choice, .any => continue,
+        };
+        if (args.len != 3) continue;
+        var input = try c.facts.resolve(c.file, args[0]);
+        if (try c.role(Contract.library, input) != .untrusted) continue;
+        while (input == .pointer) input = input.pointer.*;
+        if (input != .instance) continue;
+        const parse = c.facts.member(input.instance, "parse") orelse continue;
+        if (!std.meta.eql(parse, callee)) continue;
+        const parser = try c.facts.resolve(c.file, args[2]);
         if (parser != .function or !try Program.owns(c, parser.function.file)) continue;
-        try entry(&walk, parser.function, tree.nodeMainToken(node));
+        try entry(&walk, parser.function, tree.nodeMainToken(call.node));
     }
 }
 
@@ -125,7 +135,7 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
         };
         for (choices) |choice| {
             if (choice != .function) continue;
-            if (!try Program.owns(self.c, choice.function.file) or compileTime(self, choice.function)) continue;
+            if (!try Program.owns(self.c, choice.function.file) or try compileTime(self, choice.function)) continue;
             try self.edges.append(self.c.allocator, .{ .at = function, .call = call_node });
             defer _ = self.edges.pop();
             for (self.stack.items, 0..) |on, i| {
@@ -143,25 +153,28 @@ fn visit(self: *Walk, function: Facts.Decl, token: Ast.TokenIndex) Context.Error
 /// it runs only at compile time, or every parameter it takes is comptime (`comptime T: type`,
 /// `comptime seen: []const type`), so no value read at run time reaches it and its depth is the
 /// types' it is given (strand's descriptors).
-fn compileTime(self: *Walk, f: Facts.Decl) bool {
+fn compileTime(self: *Walk, f: Facts.Decl) Context.Error!bool {
     const tree = &self.c.project.at(f.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, self.c.project.at(f.file).model.declarations[@backingInt(f.index)].node) orelse return false;
-    if (proto.ast.return_type.unwrap()) |result| if (typeKeyword(tree, result)) return true;
+    if (proto.ast.return_type.unwrap()) |result| if (try typeKeyword(self.c, f.file, result)) return true;
     var parameters = proto.iterate(tree);
     var any = false;
     while (parameters.next()) |parameter| {
         any = true;
         const declared = if (parameter.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false;
-        const typed = if (parameter.type_expr) |expr| typeKeyword(tree, expr) else false;
+        const typed = if (parameter.type_expr) |expr| try typeKeyword(self.c, f.file, expr) else false;
         if (!declared and !typed) return false;
     }
     return any;
 }
 
-/// Whether a type expression is the type `type`.
-fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
+/// Whether a type expression is the type `type`, by what it resolves to.
+fn typeKeyword(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!bool {
+    return switch (try c.facts.resolve(file, node)) {
+        .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
+        else => false,
+    };
 }
 
 /// The cycle `looped` (the stack from the function called again) makes back to its first
@@ -229,7 +242,6 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
     const from = edge.at;
     const file = from.file;
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
     const flow = try Taint.get(c, Danger.peer_input);
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, edge.call).?; // unreachable: an edge is a call
@@ -239,12 +251,12 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
         const argument = plain(tree, argumentAt(tree, call, receiver, position));
         switch (slot) {
             .param => |p| {
-                if (parameterPosition(self, from, argument) == p) {
+                if ((try parameterPosition(self, from, argument)) == p) {
                     if (try around(self, looped, edges, at + 1, start, .{ .param = position }, grows, guarded)) |way| return way;
                     continue;
                 }
-                const step = stepped(tree, model, argument) orelse continue;
-                if (parameterPosition(self, from, step.depth) != p) continue;
+                const step = (try stepped(self.c, file, argument)) orelse continue;
+                if ((try parameterPosition(self, from, step.depth)) != p) continue;
                 if (grows) |way| if (way != step.grows) continue;
                 // A shrinking depth starts where it is given: the input must not choose it.
                 const side: Range.Side = if (step.grows) .ceiling else .floor;
@@ -252,7 +264,7 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
                 if (try around(self, looped, edges, at + 1, start, .{ .param = position }, step.grows, guarded or holds)) |way| return way;
             },
             .field => |f| {
-                if (parameterPosition(self, from, argument) != f.param) continue;
+                if ((try parameterPosition(self, from, argument)) != f.param) continue;
                 var way = grows;
                 var holds = guarded;
                 // A field the function moves before the call, held by a guard before the move or
@@ -273,9 +285,9 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
                     const inner_receiver = try hasReceiver(c, file, inner);
                     for (try movesIn(self, tried.callee)) |move| {
                         const root = plain(tree, tree.nodeData(move.depth).node_and_token[0]);
-                        const q = parameterPosition(self, tried.callee, root) orelse continue;
+                        const q = (try parameterPosition(self, tried.callee, root)) orelse continue;
                         if (q >= inner.ast.params.len + @intFromBool(inner_receiver)) continue;
-                        if (parameterPosition(self, from, plain(tree, argumentAt(tree, inner, inner_receiver, q))) != f.param) continue;
+                        if ((try parameterPosition(self, from, plain(tree, argumentAt(tree, inner, inner_receiver, q)))) != f.param) continue;
                         if (!std.meta.eql(try fieldOf(c, file, move.depth), f.decl)) continue;
                         if (way) |w| if (w != move.grows) continue;
                         way = move.grows;
@@ -293,7 +305,7 @@ fn around(self: *Walk, looped: []const Facts.Decl, edges: []const Walk.Edge, at:
 /// Whether `move` steps the field `decl` of what `from`'s parameter at `param` points at.
 fn movesSlot(self: *Walk, from: Facts.Decl, file: @import("Project.zig").FileId, move: Step, param: usize, decl: Facts.Decl) Context.Error!bool {
     const tree = &self.c.project.at(file).file.tree;
-    if (parameterPosition(self, from, plain(tree, tree.nodeData(move.depth).node_and_token[0])) != param) return false;
+    if ((try parameterPosition(self, from, plain(tree, tree.nodeData(move.depth).node_and_token[0]))) != param) return false;
     return std.meta.eql(try fieldOf(self.c, file, move.depth), decl);
 }
 
@@ -327,7 +339,7 @@ fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
             },
             // A whole value stored over the field resets it, but in a local by its own name,
             // which is the function's.
-            .holder => if (!ownLocal(c, site)) return false,
+            .holder => if (!(try ownLocal(c, site))) return false,
             .named, .unresolved => return false,
         },
         .covered, .address => return false,
@@ -337,12 +349,15 @@ fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
 
 /// Whether a store's target is a local by its own name: a parameter, a capture or a variable
 /// of a function, whose memory is the function's.
-fn ownLocal(c: *Context, site: Facts.accesses.Site) bool {
-    const tree = &c.project.at(site.file).file.tree;
+fn ownLocal(c: *Context, site: Facts.accesses.Site) Context.Error!bool {
     const model = &c.project.at(site.file).model;
     const target = site.target orelse return false;
-    if (tree.nodeTag(target) != .identifier) return false;
-    const d = (model.reference(target) orelse return false).declaration orelse return false;
+    const path = try Facts.accesses.pathOf(c.facts, site.file, target);
+    if (path.steps.len != 1) return false;
+    const d = switch (path.root) {
+        .decl => |decl| if (decl.file == site.file) decl.index else return false,
+        .none, .unknown => return false,
+    };
     const record = model.declarations[@backingInt(d)];
     if (record.kind == .parameter or record.kind == .capture) return true;
     const scope = model.scopes[@backingInt(record.scope)].kind;
@@ -357,7 +372,7 @@ fn keepsWay(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Ind
     const target, const by = tree.nodeData(node).node_and_node;
     const named = try storedField(c, file, target);
     if (!std.meta.eql(named, decl)) return false;
-    const step = fieldStep(tree, node) orelse return false;
+    const step = (try fieldStep(c, file, node)) orelse return false;
     if (step.grows == grows) return true;
     // An undo: the whole of a `defer` in a block that stepped the same object at least as far
     // before it.
@@ -366,16 +381,16 @@ fn keepsWay(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Ind
     const block = model.parentOf(statement) orelse return false;
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, block) orelse return false;
-    const root = rootDeclaration(c, file, target) orelse return false;
-    const undo = literalValue(tree, by) orelse return false;
+    const root = (try rootDeclaration(c, file, target)) orelse return false;
+    const undo = (try Range.constantValue(c, file, by)) orelse return false;
     for (statements) |earlier| {
         if (earlier == statement) break;
-        const forward = fieldStep(tree, earlier) orelse continue;
+        const forward = (try fieldStep(c, file, earlier)) orelse continue;
         if (forward.grows != grows) continue;
         const moved = tree.nodeData(earlier).node_and_node[0];
         if (!std.meta.eql(try storedField(c, file, moved), decl)) continue;
-        if (rootDeclaration(c, file, moved) != root) continue;
-        if ((literalValue(tree, tree.nodeData(earlier).node_and_node[1]) orelse continue) >= undo) return true;
+        if ((try rootDeclaration(c, file, moved)) != root) continue;
+        if (((try Range.constantValue(c, file, tree.nodeData(earlier).node_and_node[1])) orelse continue) >= undo) return true;
     }
     return false;
 }
@@ -383,34 +398,22 @@ fn keepsWay(self: *Walk, file: @import("Project.zig").FileId, node: Ast.Node.Ind
 /// The field a store's target names by its declaration: `x.f`, or `@field(x, "f")`.
 fn storedField(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index) Context.Error!?Facts.Decl {
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(target)) {
-        .field_access => return fieldOf(c, file, target),
-        .builtin_call_two, .builtin_call_two_comma => {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "@field")) return null;
-            const named = try Taint.namedFields(c, file, target);
-            return if (named.len == 1) named[0] else null;
-        },
-        else => return null,
-    }
+    if (!Facts.isBuiltin(tree, target, "@field")) return fieldOf(c, file, target);
+    const named = try Taint.namedFields(c, file, target);
+    return if (named.len == 1) named[0] else null;
 }
 
 /// The parameter or constant a field store's object is (`p` of `p.depth`), which names one
 /// object wherever it is read; null for any other.
-fn rootDeclaration(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index) ?Model.Declaration.Id {
+fn rootDeclaration(c: *Context, file: @import("Project.zig").FileId, target: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const holder = switch (tree.nodeTag(target)) {
-        .field_access => tree.nodeData(target).node_and_token[0],
-        else => blk: {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, target, &buffer);
-            if (args.len != 2) return null;
-            break :blk args[0];
-        },
+    const path = try Facts.accesses.pathOf(c.facts, file, target);
+    if (path.steps.len < 2 or path.steps[0].kind != .field) return null;
+    const d = switch (try c.facts.definition(file, plain(tree, path.steps[1].node))) {
+        .decl => |decl| if (decl.file == file) decl.index else return null,
+        .none, .unknown => return null,
     };
-    const at = plain(tree, holder);
-    if (tree.nodeTag(at) != .identifier) return null;
-    const d = (model.reference(at) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(d)];
     if (record.kind == .parameter) return d;
     if (record.kind != .variable) return null;
@@ -420,19 +423,12 @@ fn rootDeclaration(c: *Context, file: @import("Project.zig").FileId, target: Ast
 
 /// The field `x.f` names by its declaration, where `x`'s type resolves.
 fn fieldOf(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!?Facts.Decl {
-    const tree = &c.project.at(file).file.tree;
-    if (tree.nodeTag(node) != .field_access) return null;
-    const holder, const name_token = tree.nodeData(node).node_and_token;
-    var value = try c.facts.resolve(file, holder);
-    while (true) value = switch (value) {
-        .pointer, .optional => |inner| inner.*,
-        else => break,
+    const path = try Facts.accesses.pathOf(c.facts, file, node);
+    if (path.steps[0].kind != .field) return null;
+    const decl = switch (try c.facts.definition(file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return null,
     };
-    const container = switch (value) {
-        .instance => |k| k,
-        else => return null,
-    };
-    const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(name_token))) orelse return null;
     if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) return null;
     return decl;
 }
@@ -455,28 +451,23 @@ fn argumentAt(tree: *const Ast, call: Ast.full.Call, receiver: bool, position: u
 
 /// An expression past what keeps its value: parentheses, `@as` and `@intCast`.
 fn plain(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (true) switch (tree.nodeTag(at)) {
-        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
-        .builtin_call_two, .builtin_call_two_comma => {
-            const name_ = tree.tokenSlice(tree.nodeMainToken(at));
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, at, &buffer);
-            if (std.mem.eql(u8, name_, "@as") and args.len == 2) {
-                at = args[1];
-            } else if (std.mem.eql(u8, name_, "@intCast") and args.len == 1) {
-                at = args[0];
-            } else return at;
-        },
-        else => return at,
-    };
+    var at = Facts.ungrouped(tree, node);
+    while (true) : (at = Facts.ungrouped(tree, at)) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, at, &buffer);
+        if (Facts.isBuiltin(tree, at, "@as") and args.len == 2) {
+            at = args[1];
+        } else if (Facts.isBuiltin(tree, at, "@intCast") and args.len == 1) {
+            at = args[0];
+        } else return at;
+    }
 }
 
 /// The position among `f`'s parameters of the one `node` names, if it names one.
-fn parameterPosition(self: *Walk, f: Facts.Decl, node: Ast.Node.Index) ?usize {
+fn parameterPosition(self: *Walk, f: Facts.Decl, node: Ast.Node.Index) Context.Error!?usize {
     const model = &self.c.project.at(f.file).model;
     const tree = &self.c.project.at(f.file).file.tree;
-    const d = parameterOf(tree, model, node) orelse return null;
+    const d = (try parameterOf(self.c, f.file, node)) orelse return null;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(f.index)].node) orelse return null;
     var parameters = proto.iterate(tree);
@@ -497,15 +488,6 @@ fn parameterCount(self: *Walk, f: Facts.Decl) usize {
     return count;
 }
 
-/// An integer literal's value.
-fn literalValue(tree: *const Ast, node: Ast.Node.Index) ?u64 {
-    if (tree.nodeTag(node) != .number_literal) return null;
-    return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-        .int => |n| n,
-        else => null,
-    };
-}
-
 /// Whether a comparison holding where `at` is evaluated holds `depth` to a clean bound on `side`.
 fn held(c: *Context, flow: Taint.Fact, file: @import("Project.zig").FileId, at: Ast.Node.Index, depth: Ast.Node.Index, side: Range.Side) Context.Error!bool {
     for (try Range.boundsAt(c, file, at, depth, side)) |bound| if (try Taint.levelAt(c, flow, file, bound) == .clean) return true;
@@ -522,46 +504,46 @@ fn body(tree: *const Ast, model: *const Model, f: Facts.Decl) ?Ast.Node.Index {
 const Step = struct { depth: Ast.Node.Index, grows: bool };
 
 /// The parameter `argument` passes on one step away: `p + k`, `k + p`, `p - k` and their wrapping
-/// and saturating forms, where `p` is a parameter and `k` a literal above zero.
-fn stepped(tree: *const Ast, model: *const Model, argument: Ast.Node.Index) ?Step {
+/// and saturating forms, where `p` is a parameter and `k` a constant above zero.
+fn stepped(c: *Context, file: @import("Project.zig").FileId, argument: Ast.Node.Index) Context.Error!?Step {
+    const tree = &c.project.at(file).file.tree;
     const grows = switch (tree.nodeTag(argument)) {
         .add, .add_wrap, .add_sat => true,
         .sub, .sub_wrap, .sub_sat => false,
         else => return null,
     };
     const lhs, const rhs = tree.nodeData(argument).node_and_node;
-    if (parameterOf(tree, model, lhs) != null and positive(tree, rhs)) return .{ .depth = lhs, .grows = grows };
-    if (grows and parameterOf(tree, model, rhs) != null and positive(tree, lhs)) return .{ .depth = rhs, .grows = grows };
+    if ((try parameterOf(c, file, lhs)) != null and try positive(c, file, rhs)) return .{ .depth = lhs, .grows = grows };
+    if (grows and (try parameterOf(c, file, rhs)) != null and try positive(c, file, lhs)) return .{ .depth = rhs, .grows = grows };
     return null;
 }
 
-fn parameterOf(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
-    if (tree.nodeTag(node) != .identifier) return null;
-    const reference = model.reference(node) orelse return null;
-    const d = reference.declaration orelse return null;
-    return if (model.declarations[@backingInt(d)].kind == .parameter) d else null;
+/// The parameter of `file`'s function that `node` names, by its definition.
+fn parameterOf(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    const decl = switch (try c.facts.definition(file, node)) {
+        .decl => |decl| decl,
+        .none, .unknown => return null,
+    };
+    if (decl.file != file or c.project.at(file).model.declarations[@backingInt(decl.index)].kind != .parameter) return null;
+    return decl.index;
 }
 
-/// Whether `node` is an integer literal above zero.
-fn positive(tree: *const Ast, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) != .number_literal) return false;
-    return switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
-        .int => |n| n > 0,
-        .big_int => true,
-        else => false,
-    };
+/// Whether `node` is a constant above zero, as the program fixes it.
+fn positive(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!bool {
+    return ((try Range.constantValue(c, file, node)) orelse return false) > 0;
 }
 
 /// The step `node` takes if it moves a field by a literal above zero: `x.f += k`, `x.f -= k` and
 /// their wrapping and saturating forms.
-fn fieldStep(tree: *const Ast, node: Ast.Node.Index) ?Step {
+fn fieldStep(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!?Step {
+    const tree = &c.project.at(file).file.tree;
     const grows = switch (tree.nodeTag(node)) {
         .assign_add, .assign_add_wrap, .assign_add_sat => true,
         .assign_sub, .assign_sub_wrap, .assign_sub_sat => false,
         else => return null,
     };
     const target, const by = tree.nodeData(node).node_and_node;
-    if (tree.nodeTag(target) != .field_access or !positive(tree, by)) return null;
+    if ((try fieldOf(c, file, target)) == null or !try positive(c, file, by)) return null;
     return .{ .depth = target, .grows = grows };
 }
 
@@ -586,9 +568,8 @@ fn before(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.Index
 
 /// The field moves among the statements that run before `call`.
 fn movesBefore(self: *Walk, file: @import("Project.zig").FileId, call: Ast.Node.Index) Context.Error![]const Step {
-    const tree = &self.c.project.at(file).file.tree;
     var out: std.ArrayList(Step) = .empty;
-    for (try before(self, file, call)) |statement| if (fieldStep(tree, statement)) |step| try out.append(self.c.allocator, step);
+    for (try before(self, file, call)) |statement| if (try fieldStep(self.c, file, statement)) |step| try out.append(self.c.allocator, step);
     return out.items;
 }
 
@@ -600,7 +581,7 @@ fn movesIn(self: *Walk, f: Facts.Decl) Context.Error![]const Step {
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, tree.nodeData(whole).node_and_node[1]) orelse return &.{};
     var out: std.ArrayList(Step) = .empty;
-    for (statements) |statement| if (fieldStep(tree, statement)) |step| try out.append(self.c.allocator, step);
+    for (statements) |statement| if (try fieldStep(self.c, f.file, statement)) |step| try out.append(self.c.allocator, step);
     return out.items;
 }
 

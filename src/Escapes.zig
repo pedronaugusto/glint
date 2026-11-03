@@ -45,7 +45,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         const stored = each.stored;
         if (c.inTest(tree.nodeMainToken(node))) continue;
         const function = self.enclosing(node) orelse continue;
-        if (stored) |target| if (!self.outlives(target)) continue;
+        if (stored) |target| if (!try self.outlives(target)) continue;
         const reached = try self.escaping(operand, function, 0);
         if (reached == .none) continue;
         if (stored) |target| if (try self.restored(function, target)) continue;
@@ -111,22 +111,24 @@ const Walk = struct {
     }
 
     /// The local a pointer value reaches into: through `depth` aliases so far.
-    fn escaping(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+    fn escaping(self: Walk, written: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         const tree = self.tree;
+        const node = Facts.ungrouped(tree, written);
         if (depth > 8) return .{ .unknown = .{ .reason = .budget_exhausted, .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
         switch (tree.nodeTag(node)) {
-            .grouped_expression => return self.escaping(tree.nodeData(node).node_and_token[0], function, depth),
             .address_of => {
                 const inner = tree.nodeData(node).node;
-                if (tree.nodeTag(inner) == .identifier) return reach(self.variable(inner, function));
-                const root = self.storage(inner) orelse return .none;
+                const root = (try self.storage(inner)) orelse return .none;
+                // The local itself is its frame's memory, whatever its type.
+                if (root == Facts.ungrouped(tree, inner)) return reach(self.variable(root, function));
                 const d = self.variable(root, function) orelse return .none;
                 return if (try self.value(d)) .{ .local = d } else .none;
             },
             .slice_open, .slice, .slice_sentinel => {
                 const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
-                if (tree.nodeTag(sliced) != .identifier) return .none;
-                const d = self.variable(sliced, function) orelse return .none;
+                const root = (try self.storage(sliced)) orelse return .none;
+                if (root != Facts.ungrouped(tree, sliced)) return .none;
+                const d = self.variable(root, function) orelse return .none;
                 return if (try self.array(d)) .{ .local = d } else .none;
             },
             // A name for a pointer: each value it or a part of it is given (`Facts.givenTo`),
@@ -178,16 +180,16 @@ const Walk = struct {
         return d;
     }
 
-    /// The identifier at the root of a path of fields and elements, never through `.*`.
-    fn storage(self: Walk, node: Ast.Node.Index) ?Ast.Node.Index {
-        var at = node;
-        while (true) switch (self.tree.nodeTag(at)) {
-            .identifier => return at,
-            .field_access => at = self.tree.nodeData(at).node_and_token[0],
-            .array_access => at = self.tree.nodeData(at).node_and_node[0],
-            .grouped_expression => at = self.tree.nodeData(at).node_and_token[0],
-            else => return null,
+    /// The name at the root of a path of fields and elements that stay in its memory: no step
+    /// crosses a pointer (`Facts.accesses.pathOf`).
+    fn storage(self: Walk, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+        const path = try Facts.accesses.pathOf(self.c.facts, self.c.file, node);
+        for (path.steps[0 .. path.steps.len - 1]) |step| switch (step.kind) {
+            .field, .index => if (step.crosses) return null,
+            .slice, .unwrap, .deref, .root => return null,
         };
+        if (path.root != .decl) return null;
+        return path.steps[path.steps.len - 1].node;
     }
 
     /// Whether a local's fields and elements live in it: its type, written or of its value, is
@@ -202,11 +204,6 @@ const Walk = struct {
     /// Whether a local is an array a slice of which is its frame's memory: its type, written
     /// or of its value, is an array, or one the reading does not know.
     fn array(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
-        const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return false;
-        if (decl.ast.type_node.unwrap()) |kind| switch (self.tree.nodeTag(kind)) {
-            .array_type, .array_type_sentinel => return true,
-            else => {},
-        };
         return switch (try self.typeOf(d)) {
             .array, .unknown => true,
             else => false,
@@ -223,20 +220,16 @@ const Walk = struct {
 
     /// Whether an assignment's target outlives the call: reached through a parameter (a pointer
     /// the caller holds) or a container's variable.
-    fn outlives(self: Walk, target: Ast.Node.Index) bool {
-        if (self.tree.nodeTag(target) == .identifier) return self.global(target);
-        var at = target;
-        while (true) switch (self.tree.nodeTag(at)) {
-            .identifier => break,
-            .field_access => at = self.tree.nodeData(at).node_and_token[0],
-            .array_access => at = self.tree.nodeData(at).node_and_node[0],
-            .deref => at = self.tree.nodeData(at).node,
-            .grouped_expression => at = self.tree.nodeData(at).node_and_token[0],
-            else => return false,
-        };
-        const reference = self.model.reference(at) orelse return false;
+    fn outlives(self: Walk, target: Ast.Node.Index) Context.Error!bool {
+        const path = try Facts.accesses.pathOf(self.c.facts, self.c.file, target);
+        if (path.root != .decl) return false;
+        const root = path.steps[path.steps.len - 1].node;
+        // The name itself is its frame's, a parameter's included; a place through it may be
+        // the caller's.
+        if (path.steps.len == 1) return self.global(root);
+        const reference = self.model.reference(root) orelse return false;
         const d = reference.declaration orelse return false;
-        return self.model.declarations[@backingInt(d)].kind == .parameter or self.global(at);
+        return self.model.declarations[@backingInt(d)].kind == .parameter or self.global(root);
     }
 
     fn global(self: Walk, identifier: Ast.Node.Index) bool {
@@ -248,44 +241,6 @@ const Walk = struct {
             .file, .container => true,
             else => false,
         };
-    }
-
-    /// Whether two targets name the same memory by meaning: names of one declaration, the same
-    /// member (by its declaration where the holder's type resolves) of the same holder, the same
-    /// pointee, an element at a literal index spelled the same.
-    fn same(self: Walk, a: Ast.Node.Index, b: Ast.Node.Index, depth: u8) Context.Error!bool {
-        const tree = self.tree;
-        if (depth > 16) return false;
-        if (tree.nodeTag(a) == .grouped_expression) return self.same(tree.nodeData(a).node_and_token[0], b, depth + 1);
-        if (tree.nodeTag(b) == .grouped_expression) return self.same(a, tree.nodeData(b).node_and_token[0], depth + 1);
-        if (tree.nodeTag(a) != tree.nodeTag(b)) return false;
-        switch (tree.nodeTag(a)) {
-            .identifier => {
-                const left = (self.model.reference(a) orelse return false).declaration orelse return false;
-                const right = (self.model.reference(b) orelse return false).declaration orelse return false;
-                return left == right;
-            },
-            .field_access => {
-                // One member's declaration, known on one side but not the other, may be the other's
-                // or not: never the same. With none known on either, the same holder's member of
-                // one name is one field.
-                const left = try self.c.facts.definition(self.c.file, a);
-                const right = try self.c.facts.definition(self.c.file, b);
-                if (left == .decl or right == .decl) {
-                    if (left != .decl or right != .decl or !std.meta.eql(left.decl, right.decl)) return false;
-                } else if (!std.mem.eql(u8, try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(a).node_and_token[1])), try Model.identifier(self.c.allocator, tree.tokenSlice(tree.nodeData(b).node_and_token[1])))) return false;
-                return self.same(tree.nodeData(a).node_and_token[0], tree.nodeData(b).node_and_token[0], depth + 1);
-            },
-            .deref => return self.same(tree.nodeData(a).node, tree.nodeData(b).node, depth + 1),
-            .array_access => {
-                const left_holder, const left_index = tree.nodeData(a).node_and_node;
-                const right_holder, const right_index = tree.nodeData(b).node_and_node;
-                if (tree.nodeTag(left_index) != .number_literal or tree.nodeTag(right_index) != .number_literal) return false;
-                if (!std.mem.eql(u8, tree.getNodeSource(left_index), tree.getNodeSource(right_index))) return false;
-                return self.same(left_holder, right_holder, depth + 1);
-            },
-            else => return false,
-        }
     }
 
     /// Whether a `defer` of `function` assigns the target again, naming the same memory, as its
@@ -300,10 +255,11 @@ const Walk = struct {
             const deferred = tree.nodeData(node).node;
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, deferred) orelse &.{deferred};
-            for (statements) |statement| {
-                if (tree.nodeTag(statement) != .assign) continue;
-                if (try self.same(tree.nodeData(statement).node_and_node[0], target, 0)) return true;
-            }
+            for (statements) |statement| for (try Facts.accesses.storesIn(self.c.facts, self.c.file)) |site| {
+                if (site.node != statement or site.kind != .set) continue;
+                const written = site.target orelse continue;
+                if (try Facts.accesses.samePlace(self.c.facts, self.c.file, written, target) == .yes) return true;
+            };
         }
         return false;
     }
@@ -311,10 +267,10 @@ const Walk = struct {
 
 /// Whether a value is a literal the program compiles in: numbers, characters, strings, enum
 /// literals, and array and struct literals and concatenations of them.
-fn compiledIn(tree: *const Ast, node: Ast.Node.Index) bool {
+fn compiledIn(tree: *const Ast, written: Ast.Node.Index) bool {
+    const node = Facts.ungrouped(tree, written);
     switch (tree.nodeTag(node)) {
         .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => return true,
-        .grouped_expression => return compiledIn(tree, tree.nodeData(node).node_and_token[0]),
         .array_cat => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             return compiledIn(tree, lhs) and compiledIn(tree, rhs);

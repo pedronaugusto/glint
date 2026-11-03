@@ -141,6 +141,27 @@ pub fn dev(b: *std.Build, tools: type) void {
         .args = &.{ "--only", "P003", "--gate", "P003" },
     });
     b.step("check-source-policy", "Verify complete all-cast, safety-off and length policy on explicit own inputs").dependOn(&source_policy.step);
+    // glint's rules read values, writes, calls and types only through the shared queries: the
+    // rule files, with std, aegis and the shared queries' files resolved and not checked.
+    const rule_readers = b.addExecutable(.{ .name = "glint-rule-readers", .root_module = b.createModule(.{
+        .root_source_file = p.path("ci/rule_readers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "glint", .module = module }},
+    }) });
+    var rule_files: std.ArrayList(std.Build.LazyPath) = .empty;
+    for ([_][]const u8{ "AegisPack", "AegisRecursion", "Builtins", "CContract", "Danger", "DangerFlow", "DangerShapes", "DeadDeclarations", "Disallowed", "Escapes", "Metrics", "ParentPointer", "Present", "Streams", "Undefined" }) |name| {
+        rule_files.append(b.allocator, p.path(b.fmt("src/{s}.zig", .{name}))) catch @panic("OOM");
+    }
+    const rule_lint = addLint(b, rule_readers, .{ .sources = rule_files.items, .directories = &.{p.path("src")}, .args = &.{ "--only", "RULE_READERS" } });
+    rule_lint.addArg("--zig-lib-path");
+    rule_lint.addDirectoryArg2(.zig_lib, .{});
+    rule_lint.addArg("--module");
+    rule_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
+    b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries").dependOn(&rule_lint.step);
+    const rule_readers_tests = b.addTest(.{ .root_module = rule_readers.root_module, .filters = if (filter) |f| &.{f} else &.{} });
+    test_step.dependOn(&b.addRunArtifact(rule_readers_tests).step);
+    check.dependOn(&rule_readers.step);
     const helper_check = b.step("check-helper", "Verify the public helper's exact source and directory inputs");
     helper_check.dependOn(&project_smoke.step);
     // The project linter on each test platform, over its own source, which its rule passes.

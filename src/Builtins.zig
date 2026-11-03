@@ -210,17 +210,16 @@ fn reflectedImport(self: *Context, node: Ast.Node.Index, candidates: std.StringH
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return;
-    const builtin = tree.tokenSlice(tree.nodeMainToken(node));
     // `@field` reads a private declaration of its own file; `@hasDecl` sees none, even of
     // its own file, so it never uses a private import.
-    if (!std.mem.eql(u8, builtin, "@field")) return;
-    var name: ?[]const u8 = null;
-    if (tree.nodeTag(args[1]) == .string_literal) {
-        name = std.zig.string_literal.parseAlloc(self.allocator, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return,
-        };
-        if (!candidates.contains(name.?)) return;
+    if (!Facts.isBuiltin(tree, node, "@field")) return;
+    // The one name it spells; any other is read by its holder below.
+    const name: ?[]const u8 = switch (try self.facts.fieldName(self.file, args[1])) {
+        .name => |one| one,
+        .each_of, .names, .computed => null,
+    };
+    if (name) |one| {
+        if (!candidates.contains(one)) return;
         switch (try self.facts.reflected(self.file, node)) {
             .decl => |definition| {
                 if (definition.file == self.file) try used.put(self.allocator, definition.index, {});
@@ -325,21 +324,17 @@ fn amendedPolicies(self: *Context) RunError!void {
 /// statement is a discard (`_ = err`, `_ = @intFromError(err)`), a grouping of one, a `switch`
 /// whose every prong is one, or a call of the program's function whose body is empty
 /// (`ignore(err)`). A call whose callee may be any function does something, as it may.
-fn discards(self: *Context, node: Ast.Node.Index, depth: usize) RunError!bool {
+fn discards(self: *Context, written: Ast.Node.Index, depth: usize) RunError!bool {
     if (depth == 8) return false;
     const tree = &self.project.at(self.file).file.tree;
+    const node = Facts.ungrouped(tree, written);
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| {
         for (statements) |statement| if (!try discards(self, statement, depth + 1)) return false;
         return true;
     }
+    if (try Facts.accesses.discardedBy(self.facts, self.file, node)) |value| return inert(tree, value, 0);
     switch (tree.nodeTag(node)) {
-        .grouped_expression => return discards(self, tree.nodeData(node).node_and_token[0], depth + 1),
-        .assign => {
-            const target, const value = tree.nodeData(node).node_and_node;
-            if (tree.nodeTag(target) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return false;
-            return inert(tree, value, 0);
-        },
         .@"switch", .switch_comma => {
             const whole = tree.fullSwitch(node).?; // unreachable: tagged a switch
             for (whole.ast.cases) |case| if (!try discards(self, tree.fullSwitchCase(case).?.ast.target_expr, depth + 1)) return false; // unreachable: a switch's cases are cases
@@ -371,12 +366,12 @@ fn discards(self: *Context, node: Ast.Node.Index, depth: usize) RunError!bool {
 
 /// Whether an expression only reads: a name, a member, a number, or a builtin of them
 /// (`@intFromError(err)`, `@errorName(err)`), with no call and no store.
-fn inert(tree: *const Ast, node: Ast.Node.Index, depth: usize) bool {
+fn inert(tree: *const Ast, written: Ast.Node.Index, depth: usize) bool {
     if (depth == 8) return false;
+    const node = Facts.ungrouped(tree, written);
     switch (tree.nodeTag(node)) {
         .identifier, .number_literal, .enum_literal, .string_literal, .char_literal => return true,
         .field_access => return inert(tree, tree.nodeData(node).node_and_token[0], depth + 1),
-        .grouped_expression => return inert(tree, tree.nodeData(node).node_and_token[0], depth + 1),
         .builtin_call_two, .builtin_call_two_comma => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
             for ([_][]const u8{ "@intFromError", "@errorName", "@errorCast", "@as" }) |pure| if (std.mem.eql(u8, name, pure)) {
@@ -445,8 +440,9 @@ fn privateSignature(self: *Context, signature: Signature, file: Project.FileId, 
 
 /// Z012 over a type written at `node` of `file` in a public signature: each type a caller has to
 /// name to use it, read by what it is. A form this does not read leaves the signature undecided.
-fn privateType(self: *Context, signature: Signature, file: Project.FileId, node: Ast.Node.Index, depth: usize) RunError!void {
+fn privateType(self: *Context, signature: Signature, file: Project.FileId, written: Ast.Node.Index, depth: usize) RunError!void {
     const tree = &self.project.at(file).file.tree;
+    const node = Facts.ungrouped(tree, written);
     if (depth >= 128) return undecidedType(self, signature, file, node, .budget);
     // A parameter, a part of one (`M.Event`) or `@TypeOf` of one: the type the caller gave.
     if (try fromParameter(self, file, node)) return;
@@ -488,7 +484,6 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, node:
         },
         .optional_type => try privateType(self, signature, file, tree.nodeData(node).node, depth + 1),
         .error_union => try privateType(self, signature, file, tree.nodeData(node).node_and_node[1], depth + 1),
-        .grouped_expression => try privateType(self, signature, file, tree.nodeData(node).node_and_token[0], depth + 1),
         // Error-set policy is not Z012.
         .error_set_decl, .merge_error_sets => {},
         // A type function's call is named by its callee and its arguments, whatever it makes.
@@ -668,9 +663,8 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
         var prototype: [1]Ast.Node.Index = undefined;
         const function = callee_source.file.tree.fullFnProto(&prototype, callee_source.model.declarations[@backingInt(callee.index)].node) orelse return exposedInferred(self, signature, self.file, init, value, 0);
         const result = function.ast.return_type.unwrap() orelse return;
-        const result_tree = &callee_source.file.tree;
         // A type function's call is a type: the constant names it.
-        if (result_tree.nodeTag(result) == .identifier and std.mem.eql(u8, result_tree.tokenSlice(result_tree.nodeMainToken(result)), "type")) return;
+        if (try namesType(self, callee.file, result)) return;
         return privateType(self, signature, callee.file, result, 0);
     }
     try exposedInferred(self, signature, self.file, init, value, 0);
@@ -692,24 +686,20 @@ fn fromParameter(self: *Context, file: Project.FileId, node: Ast.Node.Index) Run
     const tree = &self.project.at(file).file.tree;
     var at = node;
     while (true) {
-        if (tree.nodeTag(at) == .field_access) {
-            at = tree.nodeData(at).node_and_token[0];
-            continue;
+        const path = try Facts.accesses.pathOf(self.facts, file, at);
+        for (path.steps) |step| if (step.kind != .field and step.kind != .root) return false;
+        switch (path.root) {
+            .decl => |definition| return self.project.at(definition.file).model.declarations[@backingInt(definition.index)].kind == .parameter,
+            .unknown => return false,
+            .none => {},
         }
         // `@TypeOf(x)` of a parameter is the type the caller gave.
+        const root = path.steps[path.steps.len - 1].node;
         var buffer: [2]Ast.Node.Index = undefined;
-        const args = Facts.builtinArgs(tree, at, &buffer);
-        if (args.len == 1 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@TypeOf")) {
-            at = args[0];
-            continue;
-        }
-        break;
+        const args = Facts.builtinArgs(tree, root, &buffer);
+        if (args.len != 1 or !Facts.isBuiltin(tree, root, "@TypeOf")) return false;
+        at = args[0];
     }
-    if (tree.nodeTag(at) != .identifier) return false;
-    return switch (try self.facts.definition(file, at)) {
-        .decl => |definition| self.project.at(definition.file).model.declarations[@backingInt(definition.index)].kind == .parameter,
-        .none, .unknown => false,
-    };
 }
 
 /// The types a value exposes: an instance's container, a function's signature, a literal's
@@ -803,7 +793,7 @@ fn syntaxRules(self: *Context) RunError!void {
         if (decl.kind == .function) {
             var buffer: [1]Ast.Node.Index = undefined;
             const function = tree.fullFnProto(&buffer, decl.node).?;
-            const returns_type = if (function.ast.return_type.unwrap()) |t| tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type") else false;
+            const returns_type = if (function.ast.return_type.unwrap()) |t| try namesType(self, self.file, t) else false;
             if (returns_type) {
                 if (!names.isPascalCase(name)) try self.at(.Z005, decl.token, "type-producing function should use TitleCase");
             } else if (!names.isValidFunctionName(name)) try self.at(.Z001, decl.token, "callable should use camelCase");
@@ -852,7 +842,7 @@ fn syntaxRules(self: *Context) RunError!void {
                             if (function.extern_export_inline_token) |token| if (target.tokenTag(token) == .keyword_extern) continue;
                         }
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in callable aliases as ordinary words, for example readXml");
-                        const returns_type = if (function.ast.return_type.unwrap()) |t| target.nodeTag(t) == .identifier and std.mem.eql(u8, target.tokenSlice(target.nodeMainToken(t)), "type") else false;
+                        const returns_type = if (function.ast.return_type.unwrap()) |t| try namesType(self, definition.file, t) else false;
                         if (returns_type) {
                             if (!names.isPascalCase(name)) try self.at(.Z006, decl.token, "type-producing callable alias should use TitleCase");
                         } else if (!names.isValidFunctionName(name)) try self.at(.Z006, decl.token, "callable alias should use camelCase");
@@ -885,6 +875,14 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
     return false;
 }
 
+/// Whether `node` of `file` is the type `type`, by what it resolves to (an alias of it too).
+fn namesType(self: *Context, file: Project.FileId, node: Ast.Node.Index) RunError!bool {
+    return switch (try self.facts.resolve(file, node)) {
+        .primitive => |name| std.mem.eql(u8, name, "type"),
+        else => false,
+    };
+}
+
 /// Whether a selected file reads `T.name` where `T` is a parameter that takes a type: declared
 /// `type` (comptime by necessity) or `anytype`.
 fn genericReads(self: *Context, name: []const u8) RunError!bool {
@@ -898,13 +896,15 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
             if (tag != .field_access) continue;
             const data = tree.nodeData(@fromBackingInt(@intCast(i))).node_and_token;
             if (!std.mem.eql(u8, tree.tokenSlice(data[1]), name)) continue;
-            if (tree.nodeTag(data[0]) != .identifier) continue;
-            const index = (model.reference(data[0]) orelse continue).declaration orelse continue;
-            const parameter = model.declarations[@backingInt(index)];
+            const holder = switch (try self.facts.definition(each.id, data[0])) {
+                .decl => |decl| decl,
+                .none, .unknown => continue,
+            };
+            if (holder.file != each.id) continue;
+            const parameter = model.declarations[@backingInt(holder.index)];
             if (parameter.kind != .parameter) continue;
             // `anytype` has no type expression of its own: the parameter's node is the keyword.
-            const typed = tree.nodeTag(parameter.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parameter.node)), "type");
-            if (typed or tree.tokenTag(parameter.token + 2) == .keyword_anytype) return true;
+            if (tree.tokenTag(parameter.token + 2) == .keyword_anytype or try namesType(self, each.id, parameter.node)) return true;
         }
     }
     return false;
@@ -925,7 +925,7 @@ fn contextRules(self: *Context) RunError!void {
             },
             .unknown => null,
         };
-        if (first) |arg| if (tree.nodeTag(arg) != .bool_and) continue;
+        if (first) |arg| if (Model.conditionOf(tree, arg) != .both) continue;
         switch (try Governed.mayCallStd(self, call.node, "debug.assert")) {
             .no => {},
             .yes => if (first == null)
@@ -982,7 +982,7 @@ fn functionLengths(self: *Context) RunError!void {
         const last = tree.lastToken(node);
         var count = file.line(tree.tokenStart(last)) - file.line(tree.tokenStart(first)) + 1;
         const ret = function.ast.return_type.unwrap();
-        if (ret != null and tree.nodeTag(ret.?) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(ret.?)), "type")) {
+        if (ret != null and try namesType(self, self.file, ret.?)) {
             var widest: u32 = 0;
             var container_buffer: [2]Ast.Node.Index = undefined;
             for (0..tree.nodes.len) |j| {

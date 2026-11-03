@@ -10,7 +10,7 @@ Work in progress. Glint supplies token facts, a semantic model and source rules;
 
 ## Compiled project rules
 
-The public seam is `RuleContext`, `ProjectRule`, `RuleDefinition`, `runConfigured` and `FileConfig`. Built-ins use this same context and sink. A project rule supplies a callback and unique ID at least 1000, an ASCII name, group, purpose and nonzero version. Z/P/D prefixes belong to built-ins. IDs/names/collisions/configuration are validated before callbacks. Rules are statically compiled Zig, never loaded through a runtime ABI.
+The public seam is `RuleContext`, `ProjectRule`, `RuleDefinition`, `runConfigured`, `FileConfig` and `stdCall` (whether a call calls std's declaration at a path, by what its callee resolves to, as `Is`). Built-ins use this same context and sink. A project rule supplies a callback and unique ID at least 1000, an ASCII name, group, purpose and nonzero version. Z/P/D prefixes belong to built-ins. IDs/names/collisions/configuration are validated before callbacks. Rules are statically compiled Zig, never loaded through a runtime ABI.
 
 The context provides immutable checked model handles, conservative value/declaration resolution, primary/related diagnostic spans and explicit `undecided` coverage. The common runner copies temporary messages, orders diagnostics, applies real-comment suppression, and renders text, JSON version 1 and SARIF 2.1.0. Custom metadata appears in every format and coverage. Rule authors retain responsibility for their predicate; a callback cannot make unknown analysis complete by suppressing a finding.
 

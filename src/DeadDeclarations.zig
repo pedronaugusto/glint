@@ -75,25 +75,24 @@ pub fn check(context: *Context) Context.Error!void {
         spelled(candidates.items, by_name, try Model.identifier(a, tree.tokenSlice(token)), token);
     }
     var undecided = false;
-    for (tree.nodes.items(.tag), 0..) |tag, n| {
-        switch (tag) {
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
-            else => continue,
-        }
+    for (0..tree.nodes.len) |n| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(n));
+        if (!Facts.isBuiltin(tree, node, "@field")) continue;
         const main = tree.nodeMainToken(node);
-        if (!std.mem.eql(u8, tree.tokenSlice(main), "@field")) continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
         if (args.len != 2) continue;
-        if (tree.nodeTag(args[1]) == .string_literal) {
-            const literal = tree.tokenSlice(tree.nodeMainToken(args[1]));
-            const name = std.zig.string_literal.parseAlloc(a, literal) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidLiteral => continue, // The parser rejects it; no use to count.
-            };
-            spelled(candidates.items, by_name, name, main);
-            continue;
+        // The names it spells (a literal, a `const` holding one, a list it ranges over).
+        switch (try context.facts.fieldName(context.file, args[1])) {
+            .name => |name| {
+                spelled(candidates.items, by_name, name, main);
+                continue;
+            },
+            .names => |names| {
+                for (names) |name| spelled(candidates.items, by_name, name, main);
+                continue;
+            },
+            .each_of, .computed => {},
         }
         // On a value `@field` reaches only fields; only a type's declarations can be named.
         if (try context.facts.runtime(context.file, args[0])) continue;

@@ -41,6 +41,11 @@ test {
 pub const RuleContext = @import("RuleContext.zig");
 /// Compiled project rule descriptor.
 pub const ProjectRule = RuleContext.Rule;
+/// Whether something is so: yes, no, or unknown and why.
+pub const Is = @import("Governed.zig").Is;
+/// Whether a call calls std's declaration at a path (`mem.eql`), read by what its callee
+/// resolves to: yes where every function it may call is that one, no where none is.
+pub const stdCall = @import("Governed.zig").stdCall;
 /// Rule metadata for custom IDs, versions and bug/policy classes.
 pub const RuleDefinition = @import("Rule.zig").Definition;
 /// Runs compiled project rules and per-source configuration on the same model.

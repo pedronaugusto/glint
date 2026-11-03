@@ -93,6 +93,11 @@
       "zig",
       "build",
       "check-token-portable"
+    ],
+    [
+      "zig",
+      "build",
+      "check-rule-readers"
     ]
   ],
   "shipped": {
