@@ -46,8 +46,17 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(tree.nodeMainToken(node))) continue;
         const function = self.enclosing(node) orelse continue;
         if (stored) |target| if (!self.outlives(target)) continue;
-        const local = (try self.escaping(operand, function, 0)) orelse continue;
+        const reached = try self.escaping(operand, function, 0);
+        if (reached == .none) continue;
         if (stored) |target| if (try self.restored(function, target)) continue;
+        const local = switch (reached) {
+            .none => unreachable, // unreachable: left above
+            .unknown => |why| {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(operand)), why.reason, why.detail);
+                continue;
+            },
+            .local => |d| d,
+        };
         const name = model.declarations[@backingInt(local)].name;
         const message = if (stored == null)
             try c.allocator.print("returns a pointer into local '{s}', which the return frees", .{name})
@@ -56,6 +65,14 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         try c.at(rule, tree.nodeMainToken(operand), message);
     }
 }
+
+/// What a pointer value reaches into: a local of the function's frame, none, or what may be one
+/// and why it is not known.
+const Reached = union(enum) {
+    local: Model.Declaration.Id,
+    none,
+    unknown: struct { reason: @import("Report.zig").Coverage.Reason, detail: []const u8 },
+};
 
 const Walk = struct {
     c: *Context,
@@ -93,44 +110,59 @@ const Walk = struct {
         return d;
     }
 
-    /// The local a pointer value reaches into, or null: through `depth` aliases so far.
-    fn escaping(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!?Model.Declaration.Id {
+    /// The local a pointer value reaches into: through `depth` aliases so far.
+    fn escaping(self: Walk, node: Ast.Node.Index, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
         const tree = self.tree;
-        if (depth > 8) return null;
+        if (depth > 8) return .{ .unknown = .{ .reason = .budget_exhausted, .detail = "a pointer followed through more aliases than are read may point into a local the return frees" } };
         switch (tree.nodeTag(node)) {
             .grouped_expression => return self.escaping(tree.nodeData(node).node_and_token[0], function, depth),
             .address_of => {
                 const inner = tree.nodeData(node).node;
-                if (tree.nodeTag(inner) == .identifier) return self.variable(inner, function);
-                const root = self.storage(inner) orelse return null;
-                const d = self.variable(root, function) orelse return null;
-                return if (try self.value(d)) d else null;
+                if (tree.nodeTag(inner) == .identifier) return reach(self.variable(inner, function));
+                const root = self.storage(inner) orelse return .none;
+                const d = self.variable(root, function) orelse return .none;
+                return if (try self.value(d)) .{ .local = d } else .none;
             },
             .slice_open, .slice, .slice_sentinel => {
-                const sliced = (tree.fullSlice(node) orelse return null).ast.sliced;
-                if (tree.nodeTag(sliced) != .identifier) return null;
-                const d = self.variable(sliced, function) orelse return null;
-                return if (try self.array(d)) d else null;
+                const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
+                if (tree.nodeTag(sliced) != .identifier) return .none;
+                const d = self.variable(sliced, function) orelse return .none;
+                return if (try self.array(d)) .{ .local = d } else .none;
             },
-            // A name for a pointer: what its `const` holds, or each value its `var` is given.
+            // A name for a pointer: each value it or a part of it is given (`Facts.givenTo`),
+            // what a `const` holds; a store that may give it any value may give it a local's
+            // address.
             .identifier => {
-                const d = self.own(node, function) orelse return null;
-                const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
-                if (decl.ast.init_node.unwrap()) |init| if (try self.escaping(init, function, depth + 1)) |reached| return reached;
-                if (tree.tokenTag(decl.ast.mut_token) == .keyword_const) return null;
-                for (try Facts.accesses.writes(self.c.facts, .{ .declaration = .{ .file = self.c.file, .index = d } }, &.{self.c.file})) |site| {
-                    if ((site.kind != .set and site.kind != .init) or site.part) continue;
-                    if (try self.escaping(site.value orelse continue, function, depth + 1)) |reached| return reached;
-                }
-                return null;
+                const d = self.own(node, function) orelse return .none;
+                // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
+                if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
+                const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
+                    return .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                return self.first(given, function, depth + 1);
             },
             else => {
                 var buffer: [2]Ast.Node.Index = undefined;
-                const literal = tree.fullStructInit(&buffer, node) orelse return null;
-                for (literal.ast.fields) |field| if (try self.escaping(field, function, depth)) |d| return d;
-                return null;
+                const literal = tree.fullStructInit(&buffer, node) orelse return .none;
+                var fields: std.ArrayList(Facts.Key) = .empty;
+                for (literal.ast.fields) |field| try fields.append(self.c.allocator, .{ .file = self.c.file, .node = field });
+                return self.first(fields.items, function, depth);
             },
         }
+    }
+
+    /// The first local one of `values` reaches into; else what may be one, or none.
+    fn first(self: Walk, values: []const Facts.Key, function: Ast.Node.Index, depth: u8) Context.Error!Reached {
+        var out: Reached = .none;
+        for (values) |each| switch (try self.escaping(each.node, function, depth)) {
+            .local => |d| return .{ .local = d },
+            .unknown => |why| out = .{ .unknown = why },
+            .none => {},
+        };
+        return out;
+    }
+
+    fn reach(local: ?Model.Declaration.Id) Reached {
+        return if (local) |d| .{ .local = d } else .none;
     }
 
     /// A local of `function`'s own in its frame: a `var` not comptime, or a `const` whose value

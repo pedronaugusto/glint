@@ -65,7 +65,10 @@ const rows = [_]Row{
     .{ .name = "narrow: spelled", .holders = false, .source = shapes ++ "fn w(s: *S) void {\n    s.f = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set exact through" } },
     .{ .name = "narrow: other field", .holders = false, .source = shapes ++ "fn w(s: *S) void {\n    s.g = 1;\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "narrow: computed @field", .holders = false, .source = shapes ++ "fn w(s: *S, comptime n: []const u8) void {\n    @field(s, n) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set holder part through computed" } },
-    .{ .name = "narrow: @field by a const", .holders = false, .source = shapes ++ "const name = \"f\";\nfn w(s: *S) void {\n    @field(s, name) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "5 set holder part through computed" } },
+    // A name a `const` holds is the name it spells (`Facts.fieldName`).
+    .{ .name = "narrow: @field by a const", .holders = false, .source = shapes ++ "const name = \"f\";\nfn w(s: *S) void {\n    @field(s, name) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "5 set exact through" } },
+    .{ .name = "narrow: @field by a const twin", .holders = false, .source = shapes ++ "const name = \"g\";\nfn w(s: *S) void {\n    @field(s, name) = 1;\n}\n", .place = "f", .expected = &.{"1 init exact"} },
+    .{ .name = "@field by an enum literal", .source = shapes ++ "fn w(s: *S) void {\n    @field(s, @tagName(.f)) = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set exact through" } },
     .{ .name = "narrow: anytype holder", .holders = false, .source = shapes ++ "fn w(s: anytype) void {\n    s.f = 1;\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 set named" } },
     .{ .name = "narrow: cast", .holders = false, .source = shapes ++ "fn w(b: *[12]u8) *S {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
     .{ .name = "narrow: asm", .holders = false, .source = shapes ++ "fn w() void {\n    asm volatile (\"\");\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered unresolved" } },

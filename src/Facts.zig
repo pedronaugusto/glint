@@ -2403,6 +2403,50 @@ pub fn heldFields(self: *Facts, container: Container) ResolveError![]const HeldF
     return out.items;
 }
 
+const AddressFree = struct {
+    /// A container read without a type function's bindings, by its declaration; one in
+    /// progress is read as one that may hold an address.
+    found: std.AutoHashMapUnmanaged(struct { Project.FileId, Model.Scope.Id }, ?bool) = .empty,
+};
+
+/// Whether a value of type `value`, or a value `value` is, holds no address anywhere: a number,
+/// a truth value, an error, an enum's tag, and arrays, optionals and error unions of one, and a
+/// struct or a union whose every field holds none (`heldFields`). A pointer, a function, an
+/// opaque, a container a field of which may hold one, a type not known may hold one.
+pub fn holdsNoAddress(self: *Facts, value: Value) ResolveError!bool {
+    return switch (value) {
+        .primitive, .scalar, .error_set => true,
+        .array, .optional, .error_union => |inner| self.holdsNoAddress(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (!try self.holdsNoAddress(one)) break false;
+        } else true,
+        .container, .instance => |container| self.containerHoldsNoAddress(container),
+        else => false,
+    };
+}
+
+fn containerHoldsNoAddress(self: *Facts, container: Container) ResolveError!bool {
+    if (container.symbolic and container.made_by == null) return false;
+    switch (self.kindOf(container) orelse return false) {
+        .keyword_enum => return true,
+        .keyword_struct, .keyword_union => {},
+        else => return false,
+    }
+    const free = try self.memo(AddressFree);
+    const key = .{ container.file, container.scope };
+    if (container.made_by == null) {
+        if (free.found.get(key)) |kept| return kept orelse false;
+        try free.found.put(self.gpa, key, null);
+    }
+    var out = true;
+    for (try self.heldFields(container)) |field| if (!try self.holdsNoAddress(field.value)) {
+        out = false;
+        break;
+    };
+    if (container.made_by == null) try free.found.put(self.gpa, key, out);
+    return out;
+}
+
 /// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
 /// integers, bit counts, arithmetic and the queries that answer yes or no.
 const numeric_builtins = [_][]const u8{
@@ -3782,13 +3826,13 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
                 const typed = try self.instance(type_value);
                 // A function or a pointer to one: which, its initializer's and every store's.
                 if (!callable(typed)) return typed;
-                return self.identity(typed, try self.givenValues(decl, variable, mutable));
+                return self.identity(typed, try self.givenValues(decl));
             }
         }
         if (variable.ast.init_node.unwrap()) |value| {
             const initial = try self.resolve(decl.file, value);
             if (!mutable or !callable(initial)) return initial;
-            return self.identity(initial, try self.givenValues(decl, variable, true));
+            return self.identity(initial, try self.givenValues(decl));
         }
         if (model.parentOf(declaration_record.node)) |parent| if (tree.nodeTag(parent) == .assign_destructure) return self.destructured(decl.file, parent, declaration_record.node);
     }
@@ -3900,30 +3944,567 @@ fn constantLiteral(self: *const Facts, file: Project.FileId, node: Ast.Node.Inde
 /// its own file. Null where one may go unseen: a public variable, which code this run does not
 /// read may write; a store through its address, unless the address is only dropped
 /// (`_ = &f`); one of a part, or an update.
-fn givenValues(self: *Facts, decl: Decl, variable: Ast.full.VarDecl, mutable: bool) ResolveError!?[]const Value {
+fn givenValues(self: *Facts, decl: Decl) ResolveError!?[]const Value {
     var found: std.ArrayList(Value) = .empty;
-    if (variable.ast.init_node.unwrap()) |init| if (!isUndefined(self.syntaxOf(decl.file), init)) try found.append(self.gpa, try self.resolve(decl.file, try self.throughCasts(decl.file, init)));
-    if (!mutable) return found.items;
-    if (self.project.at(decl.file).model.declarations[@backingInt(decl.index)].public) return null;
+    for ((try self.givenTo(decl, false)) orelse return null) |given| {
+        // `undefined` gives no function a call may reach: calling it is illegal.
+        if (isUndefined(self.syntaxOf(given.file), given.node)) continue;
+        try found.append(self.gpa, try self.resolve(given.file, try self.throughCasts(given.file, given.node)));
+    }
+    return found.items;
+}
+
+/// The expressions that give a variable its values: its first value, and for a `var`, each
+/// store of a whole value over it by its own name (`accesses`); with `parts`, each store to a
+/// part of it too, what it then holds, and an `op=` none (what it makes is in the memory the
+/// value before points into). Null where a store may give it any: one to a part of it but with
+/// `parts`, one that reads it first (`op=`) but with `parts`, memory a builtin or code the
+/// program does not hold writes, its address taken (but dropped, `_ = &x`), a store with no
+/// one value, one that reaches it by no name of its own, a public `var` another file may
+/// write, one whose file's writes are being read.
+pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key {
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const variable = self.syntaxOf(decl.file).fullVarDecl(record.node) orelse return null;
+    var found: std.ArrayList(Key) = .empty;
+    if (variable.ast.init_node.unwrap()) |init| try found.append(self.gpa, .{ .file = decl.file, .node = init });
+    if (self.syntaxOf(decl.file).tokenTag(variable.ast.mut_token) != .keyword_var) return found.items;
+    if (record.public) return null;
     // Read while its file's writes are (a store's callee, an `extern`'s shape): its stores are
     // not all known yet.
     if (try accesses.walking(self, decl.file)) return null;
     for (try accesses.writes(self, .{ .declaration = decl }, &.{decl.file})) |site| {
-        if (site.reach != .exact or site.part) return null;
+        if (site.reach != .exact or (site.part and !parts)) return null;
         switch (site.kind) {
-            .init => continue,
+            .init, .read => continue,
             .set => {},
-            .read => continue,
-            .address => if (self.dropped(site)) continue else return null,
-            .update, .covered => return null,
+            .address => if (self.dropped(site)) continue else if (parts) {
+                // A call that takes its address stores through it what it is given; a loop's
+                // pointer capture of it, what its body stores through the capture.
+                try found.appendSlice(self.gpa, (try self.loopedWith(site) orelse try self.handedWith(site)) orelse return null);
+                continue;
+            } else return null,
+            .update => if (parts) continue else return null,
+            .covered => return null,
         }
-        const value = site.value orelse return null;
-        // `undefined` gives no function a call may reach: calling it is illegal.
-        if (isUndefined(self.syntaxOf(site.file), value)) continue;
-        try found.append(self.gpa, try self.resolve(site.file, try self.throughCasts(site.file, value)));
+        try found.append(self.gpa, .{ .file = site.file, .node = site.value orelse return null });
     }
     return found.items;
 }
+
+/// What a `for` loop given a place's address as an input (`for (&out.each) |*slot|`) stores
+/// through it: nothing where its capture takes elements by value or none takes them; each value
+/// its body stores through a pointer capture (`slot.* = v`, `slot.f = v`), found by the
+/// capture's every mention (`accesses.reads`). Null where the capture may go elsewhere: given
+/// as a value, its place's address taken, a method's receiver, a mention not read exactly. Not
+/// a loop's input: none of this (`.none`), for `handedWith`.
+fn loopedWith(self: *Facts, site: accesses.Site) ResolveError!?(?[]const Key) {
+    const tree = self.syntaxOf(site.file);
+    const model = &self.project.at(site.file).model;
+    if (tree.nodeTag(site.node) != .address_of) return null;
+    const parent = model.parentOf(site.node) orelse return null;
+    const loop = tree.fullFor(parent) orelse return null;
+    const position = std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, site.node) orelse return null;
+    const capture = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .capture and d.node == parent and Model.capturePosition(tree, loop, d.token) == position) break i;
+    } else return @as(?[]const Key, &.{});
+    const record = model.declarations[capture];
+    if (tree.tokenTag(record.token - 1) != .asterisk) return @as(?[]const Key, &.{});
+    var out: std.ArrayList(Key) = .empty;
+    const mentions = try accesses.reads(self, .{ .declaration = .{ .file = site.file, .index = @fromBackingInt(@intCast(capture)) } }, &.{site.file});
+    for (mentions) |mention| {
+        if (mention.reach != .exact) return @as(?[]const Key, null);
+        // The place the mention leads to through members, elements, payloads and `.*`.
+        var top = mention.node;
+        while (model.parentOf(top)) |above| : (top = above) switch (tree.nodeTag(above)) {
+            .deref, .unwrap_optional, .grouped_expression => {},
+            .field_access => if (tree.nodeData(above).node_and_token[0] != top) break,
+            .array_access => if (tree.nodeData(above).node_and_node[0] != top) break,
+            else => break,
+        };
+        if (top == mention.node) return @as(?[]const Key, null);
+        const use = model.parentOf(top) orelse return @as(?[]const Key, null);
+        switch (tree.nodeTag(use)) {
+            .assign => {
+                const target, const value = tree.nodeData(use).node_and_node;
+                if (target == top) try out.append(self.gpa, .{ .file = site.file, .node = value });
+            },
+            // Its address, a slice of it, a destructure's target: written past what is read here.
+            .address_of, .slice_open, .slice, .slice_sentinel, .assign_destructure => return @as(?[]const Key, null),
+            .call_one, .call_one_comma, .call, .call_comma => {
+                // A method of the element's: its receiver may be its address.
+                var buffer: [1]Ast.Node.Index = undefined;
+                if (tree.fullCall(&buffer, use).?.ast.fn_expr == top) return @as(?[]const Key, null); // unreachable: the tag is a call's
+            },
+            else => {
+                // A capture of it by its address (`if (slot.*) |*p|`) writes it where that goes.
+                if (tree.fullFor(use)) |inner| if (std.mem.findScalar(Ast.Node.Index, inner.ast.inputs, top) != null) return @as(?[]const Key, null);
+                if (tree.fullIf(use)) |inner| if (inner.ast.cond_expr == top and inner.payload_token != null and tree.tokenTag(inner.payload_token.?) == .asterisk) return @as(?[]const Key, null);
+                if (tree.fullWhile(use)) |inner| if (inner.ast.cond_expr == top and inner.payload_token != null and tree.tokenTag(inner.payload_token.?) == .asterisk) return @as(?[]const Key, null);
+                if (tree.fullSwitch(use)) |inner| if (inner.ast.condition == top) for (inner.ast.cases) |case| {
+                    const named = tree.fullSwitchCase(case).?.payload_token orelse continue; // unreachable: a switch's case
+                    if (tree.tokenTag(named) == .asterisk) return @as(?[]const Key, null);
+                };
+            },
+        }
+    }
+    return @as(?[]const Key, out.items);
+}
+
+/// What a call that takes a place's address may store through it, as far as the addresses it
+/// holds go: each other argument some callee may store there what it holds (`storesAddress`),
+/// where no callee may store there an address of the place's own memory:
+/// `out.breaks.setUnion(paths.breaks)` gives `out` what `paths.breaks` holds. Null for an
+/// address taken other than as a call's receiver or argument, or a callee that may store one or
+/// does not resolve.
+fn handedWith(self: *Facts, site: accesses.Site) ResolveError!?[]const Key {
+    const tree = self.syntaxOf(site.file);
+    const model = &self.project.at(site.file).model;
+    // The address: the receiver a method's call takes, or `&x` given as an argument.
+    const call_node: Ast.Node.Index, const given: Ast.Node.Index = if (tree.nodeTag(site.node) == .address_of)
+        .{ model.parentOf(site.node) orelse return null, site.node }
+    else
+        .{ site.node, site.target orelse return null };
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, call_node) == null) return null;
+    const call = (try calls.at(self, site.file, call_node)) orelse return null;
+    const args = switch (call.args) {
+        .known => |each| each,
+        .unknown => return null,
+    };
+    const position = std.mem.findScalar(Ast.Node.Index, args, given) orelse return null;
+    const functions: []const Decl = switch (call.callee) {
+        .function => |function| &.{function},
+        .choice => |each| each,
+        .any => return null,
+    };
+    for (functions) |function| if ((try self.storesAddress(function, position, position)) != false) return null;
+    var out: std.ArrayList(Key) = .empty;
+    for (args, 0..) |arg, k| {
+        if (k == position) continue;
+        var stored: ?bool = false;
+        for (functions) |function| stored = anyOf(stored, try self.storesAddress(function, position, k));
+        if (stored != false) try out.append(self.gpa, .{ .file = site.file, .node = arg });
+    }
+    return out.items;
+}
+
+const OwnStores = struct {
+    found: std.AutoHashMapUnmanaged(Reading.Key, Reading) = .empty,
+    /// The readings in progress, outermost first.
+    stack: std.ArrayList(Reading.Key) = .empty,
+    /// The readings kept while one in progress was assumed none, innermost assumption last.
+    provisional: std.ArrayList(Reading.Key) = .empty,
+    /// The outermost reading in progress the current one met, assumed none there.
+    low: usize = std.math.maxInt(usize),
+
+    const Reading = union(enum) {
+        reading: usize,
+        read: ?bool,
+
+        /// The function, what is read (a store through a parameter, or its result), the
+        /// parameter whose value is followed.
+        const Key = struct { Decl, Into, usize };
+    };
+
+    /// Where a value goes: memory a parameter points at, or the function's result, read
+    /// `reaching` or not (`Own.reaching`).
+    const Into = union(enum) {
+        param: usize,
+        result: bool,
+    };
+};
+
+/// Whether `function` may store, into the memory its parameter at `into` points at, a value
+/// that is or holds what its parameter at `from` holds. With `from` being `into`: an address of
+/// that memory itself (`self.next = self`, `self.view = &self.buf`, or a callee it hands that
+/// address to doing so), what makes a value of it point into itself; a store into memory the
+/// parameter's pointers reach (`self.items[i] = v`) writes none of its own, and an address read
+/// out of memory (`self.next`) is none but where such a store put it. With another `from`: the
+/// parameter's value, or anything read through it (`into.next = from.next`), which the caller
+/// may have put there. Null where it cannot tell: a target or a value it does not follow, a
+/// copy of memory into it, a callee that does not resolve, a function with no body.
+///
+/// Recursion reads as the least answer: a reading met again while in progress is assumed none,
+/// what a store in some finite run of calls makes. Where the outermost reading so assumed comes
+/// out none the assumption held and each reading kept under it stands; otherwise those are
+/// dropped and read again.
+pub fn storesAddress(self: *Facts, function: Decl, into: usize, from: usize) ResolveError!?bool {
+    return self.ownReading(function, .{ .param = into }, from);
+}
+
+/// Whether `function`'s result may be or hold what its parameter at `from` holds: an address
+/// into the memory it points at (`&self.buf`, `self` itself), or, `reaching`, anything read
+/// through it too. A value read out of that memory not `reaching` (`self.items`) is none but
+/// where a store put one there, as `storesAddress` reads it.
+pub fn returnsAddress(self: *Facts, function: Decl, from: usize, reaching: bool) ResolveError!?bool {
+    return self.ownReading(function, .{ .result = reaching }, from);
+}
+
+fn ownReading(self: *Facts, function: Decl, into: OwnStores.Into, from: usize) ResolveError!?bool {
+    const own_stores = try self.memo(OwnStores);
+    const key: OwnStores.Reading.Key = .{ function, into, from };
+    if (own_stores.found.get(key)) |entry| switch (entry) {
+        .read => |kept| return kept,
+        .reading => |depth| {
+            own_stores.low = @min(own_stores.low, depth);
+            return false;
+        },
+    };
+    const depth = own_stores.stack.items.len;
+    try own_stores.stack.append(self.gpa, key);
+    try own_stores.found.put(self.gpa, key, .{ .reading = depth });
+    const outer_low = own_stores.low;
+    own_stores.low = std.math.maxInt(usize);
+    const kept_before = own_stores.provisional.items.len;
+    const found = try self.findOwnStores(function, into, from);
+    _ = own_stores.stack.pop();
+    const low = own_stores.low;
+    own_stores.low = @min(outer_low, low);
+    try own_stores.found.put(self.gpa, key, .{ .read = found });
+    if (low < depth) {
+        // Read under an assumption about one further out: it stands or falls with that one.
+        try own_stores.provisional.append(self.gpa, key);
+    } else if (own_stores.provisional.items.len > kept_before) {
+        // Its own assumption: held where it comes out none.
+        if (found != false) for (own_stores.provisional.items[kept_before..]) |undone| {
+            _ = own_stores.found.remove(undone);
+        };
+        own_stores.provisional.shrinkRetainingCapacity(kept_before);
+    }
+    return found;
+}
+
+/// What may be so of each of several: so where one is, unknown where one may be.
+fn anyOf(a: ?bool, b: ?bool) ?bool {
+    if (a == true or b == true) return true;
+    if (a == null or b == null) return null;
+    return false;
+}
+
+/// Where both may be so: a store into the memory with an address of it.
+fn bothOf(a: ?bool, b: ?bool) ?bool {
+    if (a == false or b == false) return false;
+    if (a == true and b == true) return true;
+    return null;
+}
+
+fn findOwnStores(self: *Facts, function: Decl, into: OwnStores.Into, from: usize) ResolveError!?bool {
+    const tree = self.syntaxOf(function.file);
+    const whole = self.scopeNode(function);
+    if (tree.nodeTag(whole) != .fn_decl) return null;
+    const body = tree.nodeData(whole).node_and_node[1];
+    const first = tree.firstToken(body);
+    const last = tree.lastToken(body);
+    const reaching = switch (into) {
+        .param => |at| from != at,
+        .result => |all| all,
+    };
+    const own: Own = .{ .facts = self, .function = function, .whole = whole, .position = switch (into) {
+        .param => |at| at,
+        .result => from,
+    } };
+    const given: Own = .{ .facts = self, .function = function, .whole = whole, .position = from, .reaching = reaching };
+    var out: ?bool = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const token = tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        if (into == .result) {
+            if (tag != .@"return" or !self.ownStatement(function.file, whole, body, node)) continue;
+            out = anyOf(out, try given.address(tree.nodeData(node).opt_node.unwrap() orelse continue, 0));
+            if (out == true) return true;
+            continue;
+        }
+        const found: ?bool = switch (tag) {
+            .assign => found: {
+                if (!self.ownStatement(function.file, whole, body, node)) continue;
+                const target, const value = tree.nodeData(node).node_and_node;
+                break :found bothOf(try own.place(target, 0), try given.address(value, 0));
+            },
+            .assign_destructure => found: {
+                if (!self.ownStatement(function.file, whole, body, node)) continue;
+                const whole_value = tree.assignDestructure(node);
+                var stored: ?bool = false;
+                for (whole_value.ast.variables) |target| {
+                    if (tree.fullVarDecl(target) == null) stored = anyOf(stored, try own.place(target, 0));
+                }
+                break :found bothOf(stored, try given.address(whole_value.ast.value_expr, 0));
+            },
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => found: {
+                if (!self.ownStatement(function.file, whole, body, node)) continue;
+                const name = tree.tokenSlice(tree.nodeMainToken(node));
+                var buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(tree, node, &buffer);
+                for (accesses.writer_builtins) |entry| {
+                    if (!std.mem.eql(u8, name, entry[0])) continue;
+                    if (entry[1].pointer >= args.len) break :found null;
+                    const target = try own.address(args[entry[1].pointer], 0);
+                    // A copy writes what the source memory holds, which is not followed.
+                    const value: ?bool = if (entry[1].value) |k| (if (k < args.len) try given.address(args[k], 0) else null) else null;
+                    break :found bothOf(target, value);
+                }
+                continue;
+            },
+            .call_one, .call_one_comma, .call, .call_comma => found: {
+                if (!self.ownStatement(function.file, whole, body, node)) continue;
+                break :found try own.handed(given, node);
+            },
+            .asm_simple, .@"asm" => if (self.ownStatement(function.file, whole, body, node)) null else continue,
+            else => continue,
+        };
+        out = anyOf(out, found);
+        if (out == true) return true;
+    }
+    return out;
+}
+
+/// Whether an expression in `function` may be or hold an address into the memory its parameter
+/// at `position` points at, or names a place in it; `reaching`, or anything read through it.
+const Own = struct {
+    facts: *Facts,
+    function: Decl,
+    whole: Ast.Node.Index,
+    position: usize,
+    /// What memory the parameter reaches holds counts too: memory not the stored one, which the
+    /// caller may have filled with any address.
+    reaching: bool = false,
+
+    const depth_limit = 16;
+
+    fn syntax(o: Own) *const Ast {
+        return o.facts.syntaxOf(o.function.file);
+    }
+
+    fn lexicon(o: Own) *const Model {
+        return &o.facts.project.at(o.function.file).model;
+    }
+
+    /// Whether the place `node` names is in that memory: past the first pointer its path goes
+    /// through, by where that pointer points.
+    fn place(o: Own, node: Ast.Node.Index, depth: u8) ResolveError!?bool {
+        if (depth >= depth_limit) return null;
+        const tree = o.syntax();
+        switch (tree.nodeTag(node)) {
+            .grouped_expression, .unwrap_optional => return o.place(tree.nodeData(node).node_and_token[0], depth + 1),
+            .deref => return o.address(tree.nodeData(node).node, depth + 1),
+            .field_access, .array_access => {
+                const holder = if (tree.nodeTag(node) == .array_access) tree.nodeData(node).node_and_node[0] else tree.nodeData(node).node_and_token[0];
+                if (accesses.pointing(try o.facts.resolve(o.function.file, holder))) return o.address(holder, depth + 1);
+                return o.place(holder, depth + 1);
+            },
+            // A name: memory of the function's own, or a copy it holds.
+            .identifier => return false,
+            else => return null,
+        }
+    }
+
+    /// Whether the value `node` gives may be or hold such an address.
+    fn address(o: Own, node: Ast.Node.Index, depth: u8) ResolveError!?bool {
+        if (depth >= depth_limit) return null;
+        const tree = o.syntax();
+        const model = o.lexicon();
+        const at = try o.facts.throughCasts(o.function.file, node);
+        // A value of a type that holds no address (a number, an enum's tag) holds none, whatever
+        // gives it.
+        if (try o.facts.holdsNoAddress(try o.facts.resolve(o.function.file, at))) return false;
+        switch (tree.nodeTag(at)) {
+            .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value => return false,
+            .@"try", .@"comptime", .@"nosuspend" => return o.address(tree.nodeData(at).node, depth + 1),
+            .grouped_expression => return o.address(tree.nodeData(at).node_and_token[0], depth + 1),
+            .address_of => return o.place(tree.nodeData(at).node, depth + 1),
+            .slice_open, .slice, .slice_sentinel => {
+                const base = tree.fullSlice(at).?.ast.sliced; // unreachable: the tag is a slice's
+                if (accesses.pointing(try o.facts.resolve(o.function.file, base))) return o.address(base, depth + 1);
+                return o.place(base, depth + 1);
+            },
+            // A value read out of memory: through a pointer, what a store put there; of a value
+            // held by name, what that value holds.
+            .field_access, .array_access, .unwrap_optional => {
+                const holder = switch (tree.nodeTag(at)) {
+                    .array_access => tree.nodeData(at).node_and_node[0],
+                    else => tree.nodeData(at).node_and_token[0],
+                };
+                if (!o.reaching and accesses.pointing(try o.facts.resolve(o.function.file, holder))) return false;
+                return o.address(holder, depth + 1);
+            },
+            .deref => return if (o.reaching) o.address(tree.nodeData(at).node, depth + 1) else false,
+            .@"orelse", .@"catch", .bool_and, .bool_or, .add, .sub, .add_wrap, .sub_wrap => {
+                const lhs, const rhs = tree.nodeData(at).node_and_node;
+                return anyOf(try o.address(lhs, depth + 1), try o.address(rhs, depth + 1));
+            },
+            .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_not => return false,
+            .identifier => {
+                const text = tree.tokenSlice(tree.nodeMainToken(at));
+                for ([_][]const u8{ "undefined", "null", "true", "false" }) |word| if (std.mem.eql(u8, text, word)) return false;
+                const reference = model.reference(at) orelse return null;
+                const d = reference.declaration orelse return null;
+                const record = model.declarations[@backingInt(d)];
+                switch (record.kind) {
+                    .parameter => {
+                        if (model.scopes[@backingInt(record.scope)].node != o.whole) return false;
+                        const here = o.facts.parameterPosition(o.function.file, o.function, record.token) orelse return null;
+                        return here == o.position;
+                    },
+                    .variable => {
+                        if (!o.facts.ownLocal(o.function.file, o.whole, at)) return false;
+                        const variable = tree.fullVarDecl(record.node) orelse return null;
+                        if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
+                            return o.address(variable.ast.init_node.unwrap() orelse return null, depth + 1);
+                        }
+                        // A `var`: what each value it is given may be (`givenTo`).
+                        var out: ?bool = false;
+                        for ((try o.facts.givenTo(.{ .file = o.function.file, .index = d }, false)) orelse return null) |given| {
+                            out = anyOf(out, try o.address(given.node, depth + 1));
+                        }
+                        return out;
+                    },
+                    .function => return false,
+                    .capture => return o.captured(record, depth + 1),
+                    else => return null,
+                }
+            },
+            .call_one, .call_one_comma, .call, .call_comma => {
+                // What a callee's result may hold of what it is given (`returnsAddress`).
+                const call = (try calls.at(o.facts, o.function.file, at)) orelse return null;
+                const args = switch (call.args) {
+                    .known => |each| each,
+                    .unknown => return null,
+                };
+                const functions: []const Decl = switch (call.callee) {
+                    .function => |function| &.{function},
+                    .choice => |each| each,
+                    .any => &.{},
+                };
+                var out: ?bool = false;
+                for (args, 0..) |arg, k| {
+                    const held = try o.argument(call, k, arg, depth + 1);
+                    if (held == false) continue;
+                    if (call.callee == .any) return null;
+                    for (functions) |function| out = anyOf(out, bothOf(held, try o.facts.returnsAddress(function, k, o.reaching)));
+                }
+                return out;
+            },
+            .@"if", .if_simple => {
+                const branch = tree.fullIf(at).?; // unreachable: the tag is an if's
+                const otherwise = branch.ast.else_expr.unwrap() orelse return null;
+                return anyOf(try o.address(branch.ast.then_expr, depth + 1), try o.address(otherwise, depth + 1));
+            },
+            .@"switch", .switch_comma => {
+                const whole = tree.fullSwitch(at).?; // unreachable: the tag is a switch's
+                var out: ?bool = false;
+                for (whole.ast.cases) |case| out = anyOf(out, try o.address(tree.fullSwitchCase(case).?.ast.target_expr, depth + 1));
+                return out;
+            },
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                var out: ?bool = false;
+                for (builtinArgs(tree, at, &buffer)) |arg| out = anyOf(out, try o.address(arg, depth + 1));
+                return if (out == false) false else null;
+            },
+            else => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                if (tree.fullStructInit(&buffer, at)) |literal| {
+                    var out: ?bool = false;
+                    for (literal.ast.fields) |field| out = anyOf(out, try o.address(field, depth + 1));
+                    return out;
+                }
+                if (tree.fullArrayInit(&buffer, at)) |literal| {
+                    var out: ?bool = false;
+                    for (literal.ast.elements) |item| out = anyOf(out, try o.address(item, depth + 1));
+                    return out;
+                }
+                return null;
+            },
+        }
+    }
+
+    /// Whether a capture may be or hold such an address: an element of a loop's input, by value
+    /// or by its address; the payload of what an `if`, a `while` or a `switch` reads, or its
+    /// address. An error, an index and a tag hold none.
+    fn captured(o: Own, record: Model.Declaration, depth: u8) ResolveError!?bool {
+        if (depth >= depth_limit) return null;
+        const tree = o.syntax();
+        const by_address = tree.tokenTag(record.token - 1) == .asterisk;
+        if (tree.fullFor(record.node)) |loop| {
+            const position = Model.capturePosition(tree, loop, record.token) orelse return null;
+            if (position >= loop.ast.inputs.len) return null;
+            const input = loop.ast.inputs[position];
+            if (tree.nodeTag(input) == .for_range) return false;
+            const pointing = accesses.pointing(try o.facts.resolve(o.function.file, input));
+            if (by_address) return if (pointing) o.address(input, depth + 1) else o.place(input, depth + 1);
+            // An element read out of memory, as `input[i]` is.
+            if (pointing and !o.reaching) return false;
+            return o.address(input, depth + 1);
+        }
+        const source: Ast.Node.Index = source: {
+            if (tree.fullIf(record.node)) |branch| {
+                if (branch.payload_token == null or record.token != (if (tree.tokenTag(branch.payload_token.?) == .asterisk) branch.payload_token.? + 1 else branch.payload_token.?)) return false;
+                break :source branch.ast.cond_expr;
+            }
+            if (tree.fullWhile(record.node)) |loop| {
+                if (loop.payload_token == null or record.token != (if (tree.tokenTag(loop.payload_token.?) == .asterisk) loop.payload_token.? + 1 else loop.payload_token.?)) return false;
+                break :source loop.ast.cond_expr;
+            }
+            if (tree.fullSwitchCase(record.node)) |case| {
+                const named = case.payload_token orelse return null;
+                if (record.token != (if (tree.tokenTag(named) == .asterisk) named + 1 else named)) return false;
+                const parent = o.lexicon().parentOf(record.node) orelse return null;
+                break :source (tree.fullSwitch(parent) orelse return null).ast.condition;
+            }
+            // A `catch`'s error.
+            if (tree.nodeTag(record.node) == .@"catch") return false;
+            return null;
+        };
+        return if (by_address) o.place(source, depth + 1) else o.address(source, depth + 1);
+    }
+
+    /// Whether what a call is given at `k` may be or hold such an address: a receiver it binds
+    /// is given by its address where it is held by value (`self.bits.setUnion(b)` takes
+    /// `&self.bits`).
+    fn argument(o: Own, call: calls.Call, k: usize, arg: Ast.Node.Index, depth: u8) ResolveError!?bool {
+        if (k == 0 and call.receiver == .bound and !accesses.pointing(try o.facts.resolve(o.function.file, arg))) return o.place(arg, depth);
+        return o.address(arg, depth);
+    }
+
+    /// Whether a call stores, into that memory, what `given` names: one handed the address of
+    /// the memory at a position and the value at another (or the same), whose callee may store
+    /// the one's value through the other.
+    fn handed(o: Own, given: Own, node: Ast.Node.Index) ResolveError!?bool {
+        const call = (try calls.at(o.facts, o.function.file, node)) orelse return null;
+        const args = switch (call.args) {
+            .known => |each| each,
+            .unknown => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const full = o.syntax().fullCall(&buffer, node).?; // unreachable: the tag is a call's
+                var into: ?bool = false;
+                var value: ?bool = false;
+                for (full.ast.params) |arg| {
+                    into = anyOf(into, try o.address(arg, 0));
+                    value = anyOf(value, try given.address(arg, 0));
+                }
+                return if (into == false or value == false) false else null;
+            },
+        };
+        const functions: []const Decl = switch (call.callee) {
+            .function => |function| &.{function},
+            .choice => |each| each,
+            .any => &.{},
+        };
+        var out: ?bool = false;
+        for (args, 0..) |arg, at| {
+            const into = try o.argument(call, at, arg, 0);
+            if (into == false) continue;
+            for (args, 0..) |held, from| {
+                const value = try given.argument(call, from, held, 0);
+                if (value == false) continue;
+                if (call.callee == .any) return null;
+                for (functions) |function| out = anyOf(out, bothOf(bothOf(into, value), try o.facts.storesAddress(function, at, from)));
+                if (out == true) return true;
+            }
+        }
+        return out;
+    }
+};
 
 /// Whether an address is taken only to be dropped: `_ = &f`.
 fn dropped(self: *Facts, site: accesses.Site) bool {
@@ -6930,13 +7511,13 @@ pub const accesses = struct {
             return below;
         }
 
-        /// The name a string literal spells; null for any other node.
+        /// The one name `@field`'s name spells, as `Facts.fieldName` reads it (a string, a `const`
+        /// holding one, an enum literal, `@tagName` of one); null for a name it computes, or one
+        /// ranging over a struct's field names or a list of names: any field of the holder's type.
         fn spelled(w: *const Walk, node: Ast.Node.Index) Error!?[]const u8 {
-            const tree = w.syntax();
-            if (tree.nodeTag(node) != .string_literal) return null;
-            return std.zig.string_literal.parseAlloc(w.facts.gpa, tree.tokenSlice(tree.nodeMainToken(node))) catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => null,
+            return switch (try w.facts.fieldName(w.file, node)) {
+                .name => |name| name,
+                .each_of, .names, .computed => null,
             };
         }
 
@@ -7583,6 +8164,58 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(project.sources[0].id, first)).unknown);
     const dep = project.sources[0].file.tree.fullVarDecl(project.sources[0].model.declarations[2].node).?.ast.init_node.unwrap().?;
     try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(project.sources[0].id, dep)).unknown);
+}
+
+test "a function stores through a parameter, or returns, what another holds or its own address, through captures, branches and callees' results, recursion read as the least answer" {
+    const source =
+        \\const N = struct { next: ?*N = null, v: u8 = 0 };
+        \\fn link(self: *N) void { self.next = self; }
+        \\fn set(self: *N, v: u8) void { self.v = v; }
+        \\fn down(self: *N, n: u8) void { if (n > 0) down(self, n - 1); self.v = n; }
+        \\fn reach(self: *N, n: u8) void { if (n > 0) reach(self, n - 1) else link(self); }
+        \\fn keep(self: *N, other: *N) void { self.next = other; }
+        \\fn copy(self: *N, other: *N) void { self.v = other.v; }
+        \\fn deep(self: *N, other: *N) void { self.next = other.next; }
+        \\fn pass(self: *N, other: *N) void { keep(other, self); }
+        \\fn itself(self: *N) *N { return self; }
+        \\fn after(self: *N) ?*N { return self.next; }
+        \\fn relink(self: *N) void { self.next = itself(self); }
+        \\fn skip(self: *N) void { self.next = after(self); }
+        \\fn each(self: *N, all: []N) void { for (all) |*n| self.next = n; }
+        \\fn again(self: *N) void { if (self.next) |n| self.next = n; }
+        \\fn either(self: *N, other: *N, b: bool) void { self.next = if (b) other else null; }
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const named = struct {
+        fn of(p: *const Project, name: []const u8) Decl {
+            for (p.sources[0].model.declarations, 0..) |decl, i| if (decl.kind == .function and std.mem.eql(u8, decl.name, name)) return .{ .file = p.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+            unreachable;
+        }
+    }.of;
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "link"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "set"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "down"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "reach"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "keep"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "keep"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "copy"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "deep"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "pass"), 1, 0));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "pass"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, true), try facts.returnsAddress(named(&project, "itself"), 0, false));
+    try std.testing.expectEqual(@as(?bool, false), try facts.returnsAddress(named(&project, "after"), 0, false));
+    try std.testing.expectEqual(@as(?bool, true), try facts.returnsAddress(named(&project, "after"), 0, true));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "relink"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "skip"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "each"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "again"), 0, 0));
+    try std.testing.expectEqual(@as(?bool, true), try facts.storesAddress(named(&project, "either"), 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try facts.storesAddress(named(&project, "either"), 0, 0));
 }
 
 test "a program's builtin is Zig's own per-build file, its root a mapping the build gives" {
