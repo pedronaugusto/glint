@@ -2217,18 +2217,20 @@ fn literalPart(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) b
 /// Whether `parent` hands its operand `node` on unchanged: `try`, `catch`'s or `orelse`'s
 /// left side, a grouping, or `@as`'s value.
 fn wraps(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(parent)) {
-        .@"try" => true,
-        .grouped_expression => tree.nodeData(parent).node_and_token[0] == node,
-        .@"catch", .@"orelse" => tree.nodeData(parent).node_and_node[0] == node,
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) break :blk false;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, parent, &buffer);
-            break :blk args.len == 2 and args[1] == node;
-        },
-        else => false,
-    };
+    return handedOn(tree, parent) == node;
+}
+
+/// The operand `node` hands on unchanged: `try`'s, a grouping's, `catch`'s or `orelse`'s left
+/// side, `comptime`'s or `nosuspend`'s (accesses.carriedFrom, short of `.?`, which unwraps), or
+/// `@as`'s value.
+fn handedOn(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    if (Facts.isBuiltin(tree, node, "@as")) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = Facts.builtinArgs(tree, node, &buffer);
+        return if (args.len == 2) args[1] else null;
+    }
+    if (Facts.accesses.formOf(tree.nodeTag(node)) == .unwrap_optional) return null;
+    return Facts.accesses.carriedFrom(tree, node);
 }
 
 /// The kind of owner A003 follows the local `decl` as, from its acquisition to block end: a
@@ -2365,19 +2367,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
 /// none.
 fn acquisitionKind(c: *Context, tree: *const Ast, init: Ast.Node.Index, report: bool) Context.Error!?Contract.Kind {
     var acquisition = init;
-    while (true) acquisition = switch (tree.nodeTag(acquisition)) {
-        .@"try" => tree.nodeData(acquisition).node,
-        .grouped_expression => tree.nodeData(acquisition).node_and_token[0],
-        .@"catch", .@"orelse" => tree.nodeData(acquisition).node_and_node[0],
-        .builtin_call_two, .builtin_call_two_comma => blk: {
-            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(acquisition)), "@as")) break;
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(tree, acquisition, &buffer);
-            if (args.len != 2) break;
-            break :blk args[1];
-        },
-        else => break,
-    };
+    while (handedOn(tree, acquisition)) |inner| acquisition = inner;
     return acquisitionOwner(c, tree, acquisition, report);
 }
 
@@ -2834,19 +2824,14 @@ const Flow = struct {
     /// The value of a condition that is the flag the walk knows, or its negation.
     fn decided(f: Flow, cond: Ast.Node.Index) ?bool {
         const known = f.known orelse return null;
-        var node = cond;
+        var node = Facts.ungrouped(f.tree, cond);
         var negated = false;
-        while (true) switch (f.tree.nodeTag(node)) {
-            .grouped_expression => node = f.tree.nodeData(node).node_and_token[0],
-            .bool_not => {
-                node = f.tree.nodeData(node).node;
-                negated = !negated;
-            },
-            else => break,
-        };
-        if (f.tree.nodeTag(node) != .identifier) return null;
+        while (f.tree.nodeTag(node) == .bool_not) {
+            node = Facts.ungrouped(f.tree, f.tree.nodeData(node).node);
+            negated = !negated;
+        }
         const ref = f.model.reference(node) orelse return null;
-        if (ref.declaration != known.flag) return null;
+        if (ref.unknown != null or ref.declaration != known.flag) return null;
         return known.value != negated;
     }
 
