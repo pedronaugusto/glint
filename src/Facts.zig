@@ -27,8 +27,9 @@ settled: std.ArrayList(Assumptions) = .empty,
 assumed: ?Assumptions.Id = null,
 /// What each generic function copies of its parameters' values, found once (`parameterCopies`).
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
-/// The names those functions are declared under, for a quick look before a callee is resolved.
-copier_names: std.StringHashMapUnmanaged(void) = .empty,
+/// The names those functions are declared under, for a quick look before a callee is resolved:
+/// what the functions so named do with the values given (`copiesBy`).
+copier_names: std.StringHashMapUnmanaged(Copies) = .empty,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
 bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, Decl) = .empty,
@@ -691,7 +692,9 @@ fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index
 pub const ParameterCopy = struct {
     position: usize,
     site: Key,
-    kind: enum { copy, made, cast } = .copy,
+    /// `moved`: the parameter itself written once into storage, read nowhere else (`out.* = x`):
+    /// what the call gives moves there, a copy where the argument does not move at the call.
+    kind: enum { copy, moved, made, cast } = .copy,
     source: ?Key = null,
     path: []const Key = &.{},
     crowded: bool = false,
@@ -765,14 +768,35 @@ fn findCopies(self: *Facts) ResolveError!void {
         }
     }
     self.copies = found;
-    var it = found.keyIterator();
-    while (it.next()) |decl| try self.copier_names.put(self.gpa, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, {});
+    var it = found.iterator();
+    while (it.next()) |entry| {
+        const name = self.project.at(entry.key_ptr.file).model.declarations[@backingInt(entry.key_ptr.index)].name;
+        const kind: Copies = for (entry.value_ptr.*) |copy| {
+            if (copy.kind != .moved) break .copies;
+        } else .moves;
+        // Functions of one name: the one that copies decides.
+        const slot = try self.copier_names.getOrPut(self.gpa, name);
+        if (!slot.found_existing or kind == .copies) slot.value_ptr.* = kind;
+    }
 }
 
-/// Whether some function named `name` copies a generic parameter's values.
-pub fn mayCopy(self: *Facts, name: []const u8) ResolveError!bool {
+/// What a function named `name` may do with a generic parameter's values.
+pub const Copies = enum {
+    /// No function so named copies one.
+    none,
+    /// Those so named only move a parameter's value into storage (`ParameterCopy.kind ==
+    /// .moved`): what a call gives is copied there only where the argument does not move at
+    /// the call.
+    moves,
+    /// Some function so named copies one.
+    copies,
+};
+
+/// What some function named `name` does with a generic parameter's values: one answer, so a
+/// reader cannot take a mover for a function that copies nothing.
+pub fn copiesBy(self: *Facts, name: []const u8) ResolveError!Copies {
     if (self.copies == null) try self.findCopies();
-    return self.copier_names.contains(name);
+    return self.copier_names.get(name) orelse .none;
 }
 
 fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
@@ -1024,9 +1048,13 @@ fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
                 if (!itself and try self.resolve(function.file, place) != .unknown) continue;
                 // A call takes the parameter itself only, as a pass-on reads a part.
                 if (handed and !itself) continue;
-                if (itself and !looped and self.holdingReads(function, named.?) == 1) continue;
+                // Moved: written once, read nowhere else, and copied once by this value
+                // (`@splat(x)` copies it into each element).
+                var copied: usize = 0;
+                for (parts.places) |other| copied += @intFromBool(other == place);
+                const moving = itself and !looped and self.holdingReads(function, named.?) == 1 and copied == 1;
                 const site: Key = .{ .file = function.file, .node = node };
-                try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
+                try out.append(self.gpa, .{ .position = position, .site = site, .kind = if (moving) .moved else .copy, .source = if (itself) null else .{ .file = function.file, .node = place } });
                 try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
             }
         }
@@ -1298,9 +1326,15 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
             if (args.len != 0 and (std.mem.eql(u8, name, "@as") or std.mem.eql(u8, name, "@bitCast"))) return self.copiedWalk(file, args[args.len - 1], depth + 1, places, rest, results, deep);
             if (args.len == 3 and std.mem.eql(u8, name, "@unionInit")) return self.copiedWalk(file, args[2], depth + 1, places, rest, results, deep);
             if (std.mem.eql(u8, name, "@call")) return results.append(self.gpa, node);
+            // `@splat(x)` fills an array (or a vector) of any element type with copies of `x`:
+            // read twice, as an array of more than one element copies it.
+            if (args.len == 1 and std.mem.eql(u8, name, "@splat")) {
+                try self.copiedWalk(file, args[0], depth + 1, places, rest, results, deep);
+                return self.copiedWalk(file, args[0], depth + 1, places, rest, results, deep);
+            }
             // Every other builtin gives no owner's copy: a number, an enum, a pointer, a
-            // vector, a type, text, an error or nothing (`@intCast`, `@fromBackingInt`,
-            // `@ptrCast`, `@splat`, `@This`, `@tagName`, `@memcpy`).
+            // type, text, an error or nothing (`@intCast`, `@fromBackingInt`, `@ptrCast`,
+            // `@This`, `@tagName`, `@memcpy`).
             return;
         },
         else => {
@@ -6532,12 +6566,15 @@ pub fn atBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
     return found;
 }
 
-fn readAtBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
+/// How `atBindings` and `atCall` read a declaration: the function it is in, the node read with a
+/// call's bindings, and what of that node's value it holds.
+const BindingRead = struct { function: Decl, node: Ast.Node.Index, read: enum { instance, value, result } };
+
+fn bindingRead(self: *Facts, decl: Decl) ?BindingRead {
     const model = &self.project.at(decl.file).model;
     const tree = &self.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
-    const Read = enum { instance, value, result };
-    const function: Decl, const node: Ast.Node.Index, const read: Read = switch (record.kind) {
+    return switch (record.kind) {
         .variable => blk: {
             const variable = tree.fullVarDecl(record.node) orelse return null;
             const body = self.innermostFunction(decl.file, record.scope) orelse return null;
@@ -6545,34 +6582,58 @@ fn readAtBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
                 const candidate: Decl = .{ .file = decl.file, .index = @fromBackingInt(@intCast(i)) };
                 if (d.kind == .function and self.scopeNode(candidate) == body) break candidate;
             } else return null;
-            if (variable.ast.type_node.unwrap()) |t| break :blk .{ function, t, .instance };
-            break :blk .{ function, variable.ast.init_node.unwrap() orelse return null, .value };
+            if (variable.ast.type_node.unwrap()) |t| break :blk .{ .function = function, .node = t, .read = .instance };
+            break :blk .{ .function = function, .node = variable.ast.init_node.unwrap() orelse return null, .read = .value };
         },
-        .parameter => .{ self.functionOf(decl) orelse return null, record.node, .instance },
+        .parameter => .{ .function = self.functionOf(decl) orelse return null, .node = record.node, .read = .instance },
         .function => blk: {
             var buffer: [1]Ast.Node.Index = undefined;
             const proto = tree.fullFnProto(&buffer, record.node) orelse return null;
-            break :blk .{ decl, proto.ast.return_type.unwrap() orelse return null, .result };
+            break :blk .{ .function = decl, .node = proto.ast.return_type.unwrap() orelse return null, .read = .result };
         },
-        else => return null,
+        else => null,
     };
-    const sites = (try self.callSites(function)) orelse return null;
+}
+
+/// What `how` reads with the bindings `args` give its function.
+fn readWith(self: *Facts, decl: Decl, how: BindingRead, args: []const Value) ResolveError!Value {
+    const tree = &self.project.at(decl.file).file.tree;
+    const env = try self.gpa.create(Env);
+    env.* = .{ .function = how.function, .args = args, .depth = 0 };
+    const found = try self.resolveIn(env, decl.file, how.node);
+    return switch (how.read) {
+        .value => found,
+        .instance => try self.instance(found),
+        // `!T`: an error union whose error set the body infers, as `callResult` reads it.
+        .result => if (Model.inferredErrors(tree, how.node) and found != .unknown) .{ .error_union = try self.boxed(try self.instance(found)) } else try self.instance(found),
+    };
+}
+
+fn readAtBindings(self: *Facts, decl: Decl) ResolveError!?[]const Value {
+    const how = self.bindingRead(decl) orelse return null;
+    const sites = (try self.callSites(how.function)) orelse return null;
     var values: std.ArrayList(Value) = .empty;
     for (sites) |site| {
         var args: std.ArrayList(Value) = .empty;
         if (site.receiver != 0) try args.append(self.gpa, try self.resolve(site.file, site.holder));
         for (site.params) |arg| try args.append(self.gpa, try self.resolve(site.file, arg));
-        const env = try self.gpa.create(Env);
-        env.* = .{ .function = function, .args = args.items, .depth = 0 };
-        const found = try self.resolveIn(env, decl.file, node);
-        try values.append(self.gpa, switch (read) {
-            .value => found,
-            .instance => try self.instance(found),
-            // `!T`: an error union whose error set the body infers, as `callResult` reads it.
-            .result => if (Model.inferredErrors(tree, node) and found != .unknown) .{ .error_union = try self.boxed(try self.instance(found)) } else try self.instance(found),
-        });
+        try values.append(self.gpa, try self.readWith(decl, how, args.items));
     }
     return values.items;
+}
+
+/// What a declaration of a function holds on the one call `call` (`calls.at`) of it, read with
+/// that call's bindings as `atBindings` reads each: null where the declaration is none it reads,
+/// or the call's arguments are not known.
+pub fn atCall(self: *Facts, decl: Decl, call: calls.Call) ResolveError!?Value {
+    const how = self.bindingRead(decl) orelse return null;
+    const given = switch (call.args) {
+        .known => |each| each,
+        .unknown => return null,
+    };
+    var args: std.ArrayList(Value) = .empty;
+    for (given) |arg| try args.append(self.gpa, try self.resolve(call.file, arg));
+    return try self.readWith(decl, how, args.items);
 }
 
 /// Whether code outside the program's own calls may call `function`, with values no call of

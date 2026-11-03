@@ -149,6 +149,14 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
+        // A copy of memory out of secret material (`accesses.copyAt`: `@memcpy`,
+        // `std.mem.copyForwards`, `std.mem.asBytes(&k).*`): the copy is never wiped. A swap
+        // duplicates nothing.
+        if (!c.inTest(token)) if (try Facts.accesses.copyAt(c.facts, c.file, node)) |copy| if (!copy.exchange) switch (try copiedMaterial(c, types, copy.from.node())) {
+            .no => {},
+            .unknown => |why| if (why != .generic) try c.undecided(rule, tree.tokenStart(token), .unresolved, "memory copied whose holder does not resolve may be std's secret material"),
+            .yes => |held| try c.at(rule, token, try c.allocator.print("std.crypto {s}'s material copied out by hand outside aegis Secret: the copy is never wiped", .{held})),
+        };
         // A member read (`accesses.formOf`), or a builtin by its name.
         switch (Facts.accesses.formOf(tag)) {
             .member => if (!c.inTest(token)) try materialRead(c, rule, types, node),
@@ -361,6 +369,7 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
             // holds secret material is judged where it is declared (`heldSecret`).
             if (try c.inLibrary(Contract.library, function.file)) continue;
             const source = c.project.at(function.file);
+            try dependencyLocals(c, rule, types, call, function);
             var buffer: [1]Ast.Node.Index = undefined;
             const proto = source.file.tree.fullFnProto(&buffer, source.model.declarations[@backingInt(function.index)].node) orelse continue;
             var it = proto.iterate(&source.file.tree);
@@ -418,6 +427,44 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                 // A call's result handed on: a temporary the generic holds.
                 for (parts.results) |result| try boundSecret(c, rule, types, result, try c.facts.resolve(c.file, result));
             }
+        }
+    }
+}
+
+/// A008 at a call of a function of a dependency of the program (a file the run does not
+/// select, so nothing judges it there) given secret material, by value, behind a pointer or as a
+/// type: each local of the function, read with this call's bindings (`Facts.atCall`), that
+/// holds the material by value (`const copy = p.*`) is a copy never wiped; one that does not
+/// resolve may be.
+fn dependencyLocals(c: *Context, rule: Rule, types: []const SecretType, call: Facts.calls.Call, function: Facts.Decl) Context.Error!void {
+    const source = c.project.at(function.file);
+    if (source.input.selected or !try c.facts.program(function.file)) return;
+    const args = switch (call.args) {
+        .known => |each| each,
+        .unknown => return,
+    };
+    const given = for (args) |arg| {
+        var value = try c.facts.resolve(c.file, arg);
+        if (value == .container) {
+            const container = value.container;
+            value = .{ .instance = container };
+        }
+        while (value == .pointer) value = value.pointer.*;
+        if (try heldSecret(c, types, value) == .yes) break true;
+    } else false;
+    if (!given) return;
+    const tree = &c.project.at(c.file).file.tree;
+    const token = tree.nodeMainToken(call.node);
+    const body = source.model.parentOf(source.model.declarations[@backingInt(function.index)].node) orelse return;
+    const first = source.file.tree.firstToken(body);
+    const last = source.file.tree.lastToken(body);
+    for (source.model.declarations, 0..) |decl, d| {
+        if (decl.kind != .variable or decl.token < first or decl.token > last) continue;
+        const value = (try c.facts.atCall(.{ .file = function.file, .index = @fromBackingInt(@intCast(d)) }, call)) orelse continue;
+        switch (try heldSecret(c, types, value)) {
+            .no => {},
+            .unknown => |why| if (why != .generic) return c.undecided(rule, tree.tokenStart(token), .unresolved, "a dependency's function given std's secret material holds a value that does not resolve with this call's bindings: it may copy the material"),
+            .yes => |held| return c.at(rule, token, try c.allocator.print("std.crypto {s} copied by value in a dependency's function this call binds (its local `{s}`): the copy is never wiped", .{ held, decl.name })),
         }
     }
 }
@@ -508,6 +555,27 @@ fn placeInSecret(c: *Context, types: []const SecretType, place: Ast.Node.Index) 
             .unknown => |why| return .{ .unknown = why },
             .no => {},
         }
+    }
+    return .no;
+}
+
+/// Whether the memory at `node` (a place, or a pointer to it) is secret material or part of it:
+/// up its path (`accesses.pathOf`), the first value that holds secret material by value decides,
+/// and a part of std's public half (`public_key`) is none, whatever holds it.
+fn copiedMaterial(c: *Context, types: []const SecretType, node: Ast.Node.Index) Context.Error!Secret {
+    for ((try Facts.accesses.pathOf(c.facts, c.file, node)).steps) |step| {
+        var value = try c.facts.resolve(c.file, step.node);
+        while (value == .pointer) value = value.pointer.*;
+        switch (try heldSecret(c, types, value)) {
+            .yes => |held| return .{ .yes = held },
+            .unknown => |why| return .{ .unknown = why },
+            .no => {},
+        }
+        if (step.kind == .field) switch (try c.facts.definition(c.file, step.node)) {
+            .decl => |field| for (types) |secret| if (c.facts.member(secret.container, "public_key")) |public| if (std.meta.eql(public, field)) return .no,
+            .none => {},
+            .unknown => |why| return .{ .unknown = why },
+        };
     }
     return .no;
 }

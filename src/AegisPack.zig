@@ -1014,7 +1014,14 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         .field_access => tree.nodeData(call.ast.fn_expr).node_and_token[1],
         else => return,
     };
-    if (!try c.facts.mayCopy(try Model.identifier(c.allocator, tree.tokenSlice(name_token)))) return;
+    const spelled = try Model.identifier(c.allocator, tree.tokenSlice(name_token));
+    switch (try c.facts.copiesBy(spelled)) {
+        .none => return,
+        // A generic that only moves a parameter into storage copies for A002 alone, and only
+        // what does not move at the call.
+        .moves => if (rule != copies or try argumentsMove(c, call)) return,
+        .copies => {},
+    }
     // Each function it may call is bound by it; a callee spelled as a copying generic that
     // does not resolve may be one.
     const functions: []const Facts.Decl = switch ((try Facts.calls.at(c.facts, c.file, node) orelse return).callee) {
@@ -1029,6 +1036,17 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
         },
     };
     for (functions) |function| if (try boundBy(c, tree, node, call, rule, function, name_token)) return;
+}
+
+/// Whether every argument of `call` moves at it: made in place, or a local nothing holds beside
+/// the call (`moved`).
+fn argumentsMove(c: *Context, call: Ast.full.Call) Context.Error!bool {
+    for (call.ast.params) |argument| {
+        const parts = try c.facts.copiedParts(c.file, argument);
+        if (parts.deep != null) return false;
+        for (parts.places) |place| if (try moved(c, argument, place, false) != .yes) return false;
+    }
+    return true;
 }
 
 /// `checkBinding` of `function`, one the call at `node` may call: whether it reported a copy.
@@ -1065,6 +1083,17 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, call: Ast.full.C
         const argument = call.ast.params[copy.position - receiver];
         // A parameter of a generic this call is in, passed on: decided where that is bound.
         if (c.facts.fromParameter(c.file, argument)) continue;
+        // A parameter the generic moves into storage (`out.* = x`): the argument moves there
+        // where it is made in place, or is a local nothing holds beside the call (`moved`); a
+        // live local read again, or one passed on each pass of a loop, is copied.
+        if (copy.kind == .moved) {
+            const parts = try c.facts.copiedParts(c.file, argument);
+            var moves = parts.deep == null;
+            for (parts.places) |place| if (try moved(c, argument, place, false) != .yes) {
+                moves = false;
+            };
+            if (moves) continue;
+        }
         // What the generic passes on of the argument (what calling it returns, what it points
         // to), read with this call's bindings; else the argument, plain data as written (a type
         // of numbers, and pointers or arrays of them, or a value of one) or as it resolves.
