@@ -7995,9 +7995,9 @@ pub const accesses = struct {
         of: Of,
         /// The next file of `files` to read.
         file: usize = 0,
-        /// The file being read: its index, the part of it, and the next site there.
+        /// The file being read: its index, and the next site there, counted across its parts
+        /// in their order (the part a site is in follows from the count and `ends`).
         index: ?*const File = null,
-        part: Part = .exact,
         at: usize = 0,
         /// How many sites each part held when the file's index was read: the sites the query
         /// gives, as a list made then would hold them.
@@ -8021,35 +8021,28 @@ pub const accesses = struct {
                         .field_writes => try fieldWritesOf(each.facts, file, .{ .name = each.record().name, .holders = false }),
                         .reads => try readsOf(each.facts, file),
                     };
-                    each.part = .exact;
                     each.at = 0;
-                    for (&each.ends, 0..) |*end, part| end.* = each.sitesOf(each.index.?, @fromBackingInt(@intCast(part))).len;
+                    for (&each.ends, std.enums.values(Part)) |*end, part| end.* = each.sitesOf(each.index.?, part).len;
                     continue;
                 };
                 // Read again at each step, up to its length when the index was read: an index
                 // another file's reading is still filling may grow, and move, meanwhile.
-                const sites = each.sitesOf(index, each.part)[0..each.ends[@backingInt(each.part)]];
-                if (each.at < sites.len) {
-                    var one = sites[each.at];
-                    each.at += 1;
-                    if (each.part != .exact) one.reach = switch (each.part) {
-                        .exact => unreachable,
-                        .named => .named,
-                        .holder => .holder,
-                        .unresolved => .unresolved,
-                    };
-                    return one;
+                var rest = each.at;
+                for (each.ends, std.enums.values(Part)) |end, part| {
+                    if (rest < end) {
+                        each.at += 1;
+                        var one = each.sitesOf(index, part)[rest];
+                        switch (part) {
+                            .exact => {},
+                            .named => one.reach = .named,
+                            .holder => one.reach = .holder,
+                            .unresolved => one.reach = .unresolved,
+                        }
+                        return one;
+                    }
+                    rest -= end;
                 }
-                each.at = 0;
-                each.part = switch (each.part) {
-                    .exact => .named,
-                    .named => .holder,
-                    .holder => .unresolved,
-                    .unresolved => {
-                        each.index = null;
-                        continue;
-                    },
-                };
+                each.index = null;
             }
         }
 
