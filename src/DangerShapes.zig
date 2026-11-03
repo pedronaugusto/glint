@@ -1027,7 +1027,7 @@ fn released(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         return .no;
     }
     if (tree.fullArrayInit(&init_buffer, parent)) |literal| {
-        for (literal.ast.elements) |element| if (element == node) return .unknown;
+        for (literal.ast.elements, 0..) |element, position| if (element == node) return elementReleased(c, file, parent, position, null, next);
         return .no;
     }
     // Switched on, by each read of its prongs' captures (`.file => |x| x.close(io)`).
@@ -1139,36 +1139,220 @@ fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index, labe
     return null;
 }
 
-/// Whether the field `name` of a struct literal is `released`: the literal a local's value, by
-/// each read of that field of it; the local read whole (passed, copied, its address taken) or a
-/// method called on it may release it. A literal no local holds goes where its type's values go:
-/// by each read of that field of its type in the program (`fieldUses`); one whose type does not
-/// resolve may release it.
+/// Whether the field `name` of a struct literal is `released`: where the value it makes goes
+/// (`madeReleased`), a local it initializes by each read of the local.
 fn literalReleased(c: *Context, file: Project.FileId, literal: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!Stored {
+    if (depth >= 8) return .unknown;
+    if (c.project.at(file).model.parentOf(literal) == null) return .unknown;
+    return madeReleased(c, file, literal, name, byValue(try c.facts.literalType(file, literal)), depth);
+}
+
+/// Whether the field `name` of the value `node` in `file` makes (a struct literal no local
+/// holds, a call that returns one) is `released`, following that value where Facts.accesses
+/// reads it to go: on through a carrier, or its function's return to each call of it; that
+/// field read, by the read; another field read, or it compared or discarded, not; a method
+/// called on it or it handed to a function, by the parameter that takes it (std's by its
+/// name); a local it initializes, by each read of the local; its address, as it is; kept in
+/// another literal's field, by that field's reads. Anywhere else (stored), by each read of that
+/// field of `holder`, its type, in the program (`typeReleased`),
+/// or maybe where its type does not resolve: `dirOf(h).openDir(...)` in a function that makes
+/// a `std.Io.Dir` of a handle is that call's, not every `Io.Dir`'s.
+fn madeReleased(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!Stored {
+    if (depth >= 8) return .unknown;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    if (depth >= 8) return .unknown;
-    if (model.parentOf(literal) == null) return .unknown;
-    const id = literalLocal(tree, model, literal) orelse return typeReleased(c, byValue(try c.facts.literalType(file, literal)) orelse return .unknown, name, depth);
+    const next = depth + 1;
+    switch (try Facts.accesses.useOf(c.facts, file, node)) {
+        .carried => |via| return madeReleased(c, file, via.into, name, holder, next),
+        .returned => |ret| {
+            const function = enclosingFunction(model, tree, ret) orelse return .unknown;
+            const proto = tree.nodeData(function).node_and_node[0];
+            const id = for (model.declarations, 0..) |decl, i| {
+                if (decl.kind == .function and decl.node == proto) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
+            } else return .unknown;
+            var result: Stored = .no;
+            for (try c.facts.memberUses(model.declarations[@backingInt(id)].name)) |use| {
+                const callee = try c.facts.resolve(use.file, use.node);
+                if (callee != .function or callee.function.file != file or callee.function.index != id) continue;
+                result = join(result, try madeByCall(c, use.file, use.node, name, holder, next));
+                if (result == .yes) return .yes;
+            }
+            for (model.references) |reference| {
+                if (reference.declaration != id) continue;
+                result = join(result, try madeByCall(c, file, reference.node, name, holder, next));
+                if (result == .yes) return .yes;
+            }
+            return result;
+        },
+        .discarded, .compared => return .no,
+        // A pointer to it is read by the same fields, and handed on as it is.
+        .address => |taken| return madeReleased(c, file, taken, name, holder, next),
+        .member => |access| {
+            if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(access).node_and_token[1]), name)) return released(c, file, access, next);
+            // A method called on it is given it as its receiver; another field read is not it.
+            const call = (try Facts.calls.at(c.facts, file, model.parentOf(access) orelse return .no)) orelse return .no;
+            if (call.callee_expr != access) return .no;
+            return switch (call.receiver) {
+                .bound => madeHanded(c, &call, 0, name, holder, next),
+                .none => .no,
+                .unknown => .unknown,
+            };
+        },
+        .argument => |argument| {
+            const call = (try Facts.calls.at(c.facts, file, argument.call)) orelse return .unknown;
+            const args = switch (call.args) {
+                .known => |known| known,
+                .unknown => return .unknown,
+            };
+            return madeHanded(c, &call, std.mem.findScalar(Ast.Node.Index, args, node) orelse return .unknown, name, holder, next);
+        },
+        .initializes => |declaration| {
+            for (model.declarations, 0..) |decl, i| {
+                if (decl.kind != .variable or decl.node != declaration) continue;
+                var result: Stored = .no;
+                for (model.references) |reference| {
+                    if (@backingInt(reference.declaration orelse continue) != i) continue;
+                    result = join(result, try madeReleased(c, file, reference.node, name, holder, next));
+                    if (result == .yes) return .yes;
+                }
+                return result;
+            }
+        },
+        // Over it, a store's target holds another value from there.
+        .written => return .no,
+        .dereferenced => |deref| return madeReleased(c, file, deref, name, holder, next),
+        // An `if`'s or a `while`'s condition, by each read of what it captures of it.
+        .tested => |branch| return madeCaptured(c, file, branch, node, name, holder, next),
+        .switched => |at| return madeSwitched(c, file, at, name, next),
+        .stored => |store| if (try madeStored(c, file, store.node, name, holder, next)) |answer| return answer,
+        // Kept in another literal's field (`.{ .lent = dir }`, held.Parent's): where each read
+        // of that field of the literal's type gives it, a prong's capture of it among them.
+        .field_of => |field| {
+            const keeper = byValue(try c.facts.literalType(file, field.literal)) orelse return .unknown;
+            return keptReleased(c, keeper, tree.tokenSlice(field.name), name, holder);
+        },
+        else => {},
+    }
+    return typeReleased(c, holder orelse return .unknown, name, depth);
+}
+
+/// `madeReleased` of what the `if` or `while` `branch` captures of `node`, its condition.
+fn madeCaptured(c: *Context, file: Project.FileId, branch: Ast.Node.Index, node: Ast.Node.Index, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!Stored {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var result: Stored = .no;
-    for (model.references) |reference| {
-        if (reference.declaration != id) continue;
-        const read = model.parentOf(reference.node) orelse return .unknown;
-        if (tree.nodeTag(read) != .field_access or tree.nodeData(read).node_and_token[0] != reference.node) return .unknown;
-        if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(read).node_and_token[1]), name)) {
-            result = join(result, try released(c, file, read, depth + 1));
+    for (model.declarations, 0..) |decl, i| {
+        if (decl.kind != .capture or decl.node != branch or !captures(tree, branch, decl.token, node)) continue;
+        for (model.references) |reference| {
+            if (@backingInt(reference.declaration orelse continue) != i) continue;
+            result = join(result, try madeReleased(c, file, reference.node, name, holder, depth));
             if (result == .yes) return .yes;
-            continue;
         }
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, model.parentOf(read) orelse continue)) |call| if (call.ast.fn_expr == read) return .unknown;
     }
     return result;
+}
+
+/// `madeReleased` of a value the switch `at` is on, by what its prongs capture: one naming the
+/// field, that field by its reads; one naming other tags only, not it; any other (`else`,
+/// `inline else`), by its reads.
+fn madeSwitched(c: *Context, file: Project.FileId, at: Ast.Node.Index, name: []const u8, depth: u8) Context.Error!Stored {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const chosen = tree.fullSwitch(at) orelse return .unknown;
+    var result: Stored = .no;
+    for (chosen.ast.cases) |case_node| {
+        const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
+        if (case.payload_token == null) continue;
+        var others = case.ast.values.len != 0 and case.inline_token == null;
+        for (case.ast.values) |value| {
+            if (tree.nodeTag(value) != .enum_literal or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), name)) others = false;
+        }
+        if (others) continue;
+        for (model.declarations, 0..) |decl, i| {
+            if (decl.kind != .capture or decl.node != case_node) continue;
+            result = join(result, try readsReleased(c, file, @fromBackingInt(@intCast(i)), depth));
+            if (result == .yes) return .yes;
+        }
+    }
+    return result;
+}
+
+/// `madeReleased` of a value the assignment `store` stores: into a local, by each read of it;
+/// into a field, by that field's reads (`keptReleased`); null for another target.
+fn madeStored(c: *Context, file: Project.FileId, store: Ast.Node.Index, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!?Stored {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (tree.nodeTag(store) != .assign) return null;
+    const target = tree.nodeData(store).node_and_node[0];
+    switch (tree.nodeTag(target)) {
+        .identifier => {
+            const id = (model.reference(target) orelse return .unknown).declaration orelse return .unknown;
+            var result: Stored = .no;
+            for (model.references) |reference| {
+                if (reference.declaration != id or reference.node == target) continue;
+                result = join(result, try madeReleased(c, file, reference.node, name, holder, depth));
+                if (result == .yes) return .yes;
+            }
+            return result;
+        },
+        .field_access => {
+            const receiver, const token = tree.nodeData(target).node_and_token;
+            const keeper = byPointer(try c.facts.resolve(file, receiver)) orelse return .unknown;
+            return try keptReleased(c, keeper, tree.tokenSlice(token), name, holder);
+        },
+        else => return null,
+    }
+}
+
+/// `madeReleased` of what the call whose callee is `callee` (a reference to the function, or a
+/// member naming it) makes; a reference that is no call's callee hands the function on.
+fn madeByCall(c: *Context, file: Project.FileId, callee: Ast.Node.Index, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!Stored {
+    const tree = &c.project.at(file).file.tree;
+    const parent = c.project.at(file).model.parentOf(callee) orelse return .no;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return .no;
+    if (call.ast.fn_expr != callee) return .no;
+    return madeReleased(c, file, parent, name, holder, depth);
+}
+
+/// `madeReleased` of a value `call` hands its callee at `position`, a receiver first: by each
+/// read of that parameter of a program function, by its name for std's.
+fn madeHanded(c: *Context, call: *const Facts.calls.Call, position: usize, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!Stored {
+    const Handed = struct { position: usize, name: []const u8, holder: ?Facts.Container, depth: u8 };
+    return eachCallee(c, call, Handed{ .position = position, .name = name, .holder = holder, .depth = depth }, struct {
+        fn by(h: Handed, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
+            const record = cc.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+            if (!try cc.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+            const id = switch (parameterAt(cc, callee, h.position)) {
+                .declared => |id| id,
+                .none => return .no,
+                .unknown => return .unknown,
+            };
+            var result: Stored = .no;
+            for (cc.project.at(callee.file).model.references) |reference| {
+                if (reference.declaration != id) continue;
+                result = join(result, try madeReleased(cc, callee.file, reference.node, h.name, h.holder, h.depth));
+                if (result == .yes) return .yes;
+            }
+            return result;
+        }
+    }.by);
 }
 
 /// Whether a read of the field `name` of `holder`'s values anywhere in the program is
 /// `released` (an `@field` by a computed name on one may be).
 fn typeReleased(c: *Context, holder: Facts.Container, name: []const u8, depth: u8) Context.Error!Stored {
+    const field = c.facts.member(holder, name) orelse return holderReleased(c, holder, name, depth);
+    return summarized(c, .{ .of = .field, .decl = field });
+}
+
+/// `typeReleased` of the field `field` declares.
+fn fieldReleased(c: *Context, field: Facts.Decl, depth: u8) Context.Error!Stored {
+    const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
+    return holderReleased(c, .{ .file = field.file, .scope = record.scope }, record.name, depth);
+}
+
+fn holderReleased(c: *Context, holder: Facts.Container, name: []const u8, depth: u8) Context.Error!Stored {
     var result: Stored = .no;
     for (try fieldUses(c, name)) |use| {
         const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
@@ -1177,7 +1361,145 @@ fn typeReleased(c: *Context, holder: Facts.Container, name: []const u8, depth: u
         result = join(result, if (use.named) answer else if (answer == .no) .no else .unknown);
         if (result == .yes) return .yes;
     }
+    // A union's field is read by what a prong captures of it (`prongReads`).
+    const prongs = try prongReads(c, holder, name);
+    if (prongs.unknown) result = join(result, .unknown);
+    for (prongs.captures) |capture| {
+        result = join(result, try readsReleased(c, capture.file, capture.decl, depth + 1));
+        if (result == .yes) return .yes;
+    }
     return result;
+}
+
+/// What a prong captures of a union's field, wherever a value of `holder` is switched on
+/// (`.lent => |d| d`): a prong naming it (`named`), and one naming no tag (`else`, `inline
+/// else`) or one otherwise, which may capture it, or the union itself. A subject that does not
+/// resolve may be one (`unknown`).
+const ProngReads = struct {
+    const Capture = struct { file: Project.FileId, decl: Model.Declaration.Id, named: bool };
+    captures: []const Capture,
+    unknown: bool,
+};
+
+fn prongReads(c: *Context, holder: Facts.Container, name: []const u8) Context.Error!ProngReads {
+    var found: std.ArrayList(ProngReads.Capture) = .empty;
+    var unknown = false;
+    const prongs = try unionProngs(c);
+    const named: []const Prong = if (prongs.named.get(name)) |list| list.items else &.{};
+    for ([_][]const Prong{ named, prongs.others.items }, [_]bool{ true, false }) |each, by_name| for (each) |prong| {
+        const subject = try c.facts.resolve(prong.file, prong.subject);
+        const switched = byPointer(subject) orelse {
+            if (subject == .unknown) unknown = true;
+            continue;
+        };
+        if (switched.file != holder.file or switched.scope != holder.scope) continue;
+        for (c.project.at(prong.file).model.declarations, 0..) |decl, d| {
+            if (decl.kind != .capture or decl.node != prong.case) continue;
+            try found.append(c.allocator, .{ .file = prong.file, .decl = @fromBackingInt(@intCast(d)), .named = by_name });
+        }
+    };
+    return .{ .captures = found.items, .unknown = unknown };
+}
+
+/// What `madeReleased` reads of a value kept in a field: whether the field `name` of the values
+/// the field `field` of `keeper` holds is released, each read of that field (`x.lent`, a prong's
+/// capture of it) followed as the value it gives; a prong that may capture the union itself, by
+/// its reads whole (`released`). Read once for the run, from no depth; one met again while still
+/// being read adds nothing there, and an answer of no read meanwhile is not kept (`summarized`).
+const KeptReads = struct {
+    found: std.StringHashMapUnmanaged(Stored) = .empty,
+    open: std.StringHashMapUnmanaged(void) = .empty,
+    met_open: usize = 0,
+};
+
+fn keptReleased(c: *Context, keeper: Facts.Container, field: []const u8, name: []const u8, holder: ?Facts.Container) Context.Error!Stored {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const state = try c.facts.memo(KeptReads);
+    const of: [2]u32 = if (holder) |h| .{ @backingInt(h.file), @backingInt(h.scope) } else .{ std.math.maxInt(u32), 0 };
+    const key = try c.allocator.print("{d}:{d}:{s}:{s}:{d}:{d}", .{ @backingInt(keeper.file), @backingInt(keeper.scope), field, name, of[0], of[1] });
+    if (state.found.get(key)) |answer| return answer;
+    if (state.open.contains(key)) {
+        state.met_open += 1;
+        return .no;
+    }
+    try state.open.put(c.allocator, key, {});
+    const met_open = state.met_open;
+    const result = try keptReads(c, keeper, field, name, holder);
+    _ = state.open.remove(key);
+    if (result != .no or state.met_open == met_open) try state.found.put(c.allocator, key, result);
+    return result;
+}
+
+fn keptReads(c: *Context, keeper: Facts.Container, field: []const u8, name: []const u8, holder: ?Facts.Container) Context.Error!Stored {
+    var result: Stored = .no;
+    for (try fieldUses(c, field)) |use| {
+        const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
+        if (receiver.file != keeper.file or receiver.scope != keeper.scope) continue;
+        if (!use.named) {
+            if (try released(c, use.file, use.node, 0) != .no) result = join(result, .unknown);
+            continue;
+        }
+        result = join(result, try madeReleased(c, use.file, use.node, name, holder, 0));
+        if (result == .yes) return .yes;
+    }
+    const prongs = try prongReads(c, keeper, field);
+    if (prongs.unknown) result = join(result, .unknown);
+    for (prongs.captures) |capture| {
+        if (!capture.named) {
+            result = join(result, try readsReleased(c, capture.file, capture.decl, 0));
+        } else for (c.project.at(capture.file).model.references) |reference| {
+            if (reference.declaration != capture.decl) continue;
+            result = join(result, try madeReleased(c, capture.file, reference.node, name, holder, 0));
+            if (result == .yes) return .yes;
+        }
+        if (result == .yes) return .yes;
+    }
+    return result;
+}
+
+/// A switch's prong that captures a payload: the switch's subject and the prong.
+const Prong = struct { file: Project.FileId, subject: Ast.Node.Index, case: Ast.Node.Index };
+
+/// The prongs of the program's switches that capture a payload, made once per run
+/// (`Facts.memo`): by each tag a prong names, and those that name one otherwise or none
+/// (`else`, `inline else`, a tag named through its type), which may capture any.
+const UnionProngs = struct {
+    built: bool = false,
+    named: std.StringHashMapUnmanaged(std.ArrayList(Prong)) = .empty,
+    others: std.ArrayList(Prong) = .empty,
+};
+
+fn unionProngs(c: *Context) Context.Error!*const UnionProngs {
+    const index = try c.facts.memo(UnionProngs);
+    if (index.built) return index;
+    index.built = true;
+    const gpa = c.facts.gpa;
+    for (c.project.sources) |*source| {
+        if (!try c.facts.program(source.id)) continue;
+        const tree = &source.file.tree;
+        for (0..tree.nodes.len) |i| {
+            const chosen = tree.fullSwitch(@fromBackingInt(@intCast(i))) orelse continue;
+            for (chosen.ast.cases) |case_node| {
+                const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
+                if (case.payload_token == null) continue;
+                const prong: Prong = .{ .file = source.id, .subject = chosen.ast.condition, .case = case_node };
+                var by_literal = case.ast.values.len != 0 and case.inline_token == null;
+                for (case.ast.values) |value| {
+                    if (tree.nodeTag(value) != .enum_literal) {
+                        by_literal = false;
+                        continue;
+                    }
+                    const entry = try index.named.getOrPut(gpa, try gpa.dupe(u8, tree.tokenSlice(tree.nodeMainToken(value))));
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(gpa, prong);
+                }
+                if (!by_literal) try index.others.append(gpa, prong);
+            }
+        }
+    }
+    return index;
 }
 
 /// Whether some read of the declaration `id` in `file` is `released`.
@@ -1241,22 +1563,139 @@ fn releasesParameter(c: *Context, call: *const Facts.calls.Call, position: usize
 
 /// `releasesParameter` where the call is to `callee`, `position` among its parameters.
 fn releasesBy(c: *Context, callee: Facts.Decl, position: usize, depth: u8) Context.Error!Stored {
+    const record = c.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+    if (!try c.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+    _ = depth;
+    return switch (parameterAt(c, callee, position)) {
+        .declared => |id| summarized(c, .{ .of = .parameter, .decl = .{ .file = callee.file, .index = id } }),
+        .none => .no,
+        .unknown => .unknown,
+    };
+}
+
+/// What `released` finds of a function's parameter (by each read of it in the body) or of a
+/// type's field (by each read of that field in the program): where chains of calls and fields
+/// meet again, each read once for the run, from no depth, so how far it is reached from does not
+/// cut it short. One met again while it is still being read adds no release of its own: it is no
+/// there, and an answer of no read meanwhile is not kept, being read again where asked.
+const Summary = struct { of: enum { parameter, field }, decl: Facts.Decl };
+const Summaries = struct {
+    found: std.AutoHashMapUnmanaged(Summary, Stored) = .empty,
+    open: std.AutoHashMapUnmanaged(Summary, void) = .empty,
+    /// How many times one still being read was met again.
+    met_open: usize = 0,
+};
+
+fn summarized(c: *Context, summary: Summary) Context.Error!Stored {
+    const state = try c.facts.memo(Summaries);
+    if (state.found.get(summary)) |answer| return answer;
+    if (state.open.contains(summary)) {
+        state.met_open += 1;
+        return .no;
+    }
+    try state.open.put(c.facts.gpa, summary, {});
+    const met_open = state.met_open;
+    const result = switch (summary.of) {
+        .parameter => try readsReleased(c, summary.decl.file, summary.decl.index, 0),
+        .field => try fieldReleased(c, summary.decl, 0),
+    };
+    _ = state.open.remove(summary);
+    if (result != .no or state.met_open == met_open) try state.found.put(c.facts.gpa, summary, result);
+    return result;
+}
+
+/// The parameter of the program function `callee` at `position`, a method's receiver first:
+/// none where it has no name or no parameter is there, which nothing in its body reads.
+const Parameter = union(enum) { declared: Model.Declaration.Id, none, unknown };
+
+fn parameterAt(c: *Context, callee: Facts.Decl, position: usize) Parameter {
     const target = &c.project.at(callee.file).file.tree;
     const target_model = &c.project.at(callee.file).model;
-    const record = target_model.declarations[@backingInt(callee.index)];
-    if (!try c.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
     var proto_buffer: [1]Ast.Node.Index = undefined;
-    const proto = target.fullFnProto(&proto_buffer, record.node) orelse return .unknown;
+    const proto = target.fullFnProto(&proto_buffer, target_model.declarations[@backingInt(callee.index)].node) orelse return .unknown;
     var params = proto.iterate(target);
     var at: usize = 0;
     const name_token = while (params.next()) |param| : (at += 1) {
-        if (at == position) break param.name_token orelse return .no;
-    } else return .no;
+        if (at == position) break param.name_token orelse return .none;
+    } else return .none;
     for (target_model.declarations, 0..) |decl, i| {
-        if (decl.kind != .parameter or decl.token != name_token) continue;
-        return readsReleased(c, callee.file, @fromBackingInt(@intCast(i)), depth);
+        if (decl.kind == .parameter and decl.token == name_token) return .{ .declared = @fromBackingInt(@intCast(i)) };
     }
-    return .no;
+    return .none;
+}
+
+/// Whether the element at `position` of a tuple (`tuple`: its literal, or a parameter or carrier
+/// that holds it on the way, read under `env`) is `released` where the tuple goes, as
+/// Facts.accesses reads each use: handed to a function, by each read of the parameter that takes
+/// it, read under the binding that call makes (`Facts.bind`); given as `@call`'s arguments, by
+/// the parameter at that position of each function Facts.calls reads that `@call` to make there
+/// (`retrying(io, f, .{ dir, &path })` and its `@call(.auto, f, args)`). Anywhere else it may be.
+/// The tuple's hand-ons are counted apart (`hops`, as far as `Facts.bind` reads a chain): the
+/// function its element reaches reads it one step past `depth`, where its tuple was made.
+fn elementReleased(c: *Context, file: Project.FileId, tuple: Ast.Node.Index, position: usize, env: ?*const Facts.Env, depth: u8) Context.Error!Stored {
+    return handedElement(c, file, tuple, position, env, depth, 0);
+}
+
+fn handedElement(c: *Context, file: Project.FileId, tuple: Ast.Node.Index, position: usize, env: ?*const Facts.Env, depth: u8, hops: u8) Context.Error!Stored {
+    if (depth >= 8 or hops >= 32) return .unknown;
+    switch (try Facts.accesses.useOf(c.facts, file, tuple)) {
+        .carried => |via| return handedElement(c, file, via.into, position, env, depth, hops + 1),
+        // `@TypeOf(args)` reads its type, no value.
+        .discarded, .compared, .typed => return .no,
+        // Kept in a literal's field (`.{ .arguments = args }`): by each read of that field of the
+        // literal's type, read under this binding (a type its function declares, as `syncCall`'s
+        // `Job` and its `run`, reads the function's parameters as its call binds them).
+        .field_of => |field| {
+            const tree = &c.project.at(file).file.tree;
+            const holder = byValue(try c.facts.literalType(file, field.literal)) orelse return .unknown;
+            var result: Stored = .no;
+            for (try fieldUses(c, tree.tokenSlice(field.name))) |use| {
+                const receiver = byPointer(try c.facts.resolve(use.file, use.receiver)) orelse continue;
+                if (receiver.file != holder.file or receiver.scope != holder.scope) continue;
+                const answer = try handedElement(c, use.file, use.node, position, env, depth, hops + 1);
+                result = join(result, if (use.named) answer else if (answer == .no) .no else .unknown);
+                if (result == .yes) return .yes;
+            }
+            return result;
+        },
+        .builtin_argument => |argument| {
+            const call = (try Facts.calls.under(c.facts, env, file, argument.call)) orelse return .unknown;
+            // `@call`'s tuple binds no receiver: its element at `position` is that parameter.
+            if (call.modifier == null or argument.position != 2) return .unknown;
+            return releasesParameter(c, &call, position, depth + 1);
+        },
+        .argument => |argument| {
+            const call = (try Facts.calls.under(c.facts, env, file, argument.call)) orelse return .unknown;
+            const args = switch (call.args) {
+                .known => |known| known,
+                .unknown => return .unknown,
+            };
+            const Handed = struct { file: Project.FileId, call: Ast.Node.Index, at: usize, position: usize, env: ?*const Facts.Env, depth: u8, hops: u8 };
+            const given: Handed = .{ .file = file, .call = argument.call, .at = std.mem.findScalar(Ast.Node.Index, args, tuple) orelse return .unknown, .position = position, .env = env, .depth = depth, .hops = hops + 1 };
+            return eachCallee(c, &call, given, struct {
+                fn by(h: Handed, cc: *Context, callee: Facts.Decl) Context.Error!Stored {
+                    const record = cc.project.at(callee.file).model.declarations[@backingInt(callee.index)];
+                    if (!try cc.facts.program(callee.file)) return if (releasing(record.name)) .yes else .no;
+                    const id = switch (parameterAt(cc, callee, h.at)) {
+                        .declared => |id| id,
+                        .none => return .no,
+                        .unknown => return .unknown,
+                    };
+                    var buffer: [1]Ast.Node.Index = undefined;
+                    const written = cc.project.at(h.file).file.tree.fullCall(&buffer, h.call) orelse return .unknown;
+                    const reading = try cc.facts.bind(h.file, written, callee, h.env);
+                    var result: Stored = .no;
+                    for (cc.project.at(callee.file).model.references) |reference| {
+                        if (reference.declaration != id) continue;
+                        result = join(result, try handedElement(cc, callee.file, reference.node, h.position, reading, h.depth, h.hops));
+                        if (result == .yes) return .yes;
+                    }
+                    return result;
+                }
+            }.by);
+        },
+        else => return .unknown,
+    }
 }
 
 /// Whether `node` in `file` is an argument of a call that neither releases it (`released`) nor
@@ -1546,8 +1985,22 @@ fn callViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
     return true;
 }
 
+/// Whether the function `callee` declares its result `noreturn`: a call of it gives no value.
+fn neverReturns(c: *Context, callee: Facts.Decl) Context.Error!bool {
+    const target = &c.project.at(callee.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = target.fullFnProto(&buffer, c.project.at(callee.file).model.declarations[@backingInt(callee.index)].node) orelse return false;
+    const result = proto.ast.return_type.unwrap() orelse return false;
+    return switch (try c.facts.resolve(callee.file, result)) {
+        .primitive => |name| std.mem.eql(u8, name, "noreturn"),
+        else => false,
+    };
+}
+
 /// `callViewed` where the call is to `callee`, given `given` arguments.
 fn calleeViewed(c: *Context, resources: []const ?Facts.Container, file: Project.FileId, call: *const Facts.calls.Call, callee: Facts.Decl, given: usize, next: u8, bound: ?*const Binding) Context.Error!bool {
+    // One that never returns (`aegis.assert.never`, `@panic`'s kind) gives no value, as `unreachable`.
+    if (try neverReturns(c, callee)) return true;
     // The program's function whose every return is a view returns one.
     if (try c.facts.program(callee.file)) return views(c, resources, callee, next, &.{ .file = file, .call = call, .callee = callee, .outer = bound });
     if (given != 0) return false;
