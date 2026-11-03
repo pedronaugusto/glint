@@ -1946,7 +1946,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     var out = try dep(c, flow, function, receiver);
     if ((try c.facts.definition(f.file, node)).orNull()) |decl| {
         if (decl.file == flow.zig_ast) if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) {
-            const field = c.project.at(decl.file).file.tree.fullContainerField(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
+            const field = c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
             return treeDep(c, flow, decl.file, field.ast.type_expr.unwrap());
         };
         if (flow.globals.get(decl)) |level| out = try out.join(c.allocator, .{ .level = level });
@@ -2223,7 +2223,7 @@ fn returned(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 /// than that type (`Range.shown`).
 fn shownField(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Facts.Decl) Context.Error!bool {
     const tree = &c.project.at(decl.file).file.tree;
-    const field = tree.fullContainerField(c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
+    const field = c.project.at(decl.file).model.containerField(tree, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
     const declared = field.ast.type_expr.unwrap() orelse return false;
     if (tree.nodeTag(declared) != .identifier or !Model.primitive(tree.tokenSlice(tree.nodeMainToken(declared)))) return false;
     return Range.shown(c, file, value, decl.file, declared);
@@ -2260,7 +2260,7 @@ fn unrefined(c: *Context, flow: *Flow, function: Function.Id, value: Ast.Node.In
         const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&elements_buffer, value)) |literal| literal.ast.elements else null;
         var position: usize = 0;
         for (container.ast.members) |member| {
-            const field = tree.fullContainerField(member) orelse continue;
+            const field = c.project.at(f.file).model.containerField(tree, member) orelse continue;
             if (!field.ast.tuple_like) continue;
             defer position += 1;
             const declared = field.ast.type_expr.unwrap() orelse continue;

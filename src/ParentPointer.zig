@@ -48,7 +48,7 @@ fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts
     const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
     if (record.kind != .field) return null;
     const written = &c.project.at(field.file).file.tree;
-    const declared = (written.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    const declared = (c.project.at(field.file).model.containerField(written, record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
     const kind = held(try c.facts.resolve(field.file, declared)) orelse return null;
     const field_of: Field = .{ .parent = parent, .name = name };
     const pointer = Facts.ungrouped(tree, args[1]);
@@ -100,7 +100,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
     const tree = &source.file.tree;
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != kind.scope) continue;
-        const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+        const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
         if (functionPointer(tree, declared)) |proto| {
             const given = (try interfaceParameters(c, kind.file, proto, kind)) orelse return false;
             if (!try readsCalledOnSelf(c, decl.name, kind, false, given)) return false;
@@ -113,7 +113,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
         var any = false;
         for (inner.model.declarations) |entry| {
             if (entry.kind != .field or entry.scope != table.scope) continue;
-            const entry_type = (inner.file.tree.fullContainerField(entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+            const entry_type = (inner.model.containerField(&inner.file.tree, entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
             const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
             const given = (try interfaceParameters(c, table.file, proto, kind)) orelse return false;
             if (!try readsCalledOnSelf(c, entry.name, table, true, given)) return false;
@@ -141,7 +141,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
             if (receiver == .unknown and (generic(file_tree, &each.model, node) or try namesType(c, each.id, args[0]))) continue;
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
-                const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+                const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
                 if (functionPointer(tree, declared)) |_| {
                     // A member of it read, indexed or iterated: no function pointer.
                     if (notFunction(file_tree, &each.model, node)) continue;
@@ -539,7 +539,7 @@ fn installs(c: *Context, reference: Ast.Node.Index, field: Field, through: u8) C
             continue;
         }
         // C.F's own default value, declared in C.
-        if (tree.fullContainerField(parent)) |declared| {
+        if (model.containerField(tree, parent)) |declared| {
             if (declared.ast.value_expr.unwrap() != at) return false;
             if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(declared.ast.main_token)), field.name)) return false;
             return field.parent.file == c.file and model.parentOf(parent) == model.scopes[@backingInt(field.parent.scope)].node;
@@ -752,7 +752,7 @@ const Follow = struct {
                     const record = c.project.at(slot.file).model.declarations[@backingInt(slot.index)];
                     if (record.kind == .field) {
                         const slot_tree = &c.project.at(slot.file).file.tree;
-                        const declared = (slot_tree.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
+                        const declared = (c.project.at(slot.file).model.containerField(slot_tree, record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
                         const proto = functionPointer(slot_tree, declared) orelse return false;
                         const given = (try interfaceParameters(c, slot.file, proto, f.kind)) orelse return false;
                         return position < 64 and given & (@as(u64, 1) << @intCast(position)) != 0;
@@ -907,7 +907,7 @@ const Follow = struct {
         if ((try f.seen.getOrPut(c.allocator, decl)).found_existing) return true;
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         if (record.kind != .field) return false;
-        const declared = (c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
+        const declared = (c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
         if (!f.pointer(try c.facts.resolve(decl.file, declared))) return false;
         // A field others outside the program can read may carry it anywhere.
         if (record.public) return false;
@@ -1300,7 +1300,7 @@ const Carry = struct {
                 const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
                 // A method of C, or a declaration: the program's, typed, read there.
                 if (record.kind != .field) return .shown;
-                const declared = (c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return .undecided).ast.type_expr.unwrap() orelse return .undecided;
+                const declared = (c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, record.node) orelse return .undecided).ast.type_expr.unwrap() orelse return .undecided;
                 const value = try c.facts.resolve(decl.file, declared);
                 if (value == .unknown) return k.goes(file, access, .held);
                 return if (try k.holds(value, 0)) |inner| k.goes(file, access, inner) else .shown;
@@ -1601,7 +1601,7 @@ fn functions(c: *Context, kind: Facts.Container) Context.Error![]const Slot {
     const tree = &source.file.tree;
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != kind.scope) continue;
-        const declared = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+        const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
         if (functionPointer(tree, declared)) |proto| {
             try slots.append(c.allocator, .{ .holder = kind, .name = decl.name, .given = try interfaceParameters(c, kind.file, proto, kind) });
             continue;
@@ -1612,7 +1612,7 @@ fn functions(c: *Context, kind: Facts.Container) Context.Error![]const Slot {
         var any = false;
         for (inner.model.declarations) |entry| {
             if (entry.kind != .field or entry.scope != table.scope) continue;
-            const entry_type = (inner.file.tree.fullContainerField(entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+            const entry_type = (inner.model.containerField(&inner.file.tree, entry.node) orelse continue).ast.type_expr.unwrap() orelse continue;
             const proto = functionPointer(&inner.file.tree, entry_type) orelse continue;
             try slots.append(c.allocator, .{ .holder = table, .name = entry.name, .through = true, .given = try interfaceParameters(c, table.file, proto, kind) });
             any = true;

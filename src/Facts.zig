@@ -2377,7 +2377,7 @@ fn fieldTypes(self: *Facts, container: Container) ResolveError!Value {
     var each: std.ArrayList(Value) = .empty;
     for (model.declarations, 0..) |d, i| {
         if (d.kind != .field or d.scope != container.scope) continue;
-        const field = self.syntaxOf(container.file).fullContainerField(d.node) orelse continue;
+        const field = model.containerField(self.syntaxOf(container.file), d.node) orelse continue;
         if (field.ast.type_expr == .none) continue;
         try each.append(self.gpa, try typeOf(self, try self.memberOf(container, .{ .file = container.file, .index = @fromBackingInt(@intCast(i)) }), {}));
     }
@@ -2395,22 +2395,19 @@ pub fn heldFields(self: *Facts, container: Container) ResolveError![]const HeldF
     const model = &self.project.at(container.file).model;
     const tree = self.syntaxOf(container.file);
     var out: std.ArrayList(HeldField) = .empty;
+    // An enum's value is its tag, an integer: it holds no field.
+    if (self.kindOf(container) == .keyword_enum) return out.items;
     for (model.declarations, 0..) |d, i| {
         if (d.kind != .field or d.scope != container.scope) continue;
         const decl: Decl = .{ .file = container.file, .index = @fromBackingInt(@intCast(i)) };
-        // A field with no type holds `void`.
-        const typed = (tree.fullContainerField(d.node) orelse continue).ast.type_expr != .none;
-        try out.append(self.gpa, .{ .value = if (typed) try self.memberOf(container, decl) else .scalar, .decl = decl });
+        try out.append(self.gpa, .{ .value = try self.memberOf(container, decl), .decl = decl });
     }
     const node = model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return out.items;
     var buffer: [2]Ast.Node.Index = undefined;
     const full = tree.fullContainerDecl(&buffer, node) orelse return out.items;
-    // An enum's or a union's bare name (`none,`) is a tag, holding nothing or `void`, and no
-    // tuple's field.
-    if (tree.tokenTag(full.ast.main_token) != .keyword_struct) return out.items;
     for (full.ast.members) |item| {
-        const field = tree.fullContainerField(item) orelse continue;
+        const field = model.containerField(tree, item) orelse continue;
         if (!field.ast.tuple_like) continue;
         const type_node = field.ast.type_expr.unwrap() orelse continue;
         const value = if (container.made_by) |made| blk: {
@@ -2554,25 +2551,14 @@ fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8
     }
 }
 
-/// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags. An
-/// enum's field is written as a bare name, which Zig's syntax tree reads as a tuple's field.
+/// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags.
 pub fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
-    const node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
-    if (node == .root) return false;
-    const tree = self.syntaxOf(container.file);
-    var buffer: [2]Ast.Node.Index = undefined;
-    const decl = tree.fullContainerDecl(&buffer, node) orelse return false;
-    switch (tree.tokenTag(decl.ast.main_token)) {
+    switch (self.kindOf(container) orelse return false) {
         .keyword_enum, .keyword_union => {},
         else => return false,
     }
-    for (decl.ast.members) |member_node| {
-        var field = tree.fullContainerField(member_node) orelse continue;
-        field.convertToNonTupleLike(tree);
-        if (field.ast.tuple_like) continue;
-        if (std.mem.eql(u8, Model.identifier(self.gpa, tree.tokenSlice(field.ast.main_token)) catch return false, name)) return true;
-    }
-    return false;
+    const decl = self.member(container, name) orelse return false;
+    return self.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field;
 }
 
 /// Whether a container written in the program declares no member `name`.
@@ -2638,7 +2624,7 @@ pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Val
         };
         return self.madeWithin(try self.declaration(decl), container, made);
     }
-    const field = tree.fullContainerField(record.node) orelse return self.declaration(decl);
+    const field = self.project.at(decl.file).model.containerField(tree, record.node) orelse return self.declaration(decl);
     const type_node = field.ast.type_expr.unwrap() orelse return self.declaration(decl);
     const value = try self.substituted(decl.file, type_node, made);
     if (value == .unknown) {
@@ -3535,7 +3521,7 @@ fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) Re
     }
     if (record.kind != .field) return null;
     const tree = &self.project.at(decl.file).file.tree;
-    var declared = (tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    var declared = (self.project.at(decl.file).model.containerField(tree, record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
     if (tree.nodeTag(declared) == .optional_type) declared = tree.nodeData(declared).node;
     if (tree.fullPtrType(declared)) |ptr| declared = ptr.ast.child_type;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -3685,11 +3671,9 @@ fn switchPayload(self: *Facts, env: ?*const Env, file: Project.FileId, case_node
     if (fields.items.len == 0) return .{ .unknown = .unsupported };
     const values = try self.gpa.alloc(Value, fields.items.len);
     for (fields.items, values) |field, *value| {
-        // A field with no type holds `void`.
-        const record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
-        const typed = self.project.at(field.file).file.tree.fullContainerField(record.node).?.ast.type_expr != .none;
-        // Of a union a type function made, read with its call's bindings (`parsed: T`).
-        value.* = if (typed) try self.memberOf(container, field) else .scalar;
+        // Of a union a type function made, read with its call's bindings (`parsed: T`); a tag
+        // with no type holds `void`.
+        value.* = try self.memberOf(container, field);
         if (value.* == .unknown) return value.*;
     }
     // An `inline` prong is analysed once per field, its capture each one's payload in turn;
@@ -3885,9 +3869,16 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     }
     if (declaration_record.kind == .capture) return self.captured(null, decl);
     if (declaration_record.kind == .field) {
-        const field = tree.fullContainerField(declaration_record.node).?;
+        const field = model.containerField(tree, declaration_record.node).?; // unreachable: the declaration is a field's
         if (field.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(decl.file, t));
-        return .{ .unknown = .unsupported };
+        // A field with no type: an enum's tag, a value of the enum; a union's, holding `void`;
+        // a struct's field always has one.
+        const holder: Container = .{ .file = decl.file, .scope = declaration_record.scope };
+        return switch (self.kindOf(holder) orelse return .{ .unknown = .unsupported }) {
+            .keyword_enum => .{ .instance = holder },
+            .keyword_union => .scalar,
+            else => .{ .unknown = .unsupported },
+        };
     }
     if (tree.fullVarDecl(declaration_record.node)) |variable| {
         const mutable = tree.tokenTag(variable.ast.mut_token) == .keyword_var;
@@ -4643,7 +4634,7 @@ fn destructuredAt(self: *Facts, value: Value, position: usize) ResolveError!Valu
             const container = source.fullContainerDecl(&buffer, model.scopes[@backingInt(tuple.scope)].node) orelse return .{ .unknown = .unsupported };
             var at: usize = 0;
             for (container.ast.members) |item| {
-                const field = source.fullContainerField(item) orelse continue;
+                const field = model.containerField(source, item) orelse continue;
                 if (!field.ast.tuple_like) return .{ .unknown = .unsupported };
                 if (at == position) return self.instance(try self.resolve(tuple.file, field.ast.type_expr.unwrap() orelse return .{ .unknown = .unsupported }));
                 at += 1;
@@ -4799,7 +4790,7 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
             const container = tree.fullContainerDecl(&buffer, scope.node) orelse return false;
             var fields: usize = 0;
             for (container.ast.members) |item| {
-                const field = tree.fullContainerField(item) orelse continue;
+                const field = model.containerField(tree, item) orelse continue;
                 fields += 1;
                 if (is_enum) continue;
                 const t = field.ast.type_expr.unwrap() orelse continue;
@@ -4883,7 +4874,7 @@ pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index)
         const field = self.member(container orelse return null, try self.memberName(tree.tokenSlice(first - 2))) orelse return null;
         const record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
         if (record.kind != .field) return null;
-        const declared = (self.project.at(field.file).file.tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+        const declared = (self.project.at(field.file).model.containerField(&self.project.at(field.file).file.tree, record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
         return heldContainer(try self.resolve(field.file, declared));
     }
     return null;
@@ -5942,7 +5933,7 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
             if (!names_it) continue;
             // The declaration's own name token is no use of it, nor an enum's field of that name.
             if (tag == .identifier and tree.nodeMainToken(node) == name_token and own) continue;
-            if (tag == .identifier and enumField(tree, file_model, node)) continue;
+            if (tag == .identifier and file_model.tagName(tree, node)) continue;
             const parent = file_model.node_parents[i] orelse return null;
             // `@TypeOf(f)` asks its type: no use of it that passes it on.
             if (isTypeQuery(tree, parent)) continue;
@@ -6073,7 +6064,7 @@ fn closedField(self: *Facts, receiver: Key) ResolveError!bool {
     const source = self.project.at(decl.file);
     const record = source.model.declarations[@backingInt(decl.index)];
     if (record.kind != .field) return false;
-    const field = source.file.tree.fullContainerField(record.node) orelse return false;
+    const field = source.model.containerField(&source.file.tree, record.node) orelse return false;
     return closedType(source, field.ast.type_expr.unwrap() orelse return false, 0);
 }
 
@@ -6127,9 +6118,8 @@ fn closedType(source: *const Project.Source, node: Ast.Node.Index, depth: u8) bo
                 // whatever type it is given, the program's among them.
                 if (std.mem.eql(u8, tree.tokenSlice(token), "type")) return false;
                 if (std.zig.primitives.isPrimitive(tree.tokenSlice(token))) continue;
-                // An enum's bare field (`enum { empty, ready }`) is a name, which the parser
-                // keeps where a tuple field keeps its type.
-                if (enumField(tree, &source.model, @fromBackingInt(@intCast(i)))) continue;
+                // An enum's or a union's bare tag (`enum { empty, ready }`) names itself.
+                if (source.model.tagName(tree, @fromBackingInt(@intCast(i)))) continue;
                 const ref = source.model.reference(@fromBackingInt(@intCast(i))) orelse return false;
                 const named = ref.declaration orelse {
                     if (ref.unknown == .primitive) continue;
@@ -6307,7 +6297,7 @@ fn comptimeField(self: *Facts, name: []const u8) ResolveError!bool {
             if (file.status != .parsed) continue;
             for (model.declarations) |d| {
                 if (d.kind != .field) continue;
-                const field = file.tree.fullContainerField(d.node) orelse continue;
+                const field = model.containerField(&file.tree, d.node) orelse continue;
                 if (field.comptime_token != null) try names.put(self.gpa, d.name, {});
             }
         }
@@ -6349,16 +6339,6 @@ pub fn throughModule(self: *const Facts, file: Project.FileId, node: Ast.Node.In
     if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return false;
     if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "@import")) return false;
     return !std.mem.endsWith(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), ".zig\"");
-}
-
-/// Whether `node` is the name of an enum's field, which Zig's syntax tree holds where a
-/// struct's field holds its type.
-fn enumField(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
-    const field = model.parentOf(node) orelse return false;
-    const full = tree.fullContainerField(field) orelse return false;
-    if (full.ast.type_expr.unwrap() != node) return false;
-    const container = model.parentOf(field) orelse return false;
-    return tree.tokenTag(tree.nodeMainToken(container)) == .keyword_enum;
 }
 
 fn isTypeQuery(tree: *const Ast, node: Ast.Node.Index) bool {
@@ -7067,7 +7047,7 @@ pub const accesses = struct {
             .type => return .typed,
             .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else .typed,
             .variable => return if (tree.fullVarDecl(parent).?.ast.init_node.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a variable's
-            .field_declaration => return if (tree.fullContainerField(parent).?.ast.value_expr.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a field's
+            .field_declaration => return if (model.containerField(tree, parent).?.ast.value_expr.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a field's
             .assign => {
                 const target = tree.nodeData(parent).node_and_node[0];
                 const site = (try storeInto(facts, file, target)) orelse return if (discard(tree, target)) .discarded else .{ .unknown = .unsupported };
@@ -8153,7 +8133,7 @@ pub const accesses = struct {
                         if (try w.mentions(subject)) _ = try w.path(w.make(node, subject, .address, null));
                     },
                     .container_field_init, .container_field_align, .container_field => {
-                        const field = tree.fullContainerField(node).?; // unreachable: the tag is a field's
+                        const field = w.lexicon().containerField(tree, node).?; // unreachable: the tag is a field's
                         const default = field.ast.value_expr.unwrap() orelse continue;
                         const d = w.declared(node) orelse continue;
                         if (!w.names(w.lexicon().declarations[@backingInt(d.index)].name)) continue;
@@ -9078,7 +9058,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         return if (variable.ast.type_node.unwrap()) |t| try self.resolve(file, t) else .scalar;
     }
     // A field's default value takes the field's type.
-    if (tree.fullContainerField(parent)) |field| {
+    if (model.containerField(tree, parent)) |field| {
         if (field.ast.value_expr.unwrap() != node) return .{ .unknown = .unsupported };
         return if (field.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else .{ .unknown = .unsupported };
     }

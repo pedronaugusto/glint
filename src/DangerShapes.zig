@@ -36,7 +36,7 @@ pub fn ownership(c: *Context, rule: Rule) Context.Error!void {
     for (model.declarations, 0..) |decl, index| {
         if (c.inTest(decl.token)) continue;
         const written: Ast.Node.Index = switch (decl.kind) {
-            .field => (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue,
+            .field => (model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue,
             .function => blk: {
                 var buffer: [1]Ast.Node.Index = undefined;
                 break :blk (tree.fullFnProto(&buffer, decl.node) orelse continue).ast.return_type.unwrap() orelse continue;
@@ -186,14 +186,12 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
         try handed(c, rule, resources, &call);
     }
     // A tuple's fields, named by position only, are no declarations: each is read where it is
-    // written, as a field is. An enum's or a union's field written without a type parses the
-    // same, and is a name.
+    // written, as a field is.
     var buffer: [2]Ast.Node.Index = undefined;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const container = tree.fullContainerDecl(&buffer, @fromBackingInt(@intCast(i))) orelse continue;
-        if (tree.tokenTag(container.ast.main_token) != .keyword_struct) continue;
         for (container.ast.members) |node| {
-            const field = tree.fullContainerField(node) orelse continue;
+            const field = c.project.at(c.file).model.containerField(tree, node) orelse continue;
             if (!field.ast.tuple_like) continue;
             const first = tree.firstToken(node);
             if (c.inTest(first)) continue;
@@ -460,7 +458,7 @@ fn outside(c: *Context, resources: []const ?Facts.Container, value: Facts.Value,
     const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
     if (record.kind != .field) return null;
     const tree = &c.project.at(field.file).file.tree;
-    const written = (tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
+    const written = (c.project.at(field.file).model.containerField(tree, record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
     return find(resources, byValue(try c.facts.resolve(field.file, written)) orelse return null);
 }
 
@@ -661,7 +659,7 @@ fn resourceField(c: *Context, resources: []const ?Facts.Container, holder: Facts
     const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
     if (record.kind != .field) return false;
     const tree = &c.project.at(field.file).file.tree;
-    const written = (tree.fullContainerField(record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
+    const written = (c.project.at(field.file).model.containerField(tree, record.node) orelse return false).ast.type_expr.unwrap() orelse return false;
     return find(resources, byValue(try c.facts.resolve(field.file, written)) orelse return false) != null;
 }
 
@@ -862,7 +860,7 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
     const own = &c.project.at(file).file.tree;
     const owner = "that its file makes and writes into it";
     var doubt = false;
-    if ((own.fullContainerField(decl.node) orelse return null).ast.value_expr.unwrap()) |default| {
+    if ((c.project.at(file).model.containerField(own, decl.node) orelse return null).ast.value_expr.unwrap()) |default| {
         if (!try filled(c, resources, file, default)) return owner;
     }
     for (try fieldUses(c, decl.name)) |use| {
@@ -2309,7 +2307,7 @@ pub fn identity(c: *Context, rule: Rule) Context.Error!void {
         var kinds: std.ArrayList(Kind) = .empty;
         for (model.declarations) |decl| {
             if (decl.kind != .field or decl.scope != scope.id or c.inTest(decl.token) or !identifies(decl.name)) continue;
-            const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+            const written = (model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
             const kind = (try kindOf(c, tree, written)) orelse continue;
             try names.append(c.allocator, decl.token);
             try kinds.append(c.allocator, kind);
@@ -2526,7 +2524,7 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     for (model.declarations, 0..) |decl, index| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
-        const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+        const written = (model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
         const hold = (try stateHold(c, try c.facts.resolve(c.file, written))) orelse continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
@@ -2742,7 +2740,7 @@ const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, target: 
 fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.ArrayList(StateWrite)) Context.Error!void {
     const program = try Program.get(c);
     const field_tree = &c.project.at(field.file).file.tree;
-    const declared = (field_tree.fullContainerField(c.project.at(field.file).model.declarations[@backingInt(field.index)].node) orelse return).ast.type_expr.unwrap() orelse return;
+    const declared = (c.project.at(field.file).model.containerField(field_tree, c.project.at(field.file).model.declarations[@backingInt(field.index)].node) orelse return).ast.type_expr.unwrap() orelse return;
     const state = try c.facts.resolve(field.file, declared);
     var files: std.ArrayList(Project.FileId) = .empty;
     for (c.project.sources) |*each| {
@@ -3371,7 +3369,7 @@ fn namesTags(c: *Context, value: Facts.Container) bool {
     var buffer: [2]Ast.Node.Index = undefined;
     const container = tree.fullContainerDecl(&buffer, c.project.at(value.file).model.scopes[@backingInt(value.scope)].node) orelse return true;
     for (container.ast.members) |member| {
-        const field = tree.fullContainerField(member) orelse continue;
+        const field = c.project.at(value.file).model.containerField(tree, member) orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), "_")) return true;
     }
     return false;

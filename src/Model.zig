@@ -100,7 +100,7 @@ pub fn init(file: *File) InitError!Model {
         const decl = zir.getDeclaration(instruction);
         try lowered.append(a, .{ .instruction = instruction, .node = decl.src_node, .name = zir.nullTerminatedString(decl.name), .public = decl.is_pub, .type_body = decl.type_body, .value_body = decl.value_body });
     };
-    if (tree.errors.len == 0) try collectDeclarations(a, tree, token_scopes, scopes.items, &declarations);
+    if (tree.errors.len == 0) try collectDeclarations(a, tree, node_parents, token_scopes, scopes.items, &declarations);
     const by_node = try a.alloc(?std.zig.Zir.Inst.Index, tree.nodes.len);
     @memset(by_node, null);
     for (lowered.items) |decl| {
@@ -125,6 +125,7 @@ pub fn init(file: *File) InitError!Model {
         if (tag != .identifier and tag != .enum_literal and tag != .test_decl) continue; // safe: std node/token/instruction indexes and bounded table lengths fit u32.
         const token = if (tag == .test_decl) tree.nodeData(node).opt_token_and_node[0].unwrap() orelse continue else tree.nodeMainToken(node);
         if (tree.tokenTag(token) != .identifier) continue;
+        if (tag == .identifier and namesTag(tree, node_parents, node)) continue;
         const name = try identifier(a, tree.tokenSlice(token));
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
         const decl = model.lookup(token_scopes[token], name, token);
@@ -389,6 +390,40 @@ pub fn scopeOf(self: *const Model, token: Ast.TokenIndex) Scope.Id {
     return if (token < self.token_scopes.len) self.token_scopes[token] else self.root();
 }
 
+/// The container field `node` declares, as its container reads it; null for any other node.
+/// std's parser reads an enum's or a union's tag written with no type (`a,`, `a = 0`) as a
+/// tuple's field whose type is the identifier, since only the container's keyword tells the two
+/// apart: here such a tag is a field that identifier names, with no type. A file that does not
+/// parse has no parents, and its fields are std's reading.
+pub fn containerField(self: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.full.ContainerField {
+    return fieldIn(tree, self.node_parents, node);
+}
+
+fn fieldIn(tree: *const Ast, node_parents: []const ?Ast.Node.Index, node: Ast.Node.Index) ?Ast.full.ContainerField {
+    var field = tree.fullContainerField(node) orelse return null;
+    if (@backingInt(node) >= node_parents.len) return field;
+    // A file's own fields are a struct's.
+    const container = node_parents[@backingInt(node)] orelse return field;
+    if (container == .root) return field;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, container).?; // unreachable: a field's parent is its container
+    if (tree.tokenTag(decl.ast.main_token) != .keyword_struct) field.convertToNonTupleLike(tree);
+    return field;
+}
+
+/// Whether `node` is the identifier an enum's or a union's tag is named by (`a` of `a,`), which
+/// std's parser reads as a tuple field's type: it declares the tag and refers to nothing.
+pub fn tagName(self: *const Model, tree: *const Ast, node: Ast.Node.Index) bool {
+    return namesTag(tree, self.node_parents, node);
+}
+
+fn namesTag(tree: *const Ast, node_parents: []const ?Ast.Node.Index, node: Ast.Node.Index) bool {
+    if (@backingInt(node) >= node_parents.len) return false;
+    const parent = node_parents[@backingInt(node)] orelse return false;
+    const field = fieldIn(tree, node_parents, parent) orelse return false;
+    return field.ast.type_expr == .none and field.ast.main_token == tree.nodeMainToken(node);
+}
+
 /// The node `node` is part of; null for the root, and for a node past the file's tree.
 pub fn parentOf(self: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
     const index = @backingInt(node);
@@ -510,7 +545,7 @@ fn declarationScope(scopes: []const Scope, start: Scope.Id) Scope.Id {
     return result;
 }
 
-fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const Scope.Id, scopes: []Scope, list: *std.ArrayList(Declaration)) InitError!void {
+fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, node_parents: []const ?Ast.Node.Index, tokens: []const Scope.Id, scopes: []Scope, list: *std.ArrayList(Declaration)) InitError!void {
     for (tree.nodes.items(.tag), 0..) |tag, index| {
         if (index == 0) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
@@ -531,7 +566,7 @@ fn collectDeclarations(a: std.mem.Allocator, tree: *const Ast, tokens: []const S
                 try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = param.type_expr orelse node, .token = token, .scope = function_scope, .kind = .parameter });
             };
         }
-        if (tree.fullContainerField(node)) |field| if (!field.ast.tuple_like) {
+        if (fieldIn(tree, node_parents, node)) |field| if (!field.ast.tuple_like) {
             try addDeclaration(a, tree, scopes, list, .{ .name = "", .node = node, .token = field.ast.main_token, .scope = tokens[field.ast.main_token], .kind = .field });
         };
         if (tree.fullIf(node)) |value| {
@@ -617,6 +652,26 @@ pub fn primitive(name: []const u8) bool {
         .{ "c_char", {} },    .{ "c_short", {} },      .{ "c_ushort", {} },       .{ "c_int", {} },       .{ "c_uint", {} },
         .{ "c_long", {} },    .{ "c_ulong", {} },      .{ "c_longlong", {} },     .{ "c_ulonglong", {} }, .{ "c_longdouble", {} },
     }).has(name);
+}
+
+test "an enum's and a union's tags written with no type are fields, whose names refer to nothing" {
+    var file = try File.init(std.testing.allocator, "const a = 1; const A = u8; pub const E = enum(u8) { a, b = 2 }; pub const U = union(enum) { a, c: u32 }; pub const T = struct { u32, A };", .{});
+    defer file.deinit();
+    const model = try init(&file);
+    var fields: [4][]const u8 = undefined;
+    var count: usize = 0;
+    for (model.declarations) |decl| if (decl.kind == .field) {
+        try std.testing.expect(count < fields.len);
+        fields[count] = decl.name;
+        count += 1;
+    };
+    // A tuple's fields declare no name.
+    try std.testing.expectEqual(@as(usize, 4), count);
+    for (fields, [_][]const u8{ "a", "b", "a", "c" }) |got, want| try std.testing.expectEqualStrings(want, got);
+    // The tags `a` name themselves, not `const a`; a tuple field's type `A` refers to `const A`.
+    try std.testing.expectEqual(@as(u32, 0), model.declarations[0].references);
+    try std.testing.expectEqual(@as(u32, 1), model.declarations[1].references);
+    try std.testing.expectEqual(@as(usize, 0), model.unknown_references);
 }
 
 test "binding distinguishes strings and conservatively retains declaration literals" {

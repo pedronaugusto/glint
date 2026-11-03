@@ -1028,7 +1028,7 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     const model = &c.project.at(decl.file).model;
     const tree = &c.project.at(decl.file).file.tree;
     const record = model.declarations[@backingInt(decl.index)];
-    _ = tree.fullContainerField(record.node) orelse return false;
+    _ = model.containerField(tree, record.node) orelse return false;
     const container_node = model.scopes[@backingInt(record.scope)].node;
     var buffer: [2]Ast.Node.Index = undefined;
     const holder = tree.fullContainerDecl(&buffer, container_node) orelse return false;
@@ -1569,7 +1569,7 @@ fn backed(c: *Context, file: Project.FileId, call: Ast.Node.Index, pointer: u16)
     var open = false;
     var next: u64 = 0;
     for (declared.ast.members) |member| {
-        const each = tree.fullContainerField(member) orelse continue;
+        const each = c.project.at(container.file).model.containerField(tree, member) orelse continue;
         if (std.mem.eql(u8, tree.tokenSlice(each.ast.main_token), "_")) {
             open = true;
             continue;
@@ -3434,7 +3434,7 @@ fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
     if (tree.tokenTag(declared.ast.main_token) != .keyword_enum or declared.ast.arg == .none) return null;
     var open = false;
     for (declared.ast.members) |member| {
-        const each = tree.fullContainerField(member) orelse continue;
+        const each = model.containerField(tree, member) orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(each.ast.main_token), "_")) return null;
         open = true;
     }
@@ -4121,7 +4121,7 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
             if (decl_tree.nodeTag(length_node) == .identifier and std.mem.eql(u8, decl_tree.tokenSlice(decl_tree.nodeMainToken(length_node)), "_")) return literal_init.ast.elements.len;
             break :blk array_type;
         },
-        .field => (decl_tree.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap(),
+        .field => (c.project.at(decl.file).model.containerField(decl_tree, record.node) orelse return null).ast.type_expr.unwrap(),
         // A parameter holds what its type says: the compiler checks every call gives that.
         .parameter => c.facts.parameterTypeNode(decl),
         else => null,

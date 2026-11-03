@@ -192,7 +192,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             if (decl.kind == .parameter) return kind(c, file, decl.node, depth + 1);
             if (decl.kind == .capture) return captured(c, file, decl.node, decl.token, depth + 1);
             if (decl.kind == .field) {
-                const field = tree.fullContainerField(decl.node).?;
+                const field = model.containerField(tree, decl.node).?;
                 if (field.ast.type_expr.unwrap()) |t| return kind(c, file, t, depth + 1);
             }
             if (tree.fullVarDecl(decl.node)) |v| {
@@ -218,7 +218,7 @@ pub fn kind(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
             const written = &c.project.at(decl.file).file.tree;
             if (record.kind == .field) {
-                const field = written.fullContainerField(record.node).?;
+                const field = c.project.at(decl.file).model.containerField(written, record.node).?;
                 if (field.ast.type_expr.unwrap()) |t| return kind(c, decl.file, t, depth + 1);
                 return null;
             }

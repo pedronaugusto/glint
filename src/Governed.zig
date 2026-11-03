@@ -191,7 +191,8 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const site: Ast.TokenIndex, const spelled: []const u8 = switch (tag) {
             .identifier => blk: {
-                if (memberName(self, node)) continue;
+                // An enum's or a union's tag written with no type names itself.
+                if (self.project.at(self.file).model.tagName(tree, node)) continue;
                 break :blk .{ tree.nodeMainToken(node), try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeMainToken(node))) };
             },
             .field_access => blk: {
@@ -545,21 +546,6 @@ fn externSymbol(project: *const Project, decl: Facts.Decl) ?[]const u8 {
     const token = (tree.fullFnProto(&buffer, record.node) orelse return null).extern_export_inline_token orelse return null;
     if (tree.tokenTag(token) != .keyword_extern) return null;
     return record.name;
-}
-
-/// Whether an identifier is the name of an enum's or union's member written alone
-/// (`enum { sync, close }`): the parser gives it as a field's type, but it names the member.
-fn memberName(self: *const Context, node: Ast.Node.Index) bool {
-    const model = &self.project.at(self.file).model;
-    const tree = &self.project.at(self.file).file.tree;
-    const field_node = model.parentOf(node) orelse return false;
-    const field = tree.fullContainerField(field_node) orelse return false;
-    if (!field.ast.tuple_like or field.ast.type_expr.unwrap() != node) return false;
-    const container = model.parentOf(field_node) orelse return false;
-    return switch (tree.tokenTag(tree.nodeMainToken(container))) {
-        .keyword_enum, .keyword_union => true,
-        else => false,
-    };
 }
 
 /// Whether no governed declaration spelled `spelled` can be what a member access with an

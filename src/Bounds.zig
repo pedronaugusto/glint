@@ -3097,7 +3097,7 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         .field_access => {
             const decl = ((try c.facts.definition(file, node)).orNull()) orelse return null;
             const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-            const field = c.project.at(decl.file).file.tree.fullContainerField(record.node) orelse return null;
+            const field = c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, record.node) orelse return null;
             return .{ .file = decl.file, .node = field.ast.type_expr.unwrap() orelse return null };
         },
         .call_one, .call_one_comma, .call, .call_comma => {

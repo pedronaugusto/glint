@@ -784,7 +784,7 @@ const Walk = struct {
         const name = w.tree.tokenSlice(member);
         for (source.model.declarations) |decl| {
             if (decl.kind != .field or decl.scope != owner.container.scope or !std.mem.eql(u8, decl.name, name)) continue;
-            const field = tree.fullContainerField(decl.node) orelse return false;
+            const field = source.model.containerField(tree, decl.node) orelse return false;
             const kind = field.ast.type_expr.unwrap() orelse return false;
             return spelledPointer(tree, &source.model, owner.container.scope, kind, true);
         }
@@ -3128,7 +3128,7 @@ fn heldField(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.
     const name = tree.tokenSlice(member);
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != container.scope or !std.mem.eql(u8, decl.name, name)) continue;
-        const field = source.file.tree.fullContainerField(decl.node) orelse return .memory;
+        const field = source.model.containerField(&source.file.tree, decl.node) orelse return .memory;
         var kind = field.ast.type_expr.unwrap() orelse return .memory;
         if (source.file.tree.nodeTag(kind) == .optional_type) kind = source.file.tree.nodeData(kind).node;
         const pointer = source.file.tree.fullPtrType(kind) orelse return .memory;
@@ -3387,7 +3387,7 @@ fn cursorCountRead(c: *Context, container: Facts.Container, memory: Facts.Decl) 
     var count: ?[]const u8 = null;
     for (model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != container.scope) continue;
-        const field = tree.fullContainerField(decl.node) orelse continue;
+        const field = model.containerField(tree, decl.node) orelse continue;
         if (literalValue(tree, field.ast.value_expr.unwrap() orelse continue) != 0) continue;
         const kind = field.ast.type_expr.unwrap() orelse continue;
         if (tree.nodeTag(kind) != .identifier or !isUnsigned(tree.tokenSlice(tree.nodeMainToken(kind)))) continue;
@@ -4229,7 +4229,7 @@ fn fieldsOf(c: *Context, container: Facts.Container) Context.Error!Shape {
     var found: std.ArrayList([]const u8) = .empty;
     for (source.model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != container.scope) continue;
-        const field = tree.fullContainerField(decl.node) orelse return .none;
+        const field = source.model.containerField(tree, decl.node) orelse return .none;
         if (field.ast.tuple_like) return .none;
         if (field.comptime_token != null) continue;
         try found.append(c.allocator, decl.name);

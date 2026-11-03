@@ -417,3 +417,30 @@ test "Facts.knownBool: a bool known as the program compiles" {
     try std.testing.expectEqual(@as(?bool, true), try facts.knownBool(file, spelledNode(tree, "(true and true)", 0).?));
     try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, spelledNode(tree, "x", 0).?));
 }
+
+test "Facts: an enum's and a union's tags written with no type are members" {
+    const source = "pub const E = enum(u8) { a, b = 2 }; pub const U = union(enum) { a, c: u32 }; pub const S = struct { a: u32 };\n" ++
+        "fn f(u: U) void { _ = E.a; _ = u.a; }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const e = (try facts.declaration(facts.member(facts.rootOf(file), "E").?)).container;
+    const u = (try facts.declaration(facts.member(facts.rootOf(file), "U").?)).container;
+    const s = (try facts.declaration(facts.member(facts.rootOf(file), "S").?)).container;
+    try std.testing.expect(facts.member(e, "a") != null);
+    try std.testing.expect(facts.member(u, "a") != null);
+    try std.testing.expect(facts.declaresTag(e, "a") and facts.declaresTag(e, "b") and facts.declaresTag(u, "a") and facts.declaresTag(u, "c"));
+    try std.testing.expect(!facts.declaresTag(s, "a"));
+    // `E.a` is a value of `E`; a union's tag with no type holds `void`.
+    const tag = try facts.resolve(file, spelledNode(tree, "E.a", 0).?);
+    try std.testing.expect(tag == .instance and std.meta.eql(tag.instance.scope, e.scope));
+    try std.testing.expect(try facts.resolve(file, spelledNode(tree, "u.a", 0).?) == .scalar);
+    try std.testing.expect(try facts.declaration(facts.member(e, "a").?) == .instance);
+    // An enum's value holds no field.
+    try std.testing.expectEqual(@as(usize, 0), (try facts.heldFields(e)).len);
+}

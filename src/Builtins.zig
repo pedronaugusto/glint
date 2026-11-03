@@ -300,7 +300,7 @@ fn amendedPolicies(self: *Context) RunError!void {
                 try privateSignature(self, signature, self.file, tree.fullFnProto(&buffer, decl.node).?, 0);
             },
             .variable => try publicValue(self, signature, @fromBackingInt(@intCast(i))),
-            .field => if (tree.fullContainerField(decl.node)) |field| {
+            .field => if (source.model.containerField(tree, decl.node)) |field| {
                 if (field.ast.type_expr.unwrap()) |t| try privateType(self, signature, self.file, t, 0);
             },
             .parameter, .capture => {},
@@ -462,7 +462,7 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, node:
         const model = &self.project.at(file).model;
         const scope = scopeOf(model, node) orelse return undecidedType(self, signature, file, node, .unsupported);
         if (reachable(model, scope)) return;
-        for (container.ast.members) |member| if (tree.fullContainerField(member)) |field| {
+        for (container.ast.members) |member| if (model.containerField(tree, member)) |field| {
             if (field.ast.type_expr.unwrap()) |t| try privateType(self, signature, file, t, depth + 1);
         };
         return;

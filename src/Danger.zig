@@ -297,9 +297,8 @@ fn hasTupleField(c: *Context, found: Facts.Container) Context.Error!bool {
     if (node == .root) return false;
     var buffer: [2]Ast.Node.Index = undefined;
     const container = tree.fullContainerDecl(&buffer, node) orelse return false;
-    // An enum's or a union's bare name is a tag, no tuple's field.
-    if (tree.tokenTag(container.ast.main_token) != .keyword_struct) return false;
-    for (container.ast.members) |item| if (tree.fullContainerField(item)) |field| if (field.ast.tuple_like) return true;
+    const model = &c.project.at(found.file).model;
+    for (container.ast.members) |item| if (model.containerField(tree, item)) |field| if (field.ast.tuple_like) return true;
     return false;
 }
 
@@ -426,7 +425,7 @@ fn holdsAt(t: *const Ast, model: *const Model, node: Ast.Node.Index) Governed.Is
             continue;
         }
         if (t.fullVarDecl(parent)) |v| return if (v.ast.type_node.unwrap() == at) .yes else .{ .unknown = .unsupported };
-        if (t.fullContainerField(parent)) |field| return if (field.ast.type_expr.unwrap() == at) .yes else .{ .unknown = .unsupported };
+        if (model.containerField(t, parent)) |field| return if (field.ast.type_expr.unwrap() == at) .yes else .{ .unknown = .unsupported };
         if (t.fullFnProto(&buffer, parent)) |_| return .yes;
         switch (t.nodeTag(parent)) {
             .optional_type => at = parent,
@@ -1169,7 +1168,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
         };
         // A reference that does not resolve as this value's type, or what an array, an optional,
         // an error union or a pointer of it holds, is judged with the value.
-        if (writtenType(tree, decl)) |written| for (found.unread, judged) |each, *done| {
+        if (writtenType(tree, model, decl)) |written| for (found.unread, judged) |each, *done| {
             if (typeSpine(tree, written, each.node)) done.* = true;
         };
         switch (try heldSync(c, found.found, value)) {
@@ -1195,10 +1194,10 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
 
 /// The type a declaration is written with: a variable's, a field's or a parameter's, a
 /// function's result. Null for a capture, or one written with none.
-fn writtenType(tree: *const Ast, decl: Model.Declaration) ?Ast.Node.Index {
+fn writtenType(tree: *const Ast, model: *const Model, decl: Model.Declaration) ?Ast.Node.Index {
     return switch (decl.kind) {
         .variable => (tree.fullVarDecl(decl.node) orelse return null).ast.type_node.unwrap(),
-        .field => (tree.fullContainerField(decl.node) orelse return null).ast.type_expr.unwrap(),
+        .field => (model.containerField(tree, decl.node) orelse return null).ast.type_expr.unwrap(),
         // A parameter's node is its type, or its function's where it is written with none.
         .parameter => blk: {
             var buffer: [1]Ast.Node.Index = undefined;
@@ -1379,7 +1378,7 @@ fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
             .fn_decl, .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
             else => {},
         }
-        if (tree.fullVarDecl(parent) != null or tree.fullContainerField(parent) != null) return false;
+        if (tree.fullVarDecl(parent) != null or model.containerField(tree, parent) != null) return false;
     }
     return false;
 }
@@ -1396,7 +1395,7 @@ fn imported(tree: *const Ast, node: Ast.Node.Index) bool {
 /// Whether the type a declaration at `node` writes names a declaration of this file that holds
 /// one of `tokens`.
 fn namesHeld(tree: *const Ast, model: *const Model, node: Ast.Node.Index, tokens: []const Ast.TokenIndex) bool {
-    const written: Ast.Node.Index = if (tree.fullContainerField(node)) |field|
+    const written: Ast.Node.Index = if (model.containerField(tree, node)) |field|
         field.ast.type_expr.unwrap() orelse return false
     else if (tree.fullVarDecl(node)) |variable|
         variable.ast.type_node.unwrap() orelse return false

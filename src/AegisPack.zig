@@ -449,7 +449,7 @@ fn namesFields(c: *Context, tree: *const Ast, literal: Ast.full.StructInit, cont
     }
     for (model.declarations) |decl| {
         if (decl.kind != .field or decl.scope != container.scope) continue;
-        if (own.fullContainerField(decl.node).?.ast.value_expr != .none) continue;
+        if (model.containerField(own, decl.node).?.ast.value_expr != .none) continue;
         for (literal.ast.fields) |value| {
             if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(Model.initName(tree, value) orelse continue)), decl.name)) break;
         } else return false;
@@ -602,7 +602,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
             if (lacks) continue;
         }
         const written = &c.project.at(decl.file).file.tree;
-        const type_expr = written.fullContainerField(record.node).?.ast.type_expr.unwrap() orelse return false;
+        const type_expr = c.project.at(decl.file).model.containerField(written, record.node).?.ast.type_expr.unwrap() orelse return false;
         // A call needs a function: no backing field of this type holds one.
         if (called) {
             if (callable(try c.facts.resolve(decl.file, type_expr), 0)) return false;
@@ -1272,7 +1272,7 @@ fn fieldOwner(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed
     };
     var found: Typed = .other;
     for (members) |member| {
-        const field = tree.fullContainerField(member) orelse continue;
+        const field = model.containerField(tree, member) orelse continue;
         // A union's field with no type holds `void`.
         const t = field.ast.type_expr.unwrap() orelse continue;
         const held = try c.facts.resolve(container.file, t);
@@ -1803,7 +1803,7 @@ fn plainType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: usi
             const decl = tree.fullContainerDecl(&buffer, node).?; // unreachable: the tag is a container's
             if (tree.tokenTag(decl.ast.main_token) != .keyword_struct) break :blk false;
             for (decl.ast.members) |member| {
-                const field = tree.fullContainerField(member) orelse continue;
+                const field = c.project.at(file).model.containerField(tree, member) orelse continue;
                 const t = field.ast.type_expr.unwrap() orelse break :blk false;
                 if (!try plainType(c, file, t, depth + 1)) break :blk false;
             }

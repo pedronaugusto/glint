@@ -583,7 +583,7 @@ fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container, depth: u8) 
             .unread => unread = true,
             .none => {
                 // A tuple's field has no name to read it by: its type says what it holds.
-                const written = (tree.fullContainerField(field.node) orelse continue).ast.type_expr.unwrap() orelse continue;
+                const written = (model.containerField(tree, field.node) orelse continue).ast.type_expr.unwrap() orelse continue;
                 if (try spellsIo(c, held.file, written, io_type)) unread = true;
             },
         }
