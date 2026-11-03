@@ -387,6 +387,13 @@ pub const Flow = struct {
     stream: ?Facts.Container = null,
     /// The functions the configuration declares write to a peer.
     peer_writers: std.ArrayList(Facts.Decl) = .empty,
+    /// The types a writer that reaches a peer may be: std's `Io.Writer`, which every writer of
+    /// std's writes through, and what the configuration's peer writers give.
+    writer_types: std.ArrayList(Facts.Container) = .empty,
+    /// std's writer, or a configured peer writer's result, does not resolve: any type may be one.
+    writer_unknown: bool = false,
+    /// Whether a container outside the program may hold a writer, once each (`mayHoldWriter`).
+    writer_holders: std.AutoHashMapUnmanaged(Facts.Container, bool) = .empty,
     /// Functions whose result is what they read: std's `process.run`, which holds a child's output,
     /// and aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`.
     reads: std.ArrayList(Facts.Decl) = .empty,
@@ -408,8 +415,8 @@ pub const Flow = struct {
     /// What the functions outside the program its calls reach size work by (`sizesFlow`): a
     /// flow of its own over them, read for no fact.
     sized: ?*Flow = null,
-    /// The size sink's sites per file (`sinkSites`).
-    size_sites: std.AutoHashMapUnmanaged(Project.FileId, []const SinkSite) = .empty,
+    /// The sinks' sites per fact's lane and file (`sinkSites`).
+    sink_sites: std.AutoHashMapUnmanaged(struct { u8, Project.FileId }, []const SinkSite) = .empty,
     /// std's allocations: `Allocator.rawAlloc`, `rawResize` and `rawRemap`, each argument but
     /// the allocator a size; not known where std's allocator does not resolve.
     allocations: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
@@ -578,6 +585,35 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
         const found_writers = ((try Governed.declarations(c, declared.module, declared.declaration)).orNull()) orelse ((try Governed.declarationsOfPackage(c, declared.module, declared.declaration)).orNull()) orelse &.{};
         for (found_writers) |decl| try flow.peer_writers.append(c.allocator, ((try c.facts.origin(decl)).orNull()) orelse decl);
     }
+    // Where std's writer does not resolve, any type may be one.
+    switch (try Governed.declarations(c, "std", "Io.Writer")) {
+        .decls => |decls| for (decls) |decl| {
+            const origin = switch (try c.facts.origin(decl)) {
+                .decl => |aliased| aliased,
+                .none => decl,
+                .unknown => {
+                    flow.writer_unknown = true;
+                    continue;
+                },
+            };
+            switch (try c.facts.declaration(origin)) {
+                .container => |k| try flow.writer_types.append(c.allocator, k),
+                else => flow.writer_unknown = true,
+            }
+        },
+        .none => {},
+        .unknown => flow.writer_unknown = true,
+    }
+    for (flow.peer_writers.items) |decl| {
+        const tree = &c.project.at(decl.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse continue;
+        const result_type = proto.ast.return_type.unwrap() orelse {
+            flow.writer_unknown = true;
+            continue;
+        };
+        try writerTypes(c, flow, try c.facts.resolve(decl.file, result_type));
+    }
     for (((try Governed.declarations(c, "std", "process.run")).orNull()) orelse &.{}) |decl| try flow.reads.append(c.allocator, ((try c.facts.origin(decl)).orNull()) orelse decl);
     for (zig_text) |path| for (((try Governed.declarations(c, "std", path)).orNull()) orelse &.{}) |decl| try flow.zig_text.put(c.allocator, decl, {});
     for ([_][]const u8{ "mem.Allocator.rawAlloc", "mem.Allocator.rawResize", "mem.Allocator.rawRemap" }) |path| switch (try Governed.declarations(c, "std", path)) {
@@ -742,7 +778,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                 const target, const value = tree.nodeData(node).node_and_node;
                 const grown = try (try dep(c, flow, function, target)).widened(c.allocator);
                 const given = try grown.join(c.allocator, try dep(c, flow, function, value));
-                try store(c, flow, function, target, try given.join(c.allocator, try control(c, flow, function, node, target)));
+                try storeAt(c, flow, function, node, target, value, try given.join(c.allocator, try control(c, flow, function, node, target)));
             },
             .assign_destructure => {
                 const parts = tree.assignDestructure(node);
@@ -752,7 +788,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                 const elements: ?[]const Ast.Node.Index = if (tree.fullArrayInit(&buffer, parts.ast.value_expr)) |literal| (if (literal.ast.elements.len == parts.ast.variables.len) literal.ast.elements else null) else null;
                 for (parts.ast.variables, 0..) |variable, at| {
                     const value = try (if (elements) |each| try dep(c, flow, function, each[at]) else all).join(c.allocator, try control(c, flow, function, node, variable));
-                    if (declaredAt(model, variable)) |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value) else try store(c, flow, function, variable, value);
+                    if (declaredAt(model, variable)) |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value) else try storeAt(c, flow, function, node, variable, if (elements) |each| each[at] else null, value);
                 }
             },
             .@"return" => {
@@ -878,11 +914,12 @@ fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declara
     return .{};
 }
 
-/// The declaration a `var`/`const` node declares.
 /// A function of the program code outside it may call (`Facts.escapes`: std's sort given
 /// `less`, a hash map's context, a spawned thread's worker, an exported name) is called with
 /// values no call of the program shows: each parameter a comptime one does not fix, and each
-/// one's length, may hold the fact at its most.
+/// one's length, may hold input at its most, and one whose type may hold a writer may be one
+/// that reaches a peer (`writerSlots`). Whether it holds an error's text its type says
+/// (`errorDeclared`).
 fn escaped(c: *Context, flow: *Flow) Context.Error!void {
     var by_node: std.AutoHashMapUnmanaged(Facts.Key, Model.Declaration.Id) = .empty;
     var indexed: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty;
@@ -893,9 +930,87 @@ fn escaped(c: *Context, flow: *Flow) Context.Error!void {
         }
         const d = by_node.get(.{ .file = f.file, .node = f.node }) orelse continue;
         if (!try c.facts.handedOut(.{ .file = f.file, .index = d })) continue;
+        const input: Levels = .in(flow.masks.input(), .number);
+        const writers = try writerSlots(c, flow, .{ .file = f.file, .index = d });
         for (f.levels, 0..) |*level, slot| {
-            if (!f.fixed.has(slot / 2)) level.* = .all(.number);
+            if (f.fixed.has(slot / 2)) continue;
+            level.* = if (writers.has(slot)) input.join(.in(flow.masks.peer_writer, .unknown)) else input;
         }
+    }
+}
+
+/// The value slots of a function's parameters that may be handed a writer reaching a peer: one
+/// whose type may hold a writer (`mayHoldWriter`), or one the declaration does not spell.
+fn writerSlots(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!Slots {
+    if (flow.masks.peer_writer == none) return .{};
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{};
+    var out: Slots = .{};
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        const kind = param.type_expr orelse {
+            out = try out.with(c.allocator, valueSlot(position));
+            continue;
+        };
+        if (try mayHoldWriter(c, flow, try c.facts.resolve(decl.file, kind), 0)) out = try out.with(c.allocator, valueSlot(position));
+    }
+    return out;
+}
+
+/// Whether a value of `value`'s type may be or hold a writer that reaches a peer: one of the
+/// writer types (`Flow.writer_types`), behind a pointer, an optional or in an array, in a
+/// field a type outside the program holds (`Facts.heldFields`, by a made type's bindings), or
+/// a type that does not resolve. A field of the
+/// program's own type holds what the program stores in it, which the field's own level says.
+fn mayHoldWriter(c: *Context, flow: *Flow, value: Facts.Value, depth: usize) Context.Error!bool {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    // A type nested this deep is read as one that may.
+    if (depth > 8) return true;
+    switch (value) {
+        .unknown, .reified, .literal => return true,
+        .pointer, .optional, .error_union, .array => |inner| return mayHoldWriter(c, flow, inner.*, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (try mayHoldWriter(c, flow, one, depth + 1)) return true;
+            return false;
+        },
+        .instance, .container => |k| {
+            for (flow.writer_types.items) |writer| if (std.meta.eql(writer, k)) return true;
+            if (flow.own(k.file)) return flow.writer_unknown;
+            if (flow.writer_holders.get(k)) |known_holder| return known_holder;
+            // A container met again within itself holds nothing more there.
+            try flow.writer_holders.put(c.allocator, k, false);
+            const holds = for (try c.facts.heldFields(k)) |field| {
+                if (try mayHoldWriter(c, flow, field.value, depth + 1)) break true;
+            } else false;
+            try flow.writer_holders.put(c.allocator, k, holds);
+            return holds;
+        },
+        else => return false,
+    }
+}
+
+/// What a call that does not resolve may write into memory of `value`'s type: anything, but a
+/// writer that reaches a peer only where the type may hold one.
+fn unknownInto(c: *Context, flow: *Flow, value: Facts.Value) Context.Error!Dep {
+    const unknown: Dep = .{ .level = .all(.unknown) };
+    return if (try mayHoldWriter(c, flow, value, 0)) unknown else answered(unknown, flow.masks.peer_writer);
+}
+
+/// The containers a configured peer writer's result may be, into `Flow.writer_types`.
+fn writerTypes(c: *Context, flow: *Flow, value: Facts.Value) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    switch (value) {
+        .pointer, .optional, .error_union => |inner| try writerTypes(c, flow, inner.*),
+        .alternatives => |each| for (each) |one| try writerTypes(c, flow, one),
+        .instance, .container => |k| try flow.writer_types.append(c.allocator, k),
+        .unknown, .reified, .literal => flow.writer_unknown = true,
+        else => {},
     }
 }
 
@@ -1086,6 +1201,32 @@ fn pointing(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     };
 }
 
+/// Whether a value handed to a call may hand on a pointer: a pointer itself, or a value
+/// whose type holds one in a field, through its fields' types (`.{ .n = &n }`); a typeless
+/// literal or a type that does not resolve may.
+fn handsPointer(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    if (try pointing(c, file, node)) return true;
+    return holdsPointer(c, try c.facts.resolve(file, node), 0);
+}
+
+fn holdsPointer(c: *Context, value: Facts.Value, depth: usize) Context.Error!bool {
+    // A type nested this deep is read as one that may.
+    if (depth > 8) return true;
+    switch (value) {
+        .pointer, .unknown, .reified, .literal => return true,
+        .optional, .error_union, .array => |inner| return holdsPointer(c, inner.*, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (try holdsPointer(c, one, depth + 1)) return true;
+            return false;
+        },
+        .instance => |k| {
+            for (try fieldsOf(c, k)) |field| if (try holdsPointer(c, try c.facts.declaration(field), depth + 1)) return true;
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// The fields `@field(holder, name)` names: the one a string literal spells, or each field of
 /// the holder's type for a name computed as the program compiles.
 pub fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Facts.Decl {
@@ -1125,34 +1266,61 @@ pub fn fieldsOf(c: *Context, container: Facts.Container) Context.Error![]const F
     return out.items;
 }
 
-/// A store of `value` into `target`, into each of its `places`.
-fn store(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Index, value: Dep) Context.Error!void {
-    var found: std.ArrayList(Place) = .empty;
-    try places(c, flow, function, target, &found);
-    for (found.items) |place| try raise(c, flow, function, place, value);
-}
-
 /// The store at `node` of `value` into `target`, which `given` gives where one expression
-/// does: the places `store` names, and where none is a field or a container-level variable,
-/// the fields of the memory it writes through a pointer as a whole value or as bytes
-/// (`Facts.accesses.fieldsThrough`: `h.* = v`, `@memcpy(std.mem.asBytes(h), bytes)`): the
-/// place's other names reach that memory by those fields alone. A struct literal's fields
-/// are given each its own.
+/// does: each of the target's `places`, and the fields of the memory it writes through a
+/// pointer as a whole value or as bytes (`Facts.accesses.fieldsThrough`: `h.* = v`,
+/// `@memcpy(std.mem.asBytes(h), bytes)`, `std.mem.asBytes(c.h)[0] = b`), which the place's
+/// other names read.
 fn storeAt(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index, target: Ast.Node.Index, given: ?Ast.Node.Index, value: Dep) Context.Error!void {
     const f = flow.functions.items[@backingInt(function)];
     var found: std.ArrayList(Place) = .empty;
     try places(c, flow, function, target, &found);
     for (found.items) |place| try raise(c, flow, function, place, value);
-    for (found.items) |place| if (place == .global) return;
     // Code outside the program writes the program's fields only through what its callers hand
     // it, which their stores raise: its own stores raise none of them (bay, 2c).
     if (!flow.own(f.file)) return;
+    try raiseFields(c, flow, function, try Facts.accesses.fieldsThrough(c.facts, f.file, node), given, value);
+}
+
+/// What a call writes through `arg`, an argument it is handed: each of its `places`, and the
+/// fields of the memory it reaches through a pointer or as another type
+/// (`Facts.accesses.fieldsHanded`: `r.readSliceAll(std.mem.asBytes(h))`). The program's own
+/// callee names the fields it writes of memory of their own type in its body, which raises
+/// them there: at its call only memory it reads as another type is (`put(std.mem.asBytes(h))`).
+fn storeHanded(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, arg: Ast.Node.Index, value: Dep) Context.Error!void {
+    const f = flow.functions.items[@backingInt(function)];
+    var found: std.ArrayList(Place) = .empty;
+    try places(c, flow, function, arg, &found);
+    for (found.items) |place| try raise(c, flow, function, place, value);
+    if (!flow.own(f.file)) return;
+    if (callee.kind == .program and !try Facts.accesses.reinterprets(c.facts, f.file, arg)) return;
+    try raiseFields(c, flow, function, try Facts.accesses.fieldsHanded(c.facts, f.file, arg), null, value);
+}
+
+/// `value` into each of the program's `fields` a store writes whole. A struct literal of a
+/// known type (`given`) gives its own type's fields each its own where it is made; any other
+/// memory it covers (through a cast: `w.* = .{ .tag = b }` with `w = @ptrCast(h)`) takes what
+/// all its parts hold.
+fn raiseFields(c: *Context, flow: *Flow, function: Function.Id, fields: []const Facts.Decl, given: ?Ast.Node.Index, value: Dep) Context.Error!void {
+    if (fields.len == 0) return;
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    var parts = value;
+    var made: ?Facts.Container = null;
     if (given) |one| {
         var buffer: [2]Ast.Node.Index = undefined;
-        if (c.project.at(f.file).file.tree.fullStructInit(&buffer, one) != null) return;
+        if (tree.fullStructInit(&buffer, one)) |literal| {
+            switch (try c.facts.resolve(f.file, one)) {
+                .instance => |k| made = k,
+                else => {},
+            }
+            for (literal.ast.fields) |part| parts = try parts.join(c.allocator, try dep(c, flow, function, part));
+        }
     }
-    for (try Facts.accesses.fieldsThrough(c.facts, f.file, node)) |field| {
-        if (flow.own(field.file)) try raise(c, flow, function, .{ .global = field }, value);
+    for (fields) |field| {
+        if (!flow.own(field.file)) continue;
+        if (made) |k| if (k.file == field.file and k.scope == c.project.at(field.file).model.declarations[@backingInt(field.index)].scope) continue;
+        try raise(c, flow, function, .{ .global = field }, parts);
     }
 }
 
@@ -1223,36 +1391,69 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
                 // What it writes through the argument, under the call's control: a write of the
                 // program's own value made where input decides is input's.
                 const ruled = try control(c, flow, function, node, arg);
-                if (!g.writes[index].clean()) try store(c, flow, function, arg, try (try summarized(c, flow, function, callee, g.writes[index])).join(c.allocator, ruled)) else if (!ruled.clean() and try pointing(c, f.file, arg)) try store(c, flow, function, arg, ruled);
+                if (!g.writes[index].clean()) try storeHanded(c, flow, function, callee, arg, try (try summarized(c, flow, function, callee, g.writes[index])).join(c.allocator, ruled)) else if (!ruled.clean() and try pointing(c, f.file, arg)) try storeHanded(c, flow, function, callee, arg, ruled);
             }
         },
         .source => {
             const lanes = try readLanes(c, flow, function, callee);
             if (lanes == none) return;
             const buffers = try bufferParams(c, callee.decl.?);
-            for (callee.args, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, arg, lanes);
+            for (callee.args, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, callee, arg, lanes);
         },
-        .outside => {
-            // What a function outside the program is given may go into any memory it is given
-            // by a mutable pointer: a list appended to, a map put into, a hasher updated, a
-            // writer written to, a destination copied into.
-            const decl = callee.decl orelse return;
-            var given: Dep = .{};
-            for (callee.args) |arg| given = try given.join(c.allocator, try whole(c, flow, function, arg));
-            const writes = try mutableParams(c, decl);
-            for (callee.args, 0..) |arg, position| if (writes.has(position)) {
-                const value = try given.join(c.allocator, try control(c, flow, function, node, arg));
-                if (!value.clean()) try store(c, flow, function, arg, value);
-            };
+        .outside => try outsideWrites(c, flow, function, callee),
+        // aegis's functions but its parse are code outside the program as std's are: a
+        // bounded array appended to and popped from, an owner taken from.
+        .aegis => {
+            try parsed(c, flow, f.file, callee.params, callee.decl.?);
+            try outsideWrites(c, flow, function, callee);
         },
-        .aegis => try parsed(c, flow, f.file, callee.params, callee.decl.?),
         .choice => |each| for (each) |one| try effects(c, flow, function, one),
-        // A call that does not resolve may write anything into the memory it is given.
+        // A call that does not resolve may write anything into the memory it is given, by a
+        // pointer or through one a value it is given holds (`.{ .n = &n }`, a tuple).
+        // A writer that reaches a peer it may store only where its type may hold one
+        // (`mayHoldWriter`): no `*Context` of the program's own becomes a peer's writer.
         .none => for (callee.args) |arg| {
-            if (try pointing(c, f.file, arg)) try store(c, flow, function, arg, .{ .level = .all(.unknown) });
+            if (!try handsPointer(c, f.file, arg)) continue;
+            const value = try c.facts.resolve(f.file, arg);
+            try storeHanded(c, flow, function, callee, arg, try unknownInto(c, flow, value));
+            // A pointer the value holds in a field of the program's own type is the field's by
+            // its declaration (`Out.n`), which the memory it points at takes in turn.
+            for ((try wholeFields(c, value)) orelse &.{}) |field| {
+                const held = try c.facts.declaration(field);
+                if (flow.own(field.file) and try holdsPointer(c, held, 0)) try raise(c, flow, function, .{ .global = field }, try unknownInto(c, flow, held));
+            }
         },
-        .holder => {},
+        .holder => try outsideWrites(c, flow, function, callee),
     }
+}
+
+/// Whether `node` is one of aegis's limits, budgets or reservations, or a pointer to one.
+fn accounting(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    var value = try c.facts.resolve(file, node);
+    if (value == .pointer) value = value.pointer.*;
+    const role = (try c.role(Contract.library, value)) orelse return false;
+    return switch (role) {
+        .limit, .budget, .reservation => true,
+        else => false,
+    };
+}
+
+/// What a function outside the program is given may go into any memory it is given by a
+/// mutable pointer: a list appended to, a map put into, a hasher updated, a writer written
+/// to, a destination copied into.
+fn outsideWrites(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Context.Error!void {
+    const decl = callee.decl orelse return;
+    var given: Dep = .{};
+    for (callee.args) |arg| given = try given.join(c.allocator, try whole(c, flow, function, arg));
+    const writes = try mutableParams(c, decl);
+    const file = flow.functions.items[@backingInt(function)].file;
+    for (callee.args, 0..) |arg, position| if (writes.has(position)) {
+        // aegis's own accounting (a limit, a budget, a reservation) holds counts it checks,
+        // not the program's data: its bound is its capacity, whatever is charged against it.
+        if (callee.kind == .aegis and try accounting(c, file, arg)) continue;
+        const value = try given.join(c.allocator, try control(c, flow, function, callee.node, arg));
+        if (!value.clean()) try storeHanded(c, flow, function, callee, arg, value);
+    };
 }
 
 /// `Untrusted.parse(context, parser)` calls the program's `parser(context, value)` with the
@@ -1280,6 +1481,15 @@ fn parserOf(c: *Context, flow: *Flow, file: Project.FileId, params: []const Ast.
         else => return null,
     };
     return flow.by_node.get(.{ .file = parser.file, .node = fnDecl(c, parser) orelse return null });
+}
+
+/// Whether a function outside the program may write through the argument `arg` of a call of
+/// it: one whose parameter is a mutable pointer or of a type the declaration does not spell
+/// (`mutableParams`), or one whose callee does not resolve.
+fn writable(c: *Context, callee: Callee, arg: Ast.Node.Index) Context.Error!bool {
+    const decl = callee.decl orelse return true;
+    const position = std.mem.findScalar(Ast.Node.Index, callee.args, arg) orelse return true;
+    return (try mutableParams(c, decl)).has(position);
 }
 
 /// The parameters a function may write through, by position, the receiver first: each one a
@@ -1327,8 +1537,8 @@ fn bufferParams(c: *Context, decl: Facts.Decl) Context.Error!Slots {
 
 /// A read fills `arg`'s memory with input in `lanes`: each place a store into it reaches, a
 /// vector's buffers among them, and a parameter's memory in its callers.
-fn fill(c: *Context, flow: *Flow, function: Function.Id, arg: Ast.Node.Index, lanes: Mask) Context.Error!void {
-    try store(c, flow, function, arg, .{ .level = .in(lanes, .data) });
+fn fill(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, arg: Ast.Node.Index, lanes: Mask) Context.Error!void {
+    try storeHanded(c, flow, function, callee, arg, .{ .level = .in(lanes, .data) });
 }
 
 /// A dependence read as a level, with what callers give the function's parameters.
@@ -1673,6 +1883,8 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
             return both.ruling(c.allocator, flow.masks);
         },
         .bool_not => return try (try dep(c, flow, function, tree.nodeData(node).node)).ruling(c.allocator, flow.masks),
+        // An error is its text: what `@errorName` and a format's `{t}` make bytes of.
+        .error_value => return errorText(flow),
         else => {},
     }
     if (try literalDep(c, flow, function, node)) |out| return out;
@@ -1680,8 +1892,19 @@ fn dep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Co
     return composed(c, flow, function, node);
 }
 
-/// What a name holds: a parameter's own slots, a global's facts, a local's.
+/// What a name holds: a parameter's own slots, a global's facts, a local's; and an error's
+/// text where it holds an error, whatever gave it one.
 fn declaredDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
+    const out = try namedDep(c, flow, function, node);
+    if (flow.masks.error_text == none) return out;
+    const file = flow.functions.items[@backingInt(function)].file;
+    const ref = c.project.at(file).model.reference(node) orelse return out;
+    const d = ref.declaration orelse return out;
+    if (!try errorDeclared(c, .{ .file = file, .index = d })) return out;
+    return out.join(c.allocator, errorText(flow));
+}
+
+fn namedDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) Context.Error!Dep {
     const f = flow.functions.items[@backingInt(function)];
     const model = &c.project.at(f.file).model;
     const ref = model.reference(node) orelse return .{};
@@ -1723,6 +1946,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         if (flow.globals.get(decl)) |level| out = try out.join(c.allocator, .{ .level = level });
         if (flow.lengths.get(decl)) |length| out = try out.join(c.allocator, Dep.measuredLength(length));
         if (flow.zig_text.contains(decl)) out = try out.join(c.allocator, .{ .level = .in(flow.masks.peer, .data) });
+        if (flow.masks.error_text != none and try errorDeclared(c, decl)) out = try out.join(c.allocator, errorText(flow));
         // A function or a type named through a value is no part of its data.
         const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
         if (kind == .function) return .{};
@@ -1768,9 +1992,15 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     // `@call` is a call as `f(a)` is.
     if (try resolveCall(c, flow, file, node)) |callee| return result(c, flow, function, callee);
-    for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@errorName", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
+    // An error's name is its text; a tag's name is what chose the tag, an error's text where an
+    // error did, and no other fact's (the names are the program's own). An error made from an
+    // integer is an error; its integer no text.
+    if (std.mem.eql(u8, name, "@errorName") or std.mem.eql(u8, name, "@errorFromInt")) return errorText(flow);
+    if (std.mem.eql(u8, name, "@tagName") and args.len == 1) return answered(try dep(c, flow, function, args[0]), ~flow.masks.error_text);
+    if (std.mem.eql(u8, name, "@intFromError") and args.len == 1) return answered(try whole(c, flow, function, args[0]), flow.masks.int_from_error & flow.masks.error_text);
+    for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@TypeOf", "@typeInfo", "@tagName", "@typeName", "@import", "@This", "@src", "@hasDecl", "@hasField" }) |clean| if (std.mem.eql(u8, name, clean)) return .{};
     // A field `@field` names is read by its declaration, as `x.name` is.
     if (std.mem.eql(u8, name, "@field") and args.len == 2) {
         var out = try dep(c, flow, function, args[0]);
@@ -1803,6 +2033,47 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     return out;
 }
 
+/// An error's text, in the lanes that follow it.
+fn errorText(flow: *const Flow) Dep {
+    return .{ .level = .in(flow.masks.error_text, .data) };
+}
+
+/// Whether a declaration holds an error by its type: a parameter's or a variable's written
+/// type, a field's, a capture's (`catch |err|`). A variable with no written type holds what
+/// its initializer gives, which the flow reads.
+fn errorDeclared(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const tree = &c.project.at(decl.file).file.tree;
+    const value: Facts.Value = switch (record.kind) {
+        .capture, .field => try c.facts.declaration(decl),
+        .parameter => try c.facts.resolve(decl.file, record.node),
+        .variable => typed: {
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            break :typed try c.facts.resolve(decl.file, variable.ast.type_node.unwrap() orelse return false);
+        },
+        else => return false,
+    };
+    return errorIn(value, .declared) == .yes;
+}
+
+/// Whether a value of `value`'s type holds an error (`anyerror`, an error set, an optional of
+/// one), or, `.written`, may show one's name as it is formatted (an error union too).
+fn errorIn(value: Facts.Value, as: enum { declared, written }) enum { no, yes, unknown } {
+    return switch (value) {
+        .error_set => .yes,
+        .primitive => |p| if (std.mem.eql(u8, p, "anyerror")) .yes else .no,
+        .optional => |inner| errorIn(inner.*, as),
+        // A union's value is its payload's, read where it is unwrapped: only formatted whole
+        // does it show the error.
+        .error_union => if (as == .written) .yes else .no,
+        .unknown => .unknown,
+        .alternatives => |each| for (each) |one| {
+            if (errorIn(one, as) == .yes) break .yes;
+        } else .no,
+        else => .no,
+    };
+}
+
 /// What memory no place names may hold (`Flow.unnamed`).
 fn unnamed(flow: *const Flow) Dep {
     return .{ .level = flow.unnamed, .unchecked = flow.unnamed_length };
@@ -1815,7 +2086,10 @@ fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     switch (tree.nodeTag(node)) {
-        .@"comptime", .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi, .test_decl, .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .merge_error_sets, .anyframe_type, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => return .{},
+        // What the program computes as it compiles is no input, but an error's text it names
+        // is still the error's (`comptime @errorName(error.Full)`).
+        .@"comptime" => return answered(try dep(c, flow, function, tree.nodeData(node).node), ~flow.masks.error_text),
+        .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_simple, .fn_proto_multi, .test_decl, .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel, .array_type, .array_type_sentinel, .optional_type, .error_union, .error_set_decl, .merge_error_sets, .anyframe_type, .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => return .{},
         else => {},
     }
     var out: Dep = .{};
@@ -2171,10 +2445,12 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             }
             return out;
         },
+        // What none resolving gives may be anything, the peer's input among it, whatever it
+        // is given (a vtable's read handed the reader); and it may point into memory no place
+        // names.
         .none => {
-            var out: Dep = .{};
+            var out: Dep = .{ .level = .all(.unknown) };
             for (callee.args) |arg| out = try out.join(c.allocator, try outsideArg(c, flow, function, arg));
-            // What it gives may point into memory no place names.
             return try (try out.lowered(c.allocator)).join(c.allocator, unnamed(flow));
         },
     }
@@ -2846,9 +3122,11 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
                     // its callers' memory (`writes`), or in what it returns (`returned`).
                     .program => return false,
                     // A function outside the program may keep a pointer in what it returns
-                    // and in the other memory it is given (`map.put(gpa, &key, v)`).
+                    // and in the other memory it is given (`map.put(gpa, &key, v)`); one it
+                    // takes as a pointer to constant memory (`writeAll(w, bytes)`'s `bytes`)
+                    // writes nothing through, wherever it keeps it.
                     .outside, .source, .aegis, .holder => {
-                        for (callee.args) |arg| if (arg != node and try pointing(c, f.file, arg)) try places(c, flow, function, arg, &holders);
+                        if (try writable(c, callee, node)) for (callee.args) |arg| if (arg != node and try pointing(c, f.file, arg)) try places(c, flow, function, arg, &holders);
                         grew = try hold(c, flow, function, owners, parent);
                     },
                     // One of several: any of them may keep it.
@@ -3368,28 +3646,141 @@ pub const SinkSite = struct {
 /// The sites of the sinks `fact`'s spec judges in `file` (`Spec.sinks`), read once per run.
 /// `size`: what the program hands a function outside it that sizes memory or work by it, found
 /// by meaning: what its body gives an allocation (std's `Allocator.rawAlloc`, `rawResize`,
-/// `rawRemap`) or counts a loop's passes by, through every call it makes.
+/// `rawRemap`) or counts a loop's passes by, through every call it makes. `peer_write`: what
+/// a call outside the program writes with a writer whose bytes reach a peer (`peerSites`).
 pub fn sinkSites(c: *Context, fact: Fact, file: Project.FileId) Context.Error![]const SinkSite {
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    if (!fact.spec.sinks.size) return &.{};
+    if (!fact.spec.sinks.size and !fact.spec.sinks.peer_write) return &.{};
     const flow = fact.flow;
-    if (flow.size_sites.get(file)) |known_sites| return known_sites;
-    // Only a call given what the fact follows is read: a clean argument is no site a rule
-    // judges, and the summary reads no body for it.
-    var given: std.ArrayList(Callee) = .empty;
+    if (flow.sink_sites.get(.{ fact.lane, file })) |known_sites| return known_sites;
+    var calls: std.ArrayList(Callee) = .empty;
     if (flow.owners.get(file)) |owners| for (owners, 0..) |own, i| {
         if (own == null) continue;
-        const callee = (try resolveCall(c, flow, file, @fromBackingInt(@intCast(i)))) orelse continue;
-        if (try carries(c, fact, file, callee)) try given.append(c.allocator, callee);
+        try calls.append(c.allocator, (try resolveCall(c, flow, file, @fromBackingInt(@intCast(i)))) orelse continue);
     };
-    const sized = try sizesFlow(c, flow, given.items);
     var out: std.ArrayList(SinkSite) = .empty;
-    for (given.items) |callee| try sizeSites(c, sized, file, callee, &out);
+    if (fact.spec.sinks.size) {
+        // Only a call given what the fact follows is read: a clean argument is no site a rule
+        // judges, and the summary reads no body for it.
+        var given: std.ArrayList(Callee) = .empty;
+        for (calls.items) |callee| if (try carries(c, fact, file, callee)) try given.append(c.allocator, callee);
+        const sized = try sizesFlow(c, flow, given.items);
+        for (given.items) |callee| try sizeSites(c, sized, file, callee, &out);
+    }
+    if (fact.spec.sinks.peer_write) for (calls.items) |callee| try peerSites(c, flow, file, callee, &out);
     const sites = try out.toOwnedSlice(c.allocator);
-    try flow.size_sites.put(c.allocator, file, sites);
+    try flow.sink_sites.put(c.allocator, .{ fact.lane, file }, sites);
     return sites;
+}
+
+/// What a call outside the program writes where a peer reads it: given a writer whose bytes
+/// reach one (the peer-writer fact's, `Spec.Source.peer_writer`), each other argument, each
+/// part of a literal one apart (`w.print("{s}", .{name})`'s `name`). Undecided where the
+/// writer may reach a peer through a call that does not resolve, or the callee itself does
+/// not. The program's own callee writes in its own body, where its parameters hold the writer.
+fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out: *std.ArrayList(SinkSite)) Context.Error!void {
+    switch (callee.kind) {
+        .program, .aegis, .holder, .source => return,
+        .choice => |each| {
+            for (each) |one| try peerSites(c, flow, file, one, out);
+            return;
+        },
+        .outside, .none => {},
+    }
+    // The writer is an argument the callee takes as a pointer to one value it writes through
+    // (`self: *Writer`), or untyped and not a literal; every other one is written, whatever
+    // memory it shares with the writer (`.{ name }`, `&parts`).
+    const params = if (callee.decl) |decl| try writerParams(c, decl) else null;
+    var writer: Level = .clean;
+    var taken: Slots = .{};
+    for (callee.args, 0..) |arg, position| {
+        const single = if (params) |p| p.single.has(position) else false;
+        const untyped = if (params) |p| p.untyped.has(position) else true;
+        if (!single and (!untyped or madeAtCall(c, file, arg))) continue;
+        const level = try levelIn(c, flow, file, arg, flow.masks.peer_writer);
+        if (level == .clean) continue;
+        writer = writer.join(level);
+        taken = try taken.with(c.allocator, position);
+    }
+    if (writer == .clean) return;
+    const decided = writer.reaches(.data) and callee.kind != .none;
+    for (callee.args, 0..) |arg, position| if (!taken.has(position)) try writtenParts(c, file, callee, arg, position, decided, out);
+}
+
+/// The parameters a function may be handed its writer by, by position, the receiver first: a
+/// pointer to one mutable value (`*Writer`), and one of a type the declaration does not spell
+/// (`anytype`).
+fn writerParams(c: *Context, decl: Facts.Decl) Context.Error!struct { single: Slots, untyped: Slots } {
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{ .single = .{}, .untyped = .{} };
+    var single: Slots = .{};
+    var untyped: Slots = .{};
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        const kind = param.type_expr orelse {
+            untyped = try untyped.with(c.allocator, position);
+            continue;
+        };
+        var at = kind;
+        if (tree.nodeTag(at) == .optional_type) at = tree.nodeData(at).node;
+        const pointer = tree.fullPtrType(at) orelse continue;
+        if (pointer.size == .one and pointer.const_token == null) single = try single.with(c.allocator, position);
+    }
+    return .{ .single = single, .untyped = untyped };
+}
+
+/// Whether `node` is a struct or an array literal: a value made at the call, no writer.
+fn madeAtCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.fullStructInit(&buffer, node) != null or tree.fullArrayInit(&buffer, node) != null;
+}
+
+fn writtenParts(c: *Context, file: Project.FileId, callee: Callee, node: Ast.Node.Index, position: usize, decided: bool, out: *std.ArrayList(SinkSite)) Context.Error!void {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |literal| {
+        for (literal.ast.fields) |field| try writtenParts(c, file, callee, field, position, decided, out);
+        return;
+    }
+    if (tree.fullArrayInit(&buffer, node)) |literal| {
+        for (literal.ast.elements) |element| try writtenParts(c, file, callee, element, position, decided, out);
+        return;
+    }
+    try out.append(c.allocator, .{ .file = file, .value = node, .at = callee.node, .callee = callee.decl, .position = position, .decided = decided });
+}
+
+/// The most a value is in the lanes `mask` holds, or clean outside the functions the flow reads.
+fn levelIn(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, mask: Mask) Context.Error!Level {
+    const function = owner(flow, file, node) orelse return .clean;
+    const lanes: [lane_count]u2 = concrete(flow, function, try dep(c, flow, function, node)).masked(mask).v;
+    var most: Level = .clean;
+    for (lanes) |lane| most = most.join(@fromBackingInt(lane));
+    return most;
+}
+
+/// What a value written whole shows of an error by its type: an error's name where it holds
+/// one or may (an error union formatted whole), unknown where its type does not resolve. A
+/// literal, a slice, an address or an operator's result holds no error value of its own.
+pub fn errorShown(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+    const tree = &c.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .identifier, .field_access, .call_one, .call_one_comma, .call, .call_comma, .unwrap_optional, .deref, .array_access, .@"orelse", .@"catch", .grouped_expression => {},
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            if (!std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@errorCast") and !std.mem.eql(u8, name, "@field")) return .clean;
+        },
+        else => return .clean,
+    }
+    return switch (errorIn(try c.facts.resolve(file, node), .written)) {
+        .yes => .data,
+        .no => .clean,
+        .unknown => .unknown,
+    };
 }
 
 /// Whether a call outside the program is given a value, or memory whose length, the fact

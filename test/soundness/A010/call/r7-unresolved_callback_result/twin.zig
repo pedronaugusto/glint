@@ -1,0 +1,8 @@
+const std = @import("std");
+pub const Source = struct {
+    read: *const fn (*std.Io.Reader) anyerror!u64,
+};
+pub fn f(r: *std.Io.Reader, source: *const Source) !u64 {
+    const v = try source.read(r);
+    return v *| 3;
+}

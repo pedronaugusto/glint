@@ -301,42 +301,35 @@ fn ownReader(c: *Context, flow: Taint.Fact, call: Ast.full.Call) Context.Error!b
     return tree.nodeTag(call.ast.fn_expr) == .field_access and try Taint.fixedBytes(c, flow.flow, c.file, tree.nodeData(call.ast.fn_expr).node_and_token[0]) != null;
 }
 
-/// A018: an error's name written where a peer reads it: internal text crossing to the peer.
+/// A018: an error's text written where a peer reads it: internal text crossing to the peer.
+/// Each value a peer writer writes (`Taint.sinkSites`) is judged by what reaches it and by
+/// its own type (an error formatted whole shows its name).
 pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    var named = false;
-    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
-        .builtin_call_two, .builtin_call_two_comma => {
-            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            named = named or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@errorName");
-        },
+    // A write is a call: a file that makes none writes nothing to a peer, whatever the flow.
+    const calls = for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .call_one, .call_one_comma, .call, .call_comma => break true,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(@fromBackingInt(@intCast(i)))), "@call")) break true,
         else => {},
-    };
-    if (!named) return;
-    const flow = try Taint.get(c, Danger.peer_writer);
-    for (tree.nodes.items(.tag), 0..) |_, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, node) orelse continue;
-        if (tree.nodeTag(call.ast.fn_expr) != .field_access or !site(c, node)) continue;
-        var carries = false;
-        for (call.ast.params) |arg| carries = carries or errorName(tree, arg);
-        if (!carries) continue;
-        const writer = tree.nodeData(call.ast.fn_expr).node_and_token[0];
-        try judged(c, null, rule, node, try Taint.levelAt(c, flow, c.file, writer), .data, "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read");
+    } else false;
+    if (!calls) return;
+    const fact = try Taint.get(c, Danger.error_text);
+    var reported: ?Ast.Node.Index = null;
+    for (try Taint.sinkSites(c, fact, c.file)) |written| {
+        if (!site(c, written.at) or reported == written.at) continue;
+        const level = (try Taint.levelAt(c, fact, c.file, written.value)).join(try Taint.errorShown(c, c.file, written.value));
+        if (level == .clean) continue;
+        if (level == .unknown) {
+            try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(written.value)), .unresolved, "a value written to a peer whose type or source does not resolve: it may be an error's text");
+            continue;
+        }
+        if (!written.decided) {
+            try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(written.value)), .unresolved, "an error's text written to a writer that may reach a peer through a call that does not resolve");
+            continue;
+        }
+        if (level.reaches(.data)) reported = written.at;
+        try judged(c, null, rule, written.at, level, .data, "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read");
     }
-}
-
-/// Whether an argument is `@errorName(...)`, or a tuple or struct literal holding one.
-fn errorName(tree: *const Ast, node: Ast.Node.Index) bool {
-    switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@errorName"),
-        else => {},
-    }
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullStructInit(&buffer, node)) |literal| for (literal.ast.fields) |field| if (errorName(tree, field)) return true;
-    if (tree.fullArrayInit(&buffer, node)) |literal| for (literal.ast.elements) |element| if (errorName(tree, element)) return true;
-    return false;
 }
 
 /// A020: a function given an `Io`, by a parameter or a field of one (`self.io`), whose loop runs

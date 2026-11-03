@@ -6128,6 +6128,8 @@ pub const accesses = struct {
         reads: std.AutoHashMapUnmanaged(Project.FileId, *const File) = .empty,
         /// Of each file, the write sites a query for a field of one name reads (`Filter`).
         fields: std.HashMapUnmanaged(Narrow, *const File, Narrow.Context, std.hash_map.default_max_load_percentage) = .empty,
+        /// Of each pointer handed to a call, the fields it reaches as a whole value or as bytes.
+        handed: std.AutoHashMapUnmanaged(Facts.Key, []const Facts.Decl) = .empty,
     };
 
     /// What a query for a field needs of a file's writes: the sites whose target or literal
@@ -6231,8 +6233,31 @@ pub const accesses = struct {
     /// other names read. A field the store names is a site of its own, not among them.
     pub fn fieldsThrough(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error![]const Facts.Decl {
         const shapes_written = (try writesOf(facts, file)).through.get(node) orelse return &.{};
+        return fieldsOfShapes(facts, shapes_written.items);
+    }
+
+    /// The fields a call may write through `pointer`, an argument it is handed, as a store
+    /// through it writes them (`fieldsThrough`): each container's the memory it points at holds
+    /// by value, where it reaches that memory through a pointer or as another type
+    /// (`r.readSliceAll(std.mem.asBytes(h))`, a helper's `put(std.mem.asBytes(h))`). A pointer
+    /// to a place reached by its own name (`&x`) reaches no field but the place's.
+    pub fn fieldsHanded(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error![]const Facts.Decl {
+        const state = try facts.memo(State);
+        const key: Facts.Key = .{ .file = file, .node = pointer };
+        if (state.handed.get(key)) |kept| return kept;
+        const index = try facts.gpa.create(File);
+        index.* = .{};
+        var walk: Walk = .{ .facts = facts, .file = file, .index = index };
+        try walk.pointee(walk.make(pointer, pointer, .covered, null));
+        const fields = if (index.through.get(pointer)) |shapes_reached| try fieldsOfShapes(facts, shapes_reached.items) else &.{};
+        try state.handed.put(facts.gpa, key, fields);
+        return fields;
+    }
+
+    /// The fields of each container `shapes_held` names.
+    fn fieldsOfShapes(facts: *Facts, shapes_held: []const Shape) Error![]const Facts.Decl {
         var out: std.ArrayList(Facts.Decl) = .empty;
-        for (shapes_written.items) |held_shape| {
+        for (shapes_held) |held_shape| {
             const model = &facts.project.at(held_shape.file).model;
             for (model.declarations, 0..) |record, d| {
                 if (record.kind != .field or record.scope != held_shape.scope) continue;
@@ -6428,7 +6453,7 @@ pub const accesses = struct {
     /// Whether `pointer` reads or writes other memory as another type: a view or a cast of it
     /// whose pointee is not the memory's own type (`@ptrCast(&d)` as a `*i96`,
     /// `std.mem.asBytes(&k)`). A type that does not resolve may be another.
-    fn reinterprets(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!bool {
+    pub fn reinterprets(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!bool {
         const tree = &facts.project.at(file).file.tree;
         const memory = try viewed(facts, file, pointer);
         // A pointer held in a constant names the memory it was made from, as itself: no cast

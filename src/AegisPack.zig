@@ -82,7 +82,7 @@ pub const rules = [_]Context.Rule{
     .{ .definition = .{ .id = ownership, .name = "A015", .group = .family_policy, .purpose = "std resource held or returned without its one owner", .exception = .aegis }, .check = checkOwnership },
     .{ .definition = .{ .id = identity, .name = "A016", .group = .family_policy, .purpose = "identifying integers of one type that one may pass for another", .exception = .aegis }, .check = checkIdentity },
     .{ .definition = .{ .id = state_machines, .name = "A017", .group = .family_policy, .purpose = "state machine kept by hand", .exception = .aegis }, .check = checkStateMachines },
-    .{ .definition = .{ .id = diagnostics, .name = "A018", .group = .family_policy, .purpose = "internal text written to a peer", .exception = .aegis }, .check = checkDiagnostics, .facts = &.{Danger.peer_writer} },
+    .{ .definition = .{ .id = diagnostics, .name = "A018", .group = .family_policy, .purpose = "internal text written to a peer", .exception = .aegis }, .check = checkDiagnostics, .facts = &.{ Danger.peer_writer, Danger.error_text } },
     .{ .definition = .{ .id = unsafe_set, .name = "A019", .group = .family_policy, .purpose = "operation Zig leaves unchecked", .exception = .aegis }, .check = checkUnsafeSet },
     .{ .definition = .{ .id = cancellation, .name = "A020", .group = .family_policy, .purpose = "loop on input or without bound that cannot be canceled", .exception = .aegis }, .check = checkCancellation, .facts = &.{Danger.peer_input} },
     .{ .definition = .{ .id = lock_order, .name = "A021", .group = .family_policy, .purpose = "two aegis guards held at once without both ranked by Order", .exception = .aegis }, .check = checkLockOrder },
