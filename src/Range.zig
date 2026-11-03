@@ -1335,8 +1335,7 @@ pub fn negates(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.
 /// Whether a value is `@as(T, x)` with `x` of an integer type narrower than `T`.
 fn widened(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
-    var at = node;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    const at = Facts.ungrouped(tree, node);
     switch (tree.nodeTag(at)) {
         .builtin_call_two, .builtin_call_two_comma => {},
         else => return false,

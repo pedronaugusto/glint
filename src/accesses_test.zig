@@ -3,6 +3,7 @@
 const std = @import("std");
 const Facts = @import("Facts.zig");
 const Project = @import("Project.zig");
+const Constructs = @import("Constructs.zig");
 const accesses = Facts.accesses;
 
 const Query = enum { writes, reads };
@@ -211,4 +212,102 @@ test "accesses: a function copies memory between its parameters, or reads one's 
     try std.testing.expectEqual(null, try facts.copierOf(function.named(&project, "swap")));
     try std.testing.expectEqual(0, (try facts.readOf(function.named(&project, "read"))).?);
     try std.testing.expectEqual(null, try facts.readOf(function.named(&project, "get")));
+}
+
+test "accesses: each syntax form that holds an expression is in a construct matrix row its use is read as" {
+    var failed = false;
+    for (std.meta.tags(std.zig.Ast.Node.Tag)) |tag| {
+        const row = Constructs.ofNode(tag) orelse {
+            std.debug.print("{s}: in no row of the construct matrix\n", .{@tagName(tag)});
+            failed = true;
+            continue;
+        };
+        const form = accesses.formOf(tag);
+        if (std.mem.findScalar(Constructs.Row, form.rows(), row) != null) continue;
+        std.debug.print("{s}: row {s}, read as the form {s}\n", .{ @tagName(tag), @tagName(row), @tagName(form) });
+        failed = true;
+    }
+    try std.testing.expect(!failed);
+}
+
+test "accesses: what an expression's value does where it stands" {
+    // Each row: a source, the first expression spelled as `needle`, its use (a carried one with how).
+    const rows_of_use = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "fn f() void { var x: u32 = 0; x = 1; }", "x", "written" },
+        .{ "fn f(v: u32) void { var y: u32 = 0; y = v; }", "v", "stored" },
+        .{ "fn f(v: u32) void { _ = v; }", "v", "discarded" },
+        .{ "fn f() void { var x: u32 = 0; x += 1; }", "x", "updated" },
+        .{ "fn f(v: u32) void { var x: u32 = 0; x += v; }", "v", "operand" },
+        .{ "fn f(t: struct { u32, u32 }) void { var a: u32 = 0; var b: u32 = 0; a, b = t; }", "t", "destructured" },
+        .{ "fn f(t: struct { u32, u32 }) void { var a: u32 = 0; var b: u32 = 0; a, b = t; }", "a", "written" },
+        .{ "fn f() void { var a: [2]u32 = undefined; a[0] = 1; }", "a[0]", "written" },
+        .{ "fn f() void { var a: [2]u32 = undefined; a[0] = 1; }", "a", "element" },
+        .{ "fn f(s: struct { a: u32 }) u32 { return s.a; }", "s", "member" },
+        .{ "fn f(s: [2]u32, i: usize) u32 { return s[i]; }", "i", "index" },
+        .{ "fn f(s: []u32) []u32 { return s[1..]; }", "s", "sliced" },
+        .{ "fn f(p: *u32) u32 { return p.*; }", "p", "dereferenced" },
+        .{ "fn f(x: u32) *const u32 { return &x; }", "x", "address" },
+        .{ "fn f(x: u32) bool { return x == 1; }", "x", "compared" },
+        .{ "fn f(x: u32) u32 { return x + 1; }", "x", "operand" },
+        .{ "fn f(x: []const u8) []const u8 { return x ++ \"a\"; }", "x", "concatenated" },
+        .{ "fn f(x: ?u32) u32 { return x.?; }", "x", "carried unwrapped" },
+        .{ "fn f(x: anyerror!u32) !u32 { return try x; }", "x", "carried tried" },
+        .{ "fn f(x: ?u32) u32 { return x orelse 0; }", "x", "carried payload" },
+        .{ "fn f(x: u32, y: ?u32) u32 { return y orelse x; }", "x", "carried otherwise" },
+        .{ "fn f(x: anyerror!u32) u32 { return x catch 0; }", "x", "carried payload" },
+        .{ "fn f(x: u32) u32 { return (x); }", "x", "carried grouped" },
+        .{ "fn f(c: bool, x: u32) u32 { return if (c) x else 0; }", "x", "carried prong" },
+        .{ "fn f(c: bool, x: u32) u32 { return if (c) x else 0; }", "c", "tested" },
+        .{ "fn f(c: ?u32) void { while (c) |_| {} }", "c", "tested" },
+        .{ "fn f(x: u32) u32 { return switch (x) { else => 0 }; }", "x", "switched" },
+        .{ "fn f(k: u32, x: u32) u32 { return switch (k) { 1 => x, else => 0 }; }", "x", "carried prong" },
+        .{ "fn f(k: u32, x: u32) u32 { return switch (k) { x => 1, else => 0 }; }", "x", "matched" },
+        .{ "fn f(x: u32) u32 { return blk: { break :blk x; }; }", "x", "carried broken" },
+        .{ "fn f(x: u32) u32 { return while (true) { break x; } else 0; }", "x", "carried broken" },
+        .{ "fn f(x: u32) u32 { return outer: while (true) { while (true) break :outer x; } else 0; }", "x", "carried broken" },
+        .{ "fn f(x: u32) u32 { return comptime x; }", "x", "carried compile_time" },
+        .{ "fn f(x: []u32) void { for (x) |_| {} }", "x", "looped" },
+        .{ "fn f(n: usize) void { for (0..n) |_| {} }", "n", "operand" },
+        .{ "fn g(a: u32) void { _ = a; } fn f(x: u32) void { g(x); }", "x", "argument" },
+        .{ "fn g(a: u32) void { _ = a; } fn f(x: u32) void { g(x); }", "g", "callee" },
+        .{ "fn f(x: u32) u64 { return @as(u64, x); }", "x", "builtin_argument" },
+        .{ "const S = struct { a: u32 }; fn f(x: u32) S { return .{ .a = x }; }", "x", "field_of" },
+        .{ "fn f(x: u32) [1]u32 { return .{x}; }", "x", "element_of" },
+        .{ "fn f(x: u32) void { const y = x; _ = y; }", "x", "initializes" },
+        .{ "const S = struct { a: u32 = n }; const n: u32 = 1;", "n", "initializes" },
+        .{ "fn f(x: u32) u32 { return x; }", "x", "returned" },
+        .{ "fn f() void { var x: [n]u8 = undefined; _ = &x; } const n = 4;", "n", "typed" },
+        .{ "fn g() void {} fn f() void { g(); }", "g()", "statement" },
+        .{ "fn g() void {} fn f() void { defer g(); }", "g()", "statement" },
+    };
+    var failed = false;
+    for (rows_of_use) |row| {
+        const source, const needle, const want = row;
+        var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var facts: Facts = .{ .project = &project, .gpa = a };
+        defer facts.deinit();
+        const file = project.sources[0].id;
+        const tree = &project.sources[0].file.tree;
+        const node = for (0..tree.nodes.len) |i| {
+            const each: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (each != .root and std.mem.eql(u8, tree.getNodeSource(each), needle)) break each;
+        } else {
+            std.debug.print("{s}: no expression '{s}'\n", .{ source, needle });
+            failed = true;
+            continue;
+        };
+        const use = try accesses.useOf(&facts, file, node);
+        const got = switch (use) {
+            .carried => |carried| try std.fmt.allocPrint(a, "carried {s}", .{@tagName(carried.how)}),
+            else => @tagName(use),
+        };
+        if (std.mem.eql(u8, got, want)) continue;
+        std.debug.print("{s}: '{s}' expected {s}, found {s}\n", .{ source, needle, want, got });
+        failed = true;
+    }
+    try std.testing.expect(!failed);
 }

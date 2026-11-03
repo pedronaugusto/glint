@@ -4,6 +4,7 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
+const Constructs = @import("Constructs.zig");
 const Ast = std.zig.Ast;
 const Facts = @This();
 
@@ -6362,6 +6363,27 @@ pub fn builtinArgs(tree: *const Ast, node: Ast.Node.Index, buffer: *[2]Ast.Node.
     return tree.builtinCallParams(buffer, node) orelse &.{};
 }
 
+/// `node` through the parentheses around it, which give the value they hold.
+pub fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    return at;
+}
+
+/// The builtin `node` calls (`@field`), by the name Zig gives it, which no declaration can take;
+/// null where it calls none.
+pub fn builtinName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => tree.tokenSlice(tree.nodeMainToken(node)),
+        else => null,
+    };
+}
+
+/// Whether `node` calls the builtin `name` (`builtinName`).
+pub fn isBuiltin(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    return std.mem.eql(u8, builtinName(tree, node) orelse return false, name);
+}
+
 /// The functions each found a view of (`viewOf`).
 const Views = struct { found: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty };
 
@@ -6668,6 +6690,360 @@ pub const accesses = struct {
             .block_two => tree.nodeData(node).opt_node_and_opt_node[0] == .none,
             else => false,
         };
+    }
+
+    /// The store whose target is `target`, read from `storesIn` alone: `x = v`, `x op= v`, a
+    /// destructure's target. Null where no store writes it (`_`, a node no store targets).
+    pub fn storeInto(facts: *Facts, file: Project.FileId, target: Ast.Node.Index) Error!?Site {
+        for (try storesIn(facts, file)) |site| if (site.target) |each| if (each == target) return site;
+        return null;
+    }
+
+    /// The forms an expression stands in, one for each syntax tag that may hold it: every tag
+    /// Zig has is named in `formOf`, with no default, so a tag a new Zig adds fails to build
+    /// until it is placed; and each form is checked against the construct matrix's row of every
+    /// tag it holds (`Form.rows`, Constructs.ofNode).
+    pub const Form = enum {
+        /// Statements or members: a file, a test, a block, a container's declarations.
+        body,
+        deferred,
+        variable,
+        field_declaration,
+        assign,
+        compound_assign,
+        destructure,
+        member,
+        unwrap_optional,
+        tried,
+        @"catch",
+        @"orelse",
+        comparison,
+        operator,
+        concatenation,
+        address_of,
+        slice,
+        deref,
+        array_access,
+        array_literal,
+        struct_literal,
+        call,
+        builtin,
+        @"switch",
+        prong,
+        prong_range,
+        @"while",
+        @"for",
+        for_range,
+        @"if",
+        @"continue",
+        @"break",
+        @"return",
+        /// A type: an optional, an array, a pointer, an error union, a function prototype, an
+        /// error set; what it holds is a type or what only a type reads (a length, an alignment).
+        type,
+        grouped,
+        @"comptime",
+        @"nosuspend",
+        /// `suspend` and `resume`: async frames, which glint does not read.
+        frame,
+        @"asm",
+        fn_decl,
+        /// A form that holds no expression: a name, a literal.
+        leaf,
+
+        /// The construct matrix's rows a tag of this form may be in.
+        pub fn rows(form: Form) []const Constructs.Row {
+            return switch (form) {
+                .body => &.{ .none, .jump },
+                .deferred => &.{.deferred},
+                .variable, .assign => &.{.assignment},
+                .destructure => &.{.destructure},
+                .compound_assign, .comparison, .operator => &.{.operator},
+                .unwrap_optional, .tried, .@"catch", .@"orelse" => &.{.unwrap},
+                .member, .address_of, .slice, .deref, .array_access => &.{.address},
+                .concatenation, .array_literal, .struct_literal => &.{.aggregate},
+                .call, .builtin, .frame, .@"asm" => &.{.call},
+                .@"switch" => &.{.branch},
+                .prong => &.{ .capture, .inline_loop },
+                .prong_range, .@"while", .@"for", .for_range, .@"if" => &.{.capture},
+                .@"continue", .@"break", .@"return" => &.{.jump},
+                .@"comptime" => &.{.compile_time},
+                .field_declaration, .type, .grouped, .@"nosuspend", .fn_decl => &.{.none},
+                .leaf => &.{ .none, .address },
+            };
+        }
+    };
+
+    /// The form of a syntax tag, for each tag Zig has.
+    pub fn formOf(tag: Ast.Node.Tag) Form {
+        return switch (tag) {
+            .root, .test_decl, .block_two, .block_two_semicolon, .block, .block_semicolon => .body,
+            .container_decl, .container_decl_trailing, .container_decl_two, .container_decl_two_trailing, .container_decl_arg, .container_decl_arg_trailing => .body,
+            .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing => .body,
+            .@"defer", .@"errdefer" => .deferred,
+            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => .variable,
+            .container_field_init, .container_field_align, .container_field => .field_declaration,
+            .assign => .assign,
+            .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => .compound_assign,
+            .assign_destructure => .destructure,
+            .field_access => .member,
+            .unwrap_optional => .unwrap_optional,
+            .@"try" => .tried,
+            .@"catch" => .@"catch",
+            .@"orelse" => .@"orelse",
+            .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .comparison,
+            .mul, .div, .mod, .mul_wrap, .mul_sat, .add, .sub, .add_wrap, .sub_wrap, .add_sat, .sub_sat, .shl, .shl_sat, .shr, .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or, .bool_not, .negation, .bit_not, .negation_wrap => .operator,
+            .array_cat => .concatenation,
+            .address_of => .address_of,
+            .slice_open, .slice, .slice_sentinel => .slice,
+            .deref => .deref,
+            .array_access => .array_access,
+            .array_init_one, .array_init_one_comma, .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma, .array_init, .array_init_comma => .array_literal,
+            .struct_init_one, .struct_init_one_comma, .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init, .struct_init_comma => .struct_literal,
+            .call_one, .call_one_comma, .call, .call_comma => .call,
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => .builtin,
+            .@"switch", .switch_comma => .@"switch",
+            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => .prong,
+            .switch_range => .prong_range,
+            .while_simple, .while_cont, .@"while" => .@"while",
+            .for_simple, .@"for" => .@"for",
+            .for_range => .for_range,
+            .if_simple, .@"if" => .@"if",
+            .@"continue" => .@"continue",
+            .@"break" => .@"break",
+            .@"return" => .@"return",
+            .merge_error_sets, .optional_type, .array_type, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .anyframe_type, .error_union, .error_set_decl => .type,
+            .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto => .type,
+            .grouped_expression => .grouped,
+            .@"comptime" => .@"comptime",
+            .@"nosuspend" => .@"nosuspend",
+            .@"suspend", .@"resume" => .frame,
+            .asm_simple, .@"asm", .asm_output, .asm_input => .@"asm",
+            .fn_decl => .fn_decl,
+            .anyframe_literal, .char_literal, .number_literal, .unreachable_literal, .identifier, .enum_literal, .string_literal, .multiline_string_literal, .error_value => .leaf,
+        };
+    }
+
+    /// How a value reaches the expression that carries it on (`Use.carried`).
+    pub const Carry = enum {
+        /// Parentheses.
+        grouped,
+        /// `x.?`: the optional's payload.
+        unwrapped,
+        /// `try x`: the error union's payload.
+        tried,
+        /// The left of `orelse` or `catch`: its payload.
+        payload,
+        /// The right of `orelse` or `catch`: given in its stead.
+        otherwise,
+        /// A branch's or a prong's result, or a loop's `else`: what the `if`, `switch` or loop gives.
+        prong,
+        /// `break v`: what the block, loop or switch it leaves gives.
+        broken,
+        /// `comptime x`.
+        compile_time,
+        /// `nosuspend x`.
+        @"nosuspend",
+    };
+
+    /// What an expression's value does where it stands, by the form that holds it.
+    pub const Use = union(enum) {
+        /// A statement, a body, a member, a `defer`'s expression: no value is taken from it.
+        statement,
+        /// A type, or what only a type reads (a length, an alignment, a sentinel of a type).
+        typed,
+        /// The first value of the variable or field the declaration at the node declares.
+        initializes: Ast.Node.Index,
+        /// The target of a store (`x = v`, a destructure's): the store.
+        written: Site,
+        /// The target of a store that reads it first (`x op= v`): the store.
+        updated: Site,
+        /// The value a store writes into its target (`x = v`'s `v`): the store.
+        stored: Site,
+        /// `_ = v`'s `v`, or `_` itself: no place takes it.
+        discarded,
+        /// The value a destructure takes apart (the destructure).
+        destructured: Ast.Node.Index,
+        /// The holder of a member read (`x.f`, the access).
+        member: Ast.Node.Index,
+        /// What is indexed (`x[i]`, the access).
+        element: Ast.Node.Index,
+        /// What is sliced (`x[a..b]`, the slice).
+        sliced: Ast.Node.Index,
+        /// What is dereferenced (`x.*`).
+        dereferenced: Ast.Node.Index,
+        /// An index, a slice's bound or sentinel (the access).
+        index: Ast.Node.Index,
+        /// What `&` takes the address of.
+        address: Ast.Node.Index,
+        /// A comparison's operand.
+        compared: Ast.Node.Index,
+        /// An operator's operand (arithmetic, bits, truth values), a compound assignment's value,
+        /// a `for` range's bound.
+        operand: Ast.Node.Index,
+        /// An operand of `++`.
+        concatenated: Ast.Node.Index,
+        /// An element of an array literal, at its position.
+        element_of: struct { literal: Ast.Node.Index, position: usize },
+        /// A field of a struct literal, by the token naming it.
+        field_of: struct { literal: Ast.Node.Index, name: Ast.TokenIndex },
+        /// What a call calls.
+        callee: Ast.Node.Index,
+        /// A call's argument at a position.
+        argument: struct { call: Ast.Node.Index, position: usize },
+        /// A builtin's argument at a position.
+        builtin_argument: struct { call: Ast.Node.Index, position: usize },
+        /// An `if`'s or `while`'s condition (its capture, if any, takes the payload).
+        tested: Ast.Node.Index,
+        /// A `switch`'s operand.
+        switched: Ast.Node.Index,
+        /// A prong's item, or a bound of a prong's range (the prong or the range).
+        matched: Ast.Node.Index,
+        /// A `for`'s input at a position.
+        looped: struct { loop: Ast.Node.Index, position: usize },
+        /// Carried on to the expression that gives it (`into`).
+        carried: struct { into: Ast.Node.Index, how: Carry },
+        /// `return v`'s `v`.
+        returned: Ast.Node.Index,
+        /// `continue :label v`'s `v`.
+        continued: Ast.Node.Index,
+        /// An `asm` operand or template.
+        in_asm: Ast.Node.Index,
+        /// What it does is not read here: never clears.
+        unknown: Facts.Unknown,
+    };
+
+    /// What `node`'s value does where it stands: read by the form of the node that holds it
+    /// (`formOf`), a store's by its site (`storeInto`).
+    pub fn useOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Use {
+        const tree = &facts.project.at(file).file.tree;
+        const model = &facts.project.at(file).model;
+        const parent = model.parentOf(node) orelse return .statement;
+        switch (formOf(tree.nodeTag(parent))) {
+            .body, .deferred => return .statement,
+            .type => return .typed,
+            .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else .typed,
+            .variable => return if (tree.fullVarDecl(parent).?.ast.init_node.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a variable's
+            .field_declaration => return if (tree.fullContainerField(parent).?.ast.value_expr.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a field's
+            .assign => {
+                const target = tree.nodeData(parent).node_and_node[0];
+                const site = (try storeInto(facts, file, target)) orelse return if (discard(tree, target)) .discarded else .{ .unknown = .unsupported };
+                return if (node == target) .{ .written = site } else .{ .stored = site };
+            },
+            .compound_assign => {
+                const target = tree.nodeData(parent).node_and_node[0];
+                if (node != target) return .{ .operand = parent };
+                return if (try storeInto(facts, file, target)) |site| .{ .updated = site } else .{ .unknown = .unsupported };
+            },
+            .destructure => {
+                if (tree.assignDestructure(parent).ast.value_expr == node) return .{ .destructured = parent };
+                if (try storeInto(facts, file, node)) |site| return .{ .written = site };
+                return if (discard(tree, node)) .discarded else .{ .unknown = .unsupported };
+            },
+            .member => return .{ .member = parent },
+            .unwrap_optional => return .{ .carried = .{ .into = parent, .how = .unwrapped } },
+            .tried => return .{ .carried = .{ .into = parent, .how = .tried } },
+            .@"catch", .@"orelse" => return .{ .carried = .{ .into = parent, .how = if (tree.nodeData(parent).node_and_node[0] == node) .payload else .otherwise } },
+            .comparison => return .{ .compared = parent },
+            .operator => return .{ .operand = parent },
+            .concatenation => return .{ .concatenated = parent },
+            .address_of => return .{ .address = parent },
+            .slice => return if (tree.fullSlice(parent).?.ast.sliced == node) .{ .sliced = parent } else .{ .index = parent }, // unreachable: the form is a slice's
+            .deref => return .{ .dereferenced = parent },
+            .array_access => return if (tree.nodeData(parent).node_and_node[0] == node) .{ .element = parent } else .{ .index = parent },
+            .array_literal => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.fullArrayInit(&buffer, parent).?.ast.elements, 0..) |each, k| if (each == node) return .{ .element_of = .{ .literal = parent, .position = k } }; // unreachable: the form is an array literal's
+                return .typed;
+            },
+            .struct_literal => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (tree.fullStructInit(&buffer, parent).?.ast.fields) |each| if (each == node) { // unreachable: the form is a struct literal's
+                    return .{ .field_of = .{ .literal = parent, .name = Model.initName(tree, node) orelse return .{ .unknown = .unsupported } } };
+                };
+                return .typed;
+            },
+            .call => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, parent).?; // unreachable: the form is a call's
+                if (call.ast.fn_expr == node) return .{ .callee = parent };
+                for (call.ast.params, 0..) |each, k| if (each == node) return .{ .argument = .{ .call = parent, .position = k } };
+                return .{ .unknown = .unsupported };
+            },
+            .builtin => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (Facts.builtinArgs(tree, parent, &buffer), 0..) |each, k| if (each == node) return .{ .builtin_argument = .{ .call = parent, .position = k } };
+                return .{ .unknown = .unsupported };
+            },
+            // Its prongs are its own.
+            .@"switch" => return if (tree.fullSwitch(parent).?.ast.condition == node) .{ .switched = parent } else .statement, // unreachable: the form is a switch's
+            .prong => {
+                if (tree.fullSwitchCase(parent).?.ast.target_expr != node) return .{ .matched = parent }; // unreachable: the form is a prong's
+                return .{ .carried = .{ .into = model.parentOf(parent) orelse return .{ .unknown = .unsupported }, .how = .prong } };
+            },
+            .prong_range => return .{ .matched = parent },
+            .@"while" => {
+                const loop = tree.fullWhile(parent).?; // unreachable: the form is a while's
+                if (loop.ast.cond_expr == node) return .{ .tested = parent };
+                if (loop.ast.else_expr.unwrap() == node) return .{ .carried = .{ .into = parent, .how = .prong } };
+                return .statement;
+            },
+            .@"for" => {
+                const loop = tree.fullFor(parent).?; // unreachable: the form is a for's
+                for (loop.ast.inputs, 0..) |each, k| if (each == node) return .{ .looped = .{ .loop = parent, .position = k } };
+                if (loop.ast.else_expr.unwrap() == node) return .{ .carried = .{ .into = parent, .how = .prong } };
+                return .statement;
+            },
+            .for_range => return .{ .operand = parent },
+            .@"if" => {
+                if (tree.fullIf(parent).?.ast.cond_expr == node) return .{ .tested = parent }; // unreachable: the form is an if's
+                return .{ .carried = .{ .into = parent, .how = .prong } };
+            },
+            .@"continue" => return .{ .continued = parent },
+            .@"break" => return .{ .carried = .{ .into = breakTarget(tree, model, parent) orelse return .{ .unknown = .unsupported }, .how = .broken } },
+            .@"return" => return .{ .returned = parent },
+            .grouped => return .{ .carried = .{ .into = parent, .how = .grouped } },
+            .@"comptime" => return .{ .carried = .{ .into = parent, .how = .compile_time } },
+            .@"nosuspend" => return .{ .carried = .{ .into = parent, .how = .@"nosuspend" } },
+            .@"asm" => return .{ .in_asm = parent },
+            .frame, .leaf => return .{ .unknown = .unsupported },
+        }
+    }
+
+    /// Whether a store's target is `_`, which takes nothing.
+    fn discard(tree: *const Ast, node: Ast.Node.Index) bool {
+        return tree.nodeTag(node) == .identifier and std.zig.isUnderscore(tree.tokenSlice(tree.nodeMainToken(node)));
+    }
+
+    /// What the `break` `jump` leaves: the block, loop or switch its label names, or without
+    /// one the innermost loop whose body holds it. Null past the function, or a label not found.
+    fn breakTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Node.Index {
+        const label = tree.nodeData(jump).opt_token_and_opt_node[0].unwrap();
+        var at = jump;
+        while (model.parentOf(at)) |up| : (at = up) {
+            const own: ?Ast.TokenIndex, const body: bool = switch (formOf(tree.nodeTag(up))) {
+                .fn_decl => return null,
+                .body => blk: {
+                    const brace = tree.nodeMainToken(up);
+                    if (tree.tokenTag(brace) != .l_brace or brace < 2 or tree.tokenTag(brace - 1) != .colon) continue;
+                    break :blk .{ brace - 2, false };
+                },
+                .@"while" => blk: {
+                    const loop = tree.fullWhile(up).?; // unreachable: the form is a while's
+                    break :blk .{ loop.label_token, loop.ast.then_expr == at or loop.ast.cont_expr.unwrap() == at };
+                },
+                .@"for" => blk: {
+                    const loop = tree.fullFor(up).?; // unreachable: the form is a for's
+                    break :blk .{ loop.label_token, loop.ast.then_expr == at };
+                },
+                .@"switch" => .{ tree.fullSwitch(up).?.label_token, false }, // unreachable: the form is a switch's
+                else => continue,
+            };
+            if (label) |wanted| {
+                if (own) |token| if (std.mem.eql(u8, tree.tokenSlice(token), tree.tokenSlice(wanted))) return up;
+            } else if (body) return up;
+        }
+        return null;
     }
 
     pub const Place = union(enum) {
@@ -8194,12 +8570,6 @@ pub const calls = struct {
             .field_access => facts.definition(file, node),
             else => facts.reflected(file, node),
         };
-    }
-
-    fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-        var at_node = node;
-        while (tree.nodeTag(at_node) == .grouped_expression) at_node = tree.nodeData(at_node).node_and_token[0];
-        return at_node;
     }
 
     /// What calling the value of `node` calls: each function a source of it gives.

@@ -47,7 +47,7 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const name = builtinName(tree, node) orelse continue;
+        const name = Facts.builtinName(tree, node) orelse continue;
         for ([_][]const u8{ "@atomicLoad", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |atomic| if (std.mem.eql(u8, name, atomic)) {
             if (!c.inTest(tree.nodeMainToken(node)) and atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
         };
@@ -989,7 +989,7 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             },
             else => {},
         }
-        const name = builtinName(tree, node) orelse continue;
+        const name = Facts.builtinName(tree, node) orelse continue;
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         if (std.mem.eql(u8, name, "@setRuntimeSafety")) {
             var buffer: [2]Ast.Node.Index = undefined;
@@ -1455,9 +1455,3 @@ pub fn atRuntime(c: *const Context, node: Ast.Node.Index) bool {
     return false;
 }
 
-fn builtinName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => tree.tokenSlice(tree.nodeMainToken(node)),
-        else => null,
-    };
-}

@@ -963,7 +963,7 @@ const Walk = struct {
         const tree = w.tree;
         const all = std.math.maxInt(u64);
         if (!holdsUndefined(tree, value)) return 0;
-        const node = ungrouped(tree, value);
+        const node = Facts.ungrouped(tree, value);
         var mask: u64 = 0;
         var buffer: [2]Ast.Node.Index = undefined;
         switch (w.shape) {
@@ -1536,7 +1536,7 @@ const Walk = struct {
         }
         if (tree.nodeTag(of) != .field_access) return null;
         const reflected, const kind = tree.nodeData(of).node_and_token;
-        if (!std.mem.eql(u8, tree.tokenSlice(kind), "@\"struct\"") or !isBuiltin(tree, reflected, "@typeInfo")) return null;
+        if (!std.mem.eql(u8, tree.tokenSlice(kind), "@\"struct\"") or !Facts.isBuiltin(tree, reflected, "@typeInfo")) return null;
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, reflected, &buffer);
         if (args.len != 1 or !sameType(tree, w.model, args[0], own)) return null;
@@ -1567,7 +1567,7 @@ const Walk = struct {
     /// names), `f` or `name` the capture.
     fn fieldOfCapture(w: *const Walk, target: Ast.Node.Index, name: []const u8, by_name: bool) bool {
         const tree = w.tree;
-        if (!isBuiltin(tree, target, "@field")) return false;
+        if (!Facts.isBuiltin(tree, target, "@field")) return false;
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, target, &buffer);
         if (args.len != 2 or !w.isLocal(args[0])) return false;
@@ -2152,7 +2152,7 @@ const Walk = struct {
         if (literalValue(tree, full.ast.start) != 0) return false;
         var end = full.ast.end.unwrap() orelse return false;
         // `@intCast(n)`: the same count, or a checked stop.
-        if (isBuiltin(tree, end, "@intCast")) {
+        if (Facts.isBuiltin(tree, end, "@intCast")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, end, &buffer);
             if (args.len != 1) return false;
@@ -2417,7 +2417,7 @@ const Walk = struct {
     /// Whether `node` is the local's `.len`.
     fn isLength(w: *const Walk, node: Ast.Node.Index) bool {
         const tree = w.tree;
-        const at = ungrouped(tree, node);
+        const at = Facts.ungrouped(tree, node);
         if (tree.nodeTag(at) != .field_access) return false;
         const of, const member = tree.nodeData(at).node_and_token;
         return std.mem.eql(u8, tree.tokenSlice(member), "len") and w.isLocal(of);
@@ -2448,7 +2448,7 @@ const Walk = struct {
 
     /// Whether `node` is the guarding call's result: the call, or the constant it is held in.
     fn isResult(w: *const Walk, node: Ast.Node.Index, guard: Guard) bool {
-        const at = ungrouped(w.tree, node);
+        const at = Facts.ungrouped(w.tree, node);
         if (at == guard.call) return true;
         if (w.tree.nodeTag(at) != .identifier) return false;
         const binding = guard.binding orelse return false;
@@ -2459,7 +2459,7 @@ const Walk = struct {
     /// Which of std's errno decoders `node` is, of the guarding call's result alone: as
     /// `noteErrnos` found it by declaration; null for any other call or node.
     fn errnoOf(w: *const Walk, node: Ast.Node.Index, guard: Guard) ?CContract.Errno {
-        const at = ungrouped(w.tree, node);
+        const at = Facts.ungrouped(w.tree, node);
         var buffer: [1]Ast.Node.Index = undefined;
         const call = w.tree.fullCall(&buffer, at) orelse return null;
         if (call.ast.params.len != 1 or !w.isResult(call.ast.params[0], guard)) return null;
@@ -2544,12 +2544,12 @@ const Walk = struct {
     /// `@as`.
     fn sizeOfLocal(w: *const Walk, node: Ast.Node.Index) bool {
         const tree = w.tree;
-        var at = ungrouped(tree, node);
+        var at = Facts.ungrouped(tree, node);
         var buffer: [2]Ast.Node.Index = undefined;
-        while (isBuiltin(tree, at, "@intCast") or isBuiltin(tree, at, "@as")) {
+        while (Facts.isBuiltin(tree, at, "@intCast") or Facts.isBuiltin(tree, at, "@as")) {
             const args = Facts.builtinArgs(tree, at, &buffer);
             if (args.len == 0) return false;
-            at = ungrouped(tree, args[args.len - 1]);
+            at = Facts.ungrouped(tree, args[args.len - 1]);
         }
         const variable = tree.fullVarDecl(w.model.declarations[@backingInt(w.local)].node) orelse return false;
         const kind = variable.ast.type_node.unwrap() orelse return false;
@@ -2558,13 +2558,13 @@ const Walk = struct {
             const count, const element = tree.nodeData(kind).node_and_node;
             return literalValue(tree, count) == bytes and isWord(tree, element, "u8");
         }
-        if (!isBuiltin(tree, at, "@sizeOf")) return false;
+        if (!Facts.isBuiltin(tree, at, "@sizeOf")) return false;
         const args = Facts.builtinArgs(tree, at, &buffer);
         if (args.len != 1) return false;
-        const of = ungrouped(tree, args[0]);
-        if (isBuiltin(tree, of, "@TypeOf")) {
+        const of = Facts.ungrouped(tree, args[0]);
+        if (Facts.isBuiltin(tree, of, "@TypeOf")) {
             const inner = Facts.builtinArgs(tree, of, &buffer);
-            return inner.len == 1 and w.isLocal(ungrouped(tree, inner[0]));
+            return inner.len == 1 and w.isLocal(Facts.ungrouped(tree, inner[0]));
         }
         return sameText(w.model, tree, of, kind);
     }
@@ -2575,7 +2575,7 @@ const Walk = struct {
     /// when either shows it false.
     fn checks(w: *const Walk, cond: Ast.Node.Index, guard: Guard) ?bool {
         const tree = w.tree;
-        const node = ungrouped(tree, cond);
+        const node = Facts.ungrouped(tree, cond);
         switch (tree.nodeTag(node)) {
             .bool_and => {
                 const a, const b = tree.nodeData(node).node_and_node;
@@ -2722,7 +2722,7 @@ const Walk = struct {
 /// Whether the type `kind` spells a pointer or slice: written so, or as the name of a constant of
 /// `scope` that is one, or a choice of them (`if (a) |x| []align(x) T else []T`), where `by_name`.
 fn spelledPointer(tree: *const Ast, model: *const Model, scope: Model.Scope.Id, kind: Ast.Node.Index, by_name: bool) bool {
-    const node = ungrouped(tree, kind);
+    const node = Facts.ungrouped(tree, kind);
     if (tree.fullPtrType(node) != null) return true;
     if (tree.fullIf(node)) |choice| {
         const otherwise = choice.ast.else_expr.unwrap() orelse return false;
@@ -2959,9 +2959,9 @@ fn aliasesOf(gpa: std.mem.Allocator, tree: *const Ast, model: *const Model, loca
             const id: Model.Declaration.Id = @fromBackingInt(@intCast(d));
             if (id == local or std.mem.findScalar(Model.Declaration.Id, found.items, id) != null) continue;
             const variable = tree.fullVarDecl(decl.node) orelse continue;
-            const init = ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
+            const init = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
             const address = tree.nodeTag(init) == .address_of;
-            const spelled = ungrouped(tree, if (address) tree.nodeData(init).node else init);
+            const spelled = Facts.ungrouped(tree, if (address) tree.nodeData(init).node else init);
             if (tree.nodeTag(spelled) != .identifier) continue;
             const of = (model.reference(spelled) orelse continue).declaration orelse continue;
             // The local's address, or a parameter's pointer as it is; an alias's, as it is.
@@ -3026,14 +3026,6 @@ fn sameType(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.Nod
         },
         else => return false,
     }
-}
-
-/// Whether `node` calls the builtin `name`.
-fn isBuiltin(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name),
-        else => false,
-    };
 }
 
 /// Whether an identifier spelled `name` appears in `node`.
@@ -3495,7 +3487,7 @@ fn plain(tree: *const Ast, node: Ast.Node.Index) bool {
 /// The memory a statement writes whole: `@memcpy(m, …)`, `@memset(m, …)` or `m.* = …`, with
 /// no `undefined` in what it writes.
 fn filled(tree: *const Ast, statement: Ast.Node.Index) ?Ast.Node.Index {
-    if (isBuiltin(tree, statement, "@memcpy") or isBuiltin(tree, statement, "@memset")) {
+    if (Facts.isBuiltin(tree, statement, "@memcpy") or Facts.isBuiltin(tree, statement, "@memset")) {
         var buffer: [2]Ast.Node.Index = undefined;
         const params = tree.builtinCallParams(&buffer, statement) orelse return null;
         if (params.len != 2 or holdsUndefined(tree, params[1])) return null;
@@ -4274,7 +4266,7 @@ fn parentNamed(c: *Context, owner: Owner, name: []const u8) Context.Error!bool {
             const tree = &source.file.tree;
             for (0..tree.nodes.len) |i| {
                 const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                if (!isBuiltin(tree, node, "@fieldParentPtr")) continue;
+                if (!Facts.isBuiltin(tree, node, "@fieldParentPtr")) continue;
                 const converted = try ParentPointer.converts(c, source.id, node);
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
@@ -4376,7 +4368,7 @@ fn leavesAlways(tree: *const Ast, node: Ast.Node.Index) bool {
 /// any depth (`.{ .n = 0, .buf = undefined }`), one joined to another (`a ++ .{undefined}`), or
 /// `undefined` as a type (`@as(T, undefined)`).
 fn holdsUndefined(tree: *const Ast, value: Ast.Node.Index) bool {
-    const node = ungrouped(tree, value);
+    const node = Facts.ungrouped(tree, value);
     if (isWord(tree, node, "undefined")) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, node)) |literal| {
@@ -4391,7 +4383,7 @@ fn holdsUndefined(tree: *const Ast, value: Ast.Node.Index) bool {
         const lhs, const rhs = tree.nodeData(node).node_and_node;
         return holdsUndefined(tree, lhs) or holdsUndefined(tree, rhs);
     }
-    if (isBuiltin(tree, node, "@as")) {
+    if (Facts.isBuiltin(tree, node, "@as")) {
         const args = Facts.builtinArgs(tree, node, &buffer);
         return args.len == 2 and holdsUndefined(tree, args[1]);
     }
@@ -4413,7 +4405,7 @@ fn unevaluated(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool
     var at = node;
     while (model.parentOf(at)) |up| : (at = up) {
         if (tree.nodeTag(up) == .fn_decl) return false;
-        if (isBuiltin(tree, up, "@TypeOf")) return true;
+        if (Facts.isBuiltin(tree, up, "@TypeOf")) return true;
     }
     return false;
 }
@@ -4503,7 +4495,7 @@ fn conditional(tree: *const Ast, model: *const Model, inner: Ast.Node.Index, top
 fn strideAt(tree: *const Ast, start: Ast.Node.Index, stride: u64, index: []const u8, count: u64) bool {
     if (tree.nodeTag(start) != .mul) return false;
     const a, const b = tree.nodeData(start).node_and_node;
-    const pass = ungrouped(tree, if (literalValue(tree, a) == stride) b else if (literalValue(tree, b) == stride) a else return false);
+    const pass = Facts.ungrouped(tree, if (literalValue(tree, a) == stride) b else if (literalValue(tree, b) == stride) a else return false);
     if (isWord(tree, pass, index)) return true;
     if (tree.nodeTag(pass) != .sub) return false;
     const left, const right = tree.nodeData(pass).node_and_node;
@@ -4517,7 +4509,7 @@ fn strideAt(tree: *const Ast, start: Ast.Node.Index, stride: u64, index: []const
 /// array's (`Range.memoryLength`). Every input of one loop has the same length.
 fn passes(c: *Context, file: Project.FileId, input: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
-    const at = ungrouped(tree, input);
+    const at = Facts.ungrouped(tree, input);
     if (tree.nodeTag(at) == .for_range) {
         const start, const end = tree.nodeData(at).node_and_opt_node;
         const from = try Range.constantValue(c, file, start) orelse return false;
@@ -4530,16 +4522,9 @@ fn passes(c: *Context, file: Project.FileId, input: Ast.Node.Index) Context.Erro
     return length > 0;
 }
 
-/// `node` without the parentheses around it.
-fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    return at;
-}
-
 /// Whether `node` names a member `name`: `.SUCCESS`, or `E.SUCCESS` of some enum.
 fn isMember(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
-    const at = ungrouped(tree, node);
+    const at = Facts.ungrouped(tree, node);
     return switch (tree.nodeTag(at)) {
         .enum_literal => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), name),
         .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), name),

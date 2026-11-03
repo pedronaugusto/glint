@@ -51,7 +51,7 @@ fn shown(c: *Context, node: Ast.Node.Index) Context.Error!?struct { Field, Facts
     const declared = (written.fullContainerField(record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
     const kind = held(try c.facts.resolve(field.file, declared)) orelse return null;
     const field_of: Field = .{ .parent = parent, .name = name };
-    const pointer = strip(tree, args[1]);
+    const pointer = Facts.ungrouped(tree, args[1]);
     if (try interfaceField(c, node, pointer, field_of, kind)) return .{ field_of, kind, true };
     if (try listNode(c, pointer, field_of, kind)) return .{ field_of, kind, false };
     return null;
@@ -64,8 +64,8 @@ pub fn clearedAlignment(c: *Context, node: Ast.Node.Index) Context.Error!Verdict
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 1) return .open;
-    const inner = strip(tree, args[0]);
-    if (!isBuiltin(tree, inner, "@fieldParentPtr")) return .open;
+    const inner = Facts.ungrouped(tree, args[0]);
+    if (!Facts.isBuiltin(tree, inner, "@fieldParentPtr")) return .open;
     return cleared(c, inner);
 }
 
@@ -131,7 +131,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
         const file_tree = &each.file.tree;
         for (file_tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!isBuiltin(file_tree, node, "@field")) continue;
+            if (!Facts.isBuiltin(file_tree, node, "@field")) continue;
             if (each.model.parentOf(node)) |parent| if (file_tree.nodeTag(parent) == .assign and file_tree.nodeData(parent).node_and_node[0] == node) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(file_tree, node, &buffer);
@@ -278,8 +278,8 @@ fn calledOnSelf(tree: *const Ast, model: *const Model, use: Ast.Node.Index, thro
 fn givenSelf(tree: *const Ast, call: Ast.full.Call, interface: Ast.Node.Index, given: u64) bool {
     for (call.ast.params, 0..) |param, position| {
         if (position >= 64 or given & (@as(u64, 1) << @intCast(position)) == 0) continue;
-        var argument = strip(tree, param);
-        if (tree.nodeTag(argument) == .address_of) argument = strip(tree, tree.nodeData(argument).node);
+        var argument = Facts.ungrouped(tree, param);
+        if (tree.nodeTag(argument) == .address_of) argument = Facts.ungrouped(tree, tree.nodeData(argument).node);
         if (!sameTokens(tree, argument, interface)) return false;
     }
     return call.ast.params.len >= 64 or given >> @intCast(call.ast.params.len) == 0;
@@ -429,7 +429,7 @@ fn reachedOnlyInstalled(c: *Context, function: Ast.Node.Index, token: Ast.TokenI
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, model.parentOf(node) orelse return false) orelse return false;
         if (call.ast.fn_expr != node or position >= call.ast.params.len) return false;
-        const arg = strip(tree, call.ast.params[position]);
+        const arg = Facts.ungrouped(tree, call.ast.params[position]);
         if (tree.nodeTag(arg) != .identifier) return false;
         const given = model.declarations[@backingInt((model.reference(arg) orelse return false).declaration orelse return false)];
         if (given.kind != .parameter) return false;
@@ -494,7 +494,7 @@ fn namedByField(c: *Context, decl: Model.Declaration.Id) Context.Error!bool {
     const record = model.declarations[@backingInt(decl)];
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!isBuiltin(tree, node, "@field")) continue;
+        if (!Facts.isBuiltin(tree, node, "@field")) continue;
         var buffer: [2]Ast.Node.Index = undefined;
         const args = Facts.builtinArgs(tree, node, &buffer);
         if (args.len != 2) continue;
@@ -606,7 +606,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!isBuiltin(tree, node, "@field")) continue;
+            if (!Facts.isBuiltin(tree, node, "@field")) continue;
             if (source.model.parentOf(node)) |parent| if (tree.nodeTag(parent) == .assign and tree.nodeData(parent).node_and_node[0] == node) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
@@ -659,14 +659,14 @@ fn literalNames(tree: *const Ast, model: *const Model, node: Ast.Node.Index, buf
     const loop = tree.fullFor(decl.node) orelse return null;
     const position = Model.capturePosition(tree, loop, decl.token) orelse return null;
     if (position >= loop.ast.inputs.len) return null;
-    var list = strip(tree, loop.ast.inputs[position]);
-    if (tree.nodeTag(list) == .address_of) list = strip(tree, tree.nodeData(list).node);
+    var list = Facts.ungrouped(tree, loop.ast.inputs[position]);
+    if (tree.nodeTag(list) == .address_of) list = Facts.ungrouped(tree, tree.nodeData(list).node);
     if (tree.nodeTag(list) == .identifier) {
         const named = model.declarations[@backingInt((model.reference(list) orelse return null).declaration orelse return null)];
         if (named.kind != .variable) return null;
         const variable = tree.fullVarDecl(named.node) orelse return null;
         if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-        list = strip(tree, variable.ast.init_node.unwrap() orelse return null);
+        list = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
     }
     const literal = tree.fullArrayInit(buffer, list) orelse return null;
     for (literal.ast.elements) |each| if (tree.nodeTag(each) != .string_literal) return null;
@@ -722,8 +722,8 @@ const Follow = struct {
             .@"break" => return f.stays(file, labeled(tree, model, parent) orelse return false),
             else => {},
         }
-        if (isBuiltin(tree, parent, "@fieldParentPtr")) return true;
-        if (isBuiltin(tree, parent, "@as")) {
+        if (Facts.isBuiltin(tree, parent, "@fieldParentPtr")) return true;
+        if (Facts.isBuiltin(tree, parent, "@as")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, parent, &buffer);
             if (args.len != 2 or args[1] != node or !f.pointer(try c.facts.resolve(file, args[0]))) return false;
@@ -1033,7 +1033,7 @@ const Carry = struct {
         if (depth == 32) return .held;
         const c = k.c;
         const tree = &c.project.at(file).file.tree;
-        const at = strip(tree, node);
+        const at = Facts.ungrouped(tree, node);
         if (tree.nodeTag(at) == .address_of) return k.carries(file, tree.nodeData(at).node, depth + 1);
         var buffer: [2]Ast.Node.Index = undefined;
         if (tree.fullStructInit(&buffer, at)) |literal| {
@@ -1080,7 +1080,7 @@ const Carry = struct {
         // to `function` where it stands in it.
         if (position > 0 and try spawnArguments(c, decl, index)) {
             var buffer: [2]Ast.Node.Index = undefined;
-            if (tree.fullArrayInit(&buffer, strip(tree, call.ast.params[position]))) |tuple| {
+            if (tree.fullArrayInit(&buffer, Facts.ungrouped(tree, call.ast.params[position]))) |tuple| {
                 return k.spawned(file, call.ast.params[position - 1], tuple.ast.elements, from_program);
             }
         }
@@ -1247,11 +1247,11 @@ const Carry = struct {
         const tree = &c.project.at(file).file.tree;
         const model = &c.project.at(file).model;
         if (tree.nodeTag(target) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) return .shown;
-        var root = strip(tree, target);
+        var root = Facts.ungrouped(tree, target);
         while (true) switch (tree.nodeTag(root)) {
-            .deref, .unwrap_optional => root = strip(tree, tree.nodeData(root).node),
-            .field_access => root = strip(tree, tree.nodeData(root).node_and_token[0]),
-            .array_access => root = strip(tree, tree.nodeData(root).node_and_node[0]),
+            .deref, .unwrap_optional => root = Facts.ungrouped(tree, tree.nodeData(root).node),
+            .field_access => root = Facts.ungrouped(tree, tree.nodeData(root).node_and_token[0]),
+            .array_access => root = Facts.ungrouped(tree, tree.nodeData(root).node_and_node[0]),
             else => break,
         };
         if (tree.nodeTag(root) != .identifier) return .undecided;
@@ -1383,7 +1383,7 @@ fn spawnArguments(c: *Context, decl: Facts.Decl, index: usize) Context.Error!boo
         var call_buffer: [1]Ast.Node.Index = undefined;
         const tuple = tree.fullCall(&call_buffer, param.type_expr orelse return false) orelse return false;
         if (tree.nodeTag(tuple.ast.fn_expr) != .field_access or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(tuple.ast.fn_expr).node_and_token[1]), "ArgsTuple")) return false;
-        if (tuple.ast.params.len != 1 or !isBuiltin(tree, tuple.ast.params[0], "@TypeOf")) return false;
+        if (tuple.ast.params.len != 1 or !Facts.isBuiltin(tree, tuple.ast.params[0], "@TypeOf")) return false;
         var args_buffer: [2]Ast.Node.Index = undefined;
         const typed = Facts.builtinArgs(tree, tuple.ast.params[0], &args_buffer);
         return typed.len == 1 and tree.nodeTag(typed[0]) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(typed[0])), function orelse return false);
@@ -1422,7 +1422,7 @@ pub fn contract(c: *Context, rule: Rule) Context.Error!void {
         }
         const token = tree.nodeMainToken(node);
         if (c.inTest(token)) continue;
-        if (isBuiltin(tree, node, "@field")) if (try namesFunction(c, kinds, node)) {
+        if (Facts.isBuiltin(tree, node, "@field")) if (try namesFunction(c, kinds, node)) {
             try c.at(rule, token, "@field naming an interface's function or vtable: a function its implementation installed, read out, recovers its parent by @fieldParentPtr from whatever it is then given");
             continue;
         };
@@ -1492,11 +1492,11 @@ fn interfaces(c: *Context) Context.Error!?[]const Facts.Container {
         const tree = &source.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!isBuiltin(tree, node, "@fieldParentPtr")) continue;
+            if (!Facts.isBuiltin(tree, node, "@fieldParentPtr")) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 2) continue;
-            const pointer = strip(tree, args[1]);
+            const pointer = Facts.ungrouped(tree, args[1]);
             if (tree.nodeTag(pointer) != .identifier) continue;
             const index = (source.model.reference(pointer) orelse continue).declaration orelse continue;
             const param = source.model.declarations[@backingInt(index)];
@@ -1652,7 +1652,7 @@ fn capturedField(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     if (record.kind != .capture) return false;
     const payload = if (tree.fullIf(record.node)) |branch| branch.payload_token else if (tree.fullWhile(record.node)) |loop| loop.payload_token else return false;
     if (payload != record.token) return false;
-    const source = strip(tree, c.facts.captureSource(c.file, record.node) orelse return false);
+    const source = Facts.ungrouped(tree, c.facts.captureSource(c.file, record.node) orelse return false);
     if (tree.nodeTag(source) != .field_access) return false;
     return switch (try c.facts.definition(c.file, source)) {
         .decl => |member| c.project.at(member.file).model.declarations[@backingInt(member.index)].kind == .field,
@@ -1695,8 +1695,8 @@ fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Cont
         index = position;
         // Through a function field (`o.vtable.see(o, n)`, `h.f.?(h)`): no receiver is passed,
         // and the read is judged where it is, by `readInPlace`, whatever the field may hold.
-        const callee = strip(tree, call.ast.fn_expr);
-        const read = if (tree.nodeTag(callee) == .unwrap_optional) strip(tree, tree.nodeData(callee).node_and_token[0]) else callee;
+        const callee = Facts.ungrouped(tree, call.ast.fn_expr);
+        const read = if (tree.nodeTag(callee) == .unwrap_optional) Facts.ungrouped(tree, tree.nodeData(callee).node_and_token[0]) else callee;
         // Or through what a capture reads out of one (`if (h.f) |f| f(h)`), the same call.
         if (try capturedField(c, read)) return .shown;
         // A member not known is read as the callee resolves, below.
@@ -1793,7 +1793,7 @@ fn nodeSource(c: *Context, file: Project.FileId, node: Ast.Node.Index, field: Fi
     if (depth == 8) return null;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const at = strip(tree, node);
+    const at = Facts.ungrouped(tree, node);
     switch (tree.nodeTag(at)) {
         .address_of => {
             const operand = tree.nodeData(at).node;
@@ -1850,7 +1850,7 @@ fn nodeSource(c: *Context, file: Project.FileId, node: Ast.Node.Index, field: Fi
             // wherever that goes.
             for (tree.nodes.items(.tag), 0..) |tag, i| {
                 if (tag == .address_of) {
-                    const operand = strip(tree, tree.nodeData(@fromBackingInt(@intCast(i))).node);
+                    const operand = Facts.ungrouped(tree, tree.nodeData(@fromBackingInt(@intCast(i))).node);
                     if (tree.nodeTag(operand) == .identifier) if (model.reference(operand)) |ref| if (ref.declaration == index) return null;
                     continue;
                 }
@@ -1943,7 +1943,7 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
         // A link's address writes it wherever that goes.
         if (tree.nodeTag(parent) == .address_of) return false;
         if (tree.nodeTag(parent) != .assign or tree.nodeData(parent).node_and_node[0] != use.node) continue;
-        const value = strip(tree, tree.nodeData(parent).node_and_node[1]);
+        const value = Facts.ungrouped(tree, tree.nodeData(parent).node_and_node[1]);
         if (tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null")) continue;
         const stored = (try nodeSource(c, use.file, value, field, list, null, 0)) orelse return false;
         // A C's own node anywhere; a node out of a list only into that same list's links.
@@ -1959,7 +1959,7 @@ fn insertsOnlyParents(c: *Context, field: Field, list: List, source: Source) Con
         const tree = &each.file.tree;
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!isBuiltin(tree, node, "@field")) continue;
+            if (!Facts.isBuiltin(tree, node, "@field")) continue;
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 2) continue;
@@ -1995,7 +1995,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                     const is_link = for ([_][]const u8{ "first", "last", "next", "prev" }) |link| {
                         if (std.mem.eql(u8, name, link)) break true;
                     } else false;
-                    const plain = strip(tree, value);
+                    const plain = Facts.ungrouped(tree, value);
                     if (is_link and !(tree.nodeTag(plain) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(plain)), "null"))) linked = true;
                 }
                 if (!linked) continue;
@@ -2022,7 +2022,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
                     const target, const assigned = tree.nodeData(parent).node_and_node;
                     if (target != node) return false;
                     var literal_buffer: [2]Ast.Node.Index = undefined;
-                    if (tree.fullStructInit(&literal_buffer, strip(tree, assigned)) == null) return false;
+                    if (tree.fullStructInit(&literal_buffer, Facts.ungrouped(tree, assigned)) == null) return false;
                 },
                 else => {
                     // Its declaration names it, as its type, not as a value.
@@ -2049,7 +2049,7 @@ fn listsInPlace(c: *Context, list: List) Context.Error!bool {
         for (model.declarations) |decl| {
             if (decl.kind != .variable) continue;
             const variable = tree.fullVarDecl(decl.node) orelse continue;
-            const init = strip(tree, variable.ast.init_node.unwrap() orelse continue);
+            const init = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse continue);
             var literal_buffer: [2]Ast.Node.Index = undefined;
             if (tree.fullStructInit(&literal_buffer, init) != null) continue;
             const container = switch (try c.facts.resolve(file, init)) {
@@ -2130,11 +2130,11 @@ fn resultType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
             },
             else => {},
         }
-        if (isBuiltin(tree, parent, "@alignCast")) {
+        if (Facts.isBuiltin(tree, parent, "@alignCast")) {
             at = parent;
             continue;
         }
-        if (isBuiltin(tree, parent, "@as")) {
+        if (Facts.isBuiltin(tree, parent, "@as")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, parent, &buffer);
             if (args.len != 2 or args[1] != at) return .{ .unknown = .unresolved };
@@ -2251,7 +2251,7 @@ fn functionDecl(model: *const Model, proto: Ast.Node.Index) ?Model.Declaration.I
 /// by name or `@field`, is its declaration, never a field of a value.
 fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     var at_file = file;
-    var at = strip(&c.project.at(file).file.tree, node);
+    var at = Facts.ungrouped(&c.project.at(file).file.tree, node);
     for (0..8) |_| {
         const tree = &c.project.at(at_file).file.tree;
         const decl = switch (tree.nodeTag(at)) {
@@ -2267,14 +2267,14 @@ fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
         const written = &c.project.at(decl.file).file.tree;
         const variable = written.fullVarDecl(record.node) orelse return false;
         if (written.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-        const init = strip(written, variable.ast.init_node.unwrap() orelse return false);
-        if (isBuiltin(written, init, "@import")) {
+        const init = Facts.ungrouped(written, variable.ast.init_node.unwrap() orelse return false);
+        if (Facts.isBuiltin(written, init, "@import")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(written, init, &buffer);
             return args.len == 1 and written.nodeTag(args[0]) == .string_literal;
         }
         for ([_][]const u8{ "@This", "@TypeOf", "@Type", "@Int", "@Float", "@Vector", "@Pointer", "@Fn", "@Tuple", "@Struct", "@Union", "@Enum", "@EnumLiteral" }) |name| {
-            if (isBuiltin(written, init, name)) return true;
+            if (Facts.isBuiltin(written, init, name)) return true;
         }
         var buffer: [1]Ast.Node.Index = undefined;
         if (written.fullCall(&buffer, init)) |call| return typeFunction(c, decl.file, call.ast.fn_expr);
@@ -2315,15 +2315,3 @@ fn labeled(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Nod
     return null;
 }
 
-fn strip(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    return at;
-}
-
-fn isBuiltin(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name),
-        else => false,
-    };
-}

@@ -65,7 +65,7 @@ pub fn init(c: *Context) Context.Error!Present {
 /// Whether the `.?` at `node` reads a value known not to be null.
 pub fn unwrapped(self: *Present, node: Ast.Node.Index) Context.Error!bool {
     const tree = &self.c.project.at(self.c.file).file.tree;
-    const operand = ungrouped(tree, tree.nodeData(node).node_and_token[0]);
+    const operand = Facts.ungrouped(tree, tree.nodeData(node).node_and_token[0]);
     if (place(tree, operand)) return self.holds(node, .{ .some = operand });
     const tagged = try self.reading(operand) orelse return false;
     if (try self.caseOf(tagged)) return true;
@@ -86,8 +86,8 @@ fn reading(self: *Present, operand: Ast.Node.Index) Context.Error!?Tagged {
     };
     const shape = try self.shapeOf(function) orelse return null;
     if (shape.tree >= args.len or shape.node >= args.len) return null;
-    const on = ungrouped(tree, args[shape.tree]);
-    const node = ungrouped(tree, args[shape.node]);
+    const on = Facts.ungrouped(tree, args[shape.tree]);
+    const node = Facts.ungrouped(tree, args[shape.node]);
     if (!place(tree, on) or !place(tree, node)) return null;
     return .{ .tree = on, .node = node, .tags = shape.tags, .read = shape.read };
 }
@@ -111,7 +111,7 @@ fn shapeOf(self: *Present, function: Facts.Decl) Context.Error!?Reading {
     if (statements.len != 1 or tree.nodeTag(statements[0]) != .@"return") return null;
     const returned = tree.nodeData(statements[0]).opt_node.unwrap() orelse return null;
     const whole = tree.fullSwitch(returned) orelse return null;
-    const read = try Facts.calls.at(self.c.facts, function.file, ungrouped(tree, whole.ast.condition)) orelse return null;
+    const read = try Facts.calls.at(self.c.facts, function.file, Facts.ungrouped(tree, whole.ast.condition)) orelse return null;
     const read_function = switch (read.callee) {
         .function => |each| each,
         .choice, .any => return null,
@@ -193,7 +193,7 @@ fn caseOf(self: *Present, tagged: Tagged) Context.Error!bool {
 fn switchRead(self: *Present, holder: Ast.Node.Index, tagged: Tagged) Context.Error!bool {
     const tree = &self.c.project.at(self.c.file).file.tree;
     const model = &self.c.project.at(self.c.file).model;
-    var value = ungrouped(tree, holder);
+    var value = Facts.ungrouped(tree, holder);
     if (tree.nodeTag(value) == .identifier) {
         const reference = model.reference(value) orelse return false;
         const declared = reference.declaration orelse return false;
@@ -201,11 +201,11 @@ fn switchRead(self: *Present, holder: Ast.Node.Index, tagged: Tagged) Context.Er
         if (record.kind != .variable) return false;
         const variable = tree.fullVarDecl(record.node) orelse return false;
         if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
-        value = ungrouped(tree, variable.ast.init_node.unwrap() orelse return false);
+        value = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return false);
     }
     value = switch (tree.nodeTag(value)) {
-        .unwrap_optional => ungrouped(tree, tree.nodeData(value).node_and_token[0]),
-        .@"orelse" => ungrouped(tree, tree.nodeData(value).node_and_node[0]),
+        .unwrap_optional => Facts.ungrouped(tree, tree.nodeData(value).node_and_token[0]),
+        .@"orelse" => Facts.ungrouped(tree, tree.nodeData(value).node_and_node[0]),
         else => return false,
     };
     const call = try Facts.calls.at(self.c.facts, self.c.file, value) orelse return false;
@@ -217,7 +217,7 @@ fn switchRead(self: *Present, holder: Ast.Node.Index, tagged: Tagged) Context.Er
         .known => |known| known,
         .unknown => return false,
     };
-    if (args.len == 0 or !samePlace(tree, model, ungrouped(tree, args[0]), tagged.tree)) return false;
+    if (args.len == 0 or !samePlace(tree, model, Facts.ungrouped(tree, args[0]), tagged.tree)) return false;
     // Not known to be std's: no case's tags are known here, and the use stays reported.
     return try Governed.isStd(self.c, function, "zig.Ast.fullSwitch") == .yes;
 }
@@ -293,14 +293,14 @@ fn captured(self: *Present, condition: Ast.Node.Index, payload: ?Ast.TokenIndex,
     const tree = &self.c.project.at(self.c.file).file.tree;
     const model = &self.c.project.at(self.c.file).model;
     if (payload == null or goal != .some) return null;
-    if (!samePlace(tree, model, ungrouped(tree, condition), goal.some)) return null;
+    if (!samePlace(tree, model, Facts.ungrouped(tree, condition), goal.some)) return null;
     return tree.lastToken(condition);
 }
 
 fn nonNull(self: *Present, condition: Ast.Node.Index, truth: bool, at: Ast.Node.Index) Context.Error!?Ast.TokenIndex {
     const tree = &self.c.project.at(self.c.file).file.tree;
     const model = &self.c.project.at(self.c.file).model;
-    const node = ungrouped(tree, condition);
+    const node = Facts.ungrouped(tree, condition);
     switch (tree.nodeTag(node)) {
         .bool_not => return self.nonNull(tree.nodeData(node).node, !truth, at),
         .bool_and, .bool_or => {
@@ -318,7 +318,7 @@ fn nonNull(self: *Present, condition: Ast.Node.Index, truth: bool, at: Ast.Node.
         .equal_equal, .bang_equal => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             const other = if (isNull(tree, lhs)) rhs else if (isNull(tree, rhs)) lhs else return null;
-            if (!samePlace(tree, model, ungrouped(tree, other), at)) return null;
+            if (!samePlace(tree, model, Facts.ungrouped(tree, other), at)) return null;
             // `x != null` true, or `x == null` false.
             return if ((tree.nodeTag(node) == .bang_equal) == truth) tree.lastToken(node) else null;
         },
@@ -332,7 +332,7 @@ const Found = struct { tags: Tags, from: Ast.TokenIndex };
 /// that rests on; null for any tag.
 fn tagsUnder(self: *Present, condition: Ast.Node.Index, truth: bool, tagged: Tagged) Context.Error!?Found {
     const tree = &self.c.project.at(self.c.file).file.tree;
-    const node = ungrouped(tree, condition);
+    const node = Facts.ungrouped(tree, condition);
     switch (tree.nodeTag(node)) {
         .bool_not => return self.tagsUnder(tree.nodeData(node).node, !truth, tagged),
         .bool_and, .bool_or => {
@@ -368,7 +368,7 @@ fn tagsUnder(self: *Present, condition: Ast.Node.Index, truth: bool, tagged: Tag
 fn subject(self: *Present, expression: Ast.Node.Index, tagged: Tagged) Context.Error!?Ast.TokenIndex {
     const tree = &self.c.project.at(self.c.file).file.tree;
     const model = &self.c.project.at(self.c.file).model;
-    var value = ungrouped(tree, expression);
+    var value = Facts.ungrouped(tree, expression);
     var from = tree.lastToken(value);
     if (tree.nodeTag(value) == .identifier) {
         const reference = model.reference(value) orelse return null;
@@ -377,7 +377,7 @@ fn subject(self: *Present, expression: Ast.Node.Index, tagged: Tagged) Context.E
         if (record.kind != .variable) return null;
         const variable = tree.fullVarDecl(record.node) orelse return null;
         if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-        value = ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
+        value = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
         from = tree.lastToken(value);
     }
     const call = try Facts.calls.at(self.c.facts, self.c.file, value) orelse return null;
@@ -391,7 +391,7 @@ fn subject(self: *Present, expression: Ast.Node.Index, tagged: Tagged) Context.E
         .unknown => return null,
     };
     if (args.len != 2) return null;
-    if (!samePlace(tree, model, ungrouped(tree, args[0]), tagged.tree) or !samePlace(tree, model, ungrouped(tree, args[1]), tagged.node)) return null;
+    if (!samePlace(tree, model, Facts.ungrouped(tree, args[0]), tagged.tree) or !samePlace(tree, model, Facts.ungrouped(tree, args[1]), tagged.node)) return null;
     return from;
 }
 
@@ -441,7 +441,7 @@ fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenI
                 return false;
             },
             .assign => {
-                const target = ungrouped(tree, assigned(tree, effect.node) orelse return false);
+                const target = Facts.ungrouped(tree, assigned(tree, effect.node) orelse return false);
                 const root = rootOf(tree, target);
                 const declared = if (tree.nodeTag(root) == .identifier) if (model.reference(root)) |reference| reference.declaration else null else null;
                 if (local) |own| {
@@ -546,11 +546,11 @@ fn assigned(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 
 /// The name a place starts from (`x` of `x.f.g`); the expression itself for any other.
 fn rootOf(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = ungrouped(tree, node);
+    var at = Facts.ungrouped(tree, node);
     while (true) switch (tree.nodeTag(at)) {
-        .field_access => at = ungrouped(tree, tree.nodeData(at).node_and_token[0]),
-        .deref => at = ungrouped(tree, tree.nodeData(at).node),
-        .array_access => at = ungrouped(tree, tree.nodeData(at).node_and_node[0]),
+        .field_access => at = Facts.ungrouped(tree, tree.nodeData(at).node_and_token[0]),
+        .deref => at = Facts.ungrouped(tree, tree.nodeData(at).node),
+        .array_access => at = Facts.ungrouped(tree, tree.nodeData(at).node_and_node[0]),
         else => return at,
     };
 }
@@ -616,7 +616,7 @@ fn landsWithin(tree: *const Ast, node: Ast.Node.Index) bool {
 fn place(tree: *const Ast, node: Ast.Node.Index) bool {
     return switch (tree.nodeTag(node)) {
         .identifier => true,
-        .field_access => place(tree, ungrouped(tree, tree.nodeData(node).node_and_token[0])),
+        .field_access => place(tree, Facts.ungrouped(tree, tree.nodeData(node).node_and_token[0])),
         else => false,
     };
 }
@@ -636,7 +636,7 @@ fn samePlace(tree: *const Ast, model: *const Model, a: Ast.Node.Index, b: Ast.No
             const left = tree.nodeData(a).node_and_token;
             const right = tree.nodeData(b).node_and_token;
             if (!std.mem.eql(u8, tree.tokenSlice(left[1]), tree.tokenSlice(right[1]))) return false;
-            return samePlace(tree, model, ungrouped(tree, left[0]), ungrouped(tree, right[0]));
+            return samePlace(tree, model, Facts.ungrouped(tree, left[0]), Facts.ungrouped(tree, right[0]));
         },
         else => return false,
     }
@@ -665,12 +665,7 @@ fn tagOf(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Tag {
 }
 
 fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
-    const value = ungrouped(tree, node);
+    const value = Facts.ungrouped(tree, node);
     return tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null");
 }
 
-fn ungrouped(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
-    var at = node;
-    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
-    return at;
-}
