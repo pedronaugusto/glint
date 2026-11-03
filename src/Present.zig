@@ -475,15 +475,40 @@ fn kept(self: *Present, place_node: Ast.Node.Index, spans: []const [2]Ast.TokenI
     return true;
 }
 
-/// Whether `value` is never null: of a type that is no optional (a number, a struct), by what
-/// it resolves to. `null`, an optional and what does not resolve may be.
+/// Whether `value` is never null: none of the values it can give (`accesses.valuesOf`: both
+/// sides of `orelse` and `catch`, a branch's) is `null` or a name whose one value is, and it is
+/// of a type that is no optional (a number, a struct), by what it resolves to. An optional and
+/// what does not resolve may be.
 fn present(self: *Present, value: Ast.Node.Index) Context.Error!bool {
-    const tree = &self.c.project.at(self.c.file).file.tree;
-    if (Facts.isNull(tree, value)) return false;
+    if (try self.mayGiveNull(value, 0)) return false;
     return switch (try self.c.facts.resolve(self.c.file, value)) {
         .optional, .unknown, .alternatives => false,
         else => true,
     };
+}
+
+/// Whether one of the values `value` can give is `null`, or a name whose one value may be
+/// (`const nothing = null`); where those values are not shown, it may.
+fn mayGiveNull(self: *Present, value: Ast.Node.Index, depth: usize) Context.Error!bool {
+    if (depth == 16) return true;
+    const tree = &self.c.project.at(self.c.file).file.tree;
+    const leaves = switch (try Facts.accesses.valuesOf(self.c.facts, self.c.file, value)) {
+        .leaves => |each| each,
+        .unknown => return true,
+    };
+    for (leaves) |leaf| {
+        if (Facts.isNull(tree, leaf)) return true;
+        switch (try self.c.facts.definition(self.c.file, leaf)) {
+            .decl => {
+                // A name: the one value it is given, where that is shown.
+                const held = try self.heldValue(leaf) orelse continue;
+                if (try self.mayGiveNull(held, depth + 1)) return true;
+            },
+            .none => {},
+            .unknown => return true,
+        }
+    }
+    return false;
 }
 
 /// Whether `place_node` cannot be written at all: a parameter, a capture or a constant, and
