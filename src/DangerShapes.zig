@@ -2349,33 +2349,31 @@ fn publicContainer(tree: *const Ast, model: *const Model, node: Ast.Node.Index) 
     return variable.visib_token != null;
 }
 
-/// A017: an enum state written by two or more functions, switched on, and moved on its own value:
-/// a state machine kept by hand, where nothing says which transitions are allowed. A field is
-/// read by meaning: a read `x.state` or `@field(x, "state")`, through any holder of the type; a
-/// write by `=`, by its place in a destructure, by `@atomicStore`, through any pointer to it (by
-/// its type), or by a struct literal of its type assigned over a value
-/// (`x.* = .{ .state = .done }`); a whole copy of a holder is none (`stateWrites`). A move is a
-/// write under a switch or a condition on the field
-/// (`switch (f.state) { .start => f.state = .value, ... }`) or after a guard on it in its block
-/// (`if (f.state != .idle) return;`), or one whose value reads it
-/// (`f.state = if (f.state == .a) .b else f.state`, its integer plus one), there or where the
-/// function that writes it is called; each function that calls a writer writes it too, where
-/// the writer gives no state fixed where it is made (`fixedState`). A read
-/// is carried by a local it initializes, an `if` capture of it and a getter's calls (`carried`).
-/// A switch on it reads past `orelse`, `.?` and parentheses; an integer field is a state where
-/// a switch reads it as its enum (`@enumFromInt`). A kind set where its value is
-/// built or read (a table's layout, a date's kind) is data. A field moved on the records a loop
-/// walks is moved on each of them: a record's states kept by hand all the same.
+/// A017: a state written by two or more functions, switched on, and moved on its own value: a
+/// state machine kept by hand, where nothing says which transitions are allowed. A state is what
+/// the program switches on to choose what it does, whatever holds it (`stateHold`): an enum; a
+/// tagged union's active tag (a store of another is a transition); std's `atomic.Value` of
+/// either (`load` reads it; `store`, `swap`, `cmpxchg*` move it); an integer switched on with
+/// literal prongs or as its enum. A field is read by meaning: a read `x.state` or
+/// `@field(x, "state")`, through any holder of the type, and what carries it on (`carried`: a
+/// local, a destructure, `&`, a capture, a conversion, a comparison, a value a switch on it
+/// chooses, a parameter it is given as, a getter's or a predicate's calls); a write as
+/// `stateWrites` finds it. A move is a write under a switch or a condition on the state, or
+/// after a guard on it in its block (`if (f.state != .idle) return;`, a switch with a prong
+/// that leaves), or one whose value reads it (`f.state = if (f.state == .a) .b else f.state`,
+/// its integer plus one), there or where the function that writes it is called; each function
+/// that calls a writer writes it too, where the writer gives no one state fixed where it is
+/// made (`fixedFunctions`). A call that does not resolve, given the holder under such a
+/// condition, may call a writer: undecided. A kind set where its value is built or read (a
+/// table's layout, a date's kind) is data. A field moved on the records a loop walks is moved
+/// on each of them: a record's states kept by hand all the same.
 pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     for (model.declarations, 0..) |decl, index| {
         if (decl.kind != .field or c.inTest(decl.token)) continue;
         const written = (tree.fullContainerField(decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-        const resolved = try c.facts.resolve(c.file, written);
-        // An integer is a state where a switch reads it as its enum (`@enumFromInt(x.state)`).
-        const integral = integer(resolved) != null;
-        if (!integral and !isEnum(c, byValue(resolved) orelse continue)) continue;
+        const hold = (try stateHold(c, try c.facts.resolve(c.file, written))) orelse continue;
         const holder: Facts.Container = .{ .file = c.file, .scope = decl.scope };
         var uses: std.ArrayList(Facts.Key) = .empty;
         var writes: std.ArrayList(StateWrite) = .empty;
@@ -2386,16 +2384,29 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
         }
         try carried(c, &uses);
         var switched = false;
-        for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, integral);
+        for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, hold);
         if (!switched) continue;
-        try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, &writes);
+        try stateWrites(c, .{ .file = c.file, .index = @fromBackingInt(@intCast(index)) }, hold, &writes);
+        const fixed = try fixedFunctions(c, writes.items);
         var writers: std.ArrayList(Facts.Key) = .empty;
-        for (writes.items) |write| try writersOf(c, write, &writers, 0);
-        if (writers.items.len < 2) continue;
-        switch (try moved(c, uses.items, writes.items)) {
+        var unseen = false;
+        for (writes.items) |*write| {
+            if (write.unseen) {
+                unseen = true;
+                continue;
+            }
+            write.counted = try writersOf(c, write.file, write.node, write.target, fixed, &writers, 0);
+            const at = c.project.at(write.file);
+            const function = enclosingFunction(&at.model, &at.file.tree, write.node) orelse continue;
+            write.kept = if (write.target) |target| try writtenThrough(c, write.file, function, target) == .local else false;
+        }
+        // With one writer, a call that does not resolve may be one more: its caller.
+        if (writers.items.len == 0 or (writers.items.len == 1 and !unseen)) continue;
+        const verdict = try moved(c, uses.items, writes.items, holder);
+        switch (if (writers.items.len == 1 and verdict == .yes) .maybe else verdict) {
             .no => continue,
             .maybe => {
-                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written through its address, or by a destructure of a value not read, may be moved on its own value");
+                try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, "a state written through its address, by a destructure of a value not read or by a function a call that does not resolve may make, may be moved on its own value");
                 continue;
             },
             .yes => {},
@@ -2404,10 +2415,14 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Adds to `uses` the reads that carry a read of the state on: each reference to a local it
-/// initializes (`const now = j.state;`), to what an `if` or a `while` captures of it
-/// (`if (j.state) |now|`), and each call of a function that returns it (a getter), read past
-/// `orelse`'s left side, `.?`, parentheses and `@as`, and from those in turn.
+/// Adds to `uses` the reads that carry a read of the state on, by what the value is: what is
+/// made of it (read past `orelse`'s left side, `.?`, `.*`, `&`, parentheses, a conversion, a
+/// comparison and the logic over one, `atomic.Value`'s `load`, a `switch` or an `if` whose
+/// value its condition chooses), and where that goes: each reference to a local it
+/// initializes or is stored in (`const now = j.state;`, `const next = switch (j.state) ...`),
+/// one a destructure takes it into, what an `if` or a `while` captures of it, each parameter of
+/// a function of the program it is given as, and each call of a function that returns it (a
+/// getter, a predicate), and from those in turn.
 fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
     var next: usize = 0;
     while (next < uses.items.len and uses.items.len < 256) : (next += 1) {
@@ -2415,19 +2430,19 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
         const tree = &c.project.at(use.file).file.tree;
         const model = &c.project.at(use.file).model;
         var at = use.node;
-        const parent = while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-            .unwrap_optional, .grouped_expression => {},
-            .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) break null,
-            .builtin_call_two, .builtin_call_two_comma => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) break null,
-            else => break parent,
+        const parent = while (model.parentOf(at)) |parent| : (at = parent) {
+            if (madeOf(tree, parent, at)) continue;
+            break parent;
         } else null;
         const node = parent orelse continue;
         var local: ?Model.Declaration.Id = null;
         if (tree.fullVarDecl(node)) |variable| {
             if (variable.ast.init_node.unwrap() != at) continue;
-            for (model.declarations, 0..) |record, i| if (record.kind == .variable and record.node == node) {
-                local = @fromBackingInt(@intCast(i));
-            };
+            local = declaredBy(model, node);
+        } else if (tree.nodeTag(node) == .assign) {
+            const target, const value = tree.nodeData(node).node_and_node;
+            if (value != at or tree.nodeTag(target) != .identifier) continue;
+            local = (model.reference(target) orelse continue).declaration;
         } else if (captureOf(tree, node, at)) |token| {
             for (model.declarations, 0..) |record, i| if (record.kind == .capture and record.token == token) {
                 local = @fromBackingInt(@intCast(i));
@@ -2436,9 +2451,91 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
             const function = enclosingFunction(model, tree, node) orelse continue;
             for (try callsOf(c, use.file, function)) |call| try carry(c, uses, call);
             continue;
+        } else if (destructured(tree, model, node, at)) |variable| {
+            local = declaredBy(model, variable) orelse localOf(tree, model, variable);
+        } else {
+            try parameterOf(c, uses, use.file, node, at);
+            continue;
         }
         const d = local orelse continue;
         for (model.references) |reference| if (reference.declaration == d) try carry(c, uses, .{ .file = use.file, .node = reference.node });
+    }
+}
+
+/// Whether `parent` gives a value made of `at`, its operand, that carries a read of the state
+/// on (`carried`).
+fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index) bool {
+    switch (tree.nodeTag(parent)) {
+        .unwrap_optional, .grouped_expression, .deref, .address_of, .bool_not => return true,
+        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => return true,
+        .@"orelse" => return tree.nodeData(parent).node_and_node[0] == at,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(parent));
+            for ([_][]const u8{ "@as", "@enumFromInt", "@fromBackingInt", "@intFromEnum", "@backingInt", "@intCast", "@truncate", "@atomicLoad" }) |each| if (std.mem.eql(u8, name, each)) return true;
+            return false;
+        },
+        // `x.state.load(order)`: the state an atomic.Value holds, read.
+        .field_access => return std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "load"),
+        else => {},
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, parent)) |call| return tree.nodeTag(call.ast.fn_expr) == .field_access and call.ast.fn_expr == at and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load");
+    if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at;
+    if (tree.fullIf(parent)) |branch| return branch.ast.cond_expr == at and branch.payload_token == null;
+    return false;
+}
+
+/// The local a variable declaration declares.
+fn declaredBy(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
+    for (model.declarations, 0..) |record, i| if (record.kind == .variable and record.node == node) return @fromBackingInt(@intCast(i));
+    return null;
+}
+
+/// The variable a destructure takes `at`, an element of the tuple it destructures, into
+/// (`const now, const n = .{ j.state, j.n }`).
+fn destructured(tree: *const Ast, model: *const Model, node: Ast.Node.Index, at: Ast.Node.Index) ?Ast.Node.Index {
+    var elements: [2]Ast.Node.Index = undefined;
+    const tuple = tree.fullArrayInit(&elements, node) orelse return null;
+    const position = std.mem.findScalar(Ast.Node.Index, tuple.ast.elements, at) orelse return null;
+    const statement = model.parentOf(node) orelse return null;
+    if (tree.nodeTag(statement) != .assign_destructure) return null;
+    const full = tree.assignDestructure(statement);
+    if (full.ast.value_expr != node or position >= full.ast.variables.len) return null;
+    return full.ast.variables[position];
+}
+
+/// Adds the references to the parameter of each function of the program a call gives `at` to,
+/// a bound receiver first.
+fn parameterOf(c: *Context, uses: *std.ArrayList(Facts.Key), file: Project.FileId, node: Ast.Node.Index, at: Ast.Node.Index) Context.Error!void {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return;
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => return,
+    };
+    const position = std.mem.findScalar(Ast.Node.Index, args, at) orelse return;
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return,
+    };
+    const program = try Program.get(c);
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse continue;
+        if (!program.own(decl.file)) continue;
+        const callee_tree = &c.project.at(decl.file).file.tree;
+        const callee_model = &c.project.at(decl.file).model;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = callee_tree.fullFnProto(&buffer, callee_model.declarations[@backingInt(decl.index)].node) orelse continue;
+        var it = proto.iterate(callee_tree);
+        var i: usize = 0;
+        while (it.next()) |param| : (i += 1) {
+            if (i != position) continue;
+            const name = param.name_token orelse break;
+            for (callee_model.declarations, 0..) |record, d| if (record.kind == .parameter and record.token == name) {
+                for (callee_model.references) |reference| if (reference.declaration == @as(Model.Declaration.Id, @fromBackingInt(@intCast(d)))) try carry(c, uses, .{ .file = decl.file, .node = reference.node });
+            };
+            break;
+        }
     }
 }
 
@@ -2463,21 +2560,36 @@ fn carry(c: *Context, uses: *std.ArrayList(Facts.Key), use: Facts.Key) Context.E
 /// A write of a state field: the node it is made at, the value it writes where one is read, and
 /// whether a value not read may be one chosen on the state's own (through its address, a
 /// destructure of no literal), which memory code the program does not hold writes is not: it stores bytes.
-const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, value: ?Ast.Node.Index, unread: bool = true };
+/// A write to memory the function holds by its own name (`here`, `madeHere`) is its own: its
+/// callers write nothing through it.
+/// A call whose callee does not resolve (a function pointer's, a comptime function's) given
+/// what reaches the holder (`unseen`) writes nothing of its own: what the program's functions it
+/// may call write is found where they write it, std's chooses no state, and code the program
+/// does not hold is called by name (`extern`). It may call a writer, and so may move the state
+/// where it is called under a condition on it, or make one more function that writes it.
+/// One that makes the value it writes, not a state of a record held before (`writersOf`), is
+/// not `counted`; one of a local its function keeps is `kept`, moved there or nowhere.
+const StateWrite = struct { file: Project.FileId, node: Ast.Node.Index, target: ?Ast.Node.Index = null, value: ?Ast.Node.Index, unread: bool = true, unseen: bool = false, counted: bool = true, kept: bool = false };
 
 /// Each write of the state field `field` in the program's files, as Facts.accesses finds them by
 /// meaning: a store (`=`, a destructure's place, a memory builtin's, `@atomicStore`), and a
 /// literal of its holder stored over a value (`j.* = .{}` resets it). A store that reads it
-/// first (`op=`, `@atomicRmw`) reads it in its value. A copy of a whole holder (`a = b`, an
-/// `append` of one, `std.mem.sort` over them) carries a state chosen where its value was made,
-/// and a value made with it (a literal, a default) is data: neither is a write. A holder's
+/// first (`op=`, `@atomicRmw`) reads it in its value. A copy of a whole holder from another
+/// place (`a = b`, `j.* = p.*`, std's `append` of one or `std.mem.sort` over them) carries a
+/// state chosen where its value was made: no write; a value made here (a literal, a call's
+/// result, a constant, a choice of them: `madeValue`) is one. A holder's
 /// address taken (a method's receiver) is none either: what is written through it is, at its
-/// own site, by its type; the state's own address (`&x.state`) is a write of no value read. Memory
-/// code the program does not hold writes over it (bytes, `extern`) is a write that chooses no
-/// state on its own value. A store of `undefined` gives it no state. A holder whose type does
+/// own site, by its type; the state's own address (`&x.state`) is a write of no value read, and
+/// a tagged union's payload taken by address none. Memory code the program does not hold writes
+/// over it (bytes, `extern`) is a write that chooses no state on its own value; a call into the
+/// program's own functions (a comptime function's, as Facts.calls binds it) is none of its own,
+/// their writes found where they are made; one that does not resolve is `unseen`. A store of `undefined` gives it no state. A holder whose type does
 /// not resolve is read as no holder of it, as its uses are.
-fn stateWrites(c: *Context, field: Facts.Decl, writes: *std.ArrayList(StateWrite)) Context.Error!void {
+fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.ArrayList(StateWrite)) Context.Error!void {
     const program = try Program.get(c);
+    const field_tree = &c.project.at(field.file).file.tree;
+    const declared = (field_tree.fullContainerField(c.project.at(field.file).model.declarations[@backingInt(field.index)].node) orelse return).ast.type_expr.unwrap() orelse return;
+    const state = try c.facts.resolve(field.file, declared);
     var files: std.ArrayList(Project.FileId) = .empty;
     for (c.project.sources) |*each| {
         if (each.input.classification == .@"test" or !program.own(each.id)) continue;
@@ -2489,19 +2601,96 @@ fn stateWrites(c: *Context, field: Facts.Decl, writes: *std.ArrayList(StateWrite
         const value: ?Ast.Node.Index = switch (site.kind) {
             .init, .read => continue,
             // A pointer to a whole holder writes it by its type, at a site of its own; one to
-            // the state alone (`&x.state`) may write it as anything.
-            .address => if (site.reach == .holder) continue else null,
+            // the state alone (`&x.state`) may write it as anything, but for what an
+            // atomic.Value's own operations do with it (`atomicWrite`).
+            // A tagged union's payload taken by address (`.a => |*p|`) is written through it,
+            // never its tag: no write of the state.
+            .address => if (site.reach == .holder or (hold == .tagged and payloadCapture(tree, site.node))) continue else if (hold == .atomic) switch (atomicWrite(tree, &c.project.at(site.file).model, site.target orelse site.node)) {
+                .read => continue,
+                .write => |value| value,
+                .unknown => null,
+            } else null,
             .set => if (site.value) |value| written: {
                 // `undefined` gives it no state: reading it after is illegal.
                 if (undefinedValue(tree, value)) continue;
-                if (site.reach == .holder and !recordLiteral(tree, value)) continue;
+                if (site.reach == .holder and !try madeValue(c, site.file, value, state, 0)) continue;
                 break :written value;
             } else null,
             .update => site.node,
-            .covered => if (site.reach == .holder) continue else null,
+            // std's copies of whole holders (`append`, `std.mem.sort`) carry states made where
+            // their values were, and code given a pointer to const writes none; other code over
+            // the holder (`extern`) writes bytes.
+            .covered => if (site.reach == .holder and try coveredRead(c, site.file, site.node, site.target)) continue else null,
         };
-        try writes.append(c.allocator, .{ .file = site.file, .node = site.node, .value = value, .unread = site.kind != .covered });
+        var unseen = false;
+        if (site.kind == .covered) if (try Facts.calls.at(c.facts, site.file, site.node)) |call| switch (try heldBodies(c, &call)) {
+            .all => continue,
+            .unknown => unseen = true,
+            .some => {},
+        };
+        try writes.append(c.allocator, .{ .file = site.file, .node = site.node, .target = site.target, .value = value, .unread = site.kind != .covered, .unseen = unseen });
     }
+}
+
+/// Whether a call's callees are all functions of the program with a body, whose writes are
+/// found where they are made (`all`); one that does not resolve (`unknown`); or some code the
+/// program does not hold (`extern`).
+fn heldBodies(c: *Context, call: *const Facts.calls.Call) Context.Error!enum { all, some, unknown } {
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return .unknown,
+    };
+    const program = try Program.get(c);
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return .unknown;
+        if (!program.own(decl.file)) return .some;
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .function) return .some;
+        const parent = c.project.at(decl.file).model.parentOf(record.node) orelse return .some;
+        if (c.project.at(decl.file).file.tree.nodeTag(parent) != .fn_decl) return .some;
+    }
+    return .all;
+}
+
+/// Whether `node`, where an access is made, is a switch prong that captures its payload.
+fn payloadCapture(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => tree.fullSwitchCase(node).?.payload_token != null, // unreachable: the tag is a prong's.
+        else => false,
+    };
+}
+
+/// Whether a call's caller chooses the state of the value it returns: one of its callees takes
+/// a parameter of the state's type, or one that may be (`anytype`), or a callee does not
+/// resolve (`at(.running)`). Another chooses it where it makes it, by its own reading.
+fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: Facts.Value) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return true;
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return true,
+    };
+    const kind = switch (state) {
+        .container, .instance => |k| k,
+        else => return true,
+    };
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return true;
+        const callee_tree = &c.project.at(decl.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = callee_tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return true;
+        var it = proto.iterate(callee_tree);
+        while (it.next()) |param| {
+            const written = param.type_expr orelse return true;
+            switch (try c.facts.resolve(decl.file, written)) {
+                .container, .instance => |k| if (k.file == kind.file and k.scope == kind.scope) return true,
+                .unknown => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 /// Whether `node` is `undefined`.
@@ -2509,23 +2698,147 @@ fn undefinedValue(tree: *const Ast, node: Ast.Node.Index) bool {
     return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
 }
 
-/// Whether `node` is a struct literal, typed or not (`.{ .state = .done }`, `.{}`, `Job{}`).
-fn recordLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
-    var buffer: [2]Ast.Node.Index = undefined;
-    return tree.fullStructInit(&buffer, node) != null;
+/// Whether a whole holder's value `node` is one made here, which sets a state, rather than a
+/// copy of another place's, which carries the state chosen there (`a = b`, `j.* = p.*`): a
+/// literal, a constant, a call's result where the caller chooses its state (`choosesState`),
+/// or a choice (`if`, `switch`) of one; through `@as`, parentheses, a local's initializer and
+/// a labeled block's break. A constructor's value (`f.* = try File.init(bytes)`) carries the
+/// state chosen where it is made.
+fn madeValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: Facts.Value, depth: u8) Context.Error!bool {
+    if (depth == 8) return true;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var structs: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&structs, node) != null) return true;
+    var calls: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&calls, node) != null) return choosesState(c, file, node, state);
+    if (tree.fullIf(node)) |branch| {
+        if (try madeValue(c, file, branch.ast.then_expr, state, depth + 1)) return true;
+        return if (branch.ast.else_expr.unwrap()) |other| madeValue(c, file, other, state, depth + 1) else false;
+    }
+    if (tree.fullSwitch(node)) |choice| {
+        for (choice.ast.cases) |case_node| if (try madeValue(c, file, tree.fullSwitchCase(case_node).?.ast.target_expr, state, depth + 1)) return true; // unreachable: a switch's cases are cases.
+        return false;
+    }
+    switch (tree.nodeTag(node)) {
+        .grouped_expression => return madeValue(c, file, tree.nodeData(node).node_and_token[0], state, depth + 1),
+        .@"try" => return madeValue(c, file, tree.nodeData(node).node, state, depth + 1),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return true;
+            const value = tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return true;
+            return madeValue(c, file, value, state, depth + 1);
+        },
+        .identifier => {
+            const d = (model.reference(node) orelse return true).declaration orelse return true;
+            const record = model.declarations[@backingInt(d)];
+            if (record.kind != .variable) return false;
+            const variable = tree.fullVarDecl(record.node) orelse return true;
+            // A constant's value is made where it is declared; a var's may be copied in later.
+            if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+            return madeValue(c, file, variable.ast.init_node.unwrap() orelse return true, state, depth + 1);
+        },
+        .field_access => {
+            // A declaration of a type or a namespace (`Job.empty`) is a constant; a field is a place.
+            const held = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
+            return held == .container;
+        },
+        .deref, .array_access, .unwrap_optional => return false,
+        else => return true,
+    }
+}
+
+/// Whether the call `node`, which covers a whole holder given as `target`, writes no state of
+/// it: std's (`append`, `std.mem.sort`), or each callee's parameter there a pointer to const.
+fn coveredRead(c: *Context, file: Project.FileId, node: Ast.Node.Index, target: ?Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+    if (try constParameter(c, &call, target)) return true;
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return false,
+    };
+    const program = try Program.get(c);
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return false;
+        if (!program.std_files.contains(@backingInt(decl.file))) return false;
+    }
+    return true;
+}
+
+/// Whether each function a call may call takes the argument `target` (`&x`, `x`) as a pointer
+/// to const.
+fn constParameter(c: *Context, call: *const Facts.calls.Call, target: ?Ast.Node.Index) Context.Error!bool {
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => return false,
+    };
+    const tree = &c.project.at(call.file).file.tree;
+    const model = &c.project.at(call.file).model;
+    var at = target orelse return false;
+    var position = std.mem.findScalar(Ast.Node.Index, args, at);
+    while (position == null) {
+        at = model.parentOf(at) orelse return false;
+        if (tree.nodeTag(at) != .address_of and tree.nodeTag(at) != .grouped_expression) return false;
+        position = std.mem.findScalar(Ast.Node.Index, args, at);
+    }
+    const choices: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return false,
+    };
+    for (choices) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return false;
+        const callee_tree = &c.project.at(decl.file).file.tree;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = callee_tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return false;
+        var it = proto.iterate(callee_tree);
+        var i: usize = 0;
+        const constant = while (it.next()) |param| : (i += 1) {
+            if (i != position.?) continue;
+            const pointer = callee_tree.fullPtrType(param.type_expr orelse break false) orelse break false;
+            break pointer.const_token != null;
+        } else false;
+        if (!constant) return false;
+    }
+    return true;
+}
+
+/// What a call of an atomic.Value's operation on the state (`x.state.store(v, o)`), `at` the
+/// state, does with it: `load` reads it; `store` and `swap` write their value; `cmpxchg*` and
+/// the read-modify-writes write a value chosen on its own (the call); another, or an access
+/// that is no call, may write anything.
+fn atomicWrite(tree: *const Ast, model: *const Model, at: Ast.Node.Index) union(enum) { read, write: Ast.Node.Index, unknown } {
+    const node = model.parentOf(at) orelse return .unknown;
+    if (tree.nodeTag(node) != .field_access or tree.nodeData(node).node_and_token[0] != at) return .unknown;
+    const name = tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
+    if (std.mem.eql(u8, name, "load")) return .read;
+    const call_node = model.parentOf(node) orelse return .unknown;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return .unknown;
+    if (call.ast.fn_expr != node) return .unknown;
+    if (std.mem.eql(u8, name, "store") or std.mem.eql(u8, name, "swap")) return if (call.ast.params.len > 0) .{ .write = call.ast.params[0] } else .unknown;
+    return .{ .write = call_node };
 }
 
 /// Whether the field read at `node` is a switch's operand, read past `orelse`'s left side, `.?`,
-/// parentheses and `@as`; an integer's (`integral`) only where it is made its enum on the way
-/// (`@enumFromInt`, `@fromBackingInt`).
-fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, integral: bool) bool {
+/// `.*`, `&`, parentheses, `@as`, `@atomicLoad` and an atomic.Value's `load`; an integer's
+/// (`integral`) only where it is made its enum on the way (`@enumFromInt`, `@fromBackingInt`)
+/// or the switch's prongs are literals, as a state's are.
+fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, hold: StateHold) bool {
     var at = node;
-    var converted = !integral;
+    var converted = hold != .integral;
     while (model.parentOf(at)) |parent| : (at = parent) {
-        if (tree.fullSwitch(parent)) |choice| return converted and choice.ast.condition == at;
+        if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at and (converted or literalProngs(tree, choice));
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, parent)) |call| {
+            if (call.ast.fn_expr != at or tree.nodeTag(at) != .field_access) return false;
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load")) return false;
+            continue;
+        }
         switch (tree.nodeTag(parent)) {
-            .unwrap_optional, .grouped_expression, .address_of => {},
+            .unwrap_optional, .grouped_expression, .address_of, .deref => {},
             .@"orelse" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
+            .field_access => if (hold != .atomic or !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "load")) return false,
             .builtin_call_two, .builtin_call_two_comma => {
                 const name = tree.tokenSlice(tree.nodeMainToken(parent));
                 if (std.mem.eql(u8, name, "@enumFromInt") or std.mem.eql(u8, name, "@fromBackingInt")) {
@@ -2534,8 +2847,8 @@ fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, integ
             },
             // `@atomicLoad(T, &x.state, order)`: the state, loaded.
             .builtin_call, .builtin_call_comma => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const args = Facts.builtinArgs(tree, parent, &buffer);
+                var args_buffer: [2]Ast.Node.Index = undefined;
+                const args = Facts.builtinArgs(tree, parent, &args_buffer);
                 if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@atomicLoad") or args.len != 3 or args[1] != at) return false;
             },
             else => return false,
@@ -2544,41 +2857,202 @@ fn switchedOn(tree: *const Ast, model: *const Model, node: Ast.Node.Index, integ
     return false;
 }
 
-/// Adds to `writers` the function a write is made in, and, through calls of the program, each
-/// function that calls one that writes (a setter's callers write it too), unless the write
-/// gives a state fixed where it is made (`.done`, `Phase.done`): its callers choose none.
-fn writersOf(c: *Context, write: StateWrite, writers: *std.ArrayList(Facts.Key), depth: u8) Context.Error!void {
-    const tree = &c.project.at(write.file).file.tree;
-    const model = &c.project.at(write.file).model;
-    const function = enclosingFunction(model, tree, write.node) orelse return;
-    for (writers.items) |seen| {
-        if (seen.file == write.file and seen.node == function) return;
+/// Whether a switch's prongs are literals (`0 =>`, `'a' =>`, `1...3 =>`), as a state coded as
+/// an integer's are.
+fn literalProngs(tree: *const Ast, choice: Ast.full.Switch) bool {
+    var any = false;
+    for (choice.ast.cases) |case_node| {
+        const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases.
+        for (case.ast.values) |value| {
+            const literal = switch (tree.nodeTag(value)) {
+                .number_literal, .char_literal => true,
+                .switch_range => tree.nodeTag(tree.nodeData(value).node_and_node[0]) == .number_literal or tree.nodeTag(tree.nodeData(value).node_and_node[0]) == .char_literal,
+                else => false,
+            };
+            if (!literal) return false;
+            any = true;
+        }
     }
-    try writers.append(c.allocator, .{ .file = write.file, .node = function });
-    if (depth == 4) return;
-    if (write.value) |value| if (try fixedState(c, write.file, value)) return;
-    for (try callsOf(c, write.file, function)) |call| try writersOf(c, .{ .file = call.file, .node = call.node, .value = null }, writers, depth + 1);
+    return any;
 }
 
-/// Whether `node` gives one state whoever calls the function it is in: an enum literal
-/// (`.done`), a member of an enum type (`Phase.done`), or the integer of one
-/// (`@backingInt(Phase.done)`).
-fn fixedState(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+/// Adds to `writers` the function a write at `node` is made in, by what holds the place it
+/// writes there (`target`, `writtenThrough`), and whether it counts: a write of a record the function
+/// makes and returns (a constructor's, through the helpers it hands it to) is the state chosen
+/// where the value is made, no write of a state held before, and counts for no function. One of
+/// a local it keeps is its own. One through a parameter is made, through each call of the
+/// program, in what the caller gives there, and counts where some caller's does or where none
+/// in the program calls it. Another (a global's, one through what is not followed) is made by
+/// each function that calls one that writes, too (a setter's callers write it), unless every
+/// write it makes gives one state fixed where it is made (`fixedFunctions`): its callers choose
+/// none.
+fn writersOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, target: ?Ast.Node.Index, fixed: []const Facts.Key, writers: *std.ArrayList(Facts.Key), depth: u8) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const function = enclosingFunction(model, tree, node) orelse return true;
+    for (writers.items) |seen| if (seen.file == file and seen.node == function) return true;
+    const held: Through = if (depth == 4) .other else try writtenThrough(c, file, function, target orelse return add(c, writers, file, function));
+    const stays = for (fixed) |one| {
+        if (one.file == file and one.node == function) break true;
+    } else false;
+    switch (held) {
+        .made => return false,
+        .local => {},
+        .parameter => |position| {
+            // A function giving one state fixed where it is made adds no caller as a writer,
+            // but its write is still made in what each caller gives it.
+            var scratch: std.ArrayList(Facts.Key) = .empty;
+            const calls = try callsOf(c, file, function);
+            var counts = calls.len == 0;
+            for (calls) |call| {
+                const given = try argumentAt(c, call, position);
+                if (try writersOf(c, call.file, call.node, given, fixed, if (stays) &scratch else writers, depth + 1)) counts = true;
+            }
+            if (!counts) return false;
+        },
+        .other => if (!stays) for (try callsOf(c, file, function)) |call| {
+            _ = try writersOf(c, call.file, call.node, null, fixed, writers, depth + 1);
+        },
+    }
+    return add(c, writers, file, function);
+}
+
+fn add(c: *Context, writers: *std.ArrayList(Facts.Key), file: Project.FileId, function: Ast.Node.Index) Context.Error!bool {
+    for (writers.items) |seen| if (seen.file == file and seen.node == function) return true;
+    try writers.append(c.allocator, .{ .file = file, .node = function });
+    return true;
+}
+
+/// What holds a place in a function (`writtenThrough`): a local it makes and returns, a local it keeps,
+/// a parameter by its position (a bound receiver first), or another.
+const Through = union(enum) { made, local, parameter: usize, other };
+
+/// What holds the place `node` names in `function`: read to its root through members,
+/// elements, slices, `.?`, `.*`, `&` and parentheses, a capture to what it captures, and a
+/// constant pointer to what it is made from (`const m = &c.model;`). A `var` holding a pointer,
+/// a global, and a root that does not resolve are another.
+fn writtenThrough(c: *Context, file: Project.FileId, function: Ast.Node.Index, node: Ast.Node.Index) Context.Error!Through {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = node;
+    var steps: u8 = 0;
+    while (steps < 32) : (steps += 1) {
+        switch (tree.nodeTag(at)) {
+            .field_access, .unwrap_optional, .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .deref, .address_of => at = tree.nodeData(at).node,
+            .array_access, .slice_open => at = tree.nodeData(at).node_and_node[0],
+            .slice, .slice_sentinel => at = tree.fullSlice(at).?.ast.sliced, // unreachable: the tag is a slice's.
+            .identifier => {
+                const d = (model.reference(at) orelse return .other).declaration orelse return .other;
+                const record = model.declarations[@backingInt(d)];
+                if (enclosingFunction(model, tree, record.node) != function and record.node != function) return .other;
+                switch (record.kind) {
+                    .parameter => return if (parameterPosition(tree, model, function, d)) |position| .{ .parameter = position } else .other,
+                    .capture => at = capturedBy(tree, model, record) orelse return .other,
+                    .variable => {
+                        const variable = tree.fullVarDecl(record.node) orelse return .other;
+                        const by_value = switch (try c.facts.resolve(file, at)) {
+                            .instance, .array, .optional, .literal, .reified => true,
+                            // Its type as written where its value does not resolve.
+                            .unknown => if (variable.ast.type_node.unwrap()) |written| tree.fullPtrType(written) == null and tree.nodeTag(written) != .optional_type else false,
+                            else => false,
+                        };
+                        if (by_value) return if (returnsLocal(tree, model, function, d)) .made else .local;
+                        // A pointer: what a constant one is made from.
+                        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return .other;
+                        at = variable.ast.init_node.unwrap() orelse return .other;
+                    },
+                    else => return .other,
+                }
+            },
+            else => {
+                // A call's result held by pointer (`c.project.at(file)`): what its receiver holds.
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, at) orelse return .other;
+                if (tree.nodeTag(call.ast.fn_expr) != .field_access) return .other;
+                at = tree.nodeData(call.ast.fn_expr).node_and_token[0];
+            },
+        }
+    }
+    return .other;
+}
+
+/// What a capture captures: a `for` loop's input at its position, an `if`'s or a `while`'s
+/// condition (not its error), a switch's.
+fn capturedBy(tree: *const Ast, model: *const Model, record: Model.Declaration) ?Ast.Node.Index {
+    if (tree.fullFor(record.node)) |loop| return loop.ast.inputs[Model.capturePosition(tree, loop, record.token) orelse return null];
+    if (tree.fullIf(record.node)) |branch| return if (branch.error_token == record.token) null else branch.ast.cond_expr;
+    if (tree.fullWhile(record.node)) |loop| return if (loop.error_token == record.token) null else loop.ast.cond_expr;
+    if (tree.fullSwitchCase(record.node) != null) return (tree.fullSwitch(model.parentOf(record.node) orelse return null) orelse return null).ast.condition;
+    return null;
+}
+
+/// Whether `function` returns the local `d` itself (`return model;`).
+fn returnsLocal(tree: *const Ast, model: *const Model, function: Ast.Node.Index, d: Model.Declaration.Id) bool {
+    for (model.references) |reference| {
+        if (reference.declaration != d) continue;
+        const parent = model.parentOf(reference.node) orelse continue;
+        if (tree.nodeTag(parent) == .@"return" and enclosingFunction(model, tree, parent) == function) return true;
+    }
+    return false;
+}
+
+/// The argument a call gives at `position`, a bound receiver first; null where it is not known.
+fn argumentAt(c: *Context, call: Facts.Key, position: usize) Context.Error!?Ast.Node.Index {
+    const facts_call = (try Facts.calls.at(c.facts, call.file, call.node)) orelse return null;
+    const args = switch (facts_call.args) {
+        .known => |args| args,
+        .unknown => return null,
+    };
+    return if (position < args.len) args[position] else null;
+}
+
+/// The functions each of whose writes of the state gives one and the same state fixed where it
+/// is made (`fixedState`): a function whose writes give two (`if (done) .done else .running`)
+/// leaves its callers to choose.
+fn fixedFunctions(c: *Context, writes: []const StateWrite) Context.Error![]const Facts.Key {
+    var out: std.ArrayList(Facts.Key) = .empty;
+    for (writes) |write| {
+        const tree = &c.project.at(write.file).file.tree;
+        const model = &c.project.at(write.file).model;
+        const function = enclosingFunction(model, tree, write.node) orelse continue;
+        const known = for (out.items) |one| {
+            if (one.file == write.file and one.node == function) break true;
+        } else false;
+        if (known) continue;
+        var state: ?[]const u8 = null;
+        const every = for (writes) |other| {
+            if (other.file != write.file or enclosingFunction(model, tree, other.node) != function) continue;
+            const value = other.value orelse break false;
+            const name = (try fixedState(c, other.file, value)) orelse break false;
+            if (state) |earlier| if (!std.mem.eql(u8, earlier, name)) break false;
+            state = name;
+        } else true;
+        if (every) try out.append(c.allocator, .{ .file = write.file, .node = function });
+    }
+    return out.items;
+}
+
+/// The state `node` gives whoever calls the function it is in, by its name: an enum literal
+/// (`.done`), a member of an enum type (`Phase.done`), the integer of one
+/// (`@backingInt(Phase.done)`), a number or a character; null for another value.
+fn fixedState(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?[]const u8 {
     const tree = &c.project.at(file).file.tree;
     switch (tree.nodeTag(node)) {
-        .enum_literal => return true,
+        .enum_literal, .number_literal, .char_literal => return tree.tokenSlice(tree.nodeMainToken(node)),
         .grouped_expression => return fixedState(c, file, tree.nodeData(node).node_and_token[0]),
         .field_access => {
             const held = try c.facts.resolve(file, tree.nodeData(node).node_and_token[0]);
-            return held == .container and isEnum(c, held.container);
+            if (held != .container or !isEnum(c, held.container)) return null;
+            return tree.tokenSlice(tree.nodeData(node).node_and_token[1]);
         },
         .builtin_call_two, .builtin_call_two_comma => {
             const name = tree.tokenSlice(tree.nodeMainToken(node));
-            if (!std.mem.eql(u8, name, "@backingInt") and !std.mem.eql(u8, name, "@intFromEnum")) return false;
-            const operand = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return false;
+            if (!std.mem.eql(u8, name, "@backingInt") and !std.mem.eql(u8, name, "@intFromEnum")) return null;
+            const operand = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return null;
             return fixedState(c, file, operand);
         },
-        else => return false,
+        else => return null,
     }
 }
 
@@ -2610,11 +3084,15 @@ fn callsOf(c: *Context, file: Project.FileId, function: Ast.Node.Index) Context.
 }
 
 /// Whether one of `writes` is a move: under a switch or a condition on the field (one of `uses`),
-/// one whose value reads the field, or in a function a call under one makes. A write whose value
-/// is not read (through its address, a destructure of no literal) may be one.
-fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite) Context.Error!enum { no, maybe, yes } {
-    var maybe = false;
+/// one whose value reads the field, or in a function a call under one makes (not one of a local
+/// its function keeps: no caller's condition reads that record). A write that makes its value
+/// (not `counted`) is none. A write whose value is not read (through its address, a destructure
+/// of no literal) may be one, and so may one a call that does not resolve (`act(j)`, a function
+/// pointer) may make, given the holder, under such a condition.
+fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite, holder: Facts.Container) Context.Error!enum { no, maybe, yes } {
+    var maybe = try unresolvedUnder(c, uses, holder);
     for (writes) |write| {
+        if (!write.counted) continue;
         const tree = &c.project.at(write.file).file.tree;
         const model = &c.project.at(write.file).model;
         if (write.value) |value| for (uses) |use| {
@@ -2623,8 +3101,13 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite) Conte
             if (token >= tree.firstToken(value) and token <= tree.lastToken(value)) return .yes;
         };
         const function = enclosingFunction(model, tree, write.node) orelse continue;
+        if (write.unseen) {
+            maybe = maybe or conditioned(tree, model, uses, write.file, write.node, function);
+            continue;
+        }
         if (conditioned(tree, model, uses, write.file, write.node, function)) return .yes;
-        for (try callsOf(c, write.file, function)) |call| {
+        const callers: []const Facts.Key = if (write.kept) &.{} else try callsOf(c, write.file, function);
+        for (callers) |call| {
             const call_tree = &c.project.at(call.file).file.tree;
             const call_model = &c.project.at(call.file).model;
             const caller = enclosingFunction(call_model, call_tree, call.node) orelse continue;
@@ -2635,20 +3118,47 @@ fn moved(c: *Context, uses: []const Facts.Key, writes: []const StateWrite) Conte
     return if (maybe) .maybe else .no;
 }
 
+/// Whether a call of the program that does not resolve, given a value of the holder's type,
+/// is made under a condition on the state: it may call a writer (`moved`).
+fn unresolvedUnder(c: *Context, uses: []const Facts.Key, holder: Facts.Container) Context.Error!bool {
+    const program = try Program.get(c);
+    for (c.project.sources) |*each| {
+        if (each.input.classification == .@"test" or !program.own(each.id)) continue;
+        const tree = &each.file.tree;
+        const model = &c.project.at(each.id).model;
+        for (try Facts.calls.in(c.facts, each.id)) |*call| {
+            if (call.callee != .any) continue;
+            const args = switch (call.args) {
+                .known => |args| args,
+                .unknown => continue,
+            };
+            const given = for (args) |arg| {
+                const owner = byPointer(try c.facts.resolve(each.id, arg)) orelse continue;
+                if (owner.file == holder.file and owner.scope == holder.scope) break true;
+            } else false;
+            if (!given) continue;
+            const function = enclosingFunction(model, tree, call.node) orelse continue;
+            if (conditioned(tree, model, uses, each.id, call.node, function)) return true;
+        }
+    }
+    return false;
+}
+
 /// Whether `node` sits in a branch a switch or an `if`/`while` on one of `uses` selects, within
-/// `function`.
+/// `function`, or after a guard on one in its block or one around it.
 fn conditioned(tree: *const Ast, model: *const Model, uses: []const Facts.Key, file: Project.FileId, node: Ast.Node.Index, function: Ast.Node.Index) bool {
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (parent == function) return false;
-        // A guard before it in its block (`if (j.state != .idle) return;`) chooses it as a
-        // condition around it does.
+        // A guard before it in its block (`if (j.state != .idle) return;`,
+        // `switch (j.state) { .idle => {}, else => return }`) chooses it as a condition around
+        // it does: an `if` or a `switch` on the state that can leave.
         var buffer: [2]Ast.Node.Index = undefined;
         if (tree.blockStatements(&buffer, parent)) |statements| for (statements) |statement| {
             if (statement == at) break;
-            const guard = tree.fullIf(statement) orelse continue;
-            if (guard.ast.else_expr != .none or !leaves(tree, guard.ast.then_expr)) continue;
-            if (reads(tree, uses, file, guard.ast.cond_expr)) return true;
+            const condition = if (tree.fullIf(statement)) |guard| guard.ast.cond_expr else if (tree.fullSwitch(statement)) |guard| guard.ast.condition else continue;
+            if (!reads(tree, uses, file, condition) or !mayLeave(tree, statement)) continue;
+            return true;
         };
         const condition = if (tree.fullSwitch(parent)) |s|
             s.ast.condition
@@ -2676,15 +3186,70 @@ fn reads(tree: *const Ast, uses: []const Facts.Key, file: Project.FileId, node: 
     return false;
 }
 
-/// Whether `node` never goes on to the statement after it: a `return`, `break`, `continue` or
-/// `unreachable`, or a block ending in one.
-fn leaves(tree: *const Ast, node: Ast.Node.Index) bool {
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.blockStatements(&buffer, node)) |statements| return statements.len != 0 and leaves(tree, statements[statements.len - 1]);
-    return switch (tree.nodeTag(node)) {
-        .@"return", .@"break", .@"continue", .unreachable_literal => true,
-        else => false,
+/// Whether some way through `node` does not go on to the statement after it: it holds a
+/// `return`, a `break`, a `continue` or an `unreachable`.
+fn mayLeave(tree: *const Ast, node: Ast.Node.Index) bool {
+    for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| switch (tree.tokenTag(@intCast(token))) {
+        .keyword_return, .keyword_break, .keyword_continue, .keyword_unreachable => return true,
+        else => {},
     };
+    return false;
+}
+
+/// What holds a state (`stateMachines`): an enum naming a tag, a tagged union (its active tag),
+/// an integer, or std's `atomic.Value` of one.
+const StateHold = enum { enumerated, tagged, integral, atomic };
+
+fn stateHold(c: *Context, value: Facts.Value) Context.Error!?StateHold {
+    if (integer(value) != null) return .integral;
+    const container = byValue(value) orelse return null;
+    // An enum that names no tag (`enum(u32) { _ }`) is an id: switched on, it picks what it
+    // names, not a state.
+    if (isEnum(c, container)) return if (namesTags(c, container)) .enumerated else null;
+    if (taggedUnion(c, container)) return .tagged;
+    if (try atomicValue(c, container)) return .atomic;
+    return null;
+}
+
+/// Whether a container declares a field other than `_`: an enum's named tag.
+fn namesTags(c: *Context, value: Facts.Container) bool {
+    const tree = &c.project.at(value.file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, c.project.at(value.file).model.scopes[@backingInt(value.scope)].node) orelse return true;
+    for (container.ast.members) |member| {
+        const field = tree.fullContainerField(member) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), "_")) return true;
+    }
+    return false;
+}
+
+/// Whether a container is a union with a tag (`union(enum)`, `union(Tag)`).
+fn taggedUnion(c: *Context, value: Facts.Container) bool {
+    const tree = &c.project.at(value.file).file.tree;
+    const node = c.project.at(value.file).model.scopes[@backingInt(value.scope)].node;
+    if (node == .root) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, node) orelse return false;
+    if (tree.tokenTag(container.ast.main_token) != .keyword_union) return false;
+    return container.ast.enum_token != null or container.ast.arg != .none;
+}
+
+/// Whether a container is one std's `atomic.Value` makes.
+fn atomicValue(c: *Context, held: Facts.Container) Context.Error!bool {
+    const decls = switch (try Governed.declarations(c, "std", "atomic.Value")) {
+        .decls => |decls| decls,
+        .none, .unknown => return false,
+    };
+    const tree = &c.project.at(held.file).file.tree;
+    const model = &c.project.at(held.file).model;
+    const first = model.scopes[@backingInt(held.scope)].first;
+    for (decls) |each| {
+        const decl = (try originKnown(c, each)) orelse continue;
+        if (decl.file != held.file) continue;
+        const function = model.parentOf(model.declarations[@backingInt(decl.index)].node) orelse continue;
+        if (first >= tree.firstToken(function) and first <= tree.lastToken(function)) return true;
+    }
+    return false;
 }
 
 fn isEnum(c: *Context, value: Facts.Container) bool {
