@@ -2039,7 +2039,9 @@ fn publishedCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Contex
     const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
     const holder: Facts.Container = .{ .file = function.file, .scope = record.scope };
     if (try c.role(Contract.library, .{ .container = holder }) == null) return null;
-    return .{ .name = record.name, .known = true };
+    // By the name it is reached by, which may choose the function (`pub const deinit = if (with_io)
+    // deinitIo else deinitPlain`).
+    return .{ .name = (try memberNamed(c, file, call.callee_expr)) orelse record.name, .known = true };
 }
 
 /// Whether a published operation's name gives an owner: a constructor or an acquisition.
@@ -4722,58 +4724,51 @@ fn beforeAdoption(c: *Context, file: Project.FileId, index: Model.Declaration.Id
 
 fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: u8) Context.Error!Before {
     const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
     // `view` is what holds the allocation's memory: the local, a slice of it, its `.ptr`.
     var view = use;
-    while (model.parentOf(view)) |parent| {
-        switch (tree.nodeTag(parent)) {
-            .grouped_expression, .@"try" => view = parent,
-            .slice, .slice_open, .slice_sentinel => {
-                if (tree.fullSlice(parent).?.ast.sliced != view) return .whole; // unreachable: the tag is a slice's
-                view = parent;
+    const held = while (true) {
+        const held = try Facts.accesses.useOf(c.facts, file, view);
+        switch (held) {
+            .carried => |carry| switch (carry.how) {
+                .grouped, .tried => view = carry.into,
+                else => break held,
             },
-            .field_access => {
-                const name = tree.tokenSlice(tree.nodeData(parent).node_and_token[1]);
-                const written = if (model.parentOf(parent)) |above| assigning(tree.nodeTag(above)) and tree.nodeData(above).node_and_node[0] == parent else false;
-                if (written) return .{ .spoiled = .{ .at = parent, .what = "changed" } };
+            .sliced => |slice| view = slice,
+            .member => |read| {
+                switch (try Facts.accesses.useOf(c.facts, file, read)) {
+                    .written, .updated => return .{ .spoiled = .{ .at = read, .what = "changed" } },
+                    else => {},
+                }
+                // A slice's own fields, the language's: its length, and the pointer to its memory.
+                const name = (try Facts.accesses.pathOf(c.facts, file, read)).steps[0].name orelse return .{ .unknown = read };
                 if (std.mem.eql(u8, name, "len")) return .whole;
-                if (!std.mem.eql(u8, name, "ptr")) return .{ .unknown = parent };
-                view = parent;
+                if (!std.mem.eql(u8, name, "ptr")) return .{ .unknown = read };
+                view = read;
             },
-            // An element, read or written.
-            .array_access => return .whole,
-            else => break,
+            // An element, read or written; a slice's bound.
+            .element, .index => return .whole,
+            else => break held,
         }
-    }
-    const parent = model.parentOf(view) orelse return .{ .unknown = view };
-    const tag = tree.nodeTag(parent);
-    if (assigning(tag)) {
-        const sides = tree.nodeData(parent).node_and_node;
-        return if (sides[0] == view) .{ .spoiled = .{ .at = parent, .what = "changed" } } else .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
-    }
-    switch (tag) {
+    };
+    const parent, const position = switch (held) {
+        .written, .updated => |site| return .{ .spoiled = .{ .at = site.node, .what = "changed" } },
+        .stored => |site| return .{ .spoiled = .{ .at = site.node, .what = "kept elsewhere" } },
+        .operand => |operator| return if (Facts.accesses.formOf(tree.nodeTag(operator)) == .compound_assign) .{ .spoiled = .{ .at = operator, .what = "kept elsewhere" } } else .{ .unknown = operator },
         // A comparison, or a pass that leaves without it.
-        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .@"return" => return .whole,
-        else => {},
-    }
-    if (tree.fullVarDecl(parent) != null) return .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
-    var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullStructInit(&buffer, parent) != null or tree.fullArrayInit(&buffer, parent) != null) return .{ .spoiled = .{ .at = parent, .what = "kept elsewhere" } };
-    switch (tag) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-            const name = tree.tokenSlice(tree.nodeMainToken(parent));
-            const kept = [_][]const u8{ "@memset", "@memcpy", "@memmove", "@sizeOf", "@TypeOf" };
-            for (kept) |each| if (std.mem.eql(u8, name, each)) return .whole;
+        .compared, .returned => return .whole,
+        .initializes => |variable| return .{ .spoiled = .{ .at = variable, .what = "kept elsewhere" } },
+        .field_of => |at| return .{ .spoiled = .{ .at = at.literal, .what = "kept elsewhere" } },
+        .element_of => |at| return .{ .spoiled = .{ .at = at.literal, .what = "kept elsewhere" } },
+        .builtin_argument => |at| {
+            for ([_][]const u8{ "@memset", "@memcpy", "@memmove", "@sizeOf", "@TypeOf" }) |each| if (Facts.isBuiltin(tree, at.call, each)) return .whole;
             // Its address as a number: what is done with the number, as with the memory
             // (`where = @intFromPtr(buf.ptr)` keeps it; a comparison does not).
-            if (std.mem.eql(u8, name, "@intFromPtr")) return allocationUse(c, file, parent, depth);
-            return .{ .unknown = parent };
+            if (Facts.isBuiltin(tree, at.call, "@intFromPtr")) return allocationUse(c, file, at.call, depth);
+            return .{ .unknown = at.call };
         },
-        else => {},
-    }
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, parent) orelse return .{ .unknown = parent };
-    if (call.ast.fn_expr == view) return .{ .unknown = parent };
+        .argument => |at| .{ at.call, at.position },
+        else => return .{ .unknown = view },
+    };
     const function = switch (try calledFunction(c, file, parent)) {
         .function => |called| called,
         .unknown => return .{ .unknown = parent },
@@ -4785,19 +4780,21 @@ fn allocationUse(c: *Context, file: Project.FileId, use: Ast.Node.Index, depth: 
         .no => {},
         .unknown => return .{ .unknown = parent },
     };
-    if (file == c.file and tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-        if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(data[1])), "adopt") and try requiredOwner(c, data[0], capacity, data[1]) == .bytes) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
+    const call = (try Facts.calls.at(c.facts, file, parent)).?; // unreachable: `view` is its argument
+    if (file == c.file) {
+        const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
+        if (path.steps.len >= 2 and path.steps[0].kind == .field and std.mem.eql(u8, (try memberNamed(c, file, call.callee_expr)) orelse "", adopts(.bytes).?) and
+            try requiredOwner(c, path.steps[1].node, capacity, tree.lastToken(call.callee_expr)) == .bytes) return .{ .spoiled = .{ .at = parent, .what = "adopted by another owner" } };
     }
     // A function it is handed to: what it does with its parameter there. One that frees or
     // keeps it spoils it; one that leaves it whole and gives back no pointer hands nothing on.
     if (depth == 4) return .{ .unknown = parent };
-    const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-        .instance => 1,
-        .pointer => |p| @intFromBool(p.* == .instance),
-        else => 0,
-    } else 0;
-    const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, view) orelse return .{ .unknown = parent };
+    // A method call's receiver is its first parameter.
+    const receiver: usize = switch (call.receiver) {
+        .bound => 1,
+        .none => 0,
+        .unknown => return .{ .unknown = parent },
+    };
     const parameter = parameterOf(c, function, position + receiver) orelse return .{ .unknown = parent };
     const body = &c.project.at(function.file).file.tree;
     const scope = c.project.at(function.file).model.parentOf(c.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return .{ .unknown = parent };
