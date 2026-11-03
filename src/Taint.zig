@@ -407,6 +407,8 @@ pub const Flow = struct {
     zig_index: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     /// What decides how many passes each loop takes, read once per round (`passes`).
     loops: std.AutoHashMapUnmanaged(Facts.Key, Dep) = .empty,
+    /// How each `while` steps its counters (`stepsOf`), read once.
+    steps: std.AutoHashMapUnmanaged(Facts.Key, Steps) = .empty,
     /// What decides that each statement jumps past what follows it (`leaves`), read once per
     /// round, by the statement and the declaration a store's target is (none: one outliving
     /// the function).
@@ -415,6 +417,10 @@ pub const Flow = struct {
     /// What the functions outside the program its calls reach size work by (`sizesFlow`): a
     /// flow of its own over them, read for no fact.
     sized: ?*Flow = null,
+    /// Of a summary, the functions that read with no limit (`unlimitedRead`), and how many of
+    /// its functions were read for it.
+    unlimited: std.AutoHashMapUnmanaged(Function.Id, void) = .empty,
+    unlimited_read: usize = 0,
     /// The sinks' sites per fact's lane and file (`sinkSites`).
     sink_sites: std.AutoHashMapUnmanaged(struct { u8, Project.FileId }, []const SinkSite) = .empty,
     /// std's allocations: `Allocator.rawAlloc`, `rawResize` and `rawRemap`, each argument but
@@ -1961,17 +1967,19 @@ fn literalDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     const model = &c.project.at(f.file).model;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&buffer, node)) |literal| {
-        // A literal of a known type holds its fields' facts by their declarations; a tuple or
-        // a literal whose type does not resolve holds what it is given. A parser's result
-        // holds its numbers itself: clean through the parse, input through a direct call.
-        if (try literalFields(c, f.file, node, literal)) |fields| {
+        // A literal of the program's own type holds its fields' facts by their declarations,
+        // which its stores raise; a tuple, a literal of a type outside the program (whose
+        // fields no store raises: `.{ .stack_size = n }`) or one whose type does not resolve
+        // holds what it is given. A parser's result holds its numbers itself: clean through
+        // the parse, input through a direct call.
+        if (try literalFields(c, f.file, node, literal)) |fields| if (flow.own(fields[0].file)) {
             if (!f.parser or !returned(tree, model, node)) return .{};
             var out: Dep = .{};
             for (literal.ast.fields, fields) |value, field| if (try shownField(c, f.file, value, field)) {
                 out = try out.join(c.allocator, try dep(c, flow, function, value));
             };
             return out;
-        }
+        };
         var out: Dep = .{};
         for (literal.ast.fields) |field| out = try out.join(c.allocator, try dep(c, flow, function, field));
         return out;
@@ -2865,10 +2873,7 @@ const Walk = struct {
             .field => .{ .field = decl },
             else => .{ .declaration = decl },
         };
-        var files: std.ArrayList(Project.FileId) = .empty;
-        var each = w.flow.owners.keyIterator();
-        while (each.next()) |file| try files.append(w.c.allocator, file.*);
-        for (try Facts.accesses.writes(w.c.facts, place, files.items)) |site| {
+        for (try Facts.accesses.writes(w.c.facts, place, try ownerFiles(w.c, w.flow))) |site| {
             const function = owner(w.flow, site.file, site.node) orelse continue;
             switch (site.kind) {
                 .init, .set, .update => {
@@ -3352,59 +3357,145 @@ fn forBound(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Inde
     return out;
 }
 
-/// How a `while`'s counters step: the locals its condition `condition` reads that the loop
-/// assigns. `sum` where one steps by a sum (`i += 1`, `i = i + 2`): the loop counts against
-/// what it is compared with; `factor` where every one steps by a product, a quotient or a
-/// shift (`a /= 10`): it passes as often as the type has digits; `other` otherwise, or with
-/// none: nothing counts its passes.
-fn stepsOf(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index, condition: Ast.Node.Index) Context.Error!enum { sum, factor, other } {
+const Steps = enum { sum, factor, other };
+
+/// How a `while`'s counters step, read once per loop: the places its condition `condition`
+/// reads and what each write of them does (`Facts.accesses`). `sum` where the loop steps one by
+/// a sum, each in one direction (`i += 1`, `i = i + 2`), and writes no other place the
+/// condition reads: it counts against what they are compared with; `factor` where it steps
+/// every one it writes by a product, a quotient or a shift (`a /= 10`): it passes as often as
+/// the type has digits; `other` otherwise: a counter reset or stepped both ways, a bound the
+/// loop changes (`list.items.len` with `list.append` in the loop), memory the condition reads
+/// that does not resolve, or no counter: nothing counts its passes.
+fn stepsOf(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index, condition: Ast.Node.Index) Context.Error!Steps {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const f = flow.functions.items[@backingInt(function)];
+    const key: Facts.Key = .{ .file = f.file, .node = loop };
+    if (flow.steps.get(key)) |known_steps| return known_steps;
+    const steps = try stepsRead(c, flow, function, loop, condition);
+    try flow.steps.put(c.allocator, key, steps);
+    return steps;
+}
+
+fn stepsRead(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index, condition: Ast.Node.Index) Context.Error!Steps {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const reads = try Facts.accesses.readsOf(c.facts, f.file);
+    const in_condition: Span = .of(tree, condition);
+    if (in_condition.any(tree, reads.unresolved.items)) return .other;
+    var named = reads.named.valueIterator();
+    while (named.next()) |sites| if (in_condition.any(tree, sites.items)) return .other;
+    var shapes = reads.shapes.valueIterator();
+    while (shapes.next()) |sites| if (in_condition.any(tree, sites.items)) return .other;
+    var up = false;
+    var down = false;
+    var factor = false;
+    var read = reads.places.iterator();
+    while (read.next()) |entry| {
+        if (!in_condition.any(tree, entry.value_ptr.items)) continue;
+        switch (try placeSteps(c, flow, function, loop, entry.key_ptr.*)) {
+            .none => {},
+            .up => up = true,
+            .down => down = true,
+            .factor => factor = true,
+            .other => return .other,
+        }
+    }
+    if (up != down) return if (factor) .other else .sum;
+    if (factor and !up) return .factor;
+    return .other;
+}
+
+/// The tokens of a node, for the sites within it.
+const Span = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+
+    fn of(tree: *const Ast, node: Ast.Node.Index) Span {
+        return .{ .first = tree.firstToken(node), .last = tree.lastToken(node) };
+    }
+    fn has(span: Span, tree: *const Ast, node: Ast.Node.Index) bool {
+        const at = tree.nodeMainToken(node);
+        return at >= span.first and at <= span.last;
+    }
+    fn any(span: Span, tree: *const Ast, sites: []const Facts.accesses.Site) bool {
+        for (sites) |site| if (span.has(tree, site.node)) return true;
+        return false;
+    }
+};
+
+/// What a loop does to a place its condition reads (`placeSteps`).
+const Step = enum { none, up, down, factor, other };
+
+/// What the loop `loop` does to a place its condition reads, by each write `Facts.accesses`
+/// finds: none, steps it up or down by a sum, by a factor, or otherwise (a reset, a store of
+/// another value, a pointer that may write it, a write in a function the loop may call).
+fn placeSteps(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index, place: Facts.accesses.Place) Context.Error!Step {
     const f = flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
-    var counters: std.ArrayList(Model.Declaration.Id) = .empty;
-    const cond_first = tree.firstToken(condition);
-    const cond_last = tree.lastToken(condition);
-    for (f.nodes) |node| {
-        if (tree.nodeTag(node) != .identifier) continue;
-        const at = tree.nodeMainToken(node);
-        if (at < cond_first or at > cond_last) continue;
-        const d = localOf(model, node) orelse continue;
-        if (std.mem.findScalar(Model.Declaration.Id, counters.items, d) == null) try counters.append(c.allocator, d);
-    }
-    var sum = false;
-    var factor = false;
-    var other = false;
-    const first = tree.firstToken(loop);
-    const last = tree.lastToken(loop);
-    for (f.nodes) |node| {
-        const at = tree.nodeMainToken(node);
-        if (at < first or at > last) continue;
-        const tag = tree.nodeTag(node);
-        for (counters.items) |d| {
-            const step: enum { none, sum, factor, other } = switch (tag) {
-                .assign_add, .assign_sub, .assign_add_wrap, .assign_sub_wrap, .assign_add_sat, .assign_sub_sat => .sum,
-                .assign_mul, .assign_div, .assign_shl, .assign_shr, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => .factor,
-                .assign => assigned: {
-                    const value = tree.nodeData(node).node_and_node[1];
-                    if (stepOf(tree, model, d, tag, value) != value) break :assigned .sum;
-                    break :assigned if (scaled(tree, model, d, value)) .factor else .other;
-                },
-                .assign_mod, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_destructure => .other,
-                else => .none,
-            };
-            if (step == .none) continue;
-            const names = if (tag == .assign_destructure) destructures(tree, model, node, d) else namesDeclaration(tree, model, tree.nodeData(node).node_and_node[0], d);
-            if (!names) continue;
-            switch (step) {
-                .sum => sum = true,
-                .factor => factor = true,
-                else => other = true,
-            }
+    const in_loop: Span = .of(tree, loop);
+    const local: ?Model.Declaration.Id = switch (place) {
+        .declaration => |d| if (d.file == f.file and !Facts.accesses.global(c.facts, d)) d.index else null,
+        .field => null,
+    };
+    var steps: Step = .none;
+    var elsewhere = false;
+    for (try Facts.accesses.writes(c.facts, place, if (local != null) &.{f.file} else try ownerFiles(c, flow))) |site| {
+        if (site.kind == .init or site.kind == .read) continue;
+        const inside = site.file == f.file and in_loop.has(tree, site.node);
+        if (!inside) {
+            // A local's address may step it wherever the pointer goes; another function's
+            // write of other memory changes it where the loop calls that function.
+            if (local != null and (site.kind == .address or site.kind == .covered)) return .other;
+            if (local == null and owner(flow, site.file, site.node) != function) elsewhere = true;
+            continue;
         }
+        if (site.reach != .exact) return .other;
+        const step: Step = switch (site.kind) {
+            .update => switch (tree.nodeTag(site.node)) {
+                .assign_add, .assign_add_wrap, .assign_add_sat => .up,
+                .assign_sub, .assign_sub_wrap, .assign_sub_sat => .down,
+                .assign_mul, .assign_div, .assign_shl, .assign_shr, .assign_mul_wrap, .assign_mul_sat, .assign_shl_sat => .factor,
+                else => .other,
+            },
+            .set => set: {
+                const d = local orelse break :set .other;
+                const value = site.value orelse break :set .other;
+                if (stepOf(tree, model, d, .assign, value) != value) break :set switch (tree.nodeTag(value)) {
+                    .add, .add_wrap, .add_sat => .up,
+                    else => .down,
+                };
+                break :set if (scaled(tree, model, d, value)) .factor else .other;
+            },
+            else => .other,
+        };
+        if (step == .other) return .other;
+        // Stepped up and down, or by a sum and a factor: no one direction counts.
+        if (steps != .none and steps != step) return .other;
+        steps = step;
     }
-    if (sum) return .sum;
-    if (factor and !other) return .factor;
-    return .other;
+    if (elsewhere and try callsWithin(c, flow, function, loop)) return .other;
+    return steps;
+}
+
+/// Whether a loop makes a call.
+fn callsWithin(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index) Context.Error!bool {
+    const f = flow.functions.items[@backingInt(function)];
+    const tree = &c.project.at(f.file).file.tree;
+    const in_loop: Span = .of(tree, loop);
+    for (f.nodes) |node| if (in_loop.has(tree, node) and try Facts.calls.at(c.facts, f.file, node) != null) return true;
+    return false;
+}
+
+/// The files whose functions the flow reads.
+fn ownerFiles(c: *Context, flow: *Flow) Context.Error![]const Project.FileId {
+    var files: std.ArrayList(Project.FileId) = .empty;
+    var each = flow.owners.keyIterator();
+    while (each.next()) |file| try files.append(c.allocator, file.*);
+    return files.items;
 }
 
 /// `control` of a `break` up to the labeled block it leaves.
@@ -3787,12 +3878,13 @@ pub fn errorShown(c: *Context, file: Project.FileId, node: Ast.Node.Index) Conte
 /// reaches its sinks with (`Spec.reaches`), or may.
 fn carries(c: *Context, fact: Fact, file: Project.FileId, callee: Callee) Context.Error!bool {
     switch (callee.kind) {
-        .program, .aegis, .holder => return false,
+        .holder => return false,
+        .program => if (judged(c, callee.decl.?.file)) return false, // unreachable: a program callee has its declaration
         .choice => |each| {
             for (each) |one| if (try carries(c, fact, file, one)) return true;
             return false;
         },
-        .none, .source, .outside => {},
+        .none, .source, .outside, .aegis => {},
     }
     for (callee.args) |arg| for ([_]Level{ try levelAt(c, fact, file, arg), try lengthAt(c, fact, file, arg) }) |level| {
         if (level == .unknown or level.reaches(fact.spec.reaches)) return true;
@@ -3806,17 +3898,95 @@ pub fn lengthAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.In
     return concreteLength(fact.flow, function, try dep(c, fact.flow, function, node)).at(fact.lane);
 }
 
+pub const Unlimited = enum { yes, no, unknown };
+
+/// Whether a call reads with no limit: it is given std's `Io.Limit.unlimited`, or calls a
+/// function outside the program whose body gives it, through every call it makes
+/// (`streamRemaining`'s `stream(w, .unlimited)`): how much it reads is the peer's to choose.
+/// Unknown where std's `Io.Limit` does not resolve.
+pub fn unlimitedRead(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Unlimited {
+    const limits = switch (try Governed.declarations(c, "std", "Io.Limit")) {
+        .decls => |decls| decls,
+        .none => return .no,
+        .unknown => return .unknown,
+    };
+    const callee = (try resolveCall(c, fact.flow, file, node)) orelse return .no;
+    if (try givesUnlimited(c, limits, file, callee)) return .yes;
+    const sized = try sizesFlow(c, fact.flow, &.{callee});
+    try unlimitedIn(c, sized, limits);
+    const one = [1]Callee{callee};
+    for (if (callee.kind == .choice) callee.kind.choice else &one) |each| {
+        const decl = each.decl orelse continue;
+        const at = fnDecl(c, decl) orelse continue;
+        const id = sized.by_node.get(.{ .file = decl.file, .node = at }) orelse continue;
+        if (sized.unlimited.contains(id)) return .yes;
+    }
+    return .no;
+}
+
+/// The summary's functions that read with no limit (`Flow.unlimited`): each that gives a call
+/// std's `Io.Limit.unlimited` or calls one that does, read again as the summary grows.
+fn unlimitedIn(c: *Context, sized: *Flow, limits: []const Facts.Decl) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    if (sized.unlimited_read == sized.functions.items.len) return;
+    sized.unlimited_read = sized.functions.items.len;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (sized.functions.items, 0..) |f, i| {
+            const id: Function.Id = @fromBackingInt(@intCast(i));
+            if (sized.unlimited.contains(id)) continue;
+            for (f.nodes) |node| {
+                const callee = (try resolveCall(c, sized, f.file, node)) orelse continue;
+                const one = [1]Callee{callee};
+                const reads = for (if (callee.kind == .choice) callee.kind.choice else &one) |each| switch (each.kind) {
+                    .program => |target| if (sized.unlimited.contains(target)) break true,
+                    else => {},
+                } else try givesUnlimited(c, limits, f.file, callee);
+                if (!reads) continue;
+                try sized.unlimited.put(c.allocator, id, {});
+                changed = true;
+                break;
+            }
+        }
+    }
+}
+
+/// Whether a call is given std's `Io.Limit.unlimited` (`limits` declares the type): an argument
+/// that names that tag (`Facts.tagNamed`).
+fn givesUnlimited(c: *Context, limits: []const Facts.Decl, file: Project.FileId, callee: Callee) Context.Error!bool {
+    for (callee.args) |arg| {
+        const tag = (try c.facts.tagNamed(file, arg)) orelse continue;
+        if (!std.mem.eql(u8, tag.name, "unlimited")) continue;
+        for (limits) |limit| switch (try c.facts.declaration(limit)) {
+            .container => |k| if (k.file == tag.container.file and k.scope == tag.container.scope) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+/// Whether the run judges the sites in `file`: one it selects. What a file of the package it
+/// does not select, or a dependency's, sizes by is read only where a judged file calls it.
+fn judged(c: *Context, file: Project.FileId) bool {
+    return c.project.at(file).input.selected;
+}
+
 /// The sizes a call of the program gives a function outside it: each argument whose value or
-/// length the callee's body sizes work by. The program's own callee is read at its own calls;
-/// aegis is the limit itself.
+/// length the callee's body sizes work by. The program's own callee in a file the run judges is
+/// read at its own calls; one in a file it does not (a dependency's) is read by its body here,
+/// and so is aegis's, which allocates what it is given (`SecretBytes.init(gpa, n)`).
 fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, out: *std.ArrayList(SinkSite)) Context.Error!void {
     switch (callee.kind) {
-        .program, .aegis, .holder => return,
+        .holder => return,
         .choice => |each| {
             for (each) |one| try sizeSites(c, sized, file, one, out);
             return;
         },
-        .none, .source, .outside => {},
+        .program => if (judged(c, callee.decl.?.file)) return, // unreachable: a program callee has its declaration
+        .none, .source, .outside, .aegis => {},
     }
     const summary = try sizesOf(c, sized, callee.decl);
     for (callee.args, 0..) |arg, position| {
@@ -3831,7 +4001,9 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
                 .unknown => .{ false, false, true },
             };
             if (!sure and !ranged and !maybe) continue;
-            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged, .decided = sure or ranged });
+            // Kept to a range on one path and taken through a call that does not resolve on
+            // another, it may be taken whole: undecided, not data.
+            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe) });
         }
     }
 }
@@ -3883,8 +4055,9 @@ fn sizesFlow(c: *Context, main: *Flow, calls: []const Callee) Context.Error!*Flo
     for (calls) |callee| {
         const one = [1]Callee{callee};
         for (if (callee.kind == .choice) callee.kind.choice else &one) |each| switch (each.kind) {
-            .source, .outside => try reach(c, flow, each.decl.?, &next),
-            else => {},
+            .source, .outside, .aegis => try reach(c, flow, each.decl.?, &next),
+            .program => if (!judged(c, each.decl.?.file)) try reach(c, flow, each.decl.?, &next),
+            .holder, .choice, .none => {},
         };
     }
     if (next.items.len == 0) return flow;
@@ -3915,16 +4088,15 @@ fn sizesFlow(c: *Context, main: *Flow, calls: []const Callee) Context.Error!*Flo
 }
 
 /// Adds the function `decl` declares to a summary, its nodes owned, unless it is an
-/// allocation (a sink itself), aegis's (the limit), the program's own, already read, or has
-/// no body.
+/// allocation (a sink itself), the program's own in a file the run judges (read at its own
+/// calls), already read, or has no body.
 fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, next: *std.ArrayList(Function.Id)) Context.Error!void {
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     // An allocation is a sink itself; one whose alias does not resolve has no body read.
     if (try allocation(c, flow, decl) != .no) return;
-    if (flow.program.aegis_files.contains(@backingInt(decl.file))) return;
-    if (flow.own(decl.file)) return;
+    if (flow.own(decl.file) and judged(c, decl.file)) return;
     const node = fnDecl(c, decl) orelse return;
     if (flow.by_node.contains(.{ .file = decl.file, .node = node })) return;
     const id = (try addFunction(c, flow, decl.file, node)) orelse return;
@@ -4023,9 +4195,14 @@ const Sizes = struct {
 /// What a call in a summary's `function` sizes work by, into `sizes`.
 fn sizedBy(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, sizes: *Sizes) Context.Error!void {
     switch (callee.kind) {
-        .aegis, .holder => {},
+        .holder => {},
         .choice => |each| for (each) |one| try sizedBy(c, flow, function, one, sizes),
-        .program => |target| {
+        .program, .aegis => {
+            // aegis's function is read by its body as any other the summary reaches.
+            const target = switch (callee.kind) {
+                .program => |id| id,
+                else => (if (fnDecl(c, callee.decl.?)) |node| flow.by_node.get(.{ .file = callee.decl.?.file, .node = node }) else null) orelse return sizedOutside(c, flow, function, callee, sizes), // unreachable: aegis's callee has its declaration
+            };
             const g = flow.functions.items[@backingInt(target)];
             for (callee.args, 0..) |arg, index| {
                 for ([_]bool{ false, true }) |length| {
@@ -4037,23 +4214,27 @@ fn sizedBy(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, size
                     if (length) given = given.measured();
                     if (sure) {
                         try sizes.add(c.allocator, given);
-                    } else if (ranged) {
+                    } else if (ranged and !g.maybe_sizes.has(slot)) {
                         try sizes.addRanged(c.allocator, given);
                     } else try sizes.addMaybe(c.allocator, given);
                 }
             }
         },
-        .source, .outside, .none => {
-            const allocates: Allocation = if (callee.decl) |d| try allocation(c, flow, d) else .unknown;
-            for (callee.args, 0..) |arg, position| {
-                // An allocation's first parameter is the allocator itself.
-                if (allocates == .yes and position == 0) continue;
-                const given = try whole(c, flow, function, arg);
-                if (allocates == .yes and flow.allocations_known) {
-                    try sizes.add(c.allocator, given);
-                } else try sizes.addMaybe(c.allocator, given);
-            }
-        },
+        .source, .outside, .none => try sizedOutside(c, flow, function, callee, sizes),
+    }
+}
+
+/// What a call outside the summary's functions sizes by: an allocation every argument but the
+/// allocator; any other, or one whose body is not read, each argument, maybe.
+fn sizedOutside(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, sizes: *Sizes) Context.Error!void {
+    const allocates: Allocation = if (callee.decl) |d| try allocation(c, flow, d) else .unknown;
+    for (callee.args, 0..) |arg, position| {
+        // An allocation's first parameter is the allocator itself.
+        if (allocates == .yes and position == 0) continue;
+        const given = try whole(c, flow, function, arg);
+        if (allocates == .yes and flow.allocations_known) {
+            try sizes.add(c.allocator, given);
+        } else try sizes.addMaybe(c.allocator, given);
     }
 }
 
@@ -4084,17 +4265,6 @@ fn countOf(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index
     };
 }
 
-/// The local variable an identifier names.
-fn localOf(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
-    const d = (model.reference(node) orelse return null).declaration orelse return null;
-    const decl = model.declarations[@backingInt(d)];
-    if (decl.kind != .variable) return null;
-    return switch (model.scopes[@backingInt(decl.scope)].kind) {
-        .file, .container => null,
-        else => d,
-    };
-}
-
 /// Whether `value` takes the counter `d` by a factor: a product, a quotient or a shift of it
 /// (`a * 2`, `@divTrunc(a, 10)`, `n >> 1`).
 fn scaled(tree: *const Ast, model: *const Model, d: Model.Declaration.Id, value: Ast.Node.Index) bool {
@@ -4114,12 +4284,6 @@ fn scaled(tree: *const Ast, model: *const Model, d: Model.Declaration.Id, value:
         },
         else => return false,
     }
-}
-
-/// Whether a destructure assigns the declaration `d` among its variables.
-fn destructures(tree: *const Ast, model: *const Model, node: Ast.Node.Index, d: Model.Declaration.Id) bool {
-    for (tree.assignDestructure(node).ast.variables) |variable| if (namesDeclaration(tree, model, variable, d)) return true;
-    return false;
 }
 
 test "the aegis pack's facts fit one solve's lanes, and a set that needs more does not" {

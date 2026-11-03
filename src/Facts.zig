@@ -2448,6 +2448,58 @@ fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     return .{ .unknown = .unresolved };
 }
 
+/// A tag of an enum or a union, by its type and its name.
+pub const Tag = struct { container: Container, name: []const u8 };
+
+/// The tag a value names: an enum literal by the type its place gives it (`.unlimited` given a
+/// limit), a tag named on its type (`Io.Limit.unlimited`), a constant that names one. Null where
+/// it names none, or its type does not resolve.
+pub fn tagNamed(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Tag {
+    return self.tagWithin(file, node, 0);
+}
+
+fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) ResolveError!?Tag {
+    const tree = &self.project.at(file).file.tree;
+    switch (tree.nodeTag(node)) {
+        .enum_literal => {
+            const name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
+            var holder = try self.literalType(file, node);
+            while (true) holder = switch (holder) {
+                .optional, .error_union, .pointer => |inner| inner.*,
+                else => break,
+            };
+            const container = switch (holder) {
+                .container, .instance => |k| k,
+                else => return null,
+            };
+            return if (self.declaresTag(container, name)) .{ .container = container, .name = name } else null;
+        },
+        .field_access => {
+            const lhs, const token = tree.nodeData(node).node_and_token;
+            const container = switch (try self.resolve(file, lhs)) {
+                .container => |k| k,
+                else => return null,
+            };
+            const name = try self.memberName(tree.tokenSlice(token));
+            return if (self.declaresTag(container, name)) .{ .container = container, .name = name } else null;
+        },
+        .identifier => {
+            if (depth > 4) return null;
+            const decl = switch (try self.definition(file, node)) {
+                .decl => |d| d,
+                else => return null,
+            };
+            const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+            if (record.kind != .variable) return null;
+            const held = &self.project.at(decl.file).file.tree;
+            const constant = held.fullVarDecl(record.node) orelse return null;
+            if (held.tokenTag(constant.ast.mut_token) != .keyword_const) return null;
+            return self.tagWithin(decl.file, constant.ast.init_node.unwrap() orelse return null, depth + 1);
+        },
+        else => return null,
+    }
+}
+
 /// Whether `container` is an `enum` or a `union` with a field `name`, one of its tags. An
 /// enum's field is written as a bare name, which Zig's syntax tree reads as a tuple's field.
 pub fn declaresTag(self: *const Facts, container: Container, name: []const u8) bool {
@@ -6212,7 +6264,7 @@ pub const accesses = struct {
     }
 
     /// Whether a declaration lives outside any function: in a file's or a container's scope.
-    fn global(facts: *Facts, decl: Facts.Decl) bool {
+    pub fn global(facts: *Facts, decl: Facts.Decl) bool {
         const model = &facts.project.at(decl.file).model;
         const record = model.declarations[@backingInt(decl.index)];
         return switch (model.scopes[@backingInt(record.scope)].kind) {

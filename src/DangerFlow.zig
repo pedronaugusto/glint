@@ -241,7 +241,7 @@ fn arithmeticBuiltin(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.I
 }
 
 /// A012: work sized by a number from input without a stated limit: an allocation, a
-/// container's growth or a read sized by one, and any read with `.unlimited`.
+/// container's growth or a read sized by one, and any read with no limit (`Taint.unlimitedRead`).
 pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, Danger.bounded_input);
     const tree = &c.project.at(c.file).file.tree;
@@ -254,13 +254,11 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const decl = reached.decl orelse continue;
         if (!reached.std or !fromReader(flow, decl) or try ownReader(c, flow, call)) continue;
         const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
-        if (std.mem.find(u8, name, "Unlimited") != null) {
-            try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
-            continue;
+        switch (try Taint.unlimitedRead(c, flow, c.file, node)) {
+            .yes => try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name})),
+            .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, try c.allocator.print("{s}: whether it reads with no limit is not known: std's Io.Limit does not resolve", .{name})),
+            .no => {},
         }
-        for (call.ast.params) |arg| if (tree.nodeTag(arg) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(arg)), "unlimited")) {
-            try c.at(rule, tree.nodeMainToken(arg), try c.allocator.print("{s}(.unlimited): a read with no limit, its size a peer's to choose; state the limit with aegis bounded.Limit", .{name}));
-        };
     }
     // What the program hands std that std sizes memory or work by (Taint.sinkSites).
     for (try Taint.sinkSites(c, flow, c.file)) |sized| {
