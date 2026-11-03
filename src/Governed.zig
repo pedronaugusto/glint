@@ -344,9 +344,31 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
                 if (d.kind != .variable) continue;
                 const variable = tree.fullVarDecl(d.node) orelse continue;
                 const init = variable.ast.init_node.unwrap() orelse continue;
+                // An alias is written as a declaration's path, or a comptime choice among them:
+                // each value its initializer may give names a declaration (`std.debug.print`,
+                // `@field(ns, "print")`, `if (debug) std.debug.print else quiet`). A call's result
+                // or a literal is a value of its own, never an alias, and is not resolved here.
+                const leaves = switch (try Facts.accesses.valuesOf(self.facts, source.id, init)) {
+                    .leaves => |each| each,
+                    .unknown => continue,
+                };
+                if (leaves.len == 0) continue;
+                const spelled = try self.allocator.alloc(?[]const u8, leaves.len);
+                var named = true;
+                for (leaves, spelled) |leaf, *name| {
+                    const path = try Facts.accesses.pathOf(self.facts, source.id, leaf);
+                    named = path.root != .none;
+                    for (path.steps) |step| named = named and (step.kind == .field or step.kind == .root);
+                    if (!named) break;
+                    // The name it spells last (null: `@field`'s computed name, which may be any).
+                    const last = path.steps[0];
+                    name.* = if (last.kind == .field) last.name else try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeMainToken(last.node)));
+                }
+                if (!named) continue;
                 const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
                 // A function the value is, or one a comptime choice may give in the build that
-                // takes it, is what the alias calls.
+                // takes it, is what the alias calls; any other declaration it names (a type's, a
+                // constant's) is reached by its origin.
                 var unknown = false;
                 switch (try self.facts.declaration(decl)) {
                     .function => |function| try aliasOf(self, found, function, decl, d.name),
@@ -356,26 +378,14 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
                         else => {},
                     },
                     .unknown => unknown = true,
-                    // Any other declaration it names: a type's, a constant's.
                     else => switch (try self.facts.origin(decl)) {
                         .decl => |reached| try aliasOf(self, found, reached, decl, d.name),
                         .none => {},
                         .unknown => unknown = true,
                     },
                 }
-                if (!unknown) continue;
-                // A value that does not resolve, written as a declaration's path, may be what the
-                // name it spells last is (null: `@field`'s, which may be any); one of its own (a
-                // call's result, a literal) is no alias.
-                const path = try Facts.accesses.pathOf(self.facts, source.id, init);
-                if (path.root == .none) continue;
-                const last = path.steps[0];
-                const spelled_last: ?[]const u8 = switch (last.kind) {
-                    .field => last.name,
-                    .root => if (source.model.reference(last.node)) |ref| try Model.identifier(self.allocator, tree.tokenSlice(ref.token)) else continue,
-                    else => continue,
-                };
-                try found.unknown.append(self.allocator, .{ .name = d.name, .spells = spelled_last });
+                // A value that does not resolve may be what each name it spells last is.
+                if (unknown) for (spelled) |name| try found.unknown.append(self.allocator, .{ .name = d.name, .spells = name });
             }
         }
     }
