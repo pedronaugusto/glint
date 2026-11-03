@@ -32,6 +32,7 @@ const rows = [_]Row{
     .{ .name = "@call given no tuple literal", .source = fns ++ "fn w() void {\n    const t = .{};\n    @call(.auto, a, t);\n}\n", .expected = &.{"5 a ? unsupported"} },
     .{ .name = "@field spelled, through a type", .source = method ++ "fn w(s: S) void {\n    @field(S, \"m\")(s, 1);\n}\n", .expected = &.{"8 m 2"} },
     .{ .name = "@field spelled, on a value", .source = method ++ "fn w(s: S) void {\n    @field(s, \"m\")(1);\n}\n", .expected = &.{"8 m r2"} },
+    .{ .name = "@field spelled, through a generic's instance, as its member access", .source = "fn G(comptime T: type) type {\n    return struct {\n        fn m(x: T) void {\n            _ = x;\n        }\n    };\n}\nconst L = G(u8);\nfn w() void {\n    @field(L, \"m\")(1);\n    L.m(1);\n}\n", .expected = &.{ "10 m 1", "11 m 1", "8 G 1" } },
     .{ .name = "@field computed", .source = fns ++ "fn w(comptime n: []const u8) void {\n    @field(@This(), n)();\n}\n", .expected = &.{"4 any comptime_dependent 0"} },
     .{ .name = "a function pointer's every store", .source = vtable ++ fns ++ "const x: V = .{ .f = &a };\nconst y: V = .{ .f = &b };\nfn w(v: V) void {\n    v.f();\n}\n", .expected = &.{"7 a|b 0"} },
     .{ .name = "a function pointer whose address is taken", .source = vtable ++ fns ++ "const x: V = .{ .f = &a };\nfn z(v: *V) *const *const fn () void {\n    return &v.f;\n}\nfn w(v: V) void {\n    v.f();\n}\n", .expected = &.{"9 any unresolved 0"} },

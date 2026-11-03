@@ -2044,14 +2044,13 @@ fn typeWritten(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     return null;
 }
 
-/// `@field(holder, name)` by a name that is no one spelled: one an inline for ranges over (each
-/// member so named, one per pass), or over a typeless literal by a name it ranges over or
-/// computes (any of its parts). Null where the one name is spelled, for `reflected`.
-fn rangedField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!?Value {
-    // A name ranging over a list written in place (`inline for (.{ "lin", "length" })
-    // |part|`): each member so named, one per pass.
+/// `@field(holder, name)`: by the one name it spells, the member access it means
+/// (`@field(L, "acquire")` is `L.acquire`); by a name an inline for ranges over, each member so
+/// named, one per pass; over a typeless literal by a name it ranges over or computes, any of its
+/// parts. Null where none of these is known.
+fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!?Value {
     switch (try self.fieldName(file, args[1])) {
-        .name => {},
+        .name => |one| return try self.fieldNamed(file, args[0], one),
         // Of a typeless literal, by a name it ranges over or computes (`inline for` over
         // its own `field_names`): any of its parts.
         .each_of, .computed => {
@@ -2059,6 +2058,8 @@ fn rangedField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index)
             const held = if (resolved == .pointer) resolved.pointer.* else resolved;
             if (held == .literal) return try self.choose(try self.literalParts(held.literal));
         },
+        // A name ranging over a list written in place (`inline for (.{ "lin", "length" })
+        // |part|`): each member so named, one per pass.
         .names => |names| {
             const resolved = try self.resolve(file, args[0]);
             const held = if (resolved == .pointer) resolved.pointer.* else resolved;
@@ -2112,12 +2113,8 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
         // `@hasDecl` is a `bool` whatever it names.
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
-        if (try self.rangedField(file, args)) |value| return value;
-        return switch (try self.reflected(file, node)) {
-            .decl => |target| self.declaration(target),
-            .none => .{ .unknown = .unresolved },
-            .unknown => |why| .{ .unknown = why },
-        };
+        if (try self.builtinField(file, args)) |value| return value;
+        return .{ .unknown = .comptime_dependent };
     }
     // `@call(modifier, f, .{ a, b })` calls `f` with the tuple's elements, binding no receiver.
     if (std.mem.eql(u8, name, "@call") and args.len == 3) {
@@ -2549,8 +2546,12 @@ fn namesType(tree: *const Ast, node: Ast.Node.Index) bool {
 fn fieldValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     const data = tree.nodeData(node).node_and_token;
-    const lhs = try self.resolve(file, data[0]);
-    const name = try self.memberName(tree.tokenSlice(data[1]));
+    return self.fieldNamed(file, data[0], try self.memberName(tree.tokenSlice(data[1])));
+}
+
+/// What `holder.name` is, written as a member access or as `@field(holder, "name")`.
+fn fieldNamed(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: []const u8) ResolveError!Value {
+    const lhs = try self.resolve(file, holder);
     const value = try self.memberValue(lhs, name);
     // A field holding a function or a pointer to one: each function the program stores in it.
     if (callable(value) and !identified(value)) if (fieldOwner(lhs)) |container| {
