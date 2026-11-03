@@ -2015,25 +2015,54 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
         return try Contract.owner(c, t) != null;
     }
     var init = v.ast.init_node.unwrap() orelse return false;
-    if (tree.nodeTag(init) == .identifier) return ownedValue(c, init, depth + 1);
-    if (tree.nodeTag(init) == .@"try") init = tree.nodeData(init).node;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, init) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const name = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]));
-    return std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "adopt") or std.mem.eql(u8, name, "acquire");
+    if (Contract.local(c, init) != null) return ownedValue(c, init, depth + 1);
+    while (Facts.accesses.carriedFrom(tree, init)) |inner| init = inner;
+    return try publishedCall(c, init, &.{ "init", "adopt", "acquire" }) != null;
+}
+
+/// The published aegis function among `names` a call may call, by its name: a callee known by
+/// its declaration (`Facts.calls`) that is a function of a type aegis publishes; or, where the
+/// callee is not known, a member of that name of whatever its holder is (`v.expose()` of an
+/// `anytype` is whatever `v`'s type declares by that name). Null for any other call.
+const Published = struct { name: []const u8, known: bool };
+fn publishedCall(c: *Context, node: Ast.Node.Index, names: []const []const u8) Context.Error!?Published {
+    const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return null;
+    const function = switch (call.callee) {
+        .function => |function| function,
+        .choice, .any => {
+            const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
+            const name = path.steps[0].name orelse return null;
+            if (path.steps[0].kind != .field or !among(names, name)) return null;
+            return .{ .name = name, .known = false };
+        },
+    };
+    const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
+    if (!among(names, record.name)) return null;
+    const holder: Facts.Container = .{ .file = function.file, .scope = record.scope };
+    if (try c.role(Contract.library, .{ .container = holder }) == null) return null;
+    return .{ .name = record.name, .known = true };
+}
+
+/// Whether `name` is one of a catalogue's `names`.
+fn among(names: []const []const u8, name: []const u8) bool {
+    for (names) |each| if (std.mem.eql(u8, each, name)) return true;
+    return false;
 }
 
 fn exposure(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return false;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return false;
-    const data = tree.nodeData(call.ast.fn_expr).node_and_token;
-    const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
-    if (!std.mem.eql(u8, name, "expose") and !std.mem.eql(u8, name, "exposeMut") and !std.mem.eql(u8, name, "value")) return false;
-    const k = (try requiredOwner(c, data[0], copies, data[1])) orelse return false;
-    return ((k == .secret or k == .bytes) and (std.mem.eql(u8, name, "expose") or std.mem.eql(u8, name, "exposeMut"))) or (k == .guard and std.mem.eql(u8, name, "value"));
+    const published = (try publishedCall(c, node, &.{ "expose", "exposeMut", "value" })) orelse return false;
+    const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: publishedCall found its callee
+    // What it is called on: the member's holder (`s.expose()`'s `s`), a receiver or not.
+    const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
+    if (path.steps.len < 2 or path.steps[0].kind != .field) return false;
+    const k = (try requiredOwner(c, path.steps[1].node, copies, tree.lastToken(call.callee_expr))) orelse return false;
+    const views: []const []const u8 = switch (k) {
+        .secret, .bytes => &.{ "expose", "exposeMut" },
+        .guard => &.{"value"},
+        else => return false,
+    };
+    return among(views, published.name);
 }
 fn checkCleanup(c: *Context) Context.Error!void {
     if (!try begin(c, cleanup)) return;
