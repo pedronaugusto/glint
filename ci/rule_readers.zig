@@ -47,6 +47,8 @@ const allowed = [_]Allowed{
     .{ .file = "src/Escapes.zig", .function = "Walk.escaping", .reason = "Zig makes a pointer into a frame only by `&` or slicing a local; a name for one is followed by Facts.givenTo" },
     .{ .file = "src/Danger.zig", .function = "insertAegis", .reason = "Zig's scoping is by name: the inserted declaration must not clash with or be shadowed by one already in the file" },
     .{ .file = "src/Danger.zig", .function = "secretName", .reason = "std's crypto names its secret types by convention: SecretKey, KeyPair, BlindSecretKey, BlindKeyPair" },
+    .{ .file = "src/AegisPack.zig", .function = "Flow.moves", .reason = "`else null` is the language's null literal, which no declaration stands behind" },
+    .{ .file = "src/AegisPack.zig", .function = "rawCall", .reason = "the callee is resolved through what names it to its declaration (Facts.definition, Facts.origin); one that does not resolve is read as Zig finds it, by name in the method-call form `s.raw()`" },
     .{ .file = "src/Escapes.zig", .function = "compiledIn", .reason = "a literal as written is compiled into the program, never the frame's memory" },
 };
 
