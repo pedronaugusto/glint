@@ -611,8 +611,8 @@ fn usedAsReceiver(self: *Context, parent: Ast.Node.Index, node: Ast.Node.Index) 
     return false;
 }
 
-/// Whether something is so: yes, no, or unknown and why.
-pub const Is = union(enum) { yes, no, unknown: Facts.Unknown };
+/// Whether something is so: yes, no, or unknown and why (`Facts.Is`).
+pub const Is = Facts.Is;
 
 /// Whether `function` is std's declaration at `path` (`mem.Allocator.free`), through aliases.
 pub fn isStd(c: *Context, function: Facts.Decl, path: []const u8) Context.Error!Is {

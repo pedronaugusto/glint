@@ -311,3 +311,96 @@ test "accesses: what an expression's value does where it stands" {
     }
     try std.testing.expect(!failed);
 }
+
+/// The first node of `tree` spelled `needle` (not the root), or null.
+fn spelledNode(tree: *const std.zig.Ast, needle: []const u8, skip: usize) ?std.zig.Ast.Node.Index {
+    var left = skip;
+    for (0..tree.nodes.len) |i| {
+        const each: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (each == .root or !std.mem.eql(u8, tree.getNodeSource(each), needle)) continue;
+        if (left == 0) return each;
+        left -= 1;
+    }
+    return null;
+}
+
+test "accesses: a place's path, whether two name one place, a discarded value, a carried one" {
+    const S = "const U = union { a: u32, b: u32 }; const S = struct { a: u32, b: [4]u32, u: U, p: *S };\n";
+    // A source, two expressions (the second's occurrence), and samePlace's answer.
+    const pairs = [_]struct { []const u8, []const u8, []const u8, usize, []const u8 }{
+        .{ "fn f() void { var s: S = undefined; s.a = 1; s.a = 2; }", "s.a", "s.a", 1, "yes" },
+        .{ "fn f() void { var s: S = undefined; s.a = 1; (s).b[0] = 2; }", "s.a", "(s).b[0]", 0, "no" },
+        .{ "fn f() void { var s: S = undefined; s.b[0] = 1; s.b[1] = 2; }", "s.b[0]", "s.b[1]", 0, "no" },
+        .{ "fn f() void { var s: S = undefined; s.b[0] = 1; s.b[0] = 2; }", "s.b[0]", "s.b[0]", 1, "yes" },
+        .{ "fn f(i: usize) void { var s: S = undefined; s.b[i] = 1; s.b[i] = 2; }", "s.b[i]", "s.b[i]", 1, "yes" },
+        .{ "fn f() void { var i: usize = 0; var s: S = undefined; s.b[i] = 1; i = 1; s.b[i] = 2; }", "s.b[i]", "s.b[i]", 1, "unknown" },
+        .{ "fn f() void { var s: S = undefined; s.u.a = 1; s.u.b = 2; }", "s.u.a", "s.u.b", 0, "unknown" },
+        .{ "fn f() void { var s: S = undefined; var t: S = undefined; s.a = 1; t.a = 2; }", "s.a", "t.a", 0, "no" },
+        .{ "fn f(s: *S, t: *S) void { s.a = 1; t.a = 2; }", "s.a", "t.a", 0, "unknown" },
+        .{ "fn f(s: *S) void { s.p.a = 1; s.p.*.a = 2; }", "s.p.a", "s.p.*.a", 0, "unknown" },
+        .{ "fn g() S { return undefined; } fn f() void { g().a = 1; g().a = 2; }", "g().a", "g().a", 1, "unknown" },
+    };
+    var failed = false;
+    for (pairs) |row| {
+        const body, const first, const second, const skip, const want = row;
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ S, body });
+        defer std.testing.allocator.free(source);
+        var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const tree = &project.sources[0].file.tree;
+        const a = spelledNode(tree, first, 0) orelse return error.TestUnexpectedResult;
+        const b = spelledNode(tree, second, skip) orelse return error.TestUnexpectedResult;
+        const got = @tagName(try accesses.samePlace(&facts, project.sources[0].id, a, b));
+        if (std.mem.eql(u8, got, want)) continue;
+        std.debug.print("{s}: '{s}' and '{s}' expected {s}, found {s}\n", .{ body, first, second, want, got });
+        failed = true;
+    }
+    try std.testing.expect(!failed);
+
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = S ++ "fn f(s: *S, o: ?u32, d: u32) u32 { _ = d; s.b[1..][0] = 2; return (o.?); }" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    // `s.b[1..][0]`: an element of a slice of an array through the pointer `s`, from `s`.
+    const path = try accesses.pathOf(&facts, file, spelledNode(tree, "s.b[1..][0]", 0).?);
+    try std.testing.expectEqual(@as(usize, 4), path.steps.len);
+    try std.testing.expectEqual(.index, path.steps[0].kind);
+    try std.testing.expectEqual(.slice, path.steps[1].kind);
+    try std.testing.expect(!path.steps[1].crosses);
+    try std.testing.expectEqualStrings("b", path.steps[2].name.?);
+    try std.testing.expect(path.steps[2].crosses);
+    try std.testing.expectEqual(.root, path.steps[3].kind);
+    try std.testing.expect(path.root == .decl);
+    // `_ = d;` discards `d`; the store into the element discards nothing.
+    const discard = spelledNode(tree, "_ = d", 0).?;
+    try std.testing.expectEqualStrings("d", tree.getNodeSource((try accesses.discardedBy(&facts, file, discard)).?));
+    try std.testing.expect(try accesses.discardedBy(&facts, file, spelledNode(tree, "s.b[1..][0] = 2", 0).?) == null);
+    // `(o.?)` carries `o.?`, which carries `o`; `o` carries nothing.
+    const grouped = spelledNode(tree, "(o.?)", 0).?;
+    const unwrapped = accesses.carriedFrom(tree, grouped).?;
+    try std.testing.expectEqualStrings("o.?", tree.getNodeSource(unwrapped));
+    try std.testing.expectEqualStrings("o", tree.getNodeSource(accesses.carriedFrom(tree, unwrapped).?));
+    try std.testing.expect(accesses.carriedFrom(tree, accesses.carriedFrom(tree, unwrapped).?) == null);
+}
+
+test "Facts.knownBool: a bool known as the program compiles" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "fn f(x: bool) void { _ = !true; _ = (true and true); _ = x; }" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    try std.testing.expectEqual(@as(?bool, false), try facts.knownBool(file, spelledNode(tree, "!true", 0).?));
+    try std.testing.expectEqual(@as(?bool, true), try facts.knownBool(file, spelledNode(tree, "(true and true)", 0).?));
+    try std.testing.expectEqual(@as(?bool, null), try facts.knownBool(file, spelledNode(tree, "x", 0).?));
+}

@@ -167,6 +167,8 @@ pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown, roo
 /// optimize mode, the build's options) any file imports, or the `root` std reads
 /// (`root.std_options`), which no library's reading binds; a type or value the compiler
 /// computes for each build, holding no store and none of the program's types.
+/// Whether something is so: yes, no, or unknown and why.
+pub const Is = union(enum) { yes, no, unknown: Unknown };
 pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own };
 /// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
 /// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
@@ -1736,6 +1738,13 @@ fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.N
     };
     for (self.assumptions(self.assumed)) |held| if (held.parameter.file == file and held.parameter.index == index) return if (held.value == .boolean) held.value.boolean else null;
     return null;
+}
+
+/// A `bool` known as the program compiles, on no call's reading (`comptimeTruth`): `true`,
+/// `false`, `!`, `and` and `or` of known ones, two types known the same or different, a
+/// `@hasDecl` that resolves; null where it may be either.
+pub fn knownBool(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    return self.comptimeTruth(null, file, node);
 }
 
 /// A condition known as the program compiles on the reading `env` binds: `truth`'s, `and` and
@@ -5178,7 +5187,7 @@ fn reflectedContainer(self: *const Facts, r: Reflected) ?Container {
 }
 
 /// The keyword a container is declared with; a file is a struct.
-fn kindOf(self: *const Facts, container: Container) ?std.zig.Token.Tag {
+pub fn kindOf(self: *const Facts, container: Container) ?std.zig.Token.Tag {
     const node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
     if (node == .root) return .keyword_struct;
     const tree = self.syntaxOf(container.file);
@@ -7046,6 +7055,215 @@ pub const accesses = struct {
         return null;
     }
 
+    /// The expression whose value `node` gives on whole, the inverse of `Use.carried` for a form
+    /// with one operand: parentheses, `.?`, `try`, the payload side of `orelse` and `catch`,
+    /// `comptime`, `nosuspend`. Null for any other form.
+    pub fn carriedFrom(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+        return switch (formOf(tree.nodeTag(node))) {
+            .grouped, .unwrap_optional => tree.nodeData(node).node_and_token[0],
+            .tried, .@"comptime", .@"nosuspend" => tree.nodeData(node).node,
+            .@"catch", .@"orelse" => tree.nodeData(node).node_and_node[0],
+            else => null,
+        };
+    }
+
+    /// The value the statement `statement` discards: `_ = v`'s `v`; null for any other.
+    pub fn discardedBy(facts: *Facts, file: Project.FileId, statement: Ast.Node.Index) Error!?Ast.Node.Index {
+        const tree = &facts.project.at(file).file.tree;
+        if (formOf(tree.nodeTag(statement)) != .assign) return null;
+        const target, const value = tree.nodeData(statement).node_and_node;
+        if (try storeInto(facts, file, target) != null or !discard(tree, target)) return null;
+        return value;
+    }
+
+    /// One step of a place's path (`pathOf`), from the place in toward its root.
+    pub const Step = struct {
+        /// The node of the place this step reaches: a member read, `@field`, an element, a slice,
+        /// `.?`, `.*`, or for the root, the expression the path starts at.
+        node: Ast.Node.Index,
+        kind: enum { field, index, slice, unwrap, deref, root },
+        /// A member's holder's value (`field`).
+        holder: ?Facts.Value = null,
+        /// A member's name (`field`); null for `@field` with a name it computes, any field of the
+        /// holder's type.
+        name: ?[]const u8 = null,
+        /// The index an element is read at (`index`).
+        index: ?Ast.Node.Index = null,
+        /// Whether reaching this step's place from the one below crosses a pointer: a member or
+        /// element through one, `.*`, an element or slice of a slice.
+        crosses: bool = false,
+    };
+
+    /// The places a place expression names, from itself in to the root it starts at.
+    pub const Path = struct {
+        /// The place first, the root last (`.root`).
+        steps: []const Step,
+        /// The declaration the root names; none where the path starts at a value of its own (a
+        /// call's result, a literal, `_`); unknown where a name there does not resolve.
+        root: Facts.Named,
+    };
+
+    /// The path of the place `node` names, through parentheses, member reads, `@field`, elements,
+    /// slices, `.?` and `.*`, to the expression it starts at.
+    pub fn pathOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Path {
+        const tree = &facts.project.at(file).file.tree;
+        var steps: std.ArrayList(Step) = .empty;
+        var at = node;
+        while (true) switch (tree.nodeTag(at)) {
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .field_access => {
+                const holder = tree.nodeData(at).node_and_token[0];
+                const value = try facts.resolve(file, holder);
+                const name = try Model.identifier(facts.gpa, tree.tokenSlice(tree.nodeData(at).node_and_token[1]));
+                try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !header(name, value) });
+                at = holder;
+            },
+            .array_access => {
+                const holder, const index = tree.nodeData(at).node_and_node;
+                try steps.append(facts.gpa, .{ .node = at, .kind = .index, .index = index, .crosses = pointing(try facts.resolve(file, holder)) });
+                at = holder;
+            },
+            .slice_open, .slice, .slice_sentinel => {
+                const holder = tree.fullSlice(at).?.ast.sliced; // unreachable: the tag is a slice's
+                try steps.append(facts.gpa, .{ .node = at, .kind = .slice, .crosses = pointing(try facts.resolve(file, holder)) });
+                at = holder;
+            },
+            .unwrap_optional => {
+                try steps.append(facts.gpa, .{ .node = at, .kind = .unwrap });
+                at = tree.nodeData(at).node_and_token[0];
+            },
+            .deref => {
+                try steps.append(facts.gpa, .{ .node = at, .kind = .deref, .crosses = true });
+                at = tree.nodeData(at).node;
+            },
+            else => {
+                if (isField(tree, at)) {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, at, &buffer);
+                    if (args.len == 2) {
+                        const value = try facts.resolve(file, args[0]);
+                        const name: ?[]const u8 = switch (try facts.fieldName(file, args[1])) {
+                            .name => |spelled| spelled,
+                            .each_of, .names, .computed => null,
+                        };
+                        try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !header(name orelse "", value) });
+                        at = args[0];
+                        continue;
+                    }
+                }
+                try steps.append(facts.gpa, .{ .node = at, .kind = .root });
+                const root: Facts.Named = if (tree.nodeTag(at) == .identifier and discard(tree, at)) .none else switch (tree.nodeTag(at)) {
+                    .identifier => try facts.definition(file, at),
+                    else => .none,
+                };
+                return .{ .steps = steps.items, .root = root };
+            },
+        };
+    }
+
+    /// Whether `a` and `b` name the same place: one root declaration, and step by step the same
+    /// field (by declaration, or by name where neither holder's field resolves: unknown), the
+    /// same index (one constant's value, or one name that does not change), `.?` and `.*` alike.
+    /// Distinct roots, fields or constant indexes are no where no step crosses a pointer, which
+    /// may reach any memory; a union's fields share theirs. What is not shown either way is
+    /// unknown, never read by its spelling.
+    pub fn samePlace(facts: *Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) Error!Facts.Is {
+        const left = try pathOf(facts, file, a);
+        const right = try pathOf(facts, file, b);
+        var crosses = false;
+        for (left.steps) |step| crosses = crosses or step.crosses;
+        for (right.steps) |step| crosses = crosses or step.crosses;
+        const differ: Facts.Is = if (crosses) .{ .unknown = .unsupported } else .no;
+        const left_root = switch (left.root) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unsupported },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        const right_root = switch (right.root) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unsupported },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        if (!std.meta.eql(left_root, right_root)) return differ;
+        if (left.steps.len != right.steps.len) return differ;
+        var verdict: Facts.Is = .yes;
+        // From the root out: the step below each is the same place.
+        var k = left.steps.len - 1;
+        while (k > 0) {
+            k -= 1;
+            const x = left.steps[k];
+            const y = right.steps[k];
+            if (x.kind != y.kind) return differ;
+            switch (x.kind) {
+                .root, .unwrap, .deref => {},
+                .slice => verdict = .{ .unknown = .unsupported },
+                .field => {
+                    const x_name = x.name orelse return .{ .unknown = .unsupported };
+                    const y_name = y.name orelse return .{ .unknown = .unsupported };
+                    const holder = holderContainer(x.holder.?);
+                    if (std.mem.eql(u8, x_name, y_name)) {
+                        if (holder == null or facts.member(holder.?, x_name) == null) verdict = .{ .unknown = .unresolved };
+                        continue;
+                    }
+                    // Two fields of a union share its memory; of a type not known, may.
+                    if (facts.kindOf(holder orelse return .{ .unknown = .unresolved }) != .keyword_struct) return .{ .unknown = .unsupported };
+                    if (crosses) return differ;
+                    return .no;
+                },
+                .index => switch (try sameIndex(facts, file, x.index.?, y.index.?)) {
+                    .yes => {},
+                    .no => return differ,
+                    .unknown => |why| verdict = .{ .unknown = why },
+                },
+            }
+        }
+        return verdict;
+    }
+
+    /// The container a member's holder is, through pointers and optionals.
+    fn holderContainer(value: Facts.Value) ?Facts.Container {
+        return switch (value) {
+            .container, .instance => |container| container,
+            .pointer, .optional => |inner| holderContainer(inner.*),
+            else => null,
+        };
+    }
+
+    /// Whether two indexes are one value: two integer literals' values, or one parameter or
+    /// constant named by both; unknown otherwise.
+    fn sameIndex(facts: *Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) Error!Facts.Is {
+        const tree = &facts.project.at(file).file.tree;
+        const x = Facts.ungrouped(tree, a);
+        const y = Facts.ungrouped(tree, b);
+        if (tree.nodeTag(x) == .number_literal and tree.nodeTag(y) == .number_literal) {
+            const left = std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(x)));
+            const right = std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(y)));
+            if (left == .int and right == .int) return if (left.int == right.int) .yes else .no;
+            return .{ .unknown = .unsupported };
+        }
+        const left = switch (try facts.definition(file, x)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unsupported },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        const right = switch (try facts.definition(file, y)) {
+            .decl => |d| d,
+            .none => return .{ .unknown = .unsupported },
+            .unknown => |why| return .{ .unknown = why },
+        };
+        if (!std.meta.eql(left, right)) return .{ .unknown = .unsupported };
+        const record = facts.project.at(left.file).model.declarations[@backingInt(left.index)];
+        return switch (record.kind) {
+            .parameter => .yes,
+            .variable => blk: {
+                const declaring = &facts.project.at(left.file).file.tree;
+                const variable = declaring.fullVarDecl(record.node) orelse break :blk .{ .unknown = .unsupported };
+                break :blk if (declaring.tokenTag(variable.ast.mut_token) == .keyword_const) .yes else .{ .unknown = .unsupported };
+            },
+            else => .{ .unknown = .unsupported },
+        };
+    }
+
     pub const Place = union(enum) {
         /// A variable, a parameter or a capture.
         declaration: Facts.Decl,
@@ -7854,65 +8072,26 @@ pub const accesses = struct {
 
         /// One step of a path, outermost first: a member, an element, a payload, a dereference,
         /// `@field`, or the root.
-        const Step = struct { node: Ast.Node.Index, holder: ?Facts.Value = null, crosses: bool = false };
-
         /// The places `at.target` names, its outermost first, each inner one written in part: a
         /// name, a member, an element, an optional's payload, `@field`. A place past a pointer (a
         /// dereference, a member or an element of one) is reached through it, and the places below
         /// the pointer in the path are read, not written. Whether the target is reached through one.
         fn path(w: *Walk, at: Site) Error!bool {
             const tree = w.syntax();
-            var steps: std.ArrayList(Step) = .empty;
-            var node = at.target.?;
-            while (true) switch (tree.nodeTag(node)) {
-                .grouped_expression => node = tree.nodeData(node).node_and_token[0],
-                .field_access => {
-                    const holder = tree.nodeData(node).node_and_token[0];
-                    const value = try w.facts.resolve(w.file, holder);
-                    try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) and !header(tree.tokenSlice(tree.nodeData(node).node_and_token[1]), value) });
-                    node = holder;
-                },
-                .array_access => {
-                    const holder = tree.nodeData(node).node_and_node[0];
-                    try steps.append(w.facts.gpa, .{ .node = node, .crosses = !try w.byValue(holder) });
-                    node = holder;
-                },
-                .unwrap_optional => {
-                    try steps.append(w.facts.gpa, .{ .node = node });
-                    node = tree.nodeData(node).node_and_token[0];
-                },
-                .deref => {
-                    try steps.append(w.facts.gpa, .{ .node = node, .crosses = true });
-                    node = tree.nodeData(node).node;
-                },
-                else => {
-                    if (isField(tree, node)) {
-                        var buffer: [2]Ast.Node.Index = undefined;
-                        const args = Facts.builtinArgs(tree, node, &buffer);
-                        if (args.len == 2) {
-                            const value = try w.facts.resolve(w.file, args[0]);
-                            try steps.append(w.facts.gpa, .{ .node = node, .holder = value, .crosses = pointing(value) and !header(try w.spelled(args[1]) orelse "", value) });
-                            node = args[0];
-                            continue;
-                        }
-                    }
-                    try steps.append(w.facts.gpa, .{ .node = node });
-                    break;
-                },
-            };
+            const steps = (try pathOf(w.facts, w.file, at.target.?)).steps;
             // Each step's place is reached through a pointer where it or a step below crosses one.
-            const through = try w.facts.gpa.alloc(bool, steps.items.len);
+            const through = try w.facts.gpa.alloc(bool, steps.len);
             var below = false;
-            var k = steps.items.len;
+            var k = steps.len;
             while (k > 0) {
                 k -= 1;
-                below = below or steps.items[k].crosses;
+                below = below or steps[k].crosses;
                 through[k] = below;
             }
             // Past a pointer the places below it in the path, the root's name among them, are read,
             // their memory not written: `list.items[i] = v` writes neither `items` nor `list`.
             var above = false;
-            for (steps.items, through, 0..) |step, reached_through, k_| {
+            for (steps, through, 0..) |step, reached_through, k_| {
                 if (above) break;
                 above = step.crosses;
                 // Past a pointer that reads other memory as another type (a view, a cast), the
@@ -7920,7 +8099,7 @@ pub const accesses = struct {
                 // (`std.mem.asBytes(j)[0] = v` writes `j.*`): in part, with no one value of its
                 // places.
                 if (step.crosses) {
-                    const pointer = steps.items[k_ + 1].node;
+                    const pointer = steps[k_ + 1].node;
                     if (try reinterprets(w.facts, w.file, pointer)) {
                         var view = at;
                         view.target = pointer;
@@ -7932,7 +8111,7 @@ pub const accesses = struct {
                 var site = at;
                 site.part = k_ > 0;
                 site.through = reached_through;
-                const root = k_ + 1 == steps.items.len;
+                const root = k_ + 1 == steps.len;
                 if (root) {
                     switch (tree.nodeTag(step.node)) {
                         .identifier => {
@@ -7952,22 +8131,17 @@ pub const accesses = struct {
                     }
                     break;
                 }
-                switch (tree.nodeTag(step.node)) {
-                    .field_access => try w.member(site, step.holder.?, try Model.identifier(w.facts.gpa, tree.tokenSlice(tree.nodeData(step.node).node_and_token[1]))),
-                    .array_access, .unwrap_optional, .deref => {},
-                    else => {
-                        var buffer: [2]Ast.Node.Index = undefined;
-                        const args = Facts.builtinArgs(tree, step.node, &buffer);
-                        if (try w.spelled(args[1])) |name| {
-                            try w.member(site, step.holder.?, name);
-                        } else {
-                            // A name computed as the program compiles: any field of the holder's type.
-                            var any = site;
-                            any.computed = true;
-                            any.part = true;
-                            try w.shapes(any, held(step.holder.?), false);
-                        }
+                switch (step.kind) {
+                    .field => if (step.name) |name| {
+                        try w.member(site, step.holder.?, name);
+                    } else {
+                        // A name computed as the program compiles: any field of the holder's type.
+                        var any = site;
+                        any.computed = true;
+                        any.part = true;
+                        try w.shapes(any, held(step.holder.?), false);
                     },
+                    .index, .slice, .unwrap, .deref, .root => {},
                 }
             }
             return below;
