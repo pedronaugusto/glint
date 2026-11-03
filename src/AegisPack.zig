@@ -546,12 +546,12 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     const model = &c.project.at(c.file).model;
     // What the program reads of `x.name`.
     var member: ?[]const u8 = null;
-    // Whether the program uses `x.name` as a truth value, a number or an operand of a comparison.
-    var operand = false;
     // Whether the program calls `x.name(...)`: a method, or a field that holds a function.
     var called = false;
-    if (model.parentOf(field)) |parent| operand = scalarOperand(tree, parent, field);
-    switch (try Facts.accesses.useOf(c.facts, c.file, field)) {
+    const use = try Facts.accesses.useOf(c.facts, c.file, field);
+    // Whether the program uses `x.name` as a truth value, a number or an operand of a comparison.
+    const operand = scalarOperand(tree, use);
+    switch (use) {
         // By name: what `x` holds does not resolve.
         .member => |read| member = (try Facts.accesses.pathOf(c.facts, c.file, read)).steps[0].name,
         .callee => called = true,
@@ -659,17 +659,20 @@ fn callable(value: Facts.Value, depth: usize) bool {
     };
 }
 
-/// Whether `parent` uses its child `field` as a truth value (a condition, an operand of
-/// `and`, `or` or `!`), an operand of a comparison or of arithmetic.
-fn scalarOperand(tree: *const Ast, parent: Ast.Node.Index, field: Ast.Node.Index) bool {
-    switch (tree.nodeTag(parent)) {
-        .bool_not, .negation => return true,
-        .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .add, .sub, .mul, .div, .mod => return true,
-        else => {},
-    }
-    if (tree.fullIf(parent)) |full| return full.ast.cond_expr == field and full.payload_token == null and full.error_token == null;
-    if (tree.fullWhile(parent)) |full| return full.ast.cond_expr == field and full.payload_token == null and full.error_token == null;
-    return false;
+/// Whether a value used as `use` (accesses.useOf) is a truth value (an `if`'s or `while`'s
+/// condition with no capture, a part of `and`, `or` or `!`), an operand of a comparison or of an
+/// operator: each a use no struct's value has.
+fn scalarOperand(tree: *const Ast, use: Facts.accesses.Use) bool {
+    return switch (use) {
+        .logic, .compared, .operand => true,
+        .tested => |at| if (tree.fullIf(at)) |full|
+            full.payload_token == null and full.error_token == null
+        else if (tree.fullWhile(at)) |full|
+            full.payload_token == null and full.error_token == null
+        else
+            false,
+        else => false,
+    };
 }
 
 /// Whether a container is a struct with no packed layout (or an opaque): a type no
@@ -2491,7 +2494,6 @@ fn pointerResult(c: *Context, function: Facts.Decl) Context.Error!bool {
 /// (`.limited(n)`), of the type its place gives it, passed where such a function's parameter
 /// is.
 fn stdTyped(c: *Context, call: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(c.file).file.tree;
     switch (try calledFunction(c, c.file, call)) {
         .function => |function| if (try c.facts.standard(function.file)) {
             const source = c.project.at(function.file);
@@ -2501,8 +2503,10 @@ fn stdTyped(c: *Context, call: Ast.Node.Index) Context.Error!bool {
         },
         .unknown => {},
     }
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    if (tree.nodeTag((tree.fullCall(&call_buffer, call) orelse return false).ast.fn_expr) != .enum_literal) return false;
+    // A decl literal: a callee the model reads by the place's type (`.limited(n)`).
+    const called = (try Facts.calls.at(c.facts, c.file, call)) orelse return false;
+    const ref = c.project.at(c.file).model.reference(called.callee_expr) orelse return false;
+    if (ref.unknown != .literal_context) return false;
     const parent = c.project.at(c.file).model.parentOf(call) orelse return false;
     const outer = (try Facts.calls.at(c.facts, c.file, parent)) orelse return false;
     const position = std.mem.findScalar(Ast.Node.Index, switch (outer.args) {
