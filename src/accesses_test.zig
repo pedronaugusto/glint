@@ -464,6 +464,29 @@ test "Facts: an enum's and a union's tags written with no type are members" {
     try std.testing.expectEqual(@as(usize, 0), (try facts.heldFields(e)).len);
 }
 
+test "Facts.literalType: a switch case's item is of what the switch tests, its body of the switch's place" {
+    const source = "pub const U = union(enum) { compare: u32, skip }; pub const R = struct { compare: u32 };\n" ++
+        "fn f(u: U) u32 { switch (u) { .compare => |n| return n, .skip => {} } return 0; }\n" ++
+        "fn g(u: U) R { return switch (u) { .compare => .{ .compare = 1 }, .skip => .{ .compare = 0 } }; }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const u = (try facts.declaration(facts.member(facts.rootOf(file), "U").?)).container;
+    const r = (try facts.declaration(facts.member(facts.rootOf(file), "R").?)).container;
+    const tag = facts.member(u, "compare").?;
+    // A statement's switch: the item names the tested union's tag.
+    try std.testing.expectEqual(Facts.Named{ .decl = tag }, try facts.literalDeclaration(file, spelledNode(tree, ".compare", 0).?, "compare"));
+    // A switch giving an `R`: its item is still the union's tag; its body's literal is an `R`.
+    try std.testing.expectEqual(Facts.Named{ .decl = tag }, try facts.literalDeclaration(file, spelledNode(tree, ".compare", 1).?, "compare"));
+    const made = try facts.literalType(file, spelledNode(tree, ".{ .compare = 1 }", 0).?);
+    try std.testing.expect(made == .container and std.meta.eql(made.container.scope, r.scope));
+}
+
 test "batch 2: an update's operation, error names and sets, a condition's truths, a value's leaves, a literal" {
     const source =
         \\const E = error{ Canceled, Timeout };

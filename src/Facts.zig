@@ -9506,7 +9506,15 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     }
     switch (tree.nodeTag(parent)) {
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
-        .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma, .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => return self.placeType(file, parent, depth + 1),
+        .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(file, parent, depth + 1),
+        // A case's item takes the type of what the switch tests (`.compare =>` names a tag of
+        // the operand's union); its body gives the switch its value.
+        .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
+            if (std.mem.findScalar(Ast.Node.Index, tree.fullSwitchCase(parent).?.ast.values, node) == null) return self.placeType(file, parent, depth + 1); // unreachable: the tag is a case's
+            const whole = model.parentOf(parent) orelse return .{ .unknown = .unsupported };
+            const tested = (tree.fullSwitch(whole) orelse return .{ .unknown = .unsupported }).ast.condition;
+            return self.resolve(file, tested);
+        },
         .@"break" => {
             // A `break` with no label leaves the nearest loop; one with a label, the block or
             // loop it names. Each gives that its value.
