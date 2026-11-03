@@ -938,12 +938,15 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         const parts = try self.copiedParts(function.file, init);
         for (parts.places) |place| {
             const position = self.runtimeParameter(function, place, 0) orelse continue;
-            // A place whose value resolves where it is written is the same copy in every
-            // binding, decided there; only what the binding settles is read with it.
-            if (try self.resolve(function.file, place) != .unknown) continue;
-            const site: Key = .{ .file = function.file, .node = d.node };
-            // The parameter itself is its argument, read as written where it is bound.
+            // The parameter itself is its argument, read as written where it is bound
+            // (`const both: [2]@TypeOf(x) = .{ x, x }`); a part whose value resolves where it
+            // is written is the same copy in every binding, decided there.
             const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
+            if (!itself and try self.resolve(function.file, place) != .unknown) continue;
+            // The parameter itself held once, in no loop, by a local nothing else holds it in
+            // is moved there (`const held: [1]@TypeOf(x) = .{x};`), as a write is.
+            if (itself and !self.inLoop(function, d.node) and self.holdingReads(function, model.reference(place).?.declaration.?) == 1) continue;
+            const site: Key = .{ .file = function.file, .node = d.node };
             try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
             try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
         }
@@ -952,10 +955,13 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
     try self.scalarCasts(function, out);
 }
 
-/// What `function`'s own `return`s and assignments write of a generic parameter's value, as
-/// `directCopies` reads a local's initializer: the parameter or a part of it (`return .{ x, x }`,
-/// `out[0] = x;`). The parameter itself written once, in no loop, where nothing else in the body
-/// may hold it (`holdingReads`), is moved there (`out.* = x;`); else each such write is a copy.
+/// What `function`'s own `return`s, assignments, destructures and calls write of a generic
+/// parameter's value, as `directCopies` reads a local's initializer: the parameter or a part of
+/// it (`return .{ x, x }`, `out[0] = x;`, `a.*, b.* = .{ x, x };`, a literal whose address is
+/// taken), or the parameter itself handed by value to a call (`list.appendAssumeCapacity(x)`,
+/// by `calls`; a receiver is the value's own method). The parameter itself written once, in no
+/// loop, where nothing else in the body may hold it (`holdingReads`), is moved there
+/// (`out.* = x;`); else each such write is a copy.
 fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
@@ -967,38 +973,77 @@ fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const at = t.nodeMainToken(node);
         if (at < first or at > last) continue;
-        const value = switch (tag) {
-            .@"return" => t.nodeData(node).opt_node.unwrap() orelse continue,
+        var one: [1]Ast.Node.Index = undefined;
+        const values: []const Ast.Node.Index = switch (tag) {
+            .@"return" => blk: {
+                one[0] = t.nodeData(node).opt_node.unwrap() orelse continue;
+                break :blk &one;
+            },
             .assign => blk: {
                 const sides = t.nodeData(node).node_and_node;
                 if (t.nodeTag(sides[0]) == .identifier and std.mem.eql(u8, t.tokenSlice(t.nodeMainToken(sides[0])), "_")) continue;
-                break :blk sides[1];
+                one[0] = sides[1];
+                break :blk &one;
+            },
+            .assign_destructure => blk: {
+                one[0] = t.assignDestructure(node).ast.value_expr;
+                break :blk &one;
+            },
+            // A literal whose address is taken (`@memcpy(out, &[2]@TypeOf(x){ x, x })`): a
+            // temporary holding what it copies.
+            .address_of => blk: {
+                const operand = t.nodeData(node).node;
+                var buffer: [2]Ast.Node.Index = undefined;
+                if (t.fullArrayInit(&buffer, operand) == null and t.fullStructInit(&buffer, operand) == null) continue;
+                one[0] = operand;
+                break :blk &one;
+            },
+            .call_one, .call_one_comma, .call, .call_comma => blk: {
+                const call = (try calls.at(self, function.file, node)) orelse continue;
+                const args = switch (call.args) {
+                    .known => |each| each,
+                    .unknown => continue,
+                };
+                break :blk if (call.receiver == .bound) args[1..] else args;
             },
             else => continue,
         };
         // The function's own statement, run as it runs: not a nested function's or a
         // `comptime` block's.
         if (self.innermostFunction(function.file, model.scopeOf(at)) != whole or inComptime(t, model, node)) continue;
-        var looped = false;
-        var up = model.parentOf(node);
-        while (up) |parent| : (up = model.parentOf(parent)) {
-            if (parent == body) break;
-            if (t.fullWhile(parent) != null or t.fullFor(parent) != null) looped = true;
-        }
-        const parts = try self.copiedParts(function.file, value);
-        for (parts.places) |place| {
-            const position = self.runtimeParameter(function, place, 0) orelse continue;
-            const named: ?Model.Declaration.Id = if (t.nodeTag(place) == .identifier) if (model.reference(place)) |ref| ref.declaration else null else null;
-            // The parameter itself is its argument, read as written where it is bound; a part
-            // whose value resolves where it is written is the same copy in every binding.
-            const itself = if (named) |index| self.valueOfParameter(function, index) != null else false;
-            if (!itself and try self.resolve(function.file, place) != .unknown) continue;
-            if (itself and !looped and self.holdingReads(function, named.?) == 1) continue;
-            const site: Key = .{ .file = function.file, .node = node };
-            try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
-            try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
+        const looped = self.inLoop(function, node);
+        for (values) |value| {
+            const handed = tag != .@"return" and tag != .assign and tag != .assign_destructure and tag != .address_of;
+            const parts = try self.copiedParts(function.file, value);
+            for (parts.places) |place| {
+                const position = self.runtimeParameter(function, place, 0) orelse continue;
+                const named: ?Model.Declaration.Id = if (t.nodeTag(place) == .identifier) if (model.reference(place)) |ref| ref.declaration else null else null;
+                // The parameter itself is its argument, read as written where it is bound; a part
+                // whose value resolves where it is written is the same copy in every binding.
+                const itself = if (named) |index| self.valueOfParameter(function, index) != null else false;
+                if (!itself and try self.resolve(function.file, place) != .unknown) continue;
+                // A call takes the parameter itself only, as a pass-on reads a part.
+                if (handed and !itself) continue;
+                if (itself and !looped and self.holdingReads(function, named.?) == 1) continue;
+                const site: Key = .{ .file = function.file, .node = node };
+                try out.append(self.gpa, .{ .position = position, .site = site, .source = if (itself) null else .{ .file = function.file, .node = place } });
+                try self.bound_places.put(self.gpa, .{ .site = site, .place = place }, function);
+            }
         }
     }
+}
+
+/// Whether `node` runs in a loop of `function`'s body, which may run it more than once.
+fn inLoop(self: *const Facts, function: Decl, node: Ast.Node.Index) bool {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const body = t.nodeData(self.scopeNode(function)).node_and_node[1];
+    var up = model.parentOf(node);
+    while (up) |parent| : (up = model.parentOf(parent)) {
+        if (parent == body) return false;
+        if (t.fullWhile(parent) != null or t.fullFor(parent) != null) return true;
+    }
+    return false;
 }
 
 /// The function node of the innermost function `scope` is in, if any.
@@ -7505,6 +7550,25 @@ pub const accesses = struct {
     pub fn storeInto(facts: *Facts, file: Project.FileId, target: Ast.Node.Index) Error!?Site {
         for (try storesIn(facts, file)) |site| if (site.target) |each| if (each == target) return site;
         return null;
+    }
+
+    /// What memory the store into `target` writes (`storeInto`): a variable's own, by its name
+    /// (`box.g = v`, `pair[0] = v`, `x = v`), memory reached through a pointer (`p.g = v`,
+    /// `p.* = v`), or memory that does not resolve.
+    pub const Stored = union(enum) { declaration: Facts.Decl, through, unresolved };
+
+    pub fn storedIn(facts: *Facts, file: Project.FileId, target: Ast.Node.Index) Error!Stored {
+        const store = (try storeInto(facts, file, target)) orelse return .unresolved;
+        if (store.through) return .through;
+        var it = (try writesOf(facts, file)).places.iterator();
+        while (it.next()) |entry| {
+            const d = switch (entry.key_ptr.*) {
+                .declaration => |d| d,
+                .field => continue,
+            };
+            for (entry.value_ptr.items) |site| if (site.node == store.node and site.kind != .read and site.kind != .address and !site.through) return .{ .declaration = d };
+        }
+        return .unresolved;
     }
 
     /// The forms an expression stands in, one for each syntax tag that may hold it: every tag

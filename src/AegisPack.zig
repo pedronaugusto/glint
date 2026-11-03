@@ -846,7 +846,10 @@ fn ownerKind(c: *Context, node: Ast.Node.Index, rule: Rule) Context.Error!Typed 
     // owner's in the builds that choose the owner. Cleanup is owed along the paths of those
     // builds, which are every path unless the function branches on a comptime condition
     // (`if (wrapped) owner.deinit();`); then A003 leaves a choice that disagrees undecided.
-    return if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
+    const found = if (rule != cleanup or !try c.facts.branchesOnCondition(c.file, node)) try perBuild(c, value) else try typed(c, value, 0);
+    // An owner held in a record's field is A003's too, though the record is no owner.
+    if (rule == cleanup and found == .other) return heldInRecord(c, value, 0);
+    return found;
 }
 const Typed = union(enum) { owner: Contract.Kind, other, unknown };
 /// Two readings of what parts or alternatives hold, as one: unknown stays unknown, one owner
@@ -962,6 +965,31 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
         },
         else => .other,
     };
+}
+/// What A003 owes of a value its type reads as plain data: nothing, unless a record of the
+/// program holds an owner by value in a field (Facts.heldFields), through an array, an optional
+/// and an error union (`struct { guard: L.Guard, count: u32 }` a helper returns, `struct {
+/// L.Guard, u32 }`), or a field that does not resolve may hold one: unknown, as A003 follows no
+/// owner held in a field. A pointer field borrows; aegis's own types hold what their contract
+/// says.
+fn heldInRecord(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
+    if (depth == 64) return .unknown;
+    var current = value;
+    while (true) current = switch (current) {
+        .array, .optional, .error_union => |inner| inner.*,
+        else => break,
+    };
+    const container = switch (current) {
+        .instance => |container| container,
+        else => return .other,
+    };
+    if (try c.inLibrary(Contract.library, container.file)) return .other;
+    for (try c.facts.heldFields(container)) |field| {
+        if (field.value == .pointer) continue;
+        if (try typed(c, field.value, depth + 1) != .other) return .unknown;
+        if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown;
+    }
+    return .other;
 }
 /// Whether a value is unknown only because a generic's binding gives its type.
 fn bindingTyped(value: Facts.Value) bool {
@@ -1672,31 +1700,39 @@ fn capturedMoved(c: *Context, holder: Ast.Node.Index) Context.Error!Is {
     } else return .no;
     var unknown: ?Facts.Unknown = null;
     for (operands) |operand| {
-        var value = operand;
-        while (true) value = switch (tree.nodeTag(value)) {
-            .grouped_expression => tree.nodeData(value).node_and_token[0],
-            .@"try", .@"comptime" => tree.nodeData(value).node,
-            else => break,
-        };
-        if (placeRoot(tree, value) == null) {
-            // What a pointer a call gives points at (`s.slot().*`), or the elements of a
-            // slice one gives (`for (s.held()) |g|`), stays where it is: the capture copies it.
-            if (try sharedReturn(c, tree, value) != null) return .no;
-            if (tree.fullFor(holder) != null) switch (try c.facts.resolve(c.file, value)) {
-                .pointer => return .no,
+        // What the capture copies, as a copy of the operand does (`Facts.copiedParts`): through
+        // a branch, `orelse`, `catch`, a labeled block's `break`, `@as`.
+        const parts = try c.facts.copiedParts(c.file, operand);
+        if (parts.deep != null) unknown = .unsupported;
+        for (parts.places) |value| {
+            if (placeRoot(tree, value) == null) {
+                // What a pointer a call gives points at (`s.slot().*`) stays where it is: the
+                // capture copies it.
+                if (try sharedReturn(c, tree, value) != null) return .no;
+                unknown = .unsupported;
+                continue;
+            }
+            // A local moved by the capture: nothing reads it again (a loop's condition reads
+            // it each time round).
+            if (tree.nodeTag(value) != .identifier) return .no;
+            switch (try moved(c, value, value, false)) {
+                .yes => {},
+                .no => return .no,
                 .unknown => |why| unknown = why,
-                else => {},
-            };
-            continue;
+            }
         }
-        // A local moved by the capture: nothing reads it again (a loop's condition reads it
-        // each time round).
-        if (tree.nodeTag(value) != .identifier) return .no;
-        switch (try moved(c, value, value, false)) {
-            .yes => {},
-            .no => return .no,
+        // A call's value is made in place, moved into the capture; the elements of a slice
+        // one gives (`for (s.held()) |g|`) stay where they are: the capture copies them.
+        if (tree.fullFor(holder) != null) for (parts.results) |result| switch (try c.facts.resolve(c.file, result)) {
+            .pointer => return .no,
             .unknown => |why| unknown = why,
-        }
+            else => {},
+        };
+        // Any other shape, decided by its value's type.
+        for (parts.rest) |node| switch (try perBuild(c, try c.facts.resolve(c.file, node))) {
+            .other => {},
+            .owner, .unknown => unknown = .unsupported,
+        };
     }
     return if (unknown) |why| .{ .unknown = why } else .yes;
 }
@@ -2053,7 +2089,6 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
             if (tree.nodeData(parent).node_and_node[1] != at) break :blk false;
             const target = tree.nodeData(parent).node_and_node[0];
             switch (tree.nodeTag(target)) {
-                .field_access, .array_access, .deref => return,
                 .identifier => {
                     if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(target)), "_")) break :blk true;
                     // A local A003 follows, acquired again (`held = b.acquire()`): its flow
@@ -2063,7 +2098,21 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
                     };
                     break :blk false;
                 },
-                else => break :blk false,
+                // Stored into memory, the owner is the holder's: memory reached through a
+                // pointer or a container's variable. A block's local holding it in a field or
+                // an element (`box.g = l.acquire()`) is not followed, nor is memory that does
+                // not resolve: undecided.
+                else => switch (try Facts.accesses.storedIn(c.facts, c.file, target)) {
+                    .through => return,
+                    .declaration => |held| {
+                        const model_of = &c.project.at(held.file).model;
+                        switch (model_of.scopes[@backingInt(model_of.declarations[@backingInt(held.index)].scope)].kind) {
+                            .file, .container => return,
+                            else => break :blk false,
+                        }
+                    },
+                    .unresolved => break :blk false,
+                },
             }
         },
         else => false,
@@ -2675,7 +2724,12 @@ const Flow = struct {
                 // The owner itself, returned held, or carried by value in what is returned (a
                 // field of a returned literal, an argument of the call that makes it): its
                 // release is the caller's.
-                if (f.mine(value) or try f.carried(value)) return ends;
+                if (f.mine(value)) return ends;
+                switch (try f.carried(value)) {
+                    .yes => return ends,
+                    .unknown => return .uncertain,
+                    .no => {},
+                }
             },
             .unreachable_literal => return ends,
             // `_ = owner` discards it: no release, no transfer, so the owner goes on as it was.
@@ -3217,26 +3271,42 @@ const Flow = struct {
         };
     }
 
-    /// Whether `value` carries the owner itself: it names it by value (not through a member or
-    /// its address) at least once.
-    fn carried(f: Flow, value: Ast.Node.Index) Context.Error!bool {
-        const first = f.tree.firstToken(value);
-        const last = f.tree.lastToken(value);
-        var found = false;
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const main = f.tree.nodeMainToken(candidate);
-            if (main < first or main > last or !f.mine(candidate)) continue;
-            const parent = f.model.node_parents[i] orelse return false;
-            switch (f.tree.nodeTag(parent)) {
-                .address_of => return false,
-                .field_access => if (f.tree.nodeData(parent).node_and_token[0] == candidate) continue,
-                else => if (fieldOf(f.tree, parent, candidate)) continue,
-            }
-            found = true;
+    /// Whether `value` carries the owner itself: what a copy of it copies (`Facts.copiedParts`)
+    /// is the owner, an element or the payload of it, or the result of a call it is an argument
+    /// of by value (a field of a returned literal, an argument of the call that makes it). A
+    /// member, an operand (`held != null`) or a type query (`@TypeOf(g)`) carries none; what
+    /// does not resolve, unknown.
+    fn carried(f: Flow, value: Ast.Node.Index) Context.Error!Is {
+        const parts = try f.c.facts.copiedParts(f.c.file, value);
+        if (parts.deep != null) return .{ .unknown = .unsupported };
+        for (parts.places) |place| {
+            var at = place;
+            while (true) switch (f.tree.nodeTag(at)) {
+                .array_access => at = f.tree.nodeData(at).node_and_node[0],
+                .unwrap_optional => at = f.tree.nodeData(at).node_and_token[0],
+                else => break,
+            };
+            if (f.mine(at)) return .yes;
         }
-        return found;
+        var out: Is = .no;
+        for (parts.results) |result| {
+            const call = (try Facts.calls.at(f.c.facts, f.c.file, result)) orelse continue;
+            const args = switch (call.args) {
+                .known => |each| each,
+                .unknown => |why| {
+                    out = .{ .unknown = why };
+                    continue;
+                },
+            };
+            // A receiver is the owner's own method, used through its members.
+            const given = if (call.receiver == .bound) args[1..] else args;
+            for (given) |arg| switch (try f.carried(arg)) {
+                .yes => return .yes,
+                .unknown => |why| out = .{ .unknown = why },
+                .no => {},
+            };
+        }
+        return out;
     }
 
     /// The local a statement of the owner's own block moves the owner into: a declaration

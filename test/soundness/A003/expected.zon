@@ -1,12 +1,14 @@
-// An owner (a File, Dir, Stream, Server or Child, a struct) is no operand of any arithmetic,
-// bit or comparison operator: A003's value cannot pass through one.
 .{
-    .na = .{.operator},
     .open = .{
         // glint-b precision: an acquisition assigned to a local, put in a literal, or handed to a call is not followed (undecided, never clear), so its release there is not seen
         "aggregate/glintb-literal/twin.zig",
         "assignment/glintb-write/twin.zig",
         "call/glintb-helper/twin.zig",
+        // glint-b precision: an owner held in a record's field or a tuple's element (a helper's result, a local's field) is not followed (undecided, never clear), so its release there is not seen
+        "aggregate/ps2-record_owner/twin.zig",
+        "destructure/ps2-tuple_owner/twin.zig",
+        "assignment/ps2-handoff_field_of_local/twin.zig",
+        "assignment/ps2-guard_field_of_local/twin.zig",
         // glint-b precision: A003's flow does not follow a release through an alias, a capture, a comptime-known branch, @field, a byte copy or an unwrap
         "address/glintb-alias/twin.zig",
         "capture/glintb-pointer/twin.zig",
