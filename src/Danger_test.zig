@@ -3388,6 +3388,20 @@ test "A012 finds work sized by a number from input and reads with no limit" {
     try expect(pack.bounded_work, input_program, 2);
 }
 
+test "A012 names a size given through @call to a callee that does not resolve, undecided" {
+    // `@call` of a function pointer the program is handed: no callee is known, so what it
+    // sizes by `n` is not, and the site is named by what it calls as written.
+    const found = try run(pack.bounded_work,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader, g: *const fn (usize) void) !void {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    @call(.auto, g, .{n});
+        \\}
+    );
+    try std.testing.expectEqual(0, found.findings);
+    try std.testing.expectEqual(1, found.undecided);
+}
+
 test "A012 leaves a size std only moves a position by or compares, and finds one it allocates by" {
     // `toss` adds it to a position and `take`'s fill compares it: neither sizes work by it.
     try expect(pack.bounded_work,

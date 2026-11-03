@@ -3724,6 +3724,8 @@ pub const SinkSite = struct {
     file: Project.FileId,
     value: Ast.Node.Index,
     at: Ast.Node.Index,
+    /// What the call calls, as written: `f(a)`'s `f`, `@call`'s second argument.
+    callee_expr: Ast.Node.Index,
     callee: ?Facts.Decl,
     /// The parameter, the receiver first.
     position: usize,
@@ -3842,7 +3844,7 @@ fn writtenParts(c: *Context, file: Project.FileId, callee: Callee, node: Ast.Nod
         for (literal.ast.elements) |element| try writtenParts(c, file, callee, element, position, decided, out);
         return;
     }
-    try out.append(c.allocator, .{ .file = file, .value = node, .at = callee.node, .callee = callee.decl, .position = position, .decided = decided });
+    try out.append(c.allocator, .{ .file = file, .value = node, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .decided = decided });
 }
 
 /// The most a value is in the lanes `mask` holds, or clean outside the functions the flow reads.
@@ -4003,7 +4005,7 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
             if (!sure and !ranged and !maybe) continue;
             // Kept to a range on one path and taken through a call that does not resolve on
             // another, it may be taken whole: undecided, not data.
-            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe) });
+            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe) });
         }
     }
 }

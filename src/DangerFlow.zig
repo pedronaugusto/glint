@@ -277,7 +277,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         // A size checked against the program's own limit (`if (size > max) return`) is
         // bounded by it.
         if (!sized.length and try capped(c, flow, sized.value)) continue;
-        const name = if (sized.callee) |decl| c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name else tree.tokenSlice(tree.lastToken(call.?.ast.fn_expr)); // unreachable: a sink's site is a call
+        const name = if (sized.callee) |decl| c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name else tree.tokenSlice(tree.lastToken(sized.callee_expr));
         if (!sized.decided and level.reaches(flow.spec.reaches)) {
             try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(sized.value)), .unresolved, try c.allocator.print("{s} is given a number from input through a call that does not resolve: what it sizes by it is not known", .{name}));
             continue;
