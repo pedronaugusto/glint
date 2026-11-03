@@ -2314,4 +2314,3 @@ fn labeled(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.Nod
     }
     return null;
 }
-

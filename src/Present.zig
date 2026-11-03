@@ -668,4 +668,3 @@ fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
     const value = Facts.ungrouped(tree, node);
     return tree.nodeTag(value) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "null");
 }
-

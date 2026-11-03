@@ -1482,4 +1482,3 @@ pub fn atRuntime(c: *const Context, node: Ast.Node.Index) bool {
     }
     return false;
 }
-
