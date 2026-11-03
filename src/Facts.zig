@@ -117,6 +117,10 @@ pub const Made = struct {
     /// `Owner(T, false, f)`): the call that made the outer one, whose bindings this call's
     /// arguments are read with.
     via: ?*const Made = null,
+    /// For a container a generic declares in its own body (`const Instance = struct { fn_args:
+    /// Args }` in std's `Thread.spawn`), read in one reading of it: that reading, whose bindings
+    /// its names read (`madeEnv`). `call` is then the container's own node.
+    reading: ?*const Env = null,
 };
 /// One call of a generic function being read: its parameters bound to the call's arguments,
 /// in order (a method's receiver first). A type it returns, or a result type written in terms
@@ -3336,6 +3340,7 @@ fn forwarded(self: *Facts, function: Decl) ResolveError!?struct { function: Decl
 /// function passes on changed when it calls itself again is not the call's argument on that
 /// path, so it stays unknown.
 fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
+    if (made.reading) |reading| return reading;
     const call_tree = &self.project.at(made.file).file.tree;
     var call_buffer: [1]Ast.Node.Index = undefined;
     const call = call_tree.fullCall(&call_buffer, made.call).?;
@@ -3973,7 +3978,7 @@ fn sameMaking(a: ?*const Made, b: ?*const Made, depth: usize) bool {
     const y = b orelse return false;
     if (x == y) return true;
     if (depth >= 64) return false;
-    if (!std.meta.eql(x.function, y.function) or x.file != y.file or x.call != y.call or x.assumed != y.assumed) return false;
+    if (!std.meta.eql(x.function, y.function) or x.file != y.file or x.call != y.call or x.assumed != y.assumed or x.reading != y.reading) return false;
     if (!sameMaking(x.via, y.via, depth + 1)) return false;
     const ex = x.env orelse return y.env == null;
     const ey = y.env orelse return false;
@@ -6272,6 +6277,19 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
     }
     if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolveIn(env, file, ptr.ast.child_type)) };
     if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolveIn(env, file, array.ast.elem_type)) };
+    // A container the reading's function declares in its body, naming what the reading binds
+    // (`const Instance = struct { fn_args: Args }`): this reading's, as Zig makes one per
+    // instantiation, its names read with these bindings.
+    var container_buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&container_buffer, node) != null) if (try self.symbolicAt(file, node)) |found| {
+        if (self.enclosed(file, found.container.scope, self.scopeNode(e.function))) {
+            const made = try self.gpa.create(Made);
+            made.* = .{ .function = e.function, .file = file, .call = node, .reading = e, .assumed = self.assumed };
+            var out = found.container;
+            out.made_by = made;
+            return .{ .container = out };
+        }
+    };
     return self.resolve(file, node);
 }
 
@@ -10708,6 +10726,53 @@ test "reachedUnder: a site past a condition a binding decides is no site of that
     }
     // With no binding, every site is reached.
     for (casts.items) |cast| try std.testing.expect(try facts.reachedUnder(null, file, cast));
+}
+
+test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\const Bar = struct { b: u16 };
+        \\fn spawn(args: anytype) void {
+        \\    const Args = @TypeOf(args);
+        \\    const Instance = struct { fn_args: Args };
+        \\    var instance: Instance = undefined;
+        \\    _ = &instance;
+        \\    _ = instance.fn_args;
+        \\}
+        \\pub fn main() void {
+        \\    spawn(Foo{ .a = 1 });
+        \\    spawn(Bar{ .b = 2 });
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const spawn = facts.member(root, "spawn").?;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const field = node.of(tree, "instance.fn_args");
+    for ([_]struct { []const u8, []const u8 }{ .{ "spawn(Foo{ .a = 1 })", "Foo" }, .{ "spawn(Bar{ .b = 2 })", "Bar" } }) |row| {
+        const call_text, const type_name = row;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, call_text)).?, spawn, null);
+        const value = try facts.resolveBound(env, file, field);
+        try std.testing.expect(value == .instance);
+        const expected = try facts.resolve(file, node.of(tree, type_name));
+        try std.testing.expect(expected == .container and value.instance.scope == expected.container.scope);
+    }
 }
 
 test "a call on what a generic's context binds resolves in the instantiation its chain of calls makes" {
