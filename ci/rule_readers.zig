@@ -117,7 +117,7 @@ fn check(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.E
         }
     }
     for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
-        try context.at(rule_readers, 0, try std.fmt.allocPrint(context.allocator, "the allowed reads of {s} ({s}) are none of this file's: remove the entry", .{ entry.function, entry.reason }));
+        try context.at(rule_readers, 0, try context.allocator.print("the allowed reads of {s} ({s}) are none of this file's: remove the entry", .{ entry.function, entry.reason }));
     };
 }
 
@@ -157,7 +157,7 @@ fn spelling(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig
     } else return;
     for (comparisons) |path| switch (try glint.stdCall(context, node, path)) {
         .no => {},
-        .yes => return out.append(context.allocator, .{ .node = node, .what = .{ .read = try std.fmt.allocPrint(context.allocator, "std's {s} matches a declaration by its name \"{s}\": find it by what it resolves to (Facts.resolve, Facts.calls, Governed)", .{ path, name }) } }),
+        .yes => return out.append(context.allocator, .{ .node = node, .what = .{ .read = try context.allocator.print("std's {s} matches a declaration by its name \"{s}\": find it by what it resolves to (Facts.resolve, Facts.calls, Governed)", .{ path, name }) } }),
         .unknown => |why| return out.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
     };
 }
@@ -225,8 +225,8 @@ fn shape(context: *glint.RuleContext, tree: *const std.zig.Ast, node: std.zig.As
         .yes => {
             var queries: std.ArrayList([]const u8) = .empty;
             var each = read.iterator();
-            while (each.next()) |kind| try queries.append(context.allocator, try std.fmt.allocPrint(context.allocator, "a {s} through {s}", .{ @tagName(kind), kind.query() }));
-            try out.append(context.allocator, .{ .node = node, .what = .{ .read = try std.fmt.allocPrint(context.allocator, "a node's syntax tag reads by its shape (.{s}) what the shared queries read: {s}", .{ try std.mem.join(context.allocator, ", .", found.items), try std.mem.join(context.allocator, "; ", queries.items) }) } });
+            while (each.next()) |kind| try queries.append(context.allocator, try context.allocator.print("a {s} through {s}", .{ @tagName(kind), kind.query() }));
+            try out.append(context.allocator, .{ .node = node, .what = .{ .read = try context.allocator.print("a node's syntax tag reads by its shape (.{s}) what the shared queries read: {s}", .{ try std.mem.join(context.allocator, ", .", found.items), try std.mem.join(context.allocator, "; ", queries.items) }) } });
         },
         .unknown => |why| try out.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
     }
