@@ -10315,6 +10315,7 @@ test "a parameter's type has a length where it is or holds memory that has one" 
         \\const Node = struct { next: ?*Node, value: u64 };
         \\const Held = struct { items: []u8, count: usize };
         \\const Bytes = []const u8;
+        \\const Missing = @import("missing").Missing;
         \\fn f(
         \\    a: u32,
         \\    b: bool,
@@ -10332,7 +10333,9 @@ test "a parameter's type has a length where it is or holds memory that has one" 
         \\    o: Bytes,
         \\    p: *anyopaque,
         \\    q: Missing,
-        \\) void {}
+        \\) void {
+        \\    _ = .{ a, b, c, d, e, g, h, i, j, k, l, m, n, o, p, q };
+        \\}
     }}, &.{}, .{});
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
