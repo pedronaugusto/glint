@@ -338,34 +338,44 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
     if (!found.built) {
         found.built = true;
         for (self.project.sources) |*source| {
-            if (source.input.selected or source.file.status != .parsed or !try self.facts.program(source.id)) continue;
+            if (source.file.status != .parsed or !try self.facts.program(source.id)) continue;
             const tree = &source.file.tree;
             for (source.model.declarations, 0..) |d, i| {
                 if (d.kind != .variable) continue;
                 const variable = tree.fullVarDecl(d.node) orelse continue;
                 const init = variable.ast.init_node.unwrap() orelse continue;
-                switch (tree.nodeTag(init)) {
-                    .identifier, .field_access => {},
-                    .builtin_call_two, .builtin_call_two_comma => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "@field")) continue,
-                    else => continue,
-                }
                 const decl: Facts.Decl = .{ .file = source.id, .index = @fromBackingInt(@intCast(i)) };
-                const origin = switch (try self.facts.origin(decl)) {
-                    .decl => |reached| reached,
-                    .none => continue,
-                    .unknown => {
-                        try found.unknown.append(self.allocator, .{ .name = d.name, .spells = switch (tree.nodeTag(init)) {
-                            .identifier => tree.tokenSlice(tree.nodeMainToken(init)),
-                            .field_access => try Model.identifier(self.allocator, tree.tokenSlice(tree.nodeData(init).node_and_token[1])),
-                            else => null,
-                        } });
-                        continue;
+                // A function the value is, or one a comptime choice may give in the build that
+                // takes it, is what the alias calls.
+                var unknown = false;
+                switch (try self.facts.declaration(decl)) {
+                    .function => |function| try aliasOf(self, found, function, decl, d.name),
+                    .alternatives => |each| for (each) |one| switch (one) {
+                        .function => |function| try aliasOf(self, found, function, decl, d.name),
+                        .unknown => unknown = true,
+                        else => {},
                     },
+                    .unknown => unknown = true,
+                    // Any other declaration it names: a type's, a constant's.
+                    else => switch (try self.facts.origin(decl)) {
+                        .decl => |reached| try aliasOf(self, found, reached, decl, d.name),
+                        .none => {},
+                        .unknown => unknown = true,
+                    },
+                }
+                if (!unknown) continue;
+                // A value that does not resolve, written as a declaration's path, may be what the
+                // name it spells last is (null: `@field`'s, which may be any); one of its own (a
+                // call's result, a literal) is no alias.
+                const path = try Facts.accesses.pathOf(self.facts, source.id, init);
+                if (path.root == .none) continue;
+                const last = path.steps[0];
+                const spelled_last: ?[]const u8 = switch (last.kind) {
+                    .field => last.name,
+                    .root => if (source.model.reference(last.node)) |ref| try Model.identifier(self.allocator, tree.tokenSlice(ref.token)) else continue,
+                    else => continue,
                 };
-                if (std.meta.eql(origin, decl)) continue;
-                const entry = try found.by_origin.getOrPut(self.allocator, origin);
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(self.allocator, d.name);
+                try found.unknown.append(self.allocator, .{ .name = d.name, .spells = spelled_last });
             }
         }
     }
@@ -399,6 +409,13 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
             grew = true;
         }
     }
+}
+/// `name`, an alias `decl` declares, as a name of `reached`.
+fn aliasOf(self: *Context, found: *Aliases, reached: Facts.Decl, decl: Facts.Decl, name: []const u8) Context.Error!void {
+    if (std.meta.eql(reached, decl)) return;
+    const entry = try found.by_origin.getOrPut(self.allocator, reached);
+    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    try entry.value_ptr.append(self.allocator, name);
 }
 const Aliases = struct {
     built: bool = false,
