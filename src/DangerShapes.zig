@@ -913,14 +913,18 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
     // A write to part of it (`s.files[0] = opened()`), as accesses finds it.
     if (for (model.declarations, 0..) |each, i| {
         if (each.kind == .field and each.node == decl.node) break i;
-    } else null) |at| for (try Facts.accesses.writes(c.facts, .{ .field = .{ .file = file, .index = @fromBackingInt(@intCast(at)) } }, &.{file})) |site| {
-        if (!site.part or site.kind != .set) continue;
-        const value = site.value orelse {
-            doubt = true;
-            continue;
-        };
-        if (!try filled(c, resources, site.file, value)) return owner;
-    };
+    } else null) |at| {
+        const in_file = [_]Project.FileId{file};
+        var found_sites = Facts.accesses.writes(c.facts, .{ .field = .{ .file = file, .index = @fromBackingInt(@intCast(at)) } }, &in_file);
+        while (try found_sites.next()) |site| {
+            if (!site.part or site.kind != .set) continue;
+            const value = site.value orelse {
+                doubt = true;
+                continue;
+            };
+            if (!try filled(c, resources, site.file, value)) return owner;
+        }
+    }
     for (own.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [2]Ast.Node.Index = undefined;
@@ -2747,7 +2751,8 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
         if (each.input.classification == .@"test" or !program.own(each.id)) continue;
         try files.append(c.allocator, each.id);
     }
-    for (try Facts.accesses.writes(c.facts, .{ .field = field }, files.items)) |site| {
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = field }, files.items);
+    while (try found_sites.next()) |site| {
         if (site.reach == .named or site.reach == .unresolved) continue;
         const tree = &c.project.at(site.file).file.tree;
         const value: ?Ast.Node.Index = switch (site.kind) {

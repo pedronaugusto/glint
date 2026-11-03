@@ -147,12 +147,13 @@ test "accesses: each construct's probe is found and its twin is not" {
         };
         const decl: Facts.Decl = .{ .file = file, .index = @fromBackingInt(@intCast(index)) };
         const place: accesses.Place = if (row.decl) .{ .declaration = decl } else .{ .field = decl };
-        const sites = switch (row.query) {
-            .writes => try accesses.writesFor(&facts, place, &.{file}, .{ .holders = row.holders }),
-            .reads => try accesses.reads(&facts, place, &.{file}),
+        const in_file = [_]Project.FileId{file};
+        var sites = switch (row.query) {
+            .writes => accesses.writesFor(&facts, place, &in_file, .{ .holders = row.holders }),
+            .reads => accesses.reads(&facts, place, &in_file),
         };
         var lines: std.ArrayList([]const u8) = .empty;
-        for (sites) |site| try lines.append(a, try found(a, &project, site));
+        while (try sites.next()) |site| try lines.append(a, try found(a, &project, site));
         std.mem.sort([]const u8, lines.items, {}, lessThan);
         const same = lines.items.len == row.expected.len and for (lines.items, row.expected) |got, want| {
             if (!std.mem.eql(u8, got, want)) break false;
@@ -597,4 +598,38 @@ test "an array type through names, and the memory a length reads" {
         try std.testing.expectEqualStrings(spelled[0 .. spelled.len - 4], tree.getNodeSource(memory));
     }
     try std.testing.expect(try facts.lengthOf(file, spelledNode(tree, "h.len", 0).?) == null);
+}
+
+test "accesses: asking a place's sites again keeps nothing more on the run's memory" {
+    const source = shapes ++ "fn w(s: *S, t: S) void {\n    s.f = 1;\n    s.* = t;\n    const n = s.f;\n    _ = n;\n}\n";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const model = &project.sources[0].model;
+    const index = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .field and std.mem.eql(u8, d.name, "f")) break i;
+    } else return error.TestUnexpectedResult;
+    const place: accesses.Place = .{ .field = .{ .file = file, .index = @fromBackingInt(@intCast(index)) } };
+    const in_file = [_]Project.FileId{file};
+    // The first asking builds the file's index, kept for the run.
+    var count: usize = 0;
+    for (0..2) |_| {
+        var writes = accesses.writes(&facts, place, &in_file);
+        while (try writes.next()) |_| count += 1;
+        var reads = accesses.reads(&facts, place, &in_file);
+        while (try reads.next()) |_| count += 1;
+    }
+    try std.testing.expect(count > 0);
+    const built = arena.queryCapacity();
+    for (0..1000) |_| {
+        var writes = accesses.writes(&facts, place, &in_file);
+        while (try writes.next()) |_| {}
+        var reads = accesses.reads(&facts, place, &in_file);
+        while (try reads.next()) |_| {}
+    }
+    try std.testing.expectEqual(built, arena.queryCapacity());
 }

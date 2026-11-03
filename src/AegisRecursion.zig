@@ -312,7 +312,8 @@ fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
         if (each.input.classification == .@"test" or !program.own(each.id)) continue;
         try files.append(c.allocator, each.id);
     }
-    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, files.items)) |site| switch (site.kind) {
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, files.items);
+    while (try found_sites.next()) |site| switch (site.kind) {
         // A value made with the field moves no depth another holds.
         .init, .read => {},
         .set, .update => switch (site.reach) {

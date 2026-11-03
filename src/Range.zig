@@ -388,17 +388,21 @@ fn nonnegativeIn(c: *Context, file: Project.FileId, node: Ast.Node.Index, at: As
 fn written(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error!bool {
     if (try addressed(c, file, d)) return true;
     const tree = &c.project.at(file).file.tree;
-    for (try declarationWrites(c, file, d)) |site| if (tree.nodeTag(site.node) == .assign_destructure) return true;
+    var in_file: [1]Project.FileId = undefined;
+    var found_sites = try declarationWrites(c, file, d, &in_file);
+    while (try found_sites.next()) |site| if (tree.nodeTag(site.node) == .assign_destructure) return true;
     return false;
 }
 
 /// The writes `Facts.accesses` finds of a declaration: in its file for a function's own, in
 /// every file of the program's for one outside any function.
-fn declarationWrites(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error![]const Facts.accesses.Site {
+/// `in_file` holds the one file a function's own is read in.
+fn declarationWrites(c: *Context, file: Project.FileId, d: Model.Declaration.Id, in_file: *[1]Project.FileId) Context.Error!Facts.accesses.Each {
     const model = &c.project.at(file).model;
+    in_file.* = .{file};
     const files: []const Project.FileId = switch (model.scopes[@backingInt(model.declarations[@backingInt(d)].scope)].kind) {
         .file, .container => try programFiles(c),
-        else => &.{file},
+        else => in_file,
     };
     return Facts.accesses.writes(c.facts, .{ .declaration = .{ .file = file, .index = d } }, files);
 }
@@ -848,7 +852,9 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
     if (try addressed(c, decl.file, decl.index)) return null;
     _ = enclosing(tree, model, model.declarations[@backingInt(decl.index)].node) orelse return null;
     var out: ?Magnitude = 0;
-    for (try declarationWrites(c, decl.file, decl.index)) |site| {
+    var in_file: [1]Project.FileId = undefined;
+    var found_sites = try declarationWrites(c, decl.file, decl.index, &in_file);
+    while (try found_sites.next()) |site| {
         if (out == null) break;
         switch (site.kind) {
             // Its initializer, `x = v`, a destructure's element: what each gives. A destructure
@@ -1035,7 +1041,8 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
     const given = try givenTypes(c);
     if (given.any or given.shapes.contains(.{ decl.file, record.scope })) return false;
-    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
+    while (try found_sites.next()) |site| {
         if (site.kind == .covered or site.computed) return false;
     }
     return true;
@@ -1045,7 +1052,8 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
 /// writes are all shown (`storesShown`) and its address is never taken, so no pointer reaches it.
 pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (!try storesShown(c, decl)) return false;
-    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
+    while (try found_sites.next()) |site| {
         if (site.kind == .address and (site.reach == .exact or site.reach == .named)) return false;
     }
     return true;
@@ -1062,7 +1070,8 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
     try memo.map.put(c.allocator, key, null);
     if (!try storesShown(c, decl)) return null;
     var out: ?Magnitude = 0;
-    for (try Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c))) |site| {
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
+    while (try found_sites.next()) |site| {
         if (out == null) break;
         const site_tree = &c.project.at(site.file).file.tree;
         switch (site.kind) {
@@ -2901,7 +2910,9 @@ fn lengthWritten(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Cont
     if (try c.facts.resolve(file, memory) == .array) return false;
     const d = rootOf(tree, model, memory) orelse return false;
     if (try addressed(c, file, d)) return true;
-    for (try declarationWrites(c, file, d)) |site| {
+    var in_file: [1]Project.FileId = undefined;
+    var found_sites = try declarationWrites(c, file, d, &in_file);
+    while (try found_sites.next()) |site| {
         if (!site.part or site.kind == .init) continue;
         const target = site.target orelse continue;
         const site_tree = &c.project.at(site.file).file.tree;
@@ -2933,7 +2944,9 @@ fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context
     if (memo.map.get(key)) |known| return known;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const found = for (try declarationWrites(c, file, d)) |site| switch (site.kind) {
+    var in_file: [1]Project.FileId = undefined;
+    var found_sites = try declarationWrites(c, file, d, &in_file);
+    const found = while (try found_sites.next()) |site| switch (site.kind) {
         // An address discarded (`_ = &x;`) reaches nothing.
         .address => if (!discarded(tree, model, site.node)) break true,
         .covered => break true,

@@ -2903,7 +2903,8 @@ fn storesOf(self: *Facts, container: Container, field: Decl) ResolveError!?Value
 /// that a store here did not give: neither adds one.
 pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) ResolveError!?[]const Value {
     var targets: std.ArrayList(Value) = .empty;
-    for (try accesses.writesFor(self, .{ .field = field }, files, .{ .holders = false })) |site| {
+    var found_sites = accesses.writesFor(self, .{ .field = field }, files, .{ .holders = false });
+    while (try found_sites.next()) |site| {
         const tree = &self.project.at(site.file).file.tree;
         if (site.computed) {
             const target = site.target orelse return null;
@@ -4210,7 +4211,9 @@ pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key 
     // Read while its file's writes are (a store's callee, an `extern`'s shape): its stores are
     // not all known yet.
     if (try accesses.walking(self, decl.file)) return null;
-    for (try accesses.writes(self, .{ .declaration = decl }, &.{decl.file})) |site| {
+    const in_file = [_]Project.FileId{decl.file};
+    var found_sites = accesses.writes(self, .{ .declaration = decl }, &in_file);
+    while (try found_sites.next()) |site| {
         if (site.reach != .exact or (site.part and !parts)) return null;
         switch (site.kind) {
             .init, .read => continue,
@@ -4248,8 +4251,9 @@ fn loopedWith(self: *Facts, site: accesses.Site) ResolveError!?(?[]const Key) {
     const record = model.declarations[capture];
     if (tree.tokenTag(record.token - 1) != .asterisk) return @as(?[]const Key, &.{});
     var out: std.ArrayList(Key) = .empty;
-    const mentions = try accesses.reads(self, .{ .declaration = .{ .file = site.file, .index = @fromBackingInt(@intCast(capture)) } }, &.{site.file});
-    for (mentions) |mention| {
+    const in_file = [_]Project.FileId{site.file};
+    var mentions = accesses.reads(self, .{ .declaration = .{ .file = site.file, .index = @fromBackingInt(@intCast(capture)) } }, &in_file);
+    while (try mentions.next()) |mention| {
         if (mention.reach != .exact) return @as(?[]const Key, null);
         // The place the mention leads to through members, elements, payloads and `.*`.
         var top = mention.node;
@@ -7962,49 +7966,114 @@ pub const accesses = struct {
     /// named on a holder whose type does not resolve, a whole value stored over its container or
     /// one that holds it by value, and memory that does not resolve. An address taken is a write wherever
     /// the pointer goes, and is among them.
-    pub fn writes(facts: *Facts, place: Place, files: []const Project.FileId) Error![]const Site {
+    pub fn writes(facts: *Facts, place: Place, files: []const Project.FileId) Each {
         return writesFor(facts, place, files, .{});
     }
 
     /// `writes`, of what `need` asks.
-    pub fn writesFor(facts: *Facts, place: Place, files: []const Project.FileId, need: Need) Error![]const Site {
-        var out: Sites = .empty;
+    pub fn writesFor(facts: *Facts, place: Place, files: []const Project.FileId, need: Need) Each {
         // A query that keeps whole values and outside code's writes resolves nearly every store
         // of a file: it reads the file's one index, built once, not one of its own per name.
-        for (files) |file| try gather(facts, switch (place) {
-            .declaration => try writesOf(facts, file),
-            .field => |d| if (need.holders) try writesOf(facts, file) else try fieldWritesOf(facts, file, .{ .name = facts.project.at(d.file).model.declarations[@backingInt(d.index)].name, .holders = false }),
-        }, place, &out);
-        return out.items;
+        const of: Each.Of = switch (place) {
+            .declaration => .writes,
+            .field => if (need.holders) .writes else .field_writes,
+        };
+        return .{ .facts = facts, .place = place, .files = files, .of = of };
     }
 
     /// Each site in `files` that may read `place`, as `writes` finds them.
-    pub fn reads(facts: *Facts, place: Place, files: []const Project.FileId) Error![]const Site {
-        var out: Sites = .empty;
-        for (files) |file| try gather(facts, try readsOf(facts, file), place, &out);
-        return out.items;
+    pub fn reads(facts: *Facts, place: Place, files: []const Project.FileId) Each {
+        return .{ .facts = facts, .place = place, .files = files, .of = .reads };
     }
 
-    fn gather(facts: *Facts, index: *const File, place: Place, out: *Sites) Error!void {
-        if (index.places.get(place)) |found| try out.appendSlice(facts.gpa, found.items);
-        const decl = switch (place) {
-            inline else => |d| d,
-        };
-        const record = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-        // A local is reached only by its name and the pointers its address gives.
-        if (place == .declaration and !global(facts, decl)) return;
-        if (index.named.get(record.name)) |found| try reached(facts, out, found.items, .named);
-        if (place == .field) if (index.shapes.get(.{ .file = decl.file, .scope = record.scope })) |found| try reached(facts, out, found.items, .holder);
-        try reached(facts, out, index.unresolved.items, .unresolved);
-    }
+    /// The sites a query finds, read in place from each file's index, built once for the run,
+    /// in turn: a query copies none of them, so asking it again and again keeps nothing.
+    pub const Each = struct {
+        facts: *Facts,
+        place: Place,
+        files: []const Project.FileId,
+        of: Of,
+        /// The next file of `files` to read.
+        file: usize = 0,
+        /// The file being read: its index, the part of it, and the next site there.
+        index: ?*const File = null,
+        part: Part = .exact,
+        at: usize = 0,
+        /// How many sites each part held when the file's index was read: the sites the query
+        /// gives, as a list made then would hold them.
+        ends: [4]usize = @splat(0),
 
-    fn reached(facts: *Facts, out: *Sites, sites: []const Site, how: Reach) Error!void {
-        for (sites) |site| {
-            var one = site;
-            one.reach = how;
-            try out.append(facts.gpa, one);
+        pub const Of = enum { writes, field_writes, reads };
+        /// A file's sites in the order a query reads them: those that name the place, then for
+        /// a field or a global, a member so named on an unresolved holder, a whole value of the
+        /// container, memory that does not resolve. A local is reached only by its name and the
+        /// pointers its address gives.
+        const Part = enum { exact, named, holder, unresolved };
+
+        pub fn next(each: *Each) Error!?Site {
+            while (true) {
+                const index = each.index orelse {
+                    if (each.file == each.files.len) return null;
+                    const file = each.files[each.file];
+                    each.file += 1;
+                    each.index = switch (each.of) {
+                        .writes => try writesOf(each.facts, file),
+                        .field_writes => try fieldWritesOf(each.facts, file, .{ .name = each.record().name, .holders = false }),
+                        .reads => try readsOf(each.facts, file),
+                    };
+                    each.part = .exact;
+                    each.at = 0;
+                    for (&each.ends, 0..) |*end, part| end.* = each.sitesOf(each.index.?, @fromBackingInt(@intCast(part))).len;
+                    continue;
+                };
+                // Read again at each step, up to its length when the index was read: an index
+                // another file's reading is still filling may grow, and move, meanwhile.
+                const sites = each.sitesOf(index, each.part)[0..each.ends[@backingInt(each.part)]];
+                if (each.at < sites.len) {
+                    var one = sites[each.at];
+                    each.at += 1;
+                    if (each.part != .exact) one.reach = switch (each.part) {
+                        .exact => unreachable,
+                        .named => .named,
+                        .holder => .holder,
+                        .unresolved => .unresolved,
+                    };
+                    return one;
+                }
+                each.at = 0;
+                each.part = switch (each.part) {
+                    .exact => .named,
+                    .named => .holder,
+                    .holder => .unresolved,
+                    .unresolved => {
+                        each.index = null;
+                        continue;
+                    },
+                };
+            }
         }
-    }
+
+        fn record(each: *const Each) Model.Declaration {
+            const decl = switch (each.place) {
+                inline else => |d| d,
+            };
+            return each.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        }
+
+        fn sitesOf(each: *const Each, index: *const File, part: Part) []const Site {
+            const decl = switch (each.place) {
+                inline else => |d| d,
+            };
+            const local = each.place == .declaration and !global(each.facts, decl);
+            const found: ?Sites = switch (part) {
+                .exact => index.places.get(each.place),
+                .named => if (local) null else index.named.get(each.record().name),
+                .holder => if (each.place == .field) index.shapes.get(.{ .file = decl.file, .scope = each.record().scope }) else null,
+                .unresolved => if (local) null else index.unresolved,
+            };
+            return if (found) |list| list.items else &.{};
+        }
+    };
 
     /// Whether a declaration lives outside any function: in a file's or a container's scope.
     pub fn global(facts: *Facts, decl: Facts.Decl) bool {

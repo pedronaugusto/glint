@@ -2871,7 +2871,8 @@ const Walk = struct {
             .field => .{ .field = decl },
             else => .{ .declaration = decl },
         };
-        for (try Facts.accesses.writes(w.c.facts, place, try ownerFiles(w.c, w.flow))) |site| {
+        var found_sites = Facts.accesses.writes(w.c.facts, place, try ownerFiles(w.c, w.flow));
+        while (try found_sites.next()) |site| {
             const function = owner(w.flow, site.file, site.node) orelse continue;
             switch (site.kind) {
                 .init, .set, .update => {
@@ -3236,9 +3237,7 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
 const Wholes = struct { map: std.AutoHashMapUnmanaged(Facts.Container, []const Facts.Decl) = .empty };
 
 pub fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts.Decl {
-    // What it keeps in its memo stays for the run.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
+    // The walk is on the rule's memory for the file; what the memo keeps is copied to the run's.
     var roots: std.ArrayList(Facts.Container) = .empty;
     if (!try containersOf(c, value, &roots)) return null;
     if (roots.items.len == 0) return &.{};
@@ -3255,8 +3254,10 @@ pub fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts
             _ = try containersOf(c, try c.facts.declaration(field), &stack);
         }
     }
-    if (roots.items.len == 1) try memo.map.put(c.allocator, roots.items[0], out.items);
-    return out.items;
+    if (roots.items.len != 1) return out.items;
+    const kept = try c.facts.gpa.dupe(Facts.Decl, out.items);
+    try memo.map.put(c.facts.gpa, roots.items[0], kept);
+    return kept;
 }
 
 /// The containers a value's type is or holds (through pointers, optionals, error unions,
@@ -3441,7 +3442,9 @@ fn placeSteps(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.In
     };
     var steps: Step = .none;
     var elsewhere = false;
-    for (try Facts.accesses.writes(c.facts, place, if (local != null) &.{f.file} else try ownerFiles(c, flow))) |site| {
+    const in_file = [_]Project.FileId{f.file};
+    var found_sites = Facts.accesses.writes(c.facts, place, if (local != null) &in_file else try ownerFiles(c, flow));
+    while (try found_sites.next()) |site| {
         if (site.kind == .init or site.kind == .read) continue;
         const inside = site.file == f.file and in_loop.has(tree, site.node);
         if (!inside) {

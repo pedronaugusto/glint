@@ -515,16 +515,20 @@ fn entryOf(c: *Context, function: Callee, width: u16) Error!?[]const Lin {
     if (index.reflective) return null;
     const facts = index.callers.get(function) orelse return null;
     if (facts.escapes or facts.depth > entry_depth) return null;
+    // On `backing`: what joining the callers' states works through is dropped; the rows they
+    // join to are copied out.
+    var scratch: std.heap.ArenaAllocator = .init(c.backing);
+    defer scratch.deinit();
     var joined: ?State = null;
     for (facts.sites.items) |site| {
         const caller = try byCallers(c, site.file, site.function, width);
         if (!caller.supported or !caller.reached.contains(site.call)) return null;
         const given = (caller.calls.get(function) orelse return null) orelse return null;
         const state: State = .{ .rows = given };
-        joined = if (joined) |j| try joinRows(c.allocator, j, state) else state;
+        joined = if (joined) |j| try joinRows(scratch.allocator(), j, state) else state;
     }
     const s = joined orelse return null;
-    return s.rows;
+    return try persisted(c.allocator, s.rows);
 }
 
 /// What holds on either of two callers' states at their calls, written over the callee's
@@ -993,7 +997,9 @@ const Frame = struct {
             const d: Model.Declaration.Id = @fromBackingInt(@intCast(i));
             try f.decls.put(f.a, decl.token, d);
             var buffer: [1]Ast.Node.Index = undefined;
-            for (try Facts.accesses.writes(f.c.facts, .{ .declaration = .{ .file = f.file, .index = d } }, &.{f.file})) |site| switch (site.kind) {
+            const in_file = [_]Project.FileId{f.file};
+            var found_sites = Facts.accesses.writes(f.c.facts, .{ .declaration = .{ .file = f.file, .index = d } }, &in_file);
+            while (try found_sites.next()) |site| switch (site.kind) {
                 .address => if (f.tree.fullCall(&buffer, site.node) == null) try f.addressed.put(f.a, d, {}),
                 .covered => try f.addressed.put(f.a, d, {}),
                 else => {},
