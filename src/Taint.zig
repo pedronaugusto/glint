@@ -1656,7 +1656,6 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.In
     return out;
 }
 
-
 /// The call `node` in `file` makes, as `Facts.calls` reads it in the readings a summary reads
 /// its function with (`Function.readings`): where every instantiation's reading leaves its
 /// callee or its arguments unknown, each reading's callee, the choice of them, where every one
@@ -4147,7 +4146,6 @@ fn summaryFlow(c: *Context, program: *const Program) Context.Error!*Flow {
 /// function in it read with the bindings its chain of calls gives (`Function.readings`), so a
 /// call on what a generic's parameter binds (`ctx.hash(key)` in std's `HashMap`) calls what
 /// this instantiation is given. One summary per instantiation, closed as it is read.
-
 fn instanceSizes(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee) Context.Error!Summary {
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
