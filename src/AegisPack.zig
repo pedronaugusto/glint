@@ -156,33 +156,35 @@ fn checkAccess(c: *Context) Context.Error!void {
     if (!try begin(c, access)) return;
     const tree = try c.project.syntax(try c.source());
     const made_by_constructor = try constructed(c);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
+    // Each store's place (`x.f = v`, `x.f += v`, each a destructure writes: `p.bytes, n = …`).
+    if (made_by_constructor.len != 0) for (try Facts.accesses.storesIn(c.facts, c.file)) |site| {
+        if (site.target) |target| try checkFieldWrite(c, tree, target, site.node, made_by_constructor);
+    };
+    for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const form = Facts.accesses.formOf(tree.nodeTag(node));
         if (made_by_constructor.len != 0) {
             try checkLiteral(c, tree, node, made_by_constructor);
-            if (assigning(tag)) try checkFieldWrite(c, tree, tree.nodeData(node).node_and_node[0], node, made_by_constructor);
-            // Each place a destructure writes (`p.bytes, n = .{ secret, 1 }`).
-            if (tag == .assign_destructure) for (tree.assignDestructure(node).ast.variables) |target| try checkFieldWrite(c, tree, target, node, made_by_constructor);
-            if (tag == .address_of) {
+            if (form == .address_of) {
                 try checkFieldWrite(c, tree, tree.nodeData(node).node, node, made_by_constructor);
                 try checkWholeAddress(c, tree, node);
             }
         }
-        if (tag == .builtin_call_two or tag == .builtin_call_two_comma) {
-            try checkFieldBuiltin(c, tree, node);
-            try checkByteRead(c, tree, node);
-            continue;
-        }
-        if (tag == .call_one or tag == .call_one_comma) try checkByteRead(c, tree, node);
-        if (tag != .field_access) continue;
-        const data = tree.nodeData(node).node_and_token;
-        const name = try Model.identifier(c.allocator, tree.tokenSlice(data[1]));
+        try checkFieldBuiltin(c, tree, node);
+        try checkByteRead(c, tree, node);
+        if (form != .member) continue;
+        // A member read `x.f`: its name and holder as the place's path has them.
+        const path = try Facts.accesses.pathOf(c.facts, c.file, node);
+        const step = path.steps[0];
+        if (step.kind != .field) continue;
+        const name = step.name orelse continue;
         if (!backingName(name)) continue;
-        if (try typeValue(c, data[0])) continue;
+        const holder = path.steps[1].node;
+        const token = tree.lastToken(node);
+        if (try typeValue(c, holder)) continue;
         if (try refuted(c, node, name)) continue;
-        const k = (try requiredOwner(c, data[0], access, data[1])) orelse continue;
-        const is_backing = backing(k, name);
-        if (is_backing) try c.at(access, data[1], "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
+        const k = (try requiredOwner(c, holder, access, token)) orelse continue;
+        if (backing(k, name)) try c.at(access, token, "published aegis backing field bypasses exposure/guard/ownership contract; review this access");
     }
 }
 
@@ -191,7 +193,7 @@ fn checkAccess(c: *Context) Context.Error!void {
 /// whose `field_names` it ranges over that is one; by a name it computes, any field of the
 /// holder, undecided where the holder's kind has a backing field.
 fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Error!void {
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;
+    if (!Facts.isBuiltin(tree, node, "@field")) return;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return;
@@ -215,12 +217,10 @@ fn checkFieldBuiltin(c: *Context, tree: *const Ast, node: Ast.Node.Index) Contex
 }
 /// Whether a name `@field` spells or ranges over is a backing field: of kind `k`, or of any.
 fn backingNamed(c: *Context, named: Facts.FieldName, k: ?Contract.Kind) bool {
-    const candidates = [_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" };
     switch (named) {
         .name => |name| return if (k) |kind| backing(kind, name) else backingName(name),
         .computed => return true,
         .each_of, .names => {
-            for (candidates) |name| if (c.facts.mayName(named, name) and (if (k) |kind| backing(kind, name) else true)) return true;
             for (std.enums.values(Contract.Kind)) |each| {
                 if (k) |kind| if (each != kind) continue;
                 for (backingFields(each)) |name| if (c.facts.mayName(named, name)) return true;
@@ -278,9 +278,7 @@ fn checkByteRead(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Er
 
 /// Whether a kind publishes any backing field (`backing`).
 fn anyBacking(k: Contract.Kind) bool {
-    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" }) |candidate| if (backing(k, candidate)) return true;
-    for (backingFields(k)) |_| return true;
-    return false;
+    return backingFields(k).len != 0;
 }
 /// The published types only their own constructor may make: `err.PublicSource`, whose
 /// `classify` takes the reviewed reason that a literal of it skips.
@@ -716,34 +714,33 @@ fn publishedContainer(c: *Context, target: Facts.Target) Context.Error!?Facts.Co
     }
 }
 
-/// Whether `name` is a backing field of a published type of kind `k`.
+/// Whether `name` is a backing field of a published type of kind `k`: the one place the
+/// contract's field catalogue (`backingFields`) is read by name.
 fn backing(k: Contract.Kind, name: []const u8) bool {
-    return switch (k) {
-        .secret => std.mem.eql(u8, name, "material"),
-        .bytes => std.mem.eql(u8, name, "allocation") or std.mem.eql(u8, name, "used_len") or std.mem.eql(u8, name, "gpa"),
-        // The guarded value and the lock state of every guarded owner: a spin flag, a
-        // blocking mutex, a reader-writer lock and its admission count.
-        // An ordered owner's base lock too.
-        .guarded => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "lock") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "admitted") or std.mem.eql(u8, name, "base"),
-        // A guard's owner; an ordered guard's base guard.
-        .guard => std.mem.eql(u8, name, "owner") or std.mem.eql(u8, name, "base"),
-        // A value initialized once: its publication state, its election lock and waiters,
-        // and the value itself before the state says it is there.
-        .once => std.mem.eql(u8, name, "state") or std.mem.eql(u8, name, "mutex") or std.mem.eql(u8, name, "changed") or std.mem.eql(u8, name, "data"),
-        // A value one logical task owns: the value and the identity that is checked.
-        .confined => std.mem.eql(u8, name, "data") or std.mem.eql(u8, name, "owner"),
-        else => for (backingFields(k)) |field| {
-            if (std.mem.eql(u8, name, field)) break true;
-        } else false,
-    };
+    for (backingFields(k)) |field| if (std.mem.eql(u8, name, field)) return true;
+    return false;
 }
 
-/// The private state of the published types after the guards: what each type's source keeps
+/// The private state of the published types: the secret's material, the bytes' allocation, the
+/// guards' value and lock state, and after them what each type's source keeps
 /// behind its operations (the initialized prefix and its cursors, a budget's charge, an owner's
 /// payload and witness, a loan's copy, a staged payload, a machine's state, a scope's record,
 /// the checked pointer, the unparsed value, the decision bit).
 fn backingFields(k: Contract.Kind) []const []const u8 {
     return switch (k) {
+        .secret => &.{"material"},
+        .bytes => &.{ "allocation", "used_len", "gpa" },
+        // The guarded value and the lock state of every guarded owner: a spin flag, a
+        // blocking mutex, a reader-writer lock and its admission count. An ordered owner's
+        // base lock too.
+        .guarded => &.{ "data", "lock", "mutex", "state", "admitted", "base" },
+        // A guard's owner; an ordered guard's base guard.
+        .guard => &.{ "owner", "base" },
+        // A value initialized once: its publication state, its election lock and waiters, and
+        // the value itself before the state says it is there.
+        .once => &.{ "state", "mutex", "changed", "data" },
+        // A value one logical task owns: the value and the identity that is checked.
+        .confined => &.{ "data", "owner" },
         .inline_store => &.{ "storage", "used", "head" },
         .buffer => &.{ "storage", "gpa", "maximum", "used", "head" },
         .limit => &.{"maximum"},
@@ -767,9 +764,9 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
     };
 }
 
+/// Whether `name` is a backing field of any published type.
 fn backingName(name: []const u8) bool {
-    for ([_][]const u8{ "material", "allocation", "used_len", "gpa", "data", "lock", "mutex", "state", "admitted", "owner", "changed", "base" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
-    for (std.enums.values(Contract.Kind)) |k| for (backingFields(k)) |field| if (std.mem.eql(u8, name, field)) return true;
+    for (std.enums.values(Contract.Kind)) |k| if (backing(k, name)) return true;
     return false;
 }
 
