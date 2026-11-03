@@ -3661,16 +3661,13 @@ fn assigned(model: *const Model, tree: *const Ast, node: Ast.Node.Index) bool {
 /// defers it, so a write there holds past the statement.
 fn statementOf(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
-        .block, .block_semicolon, .block_two, .block_two_semicolon => return at,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (Model.runsWith(tree, parent, at)) {
+        .sequenced, .labeled => return at,
+        // A `for` that writes the memory it is given sets each element, so the memory is all
+        // written once it ends: its inputs run every time.
+        .always => {},
         // A deferred write runs where the scope ends, after what follows it.
-        .@"orelse", .@"catch", .bool_and, .bool_or, .@"defer", .@"errdefer" => return null,
-        else => {
-            if (tree.fullIf(parent) != null or tree.fullSwitch(parent) != null or tree.fullWhile(parent) != null) return null;
-            // A `for` that writes the memory it is given sets each element, so the memory is
-            // all written once it ends; a `for` around the write runs it on some paths only.
-            if (tree.fullFor(parent)) |loop| if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return null;
-        },
+        .branch, .loop, .deferred, .unevaluated, .compile_time, .function => return null,
     };
     return null;
 }
@@ -4473,17 +4470,10 @@ fn conditional(tree: *const Ast, model: *const Model, inner: Ast.Node.Index, top
     var at = inner;
     while (at != top) : (at = model.parentOf(at).?) {
         const up = model.parentOf(at) orelse return true;
-        switch (tree.nodeTag(up)) {
-            .@"orelse", .@"catch", .bool_and, .bool_or => if (tree.nodeData(up).node_and_node[1] == at) return true,
-            else => {
-                if (tree.fullIf(up)) |branch| {
-                    if (branch.ast.cond_expr != at) return true;
-                } else if (tree.fullSwitch(up)) |choice| {
-                    if (choice.ast.condition != at) return true;
-                } else if (tree.fullWhile(up) != null or tree.fullFor(up) != null) {
-                    return true;
-                } else if (isBlock(tree, up) and blockLabel(tree, up) != null) return true;
-            },
+        switch (Model.runsWith(tree, up, at)) {
+            .always, .sequenced, .compile_time, .deferred => {},
+            // Never run here: `@TypeOf`'s operand, another function's body.
+            .labeled, .branch, .loop, .unevaluated, .function => return true,
         }
     }
     return false;

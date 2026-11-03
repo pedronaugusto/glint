@@ -1887,17 +1887,9 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, root: Ast.Nod
     var at = node;
     while (at != root) {
         const parent = model.parentOf(at) orelse return false;
-        switch (tree.nodeTag(parent)) {
-            .bool_and, .bool_or, .@"orelse", .@"catch" => if (tree.nodeData(parent).node_and_node[0] != at) return false,
-            .@"switch", .switch_comma => if (tree.nodeData(parent).node_and_extra[0] != at) return false,
-            .fn_decl, .@"defer", .@"errdefer" => return false,
-            else => if (tree.fullIf(parent)) |branch| {
-                if (branch.ast.cond_expr != at) return false;
-            } else if (tree.fullWhile(parent)) |loop| {
-                if (loop.ast.cond_expr != at) return false;
-            } else if (tree.fullFor(parent)) |loop| {
-                if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return false;
-            },
+        switch (Model.runsWith(tree, parent, at)) {
+            .always, .sequenced, .labeled, .compile_time => {},
+            .branch, .loop, .deferred, .unevaluated, .function => return false,
         }
         at = parent;
     }
@@ -2812,8 +2804,8 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     var at = bare(tree, node);
     // An array's length, or that of an array behind a pointer, is its type's: no store or
     // pointer writes it.
-    if (tree.nodeTag(at) == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "len")) {
-        switch (try c.facts.resolve(file, tree.nodeData(at).node_and_token[0])) {
+    if (try c.facts.lengthOf(file, at)) |memory| {
+        switch (try c.facts.resolve(file, memory)) {
             .array => return null,
             .pointer => |inner| if (inner.* == .array) return null,
             else => {},
@@ -4114,9 +4106,8 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
             var buffer: [2]Ast.Node.Index = undefined;
             const literal_init = decl_tree.fullArrayInit(&buffer, init) orelse return null;
             const array_type = literal_init.ast.type_expr.unwrap() orelse return null;
-            if (decl_tree.nodeTag(array_type) != .array_type) return null;
-            const length_node = decl_tree.nodeData(array_type).node_and_node[0];
-            if (decl_tree.nodeTag(length_node) == .identifier and std.mem.eql(u8, decl_tree.tokenSlice(decl_tree.nodeMainToken(length_node)), "_")) return literal_init.ast.elements.len;
+            const array = (try c.facts.arrayType(decl.file, array_type)) orelse return null;
+            if (array.length == null) return literal_init.ast.elements.len;
             break :blk array_type;
         },
         .field => (c.project.at(decl.file).model.containerField(decl_tree, record.node) orelse return null).ast.type_expr.unwrap(),
@@ -4130,9 +4121,8 @@ fn fixedLength(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Contex
         if (pointer.size != .one) return null;
         t = pointer.ast.child_type;
     }
-    if (decl_tree.nodeTag(t) != .array_type and decl_tree.nodeTag(t) != .array_type_sentinel) return null;
-    const length_node = if (decl_tree.nodeTag(t) == .array_type) decl_tree.nodeData(t).node_and_node[0] else decl_tree.nodeData(t).node_and_extra[0];
-    return (try valueOf(c, decl.file, length_node, 0)) orelse null;
+    const array = (try c.facts.arrayType(decl.file, t)) orelse return null;
+    return (try valueOf(c, array.file, array.length orelse return null, 0)) orelse null;
 }
 
 /// The integer type an expression computes in at a pointer width, where it is one (Bounds).

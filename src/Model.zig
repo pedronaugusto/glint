@@ -232,6 +232,59 @@ pub fn conditionOf(tree: *const Ast, node: Ast.Node.Index) Condition {
     return .{ .compare = .{ .node = at, .order = order, .left = left, .right = right } };
 }
 
+/// How `parent` runs `child`, one of its parts, each time `parent` runs: Model's one reading of
+/// whether a part runs on every path through what holds it (`runsWith`).
+pub const Runs = enum {
+    /// Every time: an operand, a left side, a condition, a `for`'s input, a `switch`'s operand.
+    always,
+    /// A statement of a block: every time, unless one before it leaves the block.
+    sequenced,
+    /// A statement of a labeled block, which a `break` before it may also leave early.
+    labeled,
+    /// On some paths: an `if`'s branch, a `switch`'s prong, a loop's `else`, the right side of
+    /// `and`, `or`, `orelse` or `catch`.
+    branch,
+    /// Once a pass, perhaps none: a loop's body, a `while`'s continue expression.
+    loop,
+    /// Where the scope ends, later: a `defer`'s or an `errdefer`'s statement.
+    deferred,
+    /// Never: `@TypeOf`'s operand, read for its type alone.
+    unevaluated,
+    /// As the program compiles: a `comptime` block.
+    compile_time,
+    /// In another frame: a function's body.
+    function,
+};
+
+pub fn runsWith(tree: *const Ast, parent: Ast.Node.Index, child: Ast.Node.Index) Runs {
+    switch (tree.nodeTag(parent)) {
+        .bool_and, .bool_or, .@"orelse", .@"catch" => return if (tree.nodeData(parent).node_and_node[0] == child) .always else .branch,
+        .@"switch", .switch_comma => return if (tree.nodeData(parent).node_and_extra[0] == child) .always else .branch,
+        .fn_decl => return .function,
+        .@"defer", .@"errdefer" => return .deferred,
+        .@"comptime" => return .compile_time,
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@TypeOf")) .unevaluated else .always;
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            const lbrace = tree.nodeMainToken(parent);
+            const labeled = lbrace >= 2 and tree.tokenTag(lbrace - 1) == .colon and tree.tokenTag(lbrace - 2) == .identifier;
+            return if (labeled) .labeled else .sequenced;
+        },
+        else => {},
+    }
+    if (tree.fullIf(parent)) |branch| return if (branch.ast.cond_expr == child) .always else .branch;
+    if (tree.fullWhile(parent)) |loop| {
+        if (loop.ast.cond_expr == child) return .always;
+        return if (loop.ast.else_expr.unwrap() == child) .branch else .loop;
+    }
+    if (tree.fullFor(parent)) |loop| {
+        if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, child) != null) return .always;
+        return if (loop.ast.else_expr.unwrap() == child) .branch else .loop;
+    }
+    return .always;
+}
+
 /// The build modes a compile-time condition over `builtin.mode` holds in: `mode == .debug`,
 /// `!=`, `!`, `and`, `or`, `true` and `false`, through the builtin import's and the mode's
 /// lexical aliases and a constant that names such a condition. Null for anything else.
@@ -768,4 +821,29 @@ test "morning named tests retain declaration references" {
     defer file.deinit();
     const model = try init(&file);
     try std.testing.expectEqual(@as(u32, 1), model.declarations[0].references); // safe: one named test reference.
+}
+
+test "runsWith: how a part runs each time what holds it runs" {
+    var file = try File.init(std.testing.allocator, "fn f(a: bool, xs: []u8) u8 { const n = blk: { if (a) break :blk @as(u8, 1); break :blk 2; }; for (xs) |x| _ = x; defer _ = a; _ = @TypeOf(a and a); return if (a or n > 0) n else 0; }", .{});
+    defer file.deinit();
+    const model = try init(&file);
+    const tree = &file.tree;
+    const Case = struct { part: []const u8, runs: Runs };
+    for ([_]Case{
+        .{ .part = "n > 0", .runs = .branch },
+        .{ .part = "a or n > 0", .runs = .always },
+        .{ .part = "break :blk @as(u8, 1)", .runs = .branch },
+        .{ .part = "if (a) break :blk @as(u8, 1)", .runs = .labeled },
+        .{ .part = "for (xs) |x| _ = x", .runs = .sequenced },
+        .{ .part = "xs", .runs = .always },
+        .{ .part = "_ = x", .runs = .loop },
+        .{ .part = "_ = a", .runs = .deferred },
+        .{ .part = "a and a", .runs = .unevaluated },
+    }) |case| {
+        const part = for (0..tree.nodes.len) |i| {
+            const each: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (std.mem.eql(u8, tree.getNodeSource(each), case.part)) break each;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(case.runs, runsWith(tree, model.parentOf(part).?, part));
+    }
 }

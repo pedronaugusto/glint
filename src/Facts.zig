@@ -4910,7 +4910,8 @@ pub fn sizedMemory(self: *Facts, value: Value) ResolveError!bool {
     };
 }
 
-fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!Length {
+/// What a field `name` read on a value of `value` reads (`memoryField`).
+pub fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!Length {
     switch (value) {
         // A string literal's bytes.
         .scalar => return .memory,
@@ -5063,6 +5064,58 @@ fn heldContainer(value: Value) ?Container {
         .error_union, .optional => |inner| heldContainer(inner.*),
         else => null,
     };
+}
+
+/// An array type, its parts nodes of `file`: its length (null for `_`, which its literal's
+/// elements give), its element's type, and its sentinel.
+pub const ArrayType = struct { file: Project.FileId, length: ?Ast.Node.Index, element: Ast.Node.Index, sentinel: ?Ast.Node.Index };
+
+/// The array type `node` writes, through parentheses, `comptime` and the constants that name one
+/// (`const Buf = [32]u8`); null for any other expression, or a name that does not resolve. Its
+/// length is a node: what it counts is its constant value.
+pub fn arrayType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?ArrayType {
+    var at_file = file;
+    var at = node;
+    for (0..16) |_| {
+        const tree = &self.project.at(at_file).file.tree;
+        if (tree.fullArrayType(at)) |array| {
+            const count = array.ast.elem_count;
+            const inferred = tree.nodeTag(count) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(count)), "_");
+            return .{ .file = at_file, .length = if (inferred) null else count, .element = array.ast.elem_type, .sentinel = array.ast.sentinel.unwrap() };
+        }
+        switch (tree.nodeTag(at)) {
+            .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+            .@"comptime" => at = tree.nodeData(at).node,
+            .identifier, .field_access => {
+                // A name that does not resolve shows no array type: null, as for none.
+                const decl = switch (try self.definition(at_file, at)) {
+                    .decl => |found| found,
+                    .none, .unknown => return null,
+                };
+                const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+                if (record.kind != .variable) return null;
+                const held = &self.project.at(decl.file).file.tree;
+                const constant = held.fullVarDecl(record.node) orelse return null;
+                if (held.tokenTag(constant.ast.mut_token) != .keyword_const) return null;
+                at_file = decl.file;
+                at = constant.ast.init_node.unwrap() orelse return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The memory whose length `node` reads, through parentheses: `x` of `x.len` where `x` is an
+/// array, a slice or a pointer to an array (`memoryField`). Null for anything else, a field a
+/// container declares by that name among them, and where what `x` is does not resolve.
+pub fn lengthOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Ast.Node.Index {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    if (tree.nodeTag(at) != .field_access) return null;
+    const holder, const member_token = tree.nodeData(at).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(member_token), "len")) return null;
+    return if (try self.memoryField(file, at) != .field) holder else null;
 }
 
 pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Named {
@@ -7577,7 +7630,7 @@ pub const accesses = struct {
                 const holder = tree.nodeData(at).node_and_token[0];
                 const value = try facts.resolve(file, holder);
                 const name = try Model.identifier(facts.gpa, tree.tokenSlice(tree.nodeData(at).node_and_token[1]));
-                try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !header(name, value) });
+                try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !try header(facts, name, value) });
                 at = holder;
             },
             .array_access => {
@@ -7608,7 +7661,7 @@ pub const accesses = struct {
                             .name => |spelled| spelled,
                             .each_of, .names, .computed => null,
                         };
-                        try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !header(name orelse "", value) });
+                        try steps.append(facts.gpa, .{ .node = at, .kind = .field, .holder = value, .name = name, .crosses = pointing(value) and !try header(facts, name orelse "", value) });
                         at = args[0];
                         continue;
                     }
@@ -9100,20 +9153,12 @@ pub const accesses = struct {
         };
     }
 
-    /// Whether `name` on a pointer `value` is a slice's own `len` or `ptr`: the slice's memory,
-    /// not what it points at. On a pointer to a container it is the container's member, which a
-    /// dereference reaches; on one whose pointee does not resolve it may be either, and the
-    /// slice's own is kept.
-    fn header(name: []const u8, value: Facts.Value) bool {
+    /// Whether `name` on a pointer `value` is a slice's own `len` or `ptr` (`Facts.memoryField`):
+    /// the slice's memory, not what it points at. A container's own member, or one of a value
+    /// that does not resolve, is reached through the pointer.
+    fn header(facts: *Facts, name: []const u8, value: Facts.Value) Error!bool {
         if (!std.mem.eql(u8, name, "len") and !std.mem.eql(u8, name, "ptr")) return false;
-        const held_type = switch (value) {
-            .pointer => |inner| inner.*,
-            else => return false,
-        };
-        return switch (held_type) {
-            .instance, .container => false,
-            else => true,
-        };
+        return try facts.lengthOfValue(value, name) != .field;
     }
 
     /// Whether `node` runs in a `defer` or an `errdefer` of its function.

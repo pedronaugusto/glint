@@ -561,3 +561,40 @@ test "batch 2: an update's operation, error names and sets, a condition's truths
     try std.testing.expect((try facts.literalOf(file, spelledNode(tree, "5", 0).?)).? == .number);
     try std.testing.expect(try facts.literalOf(file, spelledNode(tree, "c", 0).?) == null);
 }
+
+test "an array type through names, and the memory a length reads" {
+    const source =
+        \\const N = 4;
+        \\const Buf = [N]u8;
+        \\const Named = (Buf);
+        \\const Header = struct { len: u32 };
+        \\const Item = struct { x: u8 };
+        \\fn f(b: Named, s: []const u8, p: *const [3]u16, h: *Header, items: []Item) usize {
+        \\    const t: [2:0]u8 = .{ 1, 2 };
+        \\    return b.len + s.len + p.len + h.len + items.len + t.len;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    // `Named` is `(Buf)`, which is `[N]u8`: its length the node `N`, its element `u8`.
+    const named = (try facts.arrayType(file, spelledNode(tree, "Named", 0).?)).?;
+    try std.testing.expectEqualStrings("N", tree.getNodeSource(named.length.?));
+    try std.testing.expectEqualStrings("u8", tree.getNodeSource(named.element));
+    try std.testing.expect(named.sentinel == null);
+    const sentinel = (try facts.arrayType(file, spelledNode(tree, "[2:0]u8", 0).?)).?;
+    try std.testing.expectEqualStrings("0", tree.getNodeSource(sentinel.sentinel.?));
+    try std.testing.expect(try facts.arrayType(file, spelledNode(tree, "Header", 0).?) == null);
+    // The length of an array, a slice, a pointer to an array, and a slice of structs; a
+    // field `len` a struct declares, read through a pointer to it, is none.
+    for ([_][]const u8{ "b.len", "s.len", "p.len", "items.len", "t.len" }) |spelled| {
+        const memory = (try facts.lengthOf(file, spelledNode(tree, spelled, 0).?)).?;
+        try std.testing.expectEqualStrings(spelled[0 .. spelled.len - 4], tree.getNodeSource(memory));
+    }
+    try std.testing.expect(try facts.lengthOf(file, spelledNode(tree, "h.len", 0).?) == null);
+}
