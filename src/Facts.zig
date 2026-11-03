@@ -8433,11 +8433,11 @@ pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
 
 /// One call of a function the program makes: its arguments, after the receiver a method call
 /// on a value passes first (`holder`).
-const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
+pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
 const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
 
 /// Every call of `function` the program makes, or null where it `escapes`. Read once.
-fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
+pub fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const read = try self.memo(CallSites);
     if (read.map.get(function)) |known_sites| return known_sites;
     const found = try self.scanCallSites(function, .consumers);
