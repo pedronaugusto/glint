@@ -975,8 +975,14 @@ fn heldInRecord(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typ
         else => return .other,
     };
     if (try c.inLibrary(Contract.library, container.file)) return .other;
+    // std's records (`std.EnumSet(E).Iterator`) are none of the program's: their own fields
+    // are std's internals, read as their types say.
+    if (!try c.facts.program(container.file)) return .other;
     for (try c.facts.heldFields(container)) |field| {
         if (field.value == .pointer) continue;
+        // A field typed only by a generic's binding (`state: State` of `Layer(State, ...)`):
+        // what the binding gives is judged where it is bound (`checkBinding`).
+        if (bindingTyped(field.value)) continue;
         if (try typed(c, field.value, depth + 1) != .other) return .unknown;
         if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown;
     }
