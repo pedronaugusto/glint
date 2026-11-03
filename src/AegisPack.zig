@@ -2676,7 +2676,10 @@ const Flow = struct {
             };
             if (!f.aggregate and !f.pointer and try f.stored(stmt)) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), "same local owner is stored after its cleanup or transfer on this straight-line path");
-                state = .released;
+                // A std handle is a value: the store copies it, and either copy may close the
+                // one handle after (`job.file = fresh; ... fresh.close(io)`), so the local is
+                // held beside the store, as a call given it holds it.
+                state = if (f.kind == .std_handle) .passed else .released;
                 continue;
             }
             const tag = f.tree.nodeTag(stmt);

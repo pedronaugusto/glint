@@ -1498,8 +1498,12 @@ fn nameViewed(c: *Context, resources: []const ?Facts.Container, file: Project.Fi
     const d = reference.declaration orelse return false;
     const record = model.declarations[@backingInt(d)];
     // A parameter is a view in its own function; read through a call (`Binding`), it is
-    // what that call passes.
-    if (record.kind == .parameter) return argumentViewed(c, resources, file, record, next, bound);
+    // what that call passes. One that points (`s: *Scratch`, a method's receiver) reaches
+    // memory its caller holds, whatever the call passes: what is read through it stays there.
+    if (record.kind == .parameter) {
+        if (try c.facts.resolve(file, node) == .pointer) return true;
+        return argumentViewed(c, resources, file, record, next, bound);
+    }
     // A capture holds what it binds: a view where that is one (an owner a call made,
     // unwrapped, is handed over).
     if (record.kind == .capture) {

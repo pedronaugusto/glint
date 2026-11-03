@@ -3,6 +3,8 @@
         // glint-b precision: an acquisition assigned to a local, put in a literal, or handed to a call is not followed (undecided, never clear), so its release there is not seen
         "aggregate/glintb-literal/twin.zig",
         "assignment/glintb-write/twin.zig",
+        // glint-b precision: a std handle stored into memory, then closed by its local: the stored copy may be closed again by its holder, which A003 does not follow (undecided, never a finding)
+        "assignment/g08-handle_stored_closed/twin.zig",
         "call/glintb-helper/twin.zig",
         // glint-b precision: an owner held in a record's field or a tuple's element (a helper's result, a local's field) is not followed (undecided, never clear), so its release there is not seen
         "aggregate/ps2-record_owner/twin.zig",
