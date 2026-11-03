@@ -5,32 +5,5 @@
         // a type is comptime-only: no builtin moves one through memory
         .memory,
     },
-    .open = .{
-        // matrix A016: an integer type that resolves to no primitive (here a type function's call) is dropped, never undecided
-        "call/mx-type_function/hole.zig",
-        // matrix A016: a function-pointer field's signature is no public function declaration, so its two ids are not read
-        "call/mx-fn_pointer_signature/hole.zig",
-        // matrix A016: `parentID` is not read as naming an id; only `Id` and `_id` spellings are
-        "call/mx-camel_id/hole.zig",
-        // matrix A016: an `if` capture's type resolves to no primitive and is dropped
-        "capture/mx-configured_type/hole.zig",
-        // matrix A016: a private struct made public by `pub const Link = Edge` is not read as public
-        "address/mx-private_struct_reexported/hole.zig",
-        // matrix A016: a labeled block's type resolves to no primitive and is dropped
-        "jump/mx-labeled_block_type/hole.zig",
-        // matrix A016: a struct a public generic returns is not read as public
-        "jump/mx-returned_struct/hole.zig",
-        // matrix A016: the integer an inline loop picks resolves to no primitive and is dropped
-        "inline_loop/mx-smallest_integer/hole.zig",
-        // matrix A016: two ids of one comptime type parameter are dropped, never undecided
-        "compile_time/mx-generic_ids/hole.zig",
-        // matrix A016: `@Int` of a computed width resolves to no primitive and is dropped
-        "operator/mx-width_product/hole.zig",
-        // matrix A016: an optional type's payload by `orelse` and `.?` resolves to no primitive and is dropped
-        "unwrap/mx-optional_type/hole.zig",
-        // matrix A016: an anonymous struct type in a public signature is not read as a public struct
-        "aggregate/mx-anonymous_struct_param/hole.zig",
-        // matrix A016: a type an `if` expression chooses resolves to no primitive and is dropped
-        "branch/mx-chosen_width/hole.zig",
-    },
+    .open = .{},
 }
