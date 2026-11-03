@@ -289,7 +289,18 @@ test "accesses: what an expression's value does where it stands" {
         .{ "fn f(x: u32) void { const y = x; _ = y; }", "x", "initializes" },
         .{ "const S = struct { a: u32 = n }; const n: u32 = 1;", "n", "initializes" },
         .{ "fn f(x: u32) u32 { return x; }", "x", "returned" },
-        .{ "fn f() void { var x: [n]u8 = undefined; _ = &x; } const n = 4;", "n", "typed" },
+        .{ "fn f() void { var x: [n]u8 = undefined; _ = &x; } const n = 4;", "n", "typed length" },
+        .{ "fn f(x: *u32) void { _ = x; }", "u32", "typed pointer_child" },
+        .{ "fn f(x: ?u8) void { _ = x; }", "u8", "typed optional_child" },
+        .{ "fn f() anyerror!u8 { return 0; }", "u8", "typed error_payload" },
+        .{ "fn f() anyerror!u8 { return 0; }", "anyerror", "typed error_set" },
+        .{ "fn f(x: u8) void { _ = x; }", "u8", "typed parameter" },
+        .{ "fn f() u8 { return 0; }", "u8", "typed result" },
+        .{ "const x: u8 = 0;", "u8", "typed declared" },
+        .{ "fn f(x: [4:0]u8) void { _ = x; }", "u8", "typed array_element" },
+        .{ "fn f(a: bool, b: bool) bool { return a and b; }", "a", "logic left" },
+        .{ "fn f(a: bool, b: bool) bool { return a or b; }", "b", "logic right" },
+        .{ "fn f(a: bool) bool { return !a; }", "a", "logic negated" },
         .{ "fn g() void {} fn f() void { g(); }", "g()", "statement" },
         .{ "fn g() void {} fn f() void { defer g(); }", "g()", "statement" },
     };
@@ -316,6 +327,8 @@ test "accesses: what an expression's value does where it stands" {
         const use = try accesses.useOf(&facts, file, node);
         const got = switch (use) {
             .carried => |carried| try std.fmt.allocPrint(a, "carried {s}", .{@tagName(carried.how)}),
+            .typed => |typed| try std.fmt.allocPrint(a, "typed {s}", .{@tagName(typed.part)}),
+            .logic => |logic| try std.fmt.allocPrint(a, "logic {s}", .{@tagName(logic.side)}),
             else => @tagName(use),
         };
         if (std.mem.eql(u8, got, want)) continue;
@@ -443,4 +456,79 @@ test "Facts: an enum's and a union's tags written with no type are members" {
     try std.testing.expect(try facts.declaration(facts.member(e, "a").?) == .instance);
     // An enum's value holds no field.
     try std.testing.expectEqual(@as(usize, 0), (try facts.heldFields(e)).len);
+}
+
+test "batch 2: an update's operation, error names and sets, a condition's truths, a value's leaves, a literal" {
+    const source =
+        \\const E = error{ Canceled, Timeout };
+        \\const F = E || error{Other};
+        \\const R = E!u8;
+        \\const canceled = error.Canceled;
+        \\fn g() R { return 0; }
+        \\fn h() !u8 { return 0; }
+        \\fn f(x: *u32, a: bool, b: bool, c: ?u8) u8 {
+        \\    x.* +%= 1;
+        \\    _ = @atomicRmw(u32, x, .Max, 2, .seq_cst);
+        \\    _ = canceled;
+        \\    _ = E.Timeout;
+        \\    if (!(a and b) or x.* < 4) {}
+        \\    if ((a) and (x.* == 2)) {}
+        \\    return if (a) .{} else blk: { if (b) break :blk c orelse 3; break :blk @as(u8, 5); };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    // `x.* +%= 1` wraps an add; `@atomicRmw(.., .Max, ..)` takes the larger.
+    const update = (try accesses.storeInto(&facts, file, spelledNode(tree, "x.*", 0).?)).?;
+    try std.testing.expectEqual(.add, update.operator.?.op.op);
+    try std.testing.expectEqual(.wrapping, update.operator.?.op.overflow);
+    // Errors by name, through a const and a set's member; sets through `||`, `E!T` and consts.
+    try std.testing.expectEqualStrings("Canceled", (try facts.errorName(file, spelledNode(tree, "canceled", 0).?)).?);
+    try std.testing.expectEqualStrings("Timeout", (try facts.errorName(file, spelledNode(tree, "E.Timeout", 0).?)).?);
+    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "E || error{Other}", 0).?, "Other") == .yes);
+    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "R", 0).?, "Timeout") == .yes);
+    try std.testing.expect(try facts.errorSetHolds(file, spelledNode(tree, "R", 0).?, "Other") == .no);
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const g = facts.member(facts.rootOf(file), "g").?;
+    const g_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(g.index)].node).?;
+    try std.testing.expect(try facts.returnedErrors(file, g_proto) == .set);
+    const h = facts.member(facts.rootOf(file), "h").?;
+    const h_proto = tree.fullFnProto(&buffer, project.sources[0].model.declarations[@backingInt(h.index)].node).?;
+    try std.testing.expect(try facts.returnedErrors(file, h_proto) == .inferred);
+    // `!(a and b) or x.* < 4` false: `a and b` true, so `a` and `b`, and `x.* < 4` false.
+    const condition = spelledNode(tree, "!(a and b) or x.* < 4", 0).?;
+    const shown = (try facts.truthsWhen(file, condition, false)).?;
+    try std.testing.expectEqual(@as(usize, 3), shown.len);
+    try std.testing.expectEqualStrings("a", tree.getNodeSource(shown[0].part));
+    try std.testing.expect(shown[0].value);
+    try std.testing.expectEqualStrings("x.* < 4", tree.getNodeSource(shown[2].part));
+    try std.testing.expect(!shown[2].value);
+    // True, it is kept whole: neither side alone is shown.
+    const whole = (try facts.truthsWhen(file, condition, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), whole.len);
+    try std.testing.expect(whole[0].part == condition and whole[0].value);
+    // Each part is read inside its parentheses: `(a) and (x.* == 2)` true shows `a` and `x.* == 2`.
+    const grouped = (try facts.truthsWhen(file, spelledNode(tree, "(a) and (x.* == 2)", 0).?, true)).?;
+    try std.testing.expectEqual(@as(usize, 2), grouped.len);
+    try std.testing.expectEqualStrings("a", tree.getNodeSource(grouped[0].part));
+    try std.testing.expectEqualStrings("x.* == 2", tree.getNodeSource(grouped[1].part));
+    // The values the `if` gives: `.{}`, `c`, `3`, `5`.
+    const result = spelledNode(tree, "if (a) .{} else blk: { if (b) break :blk c orelse 3; break :blk @as(u8, 5); }", 0).?;
+    const leaves = (try accesses.valuesOf(&facts, file, result)).leaves;
+    try std.testing.expectEqual(@as(usize, 4), leaves.len);
+    var spelled: [4][]const u8 = undefined;
+    for (leaves, &spelled) |leaf, *out| out.* = tree.getNodeSource(leaf);
+    for ([_][]const u8{ ".{}", "c", "3", "5" }) |want| {
+        for (spelled) |got| {
+            if (std.mem.eql(u8, got, want)) break;
+        } else return error.TestUnexpectedResult;
+    }
+    try std.testing.expect((try facts.literalOf(file, spelledNode(tree, "5", 0).?)).? == .number);
+    try std.testing.expect(try facts.literalOf(file, spelledNode(tree, "c", 0).?) == null);
 }

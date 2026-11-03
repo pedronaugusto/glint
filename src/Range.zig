@@ -1761,9 +1761,11 @@ fn gather(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error
     while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .fn_decl => break,
-            .bool_and, .bool_or => {
-                const lhs, const rhs = tree.nodeData(parent).node_and_node;
-                if (rhs == at) try held(c, file, &out, lhs, tree.nodeTag(parent) == .bool_and, node);
+            // The right side of `a and b` is read where `a` is true, of `a or b` where it is false.
+            .bool_and, .bool_or => switch (Facts.conditionOf(tree, parent)) {
+                .both => |sides| if (sides[1] == at) try held(c, file, &out, sides[0], true, node),
+                .either => |sides| if (sides[1] == at) try held(c, file, &out, sides[0], false, node),
+                .not, .compare, .other => {},
             },
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
                 var buffer: [2]Ast.Node.Index = undefined;
@@ -2261,35 +2263,35 @@ fn held(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition:
 /// checked is read from its call, not from where the callee is written.
 fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition: Ast.Node.Index, truth: bool, use: Ast.Node.Index, since: ?Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(file).file.tree;
-    const tag = tree.nodeTag(condition);
-    switch (tag) {
-        .grouped_expression => return holds(c, file, out, tree.nodeData(condition).node_and_token[0], truth, use, since),
-        .bool_not => return holds(c, file, out, tree.nodeData(condition).node, !truth, use, since),
-        .bool_and, .bool_or => {
-            // Both sides hold where `a and b` does, and neither where `a or b` fails.
-            if ((tag == .bool_and) != truth) return;
-            const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            try holds(c, file, out, lhs, truth, use, since);
-            try holds(c, file, out, rhs, truth, use, since);
+    const form = Facts.conditionOf(tree, condition);
+    switch (form) {
+        .not => |inner| return holds(c, file, out, inner, !truth, use, since),
+        // Both sides hold where `a and b` does, and neither where `a or b` fails.
+        .both, .either => |sides| {
+            if ((form == .both) != truth) return;
+            try holds(c, file, out, sides[0], truth, use, since);
+            try holds(c, file, out, sides[1], truth, use, since);
         },
-        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
-            const lhs, const rhs = tree.nodeData(condition).node_and_node;
+        .compare => |compared| {
+            const lhs = compared.left;
+            const rhs = compared.right;
+            const order = compared.order;
             // A compared `m[i]` was read: both sides are evaluated wherever the comparison's
             // truth is known.
             try read(c, file, out, lhs, use, since);
             try read(c, file, out, rhs, use, since);
-            if (!try kept(c, file, lhs, since orelse condition, use) or !try kept(c, file, rhs, since orelse condition, use)) return;
-            if (truth != (tag == .equal_equal) and (tag == .equal_equal or tag == .bang_equal)) {
+            if (!try kept(c, file, lhs, since orelse compared.node, use) or !try kept(c, file, rhs, since orelse compared.node, use)) return;
+            if (truth != (order == .equal) and (order == .equal or order == .not_equal)) {
                 // Two values that differ: a position other than a length is below it where
                 // another fact puts it at most the length.
                 try out.append(c.allocator, .{ .small = lhs, .large = rhs, .strict = false, .differs = true });
             }
-            const facts_of: []const Fact = switch (tag) {
-                .less_than => if (truth) &.{.{ .small = lhs, .large = rhs, .strict = true }} else &.{.{ .small = rhs, .large = lhs, .strict = false }},
+            const facts_of: []const Fact = switch (order) {
+                .less => if (truth) &.{.{ .small = lhs, .large = rhs, .strict = true }} else &.{.{ .small = rhs, .large = lhs, .strict = false }},
                 .less_or_equal => if (truth) &.{.{ .small = lhs, .large = rhs, .strict = false }} else &.{.{ .small = rhs, .large = lhs, .strict = true }},
-                .greater_than => if (truth) &.{.{ .small = rhs, .large = lhs, .strict = true }} else &.{.{ .small = lhs, .large = rhs, .strict = false }},
+                .greater => if (truth) &.{.{ .small = rhs, .large = lhs, .strict = true }} else &.{.{ .small = lhs, .large = rhs, .strict = false }},
                 .greater_or_equal => if (truth) &.{.{ .small = rhs, .large = lhs, .strict = false }} else &.{.{ .small = lhs, .large = rhs, .strict = true }},
-                .equal_equal, .bang_equal => if (truth == (tag == .equal_equal))
+                .equal, .not_equal => if (truth == (order == .equal))
                     &.{ .{ .small = lhs, .large = rhs, .strict = false }, .{ .small = rhs, .large = lhs, .strict = false } }
                 else if (literal(tree, rhs) == 0 and try unsignedAll(c, file, lhs))
                     // An unsigned value other than zero is at least one; a signed one may be
@@ -2299,8 +2301,6 @@ fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition
                     &.{.{ .small = lhs, .large = rhs, .strict = true }}
                 else
                     &.{},
-                // The prong's own tags are above: another states nothing.
-                else => &.{},
             };
             try out.appendSlice(c.allocator, facts_of);
             // `x -% 1 < a` of an unsigned `x` holds exactly where `1 <= x <= a`: at zero the
@@ -2315,7 +2315,7 @@ fn holds(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), condition
                 try out.append(c.allocator, .{ .small = one, .large = x, .strict = false });
             }
         },
-        else => {},
+        .other => {},
     }
 }
 
@@ -2410,18 +2410,20 @@ fn clamped(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), branch:
     const tree = &c.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const statements: []const Ast.Node.Index = tree.blockStatements(&buffer, branch.ast.then_expr) orelse &.{branch.ast.then_expr};
-    const condition = bare(tree, branch.ast.cond_expr);
+    const compared = switch (Facts.conditionOf(tree, branch.ast.cond_expr)) {
+        .compare => |found| switch (found.order) {
+            .less, .less_or_equal, .greater, .greater_or_equal => found,
+            .equal, .not_equal => return,
+        },
+        else => return,
+    };
     // The clamp is the block's one assignment of a side of the condition to the other; the
     // block's other statements are assignments of neither (`n = r.at; status = .end_of_buffer;`).
     var clamp: ?Ast.Node.Index = null;
     for (statements) |statement_in| {
         if (tree.nodeTag(statement_in) != .assign) continue;
         const assigned_to = tree.nodeData(statement_in).node_and_node[0];
-        const compared = switch (tree.nodeTag(condition)) {
-            .greater_than, .greater_or_equal, .less_than, .less_or_equal => tree.nodeData(condition).node_and_node,
-            else => return,
-        };
-        if (!same(tree, assigned_to, compared[0]) and !same(tree, assigned_to, compared[1])) continue;
+        if (!same(tree, assigned_to, compared.left) and !same(tree, assigned_to, compared.right)) continue;
         if (clamp != null) return;
         clamp = statement_in;
     }
@@ -2437,13 +2439,9 @@ fn clamped(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), branch:
         }
     }
     const target, const value = tree.nodeData(then).node_and_node;
-    const lhs, const rhs = switch (tree.nodeTag(condition)) {
-        .greater_than, .greater_or_equal, .less_than, .less_or_equal => tree.nodeData(condition).node_and_node,
-        else => return,
-    };
-    const above, const under = switch (tree.nodeTag(condition)) {
-        .greater_than, .greater_or_equal => .{ lhs, rhs },
-        else => .{ rhs, lhs },
+    const above, const under = switch (compared.order) {
+        .greater, .greater_or_equal => .{ compared.left, compared.right },
+        else => .{ compared.right, compared.left },
     };
     const fact: Fact = if (same(tree, target, above) and same(tree, value, under))
         .{ .small = target, .large = value, .strict = false }

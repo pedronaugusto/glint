@@ -2610,13 +2610,11 @@ pub fn reached(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Ind
 /// the fact reads it (a comparison's own result is clean; what it compares is not).
 pub fn conditionAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
     const tree = &c.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            return (try conditionAt(c, fact, file, lhs)).join(try conditionAt(c, fact, file, rhs));
-        },
-        .bool_not, .grouped_expression => return conditionAt(c, fact, file, if (tree.nodeTag(node) == .bool_not) tree.nodeData(node).node else tree.nodeData(node).node_and_token[0]),
-        else => return levelAt(c, fact, file, node),
+    switch (Facts.conditionOf(tree, node)) {
+        .both, .either => |sides| return (try conditionAt(c, fact, file, sides[0])).join(try conditionAt(c, fact, file, sides[1])),
+        .compare => |compared| return (try conditionAt(c, fact, file, compared.left)).join(try conditionAt(c, fact, file, compared.right)),
+        .not => |inner| return conditionAt(c, fact, file, inner),
+        .other => |value| return levelAt(c, fact, file, value),
     }
 }
 
@@ -3526,9 +3524,11 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
             // decides what it reads.
             .@"defer", .@"errdefer" => out = try out.join(c.allocator, try exitsAfter(c, flow, function, parent)),
             // The right side of `and` and `or` runs as the left decides.
-            .bool_and, .bool_or => {
-                const lhs, const rhs = tree.nodeData(parent).node_and_node;
-                if (at == rhs) out = try out.join(c.allocator, try (try dep(c, flow, function, lhs)).held().narrowed(c.allocator));
+            .bool_and, .bool_or => switch (Facts.conditionOf(tree, parent)) {
+                .both, .either => |sides| if (at == sides[1]) {
+                    out = try out.join(c.allocator, try (try dep(c, flow, function, sides[0])).held().narrowed(c.allocator));
+                },
+                .not, .compare, .other => {},
             },
             .@"if", .if_simple => {
                 const branch = tree.fullIf(parent).?; // unreachable: the tag is an if's
@@ -3702,14 +3702,11 @@ fn jumpTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.
 /// A condition's operands as they are: a counter compared with a bound runs as far as the bound.
 fn operands(c: *Context, flow: *Flow, function: Function.Id, condition: Ast.Node.Index) Context.Error!Dep {
     const tree = &c.project.at(flow.functions.items[@backingInt(function)].file).file.tree;
-    switch (tree.nodeTag(condition)) {
-        .grouped_expression => return operands(c, flow, function, tree.nodeData(condition).node_and_token[0]),
-        .bool_not => return operands(c, flow, function, tree.nodeData(condition).node),
-        .bool_and, .bool_or, .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
-            const lhs, const rhs = tree.nodeData(condition).node_and_node;
-            return try (try operands(c, flow, function, lhs)).join(c.allocator, try operands(c, flow, function, rhs));
-        },
-        else => return (try dep(c, flow, function, condition)).held(),
+    switch (Facts.conditionOf(tree, condition)) {
+        .not => |inner| return operands(c, flow, function, inner),
+        .both, .either => |sides| return try (try operands(c, flow, function, sides[0])).join(c.allocator, try operands(c, flow, function, sides[1])),
+        .compare => |compared| return try (try operands(c, flow, function, compared.left)).join(c.allocator, try operands(c, flow, function, compared.right)),
+        .other => |value| return (try dep(c, flow, function, value)).held(),
     }
 }
 

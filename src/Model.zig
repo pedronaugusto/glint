@@ -192,35 +192,76 @@ fn testCondition(a: std.mem.Allocator, tree: *const Ast, model: *const Model, no
     }
 }
 
+/// A condition's form, the one reading of a condition's structure every rule and solver folds
+/// its own meaning over: read through parentheses and `comptime`. `both` is `a and b`, whose
+/// right side is read only where its left is true; `either` is `a or b`, whose right side is
+/// read only where its left is false; `compare` is a comparison by its order; `other` is any
+/// other bool value (a name, a call, a member, `@hasDecl`), read by what it is. Whether a
+/// condition is known as the program compiles is `knownBool`'s.
+pub const Condition = union(enum) {
+    not: Ast.Node.Index,
+    both: [2]Ast.Node.Index,
+    either: [2]Ast.Node.Index,
+    compare: Comparison,
+    other: Ast.Node.Index,
+};
+/// A comparison: its node, its order and its sides.
+pub const Comparison = struct { node: Ast.Node.Index, order: Order, left: Ast.Node.Index, right: Ast.Node.Index };
+pub const Order = enum { less, less_or_equal, greater, greater_or_equal, equal, not_equal };
+
+pub fn conditionOf(tree: *const Ast, node: Ast.Node.Index) Condition {
+    var at = node;
+    while (true) at = switch (tree.nodeTag(at)) {
+        .grouped_expression => tree.nodeData(at).node_and_token[0],
+        .@"comptime" => tree.nodeData(at).node,
+        else => break,
+    };
+    const order: Order = switch (tree.nodeTag(at)) {
+        .bool_not => return .{ .not = tree.nodeData(at).node },
+        .bool_and => return .{ .both = tree.nodeData(at).node_and_node },
+        .bool_or => return .{ .either = tree.nodeData(at).node_and_node },
+        .less_than => .less,
+        .less_or_equal => .less_or_equal,
+        .greater_than => .greater,
+        .greater_or_equal => .greater_or_equal,
+        .equal_equal => .equal,
+        .bang_equal => .not_equal,
+        else => return .{ .other = at },
+    };
+    const left, const right = tree.nodeData(at).node_and_node;
+    return .{ .compare = .{ .node = at, .order = order, .left = left, .right = right } };
+}
+
 /// The build modes a compile-time condition over `builtin.mode` holds in: `mode == .debug`,
 /// `!=`, `!`, `and`, `or`, `true` and `false`, through the builtin import's and the mode's
 /// lexical aliases and a constant that names such a condition. Null for anything else.
 pub fn modes(a: std.mem.Allocator, tree: *const Ast, model: *const Model, node: Ast.Node.Index, depth: usize) InitError!?Modes {
     if (depth >= 32) return null;
-    switch (tree.nodeTag(node)) {
-        .bool_not => return if (try modes(a, tree, model, tree.nodeData(node).node, depth + 1)) |held| held.complement() else null,
-        .grouped_expression => return modes(a, tree, model, tree.nodeData(node).node_and_token[0], depth + 1),
-        .@"comptime" => return modes(a, tree, model, tree.nodeData(node).node, depth + 1),
-        .bool_and, .bool_or => {
-            const sides = tree.nodeData(node).node_and_node;
+    const at = switch (conditionOf(tree, node)) {
+        .not => |negated| return if (try modes(a, tree, model, negated, depth + 1)) |held| held.complement() else null,
+        .both, .either => |sides| {
             const left = (try modes(a, tree, model, sides[0], depth + 1)) orelse return null;
             const right = (try modes(a, tree, model, sides[1], depth + 1)) orelse return null;
-            return if (tree.nodeTag(node) == .bool_and) left.intersectWith(right) else left.unionWith(right);
+            return if (conditionOf(tree, node) == .both) left.intersectWith(right) else left.unionWith(right);
         },
-        .equal_equal, .bang_equal => {
-            const sides = tree.nodeData(node).node_and_node;
+        .compare => |compared| {
+            if (compared.order != .equal and compared.order != .not_equal) return null;
+            const sides: [2]Ast.Node.Index = .{ compared.left, compared.right };
             const named = for ([_][2]Ast.Node.Index{ sides, .{ sides[1], sides[0] } }) |pair| {
                 if (tree.nodeTag(pair[1]) != .enum_literal or !try modeValue(a, tree, model, pair[0], depth + 1)) continue;
                 break std.meta.stringToEnum(std.builtin.OptimizeMode, try identifier(a, tree.tokenSlice(tree.nodeMainToken(pair[1])))) orelse return null;
             } else return null;
             const equal: Modes = .initOne(named);
-            return if (tree.nodeTag(node) == .equal_equal) equal else equal.complement();
+            return if (compared.order == .equal) equal else equal.complement();
         },
+        .other => |value| value,
+    };
+    switch (tree.nodeTag(at)) {
         .identifier => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
             if (std.mem.eql(u8, name, "true")) return .full;
             if (std.mem.eql(u8, name, "false")) return .empty;
-            const ref = model.reference(node) orelse return null;
+            const ref = model.reference(at) orelse return null;
             const d = ref.declaration orelse return null;
             const v = tree.fullVarDecl(model.declarations[@backingInt(d)].node) orelse return null;
             if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return null;

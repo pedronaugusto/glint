@@ -2125,48 +2125,43 @@ const Frame = struct {
     fn cond(f: *Frame, s: State, node: Ast.Node.Index) RunError!Split {
         if (s.dead) return .{ .yes = s, .no = s };
         const tree = f.tree;
-        switch (tree.nodeTag(node)) {
-            .grouped_expression => return f.cond(s, tree.nodeData(node).node_and_token[0]),
-            .bool_not => {
-                const inner = try f.cond(s, tree.nodeData(node).node);
-                return .{ .yes = inner.no, .no = inner.yes };
+        switch (Facts.conditionOf(tree, node)) {
+            .not => |inner| {
+                const split = try f.cond(s, inner);
+                return .{ .yes = split.no, .no = split.yes };
             },
-            .bool_and => {
-                const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try f.cond(s, lhs);
-                const right = try f.cond(left.yes, rhs);
+            .both => |sides| {
+                const left = try f.cond(s, sides[0]);
+                const right = try f.cond(left.yes, sides[1]);
                 return .{ .yes = right.yes, .no = try f.join(left.no, right.no) };
             },
-            .bool_or => {
-                const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try f.cond(s, lhs);
-                const right = try f.cond(left.no, rhs);
+            .either => |sides| {
+                const left = try f.cond(s, sides[0]);
+                const right = try f.cond(left.no, sides[1]);
                 return .{ .yes = try f.join(left.yes, right.yes), .no = right.no };
             },
-            .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => {
-                const lhs, const rhs = tree.nodeData(node).node_and_node;
-                const left = try f.heldPast(try f.eval(s, lhs), node, rhs);
-                const right = try f.eval(left.s, rhs);
+            .compare => |compared| {
+                const left = try f.heldPast(try f.eval(s, compared.left), compared.node, compared.right);
+                const right = try f.eval(left.s, compared.right);
                 const base = right.s;
-                try f.counted(base, lhs, left.v.lin);
-                try f.counted(base, rhs, right.v.lin);
+                try f.counted(base, compared.left, left.v.lin);
+                try f.counted(base, compared.right, right.v.lin);
                 const x = left.v.lin orelse return .{ .yes = base, .no = base };
                 const y = right.v.lin orelse return .{ .yes = base, .no = base };
-                return switch (tree.nodeTag(node)) {
-                    .less_than => .{ .yes = try assume(f.a, base, try above(f.a, y, x)), .no = try assume(f.a, base, try atLeast(f.a, x, y)) },
+                return switch (compared.order) {
+                    .less => .{ .yes = try assume(f.a, base, try above(f.a, y, x)), .no = try assume(f.a, base, try atLeast(f.a, x, y)) },
                     .less_or_equal => .{ .yes = try assume(f.a, base, try atLeast(f.a, y, x)), .no = try assume(f.a, base, try above(f.a, x, y)) },
-                    .greater_than => .{ .yes = try assume(f.a, base, try above(f.a, x, y)), .no = try assume(f.a, base, try atLeast(f.a, y, x)) },
+                    .greater => .{ .yes = try assume(f.a, base, try above(f.a, x, y)), .no = try assume(f.a, base, try atLeast(f.a, y, x)) },
                     .greater_or_equal => .{ .yes = try assume(f.a, base, try atLeast(f.a, x, y)), .no = try assume(f.a, base, try above(f.a, y, x)) },
-                    .equal_equal => .{ .yes = try f.same(base, x, y), .no = base },
-                    else => .{ .yes = base, .no = try f.same(base, x, y) },
+                    .equal => .{ .yes = try f.same(base, x, y), .no = base },
+                    .not_equal => .{ .yes = base, .no = try f.same(base, x, y) },
                 };
             },
-            .identifier => {
-                const spelled = tree.tokenSlice(tree.nodeMainToken(node));
+            .other => |at| if (tree.nodeTag(at) == .identifier) {
+                const spelled = tree.tokenSlice(tree.nodeMainToken(at));
                 if (std.mem.eql(u8, spelled, "true")) return .{ .yes = s, .no = State.unreachable_state };
                 if (std.mem.eql(u8, spelled, "false")) return .{ .yes = State.unreachable_state, .no = s };
             },
-            else => {},
         }
         const e = try f.eval(s, node);
         return .{ .yes = e.s, .no = e.s };
@@ -2673,16 +2668,15 @@ const Frame = struct {
     /// A loop condition's comparisons in their non-strict forms (`i < n` gives `i <= n`):
     /// what a counter stepping toward its bound keeps on every pass.
     fn candidatesOf(f: *Frame, s: State, node: Ast.Node.Index, out: *std.ArrayList(Lin)) RunError!void {
-        const tree = f.tree;
-        switch (tree.nodeTag(node)) {
-            .grouped_expression => return f.candidatesOf(s, tree.nodeData(node).node_and_token[0], out),
-            .bool_and => {
-                const lhs, const rhs = tree.nodeData(node).node_and_node;
-                try f.candidatesOf(s, lhs, out);
-                try f.candidatesOf(s, rhs, out);
+        switch (Facts.conditionOf(f.tree, node)) {
+            .both => |sides| {
+                try f.candidatesOf(s, sides[0], out);
+                try f.candidatesOf(s, sides[1], out);
             },
-            .less_than, .less_or_equal, .greater_than, .greater_or_equal => {
-                const lhs, const rhs = tree.nodeData(node).node_and_node;
+            .compare => |compared| {
+                if (compared.order == .equal or compared.order == .not_equal) return;
+                const lhs = compared.left;
+                const rhs = compared.right;
                 const was_trial = f.trial;
                 // Read for their forms alone: no verdicts.
                 f.trial += 1;
@@ -2691,13 +2685,14 @@ const Frame = struct {
                 const right = f.eval(left.s, rhs) catch return;
                 const x = left.v.lin orelse return;
                 const y = right.v.lin orelse return;
-                const row = switch (tree.nodeTag(node)) {
-                    .less_than, .less_or_equal => try atLeast(f.a, y, x),
-                    else => try atLeast(f.a, x, y),
+                const row = switch (compared.order) {
+                    .less, .less_or_equal => try atLeast(f.a, y, x),
+                    .greater, .greater_or_equal => try atLeast(f.a, x, y),
+                    .equal, .not_equal => unreachable, // returned above
                 };
                 if (row) |r| try out.append(f.a, r);
             },
-            else => {},
+            .not, .either, .other => {},
         }
     }
 

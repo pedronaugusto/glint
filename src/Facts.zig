@@ -572,23 +572,19 @@ fn pathFacts(self: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *s
 /// False when `found` already holds the opposite.
 fn holds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, value: bool, found: *std.ArrayList(Assumption)) ResolveError!bool {
     const tree = &self.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return self.holds(file, tree.nodeData(node).node_and_token[0], value, found),
-        .@"comptime" => return self.holds(file, tree.nodeData(node).node, value, found),
-        .bool_not => return self.holds(file, tree.nodeData(node).node, !value, found),
-        .bool_and, .bool_or => {
-            // Each operand is known only when the whole is: `a and b` true, `a or b` false.
-            if ((tree.nodeTag(node) == .bool_and) != value) return true;
-            const operands = tree.nodeData(node).node_and_node;
-            return try self.holds(file, operands[0], value, found) and try self.holds(file, operands[1], value, found);
-        },
-        .identifier => {
-            const parameter = self.conditionParameter(file, node) orelse return true;
+    switch (conditionOf(tree, node)) {
+        .not => |inner| return self.holds(file, inner, !value, found),
+        // Each operand is known only when the whole is: `a and b` true, `a or b` false.
+        .both => |sides| return !value or (try self.holds(file, sides[0], true, found) and try self.holds(file, sides[1], true, found)),
+        .either => |sides| return value or (try self.holds(file, sides[0], false, found) and try self.holds(file, sides[1], false, found)),
+        .compare => return true,
+        .other => |at| {
+            if (tree.nodeTag(at) != .identifier) return true;
+            const parameter = self.conditionParameter(file, at) orelse return true;
             for (found.items) |held| if (std.meta.eql(held.parameter, parameter)) return held.value == .boolean and held.value.boolean == value;
             try found.append(self.gpa, .{ .parameter = parameter, .value = .{ .boolean = value } });
             return true;
         },
-        else => return true,
     }
 }
 
@@ -642,12 +638,11 @@ pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.In
 fn namesCondition(self: *const Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) bool {
     if (depth == 16) return false;
     const tree = &self.project.at(file).file.tree;
-    return switch (tree.nodeTag(node)) {
-        .identifier => self.conditionParameter(file, node) != null,
-        .grouped_expression => self.namesCondition(file, tree.nodeData(node).node_and_token[0], depth + 1),
-        .@"comptime", .bool_not => self.namesCondition(file, tree.nodeData(node).node, depth + 1),
-        .bool_and, .bool_or => self.namesCondition(file, tree.nodeData(node).node_and_node[0], depth + 1) or self.namesCondition(file, tree.nodeData(node).node_and_node[1], depth + 1),
-        else => false,
+    return switch (conditionOf(tree, node)) {
+        .not => |inner| self.namesCondition(file, inner, depth + 1),
+        .both, .either => |sides| self.namesCondition(file, sides[0], depth + 1) or self.namesCondition(file, sides[1], depth + 1),
+        .compare => false,
+        .other => |value| tree.nodeTag(value) == .identifier and self.conditionParameter(file, value) != null,
     };
 }
 
@@ -1718,18 +1713,16 @@ fn hasConditions(self: *Facts, file: Project.FileId) ResolveError!bool {
 /// and `!` of one.
 fn truth(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ?bool {
     const tree = &self.project.at(file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .grouped_expression => return self.truth(env, file, tree.nodeData(node).node_and_token[0]),
-        .@"comptime" => return self.truth(env, file, tree.nodeData(node).node),
-        .bool_not => return if (self.truth(env, file, tree.nodeData(node).node)) |t| !t else null,
-        .identifier => {},
-        else => return null,
-    }
-    const spelled = tree.tokenSlice(tree.nodeMainToken(node));
+    const at = switch (conditionOf(tree, node)) {
+        .not => |inner| return if (self.truth(env, file, inner)) |t| !t else null,
+        .both, .either, .compare => return null,
+        .other => |value| if (tree.nodeTag(value) == .identifier) value else return null,
+    };
+    const spelled = tree.tokenSlice(tree.nodeMainToken(at));
     if (std.mem.eql(u8, spelled, "true")) return true;
     if (std.mem.eql(u8, spelled, "false")) return false;
     const model = &self.project.at(file).model;
-    const index = (model.reference(node) orelse return null).declaration orelse return null;
+    const index = (model.reference(at) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(index)];
     if (record.kind != .parameter) return null;
     if (env) |e| if (file == e.function.file and model.scopes[@backingInt(record.scope)].node == self.scopeNode(e.function)) {
@@ -1747,6 +1740,94 @@ pub fn knownBool(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     return self.comptimeTruth(null, file, node);
 }
 
+/// A condition's form through parentheses and `comptime`: Model's one reading (`Model.conditionOf`).
+pub const Condition = Model.Condition;
+pub const Comparison = Model.Comparison;
+pub const Order = Model.Order;
+pub const conditionOf = Model.conditionOf;
+
+/// A part of a condition known to hold a truth value: a comparison or another bool value.
+pub const Truth = struct { part: Ast.Node.Index, value: bool };
+
+/// The parts a condition's being `value` shows, each with its truth value, in the order they are
+/// written, each read inside its parentheses: `a and b` true shows both true, `a or b` false
+/// both false, `!a` shows `a` the other way; `a and b` false or `a or b` true is kept whole,
+/// none of its parts shown alone. Null where the condition is known never `value`.
+pub fn truthsWhen(self: *Facts, file: Project.FileId, condition: Ast.Node.Index, value: bool) ResolveError!?[]const Truth {
+    var out: std.ArrayList(Truth) = .empty;
+    if (!try self.gatherTruths(file, condition, value, &out, 0)) return null;
+    return out.items;
+}
+
+fn gatherTruths(self: *Facts, file: Project.FileId, node: Ast.Node.Index, value: bool, out: *std.ArrayList(Truth), depth: u8) ResolveError!bool {
+    // Past the depth, the part is kept whole: true of it, and nothing of its parts.
+    if (depth >= 32) {
+        try out.append(self.gpa, .{ .part = node, .value = value });
+        return true;
+    }
+    if (try self.knownBool(file, node)) |known| return known == value;
+    const condition = conditionOf(&self.project.at(file).file.tree, node);
+    switch (condition) {
+        .not => |inner| return self.gatherTruths(file, inner, !value, out, depth + 1),
+        .both => |sides| if (value) {
+            return try self.gatherTruths(file, sides[0], true, out, depth + 1) and try self.gatherTruths(file, sides[1], true, out, depth + 1);
+        },
+        .either => |sides| if (!value) {
+            return try self.gatherTruths(file, sides[0], false, out, depth + 1) and try self.gatherTruths(file, sides[1], false, out, depth + 1);
+        },
+        .compare, .other => {},
+    }
+    // A part is the expression inside its parentheses and `comptime` (`(ok)` is `ok`).
+    const part = switch (condition) {
+        .compare => |compared| compared.node,
+        .other => |inner| inner,
+        .not, .both, .either => node,
+    };
+    try out.append(self.gpa, .{ .part = part, .value = value });
+    return true;
+}
+
+/// A value written in place, by what it is: an enum literal and an error by name, a number, a
+/// string, a character, `null`, `undefined`, `true` or `false`, `unreachable`; through
+/// parentheses. Null for any other expression (a name, a call), which `resolve` reads.
+pub const Literal = union(enum) {
+    enum_literal: []const u8,
+    error_value: []const u8,
+    number,
+    string,
+    char,
+    null,
+    undefined,
+    boolean: bool,
+    @"unreachable",
+};
+
+pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Literal {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    return switch (tree.nodeTag(at)) {
+        .enum_literal => .{ .enum_literal = try Model.identifier(self.gpa, tree.tokenSlice(tree.nodeMainToken(at))) },
+        .error_value => .{ .error_value = try Model.identifier(self.gpa, tree.tokenSlice(tree.nodeMainToken(at) + 2)) },
+        .number_literal => .number,
+        .string_literal, .multiline_string_literal => .string,
+        .char_literal => .char,
+        .unreachable_literal => .@"unreachable",
+        // The language's own values, which no declaration can take.
+        .identifier => switch (try self.definition(file, at)) {
+            .none => {
+                const spelled = tree.tokenSlice(tree.nodeMainToken(at));
+                if (std.mem.eql(u8, spelled, "null")) return .null;
+                if (std.mem.eql(u8, spelled, "undefined")) return .undefined;
+                if (std.mem.eql(u8, spelled, "true")) return .{ .boolean = true };
+                if (std.mem.eql(u8, spelled, "false")) return .{ .boolean = false };
+                return null;
+            },
+            .decl, .unknown => null,
+        },
+        else => null,
+    };
+}
+
 /// A condition known as the program compiles on the reading `env` binds: `truth`'s, `and` and
 /// `or` of known ones, `==` and `!=` of two types each side names (`T == Plain`, `namedType`)
 /// known the same or different, and `@hasDecl(T, "name")` where `T` is a container that
@@ -1754,33 +1835,27 @@ pub fn knownBool(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     if (self.truth(env, file, node)) |known| return known;
     const tree = &self.project.at(file).file.tree;
-    var at = node;
-    while (true) at = switch (tree.nodeTag(at)) {
-        .grouped_expression => tree.nodeData(at).node_and_token[0],
-        .@"comptime" => tree.nodeData(at).node,
-        else => break,
-    };
-    switch (tree.nodeTag(at)) {
-        .bool_and, .bool_or => {
-            const left, const right = tree.nodeData(at).node_and_node;
-            const one = try self.comptimeTruth(env, file, left);
-            const other = try self.comptimeTruth(env, file, right);
+    const condition = conditionOf(tree, node);
+    const at = switch (condition) {
+        .not => |inner| return if (try self.comptimeTruth(env, file, inner)) |known| !known else null,
+        .both, .either => |sides| {
+            const one = try self.comptimeTruth(env, file, sides[0]);
+            const other = try self.comptimeTruth(env, file, sides[1]);
             // Either side alone decides `false and` and `true or`.
-            const deciding = tree.nodeTag(at) == .bool_or;
+            const deciding = condition == .either;
             if (one == deciding or other == deciding) return deciding;
             return if (one != null and other != null) !deciding else null;
         },
-        .equal_equal, .bang_equal => {
-            const left, const right = tree.nodeData(at).node_and_node;
-            const one = try self.namedType(env, file, left) orelse return null;
-            const other = try self.namedType(env, file, right) orelse return null;
+        .compare => |compared| {
+            if (compared.order != .equal and compared.order != .not_equal) return null;
+            const one = try self.namedType(env, file, compared.left) orelse return null;
+            const other = try self.namedType(env, file, compared.right) orelse return null;
             const one_type = sameType(one, other) orelse return null;
-            return if (tree.nodeTag(at) == .equal_equal) one_type else !one_type;
+            return if (compared.order == .equal) one_type else !one_type;
         },
-        .builtin_call_two, .builtin_call_two_comma => {},
-        else => return null,
-    }
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@hasDecl")) return null;
+        .other => |value| value,
+    };
+    if (!isBuiltin(tree, at, "@hasDecl")) return null;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, at, &buffer);
     if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
@@ -2331,6 +2406,105 @@ pub fn fieldName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     if (try self.fieldNamesOf(file, node)) |container| return .{ .each_of = container };
     if (try self.rangedNames(file, node)) |names| return .{ .names = names };
     return .computed;
+}
+
+/// The const a name refers to, and the expression it is given, in its own file: what an error
+/// name or set spelled through a const is read as. Null for anything else.
+fn constantValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?struct { Project.FileId, Ast.Node.Index } {
+    const decl = switch (try self.definition(file, node)) {
+        .decl => |d| d,
+        .none, .unknown => return null,
+    };
+    const source = self.project.at(decl.file);
+    const record = source.model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable) return null;
+    const variable = source.file.tree.fullVarDecl(record.node) orelse return null;
+    if (source.file.tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    return .{ decl.file, variable.ast.init_node.unwrap() orelse return null };
+}
+
+/// The error an expression names: `error.Name`, a member of an error set (`Set.Name`), or a
+/// const given one; null where it names none, or one not shown here.
+pub fn errorName(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?[]const u8 {
+    var at_file = file;
+    var at = node;
+    for (0..16) |_| {
+        const tree = &self.project.at(at_file).file.tree;
+        at = ungrouped(tree, at);
+        switch (tree.nodeTag(at)) {
+            .error_value => return try Model.identifier(self.gpa, tree.tokenSlice(tree.nodeMainToken(at) + 2)),
+            .field_access => {
+                const holder, const name = tree.nodeData(at).node_and_token;
+                if (try self.resolve(at_file, holder) == .error_set) return try Model.identifier(self.gpa, tree.tokenSlice(name));
+            },
+            else => {},
+        }
+        at_file, at = (try self.constantValue(at_file, at)) orelse return null;
+    }
+    return null;
+}
+
+/// Whether the error set a type names holds the error `name`: an `error{...}` set, `A || B`,
+/// an error union's set, `anyerror` (every error), or a const given one. Unknown where the set
+/// is not written here (an inferred `!T`, one a function or `@TypeOf` makes, a name that does
+/// not resolve), never read as either.
+pub fn errorSetHolds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8) ResolveError!Is {
+    return self.setHolds(file, node, name, 0);
+}
+
+fn setHolds(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8, depth: u8) ResolveError!Is {
+    if (depth >= 16) return .{ .unknown = .budget };
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .error_set_decl => {
+            const open, const close = tree.nodeData(at).token_and_token;
+            var token = open + 1;
+            while (token < close) : (token += 1) {
+                if (tree.tokenTag(token) != .identifier) continue;
+                if (std.mem.eql(u8, try Model.identifier(self.gpa, tree.tokenSlice(token)), name)) return .yes;
+            }
+            return .no;
+        },
+        .merge_error_sets => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const left = try self.setHolds(file, lhs, name, depth + 1);
+            if (left == .yes) return .yes;
+            const right = try self.setHolds(file, rhs, name, depth + 1);
+            if (right == .yes) return .yes;
+            if (left == .no and right == .no) return .no;
+            return if (left == .unknown) left else right;
+        },
+        .error_union => return self.setHolds(file, tree.nodeData(at).node_and_node[0], name, depth + 1),
+        .identifier => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "anyerror") and try self.definition(file, at) == .none) return .yes,
+        else => {},
+    }
+    const given_file, const given = (try self.constantValue(file, at)) orelse return .{ .unknown = .unsupported };
+    return self.setHolds(given_file, given, name, depth + 1);
+}
+
+/// The errors a function's prototype says it returns: none (no error union), a set written
+/// there or in a const its result names (`E!T`, the set's node and file), inferred (`!T`), which
+/// the body decides, or unknown: an error union the result names in a way not read here.
+pub const Returned = union(enum) { none, set: struct { file: Project.FileId, node: Ast.Node.Index }, inferred, unknown: Unknown };
+
+pub fn returnedErrors(self: *Facts, file: Project.FileId, proto: Ast.full.FnProto) ResolveError!Returned {
+    const tree = &self.project.at(file).file.tree;
+    const result = proto.ast.return_type.unwrap() orelse return .none;
+    if (tree.tokenTag(tree.firstToken(result) - 1) == .bang) return .inferred;
+    var at_file = file;
+    var at = result;
+    for (0..16) |_| {
+        const source = &self.project.at(at_file).file.tree;
+        at = ungrouped(source, at);
+        if (source.nodeTag(at) == .error_union) return .{ .set = .{ .file = at_file, .node = source.nodeData(at).node_and_node[0] } };
+        at_file, at = (try self.constantValue(at_file, at)) orelse break;
+    }
+    return switch (try self.resolve(file, result)) {
+        .error_union => .{ .unknown = .unsupported },
+        .unknown => |why| .{ .unknown = why },
+        else => .none,
+    };
 }
 
 /// The names a capture takes from a list written in place that a `for` ranges over alone, each
@@ -3532,8 +3706,10 @@ fn throughPointer(self: *Facts, file: Project.FileId, callee: Ast.Node.Index) Re
     return try self.valueOf(value);
 }
 
-fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "null");
+/// Whether `node` is `null`, through parentheses: a primitive value no declaration can take.
+pub fn isNull(tree: *const Ast, node: Ast.Node.Index) bool {
+    const at = ungrouped(tree, node);
+    return tree.nodeTag(at) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "null");
 }
 
 fn never(tree: *const Ast, node: Ast.Node.Index) bool {
@@ -6842,6 +7018,8 @@ pub const accesses = struct {
         @"orelse",
         comparison,
         operator,
+        /// `and`, `or`, `!`: a condition's parts (`conditionOf`).
+        logic,
         concatenation,
         address_of,
         slice,
@@ -6861,9 +7039,15 @@ pub const accesses = struct {
         @"continue",
         @"break",
         @"return",
-        /// A type: an optional, an array, a pointer, an error union, a function prototype, an
-        /// error set; what it holds is a type or what only a type reads (a length, an alignment).
-        type,
+        /// Types, each holding a type or what only a type reads (a length, an alignment): `?T`,
+        /// an array's, a pointer's, `anyframe->T`, `E!T`, `A || B`, a function's prototype.
+        optional_type,
+        array_type,
+        pointer_type,
+        anyframe_type,
+        error_union,
+        merged_errors,
+        prototype,
         grouped,
         @"comptime",
         @"nosuspend",
@@ -6881,7 +7065,7 @@ pub const accesses = struct {
                 .deferred => &.{.deferred},
                 .variable, .assign => &.{.assignment},
                 .destructure => &.{.destructure},
-                .compound_assign, .comparison, .operator => &.{.operator},
+                .compound_assign, .comparison, .operator, .logic => &.{.operator},
                 .unwrap_optional, .tried, .@"catch", .@"orelse" => &.{.unwrap},
                 .member, .address_of, .slice, .deref, .array_access => &.{.address},
                 .concatenation, .array_literal, .struct_literal => &.{.aggregate},
@@ -6891,7 +7075,7 @@ pub const accesses = struct {
                 .prong_range, .@"while", .@"for", .for_range, .@"if" => &.{.capture},
                 .@"continue", .@"break", .@"return" => &.{.jump},
                 .@"comptime" => &.{.compile_time},
-                .field_declaration, .type, .grouped, .@"nosuspend", .fn_decl => &.{.none},
+                .field_declaration, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype, .grouped, .@"nosuspend", .fn_decl => &.{.none},
                 .leaf => &.{ .none, .address },
             };
         }
@@ -6915,7 +7099,8 @@ pub const accesses = struct {
             .@"catch" => .@"catch",
             .@"orelse" => .@"orelse",
             .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .comparison,
-            .mul, .div, .mod, .mul_wrap, .mul_sat, .add, .sub, .add_wrap, .sub_wrap, .add_sat, .sub_sat, .shl, .shl_sat, .shr, .bit_and, .bit_xor, .bit_or, .bool_and, .bool_or, .bool_not, .negation, .bit_not, .negation_wrap => .operator,
+            .mul, .div, .mod, .mul_wrap, .mul_sat, .add, .sub, .add_wrap, .sub_wrap, .add_sat, .sub_sat, .shl, .shl_sat, .shr, .bit_and, .bit_xor, .bit_or, .negation, .bit_not, .negation_wrap => .operator,
+            .bool_and, .bool_or, .bool_not => .logic,
             .array_cat => .concatenation,
             .address_of => .address_of,
             .slice_open, .slice, .slice_sentinel => .slice,
@@ -6935,15 +7120,20 @@ pub const accesses = struct {
             .@"continue" => .@"continue",
             .@"break" => .@"break",
             .@"return" => .@"return",
-            .merge_error_sets, .optional_type, .array_type, .array_type_sentinel, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range, .anyframe_type, .error_union, .error_set_decl => .type,
-            .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto => .type,
+            .optional_type => .optional_type,
+            .array_type, .array_type_sentinel => .array_type,
+            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => .pointer_type,
+            .anyframe_type => .anyframe_type,
+            .error_union => .error_union,
+            .merge_error_sets => .merged_errors,
+            .fn_proto_simple, .fn_proto_multi, .fn_proto_one, .fn_proto => .prototype,
             .grouped_expression => .grouped,
             .@"comptime" => .@"comptime",
             .@"nosuspend" => .@"nosuspend",
             .@"suspend", .@"resume" => .frame,
             .asm_simple, .@"asm", .asm_output, .asm_input => .@"asm",
             .fn_decl => .fn_decl,
-            .anyframe_literal, .char_literal, .number_literal, .unreachable_literal, .identifier, .enum_literal, .string_literal, .multiline_string_literal, .error_value => .leaf,
+            .anyframe_literal, .char_literal, .number_literal, .unreachable_literal, .identifier, .enum_literal, .string_literal, .multiline_string_literal, .error_value, .error_set_decl => .leaf,
         };
     }
 
@@ -6973,8 +7163,8 @@ pub const accesses = struct {
     pub const Use = union(enum) {
         /// A statement, a body, a member, a `defer`'s expression: no value is taken from it.
         statement,
-        /// A type, or what only a type reads (a length, an alignment, a sentinel of a type).
-        typed,
+        /// A type, or what only a type reads: which part of which type or declaration.
+        typed: Typed,
         /// The first value of the variable or field the declaration at the node declares.
         initializes: Ast.Node.Index,
         /// The target of a store (`x = v`, a destructure's): the store.
@@ -7006,6 +7196,9 @@ pub const accesses = struct {
         operand: Ast.Node.Index,
         /// An operand of `++`.
         concatenated: Ast.Node.Index,
+        /// A part of `a and b`, `a or b` or `!a` (`whole`): its right side is read only where its
+        /// left side has made the whole undecided (true for `and`, false for `or`).
+        logic: struct { whole: Ast.Node.Index, side: enum { left, right, negated } },
         /// An element of an array literal, at its position.
         element_of: struct { literal: Ast.Node.Index, position: usize },
         /// A field of a struct literal, by the token naming it.
@@ -7036,6 +7229,41 @@ pub const accesses = struct {
         unknown: Facts.Unknown,
     };
 
+    /// A type's or a declaration's part an expression is (`Use.typed`), and the node it is part of.
+    pub const Typed = struct { of: Ast.Node.Index, part: TypePart };
+    pub const TypePart = enum {
+        /// A variable's, a field's or a parameter's declared type.
+        declared,
+        /// A function's prototype, of its declaration.
+        signature,
+        /// The type a struct or an array literal names.
+        literal,
+        /// A prototype's parameter type, or its result type.
+        parameter,
+        result,
+        /// What `*T`, `?T` and `anyframe->T` hold; an array's element; `E!T`'s set and payload;
+        /// an operand of `A || B`.
+        pointer_child,
+        optional_child,
+        frame_result,
+        array_element,
+        error_set,
+        error_payload,
+        /// An array's length, a sentinel, an alignment, a pointer's bit range, an address space,
+        /// a link section, a calling convention.
+        length,
+        sentinel,
+        alignment,
+        bit_range,
+        address_space,
+        section,
+        calling_convention,
+    };
+
+    fn typed(of: Ast.Node.Index, part: TypePart) Use {
+        return .{ .typed = .{ .of = of, .part = part } };
+    }
+
     /// What `node`'s value does where it stands: read by the form of the node that holds it
     /// (`formOf`), a store's by its site (`storeInto`).
     pub fn useOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Use {
@@ -7044,10 +7272,50 @@ pub const accesses = struct {
         const parent = model.parentOf(node) orelse return .statement;
         switch (formOf(tree.nodeTag(parent))) {
             .body, .deferred => return .statement,
-            .type => return .typed,
-            .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else .typed,
-            .variable => return if (tree.fullVarDecl(parent).?.ast.init_node.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a variable's
-            .field_declaration => return if (model.containerField(tree, parent).?.ast.value_expr.unwrap() == node) .{ .initializes = parent } else .typed, // unreachable: the form is a field's
+            .optional_type => return typed(parent, .optional_child),
+            .anyframe_type => return typed(parent, .frame_result),
+            .merged_errors => return typed(parent, .error_set),
+            .error_union => return typed(parent, if (tree.nodeData(parent).node_and_node[0] == node) .error_set else .error_payload),
+            .array_type => {
+                const array = tree.fullArrayType(parent).?; // unreachable: the form is an array type's
+                if (array.ast.elem_type == node) return typed(parent, .array_element);
+                return typed(parent, if (array.ast.sentinel.unwrap() == node) .sentinel else .length);
+            },
+            .pointer_type => {
+                const pointer = tree.fullPtrType(parent).?; // unreachable: the form is a pointer type's
+                if (pointer.ast.child_type == node) return typed(parent, .pointer_child);
+                if (pointer.ast.sentinel.unwrap() == node) return typed(parent, .sentinel);
+                if (pointer.ast.align_node.unwrap() == node) return typed(parent, .alignment);
+                if (pointer.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
+                return typed(parent, .bit_range);
+            },
+            .prototype => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buffer, parent).?; // unreachable: the form is a prototype's
+                if (proto.ast.return_type.unwrap() == node) return typed(parent, .result);
+                if (proto.ast.align_expr.unwrap() == node) return typed(parent, .alignment);
+                if (proto.ast.addrspace_expr.unwrap() == node) return typed(parent, .address_space);
+                if (proto.ast.section_expr.unwrap() == node) return typed(parent, .section);
+                if (proto.ast.callconv_expr.unwrap() == node) return typed(parent, .calling_convention);
+                var it = proto.iterate(tree);
+                while (it.next()) |param| if (param.type_expr == node) return typed(parent, .parameter);
+                return .{ .unknown = .unsupported };
+            },
+            .fn_decl => return if (tree.nodeData(parent).node_and_node[1] == node) .statement else typed(parent, .signature),
+            .variable => {
+                const variable = tree.fullVarDecl(parent).?; // unreachable: the form is a variable's
+                if (variable.ast.init_node.unwrap() == node) return .{ .initializes = parent };
+                if (variable.ast.type_node.unwrap() == node) return typed(parent, .declared);
+                if (variable.ast.align_node.unwrap() == node) return typed(parent, .alignment);
+                if (variable.ast.addrspace_node.unwrap() == node) return typed(parent, .address_space);
+                return typed(parent, .section);
+            },
+            .field_declaration => {
+                const field = model.containerField(tree, parent).?; // unreachable: the form is a field's
+                if (field.ast.value_expr.unwrap() == node) return .{ .initializes = parent };
+                if (field.ast.type_expr.unwrap() == node) return typed(parent, .declared);
+                return typed(parent, .alignment);
+            },
             .assign => {
                 const target = tree.nodeData(parent).node_and_node[0];
                 const site = (try storeInto(facts, file, target)) orelse return if (discard(tree, target)) .discarded else .{ .unknown = .unsupported };
@@ -7069,6 +7337,7 @@ pub const accesses = struct {
             .@"catch", .@"orelse" => return .{ .carried = .{ .into = parent, .how = if (tree.nodeData(parent).node_and_node[0] == node) .payload else .otherwise } },
             .comparison => return .{ .compared = parent },
             .operator => return .{ .operand = parent },
+            .logic => return .{ .logic = .{ .whole = parent, .side = if (tree.nodeTag(parent) == .bool_not) .negated else if (tree.nodeData(parent).node_and_node[0] == node) .left else .right } },
             .concatenation => return .{ .concatenated = parent },
             .address_of => return .{ .address = parent },
             .slice => return if (tree.fullSlice(parent).?.ast.sliced == node) .{ .sliced = parent } else .{ .index = parent }, // unreachable: the form is a slice's
@@ -7077,14 +7346,14 @@ pub const accesses = struct {
             .array_literal => {
                 var buffer: [2]Ast.Node.Index = undefined;
                 for (tree.fullArrayInit(&buffer, parent).?.ast.elements, 0..) |each, k| if (each == node) return .{ .element_of = .{ .literal = parent, .position = k } }; // unreachable: the form is an array literal's
-                return .typed;
+                return typed(parent, .literal);
             },
             .struct_literal => {
                 var buffer: [2]Ast.Node.Index = undefined;
                 for (tree.fullStructInit(&buffer, parent).?.ast.fields) |each| if (each == node) { // unreachable: the form is a struct literal's
                     return .{ .field_of = .{ .literal = parent, .name = Model.initName(tree, node) orelse return .{ .unknown = .unsupported } } };
                 };
-                return .typed;
+                return typed(parent, .literal);
             },
             .call => {
                 var buffer: [1]Ast.Node.Index = undefined;
@@ -7179,6 +7448,76 @@ pub const accesses = struct {
             .@"catch", .@"orelse" => tree.nodeData(node).node_and_node[0],
             else => null,
         };
+    }
+
+    /// The expressions a value comes from: what `node` gives, through parentheses, `try`, `.?`,
+    /// `@as`, `comptime`, `nosuspend`, both sides of `orelse` and `catch`, an `if`'s and a
+    /// `switch`'s results, and the `break`s a labelled block gives; each one is an expression of
+    /// none of those forms (a literal, a name, a call). An exit (`return`, `unreachable`, a
+    /// `break` or `continue` elsewhere) gives none. Unknown where a form is not read here (a
+    /// loop's result, a block a label does not name), never part of a list.
+    pub const Values = union(enum) { leaves: []const Ast.Node.Index, unknown: Facts.Unknown };
+
+    pub fn valuesOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Values {
+        const tree = &facts.project.at(file).file.tree;
+        const model = &facts.project.at(file).model;
+        var leaves: std.ArrayList(Ast.Node.Index) = .empty;
+        var work: std.ArrayList(Ast.Node.Index) = .empty;
+        try work.append(facts.gpa, node);
+        var steps: usize = 0;
+        while (work.pop()) |at| {
+            steps += 1;
+            if (steps > 4096) return .{ .unknown = .budget };
+            switch (formOf(tree.nodeTag(at))) {
+                .grouped, .unwrap_optional => try work.append(facts.gpa, tree.nodeData(at).node_and_token[0]),
+                .tried, .@"comptime", .@"nosuspend" => try work.append(facts.gpa, tree.nodeData(at).node),
+                .@"catch", .@"orelse" => try work.appendSlice(facts.gpa, &tree.nodeData(at).node_and_node),
+                .@"if" => {
+                    const branch = tree.fullIf(at).?; // unreachable: the form is an if's
+                    try work.append(facts.gpa, branch.ast.then_expr);
+                    try work.append(facts.gpa, branch.ast.else_expr.unwrap() orelse return .{ .unknown = .unsupported });
+                },
+                .@"switch" => for (tree.fullSwitch(at).?.ast.cases) |case| { // unreachable: the form is a switch's
+                    try work.append(facts.gpa, tree.fullSwitchCase(case).?.ast.target_expr); // unreachable: a switch's case is a prong
+                },
+                .builtin => {
+                    if (!Facts.isBuiltin(tree, at, "@as")) {
+                        try leaves.append(facts.gpa, at);
+                        continue;
+                    }
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const args = Facts.builtinArgs(tree, at, &buffer);
+                    if (args.len != 2) return .{ .unknown = .invalid_front_end };
+                    try work.append(facts.gpa, args[1]);
+                },
+                .body => {
+                    // A container's declaration is a type, given whole.
+                    var container_buffer: [2]Ast.Node.Index = undefined;
+                    if (tree.fullContainerDecl(&container_buffer, at) != null) {
+                        try leaves.append(facts.gpa, at);
+                        continue;
+                    }
+                    // A labelled block gives what each `break` that leaves it gives.
+                    const brace = tree.nodeMainToken(at);
+                    if (tree.tokenTag(brace) != .l_brace or brace < 2 or tree.tokenTag(brace - 1) != .colon) return .{ .unknown = .unsupported };
+                    var found = false;
+                    for (tree.nodes.items(.tag), 0..) |tag, i| {
+                        if (tag != .@"break") continue;
+                        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                        if (breakTarget(tree, model, jump) != at) continue;
+                        found = true;
+                        try work.append(facts.gpa, tree.nodeData(jump).opt_token_and_opt_node[1].unwrap() orelse return .{ .unknown = .unsupported });
+                    }
+                    if (!found) return .{ .unknown = .unsupported };
+                },
+                .@"return", .@"continue", .@"break" => {},
+                .leaf => if (tree.nodeTag(at) != .unreachable_literal) try leaves.append(facts.gpa, at),
+                .@"while", .@"for" => return .{ .unknown = .unsupported },
+                .deferred, .variable, .field_declaration, .assign, .compound_assign, .destructure, .prong, .prong_range, .for_range, .fn_decl, .frame, .@"asm" => return .{ .unknown = .unsupported },
+                .member, .comparison, .operator, .logic, .concatenation, .address_of, .slice, .deref, .array_access, .array_literal, .struct_literal, .call, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => try leaves.append(facts.gpa, at),
+            }
+        }
+        return .{ .leaves = leaves.items };
     }
 
     /// The value the statement `statement` discards: `_ = v`'s `v`; null for any other.
@@ -7436,7 +7775,60 @@ pub const accesses = struct {
         deferred: bool = false,
         /// `@field` with a name computed as the program compiles: any field of the holder's type.
         computed: bool = false,
+        /// An update's operation (`update` only): what it combines the place's value with
+        /// `value` by.
+        operator: ?Update = null,
     };
+
+    /// What an update stores: the place's value combined with the site's by one operation, or
+    /// one that does not resolve (an `@atomicRmw` operation it does not name).
+    pub const Update = union(enum) { op: Operator, unknown: Facts.Unknown };
+    pub const Operator = struct {
+        op: enum { add, sub, mul, div, mod, shl, shr, bit_and, bit_or, bit_xor, nand, exchange, max, min },
+        /// What an integer past its type's range does: is illegal (`+=`), wraps (`+%=`, an
+        /// atomic's arithmetic) or saturates (`+|=`).
+        overflow: enum { checked, wrapping, saturating } = .checked,
+    };
+
+    /// The operation of a compound assignment's tag.
+    fn compound(tag: Ast.Node.Tag) Operator {
+        return switch (tag) {
+            .assign_mul => .{ .op = .mul },
+            .assign_div => .{ .op = .div },
+            .assign_mod => .{ .op = .mod },
+            .assign_add => .{ .op = .add },
+            .assign_sub => .{ .op = .sub },
+            .assign_shl => .{ .op = .shl },
+            .assign_shl_sat => .{ .op = .shl, .overflow = .saturating },
+            .assign_shr => .{ .op = .shr },
+            .assign_bit_and => .{ .op = .bit_and },
+            .assign_bit_xor => .{ .op = .bit_xor },
+            .assign_bit_or => .{ .op = .bit_or },
+            .assign_mul_wrap => .{ .op = .mul, .overflow = .wrapping },
+            .assign_add_wrap => .{ .op = .add, .overflow = .wrapping },
+            .assign_sub_wrap => .{ .op = .sub, .overflow = .wrapping },
+            .assign_mul_sat => .{ .op = .mul, .overflow = .saturating },
+            .assign_add_sat => .{ .op = .add, .overflow = .saturating },
+            .assign_sub_sat => .{ .op = .sub, .overflow = .saturating },
+            else => unreachable, // the caller's prong holds the compound assignments alone
+        };
+    }
+
+    /// The operation an `@atomicRmw` names, by std's own list of them: an atomic's arithmetic
+    /// wraps.
+    fn atomic(op: std.builtin.AtomicRmwOp) Operator {
+        return switch (op) {
+            .Xchg => .{ .op = .exchange },
+            .Add => .{ .op = .add, .overflow = .wrapping },
+            .Sub => .{ .op = .sub, .overflow = .wrapping },
+            .And => .{ .op = .bit_and },
+            .Nand => .{ .op = .nand },
+            .Or => .{ .op = .bit_or },
+            .Xor => .{ .op = .bit_xor },
+            .Max => .{ .op = .max },
+            .Min => .{ .op = .min },
+        };
+    }
 
     /// A container by its identity.
     const Shape = struct { file: Project.FileId, scope: Model.Scope.Id };
@@ -8064,7 +8456,9 @@ pub const accesses = struct {
                     },
                     .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_xor, .assign_bit_or, .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat, .assign_add_sat, .assign_sub_sat => {
                         const target, const value = tree.nodeData(node).node_and_node;
-                        if (try w.wants(target)) try w.store(w.make(node, target, .update, value));
+                        var site = w.make(node, target, .update, value);
+                        site.operator = .{ .op = compound(tag) };
+                        if (try w.wants(target)) try w.store(site);
                     },
                     .assign_destructure => {
                         const whole = tree.assignDestructure(node);
@@ -8399,7 +8793,13 @@ pub const accesses = struct {
                 const pointer = if (entry[1].pointer < args.len) args[entry[1].pointer] else return;
                 const value: ?Ast.Node.Index = if (entry[1].value) |k| (if (k < args.len) args[k] else null) else null;
                 if (!try w.wants(pointer)) return;
-                return w.pointee(w.make(node, pointer, entry[1].kind, value));
+                var site = w.make(node, pointer, entry[1].kind, value);
+                // `@atomicRmw(T, ptr, op, operand, order)`: the operation it names.
+                if (entry[1].kind == .update) site.operator = if (args.len > 2) switch (try w.facts.fieldName(w.file, args[2])) {
+                    .name => |op_name| if (std.meta.stringToEnum(std.builtin.AtomicRmwOp, op_name)) |op| .{ .op = atomic(op) } else .{ .unknown = .unresolved },
+                    .each_of, .names, .computed => .{ .unknown = .unsupported },
+                } else .{ .unknown = .invalid_front_end };
+                return w.pointee(site);
             }
             if (std.mem.eql(u8, name, "@ptrCast") or std.mem.eql(u8, name, "@bitCast")) {
                 // A value of the result's type made of other memory's bits; for a pointer, the memory
