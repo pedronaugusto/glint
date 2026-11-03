@@ -263,6 +263,11 @@ pub fn guardType(name: []const u8) bool {
     return false;
 }
 
+/// The hand-off type a guarded owner declares (`Guard.handOff`'s `Handoff`).
+pub fn handoffType(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Handoff");
+}
+
 /// The operations by which a guarded owner gives a guard: every acquire, blocking or
 /// spinning, cancelable or not, tried or waited for, and a reader's or a writer's.
 pub fn acquisition(name: []const u8) bool {
