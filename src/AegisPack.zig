@@ -1067,7 +1067,7 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, call: Ast.full.C
             try c.undecided(rule, tree.tokenStart(name_token), .unsupported, "a generic of more parameters than are read here copies some: its binding may copy an owner");
             return false;
         }
-        types[count] = if (param.type_expr) |t| written.nodeTag(t) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(t)), "type") else false;
+        types[count] = if (param.type_expr) |t| try typeKeyword(c, function.file, t) else false;
         values[count] = param.anytype_ellipsis3 != null;
     }
     const receiver: usize = if (tree.nodeTag(call.ast.fn_expr) == .field_access and count == call.ast.params.len + 1) 1 else 0;
@@ -1653,14 +1653,11 @@ fn moved(c: *Context, copy: Ast.Node.Index, source: Ast.Node.Index, returned: bo
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) loop = parent;
     }
     if (loop != null and !returned) return .no;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
+    var named_by = Mentions.all(model, model.declarations[@backingInt(index)].token);
+    while (named_by.next()) |candidate| {
         if (candidate == source) continue;
-        const ref = model.reference(candidate) orelse continue;
-        if (ref.declaration != index) continue;
         var deferred = false;
-        var parents = model.node_parents[i];
+        var parents = model.parentOf(candidate);
         while (parents) |parent| : (parents = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
                 .@"defer", .@"errdefer" => deferred = true,
@@ -2011,7 +2008,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     const v = tree.fullVarDecl(decl.node) orelse return false;
     if (v.ast.type_node.unwrap()) |t| {
         if (tree.fullPtrType(t) != null) return false;
-        if (tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type")) return false;
+        if (try typeKeyword(c, c.file, t)) return false;
         return try Contract.owner(c, t) != null;
     }
     var init = v.ast.init_node.unwrap() orelse return false;
@@ -2088,7 +2085,7 @@ fn checkCleanup(c: *Context) Context.Error!void {
         };
         const declared = model.parentOf(decl.node);
         const at = if (decl.kind == .capture) 0 else for (statements, 0..) |stmt, i| {
-            if (stmt == decl.node or (declared != null and stmt == declared.? and tree.nodeTag(stmt) == .assign_destructure)) break i + 1;
+            if (stmt == decl.node or (declared != null and stmt == declared.? and Facts.accesses.formOf(tree.nodeTag(stmt)) == .destructure)) break i + 1;
         } else continue;
         const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = scope };
         switch (try flow.walk(statements[at..], .live)) {
@@ -2179,7 +2176,7 @@ fn followedAt(c: *Context, tree: *const Ast, model: *const Model, parent: Ast.No
     var payload: ?Ast.TokenIndex = null;
     if (tree.fullVarDecl(parent) != null) {
         try nodes.append(c.allocator, parent);
-    } else if (tree.nodeTag(parent) == .assign_destructure) {
+    } else if (Facts.accesses.formOf(tree.nodeTag(parent)) == .destructure) {
         const destructure = tree.assignDestructure(parent);
         if (destructure.ast.value_expr != at) return false;
         try nodes.appendSlice(c.allocator, destructure.ast.variables);
@@ -2280,7 +2277,7 @@ fn acquiredFrom(tree: *const Ast, model: *const Model, decl: Model.Declaration) 
     const v = tree.fullVarDecl(decl.node) orelse return null;
     if (v.ast.init_node.unwrap()) |init| return init;
     const parent = model.parentOf(decl.node) orelse return null;
-    if (tree.nodeTag(parent) != .assign_destructure) return null;
+    if (Facts.accesses.formOf(tree.nodeTag(parent)) != .destructure) return null;
     const destructure = tree.assignDestructure(parent);
     const position = std.mem.findScalar(Ast.Node.Index, destructure.ast.variables, decl.node) orelse return null;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -3123,7 +3120,7 @@ const Flow = struct {
     fn takes(f: Flow, stmt: Ast.Node.Index) Context.Error!?Outcome {
         const returned = f.tree.nodeTag(stmt) == .@"return";
         const bound = f.tree.fullVarDecl(stmt);
-        const assigned = f.tree.nodeTag(stmt) == .assign;
+        const assigned = Facts.accesses.formOf(f.tree.nodeTag(stmt)) == .assign;
         const node = (if (returned) f.tree.nodeData(stmt).opt_node.unwrap() else if (bound) |v| v.ast.init_node.unwrap() else if (assigned) f.tree.nodeData(stmt).node_and_node[1] else stmt) orelse return null;
         if (try f.kept(node)) |move| {
             const holds = returned or (assigned and try f.unheld(f.tree.nodeData(stmt).node_and_node[0])) or (bound != null and move == node);
@@ -3356,15 +3353,13 @@ const Flow = struct {
         const first = f.tree.firstToken(init);
         const last = f.tree.lastToken(init);
         var held = false;
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (!f.mine(candidate)) continue;
+        var named_by = Mentions.all(f.model, f.token);
+        while (named_by.next()) |candidate| {
             const main = f.tree.nodeMainToken(candidate);
             if (main > last) return null;
             if (main < first) continue;
             // A field's value of this literal or of one nested in it.
-            const parent = f.model.node_parents[i] orelse return null;
+            const parent = f.model.parentOf(candidate) orelse return null;
             var literal_buffer: [2]Ast.Node.Index = undefined;
             const literal = f.tree.fullStructInit(&literal_buffer, parent) orelse return null;
             for (literal.ast.fields) |field| {
@@ -3498,7 +3493,7 @@ const Flow = struct {
     /// dependency's among them, is not walked for what it does with its parameter, so a call to
     /// one stays undecided.
     fn argument(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        var value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (f.tree.nodeTag(stmt) == .assign) f.tree.nodeData(stmt).node_and_node[1] else stmt;
+        var value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) == .assign) f.tree.nodeData(stmt).node_and_node[1] else stmt;
         if (f.tree.nodeTag(value) == .@"try") value = f.tree.nodeData(value).node;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return false;
@@ -3513,15 +3508,9 @@ const Flow = struct {
             .unknown => return false,
         };
         if (try Program.owns(f.c, callee.file)) return false;
-        const first = f.tree.firstToken(stmt);
-        const last = f.tree.lastToken(stmt);
         var named: usize = 0;
-        for (f.tree.nodes.items(.tag), 0..) |tag, i| {
-            if (tag != .identifier) continue;
-            const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            const main = f.tree.nodeMainToken(candidate);
-            if (main >= first and main <= last and f.mine(candidate)) named += 1;
-        }
+        var named_in = Mentions.of(f.model, f.token, f.tree, stmt);
+        while (named_in.next()) |_| named += 1;
         return named == 1;
     }
 
@@ -3605,7 +3594,7 @@ const Flow = struct {
     /// `place = owner` into storage the function does not hold (`unheld`), the owner itself by
     /// value: a transfer by assignment, the obligation then the place's holder's.
     fn stored(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
-        if (f.tree.nodeTag(stmt) != .assign) return false;
+        if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) != .assign) return false;
         const data = f.tree.nodeData(stmt).node_and_node;
         if (!f.mine(data[1])) return false;
         return f.unheld(data[0]);
@@ -4039,6 +4028,14 @@ fn memberNamed(c: *Context, file: Project.FileId, read: Ast.Node.Index) Context.
     return if (path.steps[0].kind == .field) path.steps[0].name else null;
 }
 
+/// Whether `node` names the type `type`, by what it resolves to.
+fn typeKeyword(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return switch (try c.facts.resolve(file, node)) {
+        .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
+        else => false,
+    };
+}
+
 /// The token declaring the local or global the name `node` reaches, by the model's resolution;
 /// null for any other node and for an enum literal spelled alike.
 fn declaringToken(model: *const Model, node: Ast.Node.Index) ?Ast.TokenIndex {
@@ -4068,6 +4065,11 @@ const Mentions = struct {
 
     fn of(model: *const Model, token: Ast.TokenIndex, tree: *const Ast, node: Ast.Node.Index) Mentions {
         return .{ .model = model, .token = token, .first = tree.firstToken(node), .last = tree.lastToken(node) };
+    }
+
+    /// Every name in the file that reaches the declaration at `token`.
+    fn all(model: *const Model, token: Ast.TokenIndex) Mentions {
+        return .{ .model = model, .token = token, .first = 0, .last = std.math.maxInt(Ast.TokenIndex) };
     }
 
     fn next(m: *Mentions) ?Ast.Node.Index {
@@ -4702,12 +4704,9 @@ fn parameterOf(c: *Context, function: Facts.Decl, position: usize) ?Model.Declar
 fn beforeAdoption(c: *Context, file: Project.FileId, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex, depth: u8) Context.Error!Before {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const use: Ast.Node.Index = @fromBackingInt(@intCast(i));
+    var named_by = Mentions.all(model, model.declarations[@backingInt(index)].token);
+    while (named_by.next()) |use| {
         if (use == read or tree.nodeMainToken(use) >= until) continue;
-        const ref = model.reference(use) orelse continue;
-        if (ref.declaration != index) continue;
         // Deferred code runs at the scope's end: `heldAlone` reads it.
         var deferred = false;
         var up = model.parentOf(use);
@@ -4834,14 +4833,11 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
 fn heldAlone(c: *Context, index: Model.Declaration.Id, read: Ast.Node.Index, until: Ast.TokenIndex) bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(i));
+    var named_by = Mentions.all(model, model.declarations[@backingInt(index)].token);
+    while (named_by.next()) |candidate| {
         if (candidate == read) continue;
-        const ref = model.reference(candidate) orelse continue;
-        if (ref.declaration != index) continue;
         if (tree.nodeMainToken(candidate) > until) return false;
-        var up = model.node_parents[i];
+        var up = model.parentOf(candidate);
         while (up) |parent| : (up = model.parentOf(parent)) {
             switch (tree.nodeTag(parent)) {
                 .@"defer", .@"errdefer" => return false,
@@ -4870,13 +4866,10 @@ fn passedWhole(c: *Context, index: Model.Declaration.Id, want: ?Path, depth: usi
         if (std.mem.eql(u8, tree.tokenSlice(tree.nodeData(member).node_and_token[1]), record.name)) return false;
     }
     const position = parameterPosition(c, function, index).?; // unreachable: the parameter was found in this function
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const use: Ast.Node.Index = @fromBackingInt(@intCast(i));
+    var named_by = Mentions.all(model, record.token);
+    while (named_by.next()) |use| {
         if (tree.nodeMainToken(use) == record.token) continue;
-        const ref = model.reference(use) orelse continue;
-        if (ref.declaration != function) continue;
-        const parent = model.node_parents[i] orelse return false;
+        const parent = model.parentOf(use) orelse return false;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, parent) orelse return false;
         if (call.ast.fn_expr != use) return false;
