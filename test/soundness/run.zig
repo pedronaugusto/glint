@@ -34,6 +34,7 @@
 //! workers (0, one per CPU); RULES the rules whose cases alone run, by comma (none, every
 //! rule's).
 const std = @import("std");
+const builtin = @import("builtin");
 const glint = @import("glint");
 const Row = glint.Constructs.Row;
 
@@ -151,6 +152,10 @@ pub fn main(init: std.process.Init) !void {
     defer group.cancel(io);
     for (0..workers) |_| try group.concurrent(io, Pool.work, .{ &pool, init.gpa, io });
     try group.await(io);
+    if (peakResident()) |peak| {
+        const ceiling = held_ceiling + workers * worker_ceiling;
+        if (peak > ceiling) try w.print("the suite's peak resident memory is {d} MiB at {d} workers, past its ceiling of {d} MiB: a run keeps memory it should give back\n", .{ peak >> 20, workers, ceiling >> 20 });
+    }
     for (jobs.items, verdicts) |job, result| {
         const verdict = try result;
         const column = &columns.items[job.column];
@@ -210,6 +215,27 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{failures.written()});
         std.process.exit(1);
     }
+}
+
+/// The most memory one worker holds at its peak (its store, and the run of the case it judges),
+/// and the most the suite holds beside its workers. A suite past them fails: a run that keeps
+/// memory it should give back (each reading of a loop's scratch kept to the run's end, 11-03,
+/// which took the suite past 32 GiB at one worker per CPU) fails here instead of exhausting the
+/// machine that runs it. Measured on aarch64-macos, ReleaseSafe (11-03): 2970 MiB at 4 workers,
+/// 11547 MiB at 16, so about 715 MiB a worker and 110 MiB beside them; the ceilings keep two
+/// fifths more a worker.
+const worker_ceiling: usize = 1024 << 20;
+const held_ceiling: usize = 512 << 20;
+
+/// This process's peak resident memory in bytes, null where its system does not say.
+fn peakResident() ?usize {
+    const usage = switch (builtin.os.tag) {
+        .linux, .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => std.posix.getrusage(std.posix.rusage.SELF),
+        else => return null,
+    };
+    const peak: usize = @intCast(usage.maxrss);
+    // Darwin's is in bytes, the others' in KiB.
+    return if (builtin.os.tag.isDarwin()) peak else peak * 1024;
 }
 
 /// The Zig that compiles the cases, what it compiles them with, and the cache its compilations

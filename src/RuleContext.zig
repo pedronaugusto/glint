@@ -9,6 +9,10 @@ const Report = @import("Report.zig");
 const RuleContext = @This();
 
 allocator: std.mem.Allocator,
+/// An allocator that frees, under `allocator` (the run's arena, which keeps all it gives until the
+/// run ends): what a rule makes and drops within its own work, a scratch arena among them
+/// (`Bounds`' reading of one function), is made on it, so dropping it gives the memory back.
+backing: std.mem.Allocator = std.heap.page_allocator,
 project: *const Project,
 file: Project.FileId,
 config: rules.Config,
@@ -19,6 +23,16 @@ sink: *Sink,
 compiled: []const Rule = &.{},
 
 pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
+
+/// Makes `allocator` the run's own (`Facts.gpa`) and returns the one it was: what a function
+/// that fills a `Facts.memo` computes, its callees' memory among it, is kept for the run, as a
+/// rule's own memory for one file is given back when the rule is done with the file. Restored
+/// on the way out: `const rule_memory = c.keep(); defer c.allocator = rule_memory;`.
+pub fn keep(self: *RuleContext) std.mem.Allocator {
+    const own = self.allocator;
+    self.allocator = self.facts.gpa;
+    return own;
+}
 /// Where a rule's findings go. Its owner embeds it in its own state and gets that back from
 /// the sink a callback is given with `@fieldParentPtr`.
 pub const Sink = struct {

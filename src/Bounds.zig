@@ -394,6 +394,9 @@ const Analyses = struct {
 };
 
 fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: u16) Error!*Analysis {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Analyses);
     const key = .{ file, function, width };
     if (memo.map.get(key)) |found| return found;
@@ -414,7 +417,8 @@ fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: 
 /// One reading of `function` into `made`, its parameters starting from their types and, where
 /// given, `entry`: constraints over their slots that every call of it in the program holds.
 fn readInto(c: *Context, made: *Analysis, file: Project.FileId, function: Ast.Node.Index, width: u16, given: ?[]const Lin) Error!void {
-    var scratch: std.heap.ArenaAllocator = .init(c.allocator);
+    // On `backing`: the run's arena would keep each reading's scratch to the run's end.
+    var scratch: std.heap.ArenaAllocator = .init(c.backing);
     defer scratch.deinit();
     var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .width = width, .function = function, .entry = given };
     frame.run() catch |err| switch (err) {
@@ -482,6 +486,9 @@ const entry_depth = 32;
 /// alone where they give none. Its calls' states come from this reading, so a caller's own
 /// entry reaches its callees in turn.
 fn byCallers(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: u16) Error!*Analysis {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Entries);
     const key = .{ file, function, width };
     if (memo.map.get(key)) |found| return found;
@@ -549,6 +556,9 @@ const Called = struct {
 };
 
 fn callersIndex(c: *Context) Error!*Callers {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Callers);
     if (memo.built) return memo;
     memo.built = true;
@@ -3173,6 +3183,9 @@ fn aliased(c: *Context, t: TypeRef) Error!?TypeRef {
 /// node's index is cast where it is set) and each token's start with `@intCast` of its offset
 /// (zig/Ast.zig:162), so a table past `maxInt(u32) + 1` entries is never made.
 fn table(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Error!?Coef {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const tree = &c.project.at(file).file.tree;
     var node = memory;
     var buffer: [1]Ast.Node.Index = undefined;

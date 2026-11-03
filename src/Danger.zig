@@ -553,6 +553,9 @@ const SecretType = struct { container: Facts.Container, name: []const u8 };
 /// relative imports (a declared set: each holds a private key), and each container those
 /// files declare that holds one by value, as a field.
 fn secretTypes(c: *Context) Context.Error![]const SecretType {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(SecretTypes);
     if (memo.built) return memo.types.items;
     memo.built = true;

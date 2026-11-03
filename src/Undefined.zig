@@ -791,14 +791,6 @@ const Walk = struct {
         return false;
     }
 
-    /// Whether a parameter's memory is left `undefined`, the parts in `left`, on some path that
-    /// returns, walking on from `mention`, which leaves them so, to the end of `body`. One that
-    /// reads it there (its own fault) is taken as leaving it.
-    fn leftUndefined(w: *Walk, mention: Ast.Node.Index, left: u64, body: Ast.Node.Index) Context.Error!bool {
-        const exits = try w.leftExits(mention, left, body);
-        return exits.success or exits.failure;
-    }
-
     /// The exits of a parameter's function that leave its memory `undefined`, the parts in
     /// `left`, walking on from `mention`, which leaves them so, to the end of `body`: one that
     /// returns an error (`return error.X`, a `try`), and one that returns otherwise (running off
@@ -2837,51 +2829,63 @@ fn functionsOf(gpa: std.mem.Allocator, value: Facts.Value, found: *std.ArrayList
     return true;
 }
 
-/// std 0.17.0's own implementations of Io.Reader's and Io.Writer's vtables, each read in std's
-/// source (2026-11-01): none gives the interface it is handed (`*Reader`, `*Writer`, the one a
-/// `stream` writes to) or its buffer `undefined`; what `undefined` they spell is their own
-/// locals'. The defaults a vtable leaves unnamed are std's too. A vtable the program installs
-/// is read where it installs it (`installed`).
-const std_interface_implementations = [_][]const u8{
-    // Io/Writer.zig: the defaults, fixed, failing, discarding, hashed and allocating writers.
-    "Io/Writer.zig:392 defaultFlush",                   "Io/Writer.zig:419 defaultRebase",                   "Io/Writer.zig:2426 unimplementedSendFile",
-    "Io/Writer.zig:398 noopFlush",                      "Io/Writer.zig:2437 fixedDrain",                     "Io/Writer.zig:2325 failingDrain",
-    "Io/Writer.zig:2332 failingSendFile",               "Io/Writer.zig:2339 failingRebase",                  "Io/Writer.zig:2368 Discarding.drain",
-    "Io/Writer.zig:2379 Discarding.sendFile",           "Io/Writer.zig:2469 unreachableDrain",               "Io/Writer.zig:2476 unreachableRebase",
-    "Io/Writer.zig:2541 Hashed.drain",                  "Io/Writer.zig:2622 Hashing.drain",                  "Io/Writer.zig:2841 Allocating.drain",
-    "Io/Writer.zig:2865 Allocating.sendFile",           "Io/Writer.zig:2884 growingRebase",
-    // Io/Reader.zig: the defaults, failing, ending, fixed and hashed readers.
-                     "Io/Reader.zig:196 defaultDiscard",
-    "Io/Reader.zig:450 defaultReadVec",                 "Io/Reader.zig:1432 defaultRebase",                  "Io/Reader.zig:1836 endingStream",
-    "Io/Reader.zig:1843 endingReadVec",                 "Io/Reader.zig:1849 endingDiscard",                  "Io/Reader.zig:1855 endingRebase",
-    "Io/Reader.zig:1861 failingStream",                 "Io/Reader.zig:1868 failingDiscard",                 "Io/Reader.zig:2013 Hashed.stream",
-    "Io/Reader.zig:2023 Hashed.readVec",                "Io/Reader.zig:2048 Hashed.discard",                 "Io/Reader/Limited.zig:28 stream",
-    "Io/Reader/Limited.zig:52 discard",
-    // Files, sockets and the multiplexed reader.
-                    "Io/File/Reader.zig:199 stream",                     "Io/File/Reader.zig:231 readVec",
-    "Io/File/Reader.zig:300 discard",                   "Io/File/Writer.zig:89 drain",                       "Io/File/Writer.zig:134 sendFile",
-    "Io/File/MultiReader.zig:149 stream",               "Io/File/MultiReader.zig:158 discard",               "Io/File/MultiReader.zig:166 readVec",
-    "Io/File/MultiReader.zig:174 rebase",               "Io/net.zig:1354 Socket.Reader.streamImpl",          "Io/net.zig:1362 Socket.Reader.readVec",
-    "Io/net.zig:1439 Stream.Writer.drain",              "Io/net.zig:1462 Stream.Writer.sendFile",
-    // HTTP bodies, TLS, the compressors and decompressors, PDB streams, the AST renderer.
-               "http.zig:509 contentLengthStream",
-    "http.zig:527 contentLengthDiscard",                "http.zig:541 chunkedStream",                        "http.zig:610 chunkedDiscard",
-    "http.zig:886 contentLengthDrain",                  "http.zig:895 noneDrain",                            "http.zig:903 elidingDrain",
-    "http.zig:917 elidingSendFile",                     "http.zig:944 noneSendFile",                         "http.zig:952 contentLengthSendFile",
-    "http.zig:961 chunkedSendFile",                     "http.zig:997 chunkedDrain",                         "crypto/tls/Client.zig:965 drain",
-    "crypto/tls/Client.zig:997 flush",                  "crypto/tls/Client.zig:1124 stream",                 "crypto/tls/Client.zig:1132 readVec",
-    "compress/flate/Compress.zig:345 drain",            "compress/flate/Compress.zig:356 flush",             "compress/flate/Compress.zig:371 rebase",
-    "compress/flate/Compress.zig:1631 Raw.drain",       "compress/flate/Compress.zig:1741 Raw.flush",        "compress/flate/Compress.zig:1752 Raw.rebase",
-    "compress/flate/Compress.zig:1877 drain",           "compress/flate/Compress.zig:1964 flush",            "compress/flate/Compress.zig:2126 Huffman.drain",
-    "compress/flate/Compress.zig:2332 Huffman.flush",   "compress/flate/Compress.zig:2347 Huffman.rebase",   "compress/flate/Decompress.zig:105 rebaseFallible",
-    "compress/flate/Decompress.zig:121 discardDirect",  "compress/flate/Decompress.zig:144 discardIndirect", "compress/flate/Decompress.zig:164 readVec",
-    "compress/flate/Decompress.zig:244 streamDirect",   "compress/flate/Decompress.zig:249 streamIndirect",  "compress/zstd/Decompress.zig:110 streamDirect",
-    "compress/zstd/Decompress.zig:115 streamIndirect",  "compress/zstd/Decompress.zig:122 rebaseFallible",   "compress/zstd/Decompress.zig:159 discardDirect",
-    "compress/zstd/Decompress.zig:182 discardIndirect", "compress/zstd/Decompress.zig:202 readVec",          "compress/xz/Decompress.zig:104 readVec",
-    "compress/xz/Decompress.zig:109 stream",            "compress/xz/Decompress.zig:115 discard",            "compress/lzma.zig:685 readVec",
-    "compress/lzma.zig:690 stream",                     "compress/lzma.zig:696 discard",                     "debug/Pdb.zig:1068 stream",
-    "zig.zig:648 drain",                                "zig.zig:660 flush",                                 "zig/Ast/Render.zig:943 drainNoNewline",
-};
+// std_interface_implementations: std 0.17.0's own implementations of Io.Reader's and Io.Writer's
+// vtables, each read in std's source (2026-11-01): none gives the interface it is handed
+// (`*Reader`, `*Writer`, the one a `stream` writes to) or its buffer `undefined`; what
+// `undefined` they spell is their own locals'. The defaults a vtable leaves unnamed are std's
+// too. A vtable the program installs is read where it installs it (`installed`).
+//
+// Io/Writer.zig: the defaults, fixed, failing, discarding, hashed and allocating writers.
+//   Io/Writer.zig:392 defaultFlush, Io/Writer.zig:419 defaultRebase,
+//   Io/Writer.zig:2426 unimplementedSendFile, Io/Writer.zig:398 noopFlush,
+//   Io/Writer.zig:2437 fixedDrain, Io/Writer.zig:2325 failingDrain,
+//   Io/Writer.zig:2332 failingSendFile, Io/Writer.zig:2339 failingRebase,
+//   Io/Writer.zig:2368 Discarding.drain, Io/Writer.zig:2379 Discarding.sendFile,
+//   Io/Writer.zig:2469 unreachableDrain, Io/Writer.zig:2476 unreachableRebase,
+//   Io/Writer.zig:2541 Hashed.drain, Io/Writer.zig:2622 Hashing.drain,
+//   Io/Writer.zig:2841 Allocating.drain, Io/Writer.zig:2865 Allocating.sendFile,
+//   Io/Writer.zig:2884 growingRebase.
+// Io/Reader.zig: the defaults, failing, ending, fixed and hashed readers.
+//   Io/Reader.zig:196 defaultDiscard, Io/Reader.zig:450 defaultReadVec,
+//   Io/Reader.zig:1432 defaultRebase, Io/Reader.zig:1836 endingStream,
+//   Io/Reader.zig:1843 endingReadVec, Io/Reader.zig:1849 endingDiscard,
+//   Io/Reader.zig:1855 endingRebase, Io/Reader.zig:1861 failingStream,
+//   Io/Reader.zig:1868 failingDiscard, Io/Reader.zig:2013 Hashed.stream,
+//   Io/Reader.zig:2023 Hashed.readVec, Io/Reader.zig:2048 Hashed.discard,
+//   Io/Reader/Limited.zig:28 stream, Io/Reader/Limited.zig:52 discard.
+// Files, sockets and the multiplexed reader.
+//   Io/File/Reader.zig:199 stream, Io/File/Reader.zig:231 readVec, Io/File/Reader.zig:300 discard,
+//   Io/File/Writer.zig:89 drain, Io/File/Writer.zig:134 sendFile,
+//   Io/File/MultiReader.zig:149 stream, Io/File/MultiReader.zig:158 discard,
+//   Io/File/MultiReader.zig:166 readVec, Io/File/MultiReader.zig:174 rebase,
+//   Io/net.zig:1354 Socket.Reader.streamImpl, Io/net.zig:1362 Socket.Reader.readVec,
+//   Io/net.zig:1439 Stream.Writer.drain, Io/net.zig:1462 Stream.Writer.sendFile.
+// HTTP bodies, TLS, the compressors and decompressors, PDB streams, the AST renderer.
+//   http.zig:509 contentLengthStream, http.zig:527 contentLengthDiscard,
+//   http.zig:541 chunkedStream, http.zig:610 chunkedDiscard, http.zig:886 contentLengthDrain,
+//   http.zig:895 noneDrain, http.zig:903 elidingDrain, http.zig:917 elidingSendFile,
+//   http.zig:944 noneSendFile, http.zig:952 contentLengthSendFile, http.zig:961 chunkedSendFile,
+//   http.zig:997 chunkedDrain, crypto/tls/Client.zig:965 drain, crypto/tls/Client.zig:997 flush,
+//   crypto/tls/Client.zig:1124 stream, crypto/tls/Client.zig:1132 readVec,
+//   compress/flate/Compress.zig:345 drain, compress/flate/Compress.zig:356 flush,
+//   compress/flate/Compress.zig:371 rebase, compress/flate/Compress.zig:1631 Raw.drain,
+//   compress/flate/Compress.zig:1741 Raw.flush, compress/flate/Compress.zig:1752 Raw.rebase,
+//   compress/flate/Compress.zig:1877 drain, compress/flate/Compress.zig:1964 flush,
+//   compress/flate/Compress.zig:2126 Huffman.drain, compress/flate/Compress.zig:2332 Huffman.flush,
+//   compress/flate/Compress.zig:2347 Huffman.rebase,
+//   compress/flate/Decompress.zig:105 rebaseFallible,
+//   compress/flate/Decompress.zig:121 discardDirect,
+//   compress/flate/Decompress.zig:144 discardIndirect, compress/flate/Decompress.zig:164 readVec,
+//   compress/flate/Decompress.zig:244 streamDirect,
+//   compress/flate/Decompress.zig:249 streamIndirect,
+//   compress/zstd/Decompress.zig:110 streamDirect, compress/zstd/Decompress.zig:115 streamIndirect,
+//   compress/zstd/Decompress.zig:122 rebaseFallible,
+//   compress/zstd/Decompress.zig:159 discardDirect,
+//   compress/zstd/Decompress.zig:182 discardIndirect, compress/zstd/Decompress.zig:202 readVec,
+//   compress/xz/Decompress.zig:104 readVec, compress/xz/Decompress.zig:109 stream,
+//   compress/xz/Decompress.zig:115 discard, compress/lzma.zig:685 readVec,
+//   compress/lzma.zig:690 stream, compress/lzma.zig:696 discard, debug/Pdb.zig:1068 stream,
+//   zig.zig:648 drain, zig.zig:660 flush, zig/Ast/Render.zig:943 drainNoNewline.
 
 /// A function of std's Io.Reader or Io.Writer vtable a call reaches: `x.vtable.name(…)` with `x`
 /// one of those interfaces (or a pointer to one), and the vtable's field by its declaration.
@@ -3219,6 +3223,9 @@ fn holderKeptByParameter(c: *Context, decl: Facts.Decl, index: usize, depth: u8)
 const StdFiles = struct { set: std.AutoHashMapUnmanaged(u32, void) = .empty, found: bool = false };
 
 fn inStd(c: *Context, file: Project.FileId) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(StdFiles);
     if (!memo.found) {
         memo.found = true;
@@ -3371,6 +3378,9 @@ const Cursors = struct {
 /// and never sets. What such a writer holds below its count was written, through it. Null
 /// where the type is no such writer.
 fn cursorCount(c: *Context, container: Facts.Container, memory: Facts.Decl) Context.Error!?[]const u8 {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Cursors);
     if (memo.counts.get(memory)) |known| return known;
     const found = try cursorCountRead(c, container, memory);
@@ -3569,6 +3579,9 @@ fn keepsWriterAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth:
 /// Whether the program's function `decl` keeps the cursor writer its parameter `index` gives
 /// it as `keepsWriterAt` says: a copy, where the parameter is no pointer, holds nothing back.
 fn keepsWriter(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     if (!try Program.owns(c, decl.file)) return false;
     const memo = try c.facts.memo(Cursors);
     const key: Calls.Key = .{ .decl = decl, .index = index, .question = .keeps };
@@ -3904,6 +3917,9 @@ const Calls = struct {
 /// every one held, the least answer, as a recursion's is; null where `budget` readings did not
 /// end the pass.
 fn readDeferred(c: *Context) Context.Error!?bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Calls);
     memo.holding = true;
     defer {
@@ -3963,6 +3979,9 @@ const Needs = struct { mask: u64, owner: Owner };
 const Owner = union(enum) { container: struct { file: Project.FileId, scope: Model.Scope.Id }, elements: u7 };
 
 fn remembered(comptime T: type, c: *Context, key: Calls.Key, depth: u8, comptime read: fn (*Context, Facts.Decl, usize, u8) Context.Error!T, comptime cut: T) Context.Error!T {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Calls);
     const map = if (T == bool) &memo.found else &memo.needed;
     const pass = if (T == bool) &memo.found_this_pass else &memo.needed_this_pass;
@@ -4001,6 +4020,9 @@ fn remembered(comptime T: type, c: *Context, key: Calls.Key, depth: u8, comptime
 /// gives `undefined`, whatever the recursion. Only what such a reading showed of itself is
 /// kept; a function past the depth is taken at what it is assumed to leave (`readDeferred`).
 fn undefines(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Calls);
     const key: Calls.Key = .{ .decl = decl, .index = index, .question = .undefines };
     if (memo.left.get(key)) |known| return known;
@@ -4070,6 +4092,9 @@ fn settle(gpa: std.mem.Allocator, memo: *Calls, head: usize, keep: bool) Context
 }
 
 fn undefinesRead(c: *Context, decl: Facts.Decl, index: usize, depth: u8) Context.Error!Left {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     (try c.facts.memo(Calls)).reads += 1;
     const found = (try parameter(c, decl, index, true)) orelse return .{ .mask = 0, .owner = null };
     var walk: Walk = .init(c, decl.file, found.id, true, depth);
@@ -4237,6 +4262,9 @@ const ParentNames = struct {
 /// Whether something in the project may convert a pointer to `owner`'s field `name` back to
 /// one to `owner`.
 fn parentNamed(c: *Context, owner: Owner, name: []const u8) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(ParentNames);
     if (!memo.read) {
         memo.read = true;

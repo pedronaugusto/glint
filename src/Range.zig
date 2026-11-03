@@ -631,6 +631,9 @@ fn readCount(c: *Context, file: Project.FileId, decl: Facts.Decl, call: Ast.full
 const Returns = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
 fn returned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Returns);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -831,6 +834,9 @@ fn constant(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
 const Assigned = struct { map: std.AutoHashMapUnmanaged(struct { Facts.Decl, u16 }, ?Magnitude) = .empty };
 
 fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Assigned);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -876,6 +882,9 @@ const Given = struct {
 };
 
 fn givenTypes(c: *Context) Context.Error!*Given {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Given);
     if (memo.built) return memo;
     memo.built = true;
@@ -992,6 +1001,9 @@ fn typeShapes(c: *Context, memo: *Given, value: Facts.Value, depth: u8) Context.
 
 /// The program's own files, the ones whose stores a field's invariant reads.
 fn programFiles(c: *Context) Context.Error![]const Project.FileId {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const Files = struct { built: bool = false, list: std.ArrayList(Project.FileId) = .empty };
     const memo = try c.facts.memo(Files);
     if (memo.built) return memo.list.items;
@@ -1040,6 +1052,9 @@ pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
 }
 
 fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!?Magnitude {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Stored);
     const key = .{ decl, pointer };
     if (memo.map.get(key)) |known| return known;
@@ -1845,6 +1860,9 @@ fn subtracted(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), stat
 const Differences = struct { files: std.AutoHashMapUnmanaged(usize, []const Ast.Node.Index) = .empty };
 
 fn differences(c: *Context, file: Project.FileId) Context.Error![]const Ast.Node.Index {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Differences);
     const entry = try memo.files.getOrPut(c.allocator, @backingInt(file));
     if (entry.found_existing) return entry.value_ptr.*;
@@ -2704,6 +2722,9 @@ const Pure = struct { built: bool = false, files: std.AutoHashMapUnmanaged(u32, 
 
 /// Whether `decl` is a function `inert` may read by its parameters: one of `Pure`'s.
 fn pure(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Pure);
     if (!memo.built) {
         memo.built = true;
@@ -2915,6 +2936,9 @@ fn fieldNamed(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
 }
 
 fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Addressed);
     const key = .{ file, d };
     if (memo.map.get(key)) |known| return known;
@@ -3308,6 +3332,9 @@ fn bare(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
 /// array's declared length. Such a position the program has checked, and no peer's choice
 /// of it reaches past the memory.
 pub fn within(c: *Context, file: Project.FileId, index: Ast.Node.Index, memory: Ast.Node.Index, end: bool) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     // A bound read through another bound reads that one's facts in turn: so deep and no deeper.
     const nesting = try c.facts.memo(Nesting);
     if (nesting.level >= 16) return false;
@@ -3495,6 +3522,9 @@ fn entriesOf(c: *Context, file: Project.FileId, table: Ast.Node.Index, owner: Fa
 /// Whether a file of the program declares a table's own id: where none does, a conversion whose
 /// type does not resolve makes none.
 pub fn declaresIds(c: *Context) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(DeclaresIds);
     if (memo.known) |known| return known;
     const out = found: for (c.project.sources) |*source| {

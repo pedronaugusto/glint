@@ -17,6 +17,9 @@ const none: Facts.FileSet = .empty;
 
 /// The run's program, found the first time an analysis asks.
 pub fn get(c: *Context) Context.Error!*const Program {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const program = try c.facts.memo(Program);
     if (program.outside != null) return program;
     const outside = try c.facts.outside();

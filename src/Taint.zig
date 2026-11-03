@@ -441,6 +441,9 @@ const Solved = struct { flow: ?*Flow = null };
 /// first time one is asked. A rule asks only the facts it declares (`Context.Rule.facts`);
 /// another is `error.InvalidSelection`.
 pub fn get(c: *Context, spec: Spec) Context.Error!Fact {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Solved);
     const flow = memo.flow orelse solved: {
         var specs: std.ArrayList(Spec) = .empty;
@@ -559,6 +562,9 @@ fn parsers(c: *Context, flow: *Flow) Context.Error!void {
 
 /// The declarations the fact starts from and stops at: std's reader, file, directory and stream.
 fn known(c: *Context, flow: *Flow) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const paths = [_][]const u8{ "Io.Reader", "Io.File", "Io.Dir", "Io.net.Stream" };
     var found: [paths.len]?Facts.Container = @splat(null);
     for (paths, &found) |path, *slot| {
@@ -610,6 +616,9 @@ fn known(c: *Context, flow: *Flow) Context.Error!void {
 
 /// The file's functions with a body, and each node's owner among them.
 fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const tree = &c.project.at(file).file.tree;
     const owners = try c.allocator.alloc(?Function.Id, tree.nodes.len);
     @memset(owners, null);
@@ -633,6 +642,9 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
 
 /// A function of the flow for the `fn_decl` `node`, its nodes not yet given.
 fn addFunction(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Function.Id {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -893,6 +905,9 @@ fn declaredAt(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
 }
 
 fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     if (value.clean()) return;
     const entry = try flow.locals.getOrPut(c.allocator, decl);
     const before: Dep = if (entry.found_existing) entry.value_ptr.* else .{};
@@ -903,6 +918,9 @@ fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Er
 
 /// A field or a container-level variable given a value of `level` in memory of `length`.
 fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Levels, length: Levels) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Levels), Levels }{ .{ &flow.globals, level }, .{ &flow.lengths, length } }) |each| {
         const map, const raised = each;
         if (raised.isClean()) continue;
@@ -1360,6 +1378,9 @@ const Callee = struct {
 /// that may be any, or arguments whose parameters are not known). Null where `node` makes no
 /// call. Read once per call: what it reaches stays as the flow's functions are.
 fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Callee {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const key: Facts.Key = .{ .file = file, .node = node };
     if (flow.callees.get(key)) |known_callee| return known_callee;
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
@@ -1852,6 +1873,9 @@ const FieldsNamed = struct {
 /// The program's own fields named `name`: those a member of a holder whose type does not
 /// resolve may be.
 fn fieldsNamed(c: *Context, flow: *const Flow, name: []const u8) Context.Error![]const Facts.Decl {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(FieldsNamed);
     if (!memo.built) {
         memo.built = true;
@@ -2643,6 +2667,9 @@ fn rootDecl(model: *const Model, tree: *const Ast, node: Ast.Node.Index) ?Model.
 const Children = struct { map: std.AutoHashMapUnmanaged(Project.FileId, []const []const Ast.Node.Index) = .empty };
 
 fn children(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Children);
     const all = memo.map.get(file) orelse blk: {
         const model = &c.project.at(file).model;
@@ -2665,6 +2692,9 @@ const CallSites = struct {
 };
 
 fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(CallSites);
     if (memo.built) return memo;
     memo.built = true;
@@ -2758,6 +2788,9 @@ fn keeps(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
 /// Links `owners` to where `node`'s value is kept, walking up through what passes it on.
 /// Returns whether what the function returns a pointer into grew.
 fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, node: Ast.Node.Index) Context.Error!bool {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const f = &flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
@@ -2850,6 +2883,9 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
 }
 
 fn link(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, holders: []const Place) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     for (owners) |owner_place| {
         if (owner_place == .unknown) continue;
         for (holders) |holder| {
@@ -2919,6 +2955,9 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
 const Wholes = struct { map: std.AutoHashMapUnmanaged(Facts.Container, []const Facts.Decl) = .empty };
 
 pub fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts.Decl {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     var roots: std.ArrayList(Facts.Container) = .empty;
     if (!try containersOf(c, value, &roots)) return null;
     if (roots.items.len == 0) return &.{};
@@ -3147,6 +3186,9 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
 /// condition's operands or its inputs' bounds and lengths, and every condition inside it, any
 /// of which may end a pass or the loop. Read once per round.
 fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index) Context.Error!Dep {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const f = flow.functions.items[@backingInt(function)];
     const key: Facts.Key = .{ .file = f.file, .node = loop };
     if (flow.loops.get(key)) |known_dep| return known_dep;
@@ -3191,6 +3233,9 @@ fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index)
 /// that the jump is taken (`controlUpTo` within the statement), and whether a `try`'s operand
 /// is an error. Read once per round.
 fn leaves(c: *Context, flow: *Flow, function: Function.Id, statement: Ast.Node.Index, bound: ?Ast.TokenIndex) Context.Error!Dep {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const f = flow.functions.items[@backingInt(function)];
     const key = .{ Facts.Key{ .file = f.file, .node = statement }, bound };
     if (flow.leaving.get(key)) |known_dep| return known_dep;
@@ -3228,6 +3273,9 @@ fn leaves(c: *Context, flow: *Flow, function: Function.Id, statement: Ast.Node.I
 
 /// A file's jumps in source order, found once.
 fn jumpsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error![]const Ast.Node.Index {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     if (flow.jumps.get(file)) |found_before| return found_before;
     const tree = &c.project.at(file).file.tree;
     var found: std.ArrayList(Ast.Node.Index) = .empty;
@@ -3322,6 +3370,9 @@ pub const SinkSite = struct {
 /// by meaning: what its body gives an allocation (std's `Allocator.rawAlloc`, `rawResize`,
 /// `rawRemap`) or counts a loop's passes by, through every call it makes.
 pub fn sinkSites(c: *Context, fact: Fact, file: Project.FileId) Context.Error![]const SinkSite {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     if (!fact.spec.sinks.size) return &.{};
     const flow = fact.flow;
     if (flow.size_sites.get(file)) |known_sites| return known_sites;
@@ -3476,6 +3527,9 @@ fn sizesFlow(c: *Context, main: *Flow, calls: []const Callee) Context.Error!*Flo
 /// allocation (a sink itself), aegis's (the limit), the program's own, already read, or has
 /// no body.
 fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, next: *std.ArrayList(Function.Id)) Context.Error!void {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     // An allocation is a sink itself; one whose alias does not resolve has no body read.
     if (try allocation(c, flow, decl) != .no) return;
     if (flow.program.aegis_files.contains(@backingInt(decl.file))) return;
@@ -3499,6 +3553,9 @@ fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, next: *std.ArrayList(Functi
 /// Each `fn_decl` of a file a summary reads, by its node, with the nodes its body holds outside
 /// any function nested in it: grouped once per file, however many of its functions are read.
 fn bodies(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!*const std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index) {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const entry = try flow.bodies.getOrPut(c.allocator, file);
     if (entry.found_existing) return entry.value_ptr;
     var grouped: std.AutoHashMapUnmanaged(Ast.Node.Index, std.ArrayList(Ast.Node.Index)) = .empty;

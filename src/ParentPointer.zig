@@ -970,6 +970,9 @@ pub const Verdict = enum { shown, open, undecided };
 /// does not fix) keeps C.F in a C there, read in the callee's body wherever it is: the
 /// program's, std's or a dependency's. Memoized per field: every conversion of C.F shares it.
 fn generics(c: *Context, field: Field, kind: Facts.Container, interface: bool) Context.Error!Verdict {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const decl = c.facts.member(field.parent, field.name) orelse return .open;
     const known = try c.facts.memo(Generics);
     if (known.verdicts.get(decl)) |verdict| return verdict;
@@ -1468,6 +1471,9 @@ const Interfaces = struct { kinds: ?[]const Facts.Container = null, handed: std.
 /// parameter from by `@fieldParentPtr`; null where std's are not known (its declarations read
 /// past the budget), which is never kept.
 fn interfaces(c: *Context) Context.Error!?[]const Facts.Container {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const known = try c.facts.memo(Interfaces);
     if (known.kinds) |kinds| return kinds;
     var kinds: std.ArrayList(Facts.Container) = .empty;
@@ -1585,6 +1591,9 @@ const Slot = struct { holder: Facts.Container, name: []const u8, table: bool = f
 const Slots = struct { found: std.AutoHashMapUnmanaged(Facts.Container, []const Slot) = .empty };
 
 fn functions(c: *Context, kind: Facts.Container) Context.Error![]const Slot {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const known = try c.facts.memo(Slots);
     if (known.found.get(kind)) |slots| return slots;
     var slots: std.ArrayList(Slot) = .empty;
@@ -1652,6 +1661,9 @@ fn capturedField(c: *Context, node: Ast.Node.Index) Context.Error!bool {
 }
 
 fn handedInPlace(c: *Context, kind: Facts.Container, value: Ast.Node.Index) Context.Error!Verdict {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     // `&w.*`, `(w)`: the same interface handed.

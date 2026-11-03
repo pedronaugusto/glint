@@ -727,3 +727,39 @@ test "a canceled analysis ends at the next file, building the project or running
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .io = std.testing.io });
     defer report.deinit();
 }
+
+/// A rule that fills 64 MiB of its own memory in each file it reads and drops it there.
+const touching: glint.Rule = @fromBackingInt(1001); // safe: this test owns its validated extension identity.
+fn touch(context: *glint.RuleContext) glint.RuleContext.Error!void {
+    const own = try context.allocator.alloc(u8, 64 << 20);
+    @memset(own, 0xaa);
+}
+
+/// This process's peak resident memory in bytes, null where its system does not say.
+fn peakResident() ?usize {
+    const builtin = @import("builtin");
+    const usage = switch (builtin.os.tag) {
+        .linux, .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => std.posix.getrusage(std.posix.rusage.SELF),
+        else => return null,
+    };
+    const peak: usize = @intCast(usage.maxrss);
+    // Darwin's is in bytes, the others' in KiB.
+    return if (builtin.os.tag.isDarwin()) peak else peak * 1024;
+}
+
+test "a rule's memory for one file is given back when the rule is done with the file" {
+    // 64 files: 4 GiB a run kept to its end, as every rule's memory once was (11-03). Given
+    // back after each file, the run holds one file's 64 MiB at a time.
+    const before = peakResident() orelse return error.SkipZigTest;
+    var inputs: [64]glint.Project.Input = undefined;
+    var names: [64][8]u8 = undefined;
+    for (&inputs, &names, 0..) |*input, *name, i| input.* = .{ .name = try std.mem.print(name, "f{d}", .{i}), .bytes = "pub const x = 1;\n" };
+    var project = try glint.Project.init(std.testing.allocator, &inputs, &.{}, .{});
+    defer project.deinit();
+    const rule: glint.ProjectRule = .{ .definition = .{ .id = touching, .name = "TOUCHES_MEMORY", .group = .family_policy, .purpose = "fills memory of its own in each file", .version = 1 }, .check = touch };
+    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = touching, .level = .report }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &.{rule} });
+    defer report.deinit();
+    const grown = (peakResident() orelse return error.SkipZigTest) -| before;
+    try std.testing.expect(grown < 1 << 30);
+}

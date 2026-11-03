@@ -680,6 +680,9 @@ const FieldBuiltins = struct {
 /// The reads of a field `name` in the program's files (`x.name`, `@field(x, "name")`), and
 /// every `@field` whose name is computed, which may be it.
 fn fieldUses(c: *Context, name: []const u8) Context.Error![]const FieldUse {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const index = try c.facts.memo(FieldBuiltins);
     if (!index.built) {
         index.built = true;
@@ -2084,6 +2087,9 @@ fn guardGiven(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 /// by one no release reaches (returned, stored, written through a pointer or into its
 /// receiver), through the functions it calls in turn; one that does not resolve, held so, may.
 fn leavesHeld(c: *Context, decl: Facts.Decl, depth: u8) Context.Error!Acquisition {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     if (depth == 8) return .{ .unknown = .cycle };
     const program = try Program.get(c);
     if (!program.own(decl.file)) return .no;

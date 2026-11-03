@@ -767,6 +767,9 @@ const Ends = struct {
 /// operation so declared return it to a task canceled (its bodies go through `Io`'s vtable).
 /// `ends` as `cancels` takes it.
 fn callCancels(c: *Context, callee: Facts.Decl, depth: u8, ending: Ends) Context.Error!bool {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const callee_tree = &c.project.at(callee.file).file.tree;
     const callee_model = &c.project.at(callee.file).model;
     if (try Program.owns(c, callee.file)) if (callee_model.parentOf(callee_model.declarations[@backingInt(callee.index)].node)) |parent| if (callee_tree.nodeTag(parent) == .fn_decl) {
@@ -1078,6 +1081,9 @@ fn skips(c: *Context, file: Project.FileId, statement: Ast.Node.Index, body: Ast
 const Jumps = struct { files: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Ast.TokenIndex, Ast.Node.Index)) = .empty };
 
 fn jumpAt(c: *Context, file: Project.FileId, token: Ast.TokenIndex) Context.Error!?Ast.Node.Index {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Jumps);
     const entry = try memo.files.getOrPut(c.allocator, file);
     if (!entry.found_existing) {

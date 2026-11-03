@@ -6,6 +6,7 @@ const rules = @import("Rule.zig");
 const Report = @import("Report.zig");
 const Suppression = @import("Suppression.zig");
 const Runner = @This();
+const File = @import("File.zig");
 const Context = @import("RuleContext.zig");
 const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
@@ -79,6 +80,13 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};
+    // A rule's own memory for one file (`Context.allocator`), given back when the rule is done
+    // with the file: what a rule keeps past that is on the run's arena, a `Facts.memo` and what
+    // it holds on `Facts.gpa`, a finding copied by the sink. Its pages are unmapped when it is
+    // reset, so what a rule kept by mistake faults where it is read again, not reads memory
+    // given to another.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
     for (project.sources) |*source| {
         if (!source.input.selected) continue;
         if (options.io) |io| try io.checkCancel();
@@ -117,62 +125,69 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
             try runner.coverage.append(a, .{ .file = runner.file, .reason = if (lowered_coverage == .budget_exhausted) .budget_exhausted else .unsupported, .detail = if (file.zir == null) "required semantic lowering was not requested" else "std-ZIR declaration references are indexed only through supported structured bodies; lexical references are indexed separately" });
             if (lowered_coverage == .budget_exhausted) runner.complete = false;
         }
-        var context: Context = .{ .allocator = a, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
+        var context: Context = .{ .allocator = scratch.allocator(), .backing = gpa, .project = project, .file = runner.file, .config = runner.config, .facts = &runner.facts, .definitions = definitions, .sink = &runner.sink, .compiled = options.project_rules };
         try Builtins.check(&context);
         if (config.metrics) {
             const counts = try Metrics.count(&context);
             total.add(counts);
             try metrics.append(a, .{ .file = runner.file, .counts = counts });
         }
+        _ = scratch.reset(.free_all);
         if (file.status == .parsed) for (options.project_rules) |rule| {
-            if (runner.config.has(rule.definition.id)) try rule.check(&context);
+            if (!runner.config.has(rule.definition.id)) continue;
+            try rule.check(&context);
+            _ = scratch.reset(.free_all);
         };
         if (file.status != .parsed) runner.complete = false;
-        // Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
-        // stale when every rule it names ran and none of their findings stood on the line (an
-        // escape in the older form, every pack rule). One for a rule this run does not enable
-        // is not judged, and is counted as such.
-        var inactive: std.ArrayList(Report.Span) = .empty;
-        for (runner.suppressions, 0..) |suppression, i| {
-            const start = suppression.comment.start;
-            const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
-            if (suppression.escape) |reason| {
-                // An escape in the older form covers what any pack rule finds on its line, a
-                // finding added later too: it is read so the fix can name what it covers, and
-                // the run that reads one is incomplete.
-                if (suppression.unnamed) {
-                    runner.complete = false;
-                    try runner.malformed.append(a, .{ .why = "an aegis escape names the rules it covers: `// aegis: <reason>(<rule>, ...): <why>`", .span = span });
-                }
-                if (suppression.used) {
-                    try runner.escapes.append(a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
-                } else if (runner.escapeRan(suppression, known)) {
-                    if (runner.config.strict_suppressions) runner.complete = false;
-                    try runner.stale.append(a, .{ .name = "aegis", .span = span });
-                } else try inactive.append(a, span);
-                continue;
-            }
-            const rule = suppression.rule.?;
-            if (suppression.used) continue;
-            if (!runner.config.has(rule)) {
-                try inactive.append(a, span);
-                continue;
-            }
-            if (runner.config.strict_suppressions) runner.complete = false;
-            try runner.stale.append(a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
-        }
-        if (inactive.items.len != 0) {
-            var detail: std.Io.Writer.Allocating = .init(a);
-            // An allocating writer fails only when memory does.
-            detail.writer.print("{d} {s} for rules this run does not enable", .{ inactive.items.len, if (inactive.items.len == 1) "escape" else "escapes" }) catch return error.OutOfMemory;
-            try runner.coverage.append(a, .{ .file = runner.file, .reason = .unsupported, .detail = detail.written() });
-        }
+        try runner.judgeSuppressions(file, known);
         runner.covered.clearRetainingCapacity();
         if (runner.facts.remaining == 0) try runner.exhausted();
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
     return .{ .arena = arena, .snapshot = project.identity, .diagnostics = runner.diagnostics.items, .coverage = runner.coverage.items, .suppressed = runner.suppressed, .stale_suppressions = runner.stale.items.len, .stale = runner.stale.items, .escapes = runner.escapes.items, .malformed = runner.malformed.items, .complete = runner.complete, .metrics = if (config.metrics) .{ .files = metrics.items, .total = total } else null };
+}
+
+/// Only a rule that ran shows that a suppression of it suppresses nothing; an escape is
+/// stale when every rule it names ran and none of their findings stood on the line (an
+/// escape in the older form, every pack rule). One for a rule this run does not enable
+/// is not judged, and is counted as such.
+fn judgeSuppressions(runner: *Runner, file: *const File, known: []const rules.Definition) RunError!void {
+    var inactive: std.ArrayList(Report.Span) = .empty;
+    for (runner.suppressions, 0..) |suppression, i| {
+        const start = suppression.comment.start;
+        const span: Report.Span = .{ .file = runner.file, .start = start, .end = suppression.comment.end, .line = suppression.comment.line + 1, .column = file.column(start) };
+        if (suppression.escape) |reason| {
+            // An escape in the older form covers what any pack rule finds on its line, a
+            // finding added later too: it is read so the fix can name what it covers, and
+            // the run that reads one is incomplete.
+            if (suppression.unnamed) {
+                runner.complete = false;
+                try runner.malformed.append(runner.a, .{ .why = "an aegis escape names the rules it covers: `// aegis: <reason>(<rule>, ...): <why>`", .span = span });
+            }
+            if (suppression.used) {
+                try runner.escapes.append(runner.a, .{ .span = span, .reason = @tagName(reason), .why = suppression.reason, .covered = runner.covered.get(i).?.items });
+            } else if (runner.escapeRan(suppression, known)) {
+                if (runner.config.strict_suppressions) runner.complete = false;
+                try runner.stale.append(runner.a, .{ .name = "aegis", .span = span });
+            } else try inactive.append(runner.a, span);
+            continue;
+        }
+        const rule = suppression.rule.?;
+        if (suppression.used) continue;
+        if (!runner.config.has(rule)) {
+            try inactive.append(runner.a, span);
+            continue;
+        }
+        if (runner.config.strict_suppressions) runner.complete = false;
+        try runner.stale.append(runner.a, .{ .name = (rules.definition(rule, known) orelse return error.InvalidSelection).name, .span = span });
+    }
+    if (inactive.items.len != 0) {
+        var detail: std.Io.Writer.Allocating = .init(runner.a);
+        // An allocating writer fails only when memory does.
+        detail.writer.print("{d} {s} for rules this run does not enable", .{ inactive.items.len, if (inactive.items.len == 1) "escape" else "escapes" }) catch return error.OutOfMemory;
+        try runner.coverage.append(runner.a, .{ .file = runner.file, .reason = .unsupported, .detail = detail.written() });
+    }
 }
 
 /// The file's fact budget ran out: the run is incomplete, and what its analysis kept, computed

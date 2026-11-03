@@ -114,6 +114,9 @@ pub const Declared = union(enum) {
 /// project's, read once per run for each source and path: a fact asks it at every place it
 /// reads, every round.
 pub fn declarations(self: *Context, source: []const u8, path: []const u8) Context.Error!Declared {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
     const memo = try self.facts.memo(Lookups);
     memo.asked += 1;
     if (memo.found.getPtr(source)) |paths| if (paths.get(path)) |known| return known;
@@ -324,6 +327,9 @@ fn spells(g: Governed, names: []const []const u8, spelled: []const u8) bool {
 /// it is also called so where that name is a declaration's or its aliases' (a use of it is
 /// then unknown, `paired`); a name `@field` computes may be any.
 pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8, out: *std.ArrayList([]const u8)) Context.Error!void {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = self.keep();
+    defer self.allocator = rule_memory;
     const found = try self.facts.memo(Aliases);
     if (!found.built) {
         found.built = true;
