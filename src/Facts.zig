@@ -2331,6 +2331,13 @@ fn stdMember(self: *Facts, path: []const []const u8) ResolveError!Value {
     return value;
 }
 
+/// Whether the type written at `node` is `type` itself, by what it resolves to: `comptime
+/// T: type`, a function returning `type`, `const Kind = type;` named for it.
+pub fn typeIsType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const value = try self.resolve(file, node);
+    return value == .primitive and std.mem.eql(u8, value.primitive, "type");
+}
+
 /// Whether a declared type holds types as values: `type`, `[N]type`, `[]const type`, `?type`.
 fn holdsTypes(value: Value) bool {
     return switch (value) {

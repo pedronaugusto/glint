@@ -17,6 +17,7 @@ const Model = @import("Model.zig");
 const ParentPointer = @import("ParentPointer.zig");
 const Present = @import("Present.zig");
 const Project = @import("Project.zig");
+const Range = @import("Range.zig");
 const Contract = @import("AegisContract.zig");
 const Report = @import("Report.zig");
 const Taint = @import("Taint.zig");
@@ -113,7 +114,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         // function, a `comptime` block) holds no material, as A007 reads it.
         if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !atRuntime(c, decl.node)) continue;
         // A module or file `@import` gives: a namespace, a type, which holds no material.
-        if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (imported(tree, init)) continue;
+        if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.isBuiltin(tree, Facts.ungrouped(tree, init), "@import")) continue;
         const value: Facts.Value = switch (decl.kind) {
             .variable, .parameter, .capture, .field => try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }),
             // What calling it gives, as Zig reads its result type (`!T`, a made type).
@@ -148,10 +149,11 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = tree.nodeMainToken(node);
-        switch (tag) {
-            .field_access => if (!c.inTest(token)) try materialRead(c, rule, types, node),
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-                const name = tree.tokenSlice(token);
+        // A member read (`accesses.formOf`), or a builtin by its name.
+        switch (Facts.accesses.formOf(tag)) {
+            .member => if (!c.inTest(token)) try materialRead(c, rule, types, node),
+            .builtin => {
+                const name = Facts.builtinName(tree, node).?; // unreachable: the form is a builtin's
                 if (!std.mem.eql(u8, name, "@memset") and !std.mem.eql(u8, name, "@memcpy") and !std.mem.eql(u8, name, "@memmove")) continue;
                 if (c.inTest(token)) continue;
                 var buffer: [2]Ast.Node.Index = undefined;
@@ -200,7 +202,7 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
         .alternatives, .literal => {
             const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Secret = .no;
-            for (each, 0..) |one, i| switch (if (value == .literal and enumLiteralPart(c, value.literal, i)) .no else try heldSecret(c, types, one)) {
+            for (each, 0..) |one, i| switch (if (value == .literal and try enumLiteralPart(c, value.literal, i)) .no else try heldSecret(c, types, one)) {
                 .yes => |held| return .{ .yes = held },
                 .unknown => |why| if (why != .comptime_dependent) {
                     out = .{ .unknown = .unresolved };
@@ -243,8 +245,7 @@ fn compiledValues(c: *Context, at: Facts.Decl) Context.Error!?[]const Facts.Valu
         const tree = &c.project.at(at.file).file.tree;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullFnProto(&buffer, record.node)) |proto| if (proto.ast.return_type.unwrap()) |written| {
-            const result = try c.facts.resolve(at.file, written);
-            if (result == .primitive and std.mem.eql(u8, result.primitive, "type")) return &.{};
+            if (try c.facts.typeIsType(at.file, written)) return &.{};
         };
     }
     if (try c.facts.atBindings(at)) |each| return each;
@@ -272,8 +273,7 @@ fn typeConstant(c: *Context, decl: Model.Declaration) Context.Error!bool {
     const source = c.project.at(function.file);
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = source.file.tree.fullFnProto(&proto_buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
-    const result = try c.facts.resolve(function.file, proto.ast.return_type.unwrap() orelse return false);
-    return result == .primitive and std.mem.eql(u8, result.primitive, "type");
+    return c.facts.typeIsType(function.file, proto.ast.return_type.unwrap() orelse return false);
 }
 
 /// Whether a declaration holds state as the program runs: a field, a parameter, a function's
@@ -289,11 +289,13 @@ fn runtimeState(c: *Context, decl: Model.Declaration) bool {
 
 /// Whether part `index` of an anonymous literal is an enum literal (`.{ "pointer", .pointer }`):
 /// a value only the compiling program holds, which no lock or key is.
-fn enumLiteralPart(c: *Context, literal: Facts.Key, index: usize) bool {
+fn enumLiteralPart(c: *Context, literal: Facts.Key, index: usize) Context.Error!bool {
     const tree = &c.project.at(literal.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
     const nodes = if (tree.fullStructInit(&buffer, literal.node)) |full| full.ast.fields else if (tree.fullArrayInit(&buffer, literal.node)) |full| full.ast.elements else return false;
-    return index < nodes.len and tree.nodeTag(nodes[index]) == .enum_literal;
+    if (index >= nodes.len) return false;
+    const part = (try c.facts.literalOf(literal.file, nodes[index])) orelse return false;
+    return part == .enum_literal;
 }
 
 /// What an instance holds by value that no declaration of this run judges where it is
@@ -371,7 +373,9 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                 } else continue;
                 // A generic's own site judges what its callers bind, unless its file is no
                 // selected one's, as a dependency's: there the binding is judged here.
-                if (!unjudged(try c.facts.declaration(parameter)) and (source.input.selected or !genericParameter(&source.file.tree, proto, param))) continue;
+                // A type parameter, or one whose type a binding gives (`value: T`, `anytype`).
+                const typed = if (param.type_expr) |t| try c.facts.typeIsType(function.file, t) else false;
+                if (!unjudged(try c.facts.declaration(parameter)) and (source.input.selected or !(typed or param.anytype_ellipsis3 != null))) continue;
                 const argument = switch (call.args) {
                     .known => |known| known[position],
                     .unknown => {
@@ -379,12 +383,11 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                         break;
                     },
                 };
-                const typed = if (param.type_expr) |t| source.file.tree.nodeTag(t) == .identifier and std.mem.eql(u8, source.file.tree.tokenSlice(source.file.tree.nodeMainToken(t)), "type") else false;
                 if (typed) {
                     const made = for (try c.facts.parameterCopies(function)) |copy| {
                         if (copy.position == position and copy.kind != .cast) break true;
                     } else false;
-                    const kept: Governed.Is = if (made) .yes else holdsParameter(c, function, source.file.tree.tokenSlice(name));
+                    const kept: Governed.Is = if (made) .yes else try holdsParameter(c, function, parameter);
                     if (kept == .no) continue;
                     const bound: Facts.Value = switch (try c.facts.resolve(c.file, argument)) {
                         .container => |container| .{ .instance = container },
@@ -407,8 +410,8 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                 // value where it is declared, and judged there.
                 const parts = try c.facts.copiedParts(c.file, argument);
                 if (parts.deep) |deep| try c.undecided(rule, tree.tokenStart(tree.firstToken(deep)), .unsupported, "a value bound to a generic's parameter is nested past the depth A008 follows: secret material it copies is not ruled out");
-                for (parts.places) |place| switch (tree.nodeTag(place)) {
-                    .identifier, .field_access => {},
+                for (parts.places) |place| switch ((try Facts.accesses.pathOf(c.facts, c.file, place)).steps[0].kind) {
+                    .root, .field => {},
                     else => try boundSecret(c, rule, types, place, try c.facts.resolve(c.file, place)),
                 };
                 for (parts.rest) |part| try boundSecret(c, rule, types, part, try c.facts.resolve(c.file, part));
@@ -424,7 +427,7 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
 /// an optional, an array or an error union of it, a result of it, `@as(name, v)`, do; one
 /// behind a pointer, an array's length, `@sizeOf(name)` and its kin, and a comparison of it
 /// hold none. Any other place is unknown.
-fn holdsParameter(c: *Context, function: Facts.Decl, name: []const u8) Governed.Is {
+fn holdsParameter(c: *Context, function: Facts.Decl, parameter: Facts.Decl) Context.Error!Governed.Is {
     const source = c.project.at(function.file);
     const t = &source.file.tree;
     const model = &source.model;
@@ -433,12 +436,16 @@ fn holdsParameter(c: *Context, function: Facts.Decl, name: []const u8) Governed.
     const first = t.firstToken(whole);
     const last = t.lastToken(whole);
     var out: Governed.Is = .no;
-    for (t.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = t.nodeMainToken(node);
-        if (token < first or token > last or !std.mem.eql(u8, t.tokenSlice(token), name)) continue;
-        switch (holdsAt(t, model, node)) {
+    // Each reference in its body to the parameter, by the model's references; one that names
+    // no declaration of the program (but a primitive) may be it.
+    for (model.references) |reference| {
+        if (reference.token < first or reference.token > last) continue;
+        const declared = reference.declaration orelse {
+            if (reference.unknown != .primitive) out = .{ .unknown = .unresolved };
+            continue;
+        };
+        if (parameter.file != function.file or declared != parameter.index) continue;
+        switch (try holdsAt(c, function.file, reference.node)) {
             .yes => return .yes,
             .no => {},
             .unknown => |why| out = .{ .unknown = why },
@@ -447,31 +454,27 @@ fn holdsParameter(c: *Context, function: Facts.Decl, name: []const u8) Governed.
     return out;
 }
 
-/// `holdsParameter` at one place `node` names the type parameter.
-fn holdsAt(t: *const Ast, model: *const Model, node: Ast.Node.Index) Governed.Is {
+/// `holdsParameter` at one place `node` names the type parameter, by the part of a type it is
+/// (`accesses.useOf`'s `typed`) or the builtin it is given to.
+fn holdsAt(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Governed.Is {
+    const tree = &c.project.at(file).file.tree;
     var at = node;
     var depth: usize = 0;
     while (depth < 64) : (depth += 1) {
-        const parent = model.parentOf(at) orelse return .{ .unknown = .unsupported };
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (t.fullPtrType(parent) != null) return .no;
-        if (t.fullArrayType(parent)) |array| {
-            if (array.ast.elem_type != at) return .no;
-            at = parent;
-            continue;
-        }
-        if (t.fullVarDecl(parent)) |v| return if (v.ast.type_node.unwrap() == at) .yes else .{ .unknown = .unsupported };
-        if (model.containerField(t, parent)) |field| return if (field.ast.type_expr.unwrap() == at) .yes else .{ .unknown = .unsupported };
-        if (t.fullFnProto(&buffer, parent)) |_| return .yes;
-        switch (t.nodeTag(parent)) {
-            .optional_type => at = parent,
-            .error_union => {
-                if (t.nodeData(parent).node_and_node[1] != at) return .no;
-                at = parent;
+        switch (try Facts.accesses.useOf(c.facts, file, at)) {
+            .typed => |typed| switch (typed.part) {
+                // A variable's, a field's or a parameter's type, a result: a value of it.
+                .declared, .signature, .parameter, .result => return .yes,
+                // An array's element, an optional's or an error union's payload: what holds it.
+                .array_element, .optional_child, .error_payload => at = typed.of,
+                // Behind a pointer, an error set, a length, a sentinel, an alignment: none.
+                .pointer_child, .error_set, .length, .sentinel, .alignment, .bit_range, .address_space, .section, .calling_convention => return .no,
+                .literal, .frame_result => return .{ .unknown = .unsupported },
             },
-            .equal_equal, .bang_equal => return .no,
-            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
-                const builtin = t.tokenSlice(t.nodeMainToken(parent));
+            // `==` and `!=` of types compare them.
+            .compared => return .no,
+            .builtin_argument => |argument| {
+                const builtin = Facts.builtinName(tree, argument.call).?; // unreachable: a builtin's argument
                 for ([_][]const u8{ "@sizeOf", "@alignOf", "@bitSizeOf", "@typeName", "@typeInfo", "@hasDecl", "@hasField" }) |inert| if (std.mem.eql(u8, builtin, inert)) return .no;
                 return if (std.mem.eql(u8, builtin, "@as")) .yes else .{ .unknown = .unsupported };
             },
@@ -479,21 +482,6 @@ fn holdsAt(t: *const Ast, model: *const Model, node: Ast.Node.Index) Governed.Is
         }
     }
     return .{ .unknown = .unsupported };
-}
-
-/// Whether a parameter is a generic's: its type is written with `type`, or the name of one of
-/// the function's parameters (`value: T`, `items: ?[4]T`), or it is `anytype`.
-fn genericParameter(tree: *const Ast, proto: Ast.full.FnProto, param: Ast.full.FnProto.Param) bool {
-    const written = param.type_expr orelse return true;
-    for (tree.firstToken(written)..tree.lastToken(written) + 1) |t| {
-        const token: Ast.TokenIndex = @intCast(t);
-        if (tree.tokenTag(token) != .identifier) continue;
-        const spelled = tree.tokenSlice(token);
-        if (std.mem.eql(u8, spelled, "type")) return true;
-        var it = proto.iterate(tree);
-        while (it.next()) |other| if (other.name_token) |name| if (std.mem.eql(u8, tree.tokenSlice(name), spelled)) return true;
-    }
-    return false;
 }
 
 /// A008 for `value`, what a binding at `node` makes a generic's parameter hold by value.
@@ -509,26 +497,17 @@ fn boundSecret(c: *Context, rule: Rule, types: []const SecretType, node: Ast.Nod
 /// Whether a place (`kp.secret_key.bytes`, `k.bytes[0..]`) lies in secret material: one of its
 /// holders up the place, through pointers, is one of `types`.
 fn placeInSecret(c: *Context, types: []const SecretType, place: Ast.Node.Index) Context.Error!Secret {
-    const tree = &c.project.at(c.file).file.tree;
-    var at = place;
-    var depth: usize = 0;
-    while (depth < 16) : (depth += 1) {
-        var value = try c.facts.resolve(c.file, at);
+    // Each place up its path (`accesses.pathOf`: members, `@field`, elements, slices, `.?`,
+    // `.*`), to its root.
+    const path = try Facts.accesses.pathOf(c.facts, c.file, place);
+    for (path.steps) |step| {
+        var value = try c.facts.resolve(c.file, step.node);
         while (value == .pointer) value = value.pointer.*;
         switch (try heldSecret(c, types, value)) {
             .yes => |held| return .{ .yes = held },
             .unknown => |why| return .{ .unknown = why },
             .no => {},
         }
-        at = switch (tree.nodeTag(at)) {
-            .field_access => tree.nodeData(at).node_and_token[0],
-            .array_access => tree.nodeData(at).node_and_node[0],
-            .deref => tree.nodeData(at).node,
-            .grouped_expression => tree.nodeData(at).node_and_token[0],
-            .slice_open => tree.nodeData(at).node_and_node[0],
-            .slice, .slice_sentinel => tree.nodeData(at).node_and_extra[0],
-            else => return .no,
-        };
     }
     return .no;
 }
@@ -539,9 +518,7 @@ fn placeInSecret(c: *Context, types: []const SecretType, place: Ast.Node.Index) 
 /// (`public_key`) are no material.
 fn materialRead(c: *Context, rule: Rule, types: []const SecretType, node: Ast.Node.Index) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     const object, const member = tree.nodeData(node).node_and_token;
-    if (std.mem.eql(u8, tree.tokenSlice(member), "public_key")) return;
     var holder = try c.facts.resolve(c.file, object);
     while (holder == .pointer) holder = holder.pointer.*;
     const held = switch (try heldSecret(c, types, holder)) {
@@ -555,29 +532,27 @@ fn materialRead(c: *Context, rule: Rule, types: []const SecretType, node: Ast.No
         .unknown => return c.undecided(rule, tree.tokenStart(member), .unresolved, "a member of std's secret material that does not resolve may be its bytes read by value"),
     };
     if (c.project.at(field.file).model.declarations[@backingInt(field.index)].kind != .field) return;
+    // std's public half of a key pair, by its declaration, is no material.
+    for (types) |secret| if (c.facts.member(secret.container, "public_key")) |public| if (std.meta.eql(public, field)) return;
     // Up the place it is part of: what is done with the whole decides.
     var top = node;
-    while (model.parentOf(top)) |parent| {
-        const part = switch (tree.nodeTag(parent)) {
-            .field_access => tree.nodeData(parent).node_and_token[0] == top,
-            .array_access => tree.nodeData(parent).node_and_node[0] == top,
-            .grouped_expression => true,
-            .slice_open => tree.nodeData(parent).node_and_node[0] == top,
-            .slice, .slice_sentinel => tree.nodeData(parent).node_and_extra[0] == top,
-            else => false,
-        };
-        if (!part) break;
-        // A method called on it (`kp.secret_key.seed()`) is std's own handling.
-        if (tree.nodeTag(parent) == .field_access) switch (try c.facts.definition(c.file, parent)) {
-            .decl => |d| if (c.project.at(d.file).model.declarations[@backingInt(d.index)].kind == .function) return,
-            .none => {},
-            .unknown => return c.undecided(rule, tree.tokenStart(member), .unresolved, "a member of std's secret material whose use does not resolve may be its bytes read by value"),
-        };
-        top = parent;
-    }
-    if (model.parentOf(top)) |parent| switch (tree.nodeTag(parent)) {
-        .address_of => return,
-        else => {},
+    while (true) switch (try Facts.accesses.useOf(c.facts, c.file, top)) {
+        .member => |access| {
+            // A method called on it (`kp.secret_key.seed()`) is std's own handling.
+            switch (try c.facts.definition(c.file, access)) {
+                .decl => |d| if (c.project.at(d.file).model.declarations[@backingInt(d.index)].kind == .function) return,
+                .none => {},
+                .unknown => return c.undecided(rule, tree.tokenStart(member), .unresolved, "a member of std's secret material whose use does not resolve may be its bytes read by value"),
+            }
+            top = access;
+        },
+        .element, .sliced => |access| top = access,
+        .carried => |carried| if (carried.how == .grouped) {
+            top = carried.into;
+        } else break,
+        // Behind `&`: a borrow.
+        .address => return,
+        else => break,
     };
     // A slice of it is a borrow too, unless its elements are read.
     if (try c.facts.resolve(c.file, top) == .pointer) return;
@@ -585,6 +560,19 @@ fn materialRead(c: *Context, rule: Rule, types: []const SecretType, node: Ast.No
 }
 
 const SecretType = struct { container: Facts.Container, name: []const u8 };
+
+/// Whether std's crypto names a secret type so: it names each type holding a private key by
+/// this convention (`SecretKey`, `KeyPair`, `BlindSecretKey`, `BlindKeyPair`).
+fn secretName(name: []const u8) bool {
+    for ([_][]const u8{ "SecretKey", "KeyPair", "BlindSecretKey", "BlindKeyPair" }) |each| if (std.mem.eql(u8, name, each)) return true;
+    return false;
+}
+
+/// Whether an import's spelling names a file: Zig's own rule, a `.zig` spelling is a file and
+/// any other a module.
+fn zigFile(spelling: []const u8) bool {
+    return std.mem.endsWith(u8, spelling, ".zig");
+}
 
 /// std's secret types, by declaration: the `SecretKey`, `KeyPair`, `BlindSecretKey` and
 /// `BlindKeyPair` declared in the files std's `crypto` namespace reaches through its own
@@ -597,25 +585,30 @@ fn secretTypes(c: *Context) Context.Error![]const SecretType {
     const memo = try c.facts.memo(SecretTypes);
     if (memo.built) return memo.types.items;
     memo.built = true;
-    var roots: std.ArrayList(Project.FileId) = .empty;
-    for (c.project.imports) |mapping| if (std.mem.eql(u8, mapping.spelling, "std")) {
-        for (roots.items) |seen| {
-            if (seen == mapping.target) break;
-        } else try roots.append(c.allocator, mapping.target);
+    // std's `crypto`, by the lookup std's governed calls read (`Governed.declarations`).
+    const cryptos = switch (try Governed.declarations(c, "std", "crypto")) {
+        .decls => |decls| decls,
+        .none => &.{},
+        // Not memoized: asked again where the budget allows.
+        .unknown => blk: {
+            memo.built = false;
+            break :blk &.{};
+        },
     };
     var files: std.ArrayList(Project.FileId) = .empty;
-    for (roots.items) |root| {
-        const crypto = c.facts.member(c.facts.rootOf(root), "crypto") orelse continue;
+    for (cryptos) |crypto| {
         // Its value, through any alias.
         const value = try c.facts.declaration(crypto);
         if (value != .container) continue;
-        try files.append(c.allocator, value.container.file);
+        for (files.items) |seen| {
+            if (seen == value.container.file) break;
+        } else try files.append(c.allocator, value.container.file);
     }
     var next: usize = 0;
     while (next < files.items.len) : (next += 1) {
         const file = files.items[next];
         for (c.project.imports) |mapping| {
-            if (mapping.from != file or !std.mem.endsWith(u8, mapping.spelling, ".zig")) continue;
+            if (mapping.from != file or !zigFile(mapping.spelling)) continue;
             for (files.items) |seen| {
                 if (seen == mapping.target) break;
             } else try files.append(c.allocator, mapping.target);
@@ -624,10 +617,10 @@ fn secretTypes(c: *Context) Context.Error![]const SecretType {
     const types = &memo.types;
     for (files.items) |file| for (c.project.at(file).model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or !decl.public) continue;
-        for ([_][]const u8{ "SecretKey", "KeyPair", "BlindSecretKey", "BlindKeyPair" }) |name| if (std.mem.eql(u8, decl.name, name)) {
+        if (secretName(decl.name)) {
             const value = try c.facts.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(d)) });
             if (value == .container) try types.append(c.allocator, .{ .container = value.container, .name = decl.name });
-        };
+        }
     };
     // Each container of those files with a field of a secret type by value, until none is new.
     var grew = true;
@@ -703,13 +696,12 @@ fn rawTime(c: *Context, rule: Rule, paths: []const []const u8) Context.Error!voi
     var sites: std.ArrayList(Governed.Site) = .empty;
     try Governed.sites(c, rule, found, &sites);
     const tree = &c.project.at(c.file).file.tree;
-    const model = &c.project.at(c.file).model;
     // The raw counts read out of std's time: what `sameUnit` compares, by meaning.
     var counts: std.ArrayList(Ast.Node.Index) = .empty;
-    for (sites.items) |site| if (std.mem.endsWith(u8, paths[site.index], ".nanoseconds") and tree.nodeTag(site.node) == .field_access) try counts.append(c.allocator, site.node);
+    for (sites.items) |site| if (std.mem.endsWith(u8, paths[site.index], ".nanoseconds")) try counts.append(c.allocator, site.node);
     for (sites.items) |site| {
         if (site.through_alias or c.inTest(site.token)) continue;
-        if (sameUnit(tree, model, counts.items, site.node)) continue;
+        if (try sameUnit(c, counts.items, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print("{s}: time as a raw integer; aegis units.Duration and Instant carry the unit and convert with toIoDuration and fromIoDuration", .{paths[site.index]}));
     }
     // A copy of memory between std's time and anything else, by what it does
@@ -792,35 +784,59 @@ fn fieldsTime(c: *Context, times: []const Facts.Container, fields: []const Facts
     return out;
 }
 
-/// Whether a raw `.nanoseconds` read meets only another one, or zero, in a comparison or a
-/// difference.
-fn sameUnit(tree: *const Ast, model: anytype, counts: []const Ast.Node.Index, node: Ast.Node.Index) bool {
+/// Whether a raw `.nanoseconds` read meets only another one, or zero (`Range.constantValue`),
+/// in a comparison or a difference, through parentheses (`accesses.useOf`).
+fn sameUnit(c: *Context, counts: []const Ast.Node.Index, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
     if (!nanoseconds(tree, counts, node)) return false;
-    var parent = model.parentOf(node) orelse return false;
     var at = node;
-    // A difference of raw counts is one too: what it meets is what the read meets.
-    while ((tree.nodeTag(parent) == .sub or tree.nodeTag(parent) == .sub_sat or tree.nodeTag(parent) == .grouped_expression) and nanoseconds(tree, counts, parent)) {
-        at = parent;
-        parent = model.parentOf(parent) orelse return false;
-    }
-    switch (tree.nodeTag(parent)) {
-        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .sub, .sub_sat => {},
-        else => return false,
-    }
-    if (nanoseconds(tree, counts, parent)) return true;
+    const parent = while (true) {
+        const parent = switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+            .carried => |carried| if (carried.how == .grouped) {
+                at = carried.into;
+                continue;
+            } else return false,
+            .operand, .compared => |parent| parent,
+            else => return false,
+        };
+        // A difference of raw counts is one too: what it meets is what the read meets.
+        if (difference(tree, parent) and nanoseconds(tree, counts, parent)) {
+            at = parent;
+            continue;
+        }
+        break parent;
+    };
+    if (!difference(tree, parent) and !comparison(tree, parent)) return false;
     const lhs, const rhs = tree.nodeData(parent).node_and_node;
     const other = if (lhs == at) rhs else lhs;
     if (nanoseconds(tree, counts, other)) return true;
-    return tree.nodeTag(other) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(other)), "0");
+    return try Range.constantValue(c, c.file, other) == 0;
 }
 
 /// Whether a node is a raw nanosecond count: a read of std's `nanoseconds` (one of `counts`),
-/// or a difference of two.
+/// or a difference of two, through parentheses.
 fn nanoseconds(tree: *const Ast, counts: []const Ast.Node.Index, node: Ast.Node.Index) bool {
+    const at = Facts.ungrouped(tree, node);
+    if (std.mem.findScalar(Ast.Node.Index, counts, at) != null) return true;
+    if (!difference(tree, at)) return false;
+    const lhs, const rhs = tree.nodeData(at).node_and_node;
+    return nanoseconds(tree, counts, lhs) and nanoseconds(tree, counts, rhs);
+}
+
+/// Whether `node` subtracts (`-`, `-|`). Zig's arithmetic and comparison operators can't be
+/// overloaded: the node tag is the operation.
+fn difference(tree: *const Ast, node: Ast.Node.Index) bool {
     return switch (tree.nodeTag(node)) {
-        .field_access => std.mem.findScalar(Ast.Node.Index, counts, node) != null,
-        .sub, .sub_sat => nanoseconds(tree, counts, tree.nodeData(node).node_and_node[0]) and nanoseconds(tree, counts, tree.nodeData(node).node_and_node[1]),
-        .grouped_expression => nanoseconds(tree, counts, tree.nodeData(node).node_and_token[0]),
+        .sub, .sub_sat => true,
+        else => false,
+    };
+}
+
+/// Whether `node` compares two values (`<`, `<=`, `>`, `>=`, `==`, `!=`). Zig's arithmetic and
+/// comparison operators can't be overloaded: the node tag is the operation.
+fn comparison(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal => true,
         else => false,
     };
 }
@@ -836,15 +852,17 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     var present: Present = try .init(c);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .unreachable_literal and tag != .unwrap_optional) continue;
+        // `unreachable`, or a `.?` (`accesses.formOf`).
+        const unwrap = Facts.accesses.formOf(tag) == .unwrap_optional;
+        if (tag != .unreachable_literal and !unwrap) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = if (tag == .unwrap_optional) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
+        const token = if (unwrap) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         // A `.?` of a value known not to be null never reaches its `unreachable`.
-        if (tag == .unwrap_optional and try present.unwrapped(node)) continue;
+        if (unwrap and try present.unwrapped(node)) continue;
         // `x.?` is `x orelse unreachable`: what makes `x` null chooses it too.
         const chosen = try chosenBy(c, flow, node);
-        switch (if (tag == .unwrap_optional) chosen.join(try failedBy(c, flow, tree.nodeData(node).node_and_token[0])) else chosen) {
+        switch (if (unwrap) chosen.join(try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?)) else chosen) { // unreachable: a `.?` carries its operand
             .clean => {},
             .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a branch that passed through a call that does not resolve may be input's to choose"),
             .data, .number => try c.at(rule, token, "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error"),
@@ -883,16 +901,18 @@ fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!T
     return out;
 }
 
-/// How far input can make `expression` fail: what it holds, and what a call it makes reads
-/// and is given.
+/// How far input can make `expression` fail: what it holds, and what each call whose result
+/// it gives (`Facts.copiedParts`: through parentheses, `try`, a branch, `orelse`) reads and is
+/// given; a value nested past what is followed may hold any.
 fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index) Context.Error!Taint.Level {
-    const tree = &c.project.at(c.file).file.tree;
     var out = try Taint.levelAt(c, flow, c.file, expression);
-    var inner = expression;
-    while (tree.nodeTag(inner) == .@"try" or tree.nodeTag(inner) == .grouped_expression) inner = if (tree.nodeTag(inner) == .@"try") tree.nodeData(inner).node else tree.nodeData(inner).node_and_token[0];
-    const reached = (try Taint.reached(c, flow, c.file, inner)) orelse return out;
-    for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
-    if (try Taint.isRead(c, flow, c.file, inner)) out = out.join(.data);
+    const copied = try c.facts.copiedParts(c.file, expression);
+    if (copied.deep != null) out = out.join(.unknown);
+    for (copied.results) |call| {
+        const reached = (try Taint.reached(c, flow, c.file, call)) orelse continue;
+        for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
+        if (try Taint.isRead(c, flow, c.file, call)) out = out.join(.data);
+    }
     return out;
 }
 
@@ -925,12 +945,10 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
         // either. The assert or an alias of it taken as a value anywhere else (a field's
         // default, a table's element, a variable) is called where it goes, which this reading
         // does not follow, at run time or not.
-        const held = if (tree.nodeTag(parent) == .address_of) model.parentOf(parent) orelse parent else parent;
-        const value = if (held == parent) site.node else parent;
-        if (tree.fullVarDecl(held)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
-            try aliasValues(c, rule, held, 0);
+        if (try aliasDeclaration(c, site.node)) |declaration| {
+            try aliasValues(c, rule, declaration, 0);
             continue;
-        };
+        }
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
@@ -977,14 +995,31 @@ fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, depth: usiz
             if (c.inTest(tree.firstToken(target))) continue;
             const parent = model.parentOf(site.node) orelse continue;
             if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == target) continue;
-            const value = if (site.kind == .address) site.node else target;
-            if (tree.fullVarDecl(parent)) |variable| if (variable.ast.init_node.unwrap() == value and tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
-                try aliasValues(c, rule, parent, depth + 1);
+            if (try aliasDeclaration(c, target)) |alias| {
+                try aliasValues(c, rule, alias, depth + 1);
                 continue;
-            };
+            }
             try c.undecided(rule, tree.tokenStart(tree.firstToken(target)), .unresolved, "an alias of std.debug.assert taken as a value: its calls are not read");
         }
     }
+}
+
+/// The constant whose first value is `node`, or its address (`const check = std.debug.assert;`,
+/// `const check: *const fn (bool) void = &std.debug.assert;`), by `accesses.useOf`; null where
+/// the value goes anywhere else.
+fn aliasDeclaration(c: *Context, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const use = try Facts.accesses.useOf(c.facts, c.file, node);
+    const held = switch (use) {
+        .address => |address| try Facts.accesses.useOf(c.facts, c.file, address),
+        else => use,
+    };
+    const declaration = switch (held) {
+        .initializes => |declaration| declaration,
+        else => return null,
+    };
+    const tree = &c.project.at(c.file).file.tree;
+    const variable = tree.fullVarDecl(declaration) orelse return null;
+    return if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) declaration else null;
 }
 
 /// The calls in this file through an alias the program declares of std's assert (`const check =
@@ -1059,32 +1094,43 @@ fn invariant(c: *Context, node: Ast.Node.Index, edits: *std.ArrayList(Report.Edi
 }
 
 /// The name the file imports aegis by, an edit adding the import (after std's) when it has
-/// none; null where `aegis` names something else.
+/// none; null where `aegis` names something else. An import is known by its value: a
+/// file-level constant whose declaration is aegis's module root (`Facts.moduleRoots`), or one
+/// of std's files, under whatever name either is imported.
 fn aegisName(c: *Context, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
-    const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    const file = c.project.at(c.file).file;
-    var after_std: u32 = 0;
-    for (model.declarations) |decl| {
+    const roots = try c.facts.moduleRoots(Contract.library.modules[0]);
+    var std_import: ?Ast.TokenIndex = null;
+    for (model.declarations, 0..) |decl, d| {
         if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .file) continue;
-        const variable = tree.fullVarDecl(decl.node) orelse continue;
-        const init = variable.ast.init_node.unwrap() orelse continue;
-        const spelled = tree.getNodeSource(init);
-        if (std.mem.eql(u8, spelled, "@import(\"aegis\")")) return decl.name;
-        if (std.mem.eql(u8, decl.name, "aegis")) return null;
-        if (std.mem.eql(u8, spelled, "@import(\"std\")")) {
-            const line = file.line(tree.tokenStart(decl.token));
-            after_std = file.lineEnd(line);
-        }
+        const container = switch (try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) })) {
+            .container => |container| container,
+            else => continue,
+        };
+        if (c.project.at(container.file).model.scopes[@backingInt(container.scope)].node != .root) continue;
+        if (std.mem.findScalar(Project.FileId, roots, container.file) != null) return decl.name;
+        if (try c.facts.standard(container.file)) std_import = decl.token;
     }
+    return insertAegis(c, std_import, edits);
+}
+
+/// The edit importing aegis as `aegis`, on the line after std's import (`std_import`), or with
+/// none after the file's doc comment; null where a declaration of the file is named `aegis`
+/// already. Zig's scoping is by name: the inserted declaration must not clash with or be
+/// shadowed by one already in the file.
+fn insertAegis(c: *Context, std_import: ?Ast.TokenIndex, edits: *std.ArrayList(Report.Edit)) Context.Error!?[]const u8 {
+    const tree = &c.project.at(c.file).file.tree;
+    const file = c.project.at(c.file).file;
+    for (c.project.at(c.file).model.declarations) |decl| if (std.mem.eql(u8, decl.name, "aegis")) return null;
+    var after: u32 = if (std_import) |token| file.lineEnd(file.line(tree.tokenStart(token))) else 0;
     // With no std import the line goes after the file's doc comment, which stands first.
-    if (after_std == 0) for (file.lines) |start| {
+    if (std_import == null) for (file.lines) |start| {
         if (!std.mem.startsWith(u8, file.source[start..], "//!")) {
-            after_std = start;
+            after = start;
             break;
         }
     };
-    try edits.append(c.allocator, .{ .start = after_std, .end = after_std, .text = "const aegis = @import(\"aegis\");\n" });
+    try edits.append(c.allocator, .{ .start = after, .end = after, .text = "const aegis = @import(\"aegis\");\n" });
     return "aegis";
 }
 
@@ -1107,17 +1153,17 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
             if (args.len != 1) continue;
-            const literal = if (tree.nodeTag(args[0]) == .identifier) tree.tokenSlice(tree.nodeMainToken(args[0])) else "";
-            if (std.mem.eql(u8, literal, "false")) {
-                try c.at(rule, token, "@setRuntimeSafety(false): bounds, overflow and union checks off; only a measured hot loop validated at its boundary");
-                continue;
-            }
             // A condition on the build mode: off in the modes whose checks it turns off. A mode
             // that builds without them (fast, small) loses nothing to it.
             const on = (try Model.modes(c.allocator, tree, &c.project.at(c.file).model, args[0], 0)) orelse {
                 try c.unknown(rule, node, .comptime_dependent);
                 continue;
             };
+            // Off in every mode (`false`, a constant that holds it).
+            if (on.count() == 0) {
+                try c.at(rule, token, "@setRuntimeSafety(false): bounds, overflow and union checks off; only a measured hot loop validated at its boundary");
+                continue;
+            }
             var off: Model.Modes = .initMany(&.{ .debug, .safe });
             off.setIntersection(on.complement());
             var it = off.iterator();
@@ -1235,7 +1281,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
                 // One whose declaration spells a governed name is judged at that site.
                 if (within(tree, found.tokens, decl.node) or within(tree, found.named, decl.node)) continue;
                 // A module or file `@import` gives: a namespace, a type, which holds no state.
-                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (imported(tree, init)) continue;
+                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.isBuiltin(tree, Facts.ungrouped(tree, init), "@import")) continue;
                 // Typed by a declaration of this file whose own site is reported (the program's
                 // alias of a lock): judged there.
                 if (namesHeld(tree, model, decl.node, found.tokens)) continue;
@@ -1253,7 +1299,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
         // A reference that does not resolve as this value's type, or what an array, an optional,
         // an error union or a pointer of it holds, is judged with the value.
         if (writtenType(tree, model, decl)) |written| for (found.unread, judged) |each, *done| {
-            if (typeSpine(tree, written, each.node)) done.* = true;
+            if (try typeSpine(c, written, each.node)) done.* = true;
         };
         switch (try heldSync(c, found.found, value)) {
             .no => {},
@@ -1265,7 +1311,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
                 // payload): no synchronization (`const w: std.meta.Tag(V) = .a`). Not where one
                 // names a member of a synchronization type: a decl literal (`.init`) makes one,
                 // and `std.Io.Event` is an enum.
-                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (enumLiterals(tree, init) and !try namesSyncMember(c, found.found, init)) continue;
+                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (try tagsOnly(c, found.found, init)) continue;
                 if (why == .comptime_dependent) if (try compiledValues(c, at)) |each| {
                     for (each) |one| switch (try heldSync(c, found.found, one)) {
                         .no => {},
@@ -1313,16 +1359,17 @@ fn writtenType(tree: *const Ast, model: *const Model, decl: Model.Declaration) ?
 }
 
 /// Whether `reference` is the type `written`, or what an array, an optional, an error union's
-/// payload or a pointer of it holds: what `heldSync` reads a value of the type through.
-fn typeSpine(tree: *const Ast, written: Ast.Node.Index, reference: Ast.Node.Index) bool {
-    var at = written;
-    while (at != reference) at = switch (tree.nodeTag(at)) {
-        .grouped_expression => tree.nodeData(at).node_and_token[0],
-        .optional_type => tree.nodeData(at).node,
-        .error_union => tree.nodeData(at).node_and_node[1],
-        .array_type => tree.nodeData(at).node_and_node[1],
-        .array_type_sentinel => tree.nodeData(at).node_and_extra[0],
-        else => (tree.fullPtrType(at) orelse return false).ast.child_type,
+/// payload or a pointer of it holds: what `heldSync` reads a value of the type through. Up from
+/// the reference by the part of a type each step is (`accesses.useOf`'s `typed`).
+fn typeSpine(c: *Context, written: Ast.Node.Index, reference: Ast.Node.Index) Context.Error!bool {
+    var at = reference;
+    while (at != written) at = switch (try Facts.accesses.useOf(c.facts, c.file, at)) {
+        .typed => |typed| switch (typed.part) {
+            .array_element, .optional_child, .error_payload, .pointer_child => typed.of,
+            else => return false,
+        },
+        .carried => |carried| if (carried.how == .grouped) carried.into else return false,
+        else => return false,
     };
     return true;
 }
@@ -1356,7 +1403,7 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
         .alternatives, .literal => {
             const each = if (value == .literal) try c.facts.literalParts(value.literal) else value.alternatives;
             var out: Sync = .no;
-            for (each, 0..) |one, i| switch (if (value == .literal and enumLiteralPart(c, value.literal, i)) .no else try heldSync(c, found, one)) {
+            for (each, 0..) |one, i| switch (if (value == .literal and try enumLiteralPart(c, value.literal, i)) .no else try heldSync(c, found, one)) {
                 .yes => |index| return .{ .yes = index },
                 .unknown => |why| if (why != .comptime_dependent) {
                     out = .{ .unknown = .unresolved };
@@ -1375,54 +1422,37 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
     }
 }
 
-/// Whether every value an expression can give is an enum literal (`.a`, `if (x) .a else .b`, a
-/// `switch` each prong of which gives one).
-fn enumLiterals(tree: *const Ast, node: Ast.Node.Index) bool {
-    switch (tree.nodeTag(node)) {
-        .enum_literal => return true,
-        .grouped_expression => return enumLiterals(tree, tree.nodeData(node).node_and_token[0]),
-        .@"switch", .switch_comma => {
-            const full = tree.fullSwitch(node).?; // unreachable: tagged a switch
-            for (full.ast.cases) |case| if (!enumLiterals(tree, tree.fullSwitchCase(case).?.ast.target_expr)) return false; // unreachable: a switch's cases are cases
-            return full.ast.cases.len != 0;
-        },
-        else => {
-            const branch = tree.fullIf(node) orelse return false;
-            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
-            return enumLiterals(tree, branch.ast.then_expr) and enumLiterals(tree, otherwise);
-        },
+/// Whether every value an expression can give (`accesses.valuesOf`: `.a`, `if (x) .a else .b`,
+/// a `switch` each prong of which gives one) is an enum literal (`Facts.literalOf`) naming no
+/// declaration or tag of one of std's synchronization types, or of the type a governed type
+/// function makes. False where a value is not shown, and where it gives none.
+fn tagsOnly(c: *Context, found: []const Governed.Governed, node: Ast.Node.Index) Context.Error!bool {
+    const leaves = switch (try Facts.accesses.valuesOf(c.facts, c.file, node)) {
+        .leaves => |each| each,
+        .unknown => return false,
+    };
+    if (leaves.len == 0) return false;
+    for (leaves) |leaf| {
+        const literal = (try c.facts.literalOf(c.file, leaf)) orelse return false;
+        if (literal != .enum_literal) return false;
+        if (try namesSyncMember(c, found, literal.enum_literal)) return false;
     }
+    return true;
 }
 
-/// Whether an enum literal `node` gives (`enumLiterals`' shapes) names a declaration or a tag
-/// of one of std's synchronization types, or of the type a governed type function makes.
-fn namesSyncMember(c: *Context, found: []const Governed.Governed, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(c.file).file.tree;
-    switch (tree.nodeTag(node)) {
-        .enum_literal => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            for (found) |g| for (g.decls) |decl| {
-                const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
-                const held = if (record.kind == .function) try c.facts.template(decl) orelse continue else try c.facts.declaration(decl);
-                const container = switch (held) {
-                    .container => |each| each,
-                    else => continue,
-                };
-                if (c.facts.member(container, name) != null or c.facts.declaresTag(container, name)) return true;
-            };
-            return false;
-        },
-        .grouped_expression => return namesSyncMember(c, found, tree.nodeData(node).node_and_token[0]),
-        .@"switch", .switch_comma => {
-            for (tree.fullSwitch(node).?.ast.cases) |case| if (try namesSyncMember(c, found, tree.fullSwitchCase(case).?.ast.target_expr)) return true; // unreachable: tagged a switch, whose cases are cases
-            return false;
-        },
-        else => {
-            const branch = tree.fullIf(node) orelse return false;
-            if (try namesSyncMember(c, found, branch.ast.then_expr)) return true;
-            return namesSyncMember(c, found, branch.ast.else_expr.unwrap() orelse return false);
-        },
-    }
+/// Whether the enum literal's `name` names a declaration or a tag of one of std's
+/// synchronization types, or of the type a governed type function makes.
+fn namesSyncMember(c: *Context, found: []const Governed.Governed, name: []const u8) Context.Error!bool {
+    for (found) |g| for (g.decls) |decl| {
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        const held = if (record.kind == .function) try c.facts.template(decl) orelse continue else try c.facts.declaration(decl);
+        const container = switch (held) {
+            .container => |each| each,
+            else => continue,
+        };
+        if (c.facts.member(container, name) != null or c.facts.declaresTag(container, name)) return true;
+    };
+    return false;
 }
 
 /// The index of the governed synchronization type `value` is, a type by value: a container
@@ -1461,38 +1491,24 @@ fn syncType(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
 fn borrowed(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    if (model.parentOf(node)) |parent| {
-        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == node) return switch (try c.facts.resolve(c.file, parent)) {
+    switch (try Facts.accesses.useOf(c.facts, c.file, node)) {
+        .member => |access| return switch (try c.facts.resolve(c.file, access)) {
             .function, .container, .error_set, .primitive, .fn_type => true,
             else => false,
-        };
+        },
         // The type itself, or what its constructor makes (`std.atomic.Value(u32)`), compared.
-        var compared = parent;
-        var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&buffer, parent)) |made| if (made.ast.fn_expr == node) {
-            compared = model.parentOf(parent) orelse parent;
-        };
-        if (tree.nodeTag(compared) == .equal_equal or tree.nodeTag(compared) == .bang_equal) return true;
+        .compared => return true,
+        .callee => |call| if (try Facts.accesses.useOf(c.facts, c.file, call) == .compared) return true,
+        else => {},
     }
+    // Up to the declaration it types, through what holds it: a pointer's borrows it.
     var at = node;
-    while (model.parentOf(at)) |parent| : (at = parent) {
-        switch (tree.nodeTag(parent)) {
-            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => return true,
-            .fn_decl, .block, .block_semicolon, .block_two, .block_two_semicolon => return false,
-            else => {},
-        }
-        if (tree.fullVarDecl(parent) != null or model.containerField(tree, parent) != null) return false;
-    }
-    return false;
-}
-
-/// Whether one of `tokens` lies in `node`.
-/// Whether `node` is an `@import`.
-fn imported(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import"),
-        else => false,
+    while (model.parentOf(at)) |parent| : (at = parent) switch (Facts.accesses.formOf(tree.nodeTag(parent))) {
+        .pointer_type => return true,
+        .fn_decl, .body, .variable, .field_declaration => return false,
+        else => {},
     };
+    return false;
 }
 
 /// Whether the type a declaration at `node` writes names a declaration of this file that holds
@@ -1506,17 +1522,16 @@ fn namesHeld(tree: *const Ast, model: *const Model, node: Ast.Node.Index, tokens
         node;
     const first = tree.firstToken(written);
     const last = tree.lastToken(written);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .identifier) continue;
-        const named: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const token = tree.nodeMainToken(named);
-        if (token < first or token > last) continue;
-        const index = (model.reference(named) orelse continue).declaration orelse continue;
+    // Each declaration a reference in the written type names, by the model's references.
+    for (model.references) |reference| {
+        if (reference.token < first or reference.token > last) continue;
+        const index = reference.declaration orelse continue;
         if (within(tree, tokens, model.declarations[@backingInt(index)].node)) return true;
     }
     return false;
 }
 
+/// Whether one of `tokens` lies in `node`.
 fn within(tree: *const Ast, tokens: []const Ast.TokenIndex, node: Ast.Node.Index) bool {
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
