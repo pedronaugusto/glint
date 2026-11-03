@@ -488,6 +488,71 @@ test "Facts.literalType: a switch case's item is of what the switch tests, its b
     try std.testing.expect(made == .container and std.meta.eql(made.container.scope, r.scope));
 }
 
+test "Facts.literalType: `&.{}` is what its place points at, a slice's an array of the element; try and comptime give their operand their place" {
+    const source =
+        \\pub const A = struct {
+        \\    in: []const u8 = &.{},
+        \\    pub fn of(n: u32) A {
+        \\        _ = n;
+        \\        return .{};
+        \\    }
+        \\    pub fn ofError(n: u32) !A {
+        \\        return .of(n);
+        \\    }
+        \\};
+        \\pub const B = struct { in: []const u8 = &.{} };
+        \\pub const D = switch (@import("builtin").os.tag) {
+        \\    .wasi => noreturn,
+        \\    .windows => A,
+        \\    else => B,
+        \\};
+        \\fn take(o: *const D) void {
+        \\    _ = o;
+        \\}
+        \\fn each(xs: []const A) void {
+        \\    _ = xs;
+        \\}
+        \\fn STRING(comptime T: type) type {
+        \\    return struct { Buffer: ?[*]T };
+        \\}
+        \\pub const WIDE = STRING(u16);
+        \\pub const NARROW = STRING(u8);
+        \\fn wide(p: *anyopaque) WIDE {
+        \\    return .{ .Buffer = @ptrCast(@alignCast(p)) };
+        \\}
+        \\fn f() !void {
+        \\    take(&.{ .in = "x" });
+        \\    each(&.{.{ .in = "y" }});
+        \\    const a: A = comptime .of(1);
+        \\    const b: A = try .ofError(2);
+        \\    _ = .{ a, b };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const a = (try facts.declaration(facts.member(facts.rootOf(file), "A").?)).container;
+    // A field of a literal under `&`, its place a pointer to a type chosen per target: each
+    // choice's own field, here a `[]const u8` in both.
+    const field = try facts.literalType(file, spelledNode(tree, "\"x\"", 0).?);
+    try std.testing.expect(field == .pointer and field.pointer.* == .primitive);
+    // `&.{ … }` where a `[]const A` is taken: an array of `A`, each element an `A`.
+    const element = try facts.literalType(file, spelledNode(tree, ".{ .in = \"y\" }", 0).?);
+    try std.testing.expect(element == .container and std.meta.eql(element.container.scope, a.scope));
+    // A returned literal's field, of a container a type function made: its type with the
+    // call's arguments, `?[*]u16` (another call makes `?[*]u8`).
+    const buffer = try facts.literalType(file, spelledNode(tree, "@ptrCast(@alignCast(p))", 0).?);
+    try std.testing.expect(buffer == .optional and buffer.optional.* == .pointer and buffer.optional.pointer.* == .primitive and std.mem.eql(u8, buffer.optional.pointer.primitive, "u16"));
+    // A declaration literal under `comptime` or `try` names its place's container's member.
+    try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".of(1)", 0).?)).?.scope, a.scope));
+    try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".ofError(2)", 0).?)).?.scope, a.scope));
+}
+
 test "batch 2: an update's operation, error names and sets, a condition's truths, a value's leaves, a literal" {
     const source =
         \\const E = error{ Canceled, Timeout };

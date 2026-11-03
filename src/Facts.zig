@@ -5235,82 +5235,11 @@ fn valueHoldsLength(self: *Facts, value: Value, open: *OpenTypes, depth: usize) 
     }
 }
 
-/// The container whose declaration a declaration literal at `node` names (`.init(...)`): the
-/// one its result location gives it, through `try` and the error union or optional around it.
-/// A variable's declared type, a returned value's function result, a struct literal's field's
-/// type, an assignment's target, an argument's parameter's type (`parameterType`). Null where
-/// nothing written there names one.
+/// The container an untyped literal or a declaration literal at `node` takes (`.{…}`,
+/// `.init(...)`): the one the type its place gives (`literalType`) is, through the error union
+/// or optional around it. Null where that type is no one container.
 pub fn resultContainer(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
-    var at = node;
-    // Each step is one parent outward; a struct literal's own location is the next.
-    for (0..8) |_| {
-        const tree = &self.project.at(file).file.tree;
-        const model = &self.project.at(file).model;
-        const parent = model.parentOf(at) orelse return null;
-        switch (tree.nodeTag(parent)) {
-            .@"try", .grouped_expression => {
-                at = parent;
-                continue;
-            },
-            .@"return" => {
-                var function = parent;
-                while (tree.nodeTag(function) != .fn_decl) function = model.parentOf(function) orelse return null;
-                var buffer: [1]Ast.Node.Index = undefined;
-                const proto = tree.fullFnProto(&buffer, tree.nodeData(function).node_and_node[0]) orelse return null;
-                return heldContainer(try self.resolve(file, proto.ast.return_type.unwrap() orelse return null));
-            },
-            .assign => {
-                const target, const value = tree.nodeData(parent).node_and_node;
-                return if (value == at) heldContainer(try self.resolve(file, target)) else null;
-            },
-            // What `orelse` or `catch` gives otherwise is the whole's value.
-            .@"orelse", .@"catch" => {
-                if (tree.nodeData(parent).node_and_node[1] != at) return null;
-                at = parent;
-                continue;
-            },
-            // A prong's value is the switch's: the case, then the switch, one step each.
-            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
-                if (tree.fullSwitchCase(parent).?.ast.target_expr != at) return null; // unreachable: tagged a case
-                at = parent;
-                continue;
-            },
-            .@"switch", .switch_comma => {
-                if (tree.fullSwitch(parent).?.ast.condition == at) return null; // unreachable: tagged a switch
-                at = parent;
-                continue;
-            },
-            else => {},
-        }
-        // An `if`'s branch is the `if`'s value.
-        if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.then_expr != at and branch.ast.else_expr.unwrap() != at) return null;
-            at = parent;
-            continue;
-        }
-        if (tree.fullVarDecl(parent)) |variable| {
-            if (variable.ast.init_node.unwrap() != at) return null;
-            return heldContainer(try self.resolve(file, variable.ast.type_node.unwrap() orelse return null));
-        }
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&call_buffer, parent)) |call| {
-            const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, at) orelse return null;
-            return heldContainer(try self.parameterType(file, parent, call, position));
-        }
-        var buffer: [2]Ast.Node.Index = undefined;
-        const literal = tree.fullStructInit(&buffer, parent) orelse return null;
-        // `.name = value`: the token before `=` names the field.
-        const first = tree.firstToken(at);
-        if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, at) == null or first < 2) return null;
-        if (tree.tokenTag(first - 1) != .equal or tree.tokenTag(first - 2) != .identifier) return null;
-        const container = if (literal.ast.type_expr.unwrap()) |kind| heldContainer(try self.resolve(file, kind)) else try self.resultContainer(file, parent);
-        const field = self.member(container orelse return null, try self.memberName(tree.tokenSlice(first - 2))) orelse return null;
-        const record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
-        if (record.kind != .field) return null;
-        const declared = (self.project.at(field.file).model.containerField(&self.project.at(field.file).file.tree, record.node) orelse return null).ast.type_expr.unwrap() orelse return null;
-        return heldContainer(try self.resolve(field.file, declared));
-    }
-    return null;
+    return heldContainer(try self.literalType(file, node));
 }
 
 /// The container a type or a value is, through the error union or optional around it.
@@ -10087,6 +10016,33 @@ pub fn literalType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Res
     return self.placeType(file, node, 0);
 }
 
+/// The type a literal's field `name` takes in a literal of type `whole`, in each type it may be:
+/// a literal coerces through an optional or an error union. A field of a container a type
+/// function made is read with that call's arguments (`memberOf`). A build that takes a
+/// `noreturn` alternative (`.wasi => noreturn`) cannot coerce the literal, so that alternative
+/// makes no field; where every one is `noreturn`, the field is not known.
+fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!Value {
+    var holder = whole;
+    while (true) holder = switch (holder) {
+        .optional, .error_union => |inner| inner.*,
+        else => break,
+    };
+    const container = switch (holder) {
+        .container, .instance => |c| c,
+        .alternatives => |each| {
+            var typed: std.ArrayList(Value) = .empty;
+            for (each) |one| if (one != .primitive or !std.mem.eql(u8, one.primitive, "noreturn")) try typed.append(self.gpa, one);
+            if (typed.items.len == 0) return .{ .unknown = .unsupported };
+            const fields = try self.gpa.alloc(Value, typed.items.len);
+            for (typed.items, fields) |one, *out| out.* = try self.literalFieldType(one, name);
+            return self.choose(fields);
+        },
+        .unknown => return holder,
+        else => return .{ .unknown = .unsupported },
+    };
+    return self.memberOf(container, self.member(container, name) orelse return .{ .unknown = .unresolved });
+}
+
 fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!Value {
     if (depth == 32) return .{ .unknown = .budget };
     const tree = &self.project.at(file).file.tree;
@@ -10113,32 +10069,38 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         const whole = try self.placeType(file, parent, depth + 1);
         if (whole == .unknown or whole == .scalar) return whole;
         const name = try self.memberName(tree.tokenSlice(Model.initName(tree, node) orelse return .{ .unknown = .unsupported }));
-        // A literal coerces through an optional or an error union; `&.{}` gives a pointer to one.
-        var holder = whole;
-        while (true) holder = switch (holder) {
-            .optional, .error_union, .pointer => |inner| inner.*,
-            else => break,
-        };
-        const container = switch (holder) {
-            .container, .instance => |c| c,
-            .unknown => return holder,
-            else => return .{ .unknown = .unsupported },
-        };
-        const field = self.member(container, name) orelse return .{ .unknown = .unresolved };
-        return self.declaration(field);
+        return self.literalFieldType(whole, name);
     }
     if (tree.fullArrayInit(&parent_buffer, parent)) |array| {
         const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else try self.placeType(file, parent, depth + 1);
         return switch (whole) {
-            // An array literal given where a slice is taken (`&.{ a, b }`) holds its elements.
-            .array, .pointer => |each| each.*,
+            .array => |each| each.*,
             .unknown => whole,
             else => .{ .unknown = .unsupported },
         };
     }
     switch (tree.nodeTag(parent)) {
         .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
-        .address_of, .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(file, parent, depth + 1),
+        // `try`, `comptime` and `nosuspend` give their operand their own place (`try`'s
+        // operand is the error union around it, read through as a literal's field is).
+        .@"try", .@"comptime", .@"nosuspend", .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(file, parent, depth + 1),
+        // An anonymous literal under `&` is what the pointer its place gives points at: a `*T`'s
+        // `&.{}` is a `T`; a slice's or a many-item pointer's (a `pointer` to the element too)
+        // `&.{ a, b }` an array of the element. Where that element is itself an array, a `*[N]E`
+        // and a `[]const [N]E` read alike and the literal is not known.
+        .address_of => {
+            const target = switch (try self.placeType(file, parent, depth + 1)) {
+                .pointer => |inner| inner.*,
+                .unknown => |why| return .{ .unknown = why },
+                else => return .{ .unknown = .unsupported },
+            };
+            var array_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullArrayInit(&array_buffer, node) == null) return target;
+            return switch (target) {
+                .array, .alternatives, .unknown => .{ .unknown = .unsupported },
+                else => .{ .array = try self.boxed(target) },
+            };
+        },
         // A case's item takes the type of what the switch tests (`.compare =>` names a tag of
         // the operand's union); its body gives the switch its value.
         .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
