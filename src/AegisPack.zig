@@ -550,24 +550,28 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
     var operand = false;
     // Whether the program calls `x.name(...)`: a method, or a field that holds a function.
     var called = false;
-    if (model.parentOf(field)) |parent| {
-        if (tree.nodeTag(parent) == .field_access and tree.nodeData(parent).node_and_token[0] == field)
-            member = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]));
-        operand = scalarOperand(tree, parent, field);
-        var call_buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullCall(&call_buffer, parent)) |call| called = call.ast.fn_expr == field;
+    if (model.parentOf(field)) |parent| operand = scalarOperand(tree, parent, field);
+    switch (try Facts.accesses.useOf(c.facts, c.file, field)) {
+        // By name: what `x` holds does not resolve.
+        .member => |read| member = (try Facts.accesses.pathOf(c.facts, c.file, read)).steps[0].name,
+        .callee => called = true,
+        else => {},
     }
     // The fields `x`'s literal initializer names.
     var literal_buffer: [2]Ast.Node.Index = undefined;
     var literal: ?Ast.full.StructInit = null;
     const receiver = tree.nodeData(field).node_and_token[0];
-    if (tree.nodeTag(receiver) == .identifier) if (model.reference(receiver)) |ref| if (ref.declaration) |index| {
+    const local: ?Model.Declaration.Id = switch (try c.facts.definition(c.file, receiver)) {
+        .decl => |decl| if (decl.file == c.file) decl.index else null,
+        .none, .unknown => null,
+    };
+    if (local) |index| {
         if (tree.fullVarDecl(model.declarations[@backingInt(index)].node)) |v| if (v.ast.init_node.unwrap()) |init| {
             if (tree.fullStructInit(&literal_buffer, init)) |value| if (value.ast.type_expr == .none) {
                 literal = value;
             };
         };
-    };
+    }
     const siblings = try receiverMembers(c, tree, model, receiver, name);
     if (siblings.len != 0 and try noLibraryHolder(c, name, siblings)) return true;
     if (member == null and literal == null and !operand and !called) return false;
@@ -1985,13 +1989,19 @@ fn plainBreaks(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u
 }
 
 /// The place `std.mem.asBytes(&x)` names: `x`.
-fn addressed(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+/// What `std.mem.asBytes(&x)` gives the bytes of: `x`, its callee read by resolution.
+fn addressed(c: *Context, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const tree = try c.project.syntax(try c.source());
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return null;
-    if (call.ast.params.len != 1 or tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(call.ast.fn_expr).node_and_token[1]), "asBytes")) return null;
+    if (call.ast.params.len != 1) return null;
+    const function = switch (try calledFunction(c, c.file, node)) {
+        .function => |function| function,
+        .unknown => return null,
+    };
+    if (try isStd(c, function, "mem.asBytes") != .yes) return null;
     const operand = call.ast.params[0];
-    if (tree.nodeTag(operand) != .address_of) return null;
+    if (Facts.accesses.formOf(tree.nodeTag(operand)) != .address_of) return null;
     return tree.nodeData(operand).node;
 }
 
@@ -2665,7 +2675,7 @@ const Flow = struct {
                 f.aggregate = true;
                 continue;
             };
-            if (state == .live and !f.aggregate and !f.pointer) if (f.copiedInto(stmt)) |copy| {
+            if (state == .live and !f.aggregate and !f.pointer) if (try f.copiedInto(stmt)) |copy| {
                 f.token = copy;
                 continue;
             };
@@ -3379,7 +3389,7 @@ const Flow = struct {
     /// The local of the owner's own block a statement copies the owner whole into, the owner
     /// named nowhere after it: `const copy = owner;`, `copy = owner;`, or its bytes copied
     /// (`@memcpy(std.mem.asBytes(&copy), std.mem.asBytes(&owner))`). The copy is then the owner.
-    fn copiedInto(f: Flow, stmt: Ast.Node.Index) ?Ast.TokenIndex {
+    fn copiedInto(f: Flow, stmt: Ast.Node.Index) Context.Error!?Ast.TokenIndex {
         if (f.model.parentOf(stmt) != f.scope) return null;
         const copy: Ast.TokenIndex, const value: Ast.Node.Index = if (f.tree.fullVarDecl(stmt)) |variable| .{
             variable.ast.mut_token + 1,
@@ -3394,8 +3404,8 @@ const Flow = struct {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(f.tree, stmt, &buffer);
                 if (args.len != 2) return null;
-                const into = addressed(f.tree, args[0]) orelse return null;
-                break :bytes .{ f.localToken(into) orelse return null, addressed(f.tree, args[1]) orelse return null };
+                const into = (try addressed(f.c, args[0])) orelse return null;
+                break :bytes .{ f.localToken(into) orelse return null, (try addressed(f.c, args[1])) orelse return null };
             },
             else => return null,
         };
