@@ -3820,7 +3820,7 @@ const Flow = struct {
             var use = try Facts.accesses.useOf(f.c.facts, f.c.file, candidate);
             switch (use) {
                 // Lent to a call that holds it again on every return: a borrow.
-                .address => |address| if (try lent(f.c, f.c.file, address, 0)) {
+                .address => |address| if (try lent(f.c, f.c.file, address, f.kind, 0)) {
                     found = .members;
                     continue;
                 },
@@ -4127,23 +4127,34 @@ fn fieldOf(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool 
     return args.len == 2 and args[0] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@field");
 }
 
-/// Whether `argument`, a guard's address or a pointer to a guard, is lent by the call it is an
-/// argument of: to an aegis condition's `wait` or `waitUncancelable`, which release the guard
-/// while they wait and hold it again on every return, or to a function of the program's own
-/// that hands it back held on every path (`Loan`).
-fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    const model = &c.project.at(file).model;
-    const call_node = model.parentOf(argument) orelse return false;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, call_node) orelse return false;
-    const position = for (call.ast.params, 0..) |param, i| {
-        if (param == argument) break i;
+/// Whether `argument`, the address of an owner of `kind` or a pointer to one, is lent by the
+/// call it is an argument of: to an aegis condition's `wait` or `waitUncancelable`, which
+/// release the guard while they wait and hold it again on every return, or to a function of the
+/// program's own that hands it back held on every path (`Loan`).
+fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, kind: Contract.Kind, depth: u8) Context.Error!bool {
+    // The call `argument` is passed to, by meaning (`Facts.calls`): `f(a)`, `x.f(a)` (its
+    // receiver the first parameter), or an element of `@call`'s tuple.
+    const call_node = switch (try Facts.accesses.useOf(c.facts, file, argument)) {
+        .argument => |at| at.call,
+        .element_of => |at| switch (try Facts.accesses.useOf(c.facts, file, at.literal)) {
+            .builtin_argument => |builtin| builtin.call,
+            else => return false,
+        },
+        else => return false,
+    };
+    const call = (try Facts.calls.at(c.facts, file, call_node)) orelse return false;
+    const args = switch (call.args) {
+        .known => |each| each,
+        .unknown => return false,
+    };
+    // In the callee's parameter order.
+    const position = for (args, 0..) |each, i| {
+        if (each == argument) break i;
     } else return false;
-    const path = try Facts.accesses.pathOf(c.facts, file, call.ast.fn_expr);
+    const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
     if (path.steps.len >= 2 and path.steps[0].kind == .field) {
         const holder = path.steps[1].node;
-        const name = (try memberNamed(c, file, call.ast.fn_expr)) orelse "";
+        const name = (try memberNamed(c, file, call.callee_expr)) orelse "";
         if (among(lends(.condition), name)) {
             const k = (try Contract.kind(c, file, holder, 0)) orelse switch (try typed(c, try c.facts.resolve(file, holder), 0)) {
                 .owner => |owned| owned,
@@ -4176,9 +4187,8 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
         params[count] = param.name_token orelse return false;
         count += 1;
     }
-    // A method called on a value takes the value as its first parameter.
-    const skip: usize = if (count == call.ast.params.len + 1) 1 else if (count == call.ast.params.len) 0 else return false;
-    const loan: Loan = .{ .c = c, .file = function.file, .tree = written, .model = &c.project.at(function.file).model, .token = params[position + skip], .depth = depth + 1 };
+    if (count != args.len) return false;
+    const loan: Loan = .{ .c = c, .file = function.file, .tree = written, .model = &c.project.at(function.file).model, .token = params[position], .kind = kind, .depth = depth + 1 };
     const body = written.nodeData(whole).node_and_node[1];
     var block_buffer: [2]Ast.Node.Index = undefined;
     const statements = written.blockStatements(&block_buffer, body) orelse return false;
@@ -4189,9 +4199,9 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, depth: u8) 
     };
 }
 
-/// A function that borrows a guard through its parameter `token`: whether every path hands it
-/// back held. The guard starts held; `p.deinit(...)` releases it and `p.* = x.acquire...(...)`
-/// holds it again; a return, a `try` or the end while released fails, as does any use while
+/// A function that borrows an owner of `kind` through its parameter `token`: whether every path
+/// hands it back held. It starts held; its release (`p.deinit(...)`, a std handle's
+/// `p.close(...)`) releases it and `p.* = x.acquire...(...)` holds it again; a return, a `try` or the end while released fails, as does any use while
 /// released, a deferred release, or a use but its members or a loan on. A loop's body must
 /// leave it as it found it held; a `break` or `continue` while released fails.
 const Loan = struct {
@@ -4200,6 +4210,8 @@ const Loan = struct {
     tree: *const Ast,
     model: *const Model,
     token: Ast.TokenIndex,
+    /// The owner's kind: what releases it (`releaseName`).
+    kind: Contract.Kind,
     depth: u8,
 
     const State = enum { live, released };
@@ -4285,7 +4297,7 @@ const Loan = struct {
     /// `p.deinit(...)`.
     fn releases(l: Loan, stmt: Ast.Node.Index) Context.Error!bool {
         const called = (try calledOn(l.c, l.file, stmt)) orelse return false;
-        return called.on == l.token and releaseName(.guard, called.name);
+        return called.on == l.token and releaseName(l.kind, called.name);
     }
 
     /// `p.* = x.acquire...(...)`.
@@ -4300,7 +4312,7 @@ const Loan = struct {
     }
 
     const Use = enum { none, members, other };
-    /// How `node` uses the borrowed guard: not at all, through its members or by lending it on
+    /// How `node` uses the borrowed owner: not at all, through its members or by lending it on
     /// (a nested `deinit` is other), or otherwise.
     fn uses(l: Loan, node: Ast.Node.Index) Context.Error!Use {
         var found: Use = .none;
@@ -4308,14 +4320,16 @@ const Loan = struct {
         while (each.next()) |candidate| {
             switch (try Facts.accesses.useOf(l.c.facts, l.file, candidate)) {
                 .member => |read| {
-                    if (releaseName(.guard, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
+                    if (releaseName(l.kind, (try memberNamed(l.c, l.file, read)) orelse return .other)) return .other;
                     found = .members;
                     continue;
                 },
+                // `_ = p;`: no place takes it.
+                .discarded => continue,
                 .statement => return .other,
                 else => {},
             }
-            if (try lent(l.c, l.file, candidate, l.depth)) {
+            if (try lent(l.c, l.file, candidate, l.kind, l.depth)) {
                 found = .members;
                 continue;
             }

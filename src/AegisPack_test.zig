@@ -1432,7 +1432,7 @@ test "a guard read in a condition before its release, and one lent to a conditio
     // Acquired by `try`, its release deferred, lent to a wait that holds it again on return.
     try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(u32), c: *aegis.Condition) !void { var held = try b.acquire(io); defer held.deinit(io); while (held.value().* == 0) c.wait(io, &held, .none) catch |err| switch (err) { error.Timeout => return, else => |e| return e }; }", pack.cleanup, true, 0);
     // Lent anywhere else, its release may move: undecided.
-    try expectJudged(head ++ "fn keep(g: anytype) void { _ = g; }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "var kept: ?*anyopaque = null;\nfn keep(g: anytype) void { kept = @ptrCast(g); }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
     // A guard never released is still a finding when it was read in a condition.
     try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } }", pack.cleanup, true, 1);
 }
@@ -1987,6 +1987,15 @@ test "A003 releases std's Server by its deinit" {
     try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); defer s.deinit(); }", pack.cleanup, true, 0);
     try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); s.deinit(); }", pack.cleanup, true, 0);
     try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); _ = &s; }", pack.cleanup, true, 1);
+}
+
+test "A003 lends an owner to a callee by its kind's release, through a call or @call's tuple" {
+    // A callee that closes a std handle it is lent releases it (a guard's `deinit` does not);
+    // one that reads only its members or discards it hands it back held.
+    const head = "const std = @import(\"std\");\nfn connect() std.Io.net.Stream { return .{}; }\nfn shut(s: *std.Io.net.Stream) void { s.close(); }\nfn peek(s: *std.Io.net.Stream) void { _ = s.handle; }\nfn ignore(s: *std.Io.net.Stream) void { _ = s; }\n";
+    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); shut(&s); }", pack.cleanup, false, 0);
+    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); peek(&s); ignore(&s); }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); @call(.auto, peek, .{&s}); }", pack.cleanup, true, 0);
 }
 
 test "A001 reads a literal's place through a field default and optional and error-union results" {
