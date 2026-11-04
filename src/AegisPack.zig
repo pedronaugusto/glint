@@ -1106,6 +1106,10 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             // parameters a runtime function's type cannot take, is called there.
             const callee = try c.facts.resolve(c.file, call.callee_expr);
             if (callee == .fn_type or (callee == .pointer and callee.pointer.child.* == .fn_type)) return;
+            // Whatever function it calls, a binding reports only an argument `boundBy` does not
+            // pass over: one neither the receiver, a parameter of a generic this call is in
+            // (decided where that is bound), nor plain data (`access.write(n)`, `n: u64`).
+            if (!try anyArgumentBinds(c, call)) return;
             return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call spelled as a generic that copies its parameters does not resolve: its binding may copy an owner");
         },
     };
@@ -1202,6 +1206,33 @@ fn argumentsMove(c: *Context, call: Facts.calls.Call) Context.Error!bool {
         for (parts.places) |place| if (try moved(c, argument, place, false) != .yes) return false;
     }
     return true;
+}
+
+/// Whether some argument of `call`, whose callee does not resolve, is one a binding of any
+/// function may report (`boundBy`): not the receiver it binds, a parameter of a generic the call
+/// is in, nor of a type that resolves to no owner. A receiver that may bind or not (`access.write(n)`,
+/// `access` of no known type) passes the written arguments either way, its holder bound as
+/// written or not passed: those are read. `@call` given no tuple literal may pass any.
+fn anyArgumentBinds(c: *Context, call: Facts.calls.Call) Context.Error!bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const tree = &c.project.at(c.file).file.tree;
+    const args = switch (call.args) {
+        .known => |each| each,
+        .unknown => if (call.receiver == .unknown) (tree.fullCall(&buffer, call.node) orelse return true).ast.params else return true,
+    };
+    for (args, 0..) |argument, position| {
+        if (call.receiver == .bound and position == 0) continue;
+        if (c.facts.fromParameter(c.file, argument)) continue;
+        // Of a type that resolves to no owner, in any build (`n`, `@as(u8, 3)`, `u8`): what a
+        // binding to it copies, casts or makes is plain, as `boundBy` judges it. Which
+        // parameter takes a type is not known here, so a type stands for its values
+        // (`aegis.Secret(u32)`, which a written reading would take as plain `type`).
+        // A record holding an owner in a field is no plain data: copying it copies the owner.
+        const value = try instanceOf(c, try c.facts.resolve(c.file, argument));
+        if (try perBuild(c, value) != .other or try copied(c, value, 0) != .other) return true;
+        if (try Shapes.holdsHandle(c, cleanup, value) or try heldInRecord(c, value, 0) != .other) return true;
+    }
+    return false;
 }
 
 /// `checkBinding` of `function`, one `call` may call, its arguments known: whether it reported
