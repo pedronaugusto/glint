@@ -5793,6 +5793,10 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
                 if (!callable(typed)) return typed;
                 return self.identity(typed, try self.givenValues(decl));
             }
+            // An array of types written element by element where it is declared (std's
+            // `Io.Operation.Result`, whose block fills `field_types` through a loop's captures).
+            if (type_value == .array and mutable) if (variable.ast.init_node.unwrap()) |init| if (isUndefined(tree, init)) if (model.parentOf(declaration_record.node)) |block|
+                return self.writtenElements(null, decl.file, decl.index, block);
         }
         if (variable.ast.init_node.unwrap()) |value| {
             const initial = try self.resolve(decl.file, value);
@@ -7882,11 +7886,48 @@ fn writtenElements(self: *Facts, env: ?*const Env, file: Project.FileId, index: 
             },
             .slice_open, .slice, .slice_sentinel => if (tree.fullSlice(parent).?.ast.sliced != node) return .{ .unknown = .unsupported }, // unreachable: a slice node is a full slice
             .field_access => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(parent).node_and_token[1]), "len")) return .{ .unknown = .unsupported },
+            // Its address read by a builtin that builds a type from it, or a loop's input
+            // written through its pointer capture.
+            .address_of => if (!try self.elementsByAddress(env, file, parent, &elements)) return .{ .unknown = .unsupported },
             else => return .{ .unknown = .unsupported },
         }
     }
     if (elements.items.len == 0) return .{ .unknown = .unsupported };
     return .{ .array = try self.boxed(try self.choose(elements.items)) };
+}
+
+/// Whether `address`, the address of an array `writtenElements` reads, is used so that every
+/// write through it is seen: an argument of `@Struct`, `@Union` or `@Tuple`, which reads it;
+/// or a `for` loop's input whose capture is a pointer, each element written as `capture.* = v`
+/// (added to `elements`) and the capture used no other way.
+fn elementsByAddress(self: *Facts, env: ?*const Env, file: Project.FileId, address: Ast.Node.Index, elements: *std.ArrayList(Value)) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const user = model.parentOf(address) orelse return false;
+    if (builtinName(tree, user)) |name| {
+        for ([_][]const u8{ "@Struct", "@Union", "@Tuple" }) |reads| if (std.mem.eql(u8, name, reads)) return true;
+        return false;
+    }
+    const loop = tree.fullFor(user) orelse return false;
+    const position = std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, address) orelse return false;
+    const capture = for (model.declarations, 0..) |d, i| {
+        if (d.kind != .capture or d.node != user) continue;
+        if (Model.capturePosition(tree, loop, d.token) != position) continue;
+        if (tree.tokenTag(d.token - 1) != .asterisk) return false;
+        break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
+    } else return false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .identifier) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const ref = model.reference(node) orelse continue;
+        if (ref.declaration != capture) continue;
+        const deref = model.parentOf(node) orelse return false;
+        if (tree.nodeTag(deref) != .deref) return false;
+        const store = model.parentOf(deref) orelse return false;
+        if (tree.nodeTag(store) != .assign or tree.nodeData(store).node_and_node[0] != deref) return false;
+        try elements.append(self.gpa, try self.resolveIn(env, file, tree.nodeData(store).node_and_node[1]));
+    }
+    return true;
 }
 
 /// The reading of `function` at one `call` in `file`: its parameters bound to the call's
@@ -14571,4 +14612,58 @@ test "a @field name of the holder's own fields or tags names no declaration, for
         try found.append(arena.allocator(), try facts.fieldNameOwn(project.sources[0].id, args[0], args[1]));
     }
     try std.testing.expectEqualSlices(bool, &.{ true, false, true, false, true, true }, found.items);
+}
+
+test "an array of types a block fills through a loop's pointer captures is what each capture is given (std's Io.Operation.Result)" {
+    const head =
+        \\const A = struct {
+        \\    pub const Result = u32;
+        \\};
+        \\const B = struct {
+        \\    pub const Result = bool;
+        \\};
+        \\const Operation = union(enum) { a: A, b: B };
+        \\const Tag = @typeInfo(Operation).@"union".tag_type.?;
+        \\pub const Result = Result: {
+        \\    const operation_info = @typeInfo(Operation).@"union";
+        \\    const operation_count = operation_info.field_names.len;
+        \\    var field_names: [operation_count][]const u8 = undefined;
+        \\    var field_types: [operation_count]type = undefined;
+        \\    for (operation_info.field_names, operation_info.field_types, &field_names, &field_types) |f_name, f_type, *field_name, *field_type| {
+        \\        field_name.* = f_name;
+        \\        field_type.* = if (f_type == noreturn) noreturn else f_type.Result;
+        \\
+    ;
+    const tail =
+        \\    }
+        \\    break :Result @Union(.auto, Tag, &field_names, &field_types, &@splat(.{}));
+        \\};
+    ;
+    for ([_]struct { []const u8, bool }{
+        // Each element written through the capture: the union's fields are its operations' results.
+        .{ head ++ tail, true },
+        // The capture kept as well: a write through it unseen, the array unknown.
+        .{ head ++ "        const kept = field_type;\n        _ = kept;\n" ++ tail, false },
+    }) |row| {
+        const source, const known = row;
+        var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const tree = &project.sources[0].file.tree;
+        const file = project.sources[0].id;
+        const built = for (0..tree.nodes.len) |i| {
+            const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (std.mem.startsWith(u8, tree.getNodeSource(at), "@Union(")) break at;
+        } else unreachable; // unreachable: each source builds the union
+        const value = try facts.resolve(file, built);
+        try std.testing.expectEqual(known, value == .reified);
+        if (!known) continue;
+        // What its fields may hold: each operation's result, or `noreturn`.
+        const fields = value.reified.fields.*;
+        try std.testing.expect(fields == .alternatives);
+        for (fields.alternatives) |one| try std.testing.expect(one == .primitive);
+    }
 }
