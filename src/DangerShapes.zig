@@ -2995,7 +2995,7 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
             if (owner.file != holder.file or owner.scope != holder.scope) continue;
             try uses.append(c.allocator, .{ .file = use.file, .node = use.node });
         }
-        try carried(c, &uses);
+        try carried(c, &uses, decl.name);
         var switched = false;
         for (uses.items) |use| switched = switched or switchedOn(&c.project.at(use.file).file.tree, &c.project.at(use.file).model, use.node, hold);
         if (!switched) continue;
@@ -3036,7 +3036,7 @@ pub fn stateMachines(c: *Context, rule: Rule) Context.Error!void {
 /// one a destructure takes it into, what an `if` or a `while` captures of it, each parameter of
 /// a function of the program it is given as, and each call of a function that returns it (a
 /// getter, a predicate), and from those in turn.
-fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
+fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Context.Error!void {
     var next: usize = 0;
     while (next < uses.items.len and uses.items.len < 256) : (next += 1) {
         const use = uses.items[next];
@@ -3044,7 +3044,7 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
         const model = &c.project.at(use.file).model;
         var at = use.node;
         const parent = while (model.parentOf(at)) |parent| : (at = parent) {
-            if (madeOf(tree, parent, at)) continue;
+            if (madeOf(tree, parent, at, name)) continue;
             break parent;
         } else null;
         const node = parent orelse continue;
@@ -3076,8 +3076,10 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key)) Context.Error!void {
 }
 
 /// Whether `parent` gives a value made of `at`, its operand, that carries a read of the state
-/// on (`carried`).
-fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index) bool {
+/// `state` on (`carried`). A value a `switch` or an `if` on it chooses carries it unless each it
+/// may choose is read from another place (`otherPlace`): `if (p.len == 1) p.one else
+/// table[p.start + i]` gives a code point, not the state.
+fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index, state: []const u8) bool {
     switch (tree.nodeTag(parent)) {
         .unwrap_optional, .grouped_expression, .deref, .address_of, .bool_not => return true,
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => return true,
@@ -3093,9 +3095,28 @@ fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index) bool {
     }
     var buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&buffer, parent)) |call| return tree.nodeTag(call.ast.fn_expr) == .field_access and call.ast.fn_expr == at and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load");
-    if (tree.fullSwitch(parent)) |choice| return choice.ast.condition == at;
-    if (tree.fullIf(parent)) |branch| return branch.ast.cond_expr == at and branch.payload_token == null;
+    if (tree.fullSwitch(parent)) |choice| {
+        if (choice.ast.condition != at) return false;
+        for (choice.ast.cases) |case| if (!otherPlace(tree, tree.fullSwitchCase(case).?.ast.target_expr, state)) return true; // unreachable: a switch's cases are cases
+        return false;
+    }
+    if (tree.fullIf(parent)) |branch| {
+        if (branch.ast.cond_expr != at or branch.payload_token != null) return false;
+        const otherwise = branch.ast.else_expr.unwrap() orelse return true;
+        return !otherPlace(tree, branch.ast.then_expr, state) or !otherPlace(tree, otherwise, state);
+    }
     return false;
+}
+
+/// Whether `value` is read from a place other than the state `name`: another field of a holder
+/// (`p.one`), or an element (`table[i]`).
+fn otherPlace(tree: *const Ast, value: Ast.Node.Index, name: []const u8) bool {
+    return switch (tree.nodeTag(value)) {
+        .grouped_expression => otherPlace(tree, tree.nodeData(value).node_and_token[0], name),
+        .field_access => !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(value).node_and_token[1]), name),
+        .array_access => true,
+        else => false,
+    };
 }
 
 /// The local a variable declaration declares.
