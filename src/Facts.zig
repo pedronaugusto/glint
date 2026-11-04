@@ -1657,8 +1657,8 @@ pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: Parameter
     const readings = try self.instantiations(bound);
     var values: std.ArrayList(Value) = .empty;
     for (readings) |reading| {
-        var open: std.ArrayList(CrowdedStep) = .empty;
-        const found = if (copy.crowded) try self.crowdedIn(reading, function, copy.position, copy, 0, &open) else try self.copyIn(reading, copy);
+        var walk: CrowdedWalk = .{};
+        const found = if (copy.crowded) try self.crowdedIn(reading, function, copy.position, copy, &walk) else try self.copyIn(reading, copy);
         if (found) |value| try values.append(self.gpa, value);
     }
     if (values.items.len == 0) return null;
@@ -1758,37 +1758,52 @@ fn placeTyped(place: Value) bool {
     };
 }
 
-/// How many calls deep `crowdedIn` follows a crowded copy's routes; past it, unknown.
-const crowd_depth = 16;
+/// How many steps (a function's parameter in one reading, `CrowdedStep`) one crowded copy's
+/// walk reads; past it, unknown. The walk is bounded by what it reads, not by how deep the calls
+/// it follows nest: a step already answered is not read again.
+const crowd_steps = 64;
 
 /// `copyIn` for a copy crowded past `routes`, whose routes were not all kept: found in the
 /// reading `env` of `function`, whose parameter `position` the copy is of. The source where
 /// `function` writes it itself, and each call `function` makes that passes that parameter on
 /// to a callee copying it to the same source, read where the reading reaches the call (as
 /// `copyIn`'s path). A call already being read in the same reading adds nothing new: a cycle
-/// of generics passing it round. Null where no route is reached; unknown past `crowd_depth`.
-fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, depth: usize, open: *std.ArrayList(CrowdedStep)) ResolveError!?Value {
-    if (depth >= crowd_depth) return .{ .unknown = .budget };
+/// of generics passing it round. Null where no route is reached; unknown past `crowd_steps`.
+fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, walk: *CrowdedWalk) ResolveError!?Value {
     const here: CrowdedStep = .{ .env = env, .function = function, .position = position };
     const memory = try self.memo(Crowded);
     const key: CrowdedKey = .{ .step = here, .kind = copy.kind, .site = copy.site, .source = copy.source.? };
     if (memory.found.get(key)) |kept| return kept;
-    for (open.items) |step| if (std.meta.eql(step, here)) {
-        memory.cuts += 1;
+    for (walk.open.items, 0..) |step, at| if (std.meta.eql(step, here)) {
+        walk.low = @min(walk.low, at);
         return null;
     };
-    try open.append(self.gpa, here);
-    defer _ = open.pop();
-    const cuts = memory.cuts;
-    const found = try self.crowdedRead(env, function, position, copy, depth, open);
-    // Kept only where no route was cut at a call already being read: a cut answer holds what
-    // the read in progress adds, not yet known here.
-    if (memory.cuts == cuts and self.remaining != 0) try memory.found.put(self.gpa, key, found);
+    if (walk.steps == crowd_steps) {
+        walk.spent = true;
+        return .{ .unknown = .budget };
+    }
+    walk.steps += 1;
+    const mine = walk.open.items.len;
+    try walk.open.append(self.gpa, here);
+    defer _ = walk.open.pop();
+    const outer_low = walk.low;
+    const outer_spent = walk.spent;
+    walk.low = std.math.maxInt(usize);
+    walk.spent = false;
+    const found = try self.crowdedRead(env, function, position, copy, walk);
+    // Kept where every route cut was cut at this step or one it began: the cycles it is in
+    // close here, so its answer holds all they add, whichever binding asked first. A route cut
+    // at a step read before this one leaves it partial; one that ran out of steps, unknown for
+    // this walk only.
+    const closed = walk.low >= mine;
+    if (closed and !walk.spent and self.remaining != 0) try memory.found.put(self.gpa, key, found);
+    walk.low = if (closed) outer_low else @min(outer_low, walk.low);
+    walk.spent = outer_spent or walk.spent;
     return found;
 }
 
 /// `crowdedIn`, read.
-fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, depth: usize, open: *std.ArrayList(CrowdedStep)) ResolveError!?Value {
+fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, walk: *CrowdedWalk) ResolveError!?Value {
     var values: std.ArrayList(Value) = .empty;
     for (try self.parameterCopies(function)) |own| {
         if (own.path.len != 0 or own.position != position or !sameCopy(own, copy)) continue;
@@ -1811,7 +1826,7 @@ fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, c
             try seen.append(self.gpa, theirs.position);
             const reading = bound orelse try self.bind(function.file, call, passing.target, env);
             bound = reading;
-            if (try self.crowdedIn(reading, passing.target, theirs.position, copy, depth + 1, open)) |value| try values.append(self.gpa, value);
+            if (try self.crowdedIn(reading, passing.target, theirs.position, copy, walk)) |value| try values.append(self.gpa, value);
         }
     }
     if (values.items.len == 0) return null;
@@ -1823,11 +1838,19 @@ const CrowdedStep = struct { env: *const Env, function: Decl, position: usize };
 
 const CrowdedKey = struct { step: CrowdedStep, kind: @FieldType(ParameterCopy, "kind"), site: Key, source: Key };
 
-/// `crowdedIn`'s answers by reading, function, parameter and copy, and how many routes it cut
-/// at a call already being read.
+/// `crowdedIn`'s answers by reading, function, parameter and copy, where they are whole.
 const Crowded = struct {
     found: std.AutoHashMapUnmanaged(CrowdedKey, ?Value) = .empty,
-    cuts: usize = 0,
+};
+
+/// One crowded copy's walk from a binding: the steps being read, outermost first; the earliest
+/// of them a route was cut at since the step being read began; how many steps it has read; and
+/// whether one ran out of `crowd_steps` since the step being read began.
+const CrowdedWalk = struct {
+    open: std.ArrayList(CrowdedStep) = .empty,
+    low: usize = std.math.maxInt(usize),
+    steps: usize = 0,
+    spent: bool = false,
 };
 
 /// Whether two copies are of one write: the same site, kind and source.
@@ -15235,6 +15258,121 @@ test "a generic's copy is read in a binding only along the routes it compiles, a
     const unresolved = try routed.copyAt(&facts, made_fn, node.of(tree, "r.unknown()"));
     const value = (try facts.boundCopy(made_call, made_fn, unresolved)).?;
     try std.testing.expect(value != .unknown);
+}
+
+test "a crowded copy is read along a route of generics deeper than any count of calls, by the steps its walk reads" {
+    const source =
+        \\fn dup(comptime T: type, v: T) T {
+        \\    return T.clone(v);
+        \\}
+        \\fn p0(comptime T: type, v: T) T {
+        \\    return p1(T, v);
+        \\}
+        \\fn p1(comptime T: type, v: T) T {
+        \\    return p2(T, v);
+        \\}
+        \\fn p2(comptime T: type, v: T) T {
+        \\    return p3(T, v);
+        \\}
+        \\fn p3(comptime T: type, v: T) T {
+        \\    return p4(T, v);
+        \\}
+        \\fn p4(comptime T: type, v: T) T {
+        \\    return p5(T, v);
+        \\}
+        \\fn p5(comptime T: type, v: T) T {
+        \\    return p6(T, v);
+        \\}
+        \\fn p6(comptime T: type, v: T) T {
+        \\    return p7(T, v);
+        \\}
+        \\fn p7(comptime T: type, v: T) T {
+        \\    return p8(T, v);
+        \\}
+        \\fn p8(comptime T: type, v: T) T {
+        \\    return p9(T, v);
+        \\}
+        \\fn p9(comptime T: type, v: T) T {
+        \\    return p10(T, v);
+        \\}
+        \\fn p10(comptime T: type, v: T) T {
+        \\    return p11(T, v);
+        \\}
+        \\fn p11(comptime T: type, v: T) T {
+        \\    return p12(T, v);
+        \\}
+        \\fn p12(comptime T: type, v: T) T {
+        \\    return p13(T, v);
+        \\}
+        \\fn p13(comptime T: type, v: T) T {
+        \\    return p14(T, v);
+        \\}
+        \\fn p14(comptime T: type, v: T) T {
+        \\    return p15(T, v);
+        \\}
+        \\fn p15(comptime T: type, v: T) T {
+        \\    return p16(T, v);
+        \\}
+        \\fn p16(comptime T: type, v: T) T {
+        \\    return p17(T, v);
+        \\}
+        \\fn p17(comptime T: type, v: T) T {
+        \\    return p18(T, v);
+        \\}
+        \\fn p18(comptime T: type, v: T) T {
+        \\    return p19(T, v);
+        \\}
+        \\fn p19(comptime T: type, v: T) T {
+        \\    return dup(T, v);
+        \\}
+        \\fn keep(comptime T: type, v: T, n: u8) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => switch (n) {
+        \\            0 => return dup(T, v),
+        \\            1 => return dup(T, v),
+        \\            2 => return dup(T, v),
+        \\            else => return dup(T, v),
+        \\        },
+        \\        .@"enum" => return p0(T, v),
+        \\        else => return v,
+        \\    }
+        \\}
+        \\const E = enum {
+        \\    a,
+        \\    fn clone(e: E) E {
+        \\        return e;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    _ = keep(E, .a, 0);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const enum_call = (try calls.at(&facts, file, node.of(tree, "keep(E, .a, 0)"))).?;
+    const keep = enum_call.callee.function;
+    const clone = node.of(tree, "T.clone(v)");
+    const crowded = for (try facts.parameterCopies(keep)) |copy| {
+        if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
+    } else return error.TestUnexpectedResult;
+    // The enum's route reaches `dup` through 20 generics passing `v` on: `E.clone` gives an `E`.
+    const value = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(value == .instance);
 }
 
 test "a copy crowded past its routes is read along the routes its binding compiles, kept or not" {
