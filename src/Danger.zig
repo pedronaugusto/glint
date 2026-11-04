@@ -182,7 +182,7 @@ const Secret = union(enum) { yes: []const u8, no, unknown: Facts.Unknown };
 
 /// Whether a value is secret material by value: an instance of one of `types`, or an array, an
 /// optional or an error union of one; a choice of them is if one is. A pointer borrows it; a
-/// type, a number, a function, an error hold none. Any other value is unknown (`Facts.resolve`'s contract).
+/// type, a number, a function, an error and type information hold none.
 /// An instance of a container a type function made holds what a field holds that the function's
 /// parameters type and no call it judges binds (`unjudged`): that field is read with this
 /// instance's bindings, as nowhere else. aegis's Secret, SecretBytes and Choice hold it sealed.
@@ -223,9 +223,9 @@ fn heldSecret(c: *Context, types: []const SecretType, value: Facts.Value) Contex
         },
         // A type built from its fields' types (`@Struct`): a value of it holds each.
         .reified => |built| return if (built.value) heldSecret(c, types, try c.facts.reifiedParts(built)) else .no,
-        .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set => return .no,
+        // Type information is `std.builtin.Type`'s, known only as the program compiles: no material.
+        .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set, .reflected => return .no,
         .unknown => |why| return .{ .unknown = why },
-        else => return .{ .unknown = .unsupported },
     }
 }
 
@@ -1487,9 +1487,9 @@ fn heldSync(c: *Context, found: []const Governed.Governed, value: Facts.Value) C
         },
         // A type built from its fields' types (`@Struct`): a value of it holds each.
         .reified => |built| return if (built.value) heldSync(c, found, try c.facts.reifiedParts(built)) else .no,
-        .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set => return .no,
+        // Type information is `std.builtin.Type`'s, known only as the program compiles: no lock.
+        .pointer, .container, .primitive, .scalar, .function, .fn_type, .error_set, .reflected => return .no,
         .unknown => |why| return .{ .unknown = why },
-        else => return .{ .unknown = .unsupported },
     }
 }
 

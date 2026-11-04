@@ -7399,6 +7399,15 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             // A vector reads as an array of its lanes (`@Vector`), its child an element.
             const kinds = .{ .{ "pointer", .pointer }, .{ "optional", .optional }, .{ "array", .array }, .{ "vector", .array }, .{ "error_union", .error_union }, .{ "fn", .function }, .{ "struct", .structure }, .{ "union", .tagged }, .{ "enum", .enumeration } };
             inline for (kinds) |kind| if (std.mem.eql(u8, name, kind[0])) return .{ .reflected = .{ .of = r.of, .at = kind[1] } };
+            // A kind whose information holds no type (an integer's signedness and bits, an
+            // error set's names) is the value `std.builtin.Type` declares for it, whatever type
+            // it describes: `@typeInfo(E).error_set.error_names` is `?[]const [:0]const u8`. A
+            // kind holding types (`anyframe`'s child) is a part, whose types are not read.
+            inline for (.{ "int", "float", "error_set", "opaque" }) |plain| if (std.mem.eql(u8, name, plain)) {
+                const information = try self.stdMember(&.{ "builtin", "Type" });
+                if (information == .unknown) return information;
+                return self.memberValue(try self.instance(information), name);
+            };
             return .{ .reflected = .{ .of = r.of, .at = .part } };
         },
         .pointer => {
