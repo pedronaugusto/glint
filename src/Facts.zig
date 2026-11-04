@@ -13428,6 +13428,10 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(Ops).ptr(bytes, 0); }\n", true));
     try std.testing.expectEqual(.function, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(u64).ptr(bytes, 0); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "fn mk(comptime M: fn (type) type) type { return M(Ops); }\npub const T = mk(Flags);\n", true));
+    // Named by a computed `@field` of its namespace, it is reached as each member that name may be.
+    const in_mod = "const mod = struct {\n    fn Flags(comptime F: type) type {\n        return struct {\n            fn ptr(p: [*]u8, comptime field: u8) *F {\n                _ = field;\n                return @ptrCast(@alignCast(p));\n            }\n        };\n    }\n};\npub fn g(x: anytype) void { _ = x.ptr; }\n";
+    try std.testing.expectEqual(.function, try fieldRead(head ++ in_mod, true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ in_mod ++ "pub fn mkBy(comptime name: []const u8) type { return @field(mod, name)(Ops); }\n", true));
     // A pointer cast keeps `const`: the bytes of a parameter's address, or of a copy's handed
     // where a `[]const u8` goes, are read, never written; through `[]u8` or `@constCast`, they
     // may be.
