@@ -4045,8 +4045,7 @@ fn namesNoDeclaration(self: *Facts, file: Project.FileId, holder: Ast.Node.Index
     // A type written as a `var` (`comptime var X: type = S;`) is one declaration that holds a
     // type, then another: no identity of a type. Its value's type (`@TypeOf(x)`) is fixed.
     const fixed = !self.namesVar(file, ungrouped(tree, names.subject)) and !self.namesVar(file, subject);
-    if (fixed and self.sameName(file, h, ungrouped(tree, names.subject))) return true;
-    if (fixed and self.sameName(file, h, subject)) return true;
+    if (fixed and self.sameTypeWritten(file, h, names.subject)) return true;
     if (typeOfOperand(tree, subject)) |operand| {
         if (self.sameName(file, h, ungrouped(tree, operand))) return true;
         // `@TypeOf(out.*)`: `out` points at the value.
@@ -4063,10 +4062,10 @@ fn namesNoDeclaration(self: *Facts, file: Project.FileId, holder: Ast.Node.Index
     const record = self.declarationAt(file, h) orelse return false;
     switch (record.kind) {
         .parameter => if (self.parameterTypeNode(.{ .file = file, .index = (self.project.at(file).model.reference(h) orelse return false).declaration.? })) |t| {
-            if (fixed and self.sameName(file, writtenPointee(tree, t), subject)) return true;
+            if (fixed and self.sameTypeWritten(file, writtenPointee(tree, t), names.subject)) return true;
         },
         .variable => if (tree.fullVarDecl(record.node)) |variable| {
-            if (variable.ast.type_node.unwrap()) |t| if (fixed and self.sameName(file, writtenPointee(tree, t), subject)) return true;
+            if (variable.ast.type_node.unwrap()) |t| if (fixed and self.sameTypeWritten(file, writtenPointee(tree, t), names.subject)) return true;
             if (self.tagTypeOf(file, variable.ast.init_node.unwrap() orelse return false, names.info)) return true;
         },
         .capture => {
@@ -4279,6 +4278,18 @@ fn typeOfOperand(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     return if (args.len == 1) args[0] else null;
 }
 
+/// Whether two type expressions name one type: one declaration, before or after the constants they
+/// go through (`const S = struct { ... }` written `S` on both sides, or `const A = S;` on one), or
+/// the one expression those constants reach.
+fn sameTypeWritten(self: *Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    const one = ungrouped(tree, a);
+    const other = ungrouped(tree, b);
+    if (self.sameName(file, one, other)) return true;
+    const one_reached = self.throughConsts(file, one);
+    const other_reached = self.throughConsts(file, other);
+    return one_reached == other_reached or self.sameName(file, one_reached, other_reached);
+}
 /// Whether two names name one declaration, or two member reads one member of one such name
 /// (`Container.asn1_tags`): what `@TypeOf` gives of them is one type.
 fn sameName(self: *const Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
