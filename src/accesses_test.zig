@@ -816,3 +816,112 @@ test "accesses: asking a place's sites again keeps nothing more on the run's mem
     }
     try std.testing.expectEqual(built, arena.queryCapacity());
 }
+
+test "shared 4: a view kept, chosen or taken of a part, a byte loop's copy, a capture's input, a loop's values" {
+    const source =
+        \\const Key = extern struct { bytes: [4]u8, tag: u8 };
+        \\fn raw(p: anytype) *[5]u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\fn part(p: *Key) *[4]u8 {
+        \\    return &p.bytes;
+        \\}
+        \\fn held(p: *Key) []u8 {
+        \\    var b: []u8 = raw(p);
+        \\    _ = &b;
+        \\    return b;
+        \\}
+        \\fn chosen(p: *Key, whole: bool) []u8 {
+        \\    return if (whole) raw(p) else raw(p)[0..1];
+        \\}
+        \\fn other(p: *Key, q: *Key, first: bool) []u8 {
+        \\    return if (first) raw(p) else raw(q);
+        \\}
+        \\fn copy(d: *Key, s: Key) void {
+        \\    for (raw(d), raw(&s)) |*to, from| to.* = from;
+        \\}
+        \\fn values(xs: []const u8, c: bool) u8 {
+        \\    const found = for (xs) |x| {
+        \\        if (x == 0) break x;
+        \\    } else 9;
+        \\    const outer = while (c) {
+        \\        while (c) {} else break 7;
+        \\    } else 8;
+        \\    const none = if (c) {};
+        \\    _ = none;
+        \\    return found + outer;
+        \\}
+        \\
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const root = facts.rootOf(file);
+    // A view of a part of what the parameter points at, of a view a `var` keeps, of one an `if`
+    // chooses between two of the same memory; none chosen between two parameters' memory.
+    try std.testing.expectEqual(@as(?usize, 0), try facts.viewOf(facts.member(root, "part").?));
+    try std.testing.expectEqual(@as(?usize, 0), try facts.viewOf(facts.member(root, "held").?));
+    try std.testing.expectEqual(@as(?usize, 0), try facts.viewOf(facts.member(root, "chosen").?));
+    try std.testing.expectEqual(@as(?usize, null), try facts.viewOf(facts.member(root, "other").?));
+    // The byte loop copies `s`'s bytes into what `d` points at: the second capture is the second
+    // input's.
+    const copied = (try accesses.copyAt(&facts, file, spelledNode(tree, "to.* = from", 0).?)).?;
+    try std.testing.expectEqualStrings("d", tree.getNodeSource(copied.into.node()));
+    try std.testing.expect(copied.from == .place);
+    try std.testing.expectEqualStrings("s", tree.getNodeSource(copied.from.node()));
+    // A loop gives each `break` out of it and its `else`; a `break` in an inner loop's `else`
+    // leaves the outer loop; an `if` with no `else` gives none.
+    const loop = (try accesses.valuesOf(&facts, file, spelledNode(tree, "for (xs) |x| {\n        if (x == 0) break x;\n    } else 9", 0).?)).leaves;
+    try std.testing.expectEqual(@as(usize, 2), loop.len);
+    const outer = (try accesses.valuesOf(&facts, file, spelledNode(tree, "while (c) {\n        while (c) {} else break 7;\n    } else 8", 0).?)).leaves;
+    try std.testing.expectEqual(@as(usize, 2), outer.len);
+    try std.testing.expectEqual(@as(usize, 0), (try accesses.valuesOf(&facts, file, spelledNode(tree, "if (c) {}", 0).?)).leaves.len);
+}
+
+test "shared 4: a view handed to a function the program holds that writes through it" {
+    const source =
+        \\const Job = extern struct {
+        \\    phase: u8 = 0,
+        \\    fn raw(p: anytype) *[1]u8 {
+        \\        return @ptrCast(p);
+        \\    }
+        \\    fn put(b: []u8, code: u8) void {
+        \\        b[0] = code;
+        \\    }
+        \\    fn look(b: []u8) u8 {
+        \\        return b[0];
+        \\    }
+        \\    pub fn force(j: *Job, code: u8) u8 {
+        \\        put(raw(j), code);
+        \\        return look(raw(j));
+        \\    }
+        \\};
+        \\
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const job = (try facts.declaration(facts.member(facts.rootOf(file), "Job").?)).container;
+    const put = facts.member(job, "put").?;
+    const look = facts.member(job, "look").?;
+    try std.testing.expect(try accesses.writtenThrough(&facts, facts.parameterAt(put, 0).?));
+    try std.testing.expect(!try accesses.writtenThrough(&facts, facts.parameterAt(look, 0).?));
+    // `put(raw(j), code)` writes `phase` as bytes; `look(raw(j))` writes nothing.
+    var at_put = false;
+    var writes = accesses.writes(&facts, .{ .field = facts.member(job, "phase").? }, &.{file});
+    while (try writes.next()) |site| {
+        if (std.mem.eql(u8, tree.getNodeSource(site.node), "put(raw(j), code)")) at_put = true;
+        try std.testing.expect(!std.mem.eql(u8, tree.getNodeSource(site.node), "look(raw(j))"));
+    }
+    try std.testing.expect(at_put);
+}

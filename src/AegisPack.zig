@@ -1594,16 +1594,12 @@ const Exposure = struct {
                 return false;
             },
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                // A block with no label gives `void`.
-                const brace = tree.nodeMainToken(node);
-                if (brace < 2 or tree.tokenTag(brace - 1) != .colon or tree.tokenTag(brace - 2) != .identifier) return false;
-                for (try c.facts.blockBreaks(c.file, node, tree.tokenSlice(brace - 2))) |value| if (try e.carries(value, depth + 1)) return true;
+                // A block with no label gives `void`; one with a label, what each `break` out of it does.
+                for (try c.facts.breaksOut(c.file, node)) |value| if (try e.carries(value, depth + 1)) return true;
                 return false;
             },
             .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
-                const start = tree.firstToken(node);
-                const label: ?[]const u8 = if (start >= 2 and tree.tokenTag(start) != .identifier and tree.tokenTag(start - 1) == .colon and tree.tokenTag(start - 2) == .identifier) tree.tokenSlice(start - 2) else null;
-                for (try c.facts.loopBreaks(c.file, node, label)) |value| if (try e.carries(value, depth + 1)) return true;
+                for (try c.facts.breaksOut(c.file, node)) |value| if (try e.carries(value, depth + 1)) return true;
                 const otherwise = if (tree.fullFor(node)) |loop| loop.ast.else_expr else tree.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
                 return if (otherwise.unwrap()) |value| e.carries(value, depth + 1) else false;
             },

@@ -1382,17 +1382,13 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
             return;
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
-            // A block with no label gives `void`.
-            const brace = t.nodeMainToken(node);
-            if (brace < 2 or t.tokenTag(brace - 1) != .colon or t.tokenTag(brace - 2) != .identifier) return;
-            for (try self.blockBreaks(file, node, t.tokenSlice(brace - 2))) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
+            // A block with no label gives `void`; one with a label, what each `break` out of it does.
+            for (try self.breaksOut(file, node)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             return;
         },
         // A loop's value: each `break` out of it, and its `else`.
         .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
-            const start = t.firstToken(node);
-            const label: ?[]const u8 = if (start >= 2 and t.tokenTag(start) != .identifier and t.tokenTag(start - 1) == .colon and t.tokenTag(start - 2) == .identifier) t.tokenSlice(start - 2) else null;
-            for (try self.loopBreaks(file, node, label)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
+            for (try self.breaksOut(file, node)) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             const otherwise = if (t.fullFor(node)) |loop| loop.ast.else_expr else t.fullWhile(node).?.ast.else_expr; // unreachable: the tag is a loop's
             if (otherwise.unwrap()) |value| try self.copiedWalk(file, value, depth + 1, places, rest, results, deep);
             return;
@@ -1440,50 +1436,32 @@ fn copiedWalk(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u
     }
 }
 
-/// The values each `break :label` out of the labeled block `node` gives (Zig refuses a label
-/// that shadows another, so each names this block).
-pub fn blockBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: []const u8) ResolveError![]const Ast.Node.Index {
-    const t = self.syntaxOf(file);
-    var found: std.ArrayList(Ast.Node.Index) = .empty;
-    const first = t.firstToken(node);
-    const last = t.lastToken(node);
-    for (t.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .@"break") continue;
-        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const at = t.nodeMainToken(brk);
-        if (at < first or at > last) continue;
-        const target, const value = t.nodeData(brk).opt_token_and_opt_node;
-        if (!std.mem.eql(u8, t.tokenSlice(target.unwrap() orelse continue), label)) continue;
-        try found.append(self.gpa, value.unwrap() orelse continue);
-    }
-    return found.items;
-}
-
-/// The values each `break` out of the loop `node` gives: one naming its `label`, or one with
-/// none whose nearest loop it is.
-pub fn loopBreaks(self: *Facts, file: Project.FileId, node: Ast.Node.Index, label: ?[]const u8) ResolveError![]const Ast.Node.Index {
+/// The values each `break` that leaves `node` gives: a labeled block, a loop or a labeled
+/// `switch`, as `accesses.breakTarget` reads where a `break` goes (its label's, or with none the
+/// loop whose body holds it: one in a loop's condition or `else` leaves an outer one). A `break`
+/// with no value gives none.
+pub fn breaksOut(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError![]const Ast.Node.Index {
     const t = self.syntaxOf(file);
     const model = &self.project.at(file).model;
+    // A block or a `switch` with no label: no `break` leaves it (one with none leaves a loop).
+    const labeled = switch (t.nodeTag(node)) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon, .@"switch", .switch_comma => blk: {
+            // The brace or `switch`, after its label where it has one.
+            const start = t.nodeMainToken(node);
+            break :blk start >= 2 and t.tokenTag(start - 1) == .colon and t.tokenTag(start - 2) == .identifier;
+        },
+        else => true,
+    };
+    if (!labeled) return &.{};
     var found: std.ArrayList(Ast.Node.Index) = .empty;
     const first = t.firstToken(node);
     const last = t.lastToken(node);
     for (t.nodes.items(.tag), 0..) |tag, i| {
         if (tag != .@"break") continue;
-        const brk: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const at = t.nodeMainToken(brk);
-        if (at < first or at > last) continue;
-        const target, const value = t.nodeData(brk).opt_token_and_opt_node;
-        if (target.unwrap()) |name| {
-            if (label == null or !std.mem.eql(u8, t.tokenSlice(name), label.?)) continue;
-        } else {
-            // The nearest loop the `break` is in.
-            var up = model.parentOf(brk);
-            const nearest = while (up) |parent| : (up = model.parentOf(parent)) {
-                if (t.fullFor(parent) != null or t.fullWhile(parent) != null) break parent;
-            } else continue;
-            if (nearest != node) continue;
-        }
-        try found.append(self.gpa, value.unwrap() orelse continue);
+        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(jump);
+        if (at < first or at > last or accesses.breakTarget(t, model, jump) != node) continue;
+        try found.append(self.gpa, t.nodeData(jump).opt_token_and_opt_node[1].unwrap() orelse continue);
     }
     return found.items;
 }
@@ -1907,8 +1885,8 @@ fn lexical(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id, name
     return null;
 }
 
-/// What the capture `capture` declares is read from: a switch's subject, the loop's input at
-/// its position, an `if`'s condition.
+/// What the capture `capture` is read from: a switch's subject, the loop's input at the
+/// capture's position (`for (a, b) |x, y|`: `y` is `b`'s), an `if`'s or a `while`'s condition.
 pub fn captureSource(self: *const Facts, file: Project.FileId, capture: Model.Declaration) ?Ast.Node.Index {
     const t = self.syntaxOf(file);
     const node = capture.node;
@@ -5954,10 +5932,14 @@ fn givenValues(self: *Facts, decl: Decl) ResolveError!?[]const Value {
 /// `parts`, one that reads it first (`op=`) but with `parts`, memory a builtin or code the
 /// program does not hold writes, its address taken (but dropped, `_ = &x`), a store with no
 /// one value, one that reaches it by no name of its own, a public `var` another file may
-/// write, one whose file's writes are being read.
+/// write, one whose file's writes are being read. A local `var`'s whole values are read by its
+/// mentions (`accesses.givenByName`), a global's and parts from its file's walk.
 pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key {
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const variable = self.syntaxOf(decl.file).fullVarDecl(record.node) orelse return null;
+    // A local `var` is written only by its name and the pointers its address gives; whole
+    // values alone are read by its mentions, with no walk of its file.
+    if (!parts and !accesses.global(self, decl) and self.syntaxOf(decl.file).tokenTag(variable.ast.mut_token) == .keyword_var) return accesses.givenByName(self, decl);
     var found: std.ArrayList(Key) = .empty;
     if (variable.ast.init_node.unwrap()) |init| try found.append(self.gpa, .{ .file = decl.file, .node = init });
     if (self.syntaxOf(decl.file).tokenTag(variable.ast.mut_token) != .keyword_var) return found.items;
@@ -8164,6 +8146,22 @@ fn spelledIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     return .{ .name = (try self.nameIn(env, file, node, 0)) orelse return null };
 }
 
+/// The parameter at `position` in `function`'s list; null past its end, or for one with no
+/// name.
+pub fn parameterAt(self: *const Facts, function: Decl, position: usize) ?Decl {
+    const tree = &self.project.at(function.file).file.tree;
+    const model = &self.project.at(function.file).model;
+    var fn_buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&fn_buffer, model.declarations[@backingInt(function.index)].node) orelse return null;
+    var it = proto.iterate(tree);
+    var at: usize = 0;
+    const token = while (it.next()) |param| : (at += 1) {
+        if (at == position) break param.name_token orelse return null;
+    } else return null;
+    for (model.declarations, 0..) |record, d| if (record.kind == .parameter and record.token == token) return .{ .file = function.file, .index = @fromBackingInt(@intCast(d)) };
+    return null;
+}
+
 /// The position of the parameter named by `token` in `function`'s list.
 fn parameterPosition(self: *const Facts, file: Project.FileId, function: Decl, token: Ast.TokenIndex) ?usize {
     const tree = &self.project.at(file).file.tree;
@@ -8953,9 +8951,10 @@ const Views = struct { found: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty };
 
 /// The position of the parameter whose memory every pointer `function` returns points into: a
 /// view of it, as `std.mem.asBytes(ptr)` and `sliceAsBytes(slice)` are. Each `return` gives the
-/// parameter through what keeps the memory it points at (`@ptrCast`, `@alignCast`,
-/// `@constCast`, `@volatileCast`, `@as`, a slice of it, parentheses), or the address of an
-/// empty literal (`&[0]u8{}`), no memory at all. Null where one gives anything else, a bare
+/// parameter through what keeps the memory it points at (`accesses.viewed`: `@ptrCast`,
+/// `@alignCast`, `@constCast`, `@volatileCast`, `@as`, a slice of it, parentheses, a variable
+/// holding it, each value an `if` or a labeled block chooses), the address of a part of what it
+/// points at (`&p.bytes`), or the address of an empty literal (`&[0]u8{}`), no memory at all. Null where one gives anything else, a bare
 /// `return`, a body the program does not hold: then what it returns is no known view.
 pub fn viewOf(self: *Facts, function: Decl) ResolveError!?usize {
     const views = try self.memo(Views);
@@ -8971,6 +8970,8 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
     const model = &self.project.at(function.file).model;
     const whole = self.scopeNode(function);
     if (tree.nodeTag(whole) != .fn_decl) return null;
+    // A result that holds no pointer is a copy, no view of any memory: its body is not read.
+    if (!mayPoint(try self.instance(try self.resultOf(.{ .file = function.file, .node = tree.nodeData(whole).node_and_node[0] })))) return null;
     const body = tree.nodeData(whole).node_and_node[1];
     var position: ?usize = null;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
@@ -8991,7 +8992,7 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
         if (tree.nodeTag(bare) == .address_of and emptyLiteral(tree, tree.nodeData(bare).node)) continue;
         // A value its parameters give no part of is no view of one: read by its spelling first,
         // so a call's callee is resolved only where the call is handed one of them.
-        if (!self.handsParameter(function, whole, at, 0)) return null;
+        if (!try self.handsParameter(function, whole, at, 0, null)) return null;
         for (0..16) |_| {
             at = try accesses.viewed(self, function.file, at);
             switch (tree.nodeTag(at)) {
@@ -8999,6 +9000,9 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
                 else => break,
             }
         }
+        // The address of a part of what a pointer parameter points at (`&p.bytes`, `&p.*`): a
+        // part of the parameter's memory.
+        if (tree.nodeTag(at) == .address_of) at = try accesses.pointeeRoot(self, function.file, tree.nodeData(at).node) orelse return null;
         if (tree.nodeTag(at) != .identifier) return null;
         const named = (model.reference(at) orelse return null).declaration orelse return null;
         const record = model.declarations[@backingInt(named)];
@@ -9008,6 +9012,19 @@ fn findView(self: *Facts, function: Decl) ResolveError!?usize {
         position = here;
     }
     return position;
+}
+
+/// Whether a value of type `value` may be a pointer: a pointer, an optional or an error union
+/// of one, a choice with one, a type that does not resolve or that reflection builds.
+fn mayPoint(value: Value) bool {
+    return switch (value) {
+        .pointer, .unknown, .reflected, .reified, .literal => true,
+        .optional, .error_union => |inner| mayPoint(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (mayPoint(one)) break true;
+        } else false,
+        .primitive, .container, .instance, .function, .array, .error_set, .scalar, .fn_type => false,
+    };
 }
 
 const Readers = struct { found: std.AutoHashMapUnmanaged(Decl, ?Reader) = .empty };
@@ -9306,18 +9323,23 @@ fn reachedParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: A
 
 /// Whether the expression `node` in `function` may hand on one of its parameters, by its
 /// spelling alone: the parameter itself, through parentheses, a cast, a slice, an address, a
-/// member or an element; a constant of the function's own whose initializer may; a call one of
-/// whose arguments, or whose receiver, may. What spells none (a literal, a global, a call given
-/// none) is no view of a parameter.
-fn handsParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast.Node.Index, depth: u8) bool {
+/// member or an element; a constant whose initializer may; a variable of the function's own one
+/// of whose values may (`givenTo`; any, where one may go unseen); a call one of whose
+/// arguments, or whose receiver, may; an `if`, a `switch`, a labeled block, `orelse` or `catch`
+/// one of whose values may (`accesses.valuesOf`; one not read there may). What spells none (a
+/// literal, a global, a call given none) is no view of a parameter. A variable whose value is
+/// read again from its own (`p = p[1..]`, `held`) hands on only what its other values do.
+const Held = struct { decl: Model.Declaration.Id, up: ?*const Held };
+
+fn handsParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast.Node.Index, depth: u8, held: ?*const Held) ResolveError!bool {
     if (depth >= 16) return true;
     const tree = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
     switch (tree.nodeTag(node)) {
-        .grouped_expression, .unwrap_optional, .field_access => return self.handsParameter(function, whole, tree.nodeData(node).node_and_token[0], depth + 1),
-        .address_of, .deref, .@"try" => return self.handsParameter(function, whole, tree.nodeData(node).node, depth + 1),
-        .array_access => return self.handsParameter(function, whole, tree.nodeData(node).node_and_node[0], depth + 1),
-        .slice_open, .slice, .slice_sentinel => return self.handsParameter(function, whole, tree.fullSlice(node).?.ast.sliced, depth + 1), // unreachable: the tag is a slice's
+        .grouped_expression, .unwrap_optional, .field_access => return self.handsParameter(function, whole, tree.nodeData(node).node_and_token[0], depth + 1, held),
+        .address_of, .deref, .@"try" => return self.handsParameter(function, whole, tree.nodeData(node).node, depth + 1, held),
+        .array_access => return self.handsParameter(function, whole, tree.nodeData(node).node_and_node[0], depth + 1, held),
+        .slice_open, .slice, .slice_sentinel => return self.handsParameter(function, whole, tree.fullSlice(node).?.ast.sliced, depth + 1, held), // unreachable: the tag is a slice's
         .identifier => {
             const named = (model.reference(node) orelse return false).declaration orelse return false;
             const record = model.declarations[@backingInt(named)];
@@ -9325,24 +9347,42 @@ fn handsParameter(self: *Facts, function: Decl, whole: Ast.Node.Index, node: Ast
                 .parameter => return model.scopes[@backingInt(record.scope)].node == whole,
                 .variable => {
                     const variable = tree.fullVarDecl(record.node) orelse return false;
-                    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
+                    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) {
+                        if (!self.enclosed(function.file, record.scope, whole)) return false;
+                        var up = held;
+                        while (up) |each| : (up = each.up) if (each.decl == named) return false;
+                        const here: Held = .{ .decl = named, .up = held };
+                        for ((try self.givenTo(.{ .file = function.file, .index = named }, false)) orelse return true) |given| {
+                            if (try self.handsParameter(function, whole, given.node, depth + 1, &here)) return true;
+                        }
+                        return false;
+                    }
                     const init = variable.ast.init_node.unwrap() orelse return false;
-                    return self.handsParameter(function, whole, init, depth + 1);
+                    return self.handsParameter(function, whole, init, depth + 1, held);
                 },
                 else => return false,
             }
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
             var buffer: [2]Ast.Node.Index = undefined;
-            for (builtinArgs(tree, node, &buffer)) |arg| if (self.handsParameter(function, whole, arg, depth + 1)) return true;
+            for (builtinArgs(tree, node, &buffer)) |arg| if (try self.handsParameter(function, whole, arg, depth + 1, held)) return true;
             return false;
         },
         else => {
             var buffer: [1]Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, node) orelse return false;
-            for (call.ast.params) |arg| if (self.handsParameter(function, whole, arg, depth + 1)) return true;
+            const call = tree.fullCall(&buffer, node) orelse {
+                const leaves = switch (try accesses.valuesOf(self, function.file, node)) {
+                    .leaves => |each| each,
+                    .unknown => return true,
+                };
+                // A value of no form that chooses or carries one: none it hands on.
+                if (leaves.len == 1 and leaves[0] == node) return false;
+                for (leaves) |leaf| if (try self.handsParameter(function, whole, leaf, depth + 1, held)) return true;
+                return false;
+            };
+            for (call.ast.params) |arg| if (try self.handsParameter(function, whole, arg, depth + 1, held)) return true;
             // A method's receiver: `p.view()` hands `p` on.
-            if (tree.nodeTag(call.ast.fn_expr) == .field_access) return self.handsParameter(function, whole, tree.nodeData(call.ast.fn_expr).node_and_token[0], depth + 1);
+            if (tree.nodeTag(call.ast.fn_expr) == .field_access) return self.handsParameter(function, whole, tree.nodeData(call.ast.fn_expr).node_and_token[0], depth + 1, held);
             return false;
         },
     }
@@ -9879,15 +9919,16 @@ pub const accesses = struct {
 
     /// The expressions a value comes from: what `node` gives, through parentheses, `try`, `.?`,
     /// `@as`, `comptime`, `nosuspend`, both sides of `orelse` and `catch`, an `if`'s and a
-    /// `switch`'s results, and the `break`s a labelled block gives; each one is an expression of
-    /// none of those forms (a literal, a name, a call). An exit (`return`, `unreachable`, a
-    /// `break` or `continue` elsewhere) gives none. Unknown where a form is not read here (a
-    /// loop's result, a block a label does not name), never part of a list.
+    /// `switch`'s results, the `break`s a labelled block or `switch` gives, and a loop's `break`s and its
+    /// `else` (`Facts.breaksOut`); each one is an expression of none of those forms (a literal, a
+    /// name, a call). An exit (`return`, `unreachable`, a `break` or `continue` elsewhere), a
+    /// block with no label and an `if` with no `else` (each `void`) give none. Unknown where a
+    /// form is not read here, never part of a list.
     pub const Values = union(enum) { leaves: []const Ast.Node.Index, unknown: Facts.Unknown };
 
     pub fn valuesOf(facts: *Facts, file: Project.FileId, node: Ast.Node.Index) Error!Values {
         const tree = &facts.project.at(file).file.tree;
-        const model = &facts.project.at(file).model;
+        if (givesItself(tree, node)) return .{ .leaves = try facts.gpa.dupe(Ast.Node.Index, &.{node}) };
         var leaves: std.ArrayList(Ast.Node.Index) = .empty;
         var work: std.ArrayList(Ast.Node.Index) = .empty;
         try work.append(facts.gpa, node);
@@ -9895,17 +9936,25 @@ pub const accesses = struct {
         while (work.pop()) |at| {
             steps += 1;
             if (steps > 4096) return .{ .unknown = .budget };
+            if (givesItself(tree, at)) {
+                try leaves.append(facts.gpa, at);
+                continue;
+            }
             switch (formOf(tree.nodeTag(at))) {
                 .grouped, .unwrap_optional => try work.append(facts.gpa, tree.nodeData(at).node_and_token[0]),
                 .tried, .@"comptime", .@"nosuspend" => try work.append(facts.gpa, tree.nodeData(at).node),
                 .@"catch", .@"orelse" => try work.appendSlice(facts.gpa, &tree.nodeData(at).node_and_node),
                 .@"if" => {
                     const branch = tree.fullIf(at).?; // unreachable: the form is an if's
+                    // One with no `else` gives `void`.
+                    const otherwise = branch.ast.else_expr.unwrap() orelse continue;
                     try work.append(facts.gpa, branch.ast.then_expr);
-                    try work.append(facts.gpa, branch.ast.else_expr.unwrap() orelse return .{ .unknown = .unsupported });
+                    try work.append(facts.gpa, otherwise);
                 },
-                .@"switch" => for (tree.fullSwitch(at).?.ast.cases) |case| { // unreachable: the form is a switch's
-                    try work.append(facts.gpa, tree.fullSwitchCase(case).?.ast.target_expr); // unreachable: a switch's case is a prong
+                // A switch gives each prong's result, and a labeled one each `break` out of it.
+                .@"switch" => {
+                    for (tree.fullSwitch(at).?.ast.cases) |case| try work.append(facts.gpa, tree.fullSwitchCase(case).?.ast.target_expr); // unreachable: the form is a switch's, its cases are prongs
+                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
                 },
                 .builtin => {
                     if (!Facts.isBuiltin(tree, at, "@as")) {
@@ -9924,27 +9973,33 @@ pub const accesses = struct {
                         try leaves.append(facts.gpa, at);
                         continue;
                     }
-                    // A labelled block gives what each `break` that leaves it gives.
-                    const brace = tree.nodeMainToken(at);
-                    if (tree.tokenTag(brace) != .l_brace or brace < 2 or tree.tokenTag(brace - 1) != .colon) return .{ .unknown = .unsupported };
-                    var found = false;
-                    for (tree.nodes.items(.tag), 0..) |tag, i| {
-                        if (tag != .@"break") continue;
-                        const jump: Ast.Node.Index = @fromBackingInt(@intCast(i));
-                        if (breakTarget(tree, model, jump) != at) continue;
-                        found = true;
-                        try work.append(facts.gpa, tree.nodeData(jump).opt_token_and_opt_node[1].unwrap() orelse return .{ .unknown = .unsupported });
-                    }
-                    if (!found) return .{ .unknown = .unsupported };
+                    // A labelled block gives what each `break` that leaves it gives; one with no
+                    // label gives `void`.
+                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
                 },
                 .@"return", .@"continue", .@"break" => {},
-                .leaf => if (tree.nodeTag(at) != .unreachable_literal) try leaves.append(facts.gpa, at),
-                .@"while", .@"for" => return .{ .unknown = .unsupported },
+                // `unreachable` gives none.
+                .leaf => {},
+                // A loop gives what each `break` out of it gives, and its `else`.
+                .@"while", .@"for" => {
+                    try work.appendSlice(facts.gpa, try facts.breaksOut(file, at));
+                    const otherwise = if (tree.fullFor(at)) |loop| loop.ast.else_expr else tree.fullWhile(at).?.ast.else_expr; // unreachable: the form is a loop's
+                    if (otherwise.unwrap()) |value| try work.append(facts.gpa, value);
+                },
                 .deferred, .variable, .field_declaration, .assign, .compound_assign, .destructure, .prong, .prong_range, .for_range, .fn_decl, .frame, .@"asm" => return .{ .unknown = .unsupported },
-                .member, .comparison, .operator, .logic, .concatenation, .address_of, .slice, .deref, .array_access, .array_literal, .struct_literal, .call, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => try leaves.append(facts.gpa, at),
+                .member, .comparison, .operator, .logic, .concatenation, .address_of, .slice, .deref, .array_access, .array_literal, .struct_literal, .call, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => unreachable, // `givesItself`
             }
         }
         return .{ .leaves = leaves.items };
+    }
+
+    /// Whether `node` is of no form that chooses or carries a value: its own one value.
+    fn givesItself(tree: *const Ast, node: Ast.Node.Index) bool {
+        return switch (formOf(tree.nodeTag(node))) {
+            .leaf => tree.nodeTag(node) != .unreachable_literal,
+            .member, .comparison, .operator, .logic, .concatenation, .address_of, .slice, .deref, .array_access, .array_literal, .struct_literal, .call, .optional_type, .array_type, .pointer_type, .anyframe_type, .error_union, .merged_errors, .prototype => true,
+            else => false,
+        };
     }
 
     /// The value the statement `statement` discards: `_ = v`'s `v`; null for any other.
@@ -10455,6 +10510,209 @@ pub const accesses = struct {
         return fieldsOfShapes(facts, shapes_written.items);
     }
 
+    /// Whether the function declaring `param` may write the memory the parameter points at,
+    /// by its mentions (the model's references; no walk is read): through a place in that
+    /// memory (`b[0] = v`, `p.f += 1`, `&p.f`, a slice of it, a method called on a part of it),
+    /// or with the pointer itself handed on, stored, returned, ranged over or its address taken.
+    /// A value read out of the memory (`b[i]`, `p.f` copied, `b.len`) writes nothing, nor the
+    /// parameter compared or tested.
+    pub fn writtenThrough(facts: *Facts, param: Facts.Decl) Error!bool {
+        const tree = &facts.project.at(param.file).file.tree;
+        const model = &facts.project.at(param.file).model;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .identifier) continue;
+            const mention: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            const reference = model.reference(mention) orelse continue;
+            if (reference.declaration != param.index) continue;
+            // `at` is the pointer itself (or what carries it on) until a step reaches a place in
+            // the memory it points at.
+            var at = mention;
+            var place = false;
+            for (0..32) |_| {
+                // A store's side is read by its assignment, not by its site (`useOf` finds the
+                // site in the file's walk, which may be the walk asking this).
+                if (model.parentOf(at)) |parent| switch (formOf(tree.nodeTag(parent))) {
+                    .assign, .compound_assign, .destructure => |form| {
+                        const target = switch (form) {
+                            .destructure => tree.assignDestructure(parent).ast.value_expr != at,
+                            else => tree.nodeData(parent).node_and_node[0] == at,
+                        };
+                        if (target) {
+                            if (place) return true;
+                            // The parameter itself given a new value writes no memory it points at.
+                            if (at == mention) break;
+                            return true;
+                        }
+                        // A value read out of the memory, or the pointer given to `_`, an
+                        // operand of `op=`: no write. The pointer itself stored or destructured
+                        // goes on where this function does not follow it.
+                        if (place or form == .compound_assign) break;
+                        if (form == .assign and discard(tree, tree.nodeData(parent).node_and_node[0])) break;
+                        return true;
+                    },
+                    else => {},
+                };
+                switch (try useOf(facts, param.file, at)) {
+                    .member, .element, .dereferenced => |access| {
+                        at = access;
+                        place = true;
+                    },
+                    // A slice of a place in the memory points into it, as the pointer does.
+                    .sliced => |access| {
+                        at = access;
+                        place = false;
+                    },
+                    .carried => |carried| switch (carried.how) {
+                        .grouped, .unwrapped, .tried, .compile_time, .@"nosuspend" => at = carried.into,
+                        else => return true,
+                    },
+                    .written, .updated, .address, .callee => {
+                        if (place) return true;
+                        // The parameter itself given a new value writes no memory it points at.
+                        if (at == mention) break;
+                        return true;
+                    },
+                    .argument, .builtin_argument, .returned, .stored, .initializes, .looped, .element_of, .field_of, .destructured => {
+                        if (place) break;
+                        return true;
+                    },
+                    .unknown => return true,
+                    else => break,
+                }
+            } else return true;
+        }
+        return false;
+    }
+
+    /// The values a local variable is given by its own name, read by its mentions (the model's
+    /// references; no walk is read): its initializer's, and each `x = v`'s `v`. A local is
+    /// reached only by its name and the pointers its address gives, so a mention that reads it
+    /// gives it nothing, nor one that reaches other memory through a pointer it holds
+    /// (`x.* = v`, `x[i] = v` of a slice, `x.f.* = v`). Null where one may change it otherwise:
+    /// a store to a part of it (`x.f = v`, `@field(x, n) = v`, `x.? = v`), an `op=`, a
+    /// destructure's target, its address or a part's (but dropped, `_ = &x`), a slice of its own
+    /// memory, a method called on it or a part of it, a capture by pointer of it, an `asm`
+    /// operand, a use not read.
+    pub fn givenByName(facts: *Facts, decl: Facts.Decl) Error!?[]const Facts.Key {
+        const kept_by = try facts.memo(GivenByName);
+        if (kept_by.found.get(decl)) |kept| return kept;
+        const found = try storedFrom(facts, decl);
+        // What a resolve the budget refused gave is not kept, as `resolve` keeps none.
+        if (facts.remaining != 0) try kept_by.found.put(facts.gpa, decl, found);
+        return found;
+    }
+
+    const GivenByName = struct {
+        found: std.AutoHashMapUnmanaged(Facts.Decl, ?[]const Facts.Key) = .empty,
+        /// Each file's mentions by the declaration they name, built once.
+        mentions: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index))) = .empty,
+    };
+
+    /// The nodes in `file` that name each of its declarations (the model's references).
+    fn mentionsIn(facts: *Facts, file: Project.FileId) Error!*const std.AutoHashMapUnmanaged(Model.Declaration.Id, std.ArrayList(Ast.Node.Index)) {
+        const kept_by = try facts.memo(GivenByName);
+        const entry = try kept_by.mentions.getOrPut(facts.gpa, file);
+        if (entry.found_existing) return entry.value_ptr;
+        entry.value_ptr.* = .empty;
+        for (facts.project.at(file).model.references) |reference| {
+            const d = reference.declaration orelse continue;
+            const list = try entry.value_ptr.getOrPut(facts.gpa, d);
+            if (!list.found_existing) list.value_ptr.* = .empty;
+            try list.value_ptr.append(facts.gpa, reference.node);
+        }
+        return entry.value_ptr;
+    }
+
+    fn storedFrom(facts: *Facts, decl: Facts.Decl) Error!?[]const Facts.Key {
+        const tree = &facts.project.at(decl.file).file.tree;
+        const model = &facts.project.at(decl.file).model;
+        var out: std.ArrayList(Facts.Key) = .empty;
+        const record = model.declarations[@backingInt(decl.index)];
+        if ((tree.fullVarDecl(record.node) orelse return null).ast.init_node.unwrap()) |init| try out.append(facts.gpa, .{ .file = decl.file, .node = init });
+        const mentions = if ((try mentionsIn(facts, decl.file)).get(decl.index)) |list| list.items else &.{};
+        for (mentions) |mention| {
+            // `at` is the variable's own memory, the whole or a part, until a step crosses a
+            // pointer it holds: past one nothing written is the variable.
+            var at = mention;
+            for (0..32) |_| {
+                // A store's side is read by its assignment, not by its site (`useOf` finds the
+                // site in the file's walk, which may be the walk asking this).
+                if (model.parentOf(at)) |parent| switch (formOf(tree.nodeTag(parent))) {
+                    .assign, .compound_assign, .destructure => |form| {
+                        const target = switch (form) {
+                            .destructure => tree.assignDestructure(parent).ast.value_expr != at,
+                            else => tree.nodeData(parent).node_and_node[0] == at,
+                        };
+                        if (!target) break;
+                        if (form != .assign or at != mention) return null;
+                        try out.append(facts.gpa, .{ .file = decl.file, .node = tree.nodeData(parent).node_and_node[1] });
+                        break;
+                    },
+                    else => {},
+                };
+                switch (try useOf(facts, decl.file, at)) {
+                    .member, .element, .dereferenced, .sliced => |access| {
+                        if ((try pathOf(facts, decl.file, access)).steps[0].crosses) break;
+                        // A slice of its own memory points into it.
+                        if (tree.fullSlice(access) != null) return null;
+                        at = access;
+                    },
+                    .builtin_argument => |argument| {
+                        if (!isField(tree, argument.call) or argument.position != 0) break;
+                        if ((try pathOf(facts, decl.file, argument.call)).steps[0].crosses) break;
+                        at = argument.call;
+                    },
+                    .carried => |carried| switch (carried.how) {
+                        .grouped, .unwrapped, .tried, .compile_time, .@"nosuspend" => at = carried.into,
+                        else => break,
+                    },
+                    .address => |access| {
+                        if (at == mention and droppedAddress(tree, model, access)) break;
+                        return null;
+                    },
+                    // A method of its own or of a part's: its receiver may be the address.
+                    .callee => if (at == mention) break else return null,
+                    // A capture by pointer of its own memory (not of what a slice of it points at).
+                    .looped => |loop| if (pointerCapture(tree, loop.loop, loop.position) and !pointing(try facts.resolve(decl.file, at))) return null else break,
+                    .tested, .switched => |holder| if (pointerCapture(tree, holder, null) and !pointing(try facts.resolve(decl.file, at))) return null else break,
+                    .written, .updated, .in_asm, .unknown => return null,
+                    else => break,
+                }
+            } else return null;
+        }
+        return out.items;
+    }
+
+    /// Whether `_ = &x` drops the address `access` takes.
+    fn droppedAddress(tree: *const Ast, model: *const Model, access: Ast.Node.Index) bool {
+        const parent = model.parentOf(access) orelse return false;
+        if (tree.nodeTag(parent) != .assign) return false;
+        const lhs, const rhs = tree.nodeData(parent).node_and_node;
+        return rhs == access and discard(tree, lhs);
+    }
+
+    /// Whether `holder` (a `for`, an `if`, a `while`, a `switch`) captures by pointer: the `for`'s
+    /// capture at `position`; the `if`'s or `while`'s payload; any prong's of the `switch`.
+    fn pointerCapture(tree: *const Ast, holder: Ast.Node.Index, position: ?usize) bool {
+        if (tree.fullFor(holder)) |loop| {
+            var at = loop.payload_token;
+            var here: usize = 0;
+            while (tree.tokenTag(at) != .pipe) : (at += 1) switch (tree.tokenTag(at)) {
+                .comma => here += 1,
+                .asterisk => if (position == null or position.? == here) return true,
+                else => {},
+            };
+            return false;
+        }
+        if (tree.fullIf(holder)) |branch| return if (branch.payload_token) |token| tree.tokenTag(token) == .asterisk else false;
+        if (tree.fullWhile(holder)) |loop| return if (loop.payload_token) |token| tree.tokenTag(token) == .asterisk else false;
+        if (tree.fullSwitch(holder)) |choice| for (choice.ast.cases) |case| {
+            const token = tree.fullSwitchCase(case).?.payload_token orelse continue; // unreachable: a switch's case
+            if (tree.tokenTag(token) == .asterisk) return true;
+        };
+        return false;
+    }
+
     /// The fields a call may write through `pointer`, an argument it is handed, as a store
     /// through it writes them (`fieldsThrough`): each container's the memory it points at holds
     /// by value, where it reaches that memory through a pointer or as another type
@@ -10494,9 +10752,14 @@ pub const accesses = struct {
         index.* = .{};
         var walk: Walk = .{ .facts = facts, .file = file, .index = index };
         try state.walked.put(facts.gpa, file, {});
-        defer _ = state.walked.remove(file);
-        try walk.writes();
+        walk.writes() catch |err| {
+            _ = state.walked.remove(file);
+            return err;
+        };
+        // The file's stores are known: what a `var` holds may now be read from them.
         try state.writes.put(facts.gpa, file, index);
+        _ = state.walked.remove(file);
+        try walk.settle();
         return index;
     }
 
@@ -10514,6 +10777,7 @@ pub const accesses = struct {
         index.* = .{};
         var walk: Walk = .{ .facts = facts, .file = file, .index = index, .filter = filter };
         try walk.writes();
+        try walk.settle();
         try state.fields.put(facts.gpa, key, index);
         return index;
     }
@@ -10595,7 +10859,7 @@ pub const accesses = struct {
                 const target, const value = tree.nodeData(node).node_and_node;
                 const pointer = try crossed(facts, file, target) orelse return null;
                 if (!try reinterprets(facts, file, pointer)) return null;
-                return .{ .into = try sideOf(facts, file, pointer), .from = .{ .value = value } };
+                return .{ .into = try sideOf(facts, file, pointer), .from = try storedSide(facts, file, value) };
             },
             else => return null,
         }
@@ -10657,6 +10921,23 @@ pub const accesses = struct {
         return null;
     }
 
+    /// What a value a store writes gives a copy: memory read as another type where it is a
+    /// `for`'s capture by value over a pointer that reinterprets it (`|s|` over
+    /// `std.mem.asBytes(&g)` reads `g`'s bytes, as `std.mem.asBytes(&g)[i]` does); else the
+    /// value itself.
+    fn storedSide(facts: *Facts, file: Project.FileId, value: Ast.Node.Index) Error!Side {
+        const tree = &facts.project.at(file).file.tree;
+        const model = &facts.project.at(file).model;
+        const named = Facts.ungrouped(tree, value);
+        if (tree.nodeTag(named) != .identifier) return .{ .value = value };
+        const d = (model.reference(named) orelse return .{ .value = value }).declaration orelse return .{ .value = value };
+        const record = model.declarations[@backingInt(d)];
+        if (record.kind != .capture or tree.fullFor(record.node) == null or (record.token > 0 and tree.tokenTag(record.token - 1) == .asterisk)) return .{ .value = value };
+        const input = facts.captureSource(file, record) orelse return .{ .value = value };
+        if (!try pointerArgument(facts, file, input) or !try reinterprets(facts, file, input)) return .{ .value = value };
+        return sideOf(facts, file, input);
+    }
+
     /// Whether a call's argument is a pointer: its value resolves to one, or it keeps one (a
     /// cast or a view of a pointer, `viewed`: `@ptrCast(d)` handed to a `*T` whose type comes
     /// from where it goes).
@@ -10704,15 +10985,10 @@ pub const accesses = struct {
     pub fn reinterprets(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!bool {
         const tree = &facts.project.at(file).file.tree;
         const memory = try viewed(facts, file, pointer);
-        // A pointer held in a constant names the memory it was made from, as itself: no cast
-        // or view between them reads it as another type.
-        var named = pointer;
-        for (0..16) |_| switch (tree.nodeTag(named)) {
-            .grouped_expression => named = tree.nodeData(named).node_and_token[0],
-            .identifier => named = try constantPointer(facts, file, named) orelse break,
-            else => break,
-        };
-        if (memory == named) return false;
+        // The pointer as itself: through the names that hold it and the values chosen as it
+        // (`try a.alloc(T, n)`, an `if`'s branches), none of which reads memory as another type.
+        // Where that reaches the memory, no cast or view lies between them.
+        if (memory == try viewedFrom(facts, file, pointer, 0, .itself)) return false;
         const given = try facts.resolve(file, pointer);
         // What the memory is: a place's own type, or what the pointer it is reached by points at.
         const own: Facts.Value = switch (tree.nodeTag(memory)) {
@@ -10738,23 +11014,34 @@ pub const accesses = struct {
     }
 
     /// The pointer whose memory `pointer` points at, through what keeps it: the casts that keep
-    /// an address (`throughCasts`), a slice of a pointer, a constant holding a pointer (its
-    /// initializer: `const b = std.mem.asBytes(j); b[0] = v` writes through what `j` points
-    /// at), and each call of a view (`viewOf`), the argument it is a view of
-    /// (`std.mem.asBytes(&x)` points at what `&x` does). A call of a choice of functions is
+    /// an address (`throughCasts`), a slice of a pointer, a name holding a pointer (`heldPointer`:
+    /// `const b = std.mem.asBytes(j); b[0] = v` writes through what `j` points at), each value an
+    /// `if`, a `switch`, a labeled block, `orelse` or `catch` chooses where all point into the
+    /// same memory (`valuesOf`), and each call of a view (`viewOf`), the argument it is a view
+    /// of (`std.mem.asBytes(&x)` points at what `&x` does). A call of a choice of functions is
     /// followed where each is a view of the same argument.
     pub fn viewed(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index) Error!Ast.Node.Index {
+        return viewedFrom(facts, file, pointer, 0, .views);
+    }
+
+    /// Which steps `viewedFrom` takes: every one that keeps the address (`views`), or only those
+    /// that keep the pointer as itself too (`itself`: the names that hold it and the values
+    /// chosen as it; no cast, slice or view, which may read the memory as another type).
+    const Steps = enum { views, itself };
+
+    fn viewedFrom(facts: *Facts, file: Project.FileId, pointer: Ast.Node.Index, depth: u8, steps: Steps) Error!Ast.Node.Index {
         const tree = &facts.project.at(file).file.tree;
         var at = pointer;
         for (0..16) |_| {
-            at = try facts.throughCasts(file, at);
+            if (steps == .views) at = try facts.throughCasts(file, at);
             switch (tree.nodeTag(at)) {
                 .identifier => {
-                    at = try constantPointer(facts, file, at) orelse return at;
+                    at = try heldPointer(facts, file, at, depth, steps) orelse return at;
                     continue;
                 },
                 // A slice of an array is the array's memory: its place (`pointed`).
                 .slice_open, .slice, .slice_sentinel => {
+                    if (steps == .itself) return at;
                     const base = tree.fullSlice(at).?.ast.sliced; // unreachable: the tag is a slice's
                     if (!pointing(try facts.resolve(file, base))) return at;
                     at = base;
@@ -10763,7 +11050,22 @@ pub const accesses = struct {
                 else => {},
             }
             var buffer: [1]Ast.Node.Index = undefined;
-            if (tree.fullCall(&buffer, at) == null) return at;
+            if (tree.fullCall(&buffer, at) == null) {
+                const leaves = switch (try valuesOf(facts, file, at)) {
+                    .leaves => |each| each,
+                    .unknown => return at,
+                };
+                if (leaves.len == 0 or (leaves.len == 1 and leaves[0] == at)) return at;
+                const memory = try sameMemory(facts, file, leaves, depth, steps) orelse return at;
+                // A choice that ends at a leaf of its own names no more than it does, and keeps
+                // its type: past `try`, `.?`, `orelse` or `catch` (`try a.alloc(T, n)`) the leaf's
+                // own value is the error union or the optional, not the pointer. A place's address
+                // names the place.
+                if (tree.nodeTag(memory) != .address_of and std.mem.findScalar(Ast.Node.Index, leaves, memory) != null) return at;
+                at = memory;
+                continue;
+            }
+            if (steps == .itself) return at;
             const call = (try calls.at(facts, file, at)) orelse return at;
             const args = switch (call.args) {
                 .known => |each| each,
@@ -10780,20 +11082,73 @@ pub const accesses = struct {
         return at;
     }
 
-    /// The initializer of the constant `name` refers to, where it holds a pointer: the same
-    /// address wherever the constant is read.
-    fn constantPointer(facts: *Facts, file: Project.FileId, name: Ast.Node.Index) Error!?Ast.Node.Index {
+    /// The pointer a name holds, the same address wherever it is read: a variable's one value,
+    /// or each it is given where all point into the same memory (`givenTo`: a constant's
+    /// initializer; a `var` no store, nor its address, may change otherwise); a `for`'s capture
+    /// by pointer, into the input at its position (`|*d|` over `std.mem.asBytes(j)` points into
+    /// what `j` does). Null for any other name.
+    fn heldPointer(facts: *Facts, file: Project.FileId, name: Ast.Node.Index, depth: u8, steps: Steps) Error!?Ast.Node.Index {
         const tree = &facts.project.at(file).file.tree;
         const model = &facts.project.at(file).model;
         const d = (model.reference(name) orelse return null).declaration orelse return null;
         const record = model.declarations[@backingInt(d)];
-        if (record.kind != .variable) return null;
-        const variable = tree.fullVarDecl(record.node) orelse return null;
-        if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
-        // Read as a pointer by every caller (a pointer a store, a copy or a view goes through):
-        // a constant so read holds one, and Zig compiles no store through one that does not.
-        // Its type is not resolved again at each use.
-        return variable.ast.init_node.unwrap();
+        switch (record.kind) {
+            .variable => {
+                // Read as a pointer by every caller (a pointer a store, a copy or a view goes
+                // through): a name so read holds one, and Zig compiles no store through one that
+                // does not. Its type is not resolved again at each use.
+                if (global(facts, .{ .file = file, .index = d })) return null;
+                const given = (try facts.givenTo(.{ .file = file, .index = d }, false)) orelse return null;
+                if (given.len == 1) return if (given[0].file == file) given[0].node else null;
+                var nodes: std.ArrayList(Ast.Node.Index) = .empty;
+                for (given) |key| {
+                    if (key.file != file) return null;
+                    try nodes.append(facts.gpa, key.node);
+                }
+                return switch (nodes.items.len) {
+                    0 => null,
+                    1 => nodes.items[0],
+                    else => try sameMemory(facts, file, nodes.items, depth, steps),
+                };
+            },
+            .capture => {
+                if (tree.fullFor(record.node) == null or record.token == 0 or tree.tokenTag(record.token - 1) != .asterisk) return null;
+                return facts.captureSource(file, record);
+            },
+            else => return null,
+        }
+    }
+
+    /// The memory each of `pointers` points into, where it is one: each read through `viewed`
+    /// to the same node, the same place's address, or the same place (`samePlace`). Null where
+    /// any differs or is not shown the same.
+    fn sameMemory(facts: *Facts, file: Project.FileId, pointers: []const Ast.Node.Index, depth: u8, steps: Steps) Error!?Ast.Node.Index {
+        if (depth >= 8) return null;
+        const tree = &facts.project.at(file).file.tree;
+        const first = try viewedFrom(facts, file, pointers[0], depth + 1, steps);
+        for (pointers[1..]) |each| {
+            const other = try viewedFrom(facts, file, each, depth + 1, steps);
+            if (other == first) continue;
+            const both = tree.nodeTag(first) == .address_of and tree.nodeTag(other) == .address_of;
+            if (both) {
+                if (try samePlace(facts, file, tree.nodeData(first).node, tree.nodeData(other).node) != .yes) return null;
+                continue;
+            }
+            if (tree.nodeTag(first) == .address_of or tree.nodeTag(other) == .address_of) return null;
+            if (try samePlace(facts, file, first, other) != .yes) return null;
+        }
+        return first;
+    }
+
+    /// The root of `place`, where it is a part of what a pointer root points at: the root's
+    /// pointer is the one step that crosses one (`p.bytes`, `p.*`, `p.a[1]` with `p` a pointer
+    /// and `a` an array). Null where no step crosses, or one past the root's does (`p.next.*`:
+    /// other memory).
+    pub fn pointeeRoot(facts: *Facts, file: Project.FileId, place: Ast.Node.Index) Error!?Ast.Node.Index {
+        const steps = (try pathOf(facts, file, place)).steps;
+        if (steps.len < 2 or steps[steps.len - 1].kind != .root or !steps[steps.len - 2].crosses) return null;
+        for (steps[0 .. steps.len - 2]) |step| if (step.crosses) return null;
+        return steps[steps.len - 1].node;
     }
 
     /// The parameter each of `functions` is a view of, where it is the same one.
@@ -10831,6 +11186,9 @@ pub const accesses = struct {
         declarations: std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id) = .empty,
         /// Null for every site; else only those a field query needs.
         filter: ?Filter = null,
+        /// The stores through a pointer a `var` of the file holds, judged once the file's
+        /// stores are all known (`settle`): what the `var` holds is read from them.
+        pending: std.ArrayList(Site) = .empty,
 
         /// Whether the walk keeps whole values' stores and outside code's writes.
         fn holders(w: *const Walk) bool {
@@ -10848,19 +11206,34 @@ pub const accesses = struct {
             if (w.filter == null) return true;
             const tree = w.syntax();
             var node = target;
+            // Whether the place is reached through what `node` gives (a member, an element, `.*`
+            // of it): only then may `node` be a pointer whose memory the place is in. A place
+            // that is `node` itself (`x = v`, `&x`) names no memory it points at.
+            var through = false;
             while (true) switch (tree.nodeTag(node)) {
                 .grouped_expression => node = tree.nodeData(node).node_and_token[0],
                 .field_access => {
                     const holder, const token = tree.nodeData(node).node_and_token;
                     if (w.names(try Model.identifier(w.facts.gpa, tree.tokenSlice(token)))) return true;
                     node = holder;
+                    through = true;
                 },
-                .array_access => node = tree.nodeData(node).node_and_node[0],
+                .array_access => {
+                    node = tree.nodeData(node).node_and_node[0];
+                    through = true;
+                },
                 .unwrap_optional => node = tree.nodeData(node).node_and_token[0],
-                .deref, .address_of => node = tree.nodeData(node).node,
+                .deref => {
+                    node = tree.nodeData(node).node;
+                    through = true;
+                },
+                .address_of => {
+                    node = tree.nodeData(node).node;
+                    through = false;
+                },
                 else => {
                     // A view of other memory, a cast or a constant names what it points at.
-                    const pointer = try viewed(w.facts, w.file, node);
+                    const pointer = if (through) try viewed(w.facts, w.file, node) else node;
                     if (pointer != node) {
                         node = pointer;
                         continue;
@@ -11093,6 +11466,23 @@ pub const accesses = struct {
             return try w.facts.declaration(d);
         }
 
+        /// Whether `pointer` is a `var` of this file whose value its stores give, while those
+        /// stores are still being found: what it holds is read once they are (`settle`).
+        fn heldLater(w: *Walk, pointer: Ast.Node.Index) Error!bool {
+            const tree = w.syntax();
+            const name = Facts.ungrouped(tree, pointer);
+            if (tree.nodeTag(name) != .identifier or !try walking(w.facts, w.file)) return false;
+            const d = (w.lexicon().reference(name) orelse return false).declaration orelse return false;
+            const variable = tree.fullVarDecl(w.lexicon().declarations[@backingInt(d)].node) orelse return false;
+            return tree.tokenTag(variable.ast.mut_token) == .keyword_var;
+        }
+
+        /// The stores `pending` holds, once the file's stores are known: one through a `var`
+        /// that holds a pointer reading other memory as another type writes that memory.
+        fn settle(w: *Walk) Error!void {
+            for (w.pending.items) |view| if (try reinterprets(w.facts, w.file, view.target.?)) try w.pointee(view);
+        }
+
         /// One step of a path, outermost first: a member, an element, a payload, a dereference,
         /// `@field`, or the root.
         /// The places `at.target` names, its outermost first, each inner one written in part: a
@@ -11122,14 +11512,13 @@ pub const accesses = struct {
                 // (`std.mem.asBytes(j)[0] = v` writes `j.*`): in part, with no one value of its
                 // places.
                 if (step.crosses) {
-                    const pointer = steps[k_ + 1].node;
-                    if (try reinterprets(w.facts, w.file, pointer)) {
-                        var view = at;
-                        view.target = pointer;
-                        view.value = null;
-                        view.part = true;
-                        try w.pointee(view);
-                    }
+                    var view = at;
+                    view.target = steps[k_ + 1].node;
+                    view.value = null;
+                    view.part = true;
+                    if (try w.heldLater(view.target.?)) {
+                        try w.pending.append(w.facts.gpa, view);
+                    } else if (try reinterprets(w.facts, w.file, view.target.?)) try w.pointee(view);
                 }
                 var site = at;
                 site.part = k_ > 0;
@@ -11393,15 +11782,50 @@ pub const accesses = struct {
                 };
                 if (handing and receiver != .container and !try w.holdsBody(callee)) try w.handed(node, h);
             }
-            if (!handing or try w.holdsBody(callee)) return;
+            if (!handing) return;
+            if (try w.holdsBody(callee)) return w.viewsHanded(node);
             for (full.ast.params) |arg| try w.handed(node, arg);
         }
 
+        /// A call of a function the program holds, handed a view that reads other memory as
+        /// another type (`put(std.mem.asBytes(j))`): where a callee may write through the
+        /// parameter it takes it as (`writtenThrough`), the memory the view reaches is written
+        /// as bytes, as code the program does not hold writes it (`handed`).
+        fn viewsHanded(w: *Walk, node: Ast.Node.Index) Error!void {
+            const made = (try calls.at(w.facts, w.file, node)) orelse return;
+            const args = switch (made.args) {
+                .known => |each| each,
+                .unknown => return,
+            };
+            const functions: []const Facts.Decl = switch (made.callee) {
+                .function => |*one| one[0..1],
+                .choice => |each| each,
+                .any => return,
+            };
+            for (args, 0..) |arg, position| {
+                if (!try pointerArgument(w.facts, w.file, arg) or !try reinterprets(w.facts, w.file, arg)) continue;
+                for (functions) |function| {
+                    const param = w.facts.parameterAt(function, position) orelse {
+                        try w.handed(node, arg);
+                        break;
+                    };
+                    if (try writtenThrough(w.facts, param)) {
+                        try w.handed(node, arg);
+                        break;
+                    }
+                }
+            }
+        }
+
         /// `arg` handed at `node` to code the program does not hold: what its pointers reach is
-        /// written as it may.
+        /// written as it may. A view hands on the memory it views (`viewed`:
+        /// `std.mem.asBytes(j)` hands what `j` points at, every field of it, not bytes alone).
+        /// A value hands no memory to view; one that does not resolve keeps its own reach.
         fn handed(w: *Walk, node: Ast.Node.Index, arg: Ast.Node.Index) Error!void {
             if (inert(w.syntax(), arg)) return;
-            try w.shapes(w.make(node, arg, .covered, null), try w.facts.resolve(w.file, arg), true);
+            const value = try w.facts.resolve(w.file, arg);
+            const memory = if (pointing(value)) try w.facts.resolve(w.file, try viewed(w.facts, w.file, arg)) else value;
+            try w.shapes(w.make(node, arg, .covered, null), memory, true);
         }
 
         /// Whether a callee is a function whose body the program holds: not `extern`, not a

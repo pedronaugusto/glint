@@ -3266,7 +3266,10 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
             .covered => if (site.reach == .holder and try coveredRead(c, site.file, site.node, site.target)) continue else null,
         };
         var unseen = false;
-        if (site.kind == .covered) if (try Facts.calls.at(c.facts, site.file, site.node)) |call| switch (try heldBodies(c, &call)) {
+        // A view that reads the holder as other bytes, handed to a function the program holds,
+        // is written there through a parameter of another type: here, not where it is made.
+        const as_bytes = if (site.target) |given| try Facts.accesses.reinterprets(c.facts, site.file, given) else false;
+        if (site.kind == .covered and !as_bytes) if (try Facts.calls.at(c.facts, site.file, site.node)) |call| switch (try heldBodies(c, &call)) {
             .all => continue,
             .unknown => unseen = true,
             .some => {},
@@ -3394,7 +3397,11 @@ fn madeValue(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: Fac
 /// it: std's (`append`, `std.mem.sort`), or each callee's parameter there a pointer to const.
 fn coveredRead(c: *Context, file: Project.FileId, node: Ast.Node.Index, target: ?Ast.Node.Index) Context.Error!bool {
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+    // A parameter that points at const only reads, through whatever view it is handed.
     if (try constParameter(c, &call, target)) return true;
+    // Handed through a view that reads it as other bytes (`std.mem.asBytes(j)`) to one that may
+    // write, it is written as bytes, whatever state they make, not copied whole.
+    if (target) |given| if (try Facts.accesses.reinterprets(c.facts, file, given)) return false;
     const choices: []const Facts.Decl = switch (call.callee) {
         .function => |*one| one[0..1],
         .choice => |all| all,
