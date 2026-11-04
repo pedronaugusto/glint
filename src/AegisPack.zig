@@ -1087,7 +1087,8 @@ fn readOutOperated(c: *Context, file: Project.FileId, node: Ast.Node.Index, dept
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
     switch (try Facts.accesses.useOf(c.facts, file, node)) {
-        .compared, .unknown, .address, .in_asm => return true,
+        // A compound assignment reads its target: `n += 1` computes on what `n` holds.
+        .compared, .updated, .unknown, .address, .in_asm => return true,
         // A `for` range's bound counts iterations, as in a function of no generic.
         .operand => |by| return tree.nodeTag(by) != .for_range,
         .carried => |carry| return readOutOperated(c, file, carry.into, depth + 1),
