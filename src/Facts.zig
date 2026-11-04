@@ -5078,7 +5078,7 @@ fn genericFunction(self: *const Facts, decl: Decl) bool {
 
 /// Whether Zig analyzes `decl` once per instantiation: a generic function, or a member of a
 /// container a function declares (a type function's), which its parameters fix.
-fn instantiated(self: *const Facts, decl: Decl) bool {
+pub fn instantiated(self: *const Facts, decl: Decl) bool {
     if (self.genericFunction(decl)) return true;
     const model = &self.project.at(decl.file).model;
     var at: ?Model.Scope.Id = model.declarations[@backingInt(decl.index)].scope;
@@ -10352,9 +10352,9 @@ pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
     return try self.namedCalls(function) == null;
 }
 
-/// One call of a function the program makes: its arguments, after the receiver a method call
-/// on a value passes first (`holder`).
-pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
+/// One call of a function the program makes (`call`): its arguments, after the receiver a
+/// method call on a value passes first (`holder`).
+pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index, call: Ast.Node.Index };
 const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
 
 /// Every call of `function` the program makes, or null where it `escapes`. Read once.
@@ -10390,40 +10390,137 @@ pub fn judgedAtBindings(self: *Facts, function: Decl) ResolveError!bool {
 /// Whether compiled code in the run binds the generic `function` (main's ruling, 2026-11-04):
 /// a call of it by name in a function that is no generic, at a container's level or in a test,
 /// or in a generic that is itself bound in the run; a call in a generic nothing compiled binds
-/// is compiled nowhere. A generic's body means nothing until it is bound: a rule judges what
-/// only a binding decides at each binding, clean at the body where this is true; where it is
-/// false the body is undecided (`unbound_generic`), judged at its consumers' bindings, its
-/// remedy a test that instantiates it. Null where a binding may be no call a run judges
+/// is compiled nowhere. A call no path reaches in a reading the run compiles (a comptime-false
+/// branch, past an exit) binds nothing (`compiledReadings`). A generic's body means nothing
+/// until it is bound: a rule judges what only a binding decides at each binding, clean at the
+/// body where this is true; where it is false the body is undecided (`unbound_generic`),
+/// judged at its consumers' bindings, its remedy a test that instantiates it. Null where a binding may be no call a run judges
 /// (`judgedAtBindings`): the body stays undecided as the rule reads it.
 pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
+    const readings = (try self.compiledReadings(function)) orelse return null;
+    return readings.len != 0;
+}
+
+/// The readings the run compiles `function` in: its one reading where it is no generic (Zig's
+/// one definition, `genericFunction`: a `comptime`, `type` or `anytype` parameter), else
+/// one per binding a compiled call of it makes (`readingFrom`), each call asked in a reading
+/// the run compiles its own function in, and reached there (`reachedUnder`: no comptime-false
+/// branch or earlier exit cuts it off). A call in a test or at a container's level is read in
+/// none. A binding whose reading cannot be made (an argument that does not resolve) is the
+/// reading of no binding. None for a generic nothing compiled binds; null where a binding may
+/// be no call a run judges (`judgedAtBindings`). Generics that call each other are bound only by
+/// a call from outside them: an answer that met one further out still being read is asked again
+/// once that one is decided (as `comptimeTruth`'s `open_met`), so it is the same in any order.
+fn compiledReadings(self: *Facts, function: Decl) ResolveError!?[]const ?*const Env {
+    if (!self.genericFunction(function)) return &.{null};
     const read = try self.memo(BoundInRun);
-    // One being read (a generic that binds itself) binds nothing of its own.
-    if (read.map.get(function)) |known| return known orelse false;
+    if (read.map.get(function)) |state| switch (state) {
+        // One being read (a generic that binds itself) binds nothing of its own yet.
+        .reading => |position| {
+            read.lowest = @min(read.lowest, position);
+            return &.{};
+        },
+        .known => |answer| return answer,
+    };
     const sites = (try self.scanCallSites(function, .program)) orelse {
-        try read.map.put(self.gpa, function, null);
+        try read.map.put(self.gpa, function, .{ .known = null });
         return null;
     };
-    try read.map.put(self.gpa, function, false);
-    var bound = false;
-    for (sites) |site| {
-        const outer = (try self.functionAround(site.file, site.holder)) orelse {
-            bound = true;
-            break;
-        };
-        if (!self.hasGenericParameter(outer) or try self.boundInRun(outer) == true) {
-            bound = true;
-            break;
+    const position = read.depth;
+    read.depth += 1;
+    defer read.depth -= 1;
+    try read.map.put(self.gpa, function, .{ .reading = position });
+    var found: std.ArrayList(?*const Env) = .empty;
+    sites: for (sites) |site| {
+        const outer_readings: []const ?*const Env = if (try self.functionAround(site.file, site.holder)) |outer| (try self.compiledReadings(outer)) orelse &.{null} else &.{null};
+        for (outer_readings) |outer| {
+            if (!try self.reachedUnder(outer, site.file, site.holder)) continue;
+            const reading = try self.readingFrom(site.file, site.call, function, outer);
+            const seen = for (found.items) |known| {
+                if (known == reading) break true;
+            } else false;
+            if (seen) continue;
+            if (found.items.len == reading_limit) {
+                try found.append(self.gpa, null);
+                break :sites;
+            }
+            try found.append(self.gpa, reading);
         }
     }
-    try read.map.put(self.gpa, function, bound);
-    return bound;
+    if (found.items.len != 0 or read.lowest >= position) {
+        try read.map.put(self.gpa, function, .{ .known = found.items });
+        if (read.lowest >= position) read.lowest = std.math.maxInt(usize);
+    } else _ = read.map.remove(function);
+    return found.items;
 }
 
 /// What a rule writes at a generic's body that `boundInRun` says nothing compiled binds.
 pub const unbound_generic = "unbound generic: judged at its consumers' bindings";
 
-/// `boundInRun`'s answers, false while one is being read.
-const BoundInRun = struct { map: std.AutoHashMapUnmanaged(Decl, ?bool) = .empty };
+/// Whether `function` is analyzed once per instantiation (`instantiated`: a generic, or a member
+/// of a container a function declares) on the package's surface (as Z012 reads it) that nothing
+/// the run compiles binds (`boundInRun` false), and none of its own: a method of the type an
+/// unbound type function returns is that function's. A rule that judges a generic at its
+/// bindings leaves it undecided at its name (`unbound_generic`); its remedy is a binding, a
+/// test of the package that instantiates it.
+pub fn unboundOnSurface(self: *Facts, function: Decl) ResolveError!bool {
+    const record = self.project.at(function.file).model.declarations[@backingInt(function.index)];
+    if (record.kind != .function or !(record.public or record.exported) or !self.instantiated(function)) return false;
+    if (!try self.onSurface(function.file, record.scope)) return false;
+    if (try self.typeFunctionOf(function)) |maker| if (try self.unboundOnSurface(maker)) return false;
+    return try self.boundInRun(function) == false;
+}
+
+/// The function whose body declares the container `function` is a member of (a type
+/// function, whose returned type's methods it fixes), if any.
+pub fn typeFunctionOf(self: *Facts, function: Decl) ResolveError!?Decl {
+    const model = &self.project.at(function.file).model;
+    var at = model.scopes[@backingInt(model.declarations[@backingInt(function.index)].scope)].parent;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        const scope = model.scopes[@backingInt(s)];
+        if (scope.kind != .function) continue;
+        const d = (try self.partsOf(function.file)).declared.get(scope.node) orelse return null;
+        return .{ .file = function.file, .index = d };
+    }
+    return null;
+}
+
+/// Whether a caller outside the file can name what is declared in `scope`, as Z012 reads the
+/// package's surface: `Model.surfaceReachable`, or a container a private declaration holds
+/// that a public constant the surface reaches names (`pub const Api = Impl;`, or a labeled
+/// block's container a public constant holds): the alias is its name, and its fields and
+/// methods are the alias's.
+pub fn onSurface(self: *Facts, file: Project.FileId, scope: Model.Scope.Id) ResolveError!bool {
+    const model = &self.project.at(file).model;
+    var at: ?Model.Scope.Id = scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind != .container) continue;
+        const holder = model.containerHolder(model.scopes[@backingInt(s)].node) orelse continue;
+        const decl = model.declarations[@backingInt(holder)];
+        if (decl.public or decl.exported) continue;
+        return self.aliasedOnSurface(file, s);
+    }
+    return true;
+}
+
+/// Whether a public constant the surface reaches holds the container whose scope is `scope`.
+pub fn aliasedOnSurface(self: *Facts, file: Project.FileId, scope: Model.Scope.Id) ResolveError!bool {
+    const model = &self.project.at(file).model;
+    for (model.declarations, 0..) |alias, i| {
+        if (!alias.public or alias.kind != .variable or !model.surfaceReachable(alias.scope)) continue;
+        const named = try self.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
+        if (named == .container and named.container.file == file and named.container.scope == scope and !named.container.symbolic) return true;
+    }
+    return false;
+}
+
+/// `compiledReadings`' answers, and the position of each being read; `lowest` is the earliest
+/// position in progress a read met.
+const BoundInRun = struct {
+    map: std.AutoHashMapUnmanaged(Decl, union(enum) { reading: usize, known: ?[]const ?*const Env }) = .empty,
+    depth: usize = 0,
+    lowest: usize = std.math.maxInt(usize),
+};
 
 /// The function whose body `node` in `file` is in; null at a container's level or in a test.
 fn functionAround(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
@@ -10523,7 +10620,7 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
             }
             const params = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) orelse return null;
             const holder = if (tag == .field_access) tree.nodeData(node).node_and_token[0] else node;
-            try sites.append(self.gpa, .{ .file = id, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = receiver, .holder = holder });
+            try sites.append(self.gpa, .{ .file = id, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = receiver, .holder = holder, .call = parent });
         }
     }
     return sites.items;
@@ -15468,6 +15565,44 @@ test "boundInRun: a generic is bound where compiled code calls it, a test or a f
     try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "tested").?));
     // `inner` is called only in `outer`, a generic nothing compiled binds.
     try std.testing.expectEqual(@as(?bool, false), try facts.boundInRun(facts.member(root, "inner").?));
+}
+
+test "boundInRun: a call no compiled path reaches binds nothing; generics calling each other answer the same in any order; an answer it cannot give stays null" {
+    const source =
+        \\pub fn dead(x: anytype) void { _ = x; }
+        \\pub fn dead2(x: anytype) void { _ = x; }
+        \\pub fn gated(comptime on: bool, x: anytype) void { if (on) dead2(x); }
+        \\pub fn a(x: anytype) void { b(x); }
+        \\pub fn b(x: anytype) void { if (false) a(x); }
+        \\pub fn handed(x: anytype) void { _ = x; }
+        \\pub fn main() void {
+        \\    if (false) dead(@as(u8, 1));
+        \\    gated(false, @as(u8, 2));
+        \\    a(@as(u8, 3));
+        \\    const f = handed;
+        \\    _ = f;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    for ([_]bool{ false, true }) |b_first| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const root = facts.rootOf(project.sources[0].id);
+        // `dead`'s calls are past a comptime-false branch, or in `gated`'s one reading, where `on`
+        // is false.
+        try std.testing.expectEqual(@as(?bool, false), try facts.boundInRun(facts.member(root, "dead").?));
+        try std.testing.expectEqual(@as(?bool, false), try facts.boundInRun(facts.member(root, "dead2").?));
+        // `b` is called by `a`, which `main` binds, whichever is asked first.
+        if (b_first) try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "b").?));
+        try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "a").?));
+        try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "b").?));
+        // Handed on as a value: no scan says what binds it, the second time too.
+        try std.testing.expectEqual(@as(?bool, null), try facts.boundInRun(facts.member(root, "handed").?));
+        try std.testing.expectEqual(@as(?bool, null), try facts.boundInRun(facts.member(root, "handed").?));
+    }
 }
 
 test "bindCall binds f(a), x.f(a) with its receiver, T.f(a) and @call's tuple, and makes no reading of arguments not known" {
