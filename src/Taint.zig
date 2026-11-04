@@ -3896,6 +3896,10 @@ fn peerSites(c: *Context, flow: *Flow, file: Project.FileId, callee: Callee, out
         const single = if (params) |p| p.single.has(position) else false;
         const untyped = if (params) |p| p.untyped.has(position) else true;
         if (!single and (!untyped or madeAtCall(c, file, arg))) continue;
+        // Only a value whose type may hold a writer is one (`mayHoldWriter`): bytes, a list
+        // or a number the fact reached through std's writes or a branch are written, never
+        // the writer.
+        if (!try mayHoldWriter(c, flow, try c.facts.resolve(file, arg), 0)) continue;
         const level = try levelIn(c, flow, file, arg, flow.masks.peer_writer);
         if (level == .clean) continue;
         writer = writer.join(level);

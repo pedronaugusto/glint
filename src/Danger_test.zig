@@ -3791,6 +3791,29 @@ test "A018 finds an error's name written to a peer, not to another writer" {
     , 1);
 }
 
+test "A018 takes as the writer only a value whose type may hold one: a peer writer's bytes handed to std are written, never the writer" {
+    // warp's Index.build: an allocation's bytes the writer fact reached through std's calls,
+    // handed to an `anytype` parameter beside other values, read as a peer's writer.
+    try expect(pack.diagnostics,
+        \\const std = @import("std");
+        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    const bytes = w.buffered();
+        \\    _ = std.mem.readInt(u32, bytes, @errorName(err));
+        \\}
+    , 0);
+    // The writer itself in that place is one.
+    try expect(pack.diagnostics,
+        \\const std = @import("std");
+        \\pub fn reply(stream: std.Io.net.Stream, err: anyerror) void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    _ = std.mem.readInt(u32, &w, @errorName(err));
+        \\}
+    , 1);
+}
+
 test "A018 reads the peer writers a package declares" {
     var project = try sources.projectWithSources(std.testing.allocator,
         \\const std = @import("std");
