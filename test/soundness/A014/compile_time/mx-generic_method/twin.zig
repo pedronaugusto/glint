@@ -7,3 +7,8 @@ pub fn Buffer(comptime n: usize) type {
         }
     };
 }
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+pub fn fill8(buf: *[8]u8) []u8 {
+    return Buffer(8).fill(buf, 0);
+}

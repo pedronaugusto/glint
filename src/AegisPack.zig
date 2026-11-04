@@ -151,6 +151,14 @@ fn begin(c: *Context, rule: Rule) Context.Error!bool {
     if (rule == access) try ownRules(c);
     if (try c.inLibrary(Contract.library, c.file)) return false;
     if (try c.drift(Contract.library)) |gap| try c.undecided(rule, gap.start, .unresolved, gap.detail);
+    // Every rule of the pack judges a generic at its bindings: one on the surface that nothing
+    // the run compiles binds is undecided at its name (main's ruling, 2026-11-04).
+    const tree = try c.project.syntax(try c.source());
+    for (c.project.at(c.file).model.declarations, 0..) |decl, i| {
+        if (decl.kind != .function) continue;
+        if (!try c.facts.unboundOnSurface(.{ .file = c.file, .index = @fromBackingInt(@intCast(i)) })) continue;
+        try c.undecided(rule, tree.tokenStart(decl.token), .unresolved, Facts.unbound_generic);
+    }
     return true;
 }
 /// Once per file (under A001), in any package: each part of a `lint_rules` this file declares

@@ -526,6 +526,42 @@ pub fn parentOf(self: *const Model, node: Ast.Node.Index) ?Ast.Node.Index {
     return if (index < self.node_parents.len) self.node_parents[index] else null;
 }
 
+/// Whether a caller outside the file can name what is declared in `scope`: each container around
+/// it held by a public or exported declaration, up to the file. A container a private declaration
+/// holds is named by nobody outside, so its `pub` methods are no public signature (reactor's
+/// backend sinks, called through `anytype`; a test's harness).
+pub fn surfaceReachable(self: *const Model, scope: Scope.Id) bool {
+    return self.privateHolder(scope) == null;
+}
+
+/// The first declaration, from `scope` outward, that holds a container around it and is neither
+/// public nor exported: what keeps callers outside the file from naming the scope.
+pub fn privateHolder(self: *const Model, scope: Scope.Id) ?Declaration.Id {
+    var at: ?Scope.Id = scope;
+    while (at) |s| : (at = self.scopes[@backingInt(s)].parent) {
+        if (self.scopes[@backingInt(s)].kind != .container) continue;
+        const holder = self.containerHolder(self.scopes[@backingInt(s)].node) orelse continue;
+        const decl = self.declarations[@backingInt(holder)];
+        if (!decl.public and !decl.exported) return holder;
+    }
+    return null;
+}
+
+/// The declaration a container written at `node` is reached through: the nearest one around it,
+/// whatever expression writes the container (`(struct {..})`, a labeled block's break,
+/// `@as(type, ..)`), a variable that holds it or a function whose signature or body writes it.
+/// Null for the file's own container.
+pub fn containerHolder(self: *const Model, node: Ast.Node.Index) ?Declaration.Id {
+    var at = node;
+    while (true) {
+        if (@backingInt(at) >= self.node_parents.len) return null;
+        at = self.node_parents[@backingInt(at)] orelse return null;
+        for (self.declarations, 0..) |decl, i| {
+            if ((decl.kind == .variable or decl.kind == .function) and decl.node == at) return @fromBackingInt(@intCast(i));
+        }
+    }
+}
+
 /// The reference an identifier is; null for any other node, and for a node past the file's tree.
 pub fn reference(self: *const Model, node: Ast.Node.Index) ?Reference {
     const index = @backingInt(node);

@@ -8,3 +8,8 @@ pub fn first(h: anytype, io: std.Io) !u8 {
         else => |other| other,
     };
 }
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+pub fn firstOfFile(file: std.Io.File, io: std.Io) !u8 {
+    return first(file, io);
+}
