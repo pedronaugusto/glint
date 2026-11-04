@@ -1998,6 +1998,14 @@ test "A003 lends an owner to a callee by its kind's release, through a call or @
     try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); @call(.auto, peek, .{&s}); }", pack.cleanup, true, 0);
 }
 
+test "A003 releases an array of std handles by closing each copy a loop takes" {
+    // A std handle is a value: `for (pair) |s| s.close()` closes each of the pair's handles, as
+    // `for (&pair) |*s| s.close()` does; a loop that only reads them closes none.
+    const head = "const std = @import(\"std\");\nfn pairOf() [2]std.Io.net.Stream { return .{ .{}, .{} }; }\n";
+    try expectJudgedStd(head ++ "pub fn f() void { const pair = pairOf(); defer for (pair) |s| s.close(); }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f() void { var pair = pairOf(); defer for (&pair) |*s| s.close(); }", pack.cleanup, true, 0);
+}
+
 test "A001 reads a literal's place through a field default and optional and error-union results" {
     const head = "const err = @import(\"aegis\").err;\n";
     try expectJudged(head ++ "const Holder = struct { source: err.PublicSource = .{ .bytes = \"\" } };\npub fn f() Holder { return .{}; }", pack.access, true, 1);

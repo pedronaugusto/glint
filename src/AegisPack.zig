@@ -4525,22 +4525,27 @@ fn release(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract
     return releaseName(k, (try ownerCall(c, node, token)) orelse return false);
 }
 /// `for (&owners) |*owner| owner.deinit();`: a loop over the local array `token` declares,
-/// whose one statement releases each element through its pointer capture.
+/// whose one statement releases each element through its pointer capture; or, of std handles,
+/// through a copy (`for (pair) |s| s.close(io);`): a std handle is a value, and closing a copy
+/// closes it.
 fn releasedEach(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex, k: Contract.Kind) Context.Error!bool {
     const tree = try c.project.syntax(try c.source());
     const loop = tree.fullFor(node) orelse return false;
     if (loop.ast.inputs.len != 1 or loop.ast.else_expr != .none or loop.label_token != null) return false;
     const input = loop.ast.inputs[0];
-    if (Facts.accesses.formOf(tree.nodeTag(input)) != .address_of) return false;
-    if (declaredAt(c, c.file, try c.facts.definition(c.file, tree.nodeData(input).node)) != token) return false;
-    if (tree.tokenTag(loop.payload_token) != .asterisk) return false;
+    const by_pointer = Facts.accesses.formOf(tree.nodeTag(input)) == .address_of;
+    if (!by_pointer and k != .std_handle) return false;
+    const array = if (by_pointer) tree.nodeData(input).node else input;
+    if (declaredAt(c, c.file, try c.facts.definition(c.file, array)) != token) return false;
+    if ((tree.tokenTag(loop.payload_token) == .asterisk) != by_pointer) return false;
+    const capture = if (by_pointer) loop.payload_token + 1 else loop.payload_token;
     var body = loop.ast.then_expr;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, body)) |statements| {
         if (statements.len != 1) return false;
         body = statements[0];
     }
-    return releaseName(k, (try ownerCall(c, body, loop.payload_token + 1)) orelse return false);
+    return releaseName(k, (try ownerCall(c, body, capture)) orelse return false);
 }
 /// The member `node` calls on the local `token` declares, if it is such a call.
 fn ownerCall(c: *Context, node: Ast.Node.Index, token: Ast.TokenIndex) Context.Error!?[]const u8 {
