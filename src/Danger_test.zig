@@ -2973,11 +2973,10 @@ test "A009's input is a child's output and a file's contents, aegis's whole-file
         \\    return out.stdout[out.stdout[0]];
         \\}
     ;
-    // Four reads of input, and two of `name` (lines 6 and 9) that are not: aegis calls a member
-    // named `load` on a slot of `*Table(Brand)`, whose members Facts does not yet read through
-    // the generic, so the program's `pub fn load` may be what it calls, with anything. The
-    // shared resolver reads them, and these two go.
-    try expect(pack.untrusted_input, program, 6);
+    // Four reads of input. `name` is not: no call outside the program may be its `pub fn load`.
+    // std's calls of a member so named resolve to its own atomics, and aegis's on a value that does
+    // not resolve (Atomic's `self.cell.load(order)`) are in code no compilation of it analyzes.
+    try expect(pack.untrusted_input, program, 4);
     var project = try sources.projectWithSources(std.testing.allocator, program, &std_files, &std_imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .gate }} }, .{ .project_rules = &pack.rules });

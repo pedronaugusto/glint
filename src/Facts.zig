@@ -9,6 +9,8 @@ const Ast = std.zig.Ast;
 const Facts = @This();
 
 project: *const Project,
+/// An arena's: nothing Facts makes is freed one by one, and a memo replaced once the analysis
+/// is built (`dropMemos`) is left to it, never freed while a query up the stack may hold it.
 gpa: std.mem.Allocator,
 /// The library the analyses know by its declarations (aegis): its package's own files, like
 /// std's, are not the program's (`program`), under whatever name a program imports it. Only
@@ -68,7 +70,24 @@ storing: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 /// and per file, the files that may share a compilation with it (`compiledWith`).
 imports_read: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 compiled_with: std.AutoHashMapUnmanaged(Project.FileId, Files) = .empty,
+/// What a compilation of the program analyzes (`analysis`): per file, the parts Zig analyzes
+/// as one; the functions and container-level constants by name; and the budget of resolutions
+/// that reading spends, its own as a fact of the whole run.
+file_parts: std.AutoHashMapUnmanaged(Project.FileId, FileParts) = .empty,
+declarations_named: ?std.StringHashMapUnmanaged(std.ArrayList(Decl)) = null,
 remaining: usize = 100_000,
+/// Whether this Facts is the one building the analysis (`analysis`): it reads each declaration
+/// as one a compilation may analyze, in any reading.
+building_analysis: bool = false,
+/// How many answers were given wider than the analysis gives once built (`building_analysis`):
+/// what one is read on, whatever reads it while the count grows, is not memoized.
+wide: usize = 0,
+/// The analysis being built (`analysis`): a store of a function-pointer field counts once the
+/// walk reaches its part (`storeCounts`).
+walk: ?*Analysis = null,
+/// The memos (`memo`) handed out while the analysis is built, made then or before: each is
+/// replaced once it is built (`dropMemos`).
+walked: std.AutoHashMapUnmanaged(usize, void) = .empty,
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
@@ -133,6 +152,8 @@ pub const Made = struct {
 /// One call of a generic function being read: its parameters bound to the call's arguments,
 /// in order (a method's receiver first). A type it returns, or a result type written in terms
 /// of them, is read with these bindings.
+/// One is made where it is kept for the run and never changed once read: what a node reads in
+/// it is memoized by where it is (`resolveIn`).
 pub const Env = struct {
     function: Decl,
     args: []const Value,
@@ -155,6 +176,11 @@ pub const Env = struct {
     /// (none for a receiver or one that spells nothing): what a name a type function is given
     /// (`items(.tag)`, `@tagName(field)`) reads, or a number written as a literal (`Pick(1)`).
     spelled: []const ?Spelled = &.{},
+    /// Whether each argument's expression is a value (`valueIn` in the reading the call is
+    /// in), in order with `args`: Zig makes one instance of a function handed a type and
+    /// another handed a value, so it is part of the instantiation. False where the site has no
+    /// expression for the argument, or it is not known to be a value.
+    values: []const bool = &.{},
 };
 /// What an argument spells: a name (`nameIn`), or a number written as a literal.
 pub const Spelled = union(enum) { name: []const u8, number: usize };
@@ -543,9 +569,10 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     const outer = self.assumed;
     defer self.assumed = outer;
     self.assumed = try self.settle(file, node, outer);
+    const wide = self.wide;
     const value = try self.resolveInner(file, node);
     // Read with none left, a part of it may have come back unknown(budget): it is not kept.
-    if (self.remaining != 0) try self.cache.put(self.gpa, key, value);
+    if (self.remaining != 0 and !self.wideSince(wide)) try self.cache.put(self.gpa, key, value);
     return value;
 }
 
@@ -2053,7 +2080,9 @@ pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 /// `or` of known ones, `==` and `!=` of two types each side names (`T == Plain`, `namedType`)
 /// known the same or different, or of a pointer's known size and a tag (`sizeIs`), and
 /// `@hasDecl(T, "name")` where `T` is a container that resolves (a module a driver is built
-/// against).
+/// against), its name a string or what the reading binds; `@typeInfo(X) == .tag`;
+/// `info.is_tuple` (`isTuple`); and a call to a function returning `bool` whose body decides
+/// it (`callTruth`).
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     if (self.truth(env, file, node)) |known| return known;
     const tree = &self.project.at(file).file.tree;
@@ -2073,6 +2102,7 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
             // A pointer's size against a tag (`info.size == .slice`).
             if (try self.sizeIs(env, file, compared.left, compared.right) orelse try self.sizeIs(env, file, compared.right, compared.left)) |same_size|
                 return if (compared.order == .equal) same_size else !same_size;
+            if (try self.kindCompared(env, file, compared.left, compared.right)) |kinds_agree| return if (compared.order == .equal) kinds_agree else !kinds_agree;
             const one = try self.namedType(env, file, compared.left) orelse return null;
             const other = try self.namedType(env, file, compared.right) orelse return null;
             const one_type = sameType(one, other) orelse return null;
@@ -2080,19 +2110,18 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         },
         .other => |value| value,
     };
+    if (try self.isTuple(env, file, at)) |known| return known;
+    if (try self.callTruth(env, file, at)) |known| return known;
     if (!isBuiltin(tree, at, "@hasDecl")) return null;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, at, &buffer);
-    if (args.len != 2 or tree.nodeTag(args[1]) != .string_literal) return null;
+    if (args.len != 2) return null;
     const container = switch (try self.resolveIn(env, file, args[0])) {
         .container => |c| c,
         else => return null,
     };
     if (container.symbolic) return null;
-    const name = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[1]))) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
+    const name = try self.nameIn(env, file, args[1], 0) orelse return null;
     const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
     return self.project.at(container.file).model.declarations[@backingInt(decl)].kind != .field;
 }
@@ -2412,6 +2441,25 @@ fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index
     return null;
 }
 
+/// What an atomic or a union builtin gives, null for any other: an atomic load's value, or a
+/// read-modify-write's old one, what the pointer points at as `p.*` reads it, a value of the type
+/// the first argument names where the pointer is none; `@unionInit`'s union, a value of that type;
+/// a compare-and-exchange's old value where it fails, null where it succeeds.
+fn memoryBuiltin(self: *Facts, env: ?*const Env, file: Project.FileId, name: []const u8, args: []const Ast.Node.Index) ResolveError!?Value {
+    for ([_][]const u8{ "@atomicLoad", "@atomicRmw" }) |load| if (args.len >= 2 and std.mem.eql(u8, name, load)) {
+        const pointer = try self.resolveIn(env, file, args[1]);
+        if (pointer == .pointer or pointer == .alternatives) return try self.pointee(pointer, {});
+        return try self.instance(try self.resolveIn(env, file, args[0]));
+    };
+    if (std.mem.eql(u8, name, "@unionInit") and args.len != 0) return try self.instance(try self.resolveIn(env, file, args[0]));
+    for ([_][]const u8{ "@cmpxchgWeak", "@cmpxchgStrong" }) |exchange| if (args.len != 0 and std.mem.eql(u8, name, exchange)) {
+        const value = try self.instance(try self.resolveIn(env, file, args[0]));
+        if (value == .unknown) return value;
+        return .{ .optional = try self.boxed(value) };
+    };
+    return null;
+}
+
 /// What a builtin call gives: an imported file, `@This()`, a reflected declaration, a type
 /// `@as` names, a value's type, a type's information; its operands read with `env`'s
 /// bindings where a generic call's reading gives them.
@@ -2466,6 +2514,8 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
         // `@hasDecl` is a `bool` whatever it names.
         if (std.mem.eql(u8, name, "@hasDecl")) return .scalar;
+        // In a reading, the holder and a name it binds (`hasFn`'s `@field(T, name)`).
+        if (env != null) if (try self.nameIn(env, file, args[1], 0)) |known| return self.fieldOf(try self.resolveIn(env, file, args[0]), known);
         if (try self.builtinField(file, args)) |value| return value;
         return .{ .unknown = .comptime_dependent };
     }
@@ -2483,6 +2533,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         if (holdsTypes(named)) return self.resolveIn(env, file, args[1]);
         return self.instance(named);
     }
+    if (try self.memoryBuiltin(env, file, name, args)) |value| return value;
     // Every element the operand: an array of it (a vector is indexed as one).
     if (std.mem.eql(u8, name, "@splat") and args.len == 1) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[0])) };
     // A type built from its fields' types: `@Struct(layout, backing, names, types, attributes)`,
@@ -3096,7 +3147,11 @@ fn fieldValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveE
 
 /// What `holder.name` is, written as a member access or as `@field(holder, "name")`.
 fn fieldNamed(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: []const u8) ResolveError!Value {
-    const lhs = try self.resolve(file, holder);
+    return self.fieldOf(try self.resolve(file, holder), name);
+}
+
+/// What `name` read off `lhs` is (`fieldNamed`), the holder already read.
+fn fieldOf(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     const value = try self.memberValue(lhs, name);
     // A field holding a function or a pointer to one: each function the program stores in it.
     if (callable(value) and !identified(value)) if (fieldOwner(lhs)) |container| {
@@ -3143,8 +3198,9 @@ fn storedFunctions(self: *Facts, container: Container, name: []const u8) Resolve
     if (self.storing.contains(field)) return null;
     try self.storing.put(self.gpa, field, {});
     defer _ = self.storing.remove(field);
+    const wide = self.wide;
     const found = try self.storesOf(container, field);
-    try self.stored.put(self.gpa, field, found);
+    if (!self.wideSince(wide)) try self.stored.put(self.gpa, field, found);
     return found;
 }
 
@@ -3176,6 +3232,8 @@ pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) Res
     var found_sites = accesses.writesFor(self, .{ .field = field }, files, .{ .holders = false });
     while (try found_sites.next()) |site| {
         const tree = &self.project.at(site.file).file.tree;
+        // A store in code no compilation of the program analyzes gives it nothing.
+        if (!try self.storeCounts(site.file, site.node)) continue;
         if (site.computed) {
             const target = site.target orelse return null;
             var buffer: [2]Ast.Node.Index = undefined;
@@ -3187,11 +3245,15 @@ pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) Res
             // only where that struct has one so named.
             if (try self.isType(site.file, args[0])) continue;
             if (try self.fieldNamesOf(site.file, args[1])) |other| if (!self.hasField(other, self.project.at(field.file).model.declarations[@backingInt(field.index)].name)) continue;
+            // In a generic, only a reading whose holder is this field's struct may name it.
+            if (try self.holderMisses(site.file, site.node, args[0], field)) continue;
             return null;
         }
         switch (site.kind) {
             .covered => switch (tree.nodeTag(site.node)) {
-                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return null,
+                // `@bitCast` takes and makes only types of a defined layout: never an auto
+                // struct or union, nor one holding one, so never this field of one.
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(site.node)), "@bitCast") or !self.autoLayout(field)) if (!try self.castMisses(site.file, site.node, field)) return null,
                 else => if (tree.fullVarDecl(site.node) != null) return null,
             },
             .init, .set => switch (site.reach) {
@@ -3204,6 +3266,1185 @@ pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) Res
         }
     }
     return targets.items;
+}
+
+/// Whether the field's container is laid out by Zig (`struct`, `union`, no `extern` or
+/// `packed`).
+fn autoLayout(self: *Facts, field: Decl) bool {
+    const model = &self.project.at(field.file).model;
+    const tree = &self.project.at(field.file).file.tree;
+    const scope = model.scopes[@backingInt(model.declarations[@backingInt(field.index)].scope)];
+    if (scope.node == .root) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buffer, scope.node) orelse return false;
+    return container.layout_token == null;
+}
+
+/// Whether a store at `node` counts for its field (`fieldStores`): its part is analyzed. While
+/// the walk builds, a part counts once the walk has reached it. A function a store gives is
+/// named at the store, so the walk reaches it when it reaches the store's part, never only
+/// through the call: the walk reaches the least set from its roots, and a function stored
+/// only in code nothing compiles is never reached. What an unresolved call reaches (a function
+/// type, `erased`) is no more than that either.
+fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const found = self.walk orelse return self.analyzedAt(file, node);
+    // An answer narrower than the built analysis may give: no memo keeps what reads it, and
+    // `dropMemos` drops what one kept regardless.
+    self.wide += 1;
+    if (found.everything) return true;
+    const part = self.partOf(file, node) orelse return true;
+    const index = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
+        .test_decl => try self.program(file),
+        else => true,
+    };
+    return found.reached.contains(.{ .file = file, .index = index });
+}
+
+/// Whether a pointer cast makes no view of memory that may hold `field`'s struct, in each
+/// reading a compilation of the program analyzes its function in (`analyzedReadings`; one,
+/// binding nothing, for a function read once): the type its result takes where it is written
+/// and its operand's each hold no value of it (`create(T)` with `T` a `u32`; a `[*]u16` field
+/// given a `*anyopaque`'s bytes). False where a reading is not known, or a type does not resolve.
+fn castMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, field: Decl) ResolveError!bool {
+    const part = self.partOf(file, node) orelse return false;
+    const index = (try self.partsOf(file)).declared.get(part) orelse return false;
+    const function: Decl = .{ .file = file, .index = index };
+    if (!self.instantiated(function)) return self.castMissesIn(null, file, node, field);
+    for ((try self.analyzedReadings(function)) orelse return false) |reading| {
+        if (!try self.castMissesIn(reading, file, node, field)) return false;
+    }
+    return true;
+}
+
+/// `castMisses` in one reading: the cast's result type is the one it makes there (`castTypeIn`).
+fn castMissesIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, field: Decl) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    if (args.len != 1) return false;
+    const result = try self.castTypeIn(env, file, node);
+    const holder = self.project.at(field.file).model.declarations[@backingInt(field.index)].scope;
+    if (try self.mayHoldStruct(accesses.held(result), field.file, holder, 0)) return false;
+    return !try self.mayHoldStruct(accesses.held(try self.resolveIn(env, file, accesses.uncast(tree, args[0]))), field.file, holder, 0);
+}
+
+/// Whether `@field(holder, name)` at `node`, in a function Zig analyzes once per instantiation,
+/// names a field of `field`'s struct in none of the readings a compilation of the program
+/// analyzes it in: in each, the holder, read with that reading's bindings, is a value of another
+/// type or a pointer to one (zon's `&@field(out, info.field_names[j])` for an `out: *T`). A computed
+/// name names a field of the holder's own type only. False where a reading is not known or the
+/// holder does not resolve.
+fn holderMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, holder: Ast.Node.Index, field: Decl) ResolveError!bool {
+    const part = self.partOf(file, node) orelse return false;
+    const index = (try self.partsOf(file)).declared.get(part) orelse return false;
+    const function: Decl = .{ .file = file, .index = index };
+    if (!self.genericFunction(function)) return false;
+    const readings = (try self.analyzedReadings(function)) orelse return false;
+    const scope = self.project.at(field.file).model.declarations[@backingInt(field.index)].scope;
+    for (readings) |reading| {
+        switch (accesses.held(try self.resolveIn(reading, file, holder))) {
+            .container, .instance => |k| if (k.symbolic or (k.file == field.file and k.scope == scope)) return false,
+            .primitive, .scalar, .array, .function, .fn_type, .error_set => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Whether a value of `value`'s type may hold, by value, one of the struct `scope` of `file`
+/// declares: it is that struct, or one of its fields, elements or payloads may hold one. What
+/// a pointer points at is not held; what does not resolve may be.
+fn mayHoldStruct(self: *Facts, value: Value, file: Project.FileId, scope: Model.Scope.Id, depth: u8) ResolveError!bool {
+    if (depth >= 16) return true;
+    switch (value) {
+        .container, .instance => |k| {
+            if (k.file == file and k.scope == scope) return true;
+            if (k.symbolic) return true;
+            const model = &self.project.at(k.file).model;
+            const tree = &self.project.at(k.file).file.tree;
+            for (model.declarations, 0..) |record, d| {
+                if (record.kind != .field or record.scope != k.scope) continue;
+                // An enum's tag holds no value.
+                const declared = model.containerField(tree, record.node) orelse return true;
+                if (declared.ast.type_expr == .none) continue;
+                if (try self.mayHoldStruct(try self.memberOf(k, .{ .file = k.file, .index = @fromBackingInt(@intCast(d)) }), file, scope, depth + 1)) return true;
+            }
+            return false;
+        },
+        .array, .optional, .error_union => |inner| return self.mayHoldStruct(inner.*, file, scope, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (try self.mayHoldStruct(one, file, scope, depth + 1)) return true;
+            return false;
+        },
+        .pointer, .primitive, .scalar, .function, .fn_type, .error_set => return false,
+        // A literal with no type of its own holds what its parts do.
+        .literal => |key| {
+            for (try self.literalParts(key)) |part| if (try self.mayHoldStruct(part, file, scope, depth + 1)) return true;
+            return false;
+        },
+        .unknown, .reflected, .reified => return true,
+    }
+}
+
+/// What a compilation of the program analyzes, as Zig analyzes lazily: each function and
+/// container-level constant reached from the program's roots, with the readings it is reached
+/// in (`every`: one binding nothing, so each instantiation's).
+pub const Analysis = struct {
+    reached: std.AutoHashMapUnmanaged(Decl, Readings) = .empty,
+    /// Per function, the members of containers it declares reached with no instance known:
+    /// each is read in every reading of the function, those found later too.
+    members: std.AutoHashMapUnmanaged(Decl, std.ArrayList(Decl)) = .empty,
+    /// Anything may be analyzed: at each of `limits`.
+    everything: bool = false,
+    /// Where the walk could not decide what is analyzed: a file the front end refused (it may
+    /// name anything), a reading past its budget, an `@field` whose holder may be a type and
+    /// whose name no rule reads (it may analyze any declaration). Each is a coverage limit,
+    /// never cleared.
+    limits: std.ArrayList(Limit) = .empty,
+
+    built: bool = false,
+
+    pub const Limit = struct { file: Project.FileId, node: Ast.Node.Index, why: enum { refused, budget, reflected } };
+    pub const Readings = struct { every: bool = false, envs: std.ArrayList(*const Env) = .empty };
+};
+
+/// Per file, the nodes of each part Zig analyzes as one (`partOf`; the file's own loose parts
+/// under `.root`), and the part each function and container-level constant is.
+pub const FileParts = struct {
+    nodes: std.AutoHashMapUnmanaged(Ast.Node.Index, std.ArrayList(Ast.Node.Index)) = .empty,
+    declared: std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id) = .empty,
+};
+
+/// A part to read and the reading it is read in.
+const PartRead = struct { file: Project.FileId, part: Ast.Node.Index, env: ?*const Env };
+
+/// The readings of one declaration kept apart: past them, it is read binding nothing.
+const reading_limit = 64;
+
+/// What one reading of a part may spend resolving.
+const reading_budget = 100_000;
+
+/// What a compilation of the program analyzes, found once. The roots are every function and
+/// container-level constant of the program's files, each exported declaration, each file's
+/// container-level `comptime` blocks and loose parts, and the program's tests. From each part
+/// read, in the reading it is reached in: a call reaches its callee in the reading it makes
+/// (`calls.under`, `readingAt`); a name, a member, a decl literal or an `@field` naming a
+/// function or a container-level constant reaches it (no binding); one whose holder does not
+/// resolve reaches every declaration so named; an `@field` of a value names a field, of a type
+/// whose name is not known each of its declarations, and with neither known anything.
+pub fn analysis(self: *Facts) ResolveError!*const Analysis {
+    const found = try self.memo(Analysis);
+    if (found.built) return found;
+    found.built = true;
+    const file_budget = self.remaining;
+    defer self.remaining = file_budget;
+    // What the walk asks of the analysis while it is built is answered as if anything may be
+    // analyzed (`building_analysis`); what is read on that answer is not kept (`wide`). Once
+    // built, what a query in progress reads of it is exact.
+    const wide = self.wide;
+    defer self.wide = wide;
+    self.building_analysis = true;
+    defer self.building_analysis = false;
+    self.walk = found;
+    defer self.walk = null;
+    try self.reachAll(found);
+    self.dropMemos();
+    return found;
+}
+
+/// Replaces each memo the walk was handed (`walked`), which it may have filled with an answer
+/// read before a store's part was reached (`storeCounts`), whatever kind of answer the memo
+/// keeps: the next query makes it again, of the built analysis. The analysis itself is kept, and
+/// every memo no part of the walk asked for keeps what it holds. A replaced memo is left in the
+/// arena, never cleared: a query up the stack holding it writes into storage nothing reads again.
+fn dropMemos(self: *Facts) void {
+    const kept = comptime std.hash.Wyhash.hash(0, @typeName(Analysis));
+    var each = self.walked.keyIterator();
+    while (each.next()) |key| if (key.* != kept) {
+        _ = self.memos.remove(key.*);
+    };
+    self.walked = .empty;
+}
+
+/// Builds `found` (`analysis`).
+fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
+    var next: std.ArrayList(PartRead) = .empty;
+    for (self.project.sources) |*source| {
+        if (source.file.status != .parsed) {
+            try found.limits.append(self.gpa, .{ .file = source.id, .node = .root, .why = .refused });
+            found.everything = true;
+            continue;
+        }
+        const file = source.id;
+        const own = try self.program(file);
+        const model = &source.model;
+        for (model.declarations, 0..) |record, d| {
+            if (!own and !record.exported) continue;
+            const decl: Decl = .{ .file = file, .index = @fromBackingInt(@intCast(d)) };
+            // An instantiated one is read in the instantiations the walk reaches it in; one a
+            // consumer may instantiate (the program's public one), in each.
+            if (!self.instantiated(decl) or (own and record.public)) try self.reachDeclaration(found, &next, decl, null);
+        }
+        const tree = &source.file.tree;
+        var parts = (try self.partsOf(file)).nodes.keyIterator();
+        while (parts.next()) |part| {
+            const loose = part.* == .root;
+            if (loose or tree.nodeTag(part.*) == .@"comptime" or (own and tree.nodeTag(part.*) == .test_decl)) try next.append(self.gpa, .{ .file = file, .part = part.*, .env = null });
+        }
+    }
+    // Each reading has its own budget; what it reads is memoized for the others.
+    while (next.pop()) |reading| {
+        self.remaining = reading_budget;
+        const nodes = (try self.partsOf(reading.file)).nodes.get(reading.part) orelse continue;
+        for (nodes.items) |node| {
+            // A branch the reading's bindings rule out is not analyzed in it (`.array`
+            // of a `switch (@typeInfo(T))` reading a pointer `T`).
+            if (!try self.reachedUnder(reading.env, reading.file, node)) continue;
+            try self.reachFrom(found, &next, reading.file, node, reading.env);
+        }
+        if (self.remaining == 0) {
+            try found.limits.append(self.gpa, .{ .file = reading.file, .node = reading.part, .why = .budget });
+            found.everything = true;
+        }
+    }
+}
+
+/// Whether an answer wider than the analysis gives once built was given since `mark` (`wide`, read
+/// before): a memo keeps nothing read since then.
+pub fn wideSince(self: *const Facts, mark: usize) bool {
+    return self.wide != mark;
+}
+
+/// Whether a compilation of the program may analyze `decl` (`analysis`).
+pub fn analyzed(self: *Facts, decl: Decl) ResolveError!bool {
+    if (self.building_analysis) {
+        self.wide += 1;
+        return true;
+    }
+    const found = try self.analysis();
+    return found.everything or found.reached.contains(decl);
+}
+
+/// Whether the part of a file holding `node` is analyzed: its function's or constant's
+/// declaration is; a `comptime` block or a loose part of a file is; a test is in the program's
+/// files.
+pub fn analyzedAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const part = self.partOf(file, node) orelse return true;
+    const d = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
+        .test_decl => try self.program(file),
+        else => true,
+    };
+    return self.analyzed(.{ .file = file, .index = d });
+}
+
+/// The readings a declaration is analyzed in, or null where it is read in each one (binding
+/// nothing) or anything may be analyzed.
+pub fn analyzedReadings(self: *Facts, decl: Decl) ResolveError!?[]const *const Env {
+    if (self.building_analysis) {
+        self.wide += 1;
+        return null;
+    }
+    const found = try self.analysis();
+    if (found.everything) return null;
+    const readings = found.reached.get(decl) orelse return &.{};
+    return if (readings.every) null else readings.envs.items;
+}
+
+/// Reaches a function or a container-level constant in `env`, queueing its part to be read in
+/// it unless it already was (`sameReading`).
+fn reachDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), decl: Decl, env: ?*const Env) ResolveError!void {
+    const model = &self.project.at(decl.file).model;
+    const record = model.declarations[@backingInt(decl.index)];
+    if (record.kind != .function and record.kind != .variable) return;
+    const part = self.partOf(decl.file, record.node) orelse return;
+    // Only a part's own declaration: a local reaches nothing beyond its function.
+    if ((try self.partsOf(decl.file)).declared.get(part) != decl.index) return;
+    // A member of a container a function declares, reached with no instance known: read in
+    // each reading of that function, the ones it is reached in later too.
+    if (env == null and !self.genericFunction(decl) and self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
+        const pending = try found.members.getOrPut(self.gpa, outer);
+        if (!pending.found_existing) pending.value_ptr.* = .empty;
+        for (pending.value_ptr.items) |known| {
+            if (std.meta.eql(known, decl)) break;
+        } else try pending.value_ptr.append(self.gpa, decl);
+        const outer_readings = found.reached.get(outer) orelse return;
+        if (!outer_readings.every) {
+            for (outer_readings.envs.items) |each| try self.readDeclaration(found, next, decl, part, each);
+            return;
+        }
+    };
+    try self.readDeclaration(found, next, decl, part, env);
+}
+
+/// Queues `decl`'s part to be read in `env` unless it already was, and each member reached
+/// with no instance known of a container it declares in the same reading.
+fn readDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), decl: Decl, part: Ast.Node.Index, env: ?*const Env) ResolveError!void {
+    const entry = try found.reached.getOrPut(self.gpa, decl);
+    if (!entry.found_existing) entry.value_ptr.* = .{};
+    const readings = entry.value_ptr;
+    if (readings.every) return;
+    var reading = env;
+    if (env) |bound| {
+        // Readings are made once by content (`keptReading`): one is the same reading as another
+        // only where it is that one.
+        for (readings.envs.items) |known| if (known == bound) return;
+        if (readings.envs.items.len < reading_limit) try readings.envs.append(self.gpa, bound) else reading = null;
+    }
+    if (reading == null) readings.every = true;
+    try next.append(self.gpa, .{ .file = decl.file, .part = part, .env = reading });
+    const members = (found.members.get(decl) orelse return).items;
+    for (members) |held| {
+        const member_record = self.project.at(held.file).model.declarations[@backingInt(held.index)];
+        const member_part = self.partOf(held.file, member_record.node) orelse continue;
+        try self.readDeclaration(found, next, held, member_part, reading);
+    }
+}
+
+/// The function whose body declares the container `decl` is a member of: a type function, or
+/// any function declaring a container.
+fn enclosingFunction(self: *Facts, decl: Decl) ?Decl {
+    const model = &self.project.at(decl.file).model;
+    var at: ?Model.Scope.Id = model.declarations[@backingInt(decl.index)].scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        const scope = model.scopes[@backingInt(s)];
+        if (scope.kind != .function) continue;
+        const d = (self.partsOf(decl.file) catch return null).declared.get(scope.node) orelse return null;
+        return .{ .file = decl.file, .index = d };
+    }
+    return null;
+}
+
+/// What one node of a part read in `env` reaches.
+fn reachFrom(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), file: Project.FileId, node: Ast.Node.Index, env: ?*const Env) ResolveError!void {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    if (try calls.under(self, env, file, node)) |call| switch (call.callee) {
+        .function => |decl| try self.reachCalled(found, next, file, node, decl, env),
+        .choice => |decls| for (decls) |decl| try self.reachCalled(found, next, file, node, decl, env),
+        .any => {},
+    };
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            if (try self.calledKnown(env, file, node)) return;
+            const reference = model.reference(node) orelse return;
+            if (reference.declaration) |d| return self.reachDeclaration(found, next, .{ .file = file, .index = d }, try self.instanceOf(.{ .file = file, .index = d }, null, env));
+            switch (reference.unknown orelse return) {
+                .primitive, .literal_context => {},
+                .unresolved, .invalid_lowering, .before_declaration => try self.reachNamed(found, next, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)))),
+            }
+        },
+        .field_access => {
+            if (try self.calledKnown(env, file, node)) return;
+            const holder, const member_token = tree.nodeData(node).node_and_token;
+            // Not called, a member read off a value is a field (Zig: "no field named").
+            const is_callee = if (model.parentOf(node)) |parent| blk: {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, parent) orelse break :blk false;
+                break :blk call.ast.fn_expr == node;
+            } else false;
+            if (!is_callee and try self.valueIn(env, file, holder, 0)) return;
+            try self.reachMember(found, next, try self.resolveIn(env, file, holder), try self.memberName(tree.tokenSlice(member_token)), env, is_callee);
+        },
+        .enum_literal => {
+            if (try self.calledKnown(env, file, node)) return;
+            const name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
+            switch (try self.literalDeclaration(file, node, name)) {
+                .decl => |decl| try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, null, env)),
+                .unknown => try self.reachNamed(found, next, name),
+                .none => {},
+            }
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, node, &buffer);
+            if (args.len != 2) return;
+            try self.reachReflected(found, next, file, node, args[0], args[1], env);
+        },
+        else => {},
+    }
+}
+
+/// Reaches what a call at `node` calls in `env`: a generic function in the reading the call
+/// makes of it (`readingFrom`), a member of a container a type function made in that
+/// container's instantiation (`instanceOf`), anything else once.
+fn reachCalled(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), file: Project.FileId, node: Ast.Node.Index, decl: Decl, env: ?*const Env) ResolveError!void {
+    if (self.genericFunction(decl)) return self.reachEach(found, next, decl, try self.readingFrom(file, node, decl, env), 0);
+    var holder: ?Container = null;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const tree = &self.project.at(file).file.tree;
+    if (tree.fullCall(&buffer, node)) |call| if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
+        holder = madeHolder(try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]));
+    };
+    try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, holder, env));
+}
+
+/// Reaches the generic `decl` in `reading`, one reading per type an argument may be where it
+/// is one of several (`inline for` over a union's fields handing each field's type): Zig
+/// instantiates the generic once per argument a `comptime`, `type` or `anytype` parameter
+/// takes, never with a choice. From the argument at `from` on.
+fn reachEach(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), decl: Decl, reading: ?*const Env, from: usize) ResolveError!void {
+    const bound = reading orelse return self.reachDeclaration(found, next, decl, null);
+    const tree = &self.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return self.reachDeclaration(found, next, decl, bound);
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |param| : (position += 1) {
+        if (position >= bound.args.len) break;
+        if (position < from or bound.args[position] != .alternatives) continue;
+        const instantiates = param.anytype_ellipsis3 != null or
+            (if (param.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false) or
+            (if (param.type_expr) |t| namesType(tree, t) else false);
+        if (!instantiates) continue;
+        for (bound.args[position].alternatives) |one| {
+            const args = try self.gpa.dupe(Value, bound.args);
+            args[position] = one;
+            // Each split is a reading made once by its content (`keptReading`), as every one is.
+            var draft = bound.*;
+            draft.args = args;
+            try self.reachEach(found, next, decl, try self.keptReading(draft), position + 1);
+        }
+        return;
+    }
+    try self.reachDeclaration(found, next, decl, bound);
+}
+
+/// The container a value is or is an instance of, through a pointer.
+fn madeHolder(value: Value) ?Container {
+    return switch (value) {
+        .container, .instance => |k| k,
+        .pointer => |inner| madeHolder(inner.child.*),
+        else => null,
+    };
+}
+
+/// Whether `decl` is a function with a `comptime`, `type` or `anytype` parameter: Zig
+/// analyzes it once per instantiation, each a call's.
+fn genericFunction(self: *const Facts, decl: Decl) bool {
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    if (record.kind != .function) return false;
+    const tree = &self.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
+    return isGeneric(tree, proto);
+}
+
+/// Whether Zig analyzes `decl` once per instantiation: a generic function, or a member of a
+/// container a function declares (a type function's), which its parameters fix.
+fn instantiated(self: *const Facts, decl: Decl) bool {
+    if (self.genericFunction(decl)) return true;
+    const model = &self.project.at(decl.file).model;
+    var at: ?Model.Scope.Id = model.declarations[@backingInt(decl.index)].scope;
+    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
+        if (model.scopes[@backingInt(s)].kind == .function) return true;
+    }
+    return false;
+}
+
+/// The instantiation a member of a type function's container is read in: that of the
+/// container it is reached through (`holder`, a type function made), else the reading
+/// `env` is made in whose function declares it; none (each one's) where neither is known, and
+/// for a declaration read once.
+fn instanceOf(self: *Facts, decl: Decl, holder: ?Container, env: ?*const Env) ResolveError!?*const Env {
+    if (self.genericFunction(decl) or !self.instantiated(decl)) return null;
+    if (holder) |k| if (k.made_by) |made| return try self.madeEnv(made);
+    const scope = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope;
+    var at = env;
+    while (at) |reading| : (at = reading.outer) {
+        if (reading.function.file == decl.file and self.enclosed(decl.file, scope, self.scopeNode(reading.function))) return reading;
+    }
+    return null;
+}
+
+/// Whether `node` is what a call calls and the call's callee is known: the call reached it.
+fn calledKnown(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const parent = self.project.at(file).model.parentOf(node) orelse return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = self.project.at(file).file.tree.fullCall(&buffer, parent) orelse return false;
+    if (call.ast.fn_expr != node) return false;
+    const read = (try calls.under(self, env, file, parent)) orelse return false;
+    return read.callee != .any;
+}
+
+/// What a member `name` read through `holder` reaches: the declaration of its container so
+/// named; through a holder that does not resolve, every declaration so named.
+fn reachMember(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), holder: Value, name: []const u8, env: ?*const Env, is_callee: bool) ResolveError!void {
+    switch (holder) {
+        .container => |k| if (self.member(k, name)) |decl| try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, k, env)),
+        // An instance's member is a field, but where called (a method).
+        .instance => |k| if (is_callee) if (self.member(k, name)) |decl| try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, k, env)),
+        .pointer => |p| try self.reachMember(found, next, p.child.*, name, env, is_callee),
+        .optional => |inner| try self.reachMember(found, next, inner.*, name, env, is_callee),
+        .alternatives => |each| for (each) |one| try self.reachMember(found, next, one, name, env, is_callee),
+        .unknown => try self.reachNamed(found, next, name),
+        else => {},
+    }
+}
+
+/// What `@field(holder, name)` at `node` reaches in `env`. Of a value it names a field, unless
+/// it is called (`@field(x, name)(…)`, `@field(x, name).*(…)`): a method of the value's type
+/// may be so named. Of a type, the declaration its name names, or where its name is not known
+/// each of its declarations, unless the name ranges over that type's fields. Of what does not
+/// resolve, every declaration its name names, or with no name known anything.
+fn reachReflected(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), file: Project.FileId, node: Ast.Node.Index, holder: Ast.Node.Index, name_node: Ast.Node.Index, env: ?*const Env) ResolveError!void {
+    const through_call = self.calledThrough(file, node);
+    if (!through_call and try self.valueIn(env, file, holder, 0)) return;
+    const name = try self.nameIn(env, file, name_node, 0);
+    // A name one of a type's field names: no declaration of that type, a value of it or its
+    // tag type has one so named (Zig refuses a member named twice); another container's
+    // declarations so named, where the type is known.
+    const over = try self.namesOf(file, name_node, 0);
+    if (over) |names| if (self.namesNoDeclaration(file, holder, names)) return;
+    if (try self.fieldGuarded(file, holder, name_node)) return;
+    const fields: ?Container = if (over) |names| switch (try self.resolveIn(env, file, names.subject)) {
+        .container => |k| k,
+        else => null,
+    } else try self.tagNamesOf(env, file, name_node);
+    const resolved = try self.resolveIn(env, file, holder);
+    // A value's type, where what is called through it may be its method.
+    const typed: Value = if (through_call) switch (resolved) {
+        .instance => |k| .{ .container = k },
+        .pointer => |p| if (p.child.* == .instance) .{ .container = p.child.instance } else resolved,
+        else => resolved,
+    } else resolved;
+    switch (typed) {
+        .container => |k| {
+            if (name) |known| return if (self.member(k, known)) |decl| self.reachDeclaration(found, next, decl, try self.instanceOf(decl, k, env));
+            if (fields) |of| {
+                if (of.file == k.file and of.scope == k.scope) return;
+                for (self.fieldNames(of)) |field| if (self.member(k, field)) |decl| try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, k, env));
+                return;
+            }
+            const model = &self.project.at(k.file).model;
+            for (model.declarations, 0..) |record, d| if (record.scope == k.scope) {
+                const decl: Decl = .{ .file = k.file, .index = @fromBackingInt(@intCast(d)) };
+                try self.reachDeclaration(found, next, decl, try self.instanceOf(decl, k, env));
+            };
+        },
+        // Zig's own per-build values hold none of the program's declarations.
+        .unknown => |why| if (why == .zig_own) {} else if (name) |known| try self.reachNamed(found, next, known) else if (fields) |of| {
+            for (self.fieldNames(of)) |field| try self.reachNamed(found, next, field);
+        } else {
+            try found.limits.append(self.gpa, .{ .file = file, .node = holder, .why = .reflected });
+            found.everything = true;
+        },
+        else => {},
+    }
+}
+
+/// Whether what `node` gives is called: `node(…)`, or `node.*(…)` through a pointer.
+fn calledThrough(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var callee = node;
+    var parent = model.parentOf(node) orelse return false;
+    if (tree.nodeTag(parent) == .deref) {
+        callee = parent;
+        parent = model.parentOf(parent) orelse return false;
+    }
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, parent) orelse return false;
+    return call.ast.fn_expr == callee;
+}
+
+/// The enum whose tags `@tagName(x)` at `node` names one of: `x`'s, a value of it or a
+/// capture of a `switch` prong on one.
+fn tagNamesOf(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    if (!isBuiltin(tree, at, "@tagName")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, at, &buffer);
+    if (args.len != 1) return null;
+    const operand = ungrouped(tree, args[0]);
+    if (enumOf(try self.resolveIn(env, file, operand))) |k| return k;
+    if (tree.nodeTag(operand) != .identifier) return null;
+    const record = self.declarationAt(file, operand) orelse return null;
+    if (record.kind != .capture) return null;
+    const model = &self.project.at(file).model;
+    var up = record.node;
+    while (tree.fullSwitchCase(up) == null) up = model.parentOf(up) orelse return null;
+    const choice = tree.fullSwitch(model.parentOf(up) orelse return null) orelse return null;
+    return enumOf(try self.resolveIn(env, file, choice.ast.condition));
+}
+
+/// The enum a value is of, or is.
+fn enumOf(value: Value) ?Container {
+    return switch (value) {
+        .instance, .container => |k| k,
+        .pointer => |inner| enumOf(inner.child.*),
+        else => null,
+    };
+}
+
+/// The names a `@field` name is one of: the field names of `subject`, a type whose struct,
+/// union or enum information (`info`, `@typeInfo(subject).@"struct"`) the name ranges over
+/// (`inline for (info.field_names) |name|`, the input at the capture's position), indexes
+/// (`info.field_names[j]`), or is the `name` of an element of `info.fields`; the list and the
+/// information named in place, through constants, or by a capture of a `switch` on or an `if`
+/// over `@typeInfo(subject)`.
+const NamesOf = struct { subject: Ast.Node.Index, info: Ast.Node.Index };
+
+fn namesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!?NamesOf {
+    if (depth > 8) return null;
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => {
+            const record = self.declarationAt(file, at) orelse return null;
+            switch (record.kind) {
+                .variable => return self.namesOf(file, constInit(tree, record) orelse return null, depth + 1),
+                .capture => return self.listOf(file, self.loopInput(file, record) orelse return null, "field_names", depth + 1),
+                else => return null,
+            }
+        },
+        .array_access => return self.listOf(file, tree.nodeData(at).node_and_node[0], "field_names", depth + 1),
+        .field_access => {
+            const item, const name_token = tree.nodeData(at).node_and_token;
+            if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(name_token)), "name")) return null;
+            const inner = ungrouped(tree, item);
+            if (tree.nodeTag(inner) == .array_access) return self.listOf(file, tree.nodeData(inner).node_and_node[0], "fields", depth + 1);
+            if (tree.nodeTag(inner) != .identifier) return null;
+            const record = self.declarationAt(file, inner) orelse return null;
+            if (record.kind != .capture) return null;
+            return self.listOf(file, self.loopInput(file, record) orelse return null, "fields", depth + 1);
+        },
+        else => return null,
+    }
+}
+
+/// The information whose `member` list `node` is (`info.field_names`, through constants).
+fn listOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, comptime list: []const u8, depth: usize) ResolveError!?NamesOf {
+    if (depth > 8) return null;
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => {
+            const record = self.declarationAt(file, at) orelse return null;
+            if (record.kind != .variable) return null;
+            return self.listOf(file, constInit(tree, record) orelse return null, list, depth + 1);
+        },
+        .field_access => {
+            const info, const token = tree.nodeData(at).node_and_token;
+            if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(token)), list)) return null;
+            return .{ .subject = (try self.infoSubject(file, info, depth + 1)) orelse return null, .info = info };
+        },
+        else => return null,
+    }
+}
+
+/// The type `node` is the struct, union or enum information of: `@typeInfo(S).@"struct"`, in
+/// place, through constants, or a `switch` prong's capture of `@typeInfo(S)`.
+fn infoSubject(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!?Ast.Node.Index {
+    if (depth > 8) return null;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const at = ungrouped(tree, node);
+    switch (tree.nodeTag(at)) {
+        .identifier => {
+            const record = self.declarationAt(file, at) orelse return null;
+            switch (record.kind) {
+                .variable => return self.infoSubject(file, constInit(tree, record) orelse return null, depth + 1),
+                .capture => {
+                    // `switch (@typeInfo(S)) { .@"struct" => |info| ... }`
+                    var up = record.node;
+                    const case = while (true) {
+                        if (tree.fullSwitchCase(up)) |found| break found;
+                        up = model.parentOf(up) orelse return null;
+                    };
+                    if (case.payload_token == null or case.payload_token.? + @intFromBool(tree.tokenTag(case.payload_token.?) == .asterisk) != record.token) return null;
+                    const choice = tree.fullSwitch(model.parentOf(up) orelse return null) orelse return null;
+                    return typeInfoOperand(tree, choice.ast.condition);
+                },
+                else => return null,
+            }
+        },
+        .field_access => {
+            const info, const token = tree.nodeData(at).node_and_token;
+            const kind = try self.memberName(tree.tokenSlice(token));
+            if (!std.mem.eql(u8, kind, "struct") and !std.mem.eql(u8, kind, "union") and !std.mem.eql(u8, kind, "enum")) return null;
+            const inner = ungrouped(tree, info);
+            if (typeInfoOperand(tree, inner)) |subject| return subject;
+            if (tree.nodeTag(inner) != .identifier) return null;
+            const record = self.declarationAt(file, inner) orelse return null;
+            if (record.kind != .variable) return null;
+            return typeInfoOperand(tree, ungrouped(tree, constInit(tree, record) orelse return null));
+        },
+        else => return null,
+    }
+}
+
+/// `S` of `@typeInfo(S)`.
+fn typeInfoOperand(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    return if (args.len == 1) args[0] else null;
+}
+
+/// Whether `@field(holder, name)`, the name one of `names`' subject's field names, names no
+/// declaration: the holder is the subject itself, a value of it (`@TypeOf(holder)` is the
+/// subject, or the holder is declared of it or a pointer to it), or its tag type
+/// (`info.tag_type`); Zig refuses a declaration named as a field or a tag of its container.
+fn namesNoDeclaration(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, names: NamesOf) bool {
+    const tree = &self.project.at(file).file.tree;
+    const h = ungrouped(tree, holder);
+    if (self.sameName(file, h, ungrouped(tree, names.subject))) return true;
+    const subject = self.throughConsts(file, names.subject);
+    if (self.sameName(file, h, subject)) return true;
+    if (typeOfOperand(tree, subject)) |operand| {
+        if (self.sameName(file, h, ungrouped(tree, operand))) return true;
+        // `@TypeOf(out.*)`: `out` points at the value.
+        if (tree.nodeTag(operand) == .deref and self.sameName(file, h, ungrouped(tree, tree.nodeData(operand).node))) return true;
+    }
+    // A field declared of the subject (`value: @TypeOf(value)`) read off a value.
+    if (tree.nodeTag(h) == .field_access) {
+        const of, const member_token = tree.nodeData(h).node_and_token;
+        const field = self.fieldTypeNode(file, ungrouped(tree, of), tree.tokenSlice(member_token)) orelse return false;
+        if (field.file != file) return false;
+        return self.sameWrittenType(file, field.node, names.subject);
+    }
+    if (tree.nodeTag(h) != .identifier) return false;
+    const record = self.declarationAt(file, h) orelse return false;
+    switch (record.kind) {
+        .parameter => if (self.parameterTypeNode(.{ .file = file, .index = (self.project.at(file).model.reference(h) orelse return false).declaration.? })) |t| {
+            if (self.sameName(file, writtenPointee(tree, t), subject)) return true;
+        },
+        .variable => if (tree.fullVarDecl(record.node)) |variable| {
+            if (variable.ast.type_node.unwrap()) |t| if (self.sameName(file, writtenPointee(tree, t), subject)) return true;
+            if (self.tagTypeOf(file, variable.ast.init_node.unwrap() orelse return false, names.info)) return true;
+        },
+        .capture => {
+            // `if (info.tag_type) |Tag|`
+            var up = record.node;
+            while (true) {
+                if (tree.fullIf(up)) |branch| {
+                    if (branch.payload_token == record.token) return self.tagTypeOf(file, branch.ast.cond_expr, names.info);
+                    return false;
+                }
+                up = self.project.at(file).model.parentOf(up) orelse return false;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Whether a `@field(holder, name)` stands where `name` is known to be a field of
+/// `@TypeOf(holder)`: in the `then` of an `if` one of whose `and`ed conditions is
+/// `@hasField(@TypeOf(holder), name)`, or after a statement of a block holding it that refuses
+/// compilation otherwise (`if (!@hasField(@TypeOf(holder), name)) @compileError(…)`, or a
+/// constant `std.meta.fieldIndex(@TypeOf(holder), name) orelse @compileError(…)`). Were the
+/// holder a type, `@TypeOf(holder)` is `type`, which has no field: that instantiation does not
+/// compile, so the name names a field of the value in each one that does, bound or not.
+fn fieldGuarded(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var child = holder;
+    var at = model.parentOf(holder) orelse return false;
+    while (true) {
+        switch (tree.nodeTag(at)) {
+            .fn_decl => return false,
+            else => {},
+        }
+        if (tree.fullIf(at)) |branch| if (branch.ast.then_expr == child and try self.hasFieldOf(file, branch.ast.cond_expr, holder, name, true)) return true;
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.blockStatements(&buffer, at)) |statements| for (statements) |statement| {
+            if (statement == child) break;
+            if (try self.refusesUnlessField(file, statement, holder, name)) return true;
+        };
+        child = at;
+        at = model.parentOf(at) orelse return false;
+    }
+}
+
+/// Whether a statement refuses compilation unless `name` is a field of `@TypeOf(holder)`.
+fn refusesUnlessField(self: *Facts, file: Project.FileId, statement: Ast.Node.Index, holder: Ast.Node.Index, name: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.fullIf(statement)) |branch| {
+        if (branch.ast.else_expr != .none) return false;
+        const cond = ungrouped(tree, branch.ast.cond_expr);
+        if (tree.nodeTag(cond) != .bool_not) return false;
+        return refuses(tree, branch.ast.then_expr) and try self.hasFieldOf(file, tree.nodeData(cond).node, holder, name, false);
+    }
+    const variable = tree.fullVarDecl(statement) orelse return false;
+    var init = ungrouped(tree, variable.ast.init_node.unwrap() orelse return false);
+    if (tree.nodeTag(init) == .@"comptime") init = ungrouped(tree, tree.nodeData(init).node);
+    if (tree.nodeTag(init) != .@"orelse") return false;
+    const index, const otherwise = tree.nodeData(init).node_and_node;
+    if (!refuses(tree, otherwise)) return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, ungrouped(tree, index)) orelse return false;
+    if (call.ast.params.len != 2) return false;
+    const callee = switch (try self.resolve(file, call.ast.fn_expr)) {
+        .function => |decl| decl,
+        else => return false,
+    };
+    const field_index = switch (try self.stdMember(&.{ "meta", "fieldIndex" })) {
+        .function => |decl| decl,
+        else => return false,
+    };
+    if (!std.meta.eql(callee, field_index)) return false;
+    return self.ownType(file, call.ast.params[0], holder) and self.sameNameOrText(file, call.ast.params[1], name);
+}
+
+/// Whether `node` is `@compileError(…)`, alone or as a block's only statement.
+fn refuses(tree: *const Ast, node: Ast.Node.Index) bool {
+    var at = ungrouped(tree, node);
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, at)) |statements| {
+        if (statements.len != 1) return false;
+        at = ungrouped(tree, statements[0]);
+    }
+    return isBuiltin(tree, at, "@compileError");
+}
+
+/// Whether `cond` is, or (with `conjuncts`) `and`s, `@hasField(@TypeOf(holder), name)`.
+fn hasFieldOf(self: *Facts, file: Project.FileId, cond: Ast.Node.Index, holder: Ast.Node.Index, name: Ast.Node.Index, conjuncts: bool) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, cond);
+    if (conjuncts and tree.nodeTag(at) == .bool_and) {
+        const left, const right = tree.nodeData(at).node_and_node;
+        return try self.hasFieldOf(file, left, holder, name, true) or try self.hasFieldOf(file, right, holder, name, true);
+    }
+    if (!isBuiltin(tree, at, "@hasField")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, at, &buffer);
+    return args.len == 2 and self.ownType(file, args[0], holder) and self.sameNameOrText(file, args[1], name);
+}
+
+/// Whether `node` is `@TypeOf(holder)`, in place or through constants.
+fn ownType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, holder: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    const operand = typeOfOperand(tree, self.throughConsts(file, node)) orelse return false;
+    return self.sameName(file, ungrouped(tree, operand), ungrouped(tree, holder));
+}
+
+/// Whether two names name one declaration, or are one string literal.
+fn sameNameOrText(self: *const Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    const one = ungrouped(tree, a);
+    const other = ungrouped(tree, b);
+    if (self.sameName(file, one, other)) return true;
+    return tree.nodeTag(one) == .string_literal and tree.nodeTag(other) == .string_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(one)), tree.tokenSlice(tree.nodeMainToken(other)));
+}
+
+/// The type written for field `name` of what `of` is declared as (a parameter or a variable
+/// of a container type, or a pointer to one), with its file.
+fn fieldTypeNode(self: *Facts, file: Project.FileId, of: Ast.Node.Index, name: []const u8) ?Key {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(of) != .identifier) return null;
+    const d = (self.project.at(file).model.reference(of) orelse return null).declaration orelse return null;
+    const record = self.project.at(file).model.declarations[@backingInt(d)];
+    const declared_as = switch (record.kind) {
+        .parameter => self.parameterTypeNode(.{ .file = file, .index = d }) orelse return null,
+        .variable => (tree.fullVarDecl(record.node) orelse return null).ast.type_node.unwrap() orelse return null,
+        else => return null,
+    };
+    const container = switch (self.resolve(file, writtenPointee(tree, declared_as)) catch return null) {
+        .container => |k| k,
+        else => return null,
+    };
+    const field = self.member(container, name) orelse return null;
+    const field_record = self.project.at(field.file).model.declarations[@backingInt(field.index)];
+    if (field_record.kind != .field) return null;
+    const field_tree = &self.project.at(field.file).file.tree;
+    const declared = field_tree.fullContainerField(field_record.node) orelse return null;
+    return .{ .file = field.file, .node = declared.ast.type_expr.unwrap() orelse return null };
+}
+
+/// Whether two type expressions of one file name one type by how they are written: one name,
+/// or `@TypeOf` of one name.
+fn sameWrittenType(self: *Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    const one = self.throughConsts(file, a);
+    const other = self.throughConsts(file, b);
+    if (self.sameName(file, one, other)) return true;
+    const x = typeOfOperand(tree, one) orelse return false;
+    const y = typeOfOperand(tree, other) orelse return false;
+    return self.sameName(file, ungrouped(tree, x), ungrouped(tree, y));
+}
+
+/// Whether `node` is the tag type of the information `info` (`info.tag_type`, `.?`, or the
+/// left of `orelse`).
+fn tagTypeOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, info: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    var at = ungrouped(tree, node);
+    while (true) switch (tree.nodeTag(at)) {
+        .unwrap_optional => at = ungrouped(tree, tree.nodeData(at).node_and_token[0]),
+        .@"orelse" => at = ungrouped(tree, tree.nodeData(at).node_and_node[0]),
+        else => break,
+    };
+    if (tree.nodeTag(at) != .field_access) return false;
+    const of, const token = tree.nodeData(at).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(token), "tag_type")) return false;
+    return self.sameName(file, ungrouped(tree, of), ungrouped(tree, info));
+}
+
+/// What a type written as `node` points at or holds: `*S`, `*const S`, `?S`, `[]S` give `S`.
+fn writtenPointee(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var at = ungrouped(tree, node);
+    while (true) {
+        if (tree.fullPtrType(at)) |pointer| {
+            at = ungrouped(tree, pointer.ast.child_type);
+            continue;
+        }
+        if (tree.nodeTag(at) == .optional_type) {
+            at = ungrouped(tree, tree.nodeData(at).node);
+            continue;
+        }
+        return at;
+    }
+}
+
+/// `node` with the constants that name it followed (`const T = @TypeOf(value)` gives
+/// `@TypeOf(value)`).
+fn throughConsts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Ast.Node.Index {
+    const tree = &self.project.at(file).file.tree;
+    var at = ungrouped(tree, node);
+    var depth: usize = 0;
+    while (depth < 8) : (depth += 1) {
+        if (tree.nodeTag(at) != .identifier) return at;
+        const record = self.declarationAt(file, at) orelse return at;
+        if (record.kind != .variable) return at;
+        at = ungrouped(tree, constInit(tree, record) orelse return at);
+    }
+    return at;
+}
+
+/// `y` of `@TypeOf(y)`.
+fn typeOfOperand(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@TypeOf")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, node, &buffer);
+    return if (args.len == 1) args[0] else null;
+}
+
+/// Whether two names name one declaration, or two member reads one member of one such name
+/// (`Container.asn1_tags`): what `@TypeOf` gives of them is one type.
+fn sameName(self: *const Facts, file: Project.FileId, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(a) == .field_access and tree.nodeTag(b) == .field_access) {
+        const one, const one_member = tree.nodeData(a).node_and_token;
+        const other, const other_member = tree.nodeData(b).node_and_token;
+        return std.mem.eql(u8, tree.tokenSlice(one_member), tree.tokenSlice(other_member)) and self.sameName(file, ungrouped(tree, one), ungrouped(tree, other));
+    }
+    if (tree.nodeTag(a) != .identifier or tree.nodeTag(b) != .identifier) return false;
+    const model = &self.project.at(file).model;
+    const one = (model.reference(a) orelse return false).declaration orelse return false;
+    const other = (model.reference(b) orelse return false).declaration orelse return false;
+    return one == other;
+}
+
+/// The declaration a name refers to, in its file.
+fn declarationAt(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Model.Declaration {
+    const model = &self.project.at(file).model;
+    const d = (model.reference(node) orelse return null).declaration orelse return null;
+    return model.declarations[@backingInt(d)];
+}
+
+/// What a `const` declaration is initialized with; null for a `var`.
+fn constInit(tree: *const Ast, record: Model.Declaration) ?Ast.Node.Index {
+    const variable = tree.fullVarDecl(record.node) orelse return null;
+    if (tree.tokenTag(variable.ast.mut_token) != .keyword_const) return null;
+    return variable.ast.init_node.unwrap();
+}
+
+/// The input a `for` capture takes, by its position among the captures.
+fn loopInput(self: *const Facts, file: Project.FileId, record: Model.Declaration) ?Ast.Node.Index {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = record.node;
+    const loop = while (true) {
+        if (tree.fullFor(at)) |found| break found;
+        at = model.parentOf(at) orelse return null;
+    };
+    const position = Model.capturePosition(tree, loop, record.token) orelse return null;
+    return if (position < loop.ast.inputs.len) loop.ast.inputs[position] else null;
+}
+
+/// The names of a container's fields.
+fn fieldNames(self: *Facts, container: Container) []const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    const model = &self.project.at(container.file).model;
+    for (model.declarations) |record| if (record.scope == container.scope and record.kind == .field) names.append(self.gpa, record.name) catch return names.items;
+    return names.items;
+}
+
+/// Reaches every function and container-level constant named `name`.
+fn reachNamed(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), name: []const u8) ResolveError!void {
+    if (self.declarations_named == null) {
+        var index: std.StringHashMapUnmanaged(std.ArrayList(Decl)) = .empty;
+        for (self.project.sources) |*source| for (source.model.declarations, 0..) |record, d| {
+            if (record.kind != .function and record.kind != .variable) continue;
+            const entry = try index.getOrPut(self.gpa, record.name);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(self.gpa, .{ .file = source.id, .index = @fromBackingInt(@intCast(d)) });
+        };
+        self.declarations_named = index;
+    }
+    const decls = self.declarations_named.?.get(name) orelse return;
+    for (decls.items) |decl| try self.reachDeclaration(found, next, decl, null);
+}
+
+/// The part of a file Zig analyzes as one that holds `node`: its function (`fn_decl`, or an
+/// `extern` prototype), its container-level constant (with the fields and members of a
+/// container it declares outside their own functions and constants), its container-level
+/// `comptime` block, or its test. Null: the file's own fields and loose parts.
+fn partOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = node;
+    while (true) {
+        switch (tree.nodeTag(at)) {
+            .fn_decl, .test_decl => return at,
+            .@"comptime" => if (containerLevel(tree, model, at)) return at,
+            else => {
+                if (tree.fullVarDecl(at) != null and containerLevel(tree, model, at)) return at;
+                var buffer: [1]Ast.Node.Index = undefined;
+                if (tree.fullFnProto(&buffer, at)) |proto| if (proto.name_token != null and containerLevel(tree, model, at)) return at;
+            },
+        }
+        at = model.parentOf(at) orelse return null;
+        if (at == .root) return null;
+    }
+}
+
+/// Whether a declaration or a block is a member of a container: the file's or one written.
+fn containerLevel(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+    const parent = model.parentOf(node) orelse return true;
+    if (parent == .root) return true;
+    var buffer: [2]Ast.Node.Index = undefined;
+    return tree.fullContainerDecl(&buffer, parent) != null;
+}
+
+/// A file's parts (`partOf`) with their nodes, and the part each function and container-level
+/// constant is, found once.
+fn partsOf(self: *Facts, file: Project.FileId) ResolveError!*const FileParts {
+    const entry = try self.file_parts.getOrPut(self.gpa, file);
+    if (entry.found_existing) return entry.value_ptr;
+    entry.value_ptr.* = .{};
+    const tree = &self.project.at(file).file.tree;
+    for (1..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const group = try entry.value_ptr.nodes.getOrPut(self.gpa, self.partOf(file, node) orelse .root);
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        try group.value_ptr.append(self.gpa, node);
+    }
+    const model = &self.project.at(file).model;
+    for (model.declarations, 0..) |record, d| {
+        if (record.kind != .function and record.kind != .variable) continue;
+        const part = self.partOf(file, record.node) orelse continue;
+        const is_own = switch (tree.nodeTag(part)) {
+            .fn_decl => record.kind == .function and model.parentOf(record.node) == part,
+            else => part == record.node,
+        };
+        if (is_own) try entry.value_ptr.declared.put(self.gpa, part, @fromBackingInt(@intCast(d)));
+    }
+    return entry.value_ptr;
+}
+
+/// The reading the call at `node` in `file` makes of `decl`, made in `env`: none where `env`
+/// is none, an `@call`'s arguments are not known, or the chain is past 32 calls deep (each
+/// binding's then).
+pub fn readingAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index, decl: Decl, env: ?*const Env) ResolveError!?*const Env {
+    const outer = env orelse return null;
+    if (outer.depth >= 32) return null;
+    return self.readingFrom(file, node, decl, outer);
+}
+
+/// The reading the call at `node` makes of `decl`, made in `outer` or in none (a function read
+/// once), at any depth (the walk bounds a declaration's readings by number): none where an
+/// `@call`'s arguments are not known.
+pub fn readingFrom(self: *Facts, file: Project.FileId, node: Ast.Node.Index, decl: Decl, outer: ?*const Env) ResolveError!?*const Env {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    if (tree.fullCall(&buffer, node)) |call| return try self.bind(file, call, decl, outer);
+    // `@call`: its callee and its tuple's elements, which bind no receiver.
+    const call = (try calls.under(self, outer, file, node)) orelse return null;
+    if (call.args != .known or call.receiver != .none) return null;
+    return try self.bindTo(file, call.callee_expr, call.args.known, decl, outer);
+}
+
+/// Whether `node`, read in `env`, is a value, never a type, whatever its type: an address, a
+/// dereference, a slice or a literal; a runtime `var` (Zig refuses one of type `type`); a
+/// parameter neither `comptime` nor `anytype` (a `type` one must be `comptime`), or an
+/// `anytype` one the reading binds to a value; a constant a value initializes, every branch
+/// of a `switch` or an `if` a value; a field of a value (`@field(value, name)`).
+fn valueIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!bool {
+    if (depth > 16) return false;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = node;
+    while (tree.nodeTag(at) == .grouped_expression) at = tree.nodeData(at).node_and_token[0];
+    switch (tree.nodeTag(at)) {
+        .address_of, .deref, .slice, .slice_open, .slice_sentinel, .string_literal, .multiline_string_literal, .number_literal, .char_literal => return true,
+        .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma => return true,
+        .identifier => {},
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@field")) return false;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, at, &buffer);
+            return args.len == 2 and try self.valueIn(env, file, args[0], depth + 1);
+        },
+        else => {
+            if (tree.fullSwitch(at)) |choice| {
+                for (choice.ast.cases) |case_node| {
+                    const case = tree.fullSwitchCase(case_node) orelse return false;
+                    if (!try self.valueIn(env, file, case.ast.target_expr, depth + 1)) return false;
+                }
+                return true;
+            }
+            if (tree.fullIf(at)) |branch| {
+                const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+                return try self.valueIn(env, file, branch.ast.then_expr, depth + 1) and try self.valueIn(env, file, otherwise, depth + 1);
+            }
+            return false;
+        },
+    }
+    const d = (model.reference(at) orelse return false).declaration orelse return false;
+    const record = model.declarations[@backingInt(d)];
+    switch (record.kind) {
+        .variable => {
+            const variable = tree.fullVarDecl(record.node) orelse return false;
+            if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return variable.comptime_token == null;
+            const init = variable.ast.init_node.unwrap() orelse return false;
+            return self.valueIn(env, file, init, depth + 1);
+        },
+        .parameter => {
+            const function = self.functionOf(.{ .file = file, .index = d }) orelse return false;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const proto = tree.fullFnProto(&buffer, model.declarations[@backingInt(function.index)].node) orelse return false;
+            var it = proto.iterate(tree);
+            const position = while (it.next()) |param| {
+                if (param.name_token != record.token) continue;
+                if (param.type_expr != null) {
+                    const marked = param.comptime_noalias orelse return true;
+                    return tree.tokenTag(marked) != .keyword_comptime;
+                }
+                break self.parameterPosition(file, function, record.token) orelse return false;
+            } else return false;
+            // `anytype`: a value where the reading binding it was handed one, by the
+            // argument's expression in the reading its call is in (`Env.values`).
+            var reading = env;
+            while (reading) |r| : (reading = r.outer) {
+                if (!std.meta.eql(r.function, function)) continue;
+                if (position >= r.values.len) return false;
+                return r.values[position];
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// The struct whose field names `node` ranges over: a `for`'s only capture over
@@ -3603,16 +4844,18 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
     const args = try self.gpa.alloc(Value, call.ast.params.len);
     const truths = try self.gpa.alloc(?bool, call.ast.params.len);
     const spelled = try self.gpa.alloc(?Spelled, call.ast.params.len);
-    for (call.ast.params, args, truths, spelled, 0..) |param, *arg, *t, *spelling, position| {
+    const values = try self.gpa.alloc(bool, call.ast.params.len);
+    for (call.ast.params, args, truths, spelled, values, 0..) |param, *arg, *t, *spelling, *value, position| {
         spelling.* = try self.spelledIn(outer_env, made.file, param);
         const changed = try self.passedOnChanged(made.function, position);
+        value.* = !changed and try self.valueIn(outer_env, made.file, param, 0);
         arg.* = if (changed)
             .{ .unknown = .comptime_dependent }
         else
             try self.boundArgument(if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param));
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
-    return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .nested = if (outer_env) |e| e.nested else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled });
+    return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .nested = if (outer_env) |e| e.nested else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled, .values = values });
 }
 
 fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveError!bool {
@@ -3802,22 +5045,9 @@ fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.f
     }
     if (subject.reflected.at != .info) return null;
     // A pointer (a slice among them), an optional, an error union or a function type is of
-    // its kind whatever it holds (`std.meta.Child(*const T)`).
-    const kind: []const u8 = switch (subject.reflected.of.*) {
-        .container => |container| switch (self.kindOf(container) orelse return null) {
-            .keyword_struct => "struct",
-            .keyword_union => "union",
-            .keyword_enum => "enum",
-            .keyword_opaque => "opaque",
-            else => return null,
-        },
-        .pointer => "pointer",
-        .optional => "optional",
-        .error_union => "error_union",
-        .fn_type => "fn",
-        .array => "array",
-        else => return null,
-    };
+    // its kind whatever it holds (`std.meta.Child(*const T)`), a primitive of its own
+    // (`kindOfType`); an array may be a vector, so it takes either prong.
+    const kind = if (subject.reflected.of.* == .array) "array" else (try self.kindOfType(subject.reflected.of.*)) orelse return null;
     const one = (try self.prongOf(tree, whole, kind)) orelse return null;
     if (!std.mem.eql(u8, kind, "array")) return .{ .one = one };
     return .{ .one = one, .other = (try self.prongOf(tree, whole, "vector")) orelse return null };
@@ -3858,6 +5088,56 @@ fn prongOf(self: *Facts, tree: *const Ast, whole: Ast.full.Switch, kind: []const
         }
     }
     return otherwise;
+}
+
+/// The `std.builtin.Type` tag of a type, where its kind is known. A pointer (a slice among them),
+/// an optional, an error union or a function type is of its kind whatever it holds
+/// (`std.meta.Child(*const T)`). An array is not: a vector reads as one. A value of a type in a
+/// type's place (a field's type read as what it holds) is of its kind.
+fn kindOfType(self: *Facts, of: Value) ResolveError!?[]const u8 {
+    return switch (of) {
+        .container, .instance => |container| switch (self.kindOf(container) orelse return null) {
+            .keyword_struct => "struct",
+            .keyword_union => "union",
+            .keyword_enum => "enum",
+            .keyword_opaque => "opaque",
+            else => null,
+        },
+        .pointer => "pointer",
+        .optional => "optional",
+        .error_union => "error_union",
+        .fn_type, .function => "fn",
+        .primitive => |name| primitiveKind(name),
+        else => null,
+    };
+}
+
+/// The `std.builtin.Type` tag a primitive type is of (`u8` an `int`), null where the name is none.
+fn primitiveKind(name: []const u8) ?[]const u8 {
+    const named = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "bool", "bool" },                     .{ "void", "void" },          .{ "type", "type" },
+        .{ "noreturn", "noreturn" },             .{ "anyopaque", "opaque" },   .{ "comptime_int", "comptime_int" },
+        .{ "comptime_float", "comptime_float" }, .{ "anyerror", "error_set" }, .{ "usize", "int" },
+        .{ "isize", "int" },                     .{ "c_char", "int" },         .{ "c_short", "int" },
+        .{ "c_ushort", "int" },                  .{ "c_int", "int" },          .{ "c_uint", "int" },
+        .{ "c_long", "int" },                    .{ "c_ulong", "int" },        .{ "c_longlong", "int" },
+        .{ "c_ulonglong", "int" },               .{ "c_longdouble", "float" }, .{ "f16", "float" },
+        .{ "f32", "float" },                     .{ "f64", "float" },          .{ "f80", "float" },
+        .{ "f128", "float" },
+    });
+    if (named.get(name)) |kind| return kind;
+    // `u0` to `u65535` and `i0` to `i65535`.
+    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return null;
+    _ = std.fmt.parseInt(u16, name[1..], 10) catch return null;
+    return "int";
+}
+
+/// Whether `node` is `@typeInfo(...)`.
+fn isTypeInfo(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo"),
+        else => false,
+    };
 }
 
 /// What a `null` or an error value among a value's branches or breaks adds to the others:
@@ -4322,8 +5602,9 @@ fn sameInstantiation(a: *const Env, b: *const Env, depth: usize) bool {
 
 /// Whether two readings' arguments are the same as conditions and as spelled names and numbers.
 fn sameComptime(a: Env, b: Env) bool {
-    if (a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
+    if (a.truths.len != b.truths.len or a.spelled.len != b.spelled.len or a.values.len != b.values.len) return false;
     for (a.truths, b.truths) |one, other| if (one != other) return false;
+    if (!std.mem.eql(bool, a.values, b.values)) return false;
     for (a.spelled, b.spelled) |one, other| {
         if ((one == null) != (other == null)) return false;
         const x = one orelse continue;
@@ -4374,8 +5655,9 @@ pub fn template(self: *Facts, decl: Decl) ResolveError!?Value {
     // A type function that returns another's call is read through it; one that reaches itself
     // again that way makes no container.
     try self.templates.put(self.gpa, decl, null);
+    const wide = self.wide;
     const found = try self.findTemplate(decl);
-    try self.templates.put(self.gpa, decl, found);
+    if (!self.wideSince(wide)) try self.templates.put(self.gpa, decl, found) else _ = self.templates.remove(decl);
     return found;
 }
 fn findTemplate(self: *Facts, decl: Decl) ResolveError!?Value {
@@ -5293,6 +6575,7 @@ fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
 /// so one rule's state is never another's. It lives as long as the run.
 pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     const key = comptime std.hash.Wyhash.hash(0, @typeName(T));
+    if (self.walk != null) try self.walked.put(self.gpa, key, {});
     const entry = try self.memos.getOrPut(self.gpa, key);
     if (!entry.found_existing) {
         const made = try self.gpa.create(T);
@@ -5913,15 +7196,15 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             if (std.mem.eql(u8, name, "child")) return self.pointee(r.of.*, {});
             // Its size: one item, many, a slice or a C pointer (`info.size`), as the type says.
             if (std.mem.eql(u8, name, "size")) return .{ .reflected = .{ .of = r.of, .at = .size } };
-            return unsupported;
+            return self.reflectedField(r.at, name);
         },
-        .optional => return if (std.mem.eql(u8, name, "child")) self.payload(r.of.*, .optional) else unsupported,
-        .error_union => return if (std.mem.eql(u8, name, "payload")) self.payload(r.of.*, .error_union) else unsupported,
-        .array => return if (std.mem.eql(u8, name, "child")) self.indexed(r.of.*, {}) else unsupported,
+        .optional => return if (std.mem.eql(u8, name, "child")) self.payload(r.of.*, .optional) else self.reflectedField(r.at, name),
+        .error_union => return if (std.mem.eql(u8, name, "payload")) self.payload(r.of.*, .error_union) else self.reflectedField(r.at, name),
+        .array => return if (std.mem.eql(u8, name, "child")) self.indexed(r.of.*, {}) else self.reflectedField(r.at, name),
         .function => {
+            if (!std.mem.eql(u8, name, "param_types") and !std.mem.eql(u8, name, "return_type")) return self.reflectedField(r.at, name);
             const proto = self.prototype(r.of.*) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
             if (std.mem.eql(u8, name, "param_types")) return .{ .reflected = .{ .of = r.of, .at = .params } };
-            if (!std.mem.eql(u8, name, "return_type")) return unsupported;
             // `?type`: null for a result that depends on an argument.
             const result = try self.resultOf(proto);
             if (result == .unknown) return result;
@@ -5938,18 +7221,154 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return try self.pointerTo(.scalar, .slice);
             if (std.mem.eql(u8, name, "is_tuple") and r.at == .structure) return .scalar;
             if (std.mem.eql(u8, name, "tag_type") and r.at != .structure) return self.tagType(container, r.at == .tagged);
-            return unsupported;
+            return self.reflectedField(r.at, name);
         },
         // A pointer's size is a tag, which has no fields.
         .params, .part, .size => return unsupported,
     }
 }
 
+/// A field of type information no rule above reads, whatever type it describes: a value of
+/// the type `std.builtin.Type` declares it (`@typeInfo(T).pointer.size` a `Type.Pointer.Size`,
+/// `.@"struct".layout` a `Type.ContainerLayout`), where the project maps std.
+fn reflectedField(self: *Facts, at: @FieldType(Reflected, "at"), name: []const u8) ResolveError!Value {
+    const tag: []const u8 = switch (at) {
+        .pointer => "pointer",
+        .optional => "optional",
+        .array => "array",
+        .error_union => "error_union",
+        .function => "fn",
+        .structure => "struct",
+        .tagged => "union",
+        .enumeration => "enum",
+        .info, .params, .part, .size => return .{ .unknown = .unsupported },
+    };
+    // The information is a `Type` value: its field `tag` holds a value of the kind's own type.
+    const kind = try self.memberValue(try self.instance(try self.stdMember(&.{ "builtin", "Type" })), tag);
+    if (kind == .unknown) return kind;
+    return self.memberValue(kind, name);
+}
+
+/// What `info.is_tuple` is on the reading `env` binds, where `node` is one and `info` a
+/// struct's type information: whether its fields are unnamed (`struct { u32, u8 }`; Zig refuses
+/// a struct with both). Null where it is not a struct's, or the struct is not known.
+fn isTuple(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .field_access) return null;
+    const holder, const name = tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(name), "is_tuple")) return null;
+    const info = try self.resolveIn(env, file, holder);
+    if (info != .reflected or info.reflected.at != .structure) return null;
+    // A type function's container writes its fields named or not whatever it is made with.
+    const container = self.reflectedContainer(info.reflected) orelse return null;
+    const scope_node = self.project.at(container.file).model.scopes[@backingInt(container.scope)].node;
+    if (scope_node == .root) return false;
+    const held = self.syntaxOf(container.file);
+    var buffer: [2]Ast.Node.Index = undefined;
+    const full = held.fullContainerDecl(&buffer, scope_node) orelse return null;
+    for (full.ast.members) |item| {
+        const field = self.project.at(container.file).model.containerField(held, item) orelse continue;
+        return field.ast.tuple_like;
+    }
+    return false;
+}
+
+/// Whether `@typeInfo(X) == .tag`, either way round, holds on the reading `env` binds: the
+/// kind of type `X` is (`takenProng`'s) is that tag. Null where neither side is so written or
+/// `X`'s kind is not known.
+fn kindCompared(self: *Facts, env: ?*const Env, file: Project.FileId, left: Ast.Node.Index, right: Ast.Node.Index) ResolveError!?bool {
+    const tree = &self.project.at(file).file.tree;
+    const info, const tag = if (isTypeInfo(tree, left) and tree.nodeTag(right) == .enum_literal)
+        .{ left, right }
+    else if (isTypeInfo(tree, right) and tree.nodeTag(left) == .enum_literal)
+        .{ right, left }
+    else
+        return null;
+    const subject = try self.resolveIn(env, file, info);
+    if (subject != .reflected or subject.reflected.at != .info) return null;
+    const kind = (try self.kindOfType(subject.reflected.of.*)) orelse return null;
+    return std.mem.eql(u8, kind, try self.memberName(tree.tokenSlice(tree.nodeMainToken(tag))));
+}
+
+/// What a call to a function returning `bool` gives on the reading `env` binds, where its body
+/// decides it as the program compiles (`std.meta.hasFn(T, "jsonParse")`): its statements read
+/// in the reading the call makes, each `if` and `switch` there settled by its bindings, up to
+/// the `return` taken. Null where a statement it may return past is not settled.
+fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    _ = tree.fullCall(&buffer, node) orelse return null;
+    if (env) |e| if (e.depth >= 8) return null;
+    const read = (try calls.under(self, env, file, node)) orelse return null;
+    const decl = switch (read.callee) {
+        .function => |d| d,
+        else => return null,
+    };
+    const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const held = &self.project.at(decl.file).file.tree;
+    // A function's declaration is its prototype, its body the `fn_decl` holding it.
+    const whole = if (held.nodeTag(record.node) == .fn_decl) record.node else self.project.at(decl.file).model.parentOf(record.node) orelse return null;
+    if (held.nodeTag(whole) != .fn_decl) return null;
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = held.fullFnProto(&proto_buffer, record.node) orelse return null;
+    const result = proto.ast.return_type.unwrap() orelse return null;
+    if (held.nodeTag(result) != .identifier or !std.mem.eql(u8, held.tokenSlice(held.nodeMainToken(result)), "bool")) return null;
+    const bound = (try self.readingFrom(file, node, decl, env)) orelse return null;
+    return switch (try self.decidedReturn(bound, decl.file, held.nodeData(whole).node_and_node[1])) {
+        .returns => |value| value,
+        .falls, .unknown => null,
+    };
+}
+
+/// What a statement read on `env` does as the program compiles: returns a known `bool`, falls
+/// through to the next, or is not known to do either.
+const Decided = union(enum) { returns: bool, falls, unknown };
+
+fn decidedReturn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Decided {
+    const tree = &self.project.at(file).file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.blockStatements(&buffer, node)) |statements| {
+        for (statements) |statement| switch (try self.decidedReturn(env, file, statement)) {
+            .falls => continue,
+            else => |decided| return decided,
+        };
+        return .falls;
+    }
+    if (tree.nodeTag(node) == .@"return") {
+        const value = tree.nodeData(node).opt_node.unwrap() orelse return .unknown;
+        return if (try self.comptimeTruth(env, file, value)) |known| .{ .returns = known } else .unknown;
+    }
+    const unsettled: Decided = if (returnsWithin(tree, node)) .unknown else .falls;
+    if (tree.fullIf(node)) |branch| {
+        if (branch.payload_token != null or branch.error_token != null) return unsettled;
+        const taken = (try self.comptimeTruth(env, file, branch.ast.cond_expr)) orelse return unsettled;
+        if (taken) return self.decidedReturn(env, file, branch.ast.then_expr);
+        return if (branch.ast.else_expr.unwrap()) |otherwise| self.decidedReturn(env, file, otherwise) else .falls;
+    }
+    if (tree.fullSwitch(node)) |choice| {
+        const taken = (try self.takenProng(env, file, choice)) orelse return unsettled;
+        // An array may take a vector's prong too: decided only where one is taken.
+        if (taken.other != null) return unsettled;
+        return self.decidedReturn(env, file, tree.fullSwitchCase(choice.ast.cases[taken.one]).?.ast.target_expr); // unreachable: a switch's cases are cases
+    }
+    return unsettled;
+}
+
+/// Whether `node` holds a `return`.
+fn returnsWithin(tree: *const Ast, node: Ast.Node.Index) bool {
+    for (tree.firstToken(node)..tree.lastToken(node) + 1) |token| {
+        if (tree.tokenTag(@intCast(token)) == .keyword_return) return true;
+    }
+    return false;
+}
+
 /// The container a reflection of a struct, a union or an enum is of, where it is one of
 /// that kind.
 fn reflectedContainer(self: *const Facts, r: Reflected) ?Container {
     const container = switch (r.of.*) {
-        .container => |c| c,
+        // `@typeInfo` takes a type: a value of one in its place (a field's type read as what it
+        // holds) is that type.
+        .container, .instance => |c| c,
         else => return null,
     };
     const kind = self.kindOf(container) orelse return null;
@@ -6094,6 +7513,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     // reading `Elem` of `MultiArrayList(Elem)`), else the calling one.
     var outer = self.enclosingReading(env, decl);
     var spelled: std.ArrayList(?Spelled) = .empty;
+    var values: std.ArrayList(bool) = .empty;
     // A method called on a value takes that value as its first parameter.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const receiver = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
@@ -6117,14 +7537,16 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
             try spelled.append(self.gpa, null);
+            try values.append(self.gpa, try self.valueIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0], 0));
         }
     }
     for (call.ast.params) |arg| {
         try args.append(self.gpa, try self.boundArgument(try self.resolveIn(env, file, arg)));
         try truths.append(self.gpa, self.truth(env, file, arg));
         try spelled.append(self.gpa, try self.spelledIn(env, file, arg));
+        try values.append(self.gpa, try self.valueIn(env, file, arg, 0));
     }
-    const bound = try self.keptReading(.{ .function = decl, .args = args.items, .depth = depth, .nested = nested, .truths = truths.items, .outer = outer, .spelled = spelled.items });
+    const bound = try self.keptReading(.{ .function = decl, .args = args.items, .depth = depth, .nested = nested, .truths = truths.items, .outer = outer, .spelled = spelled.items, .values = values.items });
     const result_tree = target_tree;
     if (returns_type) {
         const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
@@ -6265,6 +7687,7 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
     var args: std.ArrayList(Value) = .empty;
     var truths: std.ArrayList(?bool) = .empty;
     var spelled: std.ArrayList(?Spelled) = .empty;
+    var values: std.ArrayList(bool) = .empty;
     var reading = self.enclosingReading(outer, function);
     // Whether the arguments stand in the callee's parameter order: a call not through a member,
     // or one whose holder is known to be a value (bound first) or a type (bound to nothing).
@@ -6281,6 +7704,7 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
             try spelled.append(self.gpa, null);
+            try values.append(self.gpa, try self.valueIn(outer, file, tree.nodeData(fn_expr).node_and_token[0], 0));
             if (h.made_by) |made| reading = try self.madeEnv(made);
             aligned = true;
         }
@@ -6289,12 +7713,13 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         try args.append(self.gpa, try self.boundArgument(try self.resolveIn(outer, file, arg)));
         try truths.append(self.gpa, self.truth(outer, file, arg));
         try spelled.append(self.gpa, try self.spelledIn(outer, file, arg));
+        try values.append(self.gpa, try self.valueIn(outer, file, arg, 0));
     }
-    const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .nested = if (outer) |o| o.nested else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items };
+    const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .nested = if (outer) |o| o.nested else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items, .values = values.items };
     if (!aligned) return self.keptReading(draft);
     // A typed parameter's argument is read in a reading of its own, then given its declared
     // type: what that reading kept is not the one made with it.
-    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .nested = draft.nested, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled });
+    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .nested = draft.nested, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled, .values = draft.values });
     try self.typedArguments(reading_args, function, args.items);
     return self.keptReading(draft);
 }
@@ -6528,9 +7953,11 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     if (self.bound.get(key)) |value| return value;
     if (self.remaining == 0) return .{ .unknown = .budget };
     self.remaining -= 1;
+    const wide = self.wide;
     const value = try self.readBound(e, file, node);
-    // Read with none left, a part of it may have come back unknown(budget): it is not kept.
-    if (self.remaining != 0) try self.bound.put(self.gpa, key, value);
+    // Read with none left, a part of it may have come back unknown(budget): it is not kept;
+    // nor what an answer wider than the built analysis gives was read on (`wideSince`).
+    if (self.remaining != 0 and !self.wideSince(wide)) try self.bound.put(self.gpa, key, value);
     return value;
 }
 
@@ -7081,7 +8508,8 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
 /// Whether code outside the program (std's or a known library's) may call a function named
 /// `name` of the program's: a call through a member so spelled, or through `@field` with a name
 /// that is so spelled or computed, on a receiver that does not resolve to a container of its own
-/// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`.
+/// (a generic's type parameter, `anytype`), as `HashMap` calls its context's `hash`. A call in
+/// code no compilation of the program analyzes (`analyzedAt`) calls nothing.
 fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
     const found = try self.memo(OutsideCalls);
     if (!found.built) {
@@ -7117,14 +8545,18 @@ fn calledOutside(self: *Facts, name: []const u8) ResolveError!bool {
         }
     }
     if (found.verdicts.get(name)) |known| return known;
+    const wide = self.wide;
     var any = false;
     const named = if (found.by_name.get(name)) |list| list.items else &.{};
     for ([_][]const Key{ named, found.computed.items }) |receivers| for (receivers) |receiver| {
+        // A call in code no compilation of the program analyzes calls nothing (std's LLVM
+        // builder's `extra.data.name.slice(…)` for a program that never reaches it).
+        if (!try self.analyzedAt(receiver.file, receiver.node)) continue;
         if (try self.closedField(receiver)) continue;
         if (try self.mayBeProgram(try self.resolve(receiver.file, receiver.node))) any = true;
         if (any) break;
     };
-    try found.verdicts.put(self.gpa, name, any);
+    if (!self.wideSince(wide)) try found.verdicts.put(self.gpa, name, any);
     return any;
 }
 const OutsideCalls = struct {
@@ -9814,7 +11246,7 @@ pub const accesses = struct {
                 // where neither it (a parameter's or a `const` declaration's address) nor the place
                 // the result goes (`[]const u8`) is const.
                 const covered = w.make(node, null, .covered, null);
-                const made = try w.valued(try w.facts.literalType(w.file, node));
+                const made = try w.valued(try w.facts.castTypeIn(null, w.file, node));
                 try w.shapes(covered, if (std.mem.eql(u8, name, "@ptrCast")) held(made) else made, false);
                 if (std.mem.eql(u8, name, "@ptrCast") and args.len == 1 and !w.immutableAddress(args[0]) and !try w.facts.constPointerPlace(w.file, node)) try w.shapes(covered, held(try w.facts.resolve(w.file, uncast(tree, args[0]))), false);
                 return;
@@ -10070,7 +11502,7 @@ pub const accesses = struct {
     };
 
     /// What a holder holds its members in: the value a pointer or an optional of it points at.
-    fn held(value: Facts.Value) Facts.Value {
+    pub fn held(value: Facts.Value) Facts.Value {
         return switch (value) {
             .pointer => |inner| held(inner.child.*),
             .optional => |inner| held(inner.*),
@@ -10088,7 +11520,7 @@ pub const accesses = struct {
 
     /// A pointer past the casts that keep what it points at: `@alignCast`, `@constCast`,
     /// `@volatileCast`, parentheses.
-    fn uncast(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    pub fn uncast(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
         var at = node;
         while (true) switch (tree.nodeTag(at)) {
             .grouped_expression => at = tree.nodeData(at).node_and_token[0],
@@ -10260,12 +11692,14 @@ pub const calls = struct {
     pub fn in(facts: *Facts, file: Project.FileId) Error![]const Call {
         const state = try facts.memo(State);
         if (state.files.get(file)) |kept| return kept;
+        const wide = facts.wide;
         var found: std.ArrayList(Call) = .empty;
         const tree = &facts.project.at(file).file.tree;
         for (0..tree.nodes.len) |i| {
             if (try at(facts, file, @fromBackingInt(@intCast(i)))) |call| try found.append(facts.gpa, call);
         }
-        try state.files.put(facts.gpa, file, found.items);
+        // Read on an answer wider than the analysis gives once built, it is not kept (`wide`).
+        if (!facts.wideSince(wide)) try state.files.put(facts.gpa, file, found.items);
         return found.items;
     }
 
@@ -10520,14 +11954,35 @@ test "a call that passes what a module the build does not have gives binds nothi
 /// `anytype` argument): it is then an anonymous struct. Unknown where the place does not
 /// resolve.
 pub fn literalType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
-    return self.placeType(file, node, 0);
+    return self.placeType(null, file, node, 0);
+}
+
+/// `literalType` in the reading `env` of the function the place is in: each type the place
+/// names read with that reading's bindings (a `comptime T: type` parameter's `*T`, the function's
+/// result in it, a callee's parameter in the reading the call makes).
+pub fn literalTypeIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    return self.placeType(env, file, node, 0);
+}
+
+/// The type a cast at `node` makes (`@ptrCast`, `@bitCast`), in the reading `env`: its place's
+/// (`literalTypeIn`) through the coercions Zig makes to a cast's result location, an error
+/// union's payload and then an optional's (`return @ptrCast(p)` in a function returning
+/// `Error!?*T` makes a `*T`), in each type the place may be. Unknown where the place is.
+pub fn castTypeIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    return self.map(try self.literalTypeIn(env, file, node), {}, castPayload);
+}
+
+fn castPayload(_: *Facts, place: Value, _: void) ResolveError!Value {
+    const inner = if (place == .error_union) place.error_union.* else place;
+    return if (inner == .optional) inner.optional.* else inner;
 }
 
 /// The type a literal's field `name` takes in a literal of type `whole`, in each type it may be:
 /// a literal coerces through an optional or an error union. A field of a container a type
 /// function made is read with that call's arguments (`memberOf`). A build that takes a
-/// `noreturn` alternative (`.wasi => noreturn`) cannot coerce the literal, so that alternative
-/// makes no field; where every one is `noreturn`, the field is not known.
+/// `noreturn` alternative (`.wasi => noreturn`), or a container with no member `name` (a
+/// non-Windows `DeviceIoControl` has no `in`), cannot coerce the literal, so that alternative
+/// makes no field; where none is left, the field is not known.
 fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!Value {
     var holder = whole;
     while (true) holder = switch (holder) {
@@ -10538,7 +11993,11 @@ fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!V
         .container, .instance => |c| c,
         .alternatives => |each| {
             var typed: std.ArrayList(Value) = .empty;
-            for (each) |one| if (one != .primitive or !std.mem.eql(u8, one.primitive, "noreturn")) try typed.append(self.gpa, one);
+            for (each) |one| {
+                if (one == .primitive and std.mem.eql(u8, one.primitive, "noreturn")) continue;
+                if (self.lacksMember(one, name)) continue;
+                try typed.append(self.gpa, one);
+            }
             if (typed.items.len == 0) return .{ .unknown = .unsupported };
             const fields = try self.gpa.alloc(Value, typed.items.len);
             for (typed.items, fields) |one, *out| out.* = try self.literalFieldType(one, name);
@@ -10550,36 +12009,47 @@ fn literalFieldType(self: *Facts, whole: Value, name: []const u8) ResolveError!V
     return self.memberOf(container, self.member(container, name) orelse return .{ .unknown = .unresolved });
 }
 
-fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!Value {
+/// Whether `value`, through an optional or an error union, is a container that declares no
+/// member `name`: a literal with a field `name` does not coerce to it.
+fn lacksMember(self: *const Facts, value: Value, name: []const u8) bool {
+    var holder = value;
+    while (true) holder = switch (holder) {
+        .optional, .error_union => |inner| inner.*,
+        .container, .instance => |c| return self.member(c, name) == null,
+        else => return false,
+    };
+}
+
+fn placeType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!Value {
     if (depth == 32) return .{ .unknown = .budget };
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
     var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.fullStructInit(&buffer, node)) |literal| if (literal.ast.type_expr.unwrap()) |t| return self.resolve(file, t);
+    if (tree.fullStructInit(&buffer, node)) |literal| if (literal.ast.type_expr.unwrap()) |t| return self.resolveIn(env, file, t);
     const parent = model.parentOf(node) orelse return .{ .unknown = .unsupported };
     if (tree.fullVarDecl(parent)) |variable| {
         if (variable.ast.init_node.unwrap() != node) return .{ .unknown = .unsupported };
-        return if (variable.ast.type_node.unwrap()) |t| try self.resolve(file, t) else .scalar;
+        return if (variable.ast.type_node.unwrap()) |t| try self.resolveIn(env, file, t) else .scalar;
     }
     // A field's default value takes the field's type.
     if (model.containerField(tree, parent)) |field| {
         if (field.ast.value_expr.unwrap() != node) return .{ .unknown = .unsupported };
-        return if (field.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else .{ .unknown = .unsupported };
+        return if (field.ast.type_expr.unwrap()) |t| try self.resolveIn(env, file, t) else .{ .unknown = .unsupported };
     }
     var call_buffer: [1]Ast.Node.Index = undefined;
     if (tree.fullCall(&call_buffer, parent)) |call| {
         const position = std.mem.findScalar(Ast.Node.Index, call.ast.params, node) orelse return .{ .unknown = .unsupported };
-        return self.parameterType(file, parent, call, position);
+        return self.parameterType(env, file, parent, call, position);
     }
     var parent_buffer: [2]Ast.Node.Index = undefined;
     if (tree.fullStructInit(&parent_buffer, parent) != null) {
-        const whole = try self.placeType(file, parent, depth + 1);
+        const whole = try self.placeType(env, file, parent, depth + 1);
         if (whole == .unknown or whole == .scalar) return whole;
         const name = try self.memberName(tree.tokenSlice(Model.initName(tree, node) orelse return .{ .unknown = .unsupported }));
         return self.literalFieldType(whole, name);
     }
     if (tree.fullArrayInit(&parent_buffer, parent)) |array| {
-        const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolve(file, t) else try self.placeType(file, parent, depth + 1);
+        const whole = if (array.ast.type_expr.unwrap()) |t| try self.resolveIn(env, file, t) else try self.placeType(env, file, parent, depth + 1);
         return switch (whole) {
             .array => |each| each.*,
             .unknown => whole,
@@ -10587,16 +12057,22 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         };
     }
     switch (tree.nodeTag(parent)) {
-        .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolve(file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
+        .assign => return if (tree.nodeData(parent).node_and_node[1] == node) try self.resolveIn(env, file, tree.nodeData(parent).node_and_node[0]) else .{ .unknown = .unsupported },
         // `try`, `comptime` and `nosuspend` give their operand their own place (`try`'s
         // operand is the error union around it, read through as a literal's field is).
-        .@"try", .@"comptime", .@"nosuspend", .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(file, parent, depth + 1),
+        .@"try", .@"comptime", .@"nosuspend", .grouped_expression, .@"orelse", .@"catch", .@"if", .if_simple, .@"switch", .switch_comma => return self.placeType(env, file, parent, depth + 1),
+        // An operand compared with another (`size != .slice`) takes the other's type: Zig gives
+        // both one.
+        .equal_equal, .bang_equal => {
+            const lhs, const rhs = tree.nodeData(parent).node_and_node;
+            return self.typeOf(try self.resolveIn(env, file, if (lhs == node) rhs else lhs), {});
+        },
         // An anonymous literal under `&` is what the pointer its place gives points at: a `*T`'s
         // `&.{}` is a `T`; a slice's or a many-item pointer's (a `pointer` to the element too)
         // `&.{ a, b }` an array of the element. Where that element is itself an array, a `*[N]E`
         // and a `[]const [N]E` read alike and the literal is not known.
         .address_of => {
-            const target = switch (try self.placeType(file, parent, depth + 1)) {
+            const target = switch (try self.placeType(env, file, parent, depth + 1)) {
                 .pointer => |inner| inner.child.*,
                 .unknown => |why| return .{ .unknown = why },
                 else => return .{ .unknown = .unsupported },
@@ -10611,10 +12087,10 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         // A case's item takes the type of what the switch tests (`.compare =>` names a tag of
         // the operand's union); its body gives the switch its value.
         .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
-            if (std.mem.findScalar(Ast.Node.Index, tree.fullSwitchCase(parent).?.ast.values, node) == null) return self.placeType(file, parent, depth + 1); // unreachable: the tag is a case's
+            if (std.mem.findScalar(Ast.Node.Index, tree.fullSwitchCase(parent).?.ast.values, node) == null) return self.placeType(env, file, parent, depth + 1); // unreachable: the tag is a case's
             const whole = model.parentOf(parent) orelse return .{ .unknown = .unsupported };
             const tested = (tree.fullSwitch(whole) orelse return .{ .unknown = .unsupported }).ast.condition;
-            return self.resolve(file, tested);
+            return self.resolveIn(env, file, tested);
         },
         .@"break" => {
             // A `break` with no label leaves the nearest loop; one with a label, the block or
@@ -10624,21 +12100,21 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
             while (at) |candidate| : (at = model.parentOf(candidate)) {
                 const loop = tree.fullWhile(candidate) != null or tree.fullFor(candidate) != null;
                 const name = label orelse {
-                    if (loop) return self.placeType(file, candidate, depth + 1);
+                    if (loop) return self.placeType(env, file, candidate, depth + 1);
                     continue;
                 };
                 const tag = tree.nodeTag(candidate);
                 // A labeled block's brace follows its label and a colon, as a labeled loop's
                 // first token does.
                 const start = if (loop) tree.firstToken(candidate) else if (tag == .block or tag == .block_semicolon or tag == .block_two or tag == .block_two_semicolon) tree.nodeMainToken(candidate) else continue;
-                if (start >= 2 and tree.tokenTag(start - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(start - 2), tree.tokenSlice(name))) return self.placeType(file, candidate, depth + 1);
+                if (start >= 2 and tree.tokenTag(start - 1) == .colon and std.mem.eql(u8, tree.tokenSlice(start - 2), tree.tokenSlice(name))) return self.placeType(env, file, candidate, depth + 1);
             }
             return .{ .unknown = .unsupported };
         },
         // A loop's `else` gives the loop's value.
         .@"for", .for_simple, .@"while", .while_simple, .while_cont => {
             const otherwise = if (tree.fullFor(parent)) |loop| loop.ast.else_expr else tree.fullWhile(parent).?.ast.else_expr; // unreachable: the tag is a loop's
-            return if (otherwise.unwrap() == node) self.placeType(file, parent, depth + 1) else .{ .unknown = .unsupported };
+            return if (otherwise.unwrap() == node) self.placeType(env, file, parent, depth + 1) else .{ .unknown = .unsupported };
         },
         .@"return" => {
             var at: ?Ast.Node.Index = model.parentOf(parent);
@@ -10647,7 +12123,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
                 var fn_buffer: [1]Ast.Node.Index = undefined;
                 const function = tree.fullFnProto(&fn_buffer, tree.nodeData(candidate).node_and_node[0]) orelse return .{ .unknown = .unsupported };
                 const result = function.ast.return_type.unwrap() orelse return .{ .unknown = .unsupported };
-                return self.resolve(file, result);
+                return self.resolveIn(env, file, result);
             }
             return .{ .unknown = .unsupported };
         },
@@ -10655,23 +12131,23 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
     }
     var args_buffer: [2]Ast.Node.Index = undefined;
     const args = builtinArgs(tree, parent, &args_buffer);
-    if (args.len == 2 and args[1] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return self.resolve(file, args[0]);
+    if (args.len == 2 and args[1] == node and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(parent)), "@as")) return self.resolveIn(env, file, args[0]);
     return .{ .unknown = .unsupported };
 }
 
 /// The written type of a call's argument at `position`: the callee's parameter (a method's
 /// receiver first), a made container's method read with the arguments that made it.
 /// `.scalar` for `anytype`, which takes the argument's own type.
-fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call, position: usize) ResolveError!Value {
+fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, call: Ast.full.Call, position: usize) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
-    const callee = try self.resolve(file, call.ast.fn_expr);
+    const callee = try self.resolveIn(env, file, call.ast.fn_expr);
     if (callee == .unknown) return callee;
     if (callee != .function) return .{ .unknown = .unsupported };
     const decl = callee.function;
     var receiver: usize = 0;
     var made: ?*const Made = null;
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
-        const on = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
+        const on = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
         const container: ?Container = switch (on) {
             .instance => |c| c,
             .pointer => |p| switch (p.child.*) {
@@ -10692,7 +12168,7 @@ fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call:
         };
     }
     // A declaration literal's call (`.init(x)`) is a function of the type its place takes.
-    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) switch (try self.placeType(file, node, 1)) {
+    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) switch (try self.placeType(env, file, node, 1)) {
         .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
             made = m;
         },
@@ -10706,12 +12182,62 @@ fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call:
     while (it.next()) |param| : (at += 1) {
         if (at < receiver or at - receiver != position) continue;
         const type_expr = param.type_expr orelse return .scalar;
+        // In a reading: the parameter's type in the reading the call makes, which binds its
+        // generic parameters, a made container's arguments and the receiver.
+        if (env != null) return self.resolveIn(try self.bind(file, call, decl, env), decl.file, type_expr);
         if (made) |m| return self.substituted(decl.file, type_expr, m);
         // Written in terms of a `comptime T: type` parameter: the call's argument for it.
         if (try self.written(.{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver }, type_expr, 0)) |bound| return bound;
         return self.resolve(decl.file, type_expr);
     }
     return .{ .unknown = .unsupported };
+}
+
+test "a place's type in a reading reads the reading's bindings: a declaration's, a return's and @as's type written in terms of a comptime type parameter" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\fn raw() *anyopaque { return undefined; }
+        \\fn create(comptime T: type) *T {
+        \\    const ptr: *T = @ptrCast(@alignCast(raw()));
+        \\    _ = ptr;
+        \\    const many = @as([*]T, @ptrCast(@alignCast(raw())));
+        \\    _ = many;
+        \\    return @ptrCast(@alignCast(raw()));
+        \\}
+        \\const Bar = struct { b: u16 };
+        \\pub fn main() void { _ = create(Foo); _ = create(Bar); }
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8, nth: usize) Ast.Node.Index {
+            var left = nth;
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (!std.mem.eql(u8, t.getNodeSource(at), text)) continue;
+                if (left == 0) return at;
+                left -= 1;
+            }
+            unreachable;
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const reading = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "create(Foo)", 0)).?, facts.member(root, "create").?, null);
+    const foo = try facts.resolve(file, node.of(tree, "Foo", 0));
+    const cast = "@ptrCast(@alignCast(raw()))";
+    // The declaration's `*T`, `@as`'s `[*]T` and the function's result `*T`, each `Foo` in
+    // `create(Foo)`'s reading, not either of the two types its calls give.
+    for (0..3) |nth| {
+        const place = try facts.literalTypeIn(reading, file, node.of(tree, cast, nth));
+        try std.testing.expect(place == .pointer and place.pointer.child.* == .container and place.pointer.child.container.scope == foo.container.scope);
+    }
 }
 
 test "a container a forwarding type function makes is read with the outer call's bindings" {
@@ -10967,6 +12493,12 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run, _ = .{ run, 0 }; }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops) *[8]u8 { return @ptrCast(o); }\n", true));
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(o: *Other) *[8]u8 { return @ptrCast(o); }\n", true));
+    // A cast returned as an error union's or an optional's payload views what the payload
+    // points at.
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!?*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) ?*Ops { return @ptrCast(bytes); }\n", true));
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(bytes: *[8]u8) error{E}!*Other { return @ptrCast(bytes); }\n", true));
     // A pointer cast keeps `const`: the bytes of a parameter's address, or of a copy's handed
     // where a `[]const u8` goes, are read, never written; through `[]u8` or `@constCast`, they
     // may be.
@@ -11107,7 +12639,8 @@ test "a parameter's type has a length where it is or holds memory that has one" 
 test "a library's call through a field whose type names none of its generic's parameters calls none of the program's functions" {
     // `lock`'s type does not resolve (a type a generic makes), but the library declares it
     // with no parameter of its own: its `load` is the library's. `ctx` is the parameter's, and
-    // may be the program's value, whose `hash` the library then calls.
+    // may be the program's value, whose `hash` the library then calls where the program reaches
+    // that call (`use`, with a context any consumer may give).
     const lib =
         \\pub fn Value(comptime T: type) type {
         \\    return struct { raw: T, pub fn load(self: @This()) T { return self.raw; } };
@@ -11128,7 +12661,7 @@ test "a library's call through a field whose type names none of its generic's pa
         \\}
     ;
     var project = try Project.init(std.testing.allocator, &.{
-        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\npub fn load(x: u8) u8 {\n    return x;\n}\npub fn hash(x: u8) u8 {\n    return x;\n}\n" },
+        .{ .name = "root", .bytes = "const lib = @import(\"lib\");\npub fn load(x: u8) u8 {\n    return x;\n}\npub fn hash(x: u8) u8 {\n    return x;\n}\npub fn use(comptime C: type, t: *lib.Table(C)) u32 {\n    return t.find();\n}\n" },
         .{ .name = "lib", .bytes = lib, .selected = false, .package = "lib", .fingerprint = 1 },
     }, &.{.{ .from = 0, .spelling = "lib", .target = 1 }}, .{});
     defer project.deinit();
@@ -11629,6 +13162,239 @@ test "a container a generic declares in its body is its reading's: its fields re
     }
 }
 
+test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple, and a primitive's kind" {
+    const source =
+        \\const Plain = struct { v: u32 };
+        \\const Pair = struct { u8, u16 };
+        \\const Id = enum(u32) { _ };
+        \\fn kinds(comptime T: type) T {
+        \\    if (@typeInfo(T) == .@"struct") return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+        \\fn tuples(comptime T: type) T {
+        \\    if (@typeInfo(T).@"struct".is_tuple) return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+        \\fn ints(comptime T: type) T {
+        \\    if (@typeInfo(T) != .int) return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+        \\fn prongs(comptime T: type) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .int, .comptime_int => return undefined,
+        \\        else => return @enumFromInt(0),
+        \\    }
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const model = &project.sources[0].model;
+    const named = struct {
+        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
+            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind != .parameter) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+            unreachable; // unreachable: the source declares each name asked
+        }
+    };
+    const plain = try facts.declaration(named.decl(model, file, "Plain"));
+    const pair = try facts.declaration(named.decl(model, file, "Pair"));
+    const id = try facts.declaration(named.decl(model, file, "Id"));
+    const int: Value = .{ .primitive = "u32" };
+    const float: Value = .{ .primitive = "f32" };
+    // Each `@enumFromInt`, in the order the functions declare them.
+    var casts: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if ((tag == .builtin_call_two or tag == .builtin_call_two_comma) and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@enumFromInt")) try casts.append(arena.allocator(), node);
+    }
+    std.mem.sort(Ast.Node.Index, casts.items, tree, struct {
+        fn less(t: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+            return t.nodeMainToken(a) < t.nodeMainToken(b);
+        }
+    }.less);
+    try std.testing.expectEqual(4, casts.items.len);
+    const Row = struct { function: []const u8, cast: usize, bound: Value, reached: bool };
+    const rows = [_]Row{
+        // `@typeInfo(T) == .tag` (kindCompared): a struct returns before it, an enum gets past.
+        .{ .function = "kinds", .cast = 0, .bound = plain, .reached = false },
+        .{ .function = "kinds", .cast = 0, .bound = id, .reached = true },
+        // `is_tuple` (isTuple): a struct of unnamed fields is one, a struct of named ones is not.
+        .{ .function = "tuples", .cast = 1, .bound = pair, .reached = false },
+        .{ .function = "tuples", .cast = 1, .bound = plain, .reached = true },
+        // A primitive's kind (primitiveKind): `u32` is an int, `f32` a float.
+        .{ .function = "ints", .cast = 2, .bound = int, .reached = true },
+        .{ .function = "ints", .cast = 2, .bound = float, .reached = false },
+        .{ .function = "ints", .cast = 2, .bound = plain, .reached = false },
+        .{ .function = "prongs", .cast = 3, .bound = int, .reached = false },
+        .{ .function = "prongs", .cast = 3, .bound = float, .reached = true },
+    };
+    for (rows) |row| {
+        const env = try arena.allocator().create(Env);
+        env.* = .{ .function = named.decl(model, file, row.function), .args = &.{row.bound}, .depth = 0 };
+        try std.testing.expectEqual(row.reached, try facts.reachedUnder(env, file, casts.items[row.cast]));
+    }
+}
+
+test "the walk decides a bool function's call by its body in the call's reading, and reads a generic once per type an argument may be" {
+    const source =
+        \\inline fn hasFn(comptime T: type, comptime name: []const u8) bool {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"struct", .@"union", .@"enum", .@"opaque" => {},
+        \\        else => return false,
+        \\    }
+        \\    if (!@hasDecl(T, name)) return false;
+        \\    return @typeInfo(@TypeOf(@field(T, name))) == .@"fn";
+        \\}
+        \\const Parsed = struct {
+        \\    pub fn jsonParse() void {}
+        \\};
+        \\const Plain = struct { v: u32 };
+        \\fn parsed(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn plain(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn parse(comptime T: type) void {
+        \\    if (hasFn(T, "jsonParse")) parsed(T) else plain(T);
+        \\}
+        \\fn either(comptime T: type) void {
+        \\    if (hasFn(T, "jsonParse")) parsedEither(T) else plainEither(T);
+        \\}
+        \\fn parsedEither(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn plainEither(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\fn pick() bool {
+        \\    return true;
+        \\}
+        \\pub fn main() void {
+        \\    parse(Parsed);
+        \\    either(if (pick()) Parsed else Plain);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const model = &project.sources[0].model;
+    const named = struct {
+        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
+            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind != .parameter) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+            unreachable; // unreachable: the source declares each name asked
+        }
+    };
+    const found = try facts.analysis();
+    try std.testing.expect(!found.everything);
+    try std.testing.expectEqual(0, found.limits.items.len);
+    // A generic is read only in the instantiations calls make (a non-generic function of the
+    // program is read on its own).
+    // `hasFn(Parsed, "jsonParse")` is true in parse's one reading (callTruth): `plain` is never called.
+    try std.testing.expect(try facts.analyzed(named.decl(model, file, "parsed")));
+    try std.testing.expect(!try facts.analyzed(named.decl(model, file, "plain")));
+    // An argument that is one of two types is read as each (reachEach): both branches are taken,
+    // each in its own reading.
+    try std.testing.expect(try facts.analyzed(named.decl(model, file, "parsedEither")));
+    try std.testing.expect(try facts.analyzed(named.decl(model, file, "plainEither")));
+    const readings = (try facts.analyzedReadings(named.decl(model, file, "either"))) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(2, readings.len);
+}
+
+test "an anytype handed a value reads as one (Env.values): an uncalled @field of it names a field; handed a type, it may name a declaration; a called one may be its type's method" {
+    const library =
+        \\const missing = @import("missing");
+        \\pub const Other = struct {
+        \\    pub fn stay() void {}
+        \\    pub fn go() void {}
+        \\    pub fn ops() void {}
+        \\};
+        \\fn which() []const u8 {
+        \\    return "stay";
+        \\}
+        \\fn read(container: anytype) void {
+        \\    _ = @field(container, which());
+        \\    _ = @field(container, "stay");
+        \\}
+        \\pub fn data(comptime T: type, result: T) void {
+        \\    read(result);
+        \\}
+        \\pub fn readType(x: anytype) void {
+        \\    _ = @field(x, "go");
+        \\}
+        \\const Ops = struct { ops: u32 };
+        \\pub const Impl = struct {
+        \\    pub fn ops(self: *Impl) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\pub fn each(impl: *Impl) void {
+        \\    inline for (@typeInfo(Ops).@"struct".field_names) |name| @field(impl, name)();
+        \\}
+        \\pub fn take(x: anytype) void {
+        \\    _ = x;
+        \\}
+    ;
+    const source =
+        \\const lib = @import("std");
+        \\const missing = @import("missing");
+        \\pub fn main() void {
+        \\    lib.data(missing.T, undefined);
+        \\    lib.readType(missing.T);
+        \\    var impl: lib.Impl = .{};
+        \\    lib.each(&impl);
+        \\    const s: u8 = 0;
+        \\    lib.take(u8);
+        \\    lib.take(s);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = source },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[1].id;
+    const model = &project.sources[1].model;
+    const named = struct {
+        fn decl(m: *const Model, f: Project.FileId, name: []const u8, nth: usize) Decl {
+            var left = nth;
+            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind == .function) {
+                if (left == 0) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+                left -= 1;
+            };
+            unreachable; // unreachable: the source declares each name asked
+        }
+    };
+    const found = try facts.analysis();
+    // `read(result)`: `container` is handed a value, so `@field(container, which())` names a
+    // field of it, whatever its type: no declaration, and the walk does not give up.
+    try std.testing.expect(!found.everything);
+    try std.testing.expectEqual(0, found.limits.items.len);
+    try std.testing.expect(!try facts.analyzed(named.decl(model, file, "stay", 0)));
+    // `readType(missing.T)`: handed what may be a type, `@field(x, "go")` may be its
+    // declaration: every `go` is reached.
+    try std.testing.expect(try facts.analyzed(named.decl(model, file, "go", 0)));
+    // `@field(impl, name)()` through a value: the method of its type so named, not another's.
+    try std.testing.expect(try facts.analyzed(named.decl(model, file, "ops", 1)));
+    try std.testing.expect(!try facts.analyzed(named.decl(model, file, "ops", 0)));
+    // `take(u8)` and `take(s)`: a type and a value are two instantiations.
+    const readings = (try facts.analyzedReadings(named.decl(model, file, "take", 0))).?;
+    try std.testing.expectEqual(2, readings.len);
+}
+
 test "a call on what a generic's context binds resolves in the instantiation its chain of calls makes" {
     const source =
         \\pub fn AutoContext(comptime K: type) type {
@@ -11773,4 +13539,129 @@ test "a method of a value a type parameter types is made per binding: each bindi
     const binding = (try calls.at(&facts, file, node.of(tree, "facts.fieldsHold(IoProbe, .{ .key = 1 }, 3)"))).?;
     const value = try facts.boundCopy(binding, hold, found.?);
     try std.testing.expect(value == .error_union and value.error_union.* == .instance);
+}
+
+/// What `facts` reads for `io.vtable.run` in the library of `storeWalk`'s project, past
+/// pointers: a function, a choice of them, or anything else.
+fn storeWalk(root: []const u8, library_tail: []const u8) !struct { futex: bool, real: bool, other: bool, call: FieldRead, everything: bool } {
+    const library_head =
+        \\pub const VTable = struct { run: *const fn () void };
+        \\pub const Io = struct {
+        \\    vtable: *const VTable,
+        \\    pub fn run(io: Io) void {
+        \\        io.vtable.run();
+        \\    }
+        \\};
+        \\pub fn real() void {
+        \\    reached();
+        \\}
+        \\pub const real_vtable: VTable = .{ .run = real };
+        \\pub const Unreached = struct {
+        \\    fn futex() void {}
+        \\    pub const vt: VTable = .{ .run = futex };
+        \\};
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "std/std.zig", .bytes = try std.mem.concat(a, u8, &.{ library_head, library_tail }), .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = a };
+    defer facts.deinit();
+    const file = project.sources[1].id;
+    const model = &project.sources[1].model;
+    const tree = &project.sources[1].file.tree;
+    const function = struct {
+        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
+            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind == .function) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+            unreachable; // unreachable: the library declares each name asked
+        }
+    };
+    const found = try facts.analysis();
+    const call = for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (tree.nodeTag(node) == .field_access and std.mem.eql(u8, tree.getNodeSource(node), "io.vtable.run")) break node;
+    } else unreachable; // unreachable: Io.run calls through it
+    var value = try facts.resolve(file, call);
+    while (value == .pointer) value = value.pointer.child.*;
+    return .{
+        .futex = try facts.analyzed(function.decl(model, file, "futex")),
+        .real = try facts.analyzed(function.decl(model, file, "real")),
+        // A function the tail declares and stores, where it does.
+        .other = for (model.declarations, 0..) |d, i| {
+            if (std.mem.eql(u8, d.name, "other") and d.kind == .function) break try facts.analyzed(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
+        } else false,
+        .call = switch (value) {
+            .function => .function,
+            .alternatives => .choice,
+            else => .any,
+        },
+        .everything = found.everything,
+    };
+}
+
+test "a store counts for a call through its field once the walk reaches its part: one in code nothing compiles gives nothing, even a store that would leave the call unresolved" {
+    const through_io = "const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n}\n";
+    // The store of `futex` is in a declaration nothing reaches (aegis's test-only shake layer):
+    // the call reaches `real` alone.
+    const plain = "fn reached() void {}\n";
+    const alone = try storeWalk(through_io, plain);
+    try std.testing.expect(!alone.everything);
+    try std.testing.expect(alone.real and !alone.futex);
+    try std.testing.expectEqual(.function, alone.call);
+    // Its twin reaches that declaration: the call reaches both.
+    const reached = try storeWalk("const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n    _ = std.Unreached.vt;\n}\n", plain);
+    try std.testing.expect(reached.real and reached.futex);
+    try std.testing.expectEqual(.choice, reached.call);
+    // A store nothing reaches that takes the field's address leaves the call resolved.
+    const hidden = try storeWalk(through_io, plain ++ "const Hidden = struct {\n    fn take(v: *VTable) void {\n        _ = &v.run;\n    }\n};\n");
+    try std.testing.expectEqual(.function, hidden.call);
+    // Its order twin: the call is read first; `real`, which it reaches, reaches `later`, whose
+    // part takes the field's address and stores `other`, named nowhere else. Reading the call
+    // again leaves it unresolved, and the walk reaches `other` by its name at the store, not
+    // by the call's answer: no part of the walk waits on a call through a field, nor gives up.
+    const late = try storeWalk(through_io, "fn reached() void {\n    var vt: VTable = real_vtable;\n    later(&vt);\n}\nfn other() void {}\nfn later(v: *VTable) void {\n    _ = &v.run;\n    v.run = other;\n}\n");
+    try std.testing.expect(late.real and late.other);
+    try std.testing.expect(!late.everything);
+    try std.testing.expectEqual(.any, late.call);
+}
+
+test "a memo the walk was handed is replaced once the analysis is built, one it never asked for kept" {
+    const root = "const std = @import(\"std\");\npub fn main() void {\n    const io: std.Io = .{ .vtable = &std.real_vtable };\n    io.run();\n}\n";
+    const library =
+        \\pub const VTable = struct { run: *const fn () void };
+        \\pub const Io = struct {
+        \\    vtable: *const VTable,
+        \\    pub fn run(io: Io) void {
+        \\        io.vtable.run();
+        \\    }
+        \\};
+        \\fn real() void {}
+        \\pub const real_vtable: VTable = .{ .run = real };
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    // Both made before the walk: the call through `io.vtable.run` reads `run`'s write sites
+    // (accesses' index) while the walk builds; nothing asks for `Untouched`.
+    const Untouched = struct { n: u32 = 0 };
+    const untouched = try facts.memo(Untouched);
+    untouched.n = 7;
+    const index = try facts.memo(accesses.State);
+    const found = try facts.analysis();
+    try std.testing.expect(!found.everything);
+    try std.testing.expect(try facts.memo(accesses.State) != index);
+    try std.testing.expect(try facts.memo(Untouched) == untouched and untouched.n == 7);
+    try std.testing.expect(try facts.analysis() == found);
 }

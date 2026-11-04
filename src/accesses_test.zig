@@ -47,6 +47,8 @@ const rows = [_]Row{
     .{ .name = "W9 twin", .source = shapes ++ "fn w(d: []T, s: []const T) void {\n    @memcpy(d, s);\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "W10 cast", .source = shapes ++ "fn w(b: *[12]u8) *S {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
     .{ .name = "W10 twin", .source = shapes ++ "fn w(b: *[8]u8) *T {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{"1 init exact"} },
+    .{ .name = "W10 cast as an error union's payload", .source = shapes ++ "fn w(b: *[12]u8) error{E}!*S {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
+    .{ .name = "W10 cast as an error union's optional's payload", .source = shapes ++ "fn w(b: *[12]u8) error{E}!?*S {\n    return @ptrCast(@alignCast(b));\n}\n", .place = "f", .expected = &.{ "1 init exact", "4 covered holder" } },
     .{ .name = "W11 outside call", .source = shapes ++ "extern fn ext(p: *S) void;\nfn w(s: *S) void {\n    ext(s);\n}\n", .place = "f", .expected = &.{ "1 init exact", "5 covered holder" } },
     .{ .name = "W11 twin", .source = shapes ++ "extern fn ext(p: *T) void;\nfn w(t: *T) void {\n    ext(t);\n}\n", .place = "f", .expected = &.{"1 init exact"} },
     .{ .name = "W12 element", .source = shapes ++ "fn w(v: S) void {\n    var arr: [2]S = undefined;\n    arr[0] = v;\n}\n", .place = "arr", .decl = true, .expected = &.{ "4 init exact", "5 set exact part" } },
@@ -509,6 +511,14 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
         \\fn take(o: *const D) void {
         \\    _ = o;
         \\}
+        \\pub const C = struct { arg: ?*anyopaque };
+        \\pub const E = switch (@import("builtin").os.tag) {
+        \\    .windows => A,
+        \\    else => C,
+        \\};
+        \\fn control(o: *const E) void {
+        \\    _ = o;
+        \\}
         \\fn each(xs: []const A) void {
         \\    _ = xs;
         \\}
@@ -522,6 +532,7 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
         \\}
         \\fn f() !void {
         \\    take(&.{ .in = "x" });
+        \\    control(&.{ .in = "z" });
         \\    each(&.{.{ .in = "y" }});
         \\    const a: A = comptime .of(1);
         \\    const b: A = try .ofError(2);
@@ -541,6 +552,10 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
     // choice's own field, here a `[]const u8` in both.
     const field = try facts.literalType(file, spelledNode(tree, "\"x\"", 0).?);
     try std.testing.expect(field == .pointer and field.pointer.child.* == .primitive);
+    // A choice whose other struct has no `in` (a non-Windows `DeviceIoControl`): a build that
+    // takes it does not compile the literal, so the field is the one choice's.
+    const only = try facts.literalType(file, spelledNode(tree, "\"z\"", 0).?);
+    try std.testing.expect(only == .pointer and only.pointer.child.* == .primitive);
     // `&.{ … }` where a `[]const A` is taken: an array of `A`, each element an `A`.
     const element = try facts.literalType(file, spelledNode(tree, ".{ .in = \"y\" }", 0).?);
     try std.testing.expect(element == .container and std.meta.eql(element.container.scope, a.scope));
@@ -551,6 +566,106 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
     // A declaration literal under `comptime` or `try` names its place's container's member.
     try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".of(1)", 0).?)).?.scope, a.scope));
     try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".ofError(2)", 0).?)).?.scope, a.scope));
+}
+
+test "Facts.literalType: a compared enum literal is of the other operand's type, type information's fields std.builtin.Type's" {
+    const source =
+        \\const std = @import("std");
+        \\pub const Other = struct {
+        \\    pub fn slice() void {}
+        \\    pub fn neg() void {}
+        \\};
+        \\pub fn free(memory: anytype) void {
+        \\    const info = @typeInfo(@TypeOf(memory)).pointer;
+        \\    if (info.size != .slice) {}
+        \\}
+        \\pub fn parse(negative: bool) void {
+        \\    const sign: enum { pos, neg } = if (negative) .neg else .pos;
+        \\    if (sign == .neg) {}
+        \\}
+        \\pub const Sign = enum { pos, neg };
+        \\pub fn maybe(opt: ?Sign) void {
+        \\    if (opt == .neg) {}
+        \\}
+        \\pub const U = union(enum) { slice: u32, one };
+        \\pub fn tagged(u: U) void {
+        \\    if (u == .slice) {}
+        \\}
+    ;
+    const lang =
+        \\pub const Type = union(enum) {
+        \\    pointer: Pointer,
+        \\    pub const Pointer = struct {
+        \\        size: Size,
+        \\        child: type,
+        \\        pub const Size = enum { one, many, slice, c };
+        \\    };
+        \\};
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = source },
+        .{ .name = "std/std.zig", .bytes = "pub const lang = @import(\"lang.zig\");\npub const builtin = lang;\n", .selected = false },
+        .{ .name = "std/lang.zig", .bytes = lang, .selected = false },
+    }, &.{
+        .{ .from = 0, .spelling = "std", .target = 1 },
+        .{ .from = 1, .spelling = "lang.zig", .target = 2 },
+    }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const t = (try facts.declaration(facts.member(facts.rootOf(project.sources[2].id), "Type").?)).container;
+    const pointer = (try facts.declaration(facts.member(t, "Pointer").?)).container;
+    const size = (try facts.declaration(facts.member(pointer, "Size").?)).container;
+    // `size != .slice`: the tag of the information's `Size`, never another `slice`.
+    try std.testing.expectEqual(Facts.Named{ .decl = facts.member(size, "slice").? }, try facts.literalDeclaration(file, spelledNode(tree, ".slice", 0).?, "slice"));
+    // `sign == .neg`: the tag of `sign`'s own enum.
+    const named = try facts.literalDeclaration(file, spelledNode(tree, ".neg", 1).?, "neg");
+    try std.testing.expect(named == .decl and named.decl.file == file and !std.meta.eql(named.decl, facts.member((try facts.declaration(facts.member(facts.rootOf(file), "Other").?)).container, "neg").?));
+    // `opt == .neg`, `opt` a `?Sign`: Zig coerces the literal to the optional, whose payload's
+    // tag it names.
+    const sign = (try facts.declaration(facts.member(facts.rootOf(file), "Sign").?)).container;
+    try std.testing.expectEqual(Facts.Named{ .decl = facts.member(sign, "neg").? }, try facts.literalDeclaration(file, spelledNode(tree, ".neg", 2).?, "neg"));
+    // `u == .slice`, `u` a tagged union: the union's tag, a field Zig gives no declaration
+    // the same name.
+    const u = (try facts.declaration(facts.member(facts.rootOf(file), "U").?)).container;
+    try std.testing.expectEqual(Facts.Named{ .decl = facts.member(u, "slice").? }, try facts.literalDeclaration(file, spelledNode(tree, ".slice", 1).?, "slice"));
+}
+
+test "Facts.resolve: a builtin's value of the type its first argument names (an atomic load, a read-modify-write, @unionInit; a compare-and-exchange's optional)" {
+    const source =
+        \\const U = union { a: u32, b: bool };
+        \\var x: u32 = 0;
+        \\fn f() void {
+        \\    const loaded = @atomicLoad(u32, &x, .acquire);
+        \\    const old = @atomicRmw(u32, &x, .Add, 1, .monotonic);
+        \\    const exchanged = @cmpxchgWeak(u32, &x, 0, 1, .acquire, .monotonic);
+        \\    const strong = @cmpxchgStrong(u32, &x, 0, 1, .acquire, .monotonic);
+        \\    const made = @unionInit(U, "a", 1);
+        \\    _ = .{ loaded, old, exchanged, strong, made };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    for ([_][]const u8{ "loaded", "old" }) |name| {
+        const value = try facts.resolve(file, spelledNode(tree, name, 0).?);
+        try std.testing.expect(value == .primitive and std.mem.eql(u8, value.primitive, "u32"));
+    }
+    for ([_][]const u8{ "exchanged", "strong" }) |name| {
+        const exchanged = try facts.resolve(file, spelledNode(tree, name, 0).?);
+        try std.testing.expect(exchanged == .optional and exchanged.optional.* == .primitive and std.mem.eql(u8, exchanged.optional.primitive, "u32"));
+    }
+    const made = try facts.resolve(file, spelledNode(tree, "made", 0).?);
+    try std.testing.expect(made == .instance and std.meta.eql(made.instance, (try facts.declaration(facts.member(facts.rootOf(file), "U").?)).container));
 }
 
 test "batch 2: an update's operation, error names and sets, a condition's truths, a value's leaves, a literal" {
