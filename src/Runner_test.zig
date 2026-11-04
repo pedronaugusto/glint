@@ -315,6 +315,7 @@ test "Z012 judges the whole public surface: constants' types, reached fields, al
     try check(.Z012, "pub fn get(x: anytype) @TypeOf(x) { return x; }", 0);
     // A public constant holding a type function's call names the type.
     try check(.Z012, "fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(u8);", 0);
+    try check(.Z012, "const Hidden = struct { x: u8 }; fn StepOf(comptime T: type) type { return struct { t: T }; } pub const Step = StepOf(Hidden);", 1);
     // A private alias whose value does not resolve is read as what it is written as.
     try check(.Z012, "fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 1);
     try check(.Z012, "pub fn Backing(comptime T: type) type { return T; } pub fn Atomic(comptime T: type) type { const Repr = Backing(T); return struct { cell: [1]Repr }; }", 0);

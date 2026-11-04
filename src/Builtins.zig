@@ -684,7 +684,16 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
     // A public constant holding a type is a name for it: what the type is written as is read
     // (a slice or a function type of a private type, a tuple's fields, a type function's
     // arguments), and a container it names is reached through it.
-    if (value != .unknown and isType(value)) return privateType(self, signature, self.file, init, 0);
+    if (value != .unknown and isType(value)) {
+        // A type function's call it holds is named by the constant: its callee is no part of the
+        // surface (`pub const Step = StepOf(u8);`), its arguments are.
+        var made: [1]Ast.Node.Index = undefined;
+        if (source.file.tree.fullCall(&made, Facts.ungrouped(&source.file.tree, init))) |call| {
+            for (call.ast.params) |argument| try exposedArgument(self, signature, self.file, argument, 1);
+            return;
+        }
+        return privateType(self, signature, self.file, init, 0);
+    }
     if (value == .unknown) {
         // What a call gives is of the type its callee declares it returns.
         var buffer: [1]Ast.Node.Index = undefined;

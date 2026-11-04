@@ -183,7 +183,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
     const renamed = try self.allocator.alloc([]const []const u8, governed.len);
     for (governed, renamed) |g, *names| {
         var found: std.ArrayList([]const u8) = .empty;
-        try aliasNames(self, g.decls, g.symbol, &found);
+        try aliasNames(self, .unreported, g.decls, g.symbol, &found);
         names.* = found.items;
     }
     const tree = &self.project.at(self.file).file.tree;
@@ -323,22 +323,28 @@ fn spells(g: Governed, names: []const []const u8, spelled: []const u8) bool {
     return false;
 }
 
-/// The names the program's files the run does not select give `decls` (or a function of the
+/// Which aliases `aliasNames` gives: those in the program's files the run does not select, whose
+/// own site this run does not report (`.unreported`: a rule that reports what a reference
+/// reaches reports an alias where it spells the declaration, so a use of it is no second site),
+/// or every alias in the program (`.program`: what a call may reach, whatever reports it).
+pub const AliasScope = enum { unreported, program };
+
+/// The names the program's files (those `among` names) give `decls` (or a function of the
 /// extern `symbol`) under another name: `pub const zero = std.crypto.secureZero;`. A use that
-/// spells one reaches the declaration, and the alias's own site is not reported in this run,
-/// so the use is the site. Each alias is found once, by the declaration its value reaches. One
+/// spells one reaches the declaration. Each alias is found once, by the declaration its value reaches. One
 /// whose value does not resolve reaches what the name it spells last may (`h.sync`, `T.sync`):
 /// it is also called so where that name is a declaration's or its aliases' (a use of it is
 /// then unknown, `paired`); a name `@field` computes may be any.
-pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8, out: *std.ArrayList([]const u8)) Context.Error!void {
+pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Facts.Decl, symbol: ?[]const u8, out: *std.ArrayList([]const u8)) Context.Error!void {
     // What it keeps in its memo stays for the run.
     const rule_memory = self.keep();
     defer self.allocator = rule_memory;
-    const found = try self.facts.memo(Aliases);
+    const found = try self.facts.memo(Aliases(among));
     if (!found.built) {
         found.built = true;
         for (self.project.sources) |*source| {
             if (source.file.status != .parsed or !try self.facts.program(source.id)) continue;
+            if (among == .unreported and source.input.selected) continue;
             const tree = &source.file.tree;
             for (source.model.declarations, 0..) |d, i| {
                 if (d.kind != .variable) continue;
@@ -421,19 +427,23 @@ pub fn aliasNames(self: *Context, decls: []const Facts.Decl, symbol: ?[]const u8
     }
 }
 /// `name`, an alias `decl` declares, as a name of `reached`.
-fn aliasOf(self: *Context, found: *Aliases, reached: Facts.Decl, decl: Facts.Decl, name: []const u8) Context.Error!void {
+fn aliasOf(self: *Context, found: anytype, reached: Facts.Decl, decl: Facts.Decl, name: []const u8) Context.Error!void {
     if (std.meta.eql(reached, decl)) return;
     const entry = try found.by_origin.getOrPut(self.allocator, reached);
     if (!entry.found_existing) entry.value_ptr.* = .empty;
     try entry.value_ptr.append(self.allocator, name);
 }
-const Aliases = struct {
-    built: bool = false,
-    by_origin: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList([]const u8)) = .empty,
-    /// The aliases whose value does not resolve: each name, and the name its value spells
-    /// last (null for `@field`'s, which may be any).
-    unknown: std.ArrayList(struct { name: []const u8, spells: ?[]const u8 }) = .empty,
-};
+fn Aliases(comptime among: AliasScope) type {
+    return struct {
+        /// Which files' aliases: one memo per scope.
+        pub const scope = among;
+        built: bool = false,
+        by_origin: std.AutoHashMapUnmanaged(Facts.Decl, std.ArrayList([]const u8)) = .empty,
+        /// The aliases whose value does not resolve: each name, and the name its value spells
+        /// last (null for `@field`'s, which may be any).
+        unknown: std.ArrayList(struct { name: []const u8, spells: ?[]const u8 }) = .empty,
+    };
+}
 
 /// Whether every governed declaration named `name` is a function of a namespace: a container
 /// with no fields, so no value's method.
@@ -705,7 +715,7 @@ fn notCalled(c: *Context, call: Facts.calls.Call, decls: []const Facts.Decl, pat
     const spelled = try Model.identifier(c.allocator, tree.tokenSlice(tree.nodeData(call.callee_expr).node_and_token[1]));
     var names: std.ArrayList([]const u8) = .empty;
     try names.append(c.allocator, if (std.mem.findScalarLast(u8, path, '.')) |dot| path[dot + 1 ..] else path);
-    try aliasNames(c, decls, null, &names);
+    try aliasNames(c, .program, decls, null, &names);
     for (names.items) |name| if (std.mem.eql(u8, name, spelled)) return false;
     return true;
 }
