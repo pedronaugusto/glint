@@ -1019,15 +1019,44 @@ fn heldInRecord(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typ
     // std's records (`std.EnumSet(E).Iterator`) are none of the program's: their own fields
     // are std's internals, read as their types say.
     if (!try c.facts.program(container.file)) return .other;
+    return heldIn(c, container, .judged_at_binding, depth);
+}
+/// Where a field typed only by a generic's binding is judged: a program record's
+/// (`state: State` of `Layer(State, ...)`) where the binding is made (`checkBinding`); what a
+/// published owner carries (`Guarded(T)`'s `T`), here, unknown unless the binding resolves.
+const Bindings = enum { judged_at_binding, read_here };
+/// What `heldInRecord` reads of a record's fields held by value. An owner of a kind that owes no
+/// release (a guarded value, an atomic: `releases`) owes nothing of its own, as a local of it
+/// owes nothing (`acquisitionOwner`); what it carries by value (a guarded value's payload, bound to
+/// the program's type) is still the record's.
+fn heldIn(c: *Context, container: Facts.Container, bindings: Bindings, depth: usize) Context.Error!Typed {
     for (try c.facts.heldFields(container)) |field| {
         if (field.value == .pointer) continue;
-        // A field typed only by a generic's binding (`state: State` of `Layer(State, ...)`):
-        // what the binding gives is judged where it is bound (`checkBinding`).
-        if (bindingTyped(field.value)) continue;
-        if (try typed(c, field.value, depth + 1) != .other) return .unknown;
-        if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown;
+        if (bindingTyped(field.value)) switch (bindings) {
+            .judged_at_binding => continue,
+            .read_here => return .unknown,
+        };
+        switch (try typed(c, field.value, depth + 1)) {
+            .other => if (try heldInRecord(c, field.value, depth + 1) != .other) return .unknown,
+            .owner => |k| if (releases(k) != null or try carried(c, field.value, depth + 1) != .other) return .unknown,
+            .unknown => return .unknown,
+        }
     }
     return .other;
+}
+/// What a published owner with no release carries by value, through an array, an optional and
+/// an error union: its fields as `heldIn` reads them, with its bindings read here.
+fn carried(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
+    if (depth == 64) return .unknown;
+    var current = value;
+    while (true) current = switch (current) {
+        .array, .optional, .error_union => |inner| inner.*,
+        else => break,
+    };
+    return switch (current) {
+        .instance => |container| heldIn(c, container, .read_here, depth + 1),
+        else => .unknown,
+    };
 }
 /// Whether a value is unknown only because a generic's binding gives its type.
 fn bindingTyped(value: Facts.Value) bool {
