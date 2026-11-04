@@ -810,8 +810,9 @@ fn releases(k: Contract.Kind) ?[]const []const u8 {
         .handoff => &.{"release"},
         .reservation => &.{ "release", "consume", "moveInto" },
         .owned => &.{ "deinit", "take", "moveInto" },
-        // A std resource held raw: `close`, a child's `kill` or `wait`.
-        .std_handle => &.{ "close", "kill", "wait" },
+        // A std resource held raw: `close`, a server's `deinit` (it closes the listening
+        // socket), a child's `kill` or `wait`. No other std resource declares a `deinit`.
+        .std_handle => &.{ "close", "deinit", "kill", "wait" },
         // A result obligation is discharged by taking it or acknowledging it with a reason;
         // its `deinit` checks that it was.
         .must_use => &.{ "take", "acknowledge" },

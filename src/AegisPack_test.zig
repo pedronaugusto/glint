@@ -1981,6 +1981,14 @@ test "A001 reads a runtime machine's state as its backing field" {
     try expectJudged(head ++ "pub fn f(m: *Machine.Runtime(void)) S { return m.current(); }", pack.access, true, 0);
 }
 
+test "A003 releases std's Server by its deinit" {
+    // std.Io.net.Server closes its socket in `deinit`, its one release (reactor's tests).
+    const head = "const std = @import(\"std\");\nfn listen() std.Io.net.Server { return .{}; }\n";
+    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); defer s.deinit(); }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); s.deinit(); }", pack.cleanup, true, 0);
+    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); _ = &s; }", pack.cleanup, true, 1);
+}
+
 test "A001 reads a literal's place through a field default and optional and error-union results" {
     const head = "const err = @import(\"aegis\").err;\n";
     try expectJudged(head ++ "const Holder = struct { source: err.PublicSource = .{ .bytes = \"\" } };\npub fn f() Holder { return .{}; }", pack.access, true, 1);
