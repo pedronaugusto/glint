@@ -568,7 +568,7 @@ fn parameterIo(c: *Context, decl: Model.Declaration, io_type: Facts.Container) C
 /// (`self.ctx.io`), as deep as its fields go (Facts.fieldsHold, a type's property read once per
 /// type); `Held.unread` where it may hold one in a form not read.
 fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container, depth: u8) Context.Error!Held {
-    const held = switch (if (value == .pointer) value.pointer.* else value) {
+    const held = switch (if (value == .pointer) value.pointer.child.* else value) {
         .instance, .container => |k| k,
         // A parameter's type that does not resolve may be an Io; a field's is read by how it
         // is written (`spellsIo`).
@@ -597,7 +597,7 @@ const IoProbe = struct {
     pub fn of(probe: IoProbe, facts: *Facts, field: Facts.Decl, value: Facts.Value) Error!Facts.Probed {
         _ = facts;
         const io_type: Facts.Container = .{ .file = probe.key.file, .scope = probe.key.scope };
-        const out: Facts.Probed = switch (if (value == .pointer) value.pointer.* else value) {
+        const out: Facts.Probed = switch (if (value == .pointer) value.pointer.child.* else value) {
             .instance, .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) .is else .{ .holder = k },
             else => |other| if (try mentionsIo(other, io_type, true, 0)) .maybe else .none,
         };
@@ -616,7 +616,8 @@ fn mentionsIo(value: Facts.Value, io_type: Facts.Container, unresolved: bool, de
     if (depth == 4) return unresolved;
     return switch (value) {
         .instance, .container => |k| k.file == io_type.file and k.scope == io_type.scope,
-        .pointer, .optional, .array, .error_union => |inner| mentionsIo(inner.*, io_type, unresolved, depth + 1),
+        .pointer => |inner| mentionsIo(inner.child.*, io_type, unresolved, depth + 1),
+        .optional, .array, .error_union => |inner| mentionsIo(inner.*, io_type, unresolved, depth + 1),
         .alternatives => |each| for (each) |one| {
             if (try mentionsIo(one, io_type, unresolved, depth + 1)) break true;
         } else false,
@@ -990,7 +991,8 @@ fn holdsNoError(t: Facts.Value) bool {
     return switch (t) {
         .primitive => |name| !std.mem.eql(u8, name, "anyerror"),
         .container => true,
-        .pointer, .array, .optional => |inner| holdsNoError(inner.*),
+        .pointer => |inner| holdsNoError(inner.child.*),
+        .array, .optional => |inner| holdsNoError(inner.*),
         else => false,
     };
 }
@@ -2037,7 +2039,7 @@ fn allocates(c: *Context, decl: Facts.Decl) Context.Error!bool {
     while (it.next()) |param| {
         const declared = param.type_expr orelse return true;
         var value = try c.facts.resolve(decl.file, declared);
-        if (value == .pointer) value = value.pointer.*;
+        if (value == .pointer) value = value.pointer.child.*;
         const k = switch (value) {
             .container, .instance => |k| k,
             .unknown, .alternatives => return true,

@@ -74,7 +74,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         if (args.len != 3) continue;
         var input = try c.facts.resolve(c.file, args[0]);
         if (try c.role(Contract.library, input) != .untrusted) continue;
-        while (input == .pointer) input = input.pointer.*;
+        while (input == .pointer) input = input.pointer.child.*;
         if (input != .instance) continue;
         const parse = c.facts.member(input.instance, "parse") orelse continue;
         if (!std.meta.eql(parse, callee)) continue;

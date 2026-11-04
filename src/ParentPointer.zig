@@ -809,7 +809,7 @@ const Follow = struct {
     /// Whether a value is a pointer to the interface, or an optional one.
     fn pointer(f: *const Follow, value: Facts.Value) bool {
         const to = switch (value) {
-            .pointer => |to| to.*,
+            .pointer => |to| to.child.*,
             .optional => |inner| return f.pointer(inner.*),
             else => return false,
         };
@@ -1054,7 +1054,8 @@ const Carry = struct {
         if (depth == 32) return .held;
         return switch (value) {
             .instance => |container| if (same(container, k.field.parent)) .whole else null,
-            .pointer, .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
+            .pointer => |inner| try k.holds(inner.child.*, depth + 1),
+            .optional, .error_union => |inner| try k.holds(inner.*, depth + 1),
             .array => |element| if (try k.holds(element.*, depth + 1) != null) .held else null,
             else => null,
         };
@@ -1882,7 +1883,7 @@ fn joinSource(a: ?Source, b: Source) ?Source {
 fn listOf(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, list: List) Context.Error!?Source {
     const value = try c.facts.resolve(file, receiver);
     const container = held(value) orelse switch (value) {
-        .pointer => |to| held(to.*) orelse return null,
+        .pointer => |to| held(to.child.*) orelse return null,
         else => return null,
     };
     if (try isList(c, container, "", list) != .yes) return null;
@@ -2070,7 +2071,7 @@ fn receiverKind(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, lis
     const value = try c.facts.resolve(file, receiver);
     if (value == .unknown) return .unknown;
     const container = held(value) orelse switch (value) {
-        .pointer => |to| held(to.*),
+        .pointer => |to| held(to.child.*),
         else => null,
     } orelse return null;
     const whole = try isList(c, container, "", list);
@@ -2152,7 +2153,7 @@ fn resultType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 /// The container a single-item pointer type points at.
 fn pointee(value: Facts.Value) ?Facts.Container {
     return switch (value) {
-        .pointer => |to| held(to.*),
+        .pointer => |to| held(to.child.*),
         .optional, .error_union => |inner| pointee(inner.*),
         else => null,
     };
@@ -2175,7 +2176,8 @@ fn same(a: Facts.Container, b: Facts.Container) bool {
 fn otherThan(value: Facts.Value, holder: Facts.Container) bool {
     return switch (value) {
         .container, .instance => |container| !same(container, holder),
-        .pointer, .optional => |to| otherThan(to.*, holder),
+        .pointer => |to| otherThan(to.child.*, holder),
+        .optional => |to| otherThan(to.*, holder),
         .alternatives => |each| for (each) |one| {
             if (!otherThan(one, holder)) break false;
         } else each.len != 0,
@@ -2186,7 +2188,7 @@ fn otherThan(value: Facts.Value, holder: Facts.Container) bool {
 fn isParent(value: Facts.Value, parent: Facts.Container) bool {
     return switch (value) {
         .container, .instance => |container| same(container, parent),
-        .pointer => |to| isParent(to.*, parent),
+        .pointer => |to| isParent(to.child.*, parent),
         else => false,
     };
 }

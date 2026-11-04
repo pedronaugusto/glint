@@ -4079,7 +4079,8 @@ fn byValue(value: Facts.Value) ?Facts.Container {
 fn byPointer(value: Facts.Value) ?Facts.Container {
     return switch (value) {
         .container, .instance => |k| k,
-        .pointer, .optional => |inner| byPointer(inner.*),
+        .pointer => |inner| byPointer(inner.child.*),
+        .optional => |inner| byPointer(inner.*),
         else => null,
     };
 }

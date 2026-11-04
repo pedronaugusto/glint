@@ -553,7 +553,8 @@ fn exposedValue(self: *Context, signature: Signature, file: Project.FileId, node
         .unknown => |why| try undecidedType(self, signature, file, node, why),
         // A primitive alias can be named as the primitive; error-set policy is not Z012.
         .primitive, .scalar, .error_set => {},
-        .pointer, .array, .optional, .error_union => |inner| try exposedValue(self, signature, file, node, inner.*, depth + 1),
+        .pointer => |inner| try exposedValue(self, signature, file, node, inner.child.*, depth + 1),
+        .array, .optional, .error_union => |inner| try exposedValue(self, signature, file, node, inner.*, depth + 1),
         .alternatives => |each| for (each) |one| try exposedValue(self, signature, file, node, one, depth + 1),
         .fn_type => |key| {
             var prototype: [1]Ast.Node.Index = undefined;
@@ -651,7 +652,8 @@ fn isType(value: Facts.Value) bool {
         .container, .primitive, .error_set, .fn_type, .unknown => true,
         .instance, .scalar, .literal, .function, .reflected => false,
         .reified => |reified| !reified.value,
-        .pointer, .array, .optional, .error_union => |inner| isType(inner.*),
+        .pointer => |inner| isType(inner.child.*),
+        .array, .optional, .error_union => |inner| isType(inner.*),
         .alternatives => |each| each.len != 0 and isType(each[0]),
     };
 }
@@ -754,7 +756,8 @@ fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, n
         .unknown => |why| try undecidedType(self, signature, file, node, why),
         .container, .primitive, .error_set, .fn_type, .scalar => {},
         .instance => |container| try exposedContainer(self, signature, file, node, container, depth + 1),
-        .pointer, .array, .optional, .error_union => |inner| try exposedInferred(self, signature, file, node, inner.*, depth + 1),
+        .pointer => |inner| try exposedInferred(self, signature, file, node, inner.child.*, depth + 1),
+        .array, .optional, .error_union => |inner| try exposedInferred(self, signature, file, node, inner.*, depth + 1),
         .alternatives => |each| for (each) |one| try exposedInferred(self, signature, file, node, one, depth + 1),
         .function => |function| {
             // An alias of a function: its signature, named through the alias.

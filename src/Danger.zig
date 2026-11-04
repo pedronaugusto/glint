@@ -449,7 +449,7 @@ fn dependencyLocals(c: *Context, rule: Rule, types: []const SecretType, call: Fa
             const container = value.container;
             value = .{ .instance = container };
         }
-        while (value == .pointer) value = value.pointer.*;
+        while (value == .pointer) value = value.pointer.child.*;
         if (try heldSecret(c, types, value) == .yes) break true;
     } else false;
     if (!given) return;
@@ -549,7 +549,7 @@ fn placeInSecret(c: *Context, types: []const SecretType, place: Ast.Node.Index) 
     const path = try Facts.accesses.pathOf(c.facts, c.file, place);
     for (path.steps) |step| {
         var value = try c.facts.resolve(c.file, step.node);
-        while (value == .pointer) value = value.pointer.*;
+        while (value == .pointer) value = value.pointer.child.*;
         switch (try heldSecret(c, types, value)) {
             .yes => |held| return .{ .yes = held },
             .unknown => |why| return .{ .unknown = why },
@@ -565,7 +565,7 @@ fn placeInSecret(c: *Context, types: []const SecretType, place: Ast.Node.Index) 
 fn copiedMaterial(c: *Context, types: []const SecretType, node: Ast.Node.Index) Context.Error!Secret {
     for ((try Facts.accesses.pathOf(c.facts, c.file, node)).steps) |step| {
         var value = try c.facts.resolve(c.file, step.node);
-        while (value == .pointer) value = value.pointer.*;
+        while (value == .pointer) value = value.pointer.child.*;
         switch (try heldSecret(c, types, value)) {
             .yes => |held| return .{ .yes = held },
             .unknown => |why| return .{ .unknown = why },
@@ -588,7 +588,7 @@ fn materialRead(c: *Context, rule: Rule, types: []const SecretType, node: Ast.No
     const tree = &c.project.at(c.file).file.tree;
     const object, const member = tree.nodeData(node).node_and_token;
     var holder = try c.facts.resolve(c.file, object);
-    while (holder == .pointer) holder = holder.pointer.*;
+    while (holder == .pointer) holder = holder.pointer.child.*;
     const held = switch (try heldSecret(c, types, holder)) {
         .yes => |held| held,
         .no, .unknown => return,
@@ -824,7 +824,7 @@ fn timeHeld(c: *Context, times: []const Facts.Container, value: Facts.Value, sid
             break :blk fieldsTime(c, times, try c.facts.heldFields(found), depth);
         },
         // The side of a copy is what its pointer points at; a pointer a record holds is its own.
-        .pointer => |inner| if (side) timeHeld(c, times, inner.*, true, depth + 1) else .no,
+        .pointer => |inner| if (side) timeHeld(c, times, inner.child.*, true, depth + 1) else .no,
         .array, .optional => |inner| timeHeld(c, times, inner.*, side, depth + 1),
         .alternatives => |each| blk: {
             var out: TimeHeld = .no;

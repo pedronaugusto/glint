@@ -164,7 +164,9 @@ pub const Spelled = union(enum) { name: []const u8, number: usize };
 /// information (`.@"struct".fields`, a field's `name`): a `std.builtin.Type` value whose own
 /// members are not followed. A type that does not resolve still has information: what it
 /// describes stays unknown, never what the information is.
-pub const Reflected = struct { of: *const Value, at: enum { info, pointer, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
+/// Type information read off a type (`of`) at a part of it: the whole (`info`), a kind's own
+/// (`pointer`, ...), a pointer's size (`size`), a function's parameters, any other part.
+pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
 /// A library's declarations in this project, found through its modules' roots. Roles are the
 /// caller's enum values; the resolver never interprets them.
 pub const Publication = struct {
@@ -225,9 +227,10 @@ pub const Value = union(enum) {
     container: Container,
     instance: Container,
     function: Decl,
-    pointer: *const Value,
-    /// An array of the element: `[N]T`. A slice or many-item pointer is a `pointer` to its
-    /// element, as Zig indexes both the same way.
+    /// A pointer to its child, of the size its type gives (`Pointer`). A slice or many-item
+    /// pointer is a `pointer` to its element, as Zig indexes both the same way.
+    pointer: Pointer,
+    /// An array of the element: `[N]T`.
     array: *const Value,
     optional: *const Value,
     error_union: *const Value,
@@ -253,10 +256,31 @@ pub const Value = union(enum) {
         return self != .unknown;
     }
 };
+/// A pointer to `child`: to one item (`*T`), to many (`[*]T`), a slice (`[]T`) or a C pointer,
+/// as its type says (`std.builtin.Type.Pointer.Size`); null where what makes it does not say
+/// (a slicing: bounds known as the program compiles make a pointer to an array, others a
+/// slice). Two pointers are the same type only of the same size.
+pub const Pointer = struct { child: *const Value, size: ?Size };
+pub const Size = std.builtin.Type.Pointer.Size;
 pub const ResolveError = Model.InitError;
 /// A type built from its fields' types, the type itself or a value of it as `container` and
 /// `instance` are.
 pub const Reified = struct { fields: *const Value, value: bool = false };
+
+/// A pointer to `child` of `size` (`Pointer`).
+pub fn pointerTo(self: *Facts, child: Value, size: ?Size) ResolveError!Value {
+    return .{ .pointer = .{ .child = try self.boxed(child), .size = size } };
+}
+
+/// The pointer size `node` names (`@Pointer`'s first argument): an enum literal (`.slice`), or
+/// a pointer's own read off its type information (`info.size`). Null where it names none known.
+fn sizeNamed(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Size {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) == .enum_literal) return std.meta.stringToEnum(Size, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node))));
+    const value = try self.resolveIn(env, file, node);
+    if (value != .reflected or value.reflected.at != .size) return null;
+    return if (value.reflected.of.* == .pointer) value.reflected.of.pointer.size else null;
+}
 
 /// What a value of a type built from its fields' types holds: a value of each of them.
 pub fn reifiedParts(self: *Facts, built: Reified) ResolveError!Value {
@@ -476,7 +500,8 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
     const found = try self.publication(library);
     var current = value;
     while (true) switch (current) {
-        .pointer, .array, .optional, .error_union => |inner| current = inner.*,
+        .pointer => |inner| current = inner.child.*,
+        .array, .optional, .error_union => |inner| current = inner.*,
         .function => |decl| {
             for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role)));
             return null;
@@ -1941,8 +1966,9 @@ pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 
 /// A condition known as the program compiles on the reading `env` binds: `truth`'s, `and` and
 /// `or` of known ones, `==` and `!=` of two types each side names (`T == Plain`, `namedType`)
-/// known the same or different, and `@hasDecl(T, "name")` where `T` is a container that
-/// resolves (a module a driver is built against).
+/// known the same or different, or of a pointer's known size and a tag (`sizeIs`), and
+/// `@hasDecl(T, "name")` where `T` is a container that resolves (a module a driver is built
+/// against).
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     if (self.truth(env, file, node)) |known| return known;
     const tree = &self.project.at(file).file.tree;
@@ -1959,6 +1985,9 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         },
         .compare => |compared| {
             if (compared.order != .equal and compared.order != .not_equal) return null;
+            // A pointer's size against a tag (`info.size == .slice`).
+            if (try self.sizeIs(env, file, compared.left, compared.right) orelse try self.sizeIs(env, file, compared.right, compared.left)) |same_size|
+                return if (compared.order == .equal) same_size else !same_size;
             const one = try self.namedType(env, file, compared.left) orelse return null;
             const other = try self.namedType(env, file, compared.right) orelse return null;
             const one_type = sameType(one, other) orelse return null;
@@ -1981,6 +2010,17 @@ fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     };
     const decl = self.project.at(container.file).model.scopes[@backingInt(container.scope)].names.get(name) orelse return false;
     return self.project.at(container.file).model.declarations[@backingInt(decl)].kind != .field;
+}
+
+/// Whether the pointer size `size` reads (`info.size`) is the one the enum literal `tag` names
+/// (`.slice`). Null where `size` is no pointer's size known, or `tag` no enum literal.
+fn sizeIs(self: *Facts, env: ?*const Env, file: Project.FileId, size: Ast.Node.Index, tag: Ast.Node.Index) ResolveError!?bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(tag) != .enum_literal) return null;
+    const value = try self.resolveIn(env, file, size);
+    if (value != .reflected or value.reflected.at != .size or value.reflected.of.* != .pointer) return null;
+    const known = value.reflected.of.pointer.size orelse return null;
+    return std.mem.eql(u8, try self.memberName(tree.tokenSlice(tree.nodeMainToken(tag))), @tagName(known));
 }
 
 /// The type `node` names on the reading `env` binds, where it names one: a container, a
@@ -2163,10 +2203,10 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
             const lhs = try self.resolve(file, tree.nodeData(node).node_and_node[0]);
             return switch (lhs) {
                 .scalar, .array, .unknown => lhs,
-                .pointer => |to| switch (to.*) {
-                    .array => to.*,
-                    .unknown => to.*,
-                    else => .{ .array = to },
+                .pointer => |to| switch (to.child.*) {
+                    .array => to.child.*,
+                    .unknown => to.child.*,
+                    else => .{ .array = to.child },
                 },
                 else => .{ .unknown = .unsupported },
             };
@@ -2198,7 +2238,7 @@ fn resolveInner(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolv
         },
         // A tuple with no type of its own (`.{ sha2.Sha256, .sha256 }`), as a struct literal is.
         .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => return .{ .literal = .{ .file = file, .node = node } },
-        .address_of => return .{ .pointer = try self.boxed(try self.resolve(file, tree.nodeData(node).node)) },
+        .address_of => return self.pointerTo(try self.resolve(file, tree.nodeData(node).node), .one),
         .deref => return self.pointee(try self.resolve(file, tree.nodeData(node).node), {}),
         .@"try" => return self.payload(try self.resolve(file, tree.nodeData(node).node), .error_union),
         else => return .{ .unknown = .unsupported },
@@ -2240,7 +2280,7 @@ fn calledValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call: A
 /// A type written in place: a pointer, an array, a function type, a container.
 fn typeWritten(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Value {
     const tree = &self.project.at(file).file.tree;
-    if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolve(file, ptr.ast.child_type)) };
+    if (tree.fullPtrType(node)) |ptr| return try self.pointerTo(try self.resolve(file, ptr.ast.child_type), ptr.size);
     if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolve(file, array.ast.elem_type)) };
     var proto_buffer: [1]Ast.Node.Index = undefined;
     if (tree.nodeTag(node) != .fn_decl and tree.fullFnProto(&proto_buffer, node) != null) return .{ .fn_type = .{ .file = file, .node = node } };
@@ -2262,14 +2302,14 @@ fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index
         // its own `field_names`): any of its parts.
         .each_of, .computed => {
             const resolved = try self.resolve(file, args[0]);
-            const held = if (resolved == .pointer) resolved.pointer.* else resolved;
+            const held = if (resolved == .pointer) resolved.pointer.child.* else resolved;
             if (held == .literal) return try self.choose(try self.literalParts(held.literal));
         },
         // A name ranging over a list written in place (`inline for (.{ "lin", "length" })
         // |part|`): each member so named, one per pass.
         .names => |names| {
             const resolved = try self.resolve(file, args[0]);
-            const held = if (resolved == .pointer) resolved.pointer.* else resolved;
+            const held = if (resolved == .pointer) resolved.pointer.child.* else resolved;
             const each = try self.gpa.alloc(Value, names.len);
             if (held == .literal) {
                 for (names, each) |one, *out| out.* = try self.literalField(held.literal, one);
@@ -2364,12 +2404,11 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     // `@Union(layout, tag, names, types, attributes)`, `@Tuple(types)`.
     if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolveIn(env, file, args[3]));
     if (std.mem.eql(u8, name, "@Tuple") and args.len == 1) return self.reified(try self.resolveIn(env, file, args[0]));
-    // `@Pointer(size, attributes, child, sentinel)`: a pointer to `child`, as a slice or a
-    // many-item pointer is too.
+    // `@Pointer(size, attributes, child, sentinel)`: a pointer to `child` of the size it names.
     if (std.mem.eql(u8, name, "@Pointer") and args.len == 4) {
         const child = try self.resolveIn(env, file, args[2]);
         if (child == .unknown) return child;
-        return .{ .pointer = try self.boxed(child) };
+        return self.pointerTo(child, try self.sizeNamed(env, file, args[0]));
     }
     // A vector is indexed as an array of its lanes, and holds only numbers, truth values and
     // pointers.
@@ -2389,14 +2428,16 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     }
     if (std.mem.eql(u8, name, "@typeInfo") and args.len == 1) return self.reflect(try self.resolveIn(env, file, args[0]));
     // A name's bytes: `[:0]const u8`, or the file's bytes for `@embedFile`.
-    for ([_][]const u8{ "@errorName", "@tagName", "@typeName", "@embedFile" }) |bytes| if (std.mem.eql(u8, name, bytes)) return .{ .pointer = try self.boxed(.{ .primitive = "u8" }) };
+    // `[:0]const u8`; `@embedFile`'s is a pointer to one array of them.
+    for ([_][]const u8{ "@errorName", "@tagName", "@typeName" }) |bytes| if (std.mem.eql(u8, name, bytes)) return self.pointerTo(.{ .primitive = "u8" }, .slice);
+    if (std.mem.eql(u8, name, "@embedFile")) return self.pointerTo(.{ .array = try self.boxed(.{ .primitive = "u8" }) }, .one);
     // A number or a truth value, whatever the arguments are.
     for (numeric_builtins) |number| if (std.mem.eql(u8, name, number)) return .scalar;
     // Values of std's own types, as the language gives them.
     if (std.mem.eql(u8, name, "@errorReturnTrace")) {
         const trace = try self.stdMember(&.{ "builtin", "StackTrace" });
         if (trace == .unknown) return trace;
-        return .{ .optional = try self.boxed(.{ .pointer = try self.boxed(try self.instance(trace)) }) };
+        return .{ .optional = try self.boxed(try self.pointerTo(try self.instance(trace), .one)) };
     }
     if (std.mem.eql(u8, name, "@src")) return self.instance(try self.stdMember(&.{ "builtin", "SourceLocation" }));
     return .{ .unknown = .comptime_dependent };
@@ -2413,7 +2454,8 @@ fn reflectedInfo(value: Value) bool {
 fn unknownWithin(value: Value) bool {
     return switch (value) {
         .unknown => true,
-        .pointer, .optional, .error_union, .array => |inner| unknownWithin(inner.*),
+        .pointer => |inner| unknownWithin(inner.child.*),
+        .optional, .error_union, .array => |inner| unknownWithin(inner.*),
         else => false,
     };
 }
@@ -2440,7 +2482,8 @@ pub fn typeIsType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 fn holdsTypes(value: Value) bool {
     return switch (value) {
         .primitive => |name| std.mem.eql(u8, name, "type"),
-        .pointer, .array, .optional => |inner| holdsTypes(inner.*),
+        .pointer => |inner| holdsTypes(inner.child.*),
+        .array, .optional => |inner| holdsTypes(inner.*),
         else => false,
     };
 }
@@ -2449,7 +2492,7 @@ fn holdsTypes(value: Value) bool {
 /// or a tuple literal of them): one that holds what they do.
 fn reified(self: *Facts, types: Value) ResolveError!Value {
     const each: Value = switch (types) {
-        .pointer => |inner| return self.reified(inner.*),
+        .pointer => |inner| return self.reified(inner.child.*),
         .array => |inner| inner.*,
         .literal => |literal| blk: {
             const parts = try self.literalParts(literal);
@@ -2793,14 +2836,14 @@ const numeric_builtins = [_][]const u8{
 fn memberValue(self: *Facts, lhs: Value, name: []const u8) ResolveError!Value {
     if (lhs == .reflected) return self.reflectedMember(lhs.reflected, name);
     if (lhs == .literal) return self.literalField(lhs.literal, name);
-    if (lhs == .pointer and lhs.pointer.* == .literal) return self.literalField(lhs.pointer.literal, name);
-    if (lhs == .pointer and lhs.pointer.* == .alternatives) return self.memberOfChoice(lhs.pointer.alternatives, name);
+    if (lhs == .pointer and lhs.pointer.child.* == .literal) return self.literalField(lhs.pointer.child.literal, name);
+    if (lhs == .pointer and lhs.pointer.child.* == .alternatives) return self.memberOfChoice(lhs.pointer.child.alternatives, name);
     if (lhs == .alternatives) return self.memberOfChoice(lhs.alternatives, name);
     const container = switch (lhs) {
         .container, .instance => |c| c,
-        .pointer => |p| switch (p.*) {
+        .pointer => |p| switch (p.child.*) {
             .instance, .container => |c| if (self.member(c, name)) |decl| return self.memberOf(c, decl) else return sequence(lhs, name),
-            .alternatives => return self.map(p.*, name, memberValue),
+            .alternatives => return self.map(p.child.*, name, memberValue),
             else => return sequence(lhs, name),
         },
         // An array's one member is its length, a number.
@@ -2831,7 +2874,8 @@ fn tagWithin(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8
             const name = try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)));
             var holder = try self.literalType(file, node);
             while (true) holder = switch (holder) {
-                .optional, .error_union, .pointer => |inner| inner.*,
+                .pointer => |inner| inner.child.*,
+                .optional, .error_union => |inner| inner.*,
                 else => break,
             };
             const container = switch (holder) {
@@ -2905,7 +2949,7 @@ fn memberOfChoice(self: *Facts, choices: []const Value, name: []const u8) Resolv
         .array => if (!std.mem.eql(u8, name, "len")) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
         // A type that declares no such member, likewise.
         .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
-        .pointer => |to| switch (to.*) {
+        .pointer => |to| switch (to.child.*) {
             .container, .instance => |c| if (self.lacks(c, name)) continue else try kept.append(self.gpa, try self.memberValue(choice, name)),
             else => try kept.append(self.gpa, try self.memberValue(choice, name)),
         },
@@ -2989,7 +3033,7 @@ fn called(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
 fn fieldOwner(lhs: Value) ?Container {
     return switch (lhs) {
         .instance => |c| c,
-        .pointer => |to| switch (to.*) {
+        .pointer => |to| switch (to.child.*) {
             .instance => |c| c,
             else => null,
         },
@@ -3134,7 +3178,7 @@ fn isType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
 /// (`f`, `&f`), or each a per-build choice names; false where it is anything else.
 fn stores(self: *Facts, targets: *std.ArrayList(Value), file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     var value = try self.resolve(file, node);
-    if (value == .pointer and value.pointer.* == .function) value = value.pointer.*;
+    if (value == .pointer and value.pointer.child.* == .function) value = value.pointer.child.*;
     const each: []const Value = switch (value) {
         .function => &.{value},
         .alternatives => |choices| choices,
@@ -3227,7 +3271,7 @@ fn typeArgument(self: *Facts, file: Project.FileId, call: Ast.full.Call, decl: D
         switch (try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
             .container => {},
             .instance => receiver = 1,
-            .pointer => |p| if (p.* == .instance) {
+            .pointer => |p| if (p.child.* == .instance) {
                 receiver = 1;
             } else return null,
             else => return null,
@@ -3256,7 +3300,7 @@ fn written(self: *Facts, generic: Generic, node: Ast.Node.Index, depth: usize) R
     const target_tree = &self.project.at(generic.decl.file).file.tree;
     if (target_tree.fullPtrType(node)) |ptr| {
         const child = (try self.written(generic, ptr.ast.child_type, depth + 1)) orelse return null;
-        return .{ .pointer = try self.boxed(child) };
+        return try self.pointerTo(child, ptr.size);
     }
     if (target_tree.fullArrayType(node)) |array| {
         const child = (try self.written(generic, array.ast.elem_type, depth + 1)) orelse return null;
@@ -3315,7 +3359,7 @@ fn eachReceiver(self: *Facts, file: Project.FileId, call: Ast.full.Call) Resolve
     for (receiver.alternatives, each) |one, *out| {
         const container = switch (one) {
             .instance, .container => |c| c,
-            .pointer => |p| switch (p.*) {
+            .pointer => |p| switch (p.child.*) {
                 .instance, .container => |c| c,
                 else => return null,
             },
@@ -3335,7 +3379,7 @@ fn madeResultOn(self: *Facts, receiver: Value, decl: Decl) ResolveError!?Value {
     // (`Held.initFrom(source)` of `const Held = Owned(Payload, release)`).
     const container = switch (receiver) {
         .instance, .container => |c| c,
-        .pointer => |p| switch (p.*) {
+        .pointer => |p| switch (p.child.*) {
             .instance, .container => |c| c,
             else => return null,
         },
@@ -3369,7 +3413,7 @@ fn madeWithin(self: *Facts, value: Value, outer: Container, made: *const Made) R
     return switch (value) {
         .container => |inner| if (self.within(inner, outer) and !try self.madeInside(inner, outer)) .{ .container = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
         .instance => |inner| if (self.within(inner, outer) and !try self.madeInside(inner, outer)) .{ .instance = .{ .file = inner.file, .scope = inner.scope, .symbolic = inner.symbolic, .made_by = made } } else value,
-        .pointer => |to| .{ .pointer = try self.boxed(try self.madeWithin(to.*, outer, made)) },
+        .pointer => |to| try self.pointerTo(try self.madeWithin(to.child.*, outer, made), to.size),
         .optional => |to| .{ .optional = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .error_union => |to| .{ .error_union = try self.boxed(try self.madeWithin(to.*, outer, made)) },
         .array => |to| .{ .array = try self.boxed(try self.madeWithin(to.*, outer, made)) },
@@ -3527,7 +3571,7 @@ pub fn callResult(self: *Facts, callee: Value, _: void) ResolveError!Value {
     // returns, whichever function is passed.
     const fn_type: ?Key = switch (callee) {
         .fn_type => |key| key,
-        .pointer => |to| if (to.* == .fn_type) to.fn_type else null,
+        .pointer => |to| if (to.child.* == .fn_type) to.child.fn_type else null,
         else => null,
     };
     if (fn_type) |key| {
@@ -3578,7 +3622,7 @@ fn payload(self: *Facts, value: Value, wrapper: std.meta.Tag(Value)) ResolveErro
 
 fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
-        .pointer => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
         .alternatives => self.map(value, {}, pointee),
         .unknown => value,
         else => .{ .unknown = .unsupported },
@@ -3589,10 +3633,10 @@ fn pointee(self: *Facts, value: Value, _: void) ResolveError!Value {
 fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .array => |inner| inner.*,
-        .pointer => |inner| switch (inner.*) {
+        .pointer => |inner| switch (inner.child.*) {
             .array => |elements| elements.*,
             .literal => |literal| self.choose(try self.literalParts(literal)),
-            else => inner.*,
+            else => inner.child.*,
         },
         // A tuple of no type of its own, named (`inline for (kinds) |kind|`): one of its parts.
         .literal => |literal| self.choose(try self.literalParts(literal)),
@@ -3602,12 +3646,15 @@ fn indexed(self: *Facts, value: Value, _: void) ResolveError!Value {
     };
 }
 
-/// A slice of `value`: a pointer to an array's elements, or the slice or pointer itself.
+/// A slice of `value`: a pointer to an array's elements, or to what the slice or pointer
+/// points at, of a size the slicing alone does not say (bounds known as the program compiles
+/// make a pointer to an array, others a slice).
 fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
-        .array => .{ .pointer = try self.boxed(value) },
+        .array => self.pointerTo(value, null),
+        .pointer => |p| .{ .pointer = .{ .child = p.child, .size = null } },
         // A string literal's bytes stay plain bytes.
-        .pointer, .unknown, .scalar => value,
+        .unknown, .scalar => value,
         .alternatives => self.map(value, {}, sliced),
         else => .{ .unknown = .unsupported },
     };
@@ -3647,15 +3694,28 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     return try self.peeredChoice(values.items, peers);
 }
 
-/// The prongs a `switch` on type information may take where the type's kind is known: the one
-/// naming its kind (`.@"union"`), else its `else`. Zig analyses no other. An array may be a
-/// vector, which reads as one: the `.array` prong or the `.vector` one. Null where the subject
-/// is anything else, a kind has no prong, or a prong names its kind other than by a literal.
+/// The prongs a `switch` on type information may take where what it reads is known: on a
+/// type's kind, the one naming it (`.@"union"`), else its `else`; on a pointer's size, the one
+/// naming it (`.slice`), else the `else`. Zig analyses no other. An array may be a vector, which
+/// reads as one: the `.array` prong or the `.vector` one. Null where the subject is anything
+/// else, a kind has no prong, or a prong names its kind other than by a literal.
 fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.full.Switch) ResolveError!?Taken {
     const tree = &self.project.at(file).file.tree;
-    if (!isTypeInfo(tree, whole.ast.condition)) return null;
+    // Only type information or a pointer's size read off it decides: a subject written as
+    // neither (`switch (tag)`) is not resolved, every prong taken, as one that does not
+    // resolve to either is.
+    if (!mayReflect(tree, whole.ast.condition)) return null;
     const subject = try self.resolveIn(env, file, whole.ast.condition);
-    if (subject != .reflected or subject.reflected.at != .info) return null;
+    if (subject != .reflected) return null;
+    // A pointer's size (`switch (info.size)`): the prong naming it, else the `else`.
+    if (subject.reflected.at == .size) {
+        const size = switch (subject.reflected.of.*) {
+            .pointer => |p| p.size orelse return null,
+            else => return null,
+        };
+        return .{ .one = (try self.prongOf(tree, whole, @tagName(size))) orelse return null };
+    }
+    if (subject.reflected.at != .info) return null;
     // A pointer (a slice among them), an optional, an error union or a function type is of
     // its kind whatever it holds (`std.meta.Child(*const T)`).
     const kind: []const u8 = switch (subject.reflected.of.*) {
@@ -3676,6 +3736,17 @@ fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.f
     const one = (try self.prongOf(tree, whole, kind)) orelse return null;
     if (!std.mem.eql(u8, kind, "array")) return .{ .one = one };
     return .{ .one = one, .other = (try self.prongOf(tree, whole, "vector")) orelse return null };
+}
+
+/// Whether `node` is written as what may be type information or a pointer's size read off
+/// it: `@typeInfo(...)`, or a member access named `size` (`info.size`). What it is, its value
+/// decides (`takenProng`).
+fn mayReflect(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo"),
+        .field_access => std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "size"),
+        else => false,
+    };
 }
 
 /// The prongs a `switch` on type information may take (`takenProng`): one, or two.
@@ -3702,14 +3773,6 @@ fn prongOf(self: *Facts, tree: *const Ast, whole: Ast.full.Switch, kind: []const
         }
     }
     return otherwise;
-}
-
-/// Whether `node` is `@typeInfo(...)`.
-fn isTypeInfo(tree: *const Ast, node: Ast.Node.Index) bool {
-    return switch (tree.nodeTag(node)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@typeInfo"),
-        else => false,
-    };
 }
 
 /// What a `null` or an error value among a value's branches or breaks adds to the others:
@@ -3932,7 +3995,8 @@ fn captured(self: *Facts, env: ?*const Env, decl: Decl) ResolveError!Value {
     else
         .{ .unknown = .unsupported };
     if (bound == .unknown or !by_pointer) return bound;
-    return .{ .pointer = try self.boxed(bound) };
+    // `|*x|`: a pointer to the one item captured.
+    return self.pointerTo(bound, .one);
 }
 
 fn conditional(self: *Facts, env: ?*const Env, file: Project.FileId, payload_token: ?Ast.TokenIndex, error_token: ?Ast.TokenIndex, condition: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!Value {
@@ -4111,11 +4175,12 @@ fn sameMaking(a: ?*const Made, b: ?*const Made, depth: usize) bool {
     return true;
 }
 
-/// Whether two values are one, what they point at compared, not where it is kept.
+/// Whether two values are one, what they point at compared, not where it is kept, a pointer's
+/// size among it.
 pub fn sameValue(a: Value, b: Value) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .pointer => |inner| sameValue(inner.*, b.pointer.*),
+        .pointer => |inner| inner.size == b.pointer.size and sameValue(inner.child.*, b.pointer.child.*),
         .array => |inner| sameValue(inner.*, b.array.*),
         .optional => |inner| sameValue(inner.*, b.optional.*),
         .error_union => |inner| sameValue(inner.*, b.error_union.*),
@@ -4191,8 +4256,10 @@ fn same(a: Value, b: Value, depth: usize) bool {
     if (depth == 64) return false;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .pointer, .array, .optional, .error_union => |inner| switch (b) {
-            .pointer, .array, .optional, .error_union => |other| same(inner.*, other.*, depth + 1),
+        // Of one size: `*T` and `[]T` are two types.
+        .pointer => |inner| inner.size == b.pointer.size and same(inner.child.*, b.pointer.child.*, depth + 1),
+        .array, .optional, .error_union => |inner| switch (b) {
+            .array, .optional, .error_union => |other| same(inner.*, other.*, depth + 1),
             else => false,
         },
         .container, .instance => |c| switch (b) {
@@ -4326,7 +4393,8 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
 fn callable(value: Value) bool {
     return switch (value) {
         .function, .fn_type => true,
-        .pointer, .optional => |inner| callable(inner.*),
+        .pointer => |inner| callable(inner.child.*),
+        .optional => |inner| callable(inner.*),
         .alternatives => |each| for (each) |one| {
             if (!callable(one)) break false;
         } else true,
@@ -4334,15 +4402,15 @@ fn callable(value: Value) bool {
     };
 }
 
-/// Whether `value` and `typed` are the same container, or the same through as many pointers,
-/// whatever made each.
+/// Whether `value` and `typed` are the same container, or the same through as many pointers of
+/// the same sizes, whatever made each.
 fn sameContainer(value: Value, typed: Value) bool {
     return switch (value) {
         .container, .instance => |k| switch (typed) {
             .container, .instance => |other| k.file == other.file and k.scope == other.scope,
             else => false,
         },
-        .pointer => |inner| typed == .pointer and sameContainer(inner.*, typed.pointer.*),
+        .pointer => |inner| typed == .pointer and inner.size == typed.pointer.size and sameContainer(inner.child.*, typed.pointer.child.*),
         else => false,
     };
 }
@@ -4352,7 +4420,8 @@ fn sameContainer(value: Value, typed: Value) bool {
 fn namesFunction(value: Value) bool {
     return switch (value) {
         .function => true,
-        .pointer, .optional, .error_union => |inner| namesFunction(inner.*),
+        .pointer => |inner| namesFunction(inner.child.*),
+        .optional, .error_union => |inner| namesFunction(inner.*),
         .alternatives => |each| for (each) |one| {
             if (namesFunction(one)) break true;
         } else false,
@@ -4365,7 +4434,7 @@ fn namesFunction(value: Value) bool {
 fn identified(value: Value) bool {
     return switch (value) {
         .function => true,
-        .pointer => |inner| identified(inner.*),
+        .pointer => |inner| identified(inner.child.*),
         .alternatives => |each| for (each) |one| {
             if (!identified(one)) break false;
         } else true,
@@ -4390,8 +4459,8 @@ fn identity(self: *Facts, typed: Value, passed: ?[]const Value) ResolveError!Val
             if (!identified(one)) return self.erased(typed);
             // A function given where a pointer to one is held coerces to its address.
             if (pointer and one == .function) {
-                const box = try self.boxed(one);
-                one = .{ .pointer = box };
+                // `*const fn`: a pointer to the one function.
+                one = try self.pointerTo(one, .one);
             }
             try named.append(self.gpa, one);
         }
@@ -4409,7 +4478,7 @@ fn erased(self: *Facts, value: Value) ResolveError!Value {
             const node = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node;
             break :blk .{ .fn_type = .{ .file = decl.file, .node = if (tree.nodeTag(node) == .fn_decl) tree.nodeData(node).node_and_node[0] else node } };
         },
-        .pointer => |inner| .{ .pointer = try self.boxed(try self.erased(inner.*)) },
+        .pointer => |inner| try self.pointerTo(try self.erased(inner.child.*), inner.size),
         .optional => |inner| .{ .optional = try self.boxed(try self.erased(inner.*)) },
         .alternatives => |each| blk: {
             const mapped = try self.gpa.alloc(Value, each.len);
@@ -5313,20 +5382,20 @@ pub fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!
         // A string literal's bytes.
         .scalar => return .memory,
         .array => |each| return if (try self.sized(each.*, 0)) .memory else .unsized,
-        .pointer => |inner| switch (inner.*) {
+        .pointer => |inner| switch (inner.child.*) {
             // A single pointer to a container reads its field; a slice of one, its count.
             // The value is the same for both, so a container that declares `len` is read
             // as declaring it.
             .instance, .container => |k| {
                 if (self.member(k, name) != null) return .field;
-                return if (try self.sized(inner.*, 0)) .memory else .unsized;
+                return if (try self.sized(inner.child.*, 0)) .memory else .unsized;
             },
             // A pointer to an array or a slice, or a slice of them: the count is of
             // what the inner one holds for the first, of the inner one for the second.
             // An array's own size is its count's, which the value does not hold.
             .array => return .unsized,
             .unknown, .literal, .reified, .reflected, .alternatives => return .field,
-            else => return if (try self.sized(inner.*, 0)) .memory else .unsized,
+            else => return if (try self.sized(inner.child.*, 0)) .memory else .unsized,
         },
         .alternatives => |each| {
             var out: Length = .memory;
@@ -5352,7 +5421,7 @@ fn sized(self: *Facts, value: Value, depth: usize) ResolveError!bool {
             for ([_][]const u8{ "bool", "usize", "isize", "f16", "f32", "f64", "f80", "f128", "c_char", "c_short", "c_ushort", "c_int", "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong", "c_longdouble", "anyerror" }) |one| if (std.mem.eql(u8, p, one)) return true;
             return false;
         },
-        .pointer => |inner| return (inner.* == .primitive and std.mem.eql(u8, inner.primitive, "anyopaque")) or try self.sized(inner.*, depth + 1),
+        .pointer => |inner| return (inner.child.* == .primitive and std.mem.eql(u8, inner.child.primitive, "anyopaque")) or try self.sized(inner.child.*, depth + 1),
         .optional, .error_union, .error_set, .function, .fn_type => return true,
         .instance, .container => |k| {
             const model = &self.project.at(k.file).model;
@@ -5526,7 +5595,7 @@ pub fn definition(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
     if (tree.nodeTag(node) == .field_access) {
         const data = tree.nodeData(node).node_and_token;
         const value = try self.resolve(file, data[0]);
-        const holder = if (value == .pointer) value.pointer.* else value;
+        const holder = if (value == .pointer) value.pointer.child.* else value;
         const container = switch (holder) {
             .container, .instance => |c| c,
             .unknown => |why| return .{ .unknown = why },
@@ -5555,7 +5624,7 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
     };
     // `@field(p, "name")` on a single pointer names its pointee's member.
     const resolved = try self.resolve(file, args[0]);
-    const value = if (resolved == .pointer) resolved.pointer.* else resolved;
+    const value = if (resolved == .pointer) resolved.pointer.child.* else resolved;
     const container = switch (value) {
         .container, .instance => |c| c,
         .unknown => |why| return .{ .unknown = why },
@@ -5582,7 +5651,8 @@ pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
         break :blk try self.literalType(file, node);
     };
     while (true) holder = switch (holder) {
-        .optional, .error_union, .pointer => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
         else => break,
     };
     const container = switch (holder) {
@@ -5625,7 +5695,7 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
     return switch (value) {
         .container => |c| .{ .instance = c },
         .reified => |built| .{ .reified = .{ .fields = built.fields, .value = true } },
-        .pointer => |inner| .{ .pointer = try self.boxed(try self.instance(inner.*)) },
+        .pointer => |inner| try self.pointerTo(try self.instance(inner.child.*), inner.size),
         .optional => |inner| .{ .optional = try self.boxed(try self.instance(inner.*)) },
         .error_union => |inner| .{ .error_union = try self.boxed(try self.instance(inner.*)) },
         .array => |inner| .{ .array = try self.boxed(try self.instance(inner.*)) },
@@ -5674,7 +5744,7 @@ fn choose(self: *Facts, values: []const Value) ResolveError!Value {
 fn emptyLiteralValue(self: *const Facts, value: Value) bool {
     const literal = switch (value) {
         .literal => |literal| literal,
-        .pointer => |inner| if (inner.* == .literal) inner.literal else return false,
+        .pointer => |inner| if (inner.child.* == .literal) inner.child.literal else return false,
         else => return false,
     };
     return emptyLiteral(&self.project.at(literal.file).file.tree, literal.node);
@@ -5690,10 +5760,12 @@ fn map(self: *Facts, value: Value, context: anytype, comptime f: fn (*Facts, Val
 
 /// The type of a value: an instance is of its container; pointers, arrays, optionals and error
 /// unions read the same as values and as types here, and a function is its own type.
-fn typeOf(_: *Facts, value: Value, _: void) ResolveError!Value {
+fn typeOf(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .instance => |c| .{ .container = c },
         .reified => |built| .{ .reified = .{ .fields = built.fields } },
+        // A pointer's size is a `std.builtin.Type.Pointer.Size`.
+        .reflected => |r| if (r.at == .size) self.stdMember(&.{ "builtin", "Type", "Pointer", "Size" }) else value,
         else => value,
     };
 }
@@ -5752,7 +5824,12 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
             inline for (kinds) |kind| if (std.mem.eql(u8, name, kind[0])) return .{ .reflected = .{ .of = r.of, .at = kind[1] } };
             return .{ .reflected = .{ .of = r.of, .at = .part } };
         },
-        .pointer => return if (std.mem.eql(u8, name, "child")) self.pointee(r.of.*, {}) else unsupported,
+        .pointer => {
+            if (std.mem.eql(u8, name, "child")) return self.pointee(r.of.*, {});
+            // Its size: one item, many, a slice or a C pointer (`info.size`), as the type says.
+            if (std.mem.eql(u8, name, "size")) return .{ .reflected = .{ .of = r.of, .at = .size } };
+            return unsupported;
+        },
         .optional => return if (std.mem.eql(u8, name, "child")) self.payload(r.of.*, .optional) else unsupported,
         .error_union => return if (std.mem.eql(u8, name, "payload")) self.payload(r.of.*, .error_union) else unsupported,
         .array => return if (std.mem.eql(u8, name, "child")) self.indexed(r.of.*, {}) else unsupported,
@@ -5770,15 +5847,16 @@ fn reflectedMember(self: *Facts, r: Reflected, name: []const u8) ResolveError!Va
         // analyse for it.
         .structure, .tagged, .enumeration => {
             // Names are strings whatever the type is (a typeless literal's among them).
-            if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return .{ .pointer = try self.boxed(.{ .pointer = try self.boxed(.{ .primitive = "u8" }) }) };
+            if (std.mem.eql(u8, name, "field_names") or std.mem.eql(u8, name, "decl_names")) return try self.pointerTo(try self.pointerTo(.{ .primitive = "u8" }, .slice), .slice);
             const container = self.reflectedContainer(r) orelse return if (r.of.* == .unknown) r.of.* else unsupported;
-            if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return .{ .pointer = try self.boxed(try self.fieldTypes(container)) };
-            if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return .{ .pointer = try self.boxed(.scalar) };
+            if (std.mem.eql(u8, name, "field_types") and r.at != .enumeration) return try self.pointerTo(try self.fieldTypes(container), .slice);
+            if (std.mem.eql(u8, name, "field_values") and r.at == .enumeration) return try self.pointerTo(.scalar, .slice);
             if (std.mem.eql(u8, name, "is_tuple") and r.at == .structure) return .scalar;
             if (std.mem.eql(u8, name, "tag_type") and r.at != .structure) return self.tagType(container, r.at == .tagged);
             return unsupported;
         },
-        .params, .part => return unsupported,
+        // A pointer's size is a tag, which has no fields.
+        .params, .part, .size => return unsupported,
     }
 }
 
@@ -5936,7 +6014,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         const receiver = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
         const holder: ?Container = switch (receiver) {
             .instance, .container => |c| c,
-            .pointer => |p| switch (p.*) {
+            .pointer => |p| switch (p.child.*) {
                 .instance, .container => |c| c,
                 else => null,
             },
@@ -5947,7 +6025,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         };
         const on_value = switch (receiver) {
             .instance => true,
-            .pointer => |p| p.* == .instance,
+            .pointer => |p| p.child.* == .instance,
             else => false,
         };
         if (on_value) {
@@ -6111,7 +6189,7 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         aligned = receiver == .container;
         const holder: ?Container = switch (receiver) {
             .instance => |c| c,
-            .pointer => |p| if (p.* == .instance) p.instance else null,
+            .pointer => |p| if (p.child.* == .instance) p.child.instance else null,
             else => null,
         };
         if (holder) |h| {
@@ -6427,7 +6505,7 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
             return self.elementOf(base, tree, operands[1]);
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return self.builtin(env, file, node),
-        .address_of => return .{ .pointer = try self.boxed(try self.resolveIn(env, file, tree.nodeData(node).node)) },
+        .address_of => return self.pointerTo(try self.resolveIn(env, file, tree.nodeData(node).node), .one),
         .deref => return self.pointee(try self.resolveIn(env, file, tree.nodeData(node).node), {}),
         .slice_open, .slice, .slice_sentinel => return self.sliced(try self.resolveIn(env, file, tree.fullSlice(node).?.ast.sliced), {}), // unreachable: a slice node is a full slice
         .@"catch", .@"orelse" => return self.unwrapped(env, file, node),
@@ -6446,7 +6524,7 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
         },
         else => {},
     }
-    if (tree.fullPtrType(node)) |ptr| return .{ .pointer = try self.boxed(try self.resolveIn(env, file, ptr.ast.child_type)) };
+    if (tree.fullPtrType(node)) |ptr| return try self.pointerTo(try self.resolveIn(env, file, ptr.ast.child_type), ptr.size);
     if (tree.fullArrayType(node)) |array| return .{ .array = try self.boxed(try self.resolveIn(env, file, array.ast.elem_type)) };
     // A container the reading's function declares in its body, naming what the reading binds
     // (`const Instance = struct { fn_args: Args }`): this reading's, as Zig makes one per
@@ -6662,7 +6740,8 @@ fn boundByCallers(self: *Facts, parameter: Decl, position: usize) ResolveError!V
 fn absent(value: Value) bool {
     return switch (value) {
         .unknown => |why| why == .absent,
-        .pointer, .array, .optional, .error_union => |inner| absent(inner.*),
+        .pointer => |inner| absent(inner.child.*),
+        .array, .optional, .error_union => |inner| absent(inner.*),
         else => false,
     };
 }
@@ -6880,7 +6959,7 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
                         .container => |c| .{ c, false },
                         .instance => |c| .{ c, true },
                         // A pointer is a value: its method takes it as the first parameter.
-                        .pointer => |pointed| switch (pointed.*) {
+                        .pointer => |pointed| switch (pointed.child.*) {
                             .instance, .container => |c| .{ c, true },
                             .unknown => if (!callee or try self.cannotBe(tree, parent, node, function)) continue else return null,
                             else => continue,
@@ -7077,7 +7156,8 @@ fn mayBeProgram(self: *Facts, value: Value) ResolveError!bool {
     return switch (value) {
         .unknown => true,
         .container, .instance => |c| try self.program(c.file),
-        .pointer, .array, .optional, .error_union => |inner| self.mayBeProgram(inner.*),
+        .pointer => |inner| self.mayBeProgram(inner.child.*),
+        .array, .optional, .error_union => |inner| self.mayBeProgram(inner.*),
         .alternatives => |each| for (each) |one| {
             if (try self.mayBeProgram(one)) break true;
         } else false,
@@ -7122,8 +7202,8 @@ fn holders(self: *Facts, value: Value) ResolveError![]const Value {
     var list: std.ArrayList(Value) = .empty;
     const outer: []const Value = if (value == .alternatives) value.alternatives else &.{value};
     for (outer) |one| {
-        if (one == .pointer and one.pointer.* == .alternatives) {
-            for (one.pointer.alternatives) |inner| try list.append(self.gpa, .{ .pointer = try self.boxed(inner) });
+        if (one == .pointer and one.pointer.child.* == .alternatives) {
+            for (one.pointer.child.alternatives) |inner| try list.append(self.gpa, try self.pointerTo(inner, one.pointer.size));
         } else try list.append(self.gpa, one);
     }
     return list.items;
@@ -8450,7 +8530,8 @@ pub const accesses = struct {
     fn holderContainer(value: Facts.Value) ?Facts.Container {
         return switch (value) {
             .container, .instance => |container| container,
-            .pointer, .optional => |inner| holderContainer(inner.*),
+            .pointer => |inner| holderContainer(inner.child.*),
+            .optional => |inner| holderContainer(inner.*),
             else => null,
         };
     }
@@ -9063,12 +9144,12 @@ pub const accesses = struct {
         const own: Facts.Value = switch (tree.nodeTag(memory)) {
             .address_of => try facts.resolve(file, tree.nodeData(memory).node),
             else => switch (try facts.resolve(file, memory)) {
-                .pointer => |inner| inner.*,
+                .pointer => |inner| inner.child.*,
                 else => |other| other,
             },
         };
         const seen: Facts.Value = switch (given) {
-            .pointer => |inner| inner.*,
+            .pointer => |inner| inner.child.*,
             else => return true,
         };
         if (!seen.known() or !own.known()) return true;
@@ -9530,7 +9611,8 @@ pub const accesses = struct {
         fn member(w: *Walk, site: Site, holder: Facts.Value, name: []const u8) Error!void {
             switch (holder) {
                 // A literal returned as an error union's or optional's payload makes a value of the payload.
-                .pointer, .optional, .error_union => |inner| try w.member(site, inner.*, name),
+                .pointer => |inner| try w.member(site, inner.child.*, name),
+                .optional, .error_union => |inner| try w.member(site, inner.*, name),
                 .instance, .container => |container| {
                     const d = w.facts.member(container, name) orelse return w.named(name, site);
                     switch (w.facts.project.at(d.file).model.declarations[@backingInt(d.index)].kind) {
@@ -9572,7 +9654,7 @@ pub const accesses = struct {
                     return true;
                 },
                 .array, .optional, .error_union => |inner| return w.collect(site, inner.*, behind, past, seen, depth + 1),
-                .pointer => |inner| return if (behind) w.collect(site, inner.*, behind, true, seen, depth + 1) else true,
+                .pointer => |inner| return if (behind) w.collect(site, inner.child.*, behind, true, seen, depth + 1) else true,
                 .alternatives => |each| {
                     for (each) |one| if (!try w.collect(site, one, behind, past, seen, depth + 1)) return false;
                     return true;
@@ -9600,7 +9682,7 @@ pub const accesses = struct {
             };
             return switch (value) {
                 .container => |c| .{ .instance = c },
-                .pointer => |inner| .{ .pointer = try wrap.boxed(w.facts, try w.valued(inner.*)) },
+                .pointer => |inner| .{ .pointer = .{ .child = try wrap.boxed(w.facts, try w.valued(inner.child.*)), .size = inner.size } },
                 .optional => |inner| .{ .optional = try wrap.boxed(w.facts, try w.valued(inner.*)) },
                 .array => |inner| .{ .array = try wrap.boxed(w.facts, try w.valued(inner.*)) },
                 .error_union => |inner| .{ .error_union = try wrap.boxed(w.facts, try w.valued(inner.*)) },
@@ -9703,7 +9785,7 @@ pub const accesses = struct {
                 else => {},
             }
             if (w.holders()) switch (try w.facts.resolve(w.file, pointer)) {
-                .pointer => |inner| try w.shapes(through, inner.*, false),
+                .pointer => |inner| try w.shapes(through, inner.child.*, false),
                 else => try w.unresolved(through),
             };
         }
@@ -9897,7 +9979,8 @@ pub const accesses = struct {
     /// What a holder holds its members in: the value a pointer or an optional of it points at.
     fn held(value: Facts.Value) Facts.Value {
         return switch (value) {
-            .pointer, .optional => |inner| held(inner.*),
+            .pointer => |inner| held(inner.child.*),
+            .optional => |inner| held(inner.*),
             else => value,
         };
     }
@@ -10121,7 +10204,11 @@ pub const calls = struct {
             for (value.alternatives) |one| {
                 const container = switch (one) {
                     .instance => |c| c,
-                    .pointer, .optional => |inner| switch (inner.*) {
+                    .pointer => |inner| switch (inner.child.*) {
+                        .instance => |c| c,
+                        else => return .{ .unknown = .unsupported },
+                    },
+                    .optional => |inner| switch (inner.*) {
                         .instance => |c| c,
                         else => return .{ .unknown = .unsupported },
                     },
@@ -10167,7 +10254,11 @@ pub const calls = struct {
         if (env != null and tree.nodeTag(node) == .field_access) {
             const container: ?Facts.Container = switch (holder) {
                 .instance, .container => |c| c,
-                .pointer, .optional => |inner| switch (inner.*) {
+                .pointer => |inner| switch (inner.child.*) {
+                    .instance, .container => |c| c,
+                    else => null,
+                },
+                .optional => |inner| switch (inner.*) {
                     .instance, .container => |c| c,
                     else => null,
                 },
@@ -10200,7 +10291,8 @@ pub const calls = struct {
     fn functionsIn(facts: *Facts, value: Facts.Value, found: *std.ArrayList(Facts.Decl)) Error!?Facts.Unknown {
         switch (value) {
             .function => |decl| try add(facts, found, decl),
-            .pointer, .optional => |inner| return functionsIn(facts, inner.*, found),
+            .pointer => |inner| return functionsIn(facts, inner.child.*, found),
+            .optional => |inner| return functionsIn(facts, inner.*, found),
             .alternatives => |each| for (each) |one| {
                 // `null`, which no call reaches.
                 if (one == .scalar) continue;
@@ -10412,7 +10504,7 @@ fn placeType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: us
         // and a `[]const [N]E` read alike and the literal is not known.
         .address_of => {
             const target = switch (try self.placeType(file, parent, depth + 1)) {
-                .pointer => |inner| inner.*,
+                .pointer => |inner| inner.child.*,
                 .unknown => |why| return .{ .unknown = why },
                 else => return .{ .unknown = .unsupported },
             };
@@ -10489,7 +10581,7 @@ fn parameterType(self: *Facts, file: Project.FileId, node: Ast.Node.Index, call:
         const on = try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
         const container: ?Container = switch (on) {
             .instance => |c| c,
-            .pointer => |p| switch (p.*) {
+            .pointer => |p| switch (p.child.*) {
                 .instance => |c| c,
                 else => null,
             },
@@ -10553,7 +10645,7 @@ test "a container a forwarding type function makes is read with the outer call's
     const init = project.sources[0].file.tree.fullVarDecl(p.node).?.ast.init_node.unwrap().?;
     const value = try facts.resolve(project.sources[0].id, init);
     try std.testing.expect(value == .pointer);
-    try std.testing.expect(value.pointer.* == .instance);
+    try std.testing.expect(value.pointer.child.* == .instance);
 }
 
 test "an error value among a block's breaks makes the others an error union, as null makes them optional" {
@@ -10623,7 +10715,7 @@ test "@errorReturnTrace and @src give std's own types where the project maps std
         } else unreachable; // unreachable: the source declares each name
         out.* = try facts.resolve(project.sources[0].id, project.sources[0].file.tree.fullVarDecl(d.node).?.ast.init_node.unwrap().?);
     }
-    try std.testing.expect(found[0] == .pointer and found[0].pointer.* == .instance and found[0].pointer.instance.file == project.sources[2].id);
+    try std.testing.expect(found[0] == .pointer and found[0].pointer.child.* == .instance and found[0].pointer.child.instance.file == project.sources[2].id);
     try std.testing.expect(found[1] == .instance and found[1].instance.file == project.sources[2].id);
 }
 
@@ -10742,7 +10834,7 @@ fn fieldRead(source: []const u8, called_there: bool) !FieldRead {
         if (tree.nodeTag(node) != .field_access or !std.mem.eql(u8, tree.getNodeSource(node), "o.run")) continue;
         if (called(tree, &project.sources[0].model, node) != called_there) continue;
         var value = try facts.resolve(project.sources[0].id, node);
-        while (value == .pointer) value = value.pointer.*;
+        while (value == .pointer) value = value.pointer.child.*;
         return switch (value) {
             .function => .function,
             .alternatives => .choice,
@@ -11092,6 +11184,177 @@ test "a type function is evaluated in a reading however many calls deep its chai
     }
     try std.testing.expectEqual(@as(usize, 9), env.?.depth);
     const value = try facts.resolveBound(env.?, file, node.of(tree, "w.?"));
+    const foo = try facts.resolve(file, node.of(tree, "Foo"));
+    try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
+}
+
+test "a pointer's size is its type's: a reading decides a condition on it, and a pointer built of it keeps it" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\fn kind(p: anytype) void {
+        \\    const info = @typeInfo(@TypeOf(p)).pointer;
+        \\    if (info.size == .slice) {
+        \\        sliceOnly(p);
+        \\    } else {
+        \\        oneOnly(p);
+        \\    }
+        \\}
+        \\fn sliceOnly(p: anytype) void { _ = p; }
+        \\fn oneOnly(p: anytype) void { _ = p; }
+        \\fn Same(comptime P: type) type {
+        \\    const info = @typeInfo(P).pointer;
+        \\    return @Pointer(info.size, info.attrs, info.child, null);
+        \\}
+        \\pub fn main() void {
+        \\    var foo: Foo = .{ .a = 1 };
+        \\    var arr: [1]Foo = .{foo};
+        \\    const s: []Foo = &arr;
+        \\    kind(s);
+        \\    kind(&foo);
+        \\    const same: Same([]Foo) = s;
+        \\    _ = same;
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const kind = facts.member(facts.rootOf(file), "kind").?;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const by_slice = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "kind(s)")).?, kind, null);
+    const by_one = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "kind(&foo)")).?, kind, null);
+    const slice_only = node.of(tree, "sliceOnly(p)");
+    const one_only = node.of(tree, "oneOnly(p)");
+    try std.testing.expect(try facts.reachedUnder(by_slice, file, slice_only));
+    try std.testing.expect(!try facts.reachedUnder(by_slice, file, one_only));
+    try std.testing.expect(!try facts.reachedUnder(by_one, file, slice_only));
+    try std.testing.expect(try facts.reachedUnder(by_one, file, one_only));
+    // `@Pointer(info.size, ...)` makes a pointer of the size it reads.
+    const built = try facts.resolve(file, node.of(tree, "Same([]Foo)"));
+    try std.testing.expect(built == .pointer and built.pointer.size == .slice);
+    // A pointer to one and a slice are two types.
+    const one = try facts.resolve(file, node.of(tree, "&foo"));
+    try std.testing.expect(one == .pointer and one.pointer.size == .one);
+    try std.testing.expect(!Facts.same(one, try facts.pointerTo(one.pointer.child.*, .slice), 0));
+}
+
+test "a pointer's size read off its type information is a std.builtin.Type.Pointer.Size" {
+    const root =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    const size = @typeInfo([]u8).pointer.size;
+        \\    _ = @as(@TypeOf(size), size);
+        \\}
+    ;
+    const library =
+        \\pub const builtin = struct {
+        \\    pub const Type = struct {
+        \\        pub const Pointer = struct {
+        \\            pub const Size = enum { one, many, slice, c };
+        \\        };
+        \\    };
+        \\};
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes = root },
+        .{ .name = "std/std.zig", .bytes = library, .selected = false },
+    }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = for (0..tree.nodes.len) |i| {
+        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (std.mem.eql(u8, tree.getNodeSource(at), "@TypeOf(size)")) break at;
+    } else unreachable; // unreachable: the source writes it
+    const size_type = try facts.resolve(file, node);
+    try std.testing.expect(size_type == .container);
+    const library_tree = &project.sources[1].file.tree;
+    const scope = project.sources[1].model.scopes[@backingInt(size_type.container.scope)];
+    try std.testing.expect(size_type.container.file == project.sources[1].id);
+    try std.testing.expect(std.mem.startsWith(u8, library_tree.getNodeSource(scope.node), "enum { one, many, slice, c }"));
+}
+
+test "a call whose result type a type function builds from its argument's type reads in a reading many calls deep (std's realloc: absorbSentinel(allocation))" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\fn AbsorbSentinel(comptime Pointer: type) type {
+        \\    const info = @typeInfo(Pointer).pointer;
+        \\    switch (info.size) {
+        \\        .slice => return @Pointer(.slice, info.attrs, info.child, null),
+        \\        .one => {
+        \\            const child_info = @typeInfo(info.child).array;
+        \\            if (child_info.sentinel_ptr == null) {
+        \\                return Pointer;
+        \\            } else {
+        \\                return @Pointer(.one, info.attrs, [child_info.len + 1]child_info.child, null);
+        \\            }
+        \\        },
+        \\        else => unreachable,
+        \\    }
+        \\}
+        \\fn absorbSentinel(slice: anytype) AbsorbSentinel(@TypeOf(slice)) { return slice; }
+        \\fn f0(x: anytype) void { f1(x); }
+        \\fn f1(x: anytype) void { f2(x); }
+        \\fn f2(x: anytype) void { f3(x); }
+        \\fn f3(x: anytype) void { f4(x); }
+        \\fn f4(x: anytype) void { f5(x); }
+        \\fn f5(x: anytype) void { f6(x); }
+        \\fn f6(x: anytype) void { f7(x); }
+        \\fn f7(x: anytype) void { f8(x); }
+        \\fn f8(x: anytype) void { f9(x); }
+        \\fn f9(allocation: anytype) void {
+        \\    const old_memory = absorbSentinel(allocation);
+        \\    _ = old_memory[0];
+        \\}
+        \\pub fn main() void {
+        \\    var buffer: [4]Foo = undefined;
+        \\    const items: []Foo = &buffer;
+        \\    f0(items);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var env: ?*const Env = null;
+    const names = [_][]const u8{ "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9" };
+    for ([_][]const u8{ "f0(items)", "f1(x)", "f2(x)", "f3(x)", "f4(x)", "f5(x)", "f6(x)", "f7(x)", "f8(x)", "f9(x)" }, names) |text, name| {
+        var buffer: [1]Ast.Node.Index = undefined;
+        env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, text)).?, facts.member(root, name).?, env);
+    }
+    try std.testing.expectEqual(@as(usize, 9), env.?.depth);
+    const value = try facts.resolveBound(env.?, file, node.of(tree, "old_memory[0]"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }

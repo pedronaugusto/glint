@@ -540,14 +540,14 @@ test "Facts.literalType: `&.{}` is what its place points at, a slice's an array 
     // A field of a literal under `&`, its place a pointer to a type chosen per target: each
     // choice's own field, here a `[]const u8` in both.
     const field = try facts.literalType(file, spelledNode(tree, "\"x\"", 0).?);
-    try std.testing.expect(field == .pointer and field.pointer.* == .primitive);
+    try std.testing.expect(field == .pointer and field.pointer.child.* == .primitive);
     // `&.{ … }` where a `[]const A` is taken: an array of `A`, each element an `A`.
     const element = try facts.literalType(file, spelledNode(tree, ".{ .in = \"y\" }", 0).?);
     try std.testing.expect(element == .container and std.meta.eql(element.container.scope, a.scope));
     // A returned literal's field, of a container a type function made: its type with the
     // call's arguments, `?[*]u16` (another call makes `?[*]u8`).
     const buffer = try facts.literalType(file, spelledNode(tree, "@ptrCast(@alignCast(p))", 0).?);
-    try std.testing.expect(buffer == .optional and buffer.optional.* == .pointer and buffer.optional.pointer.* == .primitive and std.mem.eql(u8, buffer.optional.pointer.primitive, "u16"));
+    try std.testing.expect(buffer == .optional and buffer.optional.* == .pointer and buffer.optional.pointer.child.* == .primitive and std.mem.eql(u8, buffer.optional.pointer.child.primitive, "u16"));
     // A declaration literal under `comptime` or `try` names its place's container's member.
     try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".of(1)", 0).?)).?.scope, a.scope));
     try std.testing.expect(std.meta.eql((try facts.resultContainer(file, spelledNode(tree, ".ofError(2)", 0).?)).?.scope, a.scope));

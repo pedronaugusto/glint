@@ -78,7 +78,7 @@ fn failure(kind: usize) []const u8 {
 /// none of them.
 fn kindOf(c: *Context, ks: *const Kinds, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Kind {
     var value = try c.facts.resolve(file, node);
-    if (value == .pointer) value = value.pointer.*;
+    if (value == .pointer) value = value.pointer.child.*;
     const held = switch (value) {
         .instance, .container => |k| k,
         .unknown => return .unresolved,
@@ -445,7 +445,8 @@ fn mayHold(c: *Context, ks: *const Kinds, function: Facts.Decl, position: usize)
     const type_expr = param.type_expr orelse return true;
     var value = try c.facts.resolve(function.file, type_expr);
     while (true) value = switch (value) {
-        .pointer, .optional => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional => |inner| inner.*,
         else => break,
     };
     const held = switch (value) {

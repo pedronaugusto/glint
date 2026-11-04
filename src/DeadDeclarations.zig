@@ -144,7 +144,8 @@ fn computed(context: *Context, candidates: []Candidate, model: *const Model, val
             for (candidates) |*candidate| if (model.declarations[@backingInt(candidate.decl)].scope == container.scope) use(candidate, token);
             return true;
         },
-        .pointer, .optional, .error_union => |child| return computed(context, candidates, model, child.*, token),
+        .pointer => |child| return computed(context, candidates, model, child.child.*, token),
+        .optional, .error_union => |child| return computed(context, candidates, model, child.*, token),
         .alternatives => |each| {
             for (each) |one| if (!try computed(context, candidates, model, one, token)) return false;
             return true;

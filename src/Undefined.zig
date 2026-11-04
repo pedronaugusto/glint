@@ -2841,7 +2841,7 @@ fn functionsOf(gpa: std.mem.Allocator, value: Facts.Value, found: *std.ArrayList
     switch (value) {
         .function => |decl| try found.append(gpa, decl),
         .alternatives => |each| for (each) |one| if (!try functionsOf(gpa, one, found)) return false,
-        .pointer => |to| return functionsOf(gpa, to.*, found),
+        .pointer => |to| return functionsOf(gpa, to.child.*, found),
         else => return false,
     }
     return true;
@@ -2917,7 +2917,7 @@ fn vtableSlot(c: *Context, file: Project.FileId, function: Ast.Node.Index) Conte
     const holder, const field = tree.nodeData(table).node_and_token;
     if (!std.mem.eql(u8, tree.tokenSlice(field), "vtable")) return null;
     var value = try c.facts.resolve(file, holder);
-    if (value == .pointer) value = value.pointer.*;
+    if (value == .pointer) value = value.pointer.child.*;
     const container = switch (value) {
         .instance => |container| container,
         else => return null,
@@ -3019,7 +3019,7 @@ fn sameValue(a: Facts.Value, b: Facts.Value, depth: usize) bool {
     return switch (a) {
         .primitive => |name| std.mem.eql(u8, name, b.primitive),
         .container => |one| one.made_by == null and b.container.made_by == null and one.file == b.container.file and one.scope == b.container.scope,
-        .pointer => |inner| sameValue(inner.*, b.pointer.*, depth + 1),
+        .pointer => |inner| inner.size == b.pointer.size and sameValue(inner.child.*, b.pointer.child.*, depth + 1),
         .array => |inner| sameValue(inner.*, b.array.*, depth + 1),
         .optional => |inner| sameValue(inner.*, b.optional.*, depth + 1),
         .alternatives => |each| each.len == b.alternatives.len and for (each, b.alternatives) |x, y| {
@@ -3136,7 +3136,7 @@ fn heldField(c: *Context, file: Project.FileId, access: Ast.Node.Index) Context.
     const object, const member = tree.nodeData(access).node_and_token;
     const container = switch (try c.facts.resolve(file, object)) {
         .instance => |found| found,
-        .pointer => |to| switch (to.*) {
+        .pointer => |to| switch (to.child.*) {
             .instance => |found| found,
             else => return .memory,
         },
@@ -3436,7 +3436,8 @@ fn holderOf(c: *Context, use: Facts.Key, container: Facts.Container) Context.Err
     const tree = &c.project.at(use.file).file.tree;
     var value = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
     while (true) switch (value) {
-        .pointer, .optional => |inner| value = inner.*,
+        .pointer => |inner| value = inner.child.*,
+        .optional => |inner| value = inner.*,
         else => break,
     };
     return switch (value) {
@@ -3795,7 +3796,7 @@ fn fixedBetween(c: *Context, file: Project.FileId, node: Ast.Node.Index, from: A
             const value = try c.facts.resolve(file, held);
             if (std.mem.eql(u8, tree.tokenSlice(name), "len")) switch (value) {
                 .array => return true,
-                .pointer => |inner| switch (inner.*) {
+                .pointer => |inner| switch (inner.child.*) {
                     .array => return true,
                     .container, .instance, .unknown => return false,
                     else => return fixedBetween(c, file, held, from, to, depth + 1),

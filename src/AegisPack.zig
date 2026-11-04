@@ -636,7 +636,7 @@ fn refuted(c: *Context, field: Ast.Node.Index, name: []const u8) Context.Error!b
                 .container, .instance => |held| held,
                 .array => if (sequence) return false else continue,
                 .primitive, .scalar => continue,
-                .pointer => |to| switch (to.*) {
+                .pointer => |to| switch (to.child.*) {
                     .container, .instance => |held| held,
                     .array, .primitive, .scalar => if (sequence) return false else continue,
                     else => return false,
@@ -663,7 +663,8 @@ fn callable(value: Facts.Value, depth: usize) bool {
     if (depth == 16) return true;
     return switch (value) {
         .container, .instance, .primitive, .array, .scalar, .error_set, .error_union => false,
-        .pointer, .optional => |inner| callable(inner.*, depth + 1),
+        .pointer => |inner| callable(inner.child.*, depth + 1),
+        .optional => |inner| callable(inner.*, depth + 1),
         .alternatives => |each| for (each) |one| {
             if (callable(one, depth + 1)) break true;
         } else false,
@@ -878,7 +879,8 @@ fn joined(found: Typed, next: Typed) Typed {
 fn perBuild(c: *Context, value: Facts.Value) Context.Error!Typed {
     var current = value;
     while (true) current = switch (current) {
-        .pointer, .array, .optional, .error_union => |payload| payload.*,
+        .pointer => |payload| payload.child.*,
+        .array, .optional, .error_union => |payload| payload.*,
         .reified => |built| built.fields.*,
         else => break,
     };
@@ -946,7 +948,8 @@ fn typed(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             .zig_own, .absent => .other,
             else => .unknown,
         },
-        .pointer, .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
+        .pointer => |payload| typed(c, payload.child.*, depth + 1),
+        .array, .optional, .error_union => |payload| typed(c, payload.*, depth + 1),
         // A built type holds what its fields' types do.
         .reified => |built| typed(c, built.fields.*, depth + 1),
         .alternatives => |each| blk: {
@@ -1008,7 +1011,8 @@ fn heldInRecord(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typ
 fn bindingTyped(value: Facts.Value) bool {
     var current = value;
     while (true) current = switch (current) {
-        .pointer, .array, .optional, .error_union => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .array, .optional, .error_union => |inner| inner.*,
         .unknown => |why| return why == .generic,
         else => return false,
     };
@@ -1050,7 +1054,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             // A call through a function pointer (`rule.check(&context)`): no generic, whose
             // parameters a runtime function's type cannot take, is called there.
             const callee = try c.facts.resolve(c.file, call.callee_expr);
-            if (callee == .fn_type or (callee == .pointer and callee.pointer.* == .fn_type)) return;
+            if (callee == .fn_type or (callee == .pointer and callee.pointer.child.* == .fn_type)) return;
             return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call spelled as a generic that copies its parameters does not resolve: its binding may copy an owner");
         },
     };

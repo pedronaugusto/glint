@@ -1010,7 +1010,8 @@ fn mayHoldWriter(c: *Context, flow: *Flow, value: Facts.Value, depth: usize) Con
     if (depth > 8) return true;
     switch (value) {
         .unknown, .reified, .literal => return true,
-        .pointer, .optional, .error_union, .array => |inner| return mayHoldWriter(c, flow, inner.*, depth + 1),
+        .pointer => |inner| return mayHoldWriter(c, flow, inner.child.*, depth + 1),
+        .optional, .error_union, .array => |inner| return mayHoldWriter(c, flow, inner.*, depth + 1),
         .alternatives => |each| {
             for (each) |one| if (try mayHoldWriter(c, flow, one, depth + 1)) return true;
             return false;
@@ -1044,7 +1045,8 @@ fn writerTypes(c: *Context, flow: *Flow, value: Facts.Value) Context.Error!void 
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     switch (value) {
-        .pointer, .optional, .error_union => |inner| try writerTypes(c, flow, inner.*),
+        .pointer => |inner| try writerTypes(c, flow, inner.child.*),
+        .optional, .error_union => |inner| try writerTypes(c, flow, inner.*),
         .alternatives => |each| for (each) |one| try writerTypes(c, flow, one),
         .instance, .container => |k| try flow.writer_types.append(c.allocator, k),
         .unknown, .reified, .literal => flow.writer_unknown = true,
@@ -1274,7 +1276,8 @@ pub fn namedFields(c: *Context, file: Project.FileId, node: Ast.Node.Index) Cont
     if (args.len != 2) return &.{};
     var holder = try c.facts.resolve(file, args[0]);
     while (true) holder = switch (holder) {
-        .pointer, .optional => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional => |inner| inner.*,
         else => break,
     };
     const container = switch (holder) {
@@ -1468,7 +1471,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
 /// Whether `node` is one of aegis's limits, budgets or reservations, or a pointer to one.
 fn accounting(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     var value = try c.facts.resolve(file, node);
-    if (value == .pointer) value = value.pointer.*;
+    if (value == .pointer) value = value.pointer.child.*;
     const role = (try c.role(Contract.library, value)) orelse return false;
     return switch (role) {
         .limit, .budget, .reservation => true,
@@ -2181,7 +2184,8 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
     for (if (value == .alternatives) value.alternatives else &.{value}) |each| {
         var held = each;
         while (true) held = switch (held) {
-            .pointer, .optional, .error_union => |inner| inner.*,
+            .pointer => |inner| inner.child.*,
+            .optional, .error_union => |inner| inner.*,
             else => break,
         };
         const container = switch (held) {
@@ -2206,7 +2210,8 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
 fn unresolvedHolder(value: Facts.Value) bool {
     var current = value;
     while (true) current = switch (current) {
-        .pointer, .optional, .error_union => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
         .unknown => |why| return why != .zig_own and why != .absent,
         else => return false,
     };
@@ -2246,7 +2251,8 @@ fn literalFields(c: *Context, file: Project.FileId, node: Ast.Node.Index, litera
     if (literal.ast.fields.len == 0) return null;
     var holder = try c.facts.literalType(file, node);
     while (true) holder = switch (holder) {
-        .optional, .error_union, .pointer => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
         else => break,
     };
     const container = switch (holder) {
@@ -3072,7 +3078,8 @@ fn prongFields(c: *Context, file: Project.FileId, operand: Ast.Node.Index, case_
     const tree = &c.project.at(file).file.tree;
     var held_value = try c.facts.resolve(file, operand);
     while (true) held_value = switch (held_value) {
-        .pointer, .optional => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional => |inner| inner.*,
         else => break,
     };
     const container = switch (held_value) {
@@ -3332,7 +3339,8 @@ pub fn wholeFields(c: *Context, value: Facts.Value) Context.Error!?[]const Facts
 fn containersOf(c: *Context, value: Facts.Value, out: *std.ArrayList(Facts.Container)) Context.Error!bool {
     switch (value) {
         .instance => |k| try out.append(c.allocator, k),
-        .pointer, .optional, .error_union, .array => |inner| return containersOf(c, inner.*, out),
+        .pointer => |inner| return containersOf(c, inner.child.*, out),
+        .optional, .error_union, .array => |inner| return containersOf(c, inner.*, out),
         .alternatives => |each| for (each) |one| {
             if (!try containersOf(c, one, out)) return false;
         },

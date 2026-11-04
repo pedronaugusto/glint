@@ -998,7 +998,8 @@ fn typeShapes(c: *Context, memo: *Given, value: Facts.Value, depth: u8) Context.
         },
         // A field's type reads as a value of it.
         .instance => |k| try typeShapes(c, memo, .{ .container = k }, depth),
-        .pointer, .optional, .array, .error_union => |inner| try typeShapes(c, memo, inner.*, depth + 1),
+        .pointer => |inner| try typeShapes(c, memo, inner.child.*, depth + 1),
+        .optional, .array, .error_union => |inner| try typeShapes(c, memo, inner.*, depth + 1),
         .alternatives => |each| for (each) |one| try typeShapes(c, memo, one, depth + 1),
         .reified => memo.any = true,
         else => {},
@@ -1221,7 +1222,8 @@ fn element(c: *Context, decl: Facts.Decl, pointer: u16) Context.Error!?Typed {
     if (tree.nodeTag(input) == .for_range) return .{ .int = .{ .bits = pointer, .signed = false } };
     var value = try c.facts.resolve(decl.file, input);
     while (true) switch (value) {
-        .pointer, .array => |inner| value = inner.*,
+        .pointer => |inner| value = inner.child.*,
+        .array => |inner| value = inner.*,
         else => break,
     };
     return switch (integer(value, pointer)) {
@@ -1627,7 +1629,7 @@ fn argument(c: *Context, file: Project.FileId, call: Ast.full.Call, arg: Ast.Nod
     var skip: usize = 0;
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         var receiver = try c.facts.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
-        if (receiver == .pointer) receiver = receiver.pointer.*;
+        if (receiver == .pointer) receiver = receiver.pointer.child.*;
         if (receiver == .instance) skip = 1;
     }
     const callee_tree = &c.project.at(decl.file).file.tree;
@@ -1647,7 +1649,8 @@ fn field(c: *Context, file: Project.FileId, literal_node: Ast.Node.Index, value:
     const tree = &c.project.at(file).file.tree;
     var holder = try c.facts.literalType(file, literal_node);
     while (true) holder = switch (holder) {
-        .optional, .error_union, .pointer => |inner| inner.*,
+        .pointer => |inner| inner.child.*,
+        .optional, .error_union => |inner| inner.*,
         else => break,
     };
     const container = switch (holder) {
@@ -2128,7 +2131,7 @@ fn readFacts(c: *Context, file: Project.FileId, out: *std.ArrayList(Fact), value
     } else {
         // One buffer of bytes, a slice or an array's address, not a vector held elsewhere.
         const bytes = switch (try c.facts.resolve(file, one)) {
-            .pointer => |item| item.* == .primitive or (item.* == .array and item.array.* == .primitive),
+            .pointer => |item| item.child.* == .primitive or (item.child.* == .array and item.child.array.* == .primitive),
             else => false,
         };
         if (!bytes) return;
@@ -2816,7 +2819,7 @@ fn placeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Erro
     if (try c.facts.lengthOf(file, at)) |memory| {
         switch (try c.facts.resolve(file, memory)) {
             .array => return null,
-            .pointer => |inner| if (inner.* == .array) return null,
+            .pointer => |inner| if (inner.child.* == .array) return null,
             else => {},
         }
     }
@@ -2866,7 +2869,7 @@ fn fieldFollows(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, nam
     return switch (try c.facts.resolve(file, receiver)) {
         .pointer => |inner| blk: {
             if (!std.mem.eql(u8, name, "len") and !std.mem.eql(u8, name, "ptr")) break :blk true;
-            break :blk switch (inner.*) {
+            break :blk switch (inner.child.*) {
                 .instance, .container => |k| c.facts.member(k, name) != null,
                 // A pointer to a pointer is a slice of pointers or a single pointer to a slice
                 // (`p: *[]const u8`), whose `len` is read through it.
@@ -2883,7 +2886,7 @@ fn fieldFollows(c: *Context, file: Project.FileId, receiver: Ast.Node.Index, nam
 /// Whether a declaration's value is a struct (not a union), or a single pointer to one.
 fn structured(c: *Context, file: Project.FileId, root: Ast.Node.Index) Context.Error!bool {
     var value = try c.facts.resolve(file, root);
-    if (value == .pointer) value = value.pointer.*;
+    if (value == .pointer) value = value.pointer.child.*;
     const k = switch (value) {
         .instance => |k| k,
         else => return false,
@@ -3452,7 +3455,7 @@ fn ownerOf(c: *Context, id: Facts.Container) ?Facts.Container {
 /// or the array's a pointer to one points at.
 fn elementOf(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Context.Error!?Facts.Container {
     var value = try c.facts.resolve(file, memory);
-    if (value == .pointer) value = value.pointer.*;
+    if (value == .pointer) value = value.pointer.child.*;
     if (value == .array) value = value.array.*;
     return switch (value) {
         .instance => |k| k,
@@ -4054,7 +4057,7 @@ pub fn ceilings(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context
 /// Whether a value is std's `mem.Allocator`.
 fn allocator(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     var value_of = try c.facts.resolve(file, node);
-    if (value_of == .pointer) value_of = value_of.pointer.*;
+    if (value_of == .pointer) value_of = value_of.pointer.child.*;
     const k = switch (value_of) {
         .instance => |k| k,
         else => return false,
@@ -4080,7 +4083,7 @@ fn prongField(c: *Context, capture: Facts.Decl) Context.Error!?Facts.Decl {
     const switch_node = model.parentOf(case_node) orelse return null;
     const full = tree.fullSwitch(switch_node) orelse return null;
     var operand = try c.facts.resolve(capture.file, full.ast.condition);
-    if (operand == .pointer) operand = operand.pointer.*;
+    if (operand == .pointer) operand = operand.pointer.child.*;
     const container = switch (operand) {
         .instance, .container => |k| k,
         else => return null,

@@ -515,7 +515,7 @@ fn walk(self: *Context, roots: []const Project.FileId, path: []const u8, public_
 fn containers(self: *Context, value: Facts.Value, out: *std.ArrayList(Facts.Container)) Context.Error!void {
     switch (value) {
         .container, .instance => |c| try out.append(self.allocator, c),
-        .pointer => |inner| try containers(self, inner.*, out),
+        .pointer => |inner| try containers(self, inner.child.*, out),
         .alternatives => |each| for (each) |one| try containers(self, one, out),
         .function => |decl| if (try self.facts.template(decl)) |made| try containers(self, made, out),
         else => {},
