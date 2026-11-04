@@ -5168,6 +5168,102 @@ pub fn member(self: *const Facts, container: Container, name: []const u8) ?Decl 
     return null;
 }
 
+/// The fields a container declares, in order: each file's read once for the run, by one pass
+/// over its declarations (`member` and a walk over a type's fields find them here, not by
+/// scanning every declaration of its file).
+pub fn fieldsOf(self: *Facts, holder: Container) ResolveError![]const Model.Declaration.Id {
+    const index = try self.memo(FieldIndex);
+    const entry = try index.files.getOrPut(self.gpa, holder.file);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .empty;
+        for (self.project.at(holder.file).model.declarations, 0..) |decl, i| {
+            if (decl.kind != .field) continue;
+            const fields = try entry.value_ptr.getOrPut(self.gpa, decl.scope);
+            if (!fields.found_existing) fields.value_ptr.* = .empty;
+            try fields.value_ptr.append(self.gpa, @fromBackingInt(@intCast(i)));
+        }
+    }
+    return if (entry.value_ptr.get(holder.scope)) |fields| fields.items else &.{};
+}
+
+const FieldIndex = struct {
+    files: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Model.Scope.Id, std.ArrayList(Model.Declaration.Id))) = .empty,
+};
+
+/// What a probe of `fieldsHold` reads of one field: the kind it looks for, none of it, a form
+/// it does not read (`maybe`), or a container whose own fields say (`holder`).
+pub const Probed = union(enum) { is, none, maybe, holder: Container };
+
+/// Where a type's fields hold what a probe looks for: at a path of field names (`.at`, `"ctx.io"`,
+/// the first in declaration order), nowhere, or maybe.
+pub const Holding = union(enum) { none, at: []const u8, maybe };
+
+/// Whether a value of the container `holder` holds, in its fields and theirs, what `probe` looks
+/// for: a type's property (does it hold an `Io`, memory with a length), read once per probe and
+/// type for the run. A probe's type declares `Key`, what tells its probes apart for the run
+/// (the probe's `key`), and `Error`, what its reading may fail with; `of(probe, facts, field,
+/// value)` says what a field (its declaration, and the value Facts gives it, never unknown)
+/// holds. A field whose value does not resolve may hold it (`maybe`): an
+/// unknown never clears. A container reached again through its own fields (`next: ?*Node`) adds nothing of
+/// its own there; an answer of none read meanwhile is not kept, being read again where asked,
+/// and none read once the file's fact budget is spent.
+pub fn fieldsHold(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(probe)), holder: Container) (ResolveError || @TypeOf(probe).Error)!Holding {
+    const state = try self.memo(HoldsMemo(@TypeOf(probe).Key));
+    const at: HoldsMemo(@TypeOf(probe).Key).Type = .{ .key = probe.key, .file = holder.file, .scope = holder.scope };
+    if (state.found.get(at)) |known| return known;
+    if (state.open.contains(at)) {
+        state.met_open += 1;
+        return .none;
+    }
+    try state.open.put(self.gpa, at, {});
+    const met_open = state.met_open;
+    const out = try self.fieldsHoldOnce(probe, of, holder);
+    _ = state.open.remove(at);
+    if ((out != .none or state.met_open == met_open) and self.remaining != 0) try state.found.put(self.gpa, at, out);
+    return out;
+}
+
+/// What a probe of `fieldsHold` is asked of one field: the probe, Facts, the field's
+/// declaration and the value Facts gives it, never unknown.
+pub fn ProbeOf(comptime Probe: type) type {
+    return fn (Probe, *Facts, Decl, Value) (ResolveError || Probe.Error)!Probed;
+}
+
+fn HoldsMemo(comptime ProbeKey: type) type {
+    return struct {
+        const Type = struct { key: ProbeKey, file: Project.FileId, scope: Model.Scope.Id };
+        found: std.AutoHashMapUnmanaged(Type, Holding) = .empty,
+        open: std.AutoHashMapUnmanaged(Type, void) = .empty,
+        /// How many times one still being read was met again.
+        met_open: usize = 0,
+    };
+}
+
+fn fieldsHoldOnce(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(probe)), holder: Container) (ResolveError || @TypeOf(probe).Error)!Holding {
+    var maybe = false;
+    for (try self.fieldsOf(holder)) |index| {
+        const field: Decl = .{ .file = holder.file, .index = index };
+        const name = self.project.at(holder.file).model.declarations[@backingInt(index)].name;
+        // A field whose value does not resolve may hold anything; a probe reads resolved values.
+        const value = try self.declaration(field);
+        if (value == .unknown) {
+            maybe = true;
+            continue;
+        }
+        switch (try of(probe, self, field, value)) {
+            .is => return .{ .at = name },
+            .none => {},
+            .maybe => maybe = true,
+            .holder => |inner| switch (try self.fieldsHold(probe, of, inner)) {
+                .at => |through| return .{ .at = try self.gpa.print("{s}.{s}", .{ name, through }) },
+                .maybe => maybe = true,
+                .none => {},
+            },
+        }
+    }
+    return if (maybe) .maybe else .none;
+}
+
 /// What a field `len` or `ptr` reads. `memory`: the length (or the address) of an array or a
 /// slice (or one a single pointer reaches) whose elements take room, so one object's count of
 /// them is below half the address space. `unsized`: a length of memory whose elements may

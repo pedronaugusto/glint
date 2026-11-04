@@ -565,7 +565,8 @@ fn parameterIo(c: *Context, decl: Model.Declaration, io_type: Facts.Container) C
 
 /// Where a value holds an `Io`: itself, or through a pointer (`""`), or as a field of the
 /// struct it is or points to (`self.io`, the field's name), or a field of such a field
-/// (`self.ctx.io`), three levels down; `Held.unread` where it may hold one in a form not read.
+/// (`self.ctx.io`), as deep as its fields go (Facts.fieldsHold, a type's property read once per
+/// type); `Held.unread` where it may hold one in a form not read.
 fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container, depth: u8) Context.Error!Held {
     const held = switch (if (value == .pointer) value.pointer.* else value) {
         .instance, .container => |k| k,
@@ -575,25 +576,38 @@ fn heldIo(c: *Context, value: Facts.Value, io_type: Facts.Container, depth: u8) 
         else => |other| return if (try mentionsIo(other, io_type, depth == 0, 0)) .unread else .none,
     };
     if (held.file == io_type.file and held.scope == io_type.scope) return .{ .at = "" };
-    var unread = false;
-    const model = &c.project.at(held.file).model;
-    const tree = &c.project.at(held.file).file.tree;
-    for (model.declarations, 0..) |field, i| {
-        if (field.kind != .field or field.scope != held.scope) continue;
-        const typed = try c.facts.declaration(.{ .file = held.file, .index = @fromBackingInt(@intCast(i)) });
-        const inner: Held = if (depth == 3) (if (try mentionsIo(typed, io_type, false, 0)) .unread else .none) else try heldIo(c, typed, io_type, depth + 1);
-        switch (inner) {
-            .at => |through| return .{ .at = if (through.len == 0) field.name else try c.allocator.print("{s}.{s}", .{ field.name, through }) },
-            .unread => unread = true,
-            .none => {
-                // A tuple's field has no name to read it by: its type says what it holds.
-                const written = (model.containerField(tree, field.node) orelse continue).ast.type_expr.unwrap() orelse continue;
-                if (try spellsIo(c, held.file, written, io_type)) unread = true;
-            },
-        }
-    }
-    return if (unread) .unread else .none;
+    return switch (try c.facts.fieldsHold(IoProbe{ .key = .{ .file = io_type.file, .scope = io_type.scope }, .c = c }, IoProbe.of, held)) {
+        .none => .none,
+        .maybe => .unread,
+        .at => |path| .{ .at = path },
+    };
 }
+
+/// What a field holds of an `Io` (Facts.fieldsHold): the `Io`, or a pointer to it; a container
+/// whose fields say; one in a form not read (an optional, an array, a second pointer, one
+/// of several) or one that does not resolve there, maybe, and one that holds none where its
+/// written type spells an `Io` (a tuple's field has no name to read it by). A spelling only
+/// raises none to maybe, never clears.
+const IoProbe = struct {
+    pub const Key = struct { file: Project.FileId, scope: Model.Scope.Id };
+    pub const Error = Context.Error;
+    key: Key,
+    c: *Context,
+
+    pub fn of(probe: IoProbe, facts: *Facts, field: Facts.Decl, value: Facts.Value) Error!Facts.Probed {
+        _ = facts;
+        const io_type: Facts.Container = .{ .file = probe.key.file, .scope = probe.key.scope };
+        const out: Facts.Probed = switch (if (value == .pointer) value.pointer.* else value) {
+            .instance, .container => |k| if (k.file == io_type.file and k.scope == io_type.scope) .is else .{ .holder = k },
+            else => |other| if (try mentionsIo(other, io_type, true, 0)) .maybe else .none,
+        };
+        if (out != .none) return out;
+        const model = &probe.c.project.at(field.file).model;
+        const tree = &probe.c.project.at(field.file).file.tree;
+        const written = (model.containerField(tree, model.declarations[@backingInt(field.index)].node) orelse return .none).ast.type_expr.unwrap() orelse return .none;
+        return if (try spellsIo(probe.c, field.file, written, io_type)) .maybe else .none;
+    }
+};
 
 /// Whether a type may hold an `Io` in a form `heldIo` does not read: inside an optional, an
 /// array, an error union or a second pointer, or one of several; where `unresolved`, a type that
