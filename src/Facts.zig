@@ -451,16 +451,19 @@ pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publicati
 }
 
 /// A declaration literal called (`.init(...)`): the function its result location's container
-/// declares. Any other enum literal's meaning is its result location's, which is not known here.
+/// declares (`literalDeclaration`). Any other enum literal's meaning is its result location's,
+/// which is not known here.
 fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const tree = &self.project.at(file).file.tree;
     const parent = self.project.at(file).model.parentOf(node) orelse return .{ .unknown = .comptime_dependent };
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, parent) orelse return .{ .unknown = .comptime_dependent };
     if (call.ast.fn_expr != node) return .{ .unknown = .comptime_dependent };
-    const container = (try self.resultContainer(file, parent)) orelse return .{ .unknown = .comptime_dependent };
-    const found = self.member(container, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node)))) orelse return .{ .unknown = .unsupported };
-    return self.declaration(found);
+    return switch (try self.literalDeclaration(file, node, try self.memberName(tree.tokenSlice(tree.nodeMainToken(node))))) {
+        .decl => |found| self.declaration(found),
+        .none => .{ .unknown = .unsupported },
+        .unknown => .{ .unknown = .comptime_dependent },
+    };
 }
 
 /// Whether a file publishes a module's members: `unknown` where one does not resolve far enough
@@ -3683,9 +3686,12 @@ fn reachDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRea
     const part = try self.partOf(decl.file, record.node) orelse return;
     // Only a part's own declaration: a local reaches nothing beyond its function.
     if ((try self.partsOf(decl.file)).declared.get(part) != decl.index) return;
-    // A member of a container a function declares, reached with no instance known: read in
-    // each reading of that function, the ones it is reached in later too.
-    if (env == null and !self.genericFunction(decl) and self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
+    // A member of a container a function declares, reached with no instance known, generic
+    // itself or not: read in each reading of that function, the ones it is reached in later
+    // too, its own comptime parameters unbound there; none while nothing reaches the function,
+    // since no instance exists until it is evaluated, and every evaluation names it (a call, or
+    // the function handed as a value, each of which reaches it).
+    if (env == null and self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
         const pending = try found.members.getOrPut(self.gpa, outer);
         if (!pending.found_existing) pending.value_ptr.* = .empty;
         for (pending.value_ptr.items) |known| {
@@ -7334,16 +7340,17 @@ pub fn reflected(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 /// union and a pointer. None where that type has none; unknown where it does not resolve.
 pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Index, name: []const u8) ResolveError!Named {
     const tree = &self.project.at(file).file.tree;
-    var holder: Value = blk: {
-        if (tree.nodeTag(node) == .enum_literal) if (self.project.at(file).model.parentOf(node)) |parent| {
-            var buffer: [1]Ast.Node.Index = undefined;
-            if (tree.fullCall(&buffer, parent)) |call| if (call.ast.fn_expr == node) {
-                const container = (try self.resultContainer(file, parent)) orelse break :blk Value{ .unknown = .unresolved };
-                break :blk Value{ .container = container };
-            };
-        };
-        break :blk try self.literalType(file, node);
+    // A called one (`.init(x)`) is a function of the type the call's place gives, read as an
+    // uncalled one's is: through an optional, an error union and a pointer (std's SafeAllocator
+    // `const b: *Bucket = .of(s, p)` calls `Bucket.of`).
+    const call_node = called: {
+        if (tree.nodeTag(node) != .enum_literal) break :called null;
+        const parent = self.project.at(file).model.parentOf(node) orelse break :called null;
+        var buffer: [1]Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, parent) orelse break :called null;
+        break :called if (call.ast.fn_expr == node) parent else null;
     };
+    var holder = try self.literalType(file, call_node orelse node);
     while (true) holder = switch (holder) {
         .pointer => |inner| inner.child.*,
         .optional, .error_union => |inner| inner.*,
@@ -7352,8 +7359,9 @@ pub fn literalDeclaration(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
     const container = switch (holder) {
         .container, .instance => |c| c,
         .unknown => |why| return .{ .unknown = why },
-        // No type a declaration could be a member of: an anonymous literal, a number.
-        else => return .none,
+        // No type a declaration could be a member of: an anonymous literal, a number; for a
+        // call's place, the function it names is not known.
+        else => return if (call_node != null) .{ .unknown = .unresolved } else .none,
     };
     return .of(self.member(container, name));
 }
@@ -13064,12 +13072,20 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         };
     }
     // A declaration literal's call (`.init(x)`) is a function of the type its place takes.
-    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) switch (try self.placeType(env, file, node, 1)) {
-        .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
-            made = m;
-        },
-        else => {},
-    };
+    if (tree.nodeTag(call.ast.fn_expr) == .enum_literal) {
+        var place = try self.placeType(env, file, node, 1);
+        while (true) place = switch (place) {
+            .pointer => |inner| inner.child.*,
+            .optional, .error_union => |inner| inner.*,
+            else => break,
+        };
+        switch (place) {
+            .container, .instance => |c| if (c.made_by) |m| if (decl.file == c.file and self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope == c.scope) {
+                made = m;
+            },
+            else => {},
+        }
+    }
     const target_tree = &self.project.at(decl.file).file.tree;
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{ .unknown = .unsupported };
@@ -13395,6 +13411,23 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!?*Ops { return @ptrCast(bytes); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) ?*Ops { return @ptrCast(bytes); }\n", true));
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(bytes: *[8]u8) error{E}!*Other { return @ptrCast(bytes); }\n", true));
+    // A cast given a declaration literal's call takes its parameter's type, the function read in
+    // the type the call's place points at (std's SafeAllocator `const b: *Bucket = .of(s,
+    // @ptrCast(f))`): bytes, no Ops; a parameter of `*Ops` views one.
+    const bucket = "const Footer = struct { y: u64 };\nconst Bucket = struct {\n    x: u64,\n    fn of(ptr: [*]u8) *Bucket { return @ptrFromInt(@intFromPtr(ptr)); }\n    fn ofOps(o: *Ops) *Bucket { return @ptrFromInt(@intFromPtr(o)); }\n};\n";
+    try std.testing.expectEqual(.function, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .of(@ptrCast(ft)); _ = held; }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .ofOps(@ptrCast(ft)); _ = held; }\n", true));
+    // A type function's member, generic itself, reached by its name alone (std's
+    // `TrailerFlags(F).ptr` through a `.ptr` read off a value whose type does not resolve):
+    // no instance exists while nothing reaches the type function, so its cast views nothing.
+    // Reached, it is read in each of its readings: `Flags(Ops)`'s cast views Ops, `Flags(u64)`'s
+    // does not; handed as a value and evaluated only inside another function, it is reached by
+    // the mention.
+    const flags = "fn Flags(comptime F: type) type {\n    return struct {\n        fn ptr(p: [*]u8, comptime field: u8) *F {\n            _ = field;\n            return @ptrCast(@alignCast(p));\n        }\n    };\n}\npub fn g(x: anytype) void { _ = x.ptr; }\n";
+    try std.testing.expectEqual(.function, try fieldRead(head ++ flags, true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(Ops).ptr(bytes, 0); }\n", true));
+    try std.testing.expectEqual(.function, try fieldRead(head ++ flags ++ "pub fn k(bytes: [*]u8) void { _ = Flags(u64).ptr(bytes, 0); }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ flags ++ "fn mk(comptime M: fn (type) type) type { return M(Ops); }\npub const T = mk(Flags);\n", true));
     // A pointer cast keeps `const`: the bytes of a parameter's address, or of a copy's handed
     // where a `[]const u8` goes, are read, never written; through `[]u8` or `@constCast`, they
     // may be.
