@@ -3507,7 +3507,9 @@ fn mayHoldStruct(self: *Facts, value: Value, file: Project.FileId, scope: Model.
             for (try self.literalParts(key)) |part| if (try self.mayHoldStruct(part, file, scope, depth + 1)) return true;
             return false;
         },
-        .unknown, .reflected, .reified => return true,
+        // A type Zig builds from its fields' types, or a value of one, holds what they do.
+        .reified => |built| return self.mayHoldStruct(built.fields.*, file, scope, depth + 1),
+        .unknown, .reflected => return true,
     }
 }
 
@@ -13430,6 +13432,11 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops, run: *const fn (u32) u32) void { o.run, _ = .{ run, 0 }; }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(o: *Ops) *[8]u8 { return @ptrCast(o); }\n", true));
     try std.testing.expectEqual(.function, try fieldRead(head ++ "const Other = struct { x: u64 };\npub fn g(o: *Other) *[8]u8 { return @ptrCast(o); }\n", true));
+    // A type built from its fields' types (std's Io.Operation.Result, an `@Union`) holds what
+    // they do: a struct of a `u64` no Ops, a struct of an Ops one.
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{u64}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{\"x\"}, &.{Ops}, &@splat(.{}));\npub fn g(o: *Built) *[8]u8 { return @ptrCast(o); }\n", true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Built = @Struct(.auto, null, &.{ \"x\", \"y\" }, &.{ u64, Ops }, &@splat(.{}));\npub fn g(o: *Built) *[16]u8 { return @ptrCast(o); }\n", true));
     // A cast returned as an error union's or an optional's payload views what the payload
     // points at.
     try std.testing.expectEqual(.any, try fieldRead(head ++ "pub fn g(bytes: *[8]u8) error{E}!*Ops { return @ptrCast(bytes); }\n", true));
