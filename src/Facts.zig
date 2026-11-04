@@ -3079,6 +3079,36 @@ fn containerHoldsNoAddress(self: *Facts, container: Container) ResolveError!bool
     return out;
 }
 
+/// Each part a value holds by value, for a rule to judge one by one: an instance or a type
+/// (`container`), each field it holds (`heldFields`) in turn, a pointer (not what it points to),
+/// and what does not resolve; through an error union, an optional, an array, a choice of types,
+/// a literal's parts and a type built from its fields' types (`@Struct`), what they wrap. A
+/// record of std's no type function made holds none of the program's types (std imports none
+/// of them): its fields are not read.
+/// The list is on `allocator`, the caller's: a rule's is its file's memory.
+pub fn heldParts(self: *Facts, allocator: std.mem.Allocator, value: Value) ResolveError![]const Value {
+    var out: std.ArrayList(Value) = .empty;
+    try self.collectHeld(allocator, &out, value, 0);
+    return out.items;
+}
+
+fn collectHeld(self: *Facts, allocator: std.mem.Allocator, out: *std.ArrayList(Value), value: Value, depth: u8) ResolveError!void {
+    if (depth == 16) return out.append(allocator, .{ .unknown = .cycle });
+    switch (value) {
+        .instance, .container => |found| {
+            try out.append(allocator, value);
+            if (found.made_by == null and try self.standard(found.file)) return;
+            for (try self.heldFields(found)) |field| try self.collectHeld(allocator, out, field.value, depth + 1);
+        },
+        .error_union, .optional, .array => |inner| try self.collectHeld(allocator, out, inner.*, depth + 1),
+        .alternatives => |each| for (each) |one| try self.collectHeld(allocator, out, one, depth + 1),
+        .literal => |key| for (try self.literalParts(key)) |one| try self.collectHeld(allocator, out, one, depth + 1),
+        .reified => |built| try self.collectHeld(allocator, out, try self.reifiedParts(built), depth + 1),
+        .pointer, .unknown => try out.append(allocator, value),
+        else => {},
+    }
+}
+
 /// Builtins whose result is a number or a truth value: sizes and offsets, conversions to
 /// integers, bit counts, arithmetic and the queries that answer yes or no.
 const numeric_builtins = [_][]const u8{

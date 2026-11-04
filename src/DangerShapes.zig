@@ -2045,7 +2045,7 @@ fn calleeViewed(c: *Context, resources: []const ?Facts.Container, file: Project.
 /// `readOrdered`, `writeOrdered`, their forms), which `Order` checks in Debug; ranked through
 /// two contexts, which may be two Orders' that rank nothing against each other, it is
 /// undecided, as is a ranked guard a helper gives (its context is the helper's), and one
-/// context reset, handed on or made anew each pass (`oneContext`). An acquisition is a call by
+/// context reset, handed on or made anew each pass (`contextKept`). An acquisition is a call by
 /// meaning (Facts.calls): of an owner's acquire however it is named (`@call`, `@field`, an
 /// alias), `tryRead` and `tryWrite` among them; of another function whose value is one of the
 /// owner's guards (not its `Handoff`); or of a function of the program that returns holding a
@@ -2096,7 +2096,7 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
             break;
         }
         if (first.lock.ranked and second.lock.ranked) {
-            if (first.lock.context != null and first.lock.context == second.lock.context and oneContext(tree, model, first.function, first.lock.context.?, taken.items)) continue;
+            if (first.lock.context != null and first.lock.context == second.lock.context and try contextKept(c, c.file, first.function, first.lock.context.?, first.at, second.at, 0)) continue;
             try c.undecided(rule, tree.tokenStart(tree.firstToken(second.node)), .unresolved, "two locks ranked through two contexts: one Order's checks them, two Orders' may take them in two orders");
             break;
         }
@@ -2114,13 +2114,21 @@ const Taken = struct { node: Ast.Node.Index, function: Ast.Node.Index, lock: Loc
 /// returned holding it (`leavesHeld`), its guard in what the call gives or where it writes.
 const Lock = struct { ranked: bool, context: ?Model.Declaration.Id = null, through: bool = false, context_from: ?usize = null };
 
-/// Whether every value the context `decl` holds while `function` runs is one: each reference to
-/// it within `function` is the context argument (`ctx`, `&ctx`) of a ranked acquisition taken
-/// through it, so nothing resets it (`ctx = .{}`) or hands it on, and it is declared in no loop,
-/// whose passes would each make a new one.
-fn oneContext(tree: *const Ast, model: *const Model, function: Ast.Node.Index, decl: Model.Declaration.Id, taken: []const Taken) bool {
-    const declared = model.declarations[@backingInt(decl)].node;
-    var up = declared;
+/// Whether the context `decl` holds one value within `function` from `from` (its start, where
+/// null) until `until`, the ranked acquisitions taken through it aside: each reference to it in
+/// `function` is the context argument (`ctx`, `&ctx`) of a ranked acquisition through it, so
+/// nothing there resets it (`ctx = .{}`) or hands it on, and it is declared in no loop, whose
+/// passes would each make a new one. A parameter's context (the caller's memory) or one outside
+/// any function may be written by another name too: through another pointer or by what a call
+/// runs. Where it is such, nothing between `from` and `until` stores through a pointer or into
+/// a place outside any function (Facts.accesses' stores and their whole or byte writes through
+/// a pointer), and each call there is a ranked acquisition through it, aegis's, or std's given
+/// no pointer (`givenPointer`).
+fn contextKept(c: *Context, file: Project.FileId, function: Ast.Node.Index, decl: Model.Declaration.Id, from: ?Time, until: Time, depth: u8) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const record = model.declarations[@backingInt(decl)];
+    var up = record.node;
     while (model.parentOf(up)) |parent| : (up = parent) {
         if (parent == function) break;
         if (tree.fullWhile(parent) != null or tree.fullFor(parent) != null) return false;
@@ -2133,13 +2141,64 @@ fn oneContext(tree: *const Ast, model: *const Model, function: Ast.Node.Index, d
         while (model.parentOf(at)) |parent| : (at = parent) {
             if (tree.nodeTag(parent) != .address_of and tree.nodeTag(parent) != .grouped_expression) break;
         }
-        const call_node = model.parentOf(at) orelse return false;
-        const through = for (taken) |one| {
-            if (one.node == call_node and one.lock.ranked and one.lock.context == decl) break true;
-        } else false;
-        if (!through) return false;
+        const call = (try Facts.calls.at(c.facts, file, model.parentOf(at) orelse return false)) orelse return false;
+        if (!try rankedThrough(c, file, &call, decl, depth)) return false;
     }
+    const container_level = Facts.accesses.global(c.facts, .{ .file = file, .index = decl });
+    if (record.kind != .parameter and !container_level) return true;
+    for (try Facts.calls.in(c.facts, file)) |*call| {
+        if (!try between(c, file, function, call.node, from, until)) continue;
+        if (try rankedThrough(c, file, call, decl, depth) or !try mayWrite(c, file, call)) continue;
+        return false;
+    }
+    const index = try Facts.accesses.writesOf(c.facts, file);
+    for (index.stores.items) |site| {
+        if (!try between(c, file, function, site.node, from, until)) continue;
+        if (site.through) return false;
+        switch ((try Facts.accesses.pathOf(c.facts, file, site.target orelse site.node)).root) {
+            .decl => |root| if (Facts.accesses.global(c.facts, root)) return false,
+            .none, .unknown => return false,
+        }
+    }
+    var whole = index.through.keyIterator();
+    while (whole.next()) |node| if (try between(c, file, function, node.*, from, until)) return false;
     return true;
+}
+
+/// Whether `node` runs within `function` after `from` (its start, where null) and before `until`.
+fn between(c: *Context, file: Project.FileId, function: Ast.Node.Index, node: Ast.Node.Index, from: ?Time, until: Time) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    if (enclosingFunction(model, tree, node) != function) return false;
+    const at = try timeOf(c, tree, model, tree.firstToken(node), node);
+    if (from) |start| if (!start.before(at)) return false;
+    return at.before(until);
+}
+
+/// Whether a call is a ranked acquisition through the context `decl` (`acquisitionOf`).
+fn rankedThrough(c: *Context, file: Project.FileId, call: *const Facts.calls.Call, decl: Model.Declaration.Id, depth: u8) Context.Error!bool {
+    return switch (try acquisitionOf(c, file, call, depth)) {
+        .lock => |lock| lock.ranked and lock.context == decl,
+        .no, .unknown => false,
+    };
+}
+
+/// Whether a call may write memory the caller names otherwise: each function it may call is
+/// neither aegis's, whose owners keep their contexts, nor std's given no pointer.
+fn mayWrite(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Context.Error!bool {
+    const each: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return true,
+    };
+    const program = try Program.get(c);
+    for (each) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return true;
+        if (try c.inLibrary(Contract.library, decl.file)) continue;
+        if (program.std_files.contains(@backingInt(decl.file)) and !try givenPointer(c, file, call)) continue;
+        return true;
+    }
+    return false;
 }
 
 /// When code runs within its function, compared in order: for each `defer` it is under,
@@ -2199,8 +2258,8 @@ fn timeOf(c: *Context, tree: *const Ast, model: *const Model, token: Ast.TokenIn
 fn heldSpan(c: *Context, tree: *const Ast, model: *const Model, function: Ast.Node.Index, node: Ast.Node.Index, through: bool) Context.Error!Held {
     const body = tree.nodeData(function).node_and_node[1];
     const last: Time = .{ .levels = try c.allocator.dupe(Time.Level, &.{.{ .at = tree.lastToken(body) + 1, .order = 0 }}) };
-    const bound = if (through) throughBound(tree, model, node) else boundBy(tree, model, node);
-    const found = if (bound.declaration != null) releaseOf(tree, model, bound) else null;
+    const bound = if (through) try throughBound(c, c.file, node) else boundBy(tree, model, node);
+    const found = if (bound.declaration != null) try releaseOf(c, c.file, bound) else null;
     const release = found orelse {
         // Held to the end: through each pass of every loop around it.
         const from = outermostLoop(tree, model, bound.statement, function);
@@ -2209,13 +2268,15 @@ fn heldSpan(c: *Context, tree: *const Ast, model: *const Model, function: Ast.No
     };
     const start = if (release.loop) |loop| try timeOf(c, tree, model, tree.firstToken(loop), loop) else try timeOf(c, tree, model, tree.lastToken(bound.from), bound.from);
     const end = try timeOf(c, tree, model, tree.firstToken(release.call), release.call);
-    // What runs between the guard and a release written after it may leave without it: up to
-    // the release itself, within the statement that holds it too (`{ if (x) continue; g.deinit(); }`),
-    // or to a `defer`, which runs on every way out after it.
+    // What runs between the guard and a release written after it may leave without it: from
+    // the acquisition's value on, within the statement that binds it too (`g, n = .{ a.acquire(),
+    // try r.takeByte() }`), up to the release's end, its arguments and the statement that holds
+    // it among them (`{ if (x) continue; g.deinit(try io()); }`), or to a `defer`, which runs
+    // on every way out after it.
     var exits = false;
     if (tree.firstToken(release.statement) > tree.lastToken(bound.statement)) {
-        const until = if (tree.nodeTag(release.statement) == .@"defer") tree.firstToken(release.statement) else tree.firstToken(release.call);
-        for (tree.lastToken(bound.statement)..until) |token| switch (tree.tokenTag(@intCast(token))) {
+        const until = if (tree.nodeTag(release.statement) == .@"defer") tree.firstToken(release.statement) else tree.lastToken(release.call);
+        for (tree.lastToken(bound.value) + 1..until) |token| switch (tree.tokenTag(@intCast(token))) {
             .keyword_break, .keyword_continue => {
                 const from = outermostLoop(tree, model, bound.statement, function);
                 return .{ .start = if (from) |loop| try timeOf(c, tree, model, tree.firstToken(loop), loop) else start, .end = last, .exit = last };
@@ -2239,19 +2300,36 @@ fn outermostLoop(tree: *const Ast, model: *const Model, node: Ast.Node.Index, fu
 }
 
 /// A guard's binding (`boundBy`): the statement, the local, and the member of it that holds the
-/// guard where a record literal's field does; and the node after which it is held: the statement,
-/// or the acquisition where a literal holds others made after it.
-const Bound = struct { statement: Ast.Node.Index, declaration: ?Model.Declaration.Id, member: ?[]const u8 = null, from: Ast.Node.Index, any_member: bool = false };
+/// guard where a record literal's field does; the node after which it is held: the statement,
+/// or the acquisition where a literal holds others made after it; and the acquisition's value as
+/// the statement takes it (through `try`, `catch`, `orelse`, a branch), after which what the
+/// statement runs runs with the guard held.
+const Bound = struct { statement: Ast.Node.Index, declaration: ?Model.Declaration.Id, member: ?[]const u8 = null, from: Ast.Node.Index, value: Ast.Node.Index, any_member: bool = false };
+
+/// Whether what a call gives holds a pointer to what may hold a guard (`guardHeld`), or one that
+/// does not resolve: `take()` returning `&h.guard`.
+fn pointsAtGuard(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    for (try c.facts.heldParts(c.allocator, try c.facts.resolve(file, node))) |part| switch (part) {
+        .pointer => |to| if (try guardHeld(c, to.child.*) != .no) return true,
+        else => {},
+    };
+    return false;
+}
 
 /// The binding of a guard a function of the program took and returned holding (`leavesHeld`):
-/// the local the call's value binds, the guard in it or in one of its members
-/// (`held.guard.deinit()`); else the local whose address the call is given (`lockInto(a, &g)`).
-fn throughBound(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bound {
+/// the local the call's value binds where that value may hold a guard or point at one
+/// (`guardValue`, `pointsAtGuard`), the guard in it or in one of its members (`held.guard.deinit()`); else the local whose address the
+/// call is given (`lockInto(a, &g)`).
+fn throughBound(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Bound {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var bound = boundBy(tree, model, node);
-    if (bound.declaration != null) {
+    if (bound.declaration != null and (try guardValue(c, file, node) != .no or try pointsAtGuard(c, file, node))) {
         if (bound.member == null) bound.any_member = true;
         return bound;
     }
+    bound.declaration = null;
+    bound.member = null;
     var buffer: [1]Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return bound;
     var found: ?Model.Declaration.Id = null;
@@ -2273,7 +2351,7 @@ fn throughBound(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bou
 /// takes apart (`g, n = .{ l.acquire(), 1 }`) among them. Bound by no statement, the
 /// acquisition is its own.
 fn boundBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bound {
-    const unbound: Bound = .{ .statement = node, .declaration = null, .from = node };
+    const unbound: Bound = .{ .statement = node, .declaration = null, .from = node, .value = node };
     var at = node;
     while (model.parentOf(at)) |parent| {
         const next: ?Ast.Node.Index = switch (tree.nodeTag(parent)) {
@@ -2284,6 +2362,7 @@ fn boundBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bound {
         };
         at = next orelse break;
     }
+    const taken_as = at;
     var parent = model.parentOf(at) orelse return unbound;
     var member: ?[]const u8 = null;
     var from: ?Ast.Node.Index = null;
@@ -2302,16 +2381,16 @@ fn boundBy(tree: *const Ast, model: *const Model, node: Ast.Node.Index) Bound {
         if (tree.nodeTag(statement) != .assign_destructure) return unbound;
         const full = tree.assignDestructure(statement);
         if (full.ast.value_expr != parent or position >= full.ast.variables.len) return unbound;
-        return .{ .statement = statement, .declaration = localOf(tree, model, full.ast.variables[position]) orelse return unbound, .from = node };
+        return .{ .statement = statement, .declaration = localOf(tree, model, full.ast.variables[position]) orelse return unbound, .from = node, .value = taken_as };
     }
     if (tree.fullVarDecl(parent)) |variable| {
         if (variable.ast.init_node.unwrap() != at) return unbound;
-        return .{ .statement = parent, .declaration = localOf(tree, model, parent) orelse return unbound, .member = member, .from = from orelse parent };
+        return .{ .statement = parent, .declaration = localOf(tree, model, parent) orelse return unbound, .member = member, .from = from orelse parent, .value = taken_as };
     }
     if (tree.nodeTag(parent) != .assign) return unbound;
     const target, const value = tree.nodeData(parent).node_and_node;
     if (value != at) return unbound;
-    return .{ .statement = parent, .declaration = localOf(tree, model, target) orelse return unbound, .member = member, .from = from orelse parent };
+    return .{ .statement = parent, .declaration = localOf(tree, model, target) orelse return unbound, .member = member, .from = from orelse parent, .value = taken_as };
 }
 
 /// The local variable `node` declares (`var g = ...`, a destructure's `var g`) or names (`g`).
@@ -2358,7 +2437,9 @@ const Release = struct { statement: Ast.Node.Index, call: Ast.Node.Index, loop: 
 /// Where the guard `decl` holds from `statement` is released: a later statement that releases
 /// it in `statement`'s block or one around it, up to its declaration's, or a `defer` of one
 /// there. Null where the guard is used any other way (`onlyHeld`) or no such release is found.
-fn releaseOf(tree: *const Ast, model: *const Model, bound: Bound) ?Release {
+fn releaseOf(c: *Context, file: Project.FileId, bound: Bound) Context.Error!?Release {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     const statement = bound.statement;
     const decl = bound.declaration.?; // unreachable: heldSpan asks only of a bound guard.
     if (!onlyHeld(tree, model, decl, statement)) return null;
@@ -2378,11 +2459,11 @@ fn releaseOf(tree: *const Ast, model: *const Model, bound: Bound) ?Release {
         const own = std.mem.findScalar(Ast.Node.Index, statements, at) orelse return null;
         for (statements, 0..) |each, i| {
             if (tree.nodeTag(each) == .@"defer") {
-                if (releases(tree, model, tree.nodeData(each).node, decl, member)) |call| return .{ .statement = each, .call = call, .loop = loop };
+                if (try releases(c, file, tree.nodeData(each).node, decl, member)) |call| return .{ .statement = each, .call = call, .loop = loop };
                 continue;
             }
             if (i <= own) continue;
-            if (releases(tree, model, each, decl, member)) |call| return .{ .statement = each, .call = call, .loop = loop };
+            if (try releases(c, file, each, decl, member)) |call| return .{ .statement = each, .call = call, .loop = loop };
         }
         if (std.mem.findScalar(Ast.Node.Index, statements, declared) != null) return null;
     }
@@ -2393,12 +2474,15 @@ fn releaseOf(tree: *const Ast, model: *const Model, bound: Bound) ?Release {
 const Member = union(enum) { none, named: []const u8, any };
 
 /// The call by which `node`, a statement or a `defer`'s expression, releases the guard `decl`:
-/// its `deinit(` or `release(` (of its `member`, where a record holds it), one of a block's
-/// statements, or one of what an `if (g) |*h|` with no `else` captures.
-fn releases(tree: *const Ast, model: *const Model, node: Ast.Node.Index, decl: Model.Declaration.Id, member: Member) ?Ast.Node.Index {
+/// a call (Facts.calls) of a guard's release (`guardRelease`) whose receiver is it (its
+/// `member`, where a record holds it), one of a block's statements, or one of what an
+/// `if (g) |*h|` with no `else` captures.
+fn releases(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Model.Declaration.Id, member: Member) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var buffer: [2]Ast.Node.Index = undefined;
     if (tree.blockStatements(&buffer, node)) |statements| {
-        for (statements) |each| if (releases(tree, model, each, decl, member)) |call| return call;
+        for (statements) |each| if (try releases(c, file, each, decl, member)) |call| return call;
         return null;
     }
     if (tree.fullIf(node)) |branch| {
@@ -2409,14 +2493,26 @@ fn releases(tree: *const Ast, model: *const Model, node: Ast.Node.Index, decl: M
         if (tree.tokenTag(payload) != .asterisk) return null;
         for (model.declarations, 0..) |record, i| {
             if (record.kind != .capture or record.token != payload + 1) continue;
-            return releases(tree, model, branch.ast.then_expr, @fromBackingInt(@intCast(i)), member);
+            return releases(c, file, branch.ast.then_expr, @fromBackingInt(@intCast(i)), member);
         }
         return null;
     }
-    var call_buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&call_buffer, node) orelse return null;
-    if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-    var receiver, const method = tree.nodeData(call.ast.fn_expr).node_and_token;
+    // A declaration, a store or a return given what the guard is handed on to
+    // (`var ga = fa.await(io)`).
+    if (tree.fullVarDecl(node)) |variable| return if (variable.ast.init_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
+    if (tree.nodeTag(node) == .assign) return movedBy(c, file, tree.nodeData(node).node_and_node[1], decl);
+    if (tree.nodeTag(node) == .@"return") return if (tree.nodeData(node).opt_node.unwrap()) |value| movedBy(c, file, value, decl) else null;
+    const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
+    if (tree.nodeTag(call.callee_expr) != .field_access) return null;
+    var receiver, const method = tree.nodeData(call.callee_expr).node_and_token;
+    if (call.receiver == .none) return null;
+    if (!try guardRelease(c, call.callee)) {
+        // A guard whose type does not resolve, as its acquisition does not, is judged as one:
+        // its own `deinit` or `release`, which does not resolve with it, releases it.
+        if (call.callee != .any or member == .named or tree.nodeTag(receiver) != .identifier) return null;
+        const spelled = tree.tokenSlice(method);
+        if (!std.mem.eql(u8, spelled, "deinit") and !std.mem.eql(u8, spelled, "release")) return null;
+    }
     switch (member) {
         .none => {},
         .named => |name| {
@@ -2431,9 +2527,70 @@ fn releases(tree: *const Ast, model: *const Model, node: Ast.Node.Index, decl: M
     }
     if (tree.nodeTag(receiver) != .identifier) return null;
     const reference = model.reference(receiver) orelse return null;
-    if (reference.declaration != decl) return null;
-    const spelled = tree.tokenSlice(method);
-    return if (std.mem.eql(u8, spelled, "deinit") or std.mem.eql(u8, spelled, "release")) node else null;
+    return if (reference.declaration == decl) node else null;
+}
+
+/// The call `value` is, through `try`, that hands on the guard `decl` holds into its value
+/// (`handedOn`), which binds it anew.
+fn movedBy(c: *Context, file: Project.FileId, value: Ast.Node.Index, decl: Model.Declaration.Id) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    var at = Facts.ungrouped(tree, value);
+    while (tree.nodeTag(at) == .@"try") at = Facts.ungrouped(tree, tree.nodeData(at).node);
+    const call = (try Facts.calls.at(c.facts, file, at)) orelse return null;
+    if (!try handedOn(c, file, &call)) return null;
+    const holder = Facts.ungrouped(tree, call.receiver.bound);
+    if (tree.nodeTag(holder) != .identifier) return null;
+    const reference = model.reference(holder) orelse return null;
+    return if (reference.declaration == decl) at else null;
+}
+
+/// Whether a call hands the guard its receiver holds on into its value, which takes it from
+/// there (`acquisitionOf`): std's Io.Future's `await` or `cancel`, each of which gives the one
+/// result the future holds (`io.async(L.acquire, .{a})`).
+fn handedOn(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Context.Error!bool {
+    const holder = switch (call.receiver) {
+        .bound => |node| node,
+        .none, .unknown => return false,
+    };
+    const each: []const Facts.Decl = switch (call.callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return false,
+    };
+    for (each) |choice| {
+        const name = c.project.at(choice.file).model.declarations[@backingInt(choice.index)].name;
+        if (!std.mem.eql(u8, name, "await") and !std.mem.eql(u8, name, "cancel")) return false;
+    }
+    const value = switch (try c.facts.resolve(file, holder)) {
+        .pointer => |inner| inner.child.*,
+        else => |other| other,
+    };
+    const made = switch (value) {
+        .instance, .container => |found| found.made_by orelse return false,
+        else => return false,
+    };
+    return try Governed.isStd(c, made.function, "Io.Future") == .yes;
+}
+
+/// Whether a callee is a guard's release, each it may be: a `deinit` or `release` a guard's
+/// type declares (`guardType`). One that does not resolve releases nothing known.
+fn guardRelease(c: *Context, callee: Facts.calls.Callee) Context.Error!bool {
+    const each: []const Facts.Decl = switch (callee) {
+        .function => |*one| one[0..1],
+        .choice => |all| all,
+        .any => return false,
+    };
+    for (each) |choice| {
+        const decl = (try originKnown(c, choice)) orelse return false;
+        const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+        if (record.kind != .function or !(std.mem.eql(u8, record.name, "deinit") or std.mem.eql(u8, record.name, "release"))) return false;
+        switch (try guardType(c, .{ .file = decl.file, .scope = record.scope })) {
+            .plain, .ranked => {},
+            .no, .unknown => return false,
+        }
+    }
+    return true;
 }
 
 /// Whether the guard local `decl` is only held: each use of it a member's (`g.value()`,
@@ -2504,7 +2661,11 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
             lock = found;
             continue;
         }
-        if (program.std_files.contains(@backingInt(decl.file))) continue;
+        // std's, by its value alone (`Future(Guard).await` gives one).
+        if (program.std_files.contains(@backingInt(decl.file))) {
+            other = true;
+            continue;
+        }
         // One of the program's with a body is read by its body alone.
         const body = record.kind == .function and program.own(decl.file) and if (c.project.at(decl.file).model.parentOf(record.node)) |parent| c.project.at(decl.file).file.tree.nodeTag(parent) == .fn_decl else false;
         if (!body) other = true;
@@ -2521,47 +2682,56 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
         }
     }
     if (lock) |found| if (found.through) return .{ .lock = found };
-    // One given an address (`lockInto(a, &g)`) may write a guard there all the same.
-    if (statement) {
-        // As written: a receiver, bound or not, is no address the call is given.
-        const tree = &c.project.at(file).file.tree;
-        var buffer: [1]Ast.Node.Index = undefined;
-        const written = tree.fullCall(&buffer, call.node);
-        const given = if (written) |each| for (each.ast.params) |arg| {
-            if (tree.nodeTag(arg) == .address_of) break true;
-        } else false else true;
-        if (!given) return .no;
-    }
+    // One given a pointer (`lockInto(a, &g)`) may write a guard there all the same.
+    if (statement and !try givenPointer(c, file, call)) return .no;
     if (!other) return if (lock) |found| .{ .lock = found } else .no;
+    // A guard in what the call gives is bound as a helper's is (`throughBound`): the local its
+    // value binds, the guard in it or in one of its members.
     return switch (try guardValue(c, file, call.node)) {
-        .plain => .{ .lock = .{ .ranked = false } },
+        .plain => .{ .lock = .{ .ranked = false, .through = true } },
         // A helper's ranked guard was ranked through a context of its own, which its arguments
         // need not name: no context is known.
-        .ranked => .{ .lock = .{ .ranked = if (lock) |earlier| earlier.ranked else true } },
-        .no => if (lock) |found| .{ .lock = found } else if (unknown) |why| .{ .unknown = why } else if (call.callee == .any) try guardGiven(c, file, call.node) else .no,
+        .ranked => .{ .lock = .{ .ranked = if (lock) |earlier| earlier.ranked else true, .through = true } },
+        .no => if (lock) |found| .{ .lock = found } else if (unknown) |why| .{ .unknown = why } else if (call.callee == .any) try guardGiven(c, file, call) else .no,
         .unknown => |why| if (lock) |found| .{ .lock = found } else .{ .unknown = why },
     };
 }
 
-/// Whether a call that does not resolve, whose value is no guard, may take one all the same
-/// into what it is given: an address, as written, of a guard or of what does not resolve
-/// (`lockInto(a, &g)`), or a receiver that is one.
-fn guardGiven(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Acquisition {
-    const tree = &c.project.at(file).file.tree;
+/// Whether a call is given a pointer (Facts.calls' arguments, its receiver among them): one an
+/// argument holds by value (`&g`, `p` of `const p = &g`, `.{ .slot = &g }`), or an argument
+/// that does not resolve, which may be one. Where a receiver that does not resolve leaves
+/// Facts.calls' arguments unknown, the arguments as written (a receiver, bound or not, is no
+/// address the call is given).
+fn givenPointer(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Context.Error!bool {
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return .{ .unknown = .unresolved };
-    for (call.ast.params) |arg| {
-        if (tree.nodeTag(arg) != .address_of) continue;
-        switch (try guardValue(c, file, tree.nodeData(arg).node)) {
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => if (call.receiver == .unknown) (c.project.at(file).file.tree.fullCall(&buffer, call.node) orelse return true).ast.params else return true,
+    };
+    for (args) |arg| for (try c.facts.heldParts(c.allocator, try c.facts.resolve(file, arg))) |part| switch (part) {
+        .pointer, .unknown => return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether a call that does not resolve, whose value is no guard, may take one all the same
+/// into what it is given (Facts.calls' arguments, its receiver among them): through a pointer
+/// an argument holds by value (`givenPointer`) to what holds a guard or does not resolve, or
+/// an argument that does not resolve.
+fn guardGiven(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) Context.Error!Acquisition {
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    for (args) |arg| for (try c.facts.heldParts(c.allocator, try c.facts.resolve(file, arg))) |part| switch (part) {
+        .pointer => |to| switch (try guardHeld(c, to.child.*)) {
             .no => {},
             .unknown => |why| return .{ .unknown = why },
             .plain, .ranked => return .{ .unknown = .unresolved },
-        }
-    }
-    if (tree.nodeTag(call.ast.fn_expr) == .field_access) switch (try guardValue(c, file, tree.nodeData(call.ast.fn_expr).node_and_token[0])) {
-        .no => {},
+        },
         .unknown => |why| return .{ .unknown = why },
-        .plain, .ranked => return .{ .unknown = .unresolved },
+        else => {},
     };
     return .no;
 }
@@ -2609,11 +2779,16 @@ fn heldAtExit(c: *Context, tree: *const Ast, model: *const Model, function: Ast.
         if (enclosingFunction(model, tree, call.node) != function or typeOnly(tree, model, call.node)) continue;
         const found = try acquisitionOf(c, file, call, depth + 1);
         if (found == .no) continue;
-        const bound = if (found == .lock and found.lock.through) throughBound(tree, model, call.node) else boundBy(tree, model, call.node);
-        if (bound.declaration != null and releaseOf(tree, model, bound) != null) continue;
+        const bound = if (found == .lock and found.lock.through) try throughBound(c, file, call.node) else boundBy(tree, model, call.node);
+        if (bound.declaration != null and try releaseOf(c, file, bound) != null) continue;
         switch (found) {
             .no => unreachable, // unreachable: skipped above.
-            .lock => |lock| return .{ .lock = .{ .ranked = lock.ranked, .context_from = if (lock.context) |d| parameterPosition(tree, model, function, d) else null } },
+            .lock => |lock| {
+                // Ranked through its parameter's context, kept as the caller gives it up to here.
+                const position = if (lock.context) |d| parameterPosition(tree, model, function, d) else null;
+                const unwritten = if (position != null) try contextKept(c, file, function, lock.context.?, null, try timeOf(c, tree, model, tree.firstToken(call.node), call.node), depth + 1) else false;
+                return .{ .lock = .{ .ranked = lock.ranked, .context_from = if (unwritten) position else null } };
+            },
             .unknown => |why| out = .{ .unknown = why },
         }
     }
@@ -2681,25 +2856,23 @@ fn contextOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Call) ?
 /// Whether a value is a guard (`guardValue`), and an Order's ranked one.
 const Guard = union(enum) { no, plain, ranked, unknown: Facts.Unknown };
 
-/// Whether what a call gives, through its error union and optional, is a guard: a type
-/// declared in an aegis owner (`Guard`, `ReadGuard`, `WriteGuard`) or an Order's ranked
-/// capability. One that does not resolve is a guard where its declared result names one.
+/// Whether what a call gives holds a guard by value (`guardHeld`). One that does not resolve
+/// is a guard where its declared result names one.
 fn guardValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Guard {
-    var value = try c.facts.resolve(file, node);
-    while (true) switch (value) {
-        .error_union, .optional => |inner| value = inner.*,
-        else => break,
+    return switch (try guardHeld(c, try c.facts.resolve(file, node))) {
+        .unknown => |why| if (try Contract.kind(c, file, node, 0) != .guard) .{ .unknown = why } else if (rankedForm(&c.project.at(file).file.tree, node)) .ranked else .plain,
+        else => |found| found,
     };
-    const each: []const Facts.Value = switch (value) {
-        .alternatives => |all| all,
-        else => (&value)[0..1],
-    };
+}
+
+/// Whether a value holds a guard by value (Facts.heldParts: through its error union, optional,
+/// array, a choice of types and a record's fields): a type declared in an aegis owner (`Guard`,
+/// `ReadGuard`, `WriteGuard`) or an Order's ranked capability; a part that does not resolve
+/// may be one.
+fn guardHeld(c: *Context, value: Facts.Value) Context.Error!Guard {
     var guard: Guard = .no;
-    for (each) |one| switch (one) {
-        .unknown => |why| {
-            if (try Contract.kind(c, file, node, 0) != .guard) return .{ .unknown = why };
-            return if (rankedForm(&c.project.at(file).file.tree, node)) .ranked else .plain;
-        },
+    for (try c.facts.heldParts(c.allocator, value)) |part| switch (part) {
+        .unknown => |why| return .{ .unknown = why },
         .instance, .container => |held| switch (try guardType(c, held)) {
             .no => {},
             // Of a choice, ranked only where each is.
