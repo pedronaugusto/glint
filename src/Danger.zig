@@ -999,6 +999,8 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
     var calls: std.ArrayList(Ast.Node.Index) = .empty;
     // A call through an alias the program declares is read by what its callee reaches.
     try aliasCalls(c, found[0].decls, &calls);
+    // Each alias declaration is read once, however many sites name it or aliases of it reach it.
+    var read: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
     for (sites.items) |site| {
         if (c.inTest(site.token)) continue;
         const parent = model.parentOf(site.node) orelse continue;
@@ -1014,7 +1016,7 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
         // default, a table's element, a variable) is called where it goes, which this reading
         // does not follow, at run time or not.
         if (try aliasDeclaration(c, site.node)) |declaration| {
-            try aliasValues(c, rule, declaration, 0);
+            try aliasValues(c, rule, declaration, &read, 0);
             continue;
         }
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
@@ -1046,8 +1048,9 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
 /// std.debug.assert;`) taken as a value in this file (`.{ .each = &check }`, a table's
 /// element), by `accesses`: called where it goes, which A013 does not follow, so undecided. A
 /// call of it is `aliasCalls`'s, an alias of it is read as this one is; another file's use of
-/// the alias is a site `Governed.sites` gives there.
-fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, depth: usize) Context.Error!void {
+/// the alias is a site `Governed.sites` gives there. A declaration in `read` is read already.
+fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, read: *std.AutoHashMapUnmanaged(Ast.Node.Index, void), depth: usize) Context.Error!void {
+    if ((try read.getOrPut(c.allocator, declaration)).found_existing) return;
     if (depth == 8) return c.undecided(rule, c.project.at(c.file).file.tree.tokenStart(c.project.at(c.file).file.tree.firstToken(declaration)), .unsupported, "an alias of std.debug.assert past the depth A013 follows");
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
@@ -1064,7 +1067,7 @@ fn aliasValues(c: *Context, rule: Rule, declaration: Ast.Node.Index, depth: usiz
             const parent = model.parentOf(site.node) orelse continue;
             if (try Facts.calls.at(c.facts, c.file, parent)) |call| if (call.callee_expr == target) continue;
             if (try aliasDeclaration(c, target)) |alias| {
-                try aliasValues(c, rule, alias, depth + 1);
+                try aliasValues(c, rule, alias, read, depth + 1);
                 continue;
             }
             try c.undecided(rule, tree.tokenStart(tree.firstToken(target)), .unresolved, "an alias of std.debug.assert taken as a value: its calls are not read");

@@ -9017,6 +9017,23 @@ test "A013 reads std's assert called through any alias the program declares, pub
         \\}
     );
     try std.testing.expectEqual(@as(usize, 1), result.undecided);
+    // An alias declaration is read once, however many sites reach it: a namespace that does not
+    // resolve (`morse`) may hold the assert, so each of its reads is a site, and reading the
+    // alias again for each multiplied its undecided reads to the depth (visor's term.zig).
+    const once = try run(pack.contracts,
+        \\const std = @import("std");
+        \\const morse = @import("missing");
+        \\const assert = std.debug.assert;
+        \\const A = morse.A;
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const b = try r.takeByte();
+        \\    assert(b > 1);
+        \\    morse.g();
+        \\    morse.h();
+        \\    _ = A;
+        \\}
+    );
+    try std.testing.expect(once.undecided <= 4);
 }
 
 test "A015 flags a field the program releases or writes an owner into, and a borrow it is only given as none" {
