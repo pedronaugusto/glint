@@ -261,16 +261,20 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         }
     }
     // What the program hands std that std sizes memory or work by (Taint.sinkSites).
-    for (try Taint.sinkSites(c, flow, c.file)) |sized| {
-        if (!site(c, sized.at)) continue;
+    for (try Taint.sinkSites(c, flow, c.file)) |found| {
+        if (!site(c, found.at)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, sized.at);
-        if (sized.callee) |decl| {
+        const call = tree.fullCall(&buffer, found.at);
+        if (found.callee) |decl| {
             // A fixed reader's take, peek or discard views or skips bytes the program already
             // holds and fails past them: no work a peer sizes, unless the read allocates.
             if (fromReader(flow, decl) and call != null and try ownReader(c, flow, call.?) and !try allocates(c, decl)) continue;
         }
-        const read = if (sized.length) try Taint.lengthAt(c, flow, c.file, sized.value) else try ranged(c, flow, sized.value);
+        const read = if (found.length) try Taint.lengthAt(c, flow, c.file, found.value) else try ranged(c, flow, found.value);
+        // Not input, it is no site whatever its call's instantiation decides; input or not
+        // known, read as that instantiation reads it.
+        if (read != .unknown and !read.reaches(flow.spec.reaches)) continue;
+        const sized = (try Taint.decidedSite(c, flow, found)) orelse continue;
         // What std takes only kept to a range is data, a peer's number or not.
         const level: Taint.Level = if (sized.narrowed and read == .number) .data else read;
         if (level != .unknown and !level.reaches(flow.spec.reaches)) continue;

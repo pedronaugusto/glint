@@ -15,6 +15,10 @@ gpa: std.mem.Allocator,
 /// files the caller states are that package's: a module republishing it stays the program's.
 known: ?Package = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
+/// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
+bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
+/// Each reading made (`keptReading`), by its function, outer reading and depth.
+readings: std.AutoHashMapUnmanaged(ReadingKey, std.ArrayList(*const Env)) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
 /// The sets of comptime `bool` parameters' values that the paths read so far settle, each once.
 settled: std.ArrayList(Assumptions) = .empty,
@@ -65,6 +69,7 @@ remaining: usize = 100_000,
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
 const Settled = struct { key: Key, assumed: ?Assumptions.Id };
+const Bound = struct { env: *const Env, settled: Settled };
 /// A set of settled assumptions, held once in `settled`.
 const Assumptions = struct {
     held: []const Assumption,
@@ -122,16 +127,19 @@ pub const Env = struct {
     depth: usize,
     /// Each argument's value as a condition, where it is a comptime-known `bool`.
     truths: []const ?bool = &.{},
-    /// The reading this call is made in, whose function encloses this one: a type function
-    /// declared in a type function's container (std's `FieldIterator(V)` in a hash map),
-    /// whose parameters it reads as that reading binds them.
+    /// The reading whose function encloses this one, which binds the names it reads beyond
+    /// its own parameters: a type function declared in a type function's container (std's
+    /// `FieldIterator(V)` in a hash map) reads that one's parameters as it binds them. None
+    /// where no reading made it encloses the function (`enclosingReading`): a caller that
+    /// does not enclose it binds nothing it reads.
     outer: ?*const Env = null,
-    /// Where each argument is written, in order with `args` (none for a receiver): what a
-    /// name a type function is given (`items(.tag)`, `@tagName(field)`) is read from.
-    sources: []const ?Source = &.{},
+    /// What each argument spells where it is written (`spelledIn`), in order with `args`
+    /// (none for a receiver or one that spells nothing): what a name a type function is given
+    /// (`items(.tag)`, `@tagName(field)`) reads, or a number written as a literal (`Pick(1)`).
+    spelled: []const ?Spelled = &.{},
 };
-/// An argument as written: its node, in its file, and the reading it is written in.
-pub const Source = struct { file: Project.FileId, node: Ast.Node.Index, env: ?*const Env };
+/// What an argument spells: a name (`nameIn`), or a number written as a literal.
+pub const Spelled = union(enum) { name: []const u8, number: usize };
 /// A type seen through `@typeInfo`, and how far into its information a chain of fields has
 /// gone: `.pointer.child`, `.optional.child`, `.array.child`, `.error_union.payload`,
 /// `.@"fn".return_type` and `.@"fn".param_types[i]`. `part` is any other part of the
@@ -239,6 +247,8 @@ pub fn reifiedParts(self: *Facts, built: Reified) ResolveError!Value {
 
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
+    self.bound.deinit(self.gpa);
+    self.readings.deinit(self.gpa);
     self.active.deinit(self.gpa);
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
@@ -463,10 +473,13 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
 /// What a file whose budget ran out kept, dropped: its memos and indexes may have been built
 /// short of it (a part that came back unknown(budget)), which its file reports as exhausted but
 /// which would answer a later file as if complete (C1). What `resolve` keeps stays: it keeps
-/// only what was read with budget left, and the sets of assumptions its keys name.
+/// only what was read with budget left, and the sets of assumptions its keys name; so does what
+/// `resolveIn` keeps, by readings that are never freed.
 pub fn forget(self: *Facts) void {
-    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .settled = self.settled };
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled };
     self.cache = .empty;
+    self.bound = .empty;
+    self.readings = .empty;
     self.settled = .empty;
     self.deinit();
     fresh.active = .empty;
@@ -1454,8 +1467,7 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
     var args: std.ArrayList(Value) = .empty;
     if (receiver) try args.append(self.gpa, try self.resolve(file, tree.nodeData(call.ast.fn_expr).node_and_token[0]));
     for (call.ast.params) |arg| try args.append(self.gpa, try self.resolve(file, arg));
-    var env = try self.gpa.create(Env);
-    env.* = .{ .function = function, .args = args.items, .depth = 0 };
+    var env = try self.keptReading(.{ .function = function, .args = args.items, .depth = 0 });
     for (copy.path) |step| {
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
@@ -1473,9 +1485,7 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
         var inner_args: std.ArrayList(Value) = .empty;
         if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
         for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
-        const next = try self.gpa.create(Env);
-        next.* = .{ .function = target, .args = inner_args.items, .depth = env.depth +| 1 };
-        env = next;
+        env = try self.keptReading(.{ .function = target, .args = inner_args.items, .depth = env.depth +| 1 });
     }
     return self.resolveIn(env, source.file, source.node);
 }
@@ -1940,7 +1950,7 @@ pub fn reachedUnder(self: *Facts, env: ?*const Env, file: Project.FileId, node: 
         if (tree.fullSwitch(parent)) |choice| {
             if (at == choice.ast.condition) continue;
             const taken = try self.takenProng(env, file, choice) orelse continue;
-            if (choice.ast.cases[taken] != at) return false;
+            if (!taken.has(std.mem.findScalar(Ast.Node.Index, choice.ast.cases, at).?)) return false; // unreachable: past its condition, a switch's child is a case
             continue;
         }
         var buffer: [2]Ast.Node.Index = undefined;
@@ -2397,9 +2407,9 @@ fn nameIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.I
     while (at) |reading| : (at = reading.outer) {
         if (reading.function.file != file or model.scopes[@backingInt(record.scope)].node != self.scopeNode(reading.function)) continue;
         const position = self.parameterPosition(file, reading.function, record.token) orelse return null;
-        if (position >= reading.sources.len) return null;
-        const source = reading.sources[position] orelse return null;
-        return self.nameIn(source.env, source.file, source.node, depth + 1);
+        if (position >= reading.spelled.len) return null;
+        const spelled = reading.spelled[position] orelse return null;
+        return if (spelled == .name) spelled.name else null;
     }
     return null;
 }
@@ -3338,18 +3348,17 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
     self.assumed = made.assumed;
     const args = try self.gpa.alloc(Value, call.ast.params.len);
     const truths = try self.gpa.alloc(?bool, call.ast.params.len);
-    const sources = try self.gpa.alloc(?Source, call.ast.params.len);
-    for (call.ast.params, args, truths, sources, 0..) |param, *arg, *t, *source, position| {
-        source.* = .{ .file = made.file, .node = param, .env = outer_env };
+    const spelled = try self.gpa.alloc(?Spelled, call.ast.params.len);
+    for (call.ast.params, args, truths, spelled, 0..) |param, *arg, *t, *spelling, position| {
+        spelling.* = try self.spelledIn(outer_env, made.file, param);
         const changed = try self.passedOnChanged(made.function, position);
         arg.* = if (changed)
             .{ .unknown = .comptime_dependent }
-        else if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param);
+        else
+            try self.boundArgument(if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param));
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
-    const env = try self.gpa.create(Env);
-    env.* = .{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = outer_env, .sources = sources };
-    return env;
+    return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled });
 }
 
 fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveError!bool {
@@ -3490,7 +3499,7 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     if (tree.fullSwitch(node)) |whole| {
         const taken = try self.takenProng(env, file, whole);
         for (whole.ast.cases, 0..) |case, i| {
-            if (taken) |t| if (t != i) continue;
+            if (taken) |t| if (!t.has(i)) continue;
             const branch = tree.fullSwitchCase(case).?.ast.target_expr;
             // A prong the path rules out: Zig analyses only the one a comptime operand takes.
             if (never(tree, branch) or try self.dead(file, branch)) continue;
@@ -3513,17 +3522,17 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     return try self.peeredChoice(values.items, peers);
 }
 
-/// The prong a `switch` on type information takes where the type is one container: the one
-/// naming its kind (`.@"union"`), else its `else`. Zig analyses no other. Null where the
-/// subject is anything else, or a prong names its kind other than by a literal.
-fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.full.Switch) ResolveError!?usize {
+/// The prongs a `switch` on type information may take where the type's kind is known: the one
+/// naming its kind (`.@"union"`), else its `else`. Zig analyses no other. An array may be a
+/// vector, which reads as one: the `.array` prong or the `.vector` one. Null where the subject
+/// is anything else, a kind has no prong, or a prong names its kind other than by a literal.
+fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.full.Switch) ResolveError!?Taken {
     const tree = &self.project.at(file).file.tree;
     if (!isTypeInfo(tree, whole.ast.condition)) return null;
     const subject = try self.resolveIn(env, file, whole.ast.condition);
     if (subject != .reflected or subject.reflected.at != .info) return null;
     // A pointer (a slice among them), an optional, an error union or a function type is of
-    // its kind whatever it holds (`std.meta.Child(*const T)`). An array is not: a vector reads
-    // as one.
+    // its kind whatever it holds (`std.meta.Child(*const T)`).
     const kind: []const u8 = switch (subject.reflected.of.*) {
         .container => |container| switch (self.kindOf(container) orelse return null) {
             .keyword_struct => "struct",
@@ -3536,8 +3545,28 @@ fn takenProng(self: *Facts, env: ?*const Env, file: Project.FileId, whole: Ast.f
         .optional => "optional",
         .error_union => "error_union",
         .fn_type => "fn",
+        .array => "array",
         else => return null,
     };
+    const one = (try self.prongOf(tree, whole, kind)) orelse return null;
+    if (!std.mem.eql(u8, kind, "array")) return .{ .one = one };
+    return .{ .one = one, .other = (try self.prongOf(tree, whole, "vector")) orelse return null };
+}
+
+/// The prongs a `switch` on type information may take (`takenProng`): one, or two.
+const Taken = struct {
+    one: usize,
+    other: ?usize = null,
+
+    fn has(taken: Taken, case: usize) bool {
+        return taken.one == case or taken.other == case;
+    }
+};
+
+/// The prong of a `switch` on type information that a type of kind `kind` takes: the one
+/// naming it, else the `else`. Null where it has none, or a prong names a kind other than by a
+/// literal.
+fn prongOf(self: *Facts, tree: *const Ast, whole: Ast.full.Switch, kind: []const u8) ResolveError!?usize {
     var otherwise: ?usize = null;
     for (whole.ast.cases, 0..) |case, i| {
         const full = tree.fullSwitchCase(case).?; // unreachable: a switch's cases are cases
@@ -3954,6 +3983,63 @@ fn sameMaking(a: ?*const Made, b: ?*const Made, depth: usize) bool {
     return true;
 }
 
+/// Whether two values are one, what they point at compared, not where it is kept.
+pub fn sameValue(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .pointer => |inner| sameValue(inner.*, b.pointer.*),
+        .array => |inner| sameValue(inner.*, b.array.*),
+        .optional => |inner| sameValue(inner.*, b.optional.*),
+        .error_union => |inner| sameValue(inner.*, b.error_union.*),
+        .alternatives => |each| each.len == b.alternatives.len and for (each, b.alternatives) |one, other| {
+            if (!sameValue(one, other)) break false;
+        } else true,
+        .reflected => |r| r.at == b.reflected.at and sameValue(r.of.*, b.reflected.of.*),
+        .reified => |r| r.value == b.reified.value and sameValue(r.fields.*, b.reified.fields.*),
+        .primitive => |name| std.mem.eql(u8, name, b.primitive),
+        // A type a call made is the one another call with the same arguments makes, wherever
+        // each is kept (`sameMaking`).
+        .container, .instance => |k| switch (b) {
+            .container, .instance => |other| k.file == other.file and k.scope == other.scope and sameMaking(k.made_by, other.made_by, 0),
+            else => false,
+        },
+        else => std.meta.eql(a, b),
+    };
+}
+
+/// The reading `draft` describes, made once: one already made with the same function, depth,
+/// outer reading, arguments (`sameValue`), truths and spellings, or a new one. What `resolveIn`
+/// keeps by a reading's address is then shared by every call that makes it.
+fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
+    const key: ReadingKey = .{ .function = draft.function, .outer = draft.outer, .depth = draft.depth };
+    const entry = try self.readings.getOrPut(self.gpa, key);
+    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    for (entry.value_ptr.items) |kept| if (sameEnv(kept.*, draft)) return kept;
+    const env = try self.gpa.create(Env);
+    env.* = draft;
+    try entry.value_ptr.append(self.gpa, env);
+    return env;
+}
+
+const ReadingKey = struct { function: Decl, outer: ?*const Env, depth: usize };
+
+fn sameEnv(a: Env, b: Env) bool {
+    if (a.args.len != b.args.len or a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
+    for (a.args, b.args) |one, other| if (!sameValue(one, other)) return false;
+    for (a.truths, b.truths) |one, other| if (one != other) return false;
+    for (a.spelled, b.spelled) |one, other| {
+        if ((one == null) != (other == null)) return false;
+        const x = one orelse continue;
+        const y = other.?;
+        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+        switch (x) {
+            .name => |name| if (!std.mem.eql(u8, name, y.name)) return false,
+            .number => |number| if (number != y.number) return false,
+        }
+    }
+    return true;
+}
+
 fn same(a: Value, b: Value, depth: usize) bool {
     if (depth == 64) return false;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
@@ -4097,6 +4183,32 @@ fn callable(value: Value) bool {
         .alternatives => |each| for (each) |one| {
             if (!callable(one)) break false;
         } else true,
+        else => false,
+    };
+}
+
+/// Whether `value` and `typed` are the same container, or the same through as many pointers,
+/// whatever made each.
+fn sameContainer(value: Value, typed: Value) bool {
+    return switch (value) {
+        .container, .instance => |k| switch (typed) {
+            .container, .instance => |other| k.file == other.file and k.scope == other.scope,
+            else => false,
+        },
+        .pointer => |inner| typed == .pointer and sameContainer(inner.*, typed.pointer.*),
+        else => false,
+    };
+}
+
+/// Whether `value` may name a function: one, through a pointer, an optional or an error union,
+/// or among a choice.
+fn namesFunction(value: Value) bool {
+    return switch (value) {
+        .function => true,
+        .pointer, .optional, .error_union => |inner| namesFunction(inner.*),
+        .alternatives => |each| for (each) |one| {
+            if (namesFunction(one)) break true;
+        } else false,
         else => false,
     };
 }
@@ -4837,6 +4949,31 @@ fn destructuredAt(self: *Facts, value: Value, position: usize) ResolveError!Valu
 }
 
 /// The values an anonymous literal holds: its fields' or its elements', in order.
+/// An argument as a reading binds it: a tuple literal (`.{ x, y }`) is the first one met whose
+/// elements read alike, as Zig gives tuples of the same element types one type, so a generic
+/// handed `.{ n }` at two calls is one instantiation. A struct literal with named fields is its
+/// own type (`same`) and stays.
+fn boundArgument(self: *Facts, value: Value) ResolveError!Value {
+    if (value != .literal) return value;
+    const tree = &self.project.at(value.literal.file).file.tree;
+    switch (tree.nodeTag(value.literal.node)) {
+        .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => {},
+        else => return value,
+    }
+    const parts = try self.literalParts(value.literal);
+    const memory = try self.memo(Tuples);
+    for (memory.kept.items) |kept| {
+        if (kept.parts.len != parts.len) continue;
+        for (kept.parts, parts) |one, other| {
+            if (!sameValue(one, other)) break;
+        } else return .{ .literal = kept.key };
+    }
+    try memory.kept.append(self.gpa, .{ .key = value.literal, .parts = parts });
+    return value;
+}
+
+const Tuples = struct { kept: std.ArrayList(struct { key: Key, parts: []const Value }) = .empty };
+
 pub fn literalParts(self: *Facts, literal: Key) ResolveError![]const Value {
     const tree = &self.project.at(literal.file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
@@ -5616,8 +5753,8 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     var truths: std.ArrayList(?bool) = .empty;
     // The reading this call is made in: a made container's, for its method (`Slice.items`
     // reading `Elem` of `MultiArrayList(Elem)`), else the calling one.
-    var outer = env;
-    var sources: std.ArrayList(?Source) = .empty;
+    var outer = self.enclosingReading(env, decl);
+    var spelled: std.ArrayList(?Spelled) = .empty;
     // A method called on a value takes that value as its first parameter.
     if (tree.nodeTag(call.ast.fn_expr) == .field_access) {
         const receiver = try self.resolveIn(env, file, tree.nodeData(call.ast.fn_expr).node_and_token[0]);
@@ -5640,16 +5777,15 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         if (on_value) {
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
-            try sources.append(self.gpa, null);
+            try spelled.append(self.gpa, null);
         }
     }
     for (call.ast.params) |arg| {
-        try args.append(self.gpa, try self.resolveIn(env, file, arg));
+        try args.append(self.gpa, try self.boundArgument(try self.resolveIn(env, file, arg)));
         try truths.append(self.gpa, self.truth(env, file, arg));
-        try sources.append(self.gpa, .{ .file = file, .node = arg, .env = env });
+        try spelled.append(self.gpa, try self.spelledIn(env, file, arg));
     }
-    const bound = try self.gpa.create(Env);
-    bound.* = .{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items, .outer = outer, .sources = sources.items };
+    const bound = try self.keptReading(.{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items, .outer = outer, .spelled = spelled.items });
     const result_tree = target_tree;
     if (returns_type) {
         const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
@@ -5789,8 +5925,8 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
     const tree = &self.project.at(file).file.tree;
     var args: std.ArrayList(Value) = .empty;
     var truths: std.ArrayList(?bool) = .empty;
-    var sources: std.ArrayList(?Source) = .empty;
-    var reading = outer;
+    var spelled: std.ArrayList(?Spelled) = .empty;
+    var reading = self.enclosingReading(outer, function);
     // Whether the arguments stand in the callee's parameter order: a call not through a member,
     // or one whose holder is known to be a value (bound first) or a type (bound to nothing).
     var aligned = tree.nodeTag(fn_expr) != .field_access;
@@ -5805,26 +5941,34 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         if (holder) |h| {
             try args.append(self.gpa, receiver);
             try truths.append(self.gpa, null);
-            try sources.append(self.gpa, null);
+            try spelled.append(self.gpa, null);
             if (h.made_by) |made| reading = try self.madeEnv(made);
             aligned = true;
         }
     }
     for (params) |arg| {
-        try args.append(self.gpa, try self.resolveIn(outer, file, arg));
+        try args.append(self.gpa, try self.boundArgument(try self.resolveIn(outer, file, arg)));
         try truths.append(self.gpa, self.truth(outer, file, arg));
-        try sources.append(self.gpa, .{ .file = file, .node = arg, .env = outer });
+        try spelled.append(self.gpa, try self.spelledIn(outer, file, arg));
     }
-    const env = try self.gpa.create(Env);
-    env.* = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .truths = truths.items, .outer = reading, .sources = sources.items };
-    if (aligned) try self.typedArguments(env, function, args.items);
-    return env;
+    const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items };
+    if (!aligned) return self.keptReading(draft);
+    // A typed parameter's argument is read in a reading of its own, then given its declared
+    // type: what that reading kept is not the one made with it.
+    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled });
+    try self.typedArguments(reading_args, function, args.items);
+    return self.keptReading(draft);
 }
 
 /// A parameter of a declared type holds a value of that type, whatever its argument reads as
 /// (`self.getContext(key, undefined)` of std's unmanaged map, whose `ctx: Context` is its
-/// instantiation's context): each argument that does not resolve, of a parameter neither
-/// `anytype` nor a type nor `comptime`, is a value of the type the parameter declares in `env`.
+/// instantiation's context; a `[]const u8` given a `*const [5]u8`): each argument of a
+/// parameter neither `anytype` nor a type nor `comptime` is a value of the type the parameter
+/// declares in `env`, as Zig coerces it. One that may name a function, or a literal whose
+/// fields may, says more than its type does (which function a `*const fn` holds) and stays,
+/// as does one already of the declared container, whose making it carries (a context made by
+/// `AutoContext(u32)`, its declared `Context` read through a chain of type functions). A
+/// reading of a function with no generic parameter is then the same whoever calls it.
 fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) ResolveError!void {
     const tree = &self.project.at(function.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -5833,13 +5977,15 @@ fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) 
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
         if (position >= args.len) return;
-        if (args[position] != .unknown or param.anytype_ellipsis3 != null) continue;
+        if (namesFunction(args[position]) or args[position] == .literal or param.anytype_ellipsis3 != null) continue;
         if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) continue;
         const type_expr = param.type_expr orelse continue;
         if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) continue;
         const declared = try self.resolveIn(env, function.file, type_expr);
         if (declared == .unknown) continue;
-        args[position] = try self.instance(declared);
+        const typed = try self.instance(declared);
+        if (args[position] != .unknown and sameContainer(args[position], typed)) continue;
+        args[position] = typed;
     }
 }
 
@@ -5875,14 +6021,14 @@ fn everyReturn(self: *Facts, bound: *const Env, decl: Decl, record: Model.Declar
             if (tree.nodeTag(p) == .fn_decl) break;
             const whole = tree.fullSwitch(p) orelse continue;
             const taken = try self.takenProng(bound, decl.file, whole) orelse continue;
-            if (std.mem.findScalar(Ast.Node.Index, whole.ast.cases, child) != taken) continue :each;
+            if (!taken.has(std.mem.findScalar(Ast.Node.Index, whole.ast.cases, child) orelse continue)) continue :each;
         }
         var container_buffer: [2]Ast.Node.Index = undefined;
         const value = if (tree.fullContainerDecl(&container_buffer, returned) != null)
             // A container it declares is the template's, the same in every call where it
             // names nothing the function declares (`return struct {};`); of a function with no
             // one template, one the call makes, read with its bindings (`attachMade`).
-            if (self.namesNothingOf(decl, returned)) try self.resolve(decl.file, returned) else if (written_only and try self.template(decl) == null) (try self.symbolicAt(decl.file, returned)) orelse return null else return null
+            if (try self.bindsNothing(decl.file, returned)) try self.resolve(decl.file, returned) else if (written_only and try self.template(decl) == null) (try self.symbolicAt(decl.file, returned)) orelse return null else return null
         else
             try self.resolveIn(bound, decl.file, returned);
         if (value == .unknown) return null;
@@ -5966,25 +6112,58 @@ fn attachMade(self: *Facts, value: Value, made: Made) ResolveError!Value {
     return value;
 }
 
-/// Whether the expression `node` in function `decl` names none of the function's parameters
-/// or locals, so reads the same whatever a call binds.
-fn namesNothingOf(self: *Facts, decl: Decl, node: Ast.Node.Index) bool {
-    const tree = &self.project.at(decl.file).file.tree;
-    const model = &self.project.at(decl.file).model;
-    const function = self.scopeNode(decl);
+/// Whether `node` reads the same in every reading: each name it uses is declared in it or
+/// outside every function (a parameter, a local, a capture or a constant of a type function's
+/// container is a reading's to bind), and it asks no `@This()` (a type function's container
+/// is the one its reading makes). By what each name refers to, kept per node.
+fn bindsNothing(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const memory = try self.memo(Unbound);
+    const key: Key = .{ .file = file, .node = node };
+    if (memory.nodes.get(key)) |known_answer| return known_answer;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const named = try self.referencesByToken(file);
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
-    for (model.declarations) |d| {
-        if (d.token >= first and d.token <= last) continue;
-        if (d.token < tree.firstToken(function) or d.token > tree.lastToken(function)) continue;
-        const name = Model.identifier(self.gpa, tree.tokenSlice(d.token)) catch return false;
-        for (first..last + 1) |t| {
-            if (tree.tokenTag(@intCast(t)) != .identifier) continue;
-            const used = Model.identifier(self.gpa, tree.tokenSlice(@intCast(t))) catch return false;
-            if (std.mem.eql(u8, used, name)) return false;
-        }
+    const answer = for (first..last + 1) |t| {
+        const token: Ast.TokenIndex = @intCast(t);
+        if (tree.tokenTag(token) == .builtin and std.mem.eql(u8, tree.tokenSlice(token), "@This")) break false;
+        const reference = named[t] orelse continue;
+        const index = model.references[@backingInt(reference)].declaration orelse continue;
+        const record = model.declarations[@backingInt(index)];
+        if (record.token >= first and record.token <= last) continue;
+        if (inFunction(model, record.scope)) break false;
+    } else true;
+    try memory.nodes.put(self.gpa, key, answer);
+    return answer;
+}
+
+const Unbound = struct {
+    nodes: std.AutoHashMapUnmanaged(Key, bool) = .empty,
+    files: std.AutoHashMapUnmanaged(Project.FileId, []const ?Model.Reference.Id) = .empty,
+};
+
+/// Each token's reference in `file`'s model, where it is one: indexed once per file.
+fn referencesByToken(self: *Facts, file: Project.FileId) ResolveError![]const ?Model.Reference.Id {
+    const memory = try self.memo(Unbound);
+    const entry = try memory.files.getOrPut(self.gpa, file);
+    if (entry.found_existing) return entry.value_ptr.*;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    const named = try self.gpa.alloc(?Model.Reference.Id, tree.tokens.len);
+    @memset(named, null);
+    for (model.references, 0..) |reference, i| named[reference.token] = @fromBackingInt(@intCast(i));
+    entry.value_ptr.* = named;
+    return named;
+}
+
+/// Whether a declaration of scope `scope` is inside a function.
+fn inFunction(model: *const Model, scope: Model.Scope.Id) bool {
+    var at: ?Model.Scope.Id = scope;
+    while (at) |each| : (at = model.scopes[@backingInt(each)].parent) {
+        if (model.scopes[@backingInt(each)].kind == .function) return true;
     }
-    return true;
+    return false;
 }
 
 /// `node` read with `env`'s bindings: a parameter of the function being read is its argument,
@@ -5993,8 +6172,24 @@ fn namesNothingOf(self: *Facts, decl: Decl, node: Ast.Node.Index) bool {
 fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
     const e = env orelse return self.resolve(file, node);
     if (file != e.function.file) return self.resolve(file, node);
+    // What names nothing a reading binds reads as it does with none, kept once for every one.
+    if (try self.bindsNothing(file, node)) return self.resolve(file, node);
+    // A reading is made once and never changed (`bind`), so what a node gives in it is kept by
+    // its address, as `resolve` keeps what a node gives with no binding: a chain of calls
+    // (`x.sqn(..).mul(..)`) reads each receiver once, not again at each call it holds.
+    const key: Bound = .{ .env = e, .settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed } };
+    if (self.bound.get(key)) |value| return value;
     if (self.remaining == 0) return .{ .unknown = .budget };
     self.remaining -= 1;
+    const value = try self.readBound(e, file, node);
+    // Read with none left, a part of it may have come back unknown(budget): it is not kept.
+    if (self.remaining != 0) try self.bound.put(self.gpa, key, value);
+    return value;
+}
+
+/// What `node` gives in the reading `e` (`resolveIn`), read once per reading.
+fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
+    const env: ?*const Env = e;
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
     switch (tree.nodeTag(node)) {
@@ -6092,6 +6287,20 @@ fn enclosed(self: *const Facts, file: Project.FileId, scope: Model.Scope.Id, fun
     return false;
 }
 
+/// The reading on `chain` (a reading, then each one it is made in) whose function encloses
+/// `function`: the nearest, none where none does. Only it binds a name `function` reads
+/// beyond its own parameters (`resolveIn`'s parameter and constant walks, `nameIn`); a
+/// calling reading that does not enclose it binds none, and kept as its outer one would make
+/// a reading of it per chain of callers.
+fn enclosingReading(self: *const Facts, chain: ?*const Env, function: Decl) ?*const Env {
+    const scope = self.project.at(function.file).model.declarations[@backingInt(function.index)].scope;
+    var at = chain;
+    while (at) |reading| : (at = reading.outer) {
+        if (reading.function.file == function.file and self.enclosed(function.file, scope, self.scopeNode(reading.function))) return reading;
+    }
+    return null;
+}
+
 /// The number a parameter named at `node` is bound to by `env`'s call, written there as a
 /// literal (`Pick(1)`).
 fn boundNumber(self: *const Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ?usize {
@@ -6103,11 +6312,20 @@ fn boundNumber(self: *const Facts, env: ?*const Env, file: Project.FileId, node:
     const record = model.declarations[@backingInt(index)];
     if (record.kind != .parameter or file != e.function.file or model.scopes[@backingInt(record.scope)].node != self.scopeNode(e.function)) return null;
     const position = self.parameterPosition(file, e.function, record.token) orelse return null;
-    if (position >= e.sources.len) return null;
-    const source = e.sources[position] orelse return null;
-    const at = &self.project.at(source.file).file.tree;
-    if (at.nodeTag(source.node) != .number_literal) return null;
-    return std.fmt.parseInt(usize, at.tokenSlice(at.nodeMainToken(source.node)), 0) catch null;
+    if (position >= e.spelled.len) return null;
+    const spelled = e.spelled[position] orelse return null;
+    return if (spelled == .number) spelled.number else null;
+}
+
+/// What the argument at `node` spells, read in `env` (`Spelled`): a number literal's value, a
+/// name `nameIn` reads, or nothing.
+fn spelledIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Spelled {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) == .number_literal) {
+        const number = std.fmt.parseInt(usize, tree.tokenSlice(tree.nodeMainToken(node)), 0) catch return null;
+        return .{ .number = number };
+    }
+    return .{ .name = (try self.nameIn(env, file, node, 0)) orelse return null };
 }
 
 /// The position of the parameter named by `token` in `function`'s list.
@@ -9503,6 +9721,16 @@ pub const calls = struct {
         return under(facts, null, file, node);
     }
 
+    /// Whether `node` is written as a call `under` reads: `f(a)` or `@call`. By its form alone.
+    pub fn written(tree: *const Ast, node: Ast.Node.Index) bool {
+        var buffer: [1]Ast.Node.Index = undefined;
+        if (tree.fullCall(&buffer, node) != null) return true;
+        return switch (tree.nodeTag(node)) {
+            .builtin_call, .builtin_call_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@call"),
+            else => false,
+        };
+    }
+
     /// The call `node` makes in one instantiation of the generic it is in: read under `env`, a
     /// reading `Facts.bind` made for each call down the chain that reaches it, so a call on
     /// what a generic's parameter binds (`ctx.hash(key)` in std's `HashMap`, its context
@@ -10473,8 +10701,10 @@ test "reachedUnder: a site past a condition a binding decides is no site of that
         .{ .function = "values", .cast = 3, .bound = plain, .reached = true },
     };
     for (rows) |row| {
-        const env: Env = .{ .function = named.decl(model, file, row.function), .args = &.{ row.bound, int, int }, .depth = 0 };
-        try std.testing.expectEqual(row.reached, try facts.reachedUnder(&env, file, casts.items[row.cast]));
+        // A reading is made once, where `resolveIn` may keep what it gives by its address.
+        const env = try facts.gpa.create(Env);
+        env.* = .{ .function = named.decl(model, file, row.function), .args = try facts.gpa.dupe(Value, &.{ row.bound, int, int }), .depth = 0 };
+        try std.testing.expectEqual(row.reached, try facts.reachedUnder(env, file, casts.items[row.cast]));
     }
     // With no binding, every site is reached.
     for (casts.items) |cast| try std.testing.expect(try facts.reachedUnder(null, file, cast));

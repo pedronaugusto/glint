@@ -347,6 +347,11 @@ const Function = struct {
     /// (`instanceCall`). `every_reading`: reached with none, so as every instantiation reads it.
     readings: std.ArrayList(*const Facts.Env) = .empty,
     every_reading: bool = false,
+    /// Of a summary of one instantiation (`Flow.shared`): taken whole from the summary of every
+    /// instantiation, which read it with no reading of its own, as this one would. Its sizes,
+    /// returns and writes are by parameter, the same whoever calls it, so it is not read again
+    /// here unless a reading of its own reaches it.
+    settled: bool = false,
 
     /// The position of the parameter `d` declares.
     fn position(f: Function, d: Model.Declaration.Id) ?usize {
@@ -439,6 +444,8 @@ pub const Flow = struct {
     /// Of the summary every instantiation reads, the summaries of one instantiation each
     /// (`instanceSizes`), by the reading of the program's call that roots it.
     instances: std.ArrayList(struct { env: *const Facts.Env, flow: *Flow }) = .empty,
+    /// For a summary of one instantiation, every instantiation's (`instanceSizes`).
+    shared: ?*Flow = null,
 
     /// Whether a file is the program's (`Program`): what a file of the package the run did not
     /// select, or a dependency's, does with input is as much the program's.
@@ -3092,6 +3099,7 @@ fn linksOf(c: *Context, flow: *Flow) Context.Error!void {
         flow.links.clearRetainingCapacity();
         var changed = false;
         for (flow.functions.items, 0..) |f, i| {
+            if (f.settled) continue;
             const function: Function.Id = @fromBackingInt(@intCast(i));
             const tree = &c.project.at(f.file).file.tree;
             const model = &c.project.at(f.file).model;
@@ -3793,7 +3801,31 @@ pub const SinkSite = struct {
     /// number is data there.
     narrowed: bool = false,
     decided: bool = true,
+    /// Every instantiation's summary takes it through a call that does not resolve: the
+    /// instantiation this call makes may decide it (`decidedSite`), read only where asked.
+    refine: bool = false,
 };
+
+/// `site` as the instantiation its call makes reads it (`instanceSizes`), where every
+/// instantiation's summary leaves a size undecided (`SinkSite.refine`): null where that one
+/// sizes nothing by it. Asked of a site whose value is input, never of every site.
+pub fn decidedSite(c: *Context, fact: Fact, site: SinkSite) Context.Error!?SinkSite {
+    if (!site.refine) return site;
+    const sized = fact.flow.sized.?; // unreachable: a site to refine was found through the summary
+    const summary = try instanceSizes(c, sized, site.file, site.at, site.callee.?); // unreachable: one to refine has a summary, so a callee
+    const slot = if (site.length) lengthSlot(site.position) else valueSlot(site.position);
+    const sure, const ranged, const maybe = switch (summary) {
+        .read => |read| if (read.fixed.has(site.position)) return null else .{ read.sure.has(slot), read.ranged.has(slot), read.maybe.has(slot) },
+        .allocation => .{ site.position > 0 and !site.length, false, false },
+        .unknown => .{ false, false, true },
+    };
+    if (!sure and !ranged and !maybe) return null;
+    var out = site;
+    out.narrowed = !sure and ranged and !maybe;
+    out.decided = sure or (ranged and !maybe);
+    out.refine = false;
+    return out;
+}
 
 /// The sites of the sinks `fact`'s spec judges in `file` (`Spec.sinks`), read once per run.
 /// `size`: what the program hands a function outside it that sizes memory or work by it, found
@@ -4049,10 +4081,10 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
         .program => if (judged(c, callee.decl.?.file)) return, // unreachable: a program callee has its declaration
         .none, .source, .outside, .aegis => {},
     }
-    var summary = try sizesOf(c, sized, callee.decl);
-    // Taken through a call every instantiation does not resolve: read in the one this call
-    // makes.
-    if (summary == .read and !summary.read.maybe.empty()) summary = try instanceSizes(c, sized, file, callee);
+    const summary = try sizesOf(c, sized, callee.decl);
+    // Taken through a call every instantiation does not resolve: the one this call makes may
+    // decide it, read where a rule asks (`decidedSite`).
+    const refine = summary == .read and !summary.read.maybe.empty();
     for (callee.args, 0..) |arg, position| {
         // A comptime parameter is fixed when the program is compiled: no input sizes by it.
         if (summary == .read and summary.read.fixed.has(position)) continue;
@@ -4067,7 +4099,7 @@ fn sizeSites(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee, ou
             if (!sure and !ranged and !maybe) continue;
             // Kept to a range on one path and taken through a call that does not resolve on
             // another, it may be taken whole: undecided, not data.
-            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe) });
+            try out.append(c.allocator, .{ .file = file, .value = arg, .at = callee.node, .callee_expr = callee.callee_expr, .callee = callee.decl, .position = position, .length = length, .narrowed = !sure and ranged and !maybe, .decided = sure or (ranged and !maybe), .refine = refine });
         }
     }
 }
@@ -4146,17 +4178,17 @@ fn summaryFlow(c: *Context, program: *const Program) Context.Error!*Flow {
 /// function in it read with the bindings its chain of calls gives (`Function.readings`), so a
 /// call on what a generic's parameter binds (`ctx.hash(key)` in std's `HashMap`) calls what
 /// this instantiation is given. One summary per instantiation, closed as it is read.
-fn instanceSizes(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee) Context.Error!Summary {
+fn instanceSizes(c: *Context, sized: *Flow, file: Project.FileId, node: Ast.Node.Index, decl: Facts.Decl) Context.Error!Summary {
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const decl = callee.decl orelse return .unknown;
     const tree = &c.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, callee.node) orelse return sizesOf(c, sized, decl);
+    const call = tree.fullCall(&buffer, node) orelse return sizesOf(c, sized, decl);
     const env = try c.facts.bind(file, call, decl, null);
     for (sized.instances.items) |instance| if (sameReading(instance.env, env)) return sizesOf(c, instance.flow, decl);
     const flow = try summaryFlow(c, sized.program);
+    flow.shared = sized;
     try sized.instances.append(c.allocator, .{ .env = env, .flow = flow });
     var next: std.ArrayList(Queued) = .empty;
     try reach(c, flow, decl, env, &next);
@@ -4167,26 +4199,8 @@ fn instanceSizes(c: *Context, sized: *Flow, file: Project.FileId, callee: Callee
 /// Whether two readings bind one instantiation: one function, its arguments' values alike.
 fn sameReading(a: *const Facts.Env, b: *const Facts.Env) bool {
     if (!std.meta.eql(a.function, b.function) or a.args.len != b.args.len) return false;
-    for (a.args, b.args) |one, other| if (!sameValue(one, other)) return false;
+    for (a.args, b.args) |one, other| if (!Facts.sameValue(one, other)) return false;
     return true;
-}
-
-/// Whether two values are one, what they point at compared, not where it is kept.
-fn sameValue(a: Facts.Value, b: Facts.Value) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .pointer => |inner| sameValue(inner.*, b.pointer.*),
-        .array => |inner| sameValue(inner.*, b.array.*),
-        .optional => |inner| sameValue(inner.*, b.optional.*),
-        .error_union => |inner| sameValue(inner.*, b.error_union.*),
-        .alternatives => |each| each.len == b.alternatives.len and for (each, b.alternatives) |one, other| {
-            if (!sameValue(one, other)) break false;
-        } else true,
-        .reflected => |r| r.at == b.reflected.at and sameValue(r.of.*, b.reflected.of.*),
-        .reified => |r| r.value == b.reified.value and sameValue(r.fields.*, b.reified.fields.*),
-        .primitive => |name| std.mem.eql(u8, name, b.primitive),
-        else => std.meta.eql(a, b),
-    };
 }
 
 /// A function a summary reads, and the reading it is reached with (none: every
@@ -4198,11 +4212,17 @@ const Queued = struct { id: Function.Id, env: ?*const Facts.Env };
 fn closeSummary(c: *Context, flow: *Flow, next: *std.ArrayList(Queued)) Context.Error!void {
     while (next.pop()) |item| {
         const f = flow.functions.items[@backingInt(item.id)];
+        const tree = &c.project.at(f.file).file.tree;
         for (f.nodes) |node| {
+            // A call the reading's bindings never run (another prong of a `switch` on
+            // `@typeInfo(T)`) makes no reading of its callee: read, it would bind the callee to
+            // types this reading never holds, each making more (Stringify's `.array =>
+            // self.write(&v)` read for a pointer `v`). Asked before its callee is read.
+            if (item.env != null and Facts.calls.written(tree, node) and !try c.facts.reachedUnder(item.env, f.file, node)) continue;
             const call = (try Facts.calls.under(c.facts, item.env, f.file, node)) orelse continue;
             switch (call.callee) {
-                .function => |decl| try reach(c, flow, decl, try readingAt(c, f.file, node, decl, item.env), next),
-                .choice => |decls| for (decls) |decl| try reach(c, flow, decl, try readingAt(c, f.file, node, decl, item.env), next),
+                .function => |decl| try reach(c, flow, decl, try readingFor(c, flow, f.file, node, decl, item.env), next),
+                .choice => |decls| for (decls) |decl| try reach(c, flow, decl, try readingFor(c, flow, f.file, node, decl, item.env), next),
                 .any => {},
             }
         }
@@ -4212,13 +4232,27 @@ fn closeSummary(c: *Context, flow: *Flow, next: *std.ArrayList(Queued)) Context.
         flow.changed = false;
         flow.loops.clearRetainingCapacity();
         flow.leaving.clearRetainingCapacity();
-        for (flow.functions.items, 0..) |_, i| {
+        for (flow.functions.items, 0..) |f, i| {
+            if (f.settled) continue;
             try bindings(c, flow, @fromBackingInt(@intCast(i)));
             try sizing(c, flow, @fromBackingInt(@intCast(i)));
         }
         try takeHeld(c, flow);
         if (!flow.changed) break;
     }
+}
+
+/// The reading a summary of one instantiation reads `decl` in, called at `node` in `file` in
+/// the reading `env`: its own (`readingAt`) where every instantiation's summary of it leaves a
+/// size it may take undecided (`maybe`, as `sizeSites` reads the program's call in its own);
+/// none, every instantiation's alike, where that summary decides each.
+fn readingFor(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index, decl: Facts.Decl, env: ?*const Facts.Env) Context.Error!?*const Facts.Env {
+    if (env == null) return null;
+    if (flow.shared) |shared| switch (try sizesOf(c, shared, decl)) {
+        .read => |summary| if (summary.maybe.empty()) return null,
+        .allocation, .unknown => {},
+    };
+    return readingAt(c, file, node, decl, env);
 }
 
 /// The reading the call at `node` in `file` makes of `decl`, made in `env`: none where `env`
@@ -4259,13 +4293,43 @@ fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, env: ?*const Facts.Env, nex
     const nodes = (try bodies(c, flow, decl.file)).get(node) orelse &.{};
     for (nodes) |at| entry.value_ptr.*[@backingInt(at)] = id;
     flow.functions.items[@backingInt(id)].nodes = nodes;
+    // Reached with no reading in a summary of one instantiation, it is what the summary of
+    // every instantiation found, closed there: taken whole, not read again.
+    if (env == null) if (flow.shared) |shared| if (shared.by_node.get(.{ .file = decl.file, .node = node })) |kept| {
+        try settle(c, flow, id, shared.functions.items[@backingInt(kept)]);
+        return;
+    };
     try readIn(c, flow, id, env, next);
+}
+
+/// Gives a summary's function `id` what `kept`, the same function in the summary of every
+/// instantiation, found (`Function.settled`).
+fn settle(c: *Context, flow: *Flow, id: Function.Id, kept: Function) Context.Error!void {
+    const f = &flow.functions.items[@backingInt(id)];
+    f.levels = try c.allocator.dupe(Levels, kept.levels);
+    f.writes = try c.allocator.dupe(Dep, kept.writes);
+    f.ret = kept.ret;
+    f.returned = kept.returned;
+    f.returned_globals = try kept.returned_globals.clone(c.allocator);
+    f.parser = kept.parser;
+    f.unrefined = kept.unrefined;
+    f.sizes = kept.sizes;
+    f.ranged_sizes = kept.ranged_sizes;
+    f.maybe_sizes = kept.maybe_sizes;
+    f.every_reading = true;
+    f.settled = true;
 }
 
 /// Records that a summary reads `id` in `env` (none: every instantiation's), and queues it to
 /// be read so, unless it already is.
 fn readIn(c: *Context, flow: *Flow, id: Function.Id, env: ?*const Facts.Env, next: *std.ArrayList(Queued)) Context.Error!void {
     const f = &flow.functions.items[@backingInt(id)];
+    // A settled function a reading of its own reaches is read again, as every instantiation
+    // reads it too: what it calls with none is reached here.
+    if (env != null and f.settled) {
+        f.settled = false;
+        try next.append(c.allocator, .{ .id = id, .env = null });
+    }
     if (env) |e| {
         for (f.readings.items) |reading| if (sameReading(reading, e)) return;
         try f.readings.append(c.allocator, e);
@@ -4282,6 +4346,8 @@ fn bodies(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!*const s
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
+    // Grouped by syntax alone: a summary of one instantiation takes every instantiation's.
+    if (flow.shared) |shared| return bodies(c, shared, file);
     const entry = try flow.bodies.getOrPut(c.allocator, file);
     if (entry.found_existing) return entry.value_ptr;
     var grouped: std.AutoHashMapUnmanaged(Ast.Node.Index, std.ArrayList(Ast.Node.Index)) = .empty;
@@ -4553,7 +4619,8 @@ fn sizeSitesText(gpa: Allocator, program: []const u8, mem: []const u8) ![]u8 {
     const tree = &project.sources[0].file.tree;
     var seen: std.ArrayList(u8) = .empty;
     errdefer seen.deinit(gpa);
-    for (try sinkSites(&c, fact, project.sources[0].id)) |site| {
+    for (try sinkSites(&c, fact, project.sources[0].id)) |found| {
+        const site = (try decidedSite(&c, fact, found)) orelse continue;
         const name = if (site.callee) |d| project.at(d.file).model.declarations[@backingInt(d.index)].name else "?";
         try seen.print(gpa, "{s} {d} {s} {s} {s}\n", .{ name, site.position, tree.getNodeSource(site.value), if (site.length) "length" else "value", if (site.decided) "sure" else "maybe" });
     }
@@ -4610,7 +4677,7 @@ test "the sizes fact reads a std file's bodies once, however many of its functio
     const fact = try get(&c, bounded_input);
     const sites = try sinkSites(&c, fact, project.sources[0].id);
     try std.testing.expectEqual(1, sites.len);
-    try std.testing.expect(sites[0].decided and !sites[0].length and sites[0].position == 1);
+    try std.testing.expect(!sites[0].refine and sites[0].decided and !sites[0].length and sites[0].position == 1);
     const sized = fact.flow.sized.?;
     try std.testing.expectEqual(64, sized.functions.items.len);
     // One pass over the file's nodes, not one per function reached (64 here).
