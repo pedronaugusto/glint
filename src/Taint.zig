@@ -1441,7 +1441,7 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
             }
         },
         .source => {
-            const lanes = try readLanes(c, flow, function, callee);
+            const lanes = try readLanes(c, flow, function, callee.receiver);
             if (lanes == none) return;
             const buffers = try bufferParams(c, callee.decl.?);
             for (callee.args, 0..) |arg, position| if (buffers.has(position)) try fill(c, flow, function, callee, arg, lanes);
@@ -1790,12 +1790,13 @@ fn source(c: *Context, flow: *Flow, decl: Facts.Decl, name: []const u8) Context.
     return false;
 }
 
-/// The lanes a read reads a peer's input in: every peer lane, but where the reader is one
-/// std's `Reader.fixed` made over bytes clean in that lane (`fixedBytes`), whose read carries
-/// the bytes' fact, not input's.
-fn readLanes(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Context.Error!Mask {
+/// The lanes a read from the reader `receiver` (a read's, or a reader whose `buffer` is read)
+/// reads a peer's input in: every peer lane, but where the reader is one std's `Reader.fixed`
+/// made over bytes clean in that lane (`fixedBytes`), whose read carries the bytes' fact, not
+/// input's.
+fn readLanes(c: *Context, flow: *Flow, function: Function.Id, reader: ?Ast.Node.Index) Context.Error!Mask {
     const f = flow.functions.items[@backingInt(function)];
-    const receiver = callee.receiver orelse return flow.masks.peer;
+    const receiver = reader orelse return flow.masks.peer;
     const bytes = (try fixedBytes(c, flow, f.file, receiver)) orelse return flow.masks.peer;
     return flow.masks.peer & lanesOf(concrete(flow, function, try dep(c, flow, function, bytes)));
 }
@@ -2019,6 +2020,8 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     }
     var out = try dep(c, flow, function, receiver);
     if ((try c.facts.definition(f.file, node)).orNull()) |decl| {
+        // A reader's buffer holds what it read, as `buffered()` gives it.
+        if (readerBuffer(c, flow, decl)) out = try out.join(c.allocator, .{ .level = .in(try readLanes(c, flow, function, receiver), .data) });
         if (decl.file == flow.zig_ast) if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) {
             const field = c.project.at(decl.file).model.containerField(&c.project.at(decl.file).file.tree, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node).?;
             return treeDep(c, flow, decl.file, field.ast.type_expr.unwrap());
@@ -2032,6 +2035,14 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         if (kind == .function) return .{};
     } else out = try out.join(c.allocator, .{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
     return out;
+}
+
+/// Whether `decl` is std's reader's `buffer` field: the bytes its reads fill, a peer's where
+/// the reader reads one.
+fn readerBuffer(c: *Context, flow: *const Flow, decl: Facts.Decl) bool {
+    const reader = flow.reader orelse return false;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    return decl.file == reader.file and record.scope == reader.scope and record.kind == .field and std.mem.eql(u8, record.name, "buffer");
 }
 
 /// What a struct or an array literal holds, or null where `node` is neither.
@@ -2488,7 +2499,7 @@ fn resultOf(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Con
             return out;
         },
         .source => {
-            const lanes = try readLanes(c, flow, function, callee);
+            const lanes = try readLanes(c, flow, function, callee.receiver);
             const decl = callee.decl.?;
             // A read into the caller's buffer returns how much it read: a count the buffer
             // bounds, a peer's within it.

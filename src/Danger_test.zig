@@ -3052,6 +3052,26 @@ test "A010 finds arithmetic on input that may overflow its type: a byte's sum an
     try expect(pack.integers, input_program, 4);
 }
 
+test "A010 reads a reader's buffer as what it read: a peer's bytes, but a fixed reader's over the program's own" {
+    // A byte summed into a `u8` over a peer's buffer may pass 255; over the program's own
+    // bytes, which `Reader.fixed` holds, it is the program's arithmetic.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) u8 {
+        \\    var n: u8 = 0;
+        \\    for (r.buffer) |c| n += c;
+        \\    return n;
+        \\}
+        \\pub fn g() u8 {
+        \\    const own = [_]u8{ 1, 2 };
+        \\    const rd = std.Io.Reader.fixed(&own);
+        \\    var n: u8 = 0;
+        \\    for (rd.buffer) |c| n += c;
+        \\    return n;
+        \\}
+    , 1);
+}
+
 test "A010 leaves what a number's range holds: arithmetic that cannot overflow its type and a conversion its destination holds, from a decode's width, a typed local, @as and a constant" {
     try expect(pack.integers,
         \\const std = @import("std");
