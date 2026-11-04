@@ -13046,7 +13046,17 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     const tree = &self.project.at(file).file.tree;
     const callee = try self.resolveIn(env, file, call.ast.fn_expr);
     if (callee == .unknown) return callee;
-    if (callee != .function) return .{ .unknown = .unsupported };
+    // A call through a function pointer whose functions are not all seen (a table firmware
+    // fills, a callback handed in): the parameter its type declares, which binds no receiver.
+    if (callee != .function) {
+        var typed = callee;
+        while (true) typed = switch (typed) {
+            .pointer => |inner| inner.child.*,
+            .optional => |inner| inner.*,
+            else => break,
+        };
+        return if (typed == .fn_type) self.fnTypeParameter(typed.fn_type, position) else .{ .unknown = .unsupported };
+    }
     const decl = callee.function;
     var receiver: usize = 0;
     var made: ?*const Made = null;
@@ -13101,6 +13111,21 @@ fn parameterType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
         // Written in terms of a `comptime T: type` parameter: the call's argument for it.
         if (try self.written(.{ .file = file, .call = call, .decl = decl, .function = function, .receiver = receiver }, type_expr, 0)) |bound| return bound;
         return self.resolve(decl.file, type_expr);
+    }
+    return .{ .unknown = .unsupported };
+}
+
+/// The type a function type written at `key` gives its parameter at `position`; unknown where
+/// it has none there.
+fn fnTypeParameter(self: *Facts, key: Key, position: usize) ResolveError!Value {
+    const tree = self.syntaxOf(key.file);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, key.node) orelse return .{ .unknown = .unsupported };
+    var it = proto.iterate(tree);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) {
+        if (at != position) continue;
+        return if (param.type_expr) |type_expr| self.resolve(key.file, type_expr) else .scalar;
     }
     return .{ .unknown = .unsupported };
 }
@@ -13417,6 +13442,12 @@ test "a call through a function-pointer field reaches the functions stored there
     const bucket = "const Footer = struct { y: u64 };\nconst Bucket = struct {\n    x: u64,\n    fn of(ptr: [*]u8) *Bucket { return @ptrFromInt(@intFromPtr(ptr)); }\n    fn ofOps(o: *Ops) *Bucket { return @ptrFromInt(@intFromPtr(o)); }\n};\n";
     try std.testing.expectEqual(.function, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .of(@ptrCast(ft)); _ = held; }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ bucket ++ "pub fn g(ft: *Footer) void { const held: *Bucket = .ofOps(@ptrCast(ft)); _ = held; }\n", true));
+    // Handed to a call through a function pointer whose functions are not all seen (a table
+    // firmware fills: std's UEFI `self._exit(..., @ptrCast(msg.ptr))`), a cast takes the
+    // parameter the pointer's function type declares: a `?[*]const u16`, no Ops; a `*Ops`, one.
+    const table = "pub fn set(t: *Table, cb: @FieldType(Table, \"cb\")) void { t.cb = cb; }\npub fn g(t: *Table, w: [:0]const u16) void { t.cb(@ptrCast(w.ptr)); }\n";
+    try std.testing.expectEqual(.function, try fieldRead(head ++ "const Table = struct { cb: *const fn (?[*]const u16) void };\n" ++ table, true));
+    try std.testing.expectEqual(.any, try fieldRead(head ++ "const Table = struct { cb: *const fn (*Ops) void };\n" ++ table, true));
     // A type function's member, generic itself, reached by its name alone (std's
     // `TrailerFlags(F).ptr` through a `.ptr` read off a value whose type does not resolve):
     // no instance exists while nothing reaches the type function, so its cast views nothing.
