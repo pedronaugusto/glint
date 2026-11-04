@@ -141,3 +141,64 @@ test "calls: a call of one argument keeps it past the next call read" {
         try std.testing.expectEqualStrings(literal, tree.getNodeSource(call.args.known[0]));
     }
 }
+
+test "calls: a function-running call makes a deferred call of its function with the tuple's elements, found by meaning" {
+    // `concurrent` and `async` declare their tuple `std.meta.ArgsTuple(@TypeOf(function))`;
+    // `spawn` hands both to a function whose body `@call`s them; `other` takes a tuple it never
+    // runs, as `anytype`: no call of `work` is read there.
+    const fixture_std = "pub const meta = struct {\n    pub fn ArgsTuple(comptime F: type) type {\n        _ = F;\n        return struct {};\n    }\n};\n";
+    const source =
+        \\const std = @import("std");
+        \\const Io = struct {
+        \\    fn concurrent(io: Io, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+        \\        _ = io;
+        \\        _ = args;
+        \\    }
+        \\};
+        \\const Group = struct {
+        \\    fn async(g: *Group, io: Io, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+        \\        _ = g;
+        \\        _ = io;
+        \\        _ = args;
+        \\    }
+        \\};
+        \\fn start(comptime function: anytype, args: anytype) void {
+        \\    @call(.auto, function, args);
+        \\}
+        \\fn spawn(comptime function: anytype, args: anytype) void {
+        \\    start(function, args);
+        \\}
+        \\fn other(function: anytype, args: anytype) void {
+        \\    _ = function;
+        \\    _ = args;
+        \\}
+        \\fn work(x: u8) void {
+        \\    _ = x;
+        \\}
+        \\fn w(io: Io, g: *Group) void {
+        \\    io.concurrent(work, .{1});
+        \\    g.async(io, work, .{2});
+        \\    spawn(work, .{3});
+        \\    other(work, .{4});
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{ .{ .name = "root", .bytes = source }, .{ .name = "std", .bytes = fixture_std, .selected = false } }, &.{.{ .from = 0, .spelling = "std", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var facts: Facts = .{ .project = &project, .gpa = a };
+    defer facts.deinit();
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (try calls.in(&facts, project.sources[0].id)) |call| {
+        const later = (try calls.deferredOf(&facts, call)) orelse continue;
+        try std.testing.expect(later.deferred);
+        try lines.append(a, try found(a, &project, later));
+    }
+    std.mem.sort([]const u8, lines.items, {}, lessThan);
+    // `start(function, args)` in `spawn` runs `spawn`'s own parameters: `work`, its one
+    // binding, with a tuple that is no literal there.
+    const expected = [_][]const u8{ "19 work ? unsupported", "29 work 1", "30 work 1", "31 work 1" };
+    try std.testing.expectEqual(expected.len, lines.items.len);
+    for (expected, lines.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}

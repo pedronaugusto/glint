@@ -12527,6 +12527,9 @@ pub const calls = struct {
         /// `@call`'s modifier.
         modifier: ?Ast.Node.Index = null,
         callee: Callee,
+        /// A call another call makes later (`deferredOf`): it may run after the statement that
+        /// makes it, until the future that call gives is awaited, cancelled or joined.
+        deferred: bool = false,
     };
 
     pub const Error = Facts.ResolveError;
@@ -12583,15 +12586,158 @@ pub const calls = struct {
         const operands = Facts.builtinArgs(tree, node, &buffer);
         if (operands.len != 3) return null;
         // `@call` binds no receiver: a method is named through its type, the value in the tuple.
-        var tuple_buffer: [2]Ast.Node.Index = undefined;
-        const args: Args = if (tree.fullArrayInit(&tuple_buffer, operands[2])) |literal|
-            if (literal.ast.type_expr == .none) .{ .known = try facts.gpa.dupe(Ast.Node.Index, literal.ast.elements) } else .{ .unknown = .unsupported }
-        else if (tree.fullStructInit(&tuple_buffer, operands[2])) |empty|
-            // `.{}` parses as a struct literal: an empty tuple.
-            if (empty.ast.type_expr == .none and empty.ast.fields.len == 0) .{ .known = &.{} } else .{ .unknown = .unsupported }
-        else
-            .{ .unknown = .unsupported };
-        return .{ .file = file, .node = node, .callee_expr = operands[1], .args = args, .modifier = operands[0], .callee = try calleeOf(facts, env, file, operands[1]) };
+        return .{ .file = file, .node = node, .callee_expr = operands[1], .args = try tupleArgs(facts, tree, operands[2]), .modifier = operands[0], .callee = try calleeOf(facts, env, file, operands[1]) };
+    }
+
+    /// What a tuple handed as a call's arguments passes (`@call`'s, a function-running call's):
+    /// a literal's elements, in order; unknown for any other tuple.
+    fn tupleArgs(facts: *Facts, tree: *const Ast, node: Ast.Node.Index) Error!Args {
+        var buffer: [2]Ast.Node.Index = undefined;
+        if (tree.fullArrayInit(&buffer, node)) |literal|
+            return if (literal.ast.type_expr == .none) .{ .known = try facts.gpa.dupe(Ast.Node.Index, literal.ast.elements) } else .{ .unknown = .unsupported };
+        // `.{}` parses as a struct literal: an empty tuple.
+        if (tree.fullStructInit(&buffer, node)) |empty|
+            return if (empty.ast.type_expr == .none and empty.ast.fields.len == 0) .{ .known = &.{} } else .{ .unknown = .unsupported };
+        return .{ .unknown = .unsupported };
+    }
+
+    /// Which of a function's parameters (in its parameter order) it runs, and with which
+    /// tuple: a function-running function (`Io.concurrent(io, function, args)`).
+    pub const Runs = struct { function: usize, args: usize };
+
+    /// The call of its function argument that `call` makes later, if the function it calls
+    /// runs one (`runsWith`): `io.concurrent(f, .{ io, &s })` calls `f` with the tuple's
+    /// elements, read as `@call` reads them, `deferred`. Its result is the future `call` gives,
+    /// never `f`'s. Null where `call` runs no function it is given, or what it calls is not one
+    /// function.
+    pub fn deferredOf(facts: *Facts, call: Call) Error!?Call {
+        const callee = switch (call.callee) {
+            .function => |function| function,
+            .choice, .any => return null,
+        };
+        const runs = (try runsWith(facts, callee)) orelse return null;
+        const args = switch (call.args) {
+            .known => |each| each,
+            .unknown => return null,
+        };
+        if (runs.function >= args.len or runs.args >= args.len) return null;
+        const tree = &facts.project.at(call.file).file.tree;
+        return .{
+            .file = call.file,
+            .node = call.node,
+            .callee_expr = args[runs.function],
+            .args = try tupleArgs(facts, tree, args[runs.args]),
+            .callee = try calleeOf(facts, null, call.file, args[runs.function]),
+            .deferred = true,
+        };
+    }
+
+    const Running = struct { found: std.AutoHashMapUnmanaged(Facts.Decl, ?Runs) = .empty };
+
+    /// Whether `function` runs a function it is given with a tuple it is given, by meaning: its
+    /// tuple parameter is declared `std.meta.ArgsTuple(@TypeOf(f))` of its function parameter
+    /// `f` (std's `Io.async`, `Io.concurrent`, a group's), or its body runs the two: `@call` of
+    /// them, or a call of a function-running function handed them (`Thread.spawn` forwarding to
+    /// its target's). Null where it runs none known.
+    pub fn runsWith(facts: *Facts, function: Facts.Decl) Error!?Runs {
+        return runsWithAt(facts, function, 0);
+    }
+
+    fn runsWithAt(facts: *Facts, function: Facts.Decl, depth: u8) Error!?Runs {
+        const state = try facts.memo(Running);
+        if (state.found.get(function)) |kept| return kept;
+        // Until it is known, a function that reaches itself runs nothing it is given.
+        try state.found.put(facts.gpa, function, null);
+        const found = try runsFound(facts, function, depth);
+        try state.found.put(facts.gpa, function, found);
+        return found;
+    }
+
+    fn runsFound(facts: *Facts, function: Facts.Decl, depth: u8) Error!?Runs {
+        if (depth == 8) return null;
+        const model = &facts.project.at(function.file).model;
+        const tree = &facts.project.at(function.file).file.tree;
+        const record = model.declarations[@backingInt(function.index)];
+        if (record.kind != .function) return null;
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&proto_buffer, record.node) orelse return null;
+        var names: [16]Ast.TokenIndex = @splat(0);
+        var types: [16]?Ast.Node.Index = @splat(null);
+        var count: usize = 0;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            if (count == names.len) return null;
+            names[count] = param.name_token orelse return null;
+            types[count] = param.type_expr;
+            count += 1;
+        }
+        const params = names[0..count];
+        // Declared: `args: std.meta.ArgsTuple(@TypeOf(function))`.
+        const args_tuple = try facts.stdMember(&.{ "meta", "ArgsTuple" });
+        if (args_tuple == .function) for (types[0..count], 0..) |declared, position| {
+            const t = declared orelse continue;
+            var buffer: [1]Ast.Node.Index = undefined;
+            const made = tree.fullCall(&buffer, t) orelse continue;
+            if (made.ast.params.len != 1) continue;
+            const maker = try facts.resolve(function.file, made.ast.fn_expr);
+            if (maker != .function or !std.meta.eql(maker.function, args_tuple.function)) continue;
+            const of = made.ast.params[0];
+            if (!Facts.isBuiltin(tree, of, "@TypeOf")) continue;
+            var type_buffer: [2]Ast.Node.Index = undefined;
+            const operands = Facts.builtinArgs(tree, of, &type_buffer);
+            if (operands.len != 1) continue;
+            const ran = parameterNamed(model, tree, params, operands[0]) orelse continue;
+            return .{ .function = ran, .args = position };
+        };
+        // Its body runs them: `@call(_, function, args)`, or a call handing them on to a
+        // function that runs them, each it may call alike.
+        const whole = if (tree.nodeTag(record.node) == .fn_decl) record.node else model.parentOf(record.node) orelse return null;
+        if (tree.nodeTag(whole) != .fn_decl) return null;
+        const body = tree.nodeData(whole).node_and_node[1];
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+        for (try in(facts, function.file)) |call| {
+            const token = tree.nodeMainToken(call.node);
+            if (token < first or token > last) continue;
+            if (call.modifier != null) {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const operands = Facts.builtinArgs(tree, call.node, &buffer);
+                const ran = parameterNamed(model, tree, params, operands[1]) orelse continue;
+                const with = parameterNamed(model, tree, params, operands[2]) orelse continue;
+                return .{ .function = ran, .args = with };
+            }
+            const args = switch (call.args) {
+                .known => |each| each,
+                .unknown => continue,
+            };
+            const each: []const Facts.Decl = switch (call.callee) {
+                .function => |one| &.{one},
+                .choice => |choice| choice,
+                .any => continue,
+            };
+            var agreed: ?Runs = null;
+            for (each) |callee| {
+                const inner = (try runsWithAt(facts, callee, depth + 1)) orelse break;
+                if (inner.function >= args.len or inner.args >= args.len) break;
+                const ran = parameterNamed(model, tree, params, args[inner.function]) orelse break;
+                const with = parameterNamed(model, tree, params, args[inner.args]) orelse break;
+                const runs: Runs = .{ .function = ran, .args = with };
+                if (agreed) |one| if (!std.meta.eql(one, runs)) break;
+                agreed = runs;
+            } else if (agreed) |runs| return runs;
+        }
+        return null;
+    }
+
+    /// The position among `params` of the parameter `node` names, as written (`f`, `(f)`).
+    fn parameterNamed(model: *const Model, tree: *const Ast, params: []const Ast.TokenIndex, node: Ast.Node.Index) ?usize {
+        const named = ungrouped(tree, node);
+        const ref = model.reference(named) orelse return null;
+        const index = ref.declaration orelse return null;
+        const decl = model.declarations[@backingInt(index)];
+        if (decl.kind != .parameter) return null;
+        for (params, 0..) |name, position| if (name == decl.token) return position;
+        return null;
     }
 
     /// Every call `file` makes, as `at` reads each. Found once.
