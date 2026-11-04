@@ -209,7 +209,7 @@ pub fn sitesLeaving(self: *Context, rule: Rule, governed: []const Governed, out:
                     .name => |name| break :blk .{ tree.nodeMainToken(node), name },
                     // A name it ranges over or computes: each governed name it may be.
                     .each_of, .names, .computed => {
-                        try fieldSites(self, rule, governed, renamed, node, args[0], named, out);
+                        try fieldSites(self, rule, governed, renamed, node, args[0], args[1], named, out);
                         continue;
                     },
                 }
@@ -270,7 +270,10 @@ fn literalSite(self: *Context, rule: Rule, governed: []const Governed, renamed: 
 /// `@field` by a name it ranges over or computes: each governed member its holder has that the
 /// name may be is a site; a holder that does not resolve is undecided where a governed name may
 /// be named.
-fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, holder: Ast.Node.Index, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
+fn fieldSites(self: *Context, rule: Rule, governed: []const Governed, renamed: []const []const []const u8, node: Ast.Node.Index, holder: Ast.Node.Index, names_node: Ast.Node.Index, named: Facts.FieldName, out: *std.ArrayList(Site)) Context.Error!void {
+    // A name of the fields or tags of the very type the holder is, or holds, is a field's or a
+    // tag's: Zig forbids a declaration of one name with them in a container, so it reaches none.
+    if (try self.facts.fieldNameOwn(self.file, holder, names_node)) return;
     const tree = &self.project.at(self.file).file.tree;
     const site = tree.nodeMainToken(node);
     const value = try self.facts.resolve(self.file, holder);

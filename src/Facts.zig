@@ -3892,7 +3892,8 @@ fn enumOf(value: Value) ?Container {
 /// The names a `@field` name is one of: the field names of `subject`, a type whose struct,
 /// union or enum information (`info`, `@typeInfo(subject).@"struct"`) the name ranges over
 /// (`inline for (info.field_names) |name|`, the input at the capture's position), indexes
-/// (`info.field_names[j]`), or is the `name` of an element of `info.fields`; the list and the
+/// (`info.field_names[j]`), or is the `name` of an element of `info.fields`, or a tag `@tagName`
+/// gives of a value declared of the subject; the list and the
 /// information named in place, through constants, or by a capture of a `switch` on or an `if`
 /// over `@typeInfo(subject)`.
 const NamesOf = struct { subject: Ast.Node.Index, info: Ast.Node.Index };
@@ -3911,6 +3912,23 @@ fn namesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usiz
             }
         },
         .array_access => return self.listOf(file, tree.nodeData(at).node_and_node[0], "field_names", depth + 1),
+        // `@tagName(x)`: a tag of the type `x` is declared with.
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!isBuiltin(tree, at, "@tagName")) return null;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, at, &buffer);
+            if (args.len != 1) return null;
+            const operand = ungrouped(tree, args[0]);
+            if (tree.nodeTag(operand) != .identifier) return null;
+            const d = (self.project.at(file).model.reference(operand) orelse return null).declaration orelse return null;
+            const record = self.project.at(file).model.declarations[@backingInt(d)];
+            const declared: ?Ast.Node.Index = switch (record.kind) {
+                .parameter => self.parameterTypeNode(.{ .file = file, .index = d }),
+                .variable => (tree.fullVarDecl(record.node) orelse return null).ast.type_node.unwrap(),
+                else => null,
+            };
+            return .{ .subject = declared orelse return null, .info = at };
+        },
         .field_access => {
             const item, const name_token = tree.nodeData(at).node_and_token;
             if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(name_token)), "name")) return null;
@@ -3998,6 +4016,24 @@ fn typeInfoOperand(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
     return if (args.len == 1) args[0] else null;
 }
 
+/// Whether `@field(holder, name)` names no declaration because its name is one of the field or
+/// tag names of what the holder is or holds (`namesOf`, `namesNoDeclaration`): what P006 and
+/// the forward walk read alike.
+pub fn fieldNameOwn(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, name: Ast.Node.Index) ResolveError!bool {
+    const names = (try self.namesOf(file, name, 0)) orelse return false;
+    return self.namesNoDeclaration(file, holder, names);
+}
+
+/// Whether `node` names a `var`.
+fn namesVar(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) != .identifier) return false;
+    const record = self.declarationAt(file, node) orelse return false;
+    if (record.kind != .variable) return false;
+    const variable = tree.fullVarDecl(record.node) orelse return false;
+    return tree.tokenTag(variable.ast.mut_token) == .keyword_var;
+}
+
 /// Whether `@field(holder, name)`, the name one of `names`' subject's field names, names no
 /// declaration: the holder is the subject itself, a value of it (`@TypeOf(holder)` is the
 /// subject, or the holder is declared of it or a pointer to it), or its tag type
@@ -4005,9 +4041,12 @@ fn typeInfoOperand(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
 fn namesNoDeclaration(self: *Facts, file: Project.FileId, holder: Ast.Node.Index, names: NamesOf) bool {
     const tree = &self.project.at(file).file.tree;
     const h = ungrouped(tree, holder);
-    if (self.sameName(file, h, ungrouped(tree, names.subject))) return true;
     const subject = self.throughConsts(file, names.subject);
-    if (self.sameName(file, h, subject)) return true;
+    // A type written as a `var` (`comptime var X: type = S;`) is one declaration that holds a
+    // type, then another: no identity of a type. Its value's type (`@TypeOf(x)`) is fixed.
+    const fixed = !self.namesVar(file, ungrouped(tree, names.subject)) and !self.namesVar(file, subject);
+    if (fixed and self.sameName(file, h, ungrouped(tree, names.subject))) return true;
+    if (fixed and self.sameName(file, h, subject)) return true;
     if (typeOfOperand(tree, subject)) |operand| {
         if (self.sameName(file, h, ungrouped(tree, operand))) return true;
         // `@TypeOf(out.*)`: `out` points at the value.
@@ -4018,16 +4057,16 @@ fn namesNoDeclaration(self: *Facts, file: Project.FileId, holder: Ast.Node.Index
         const of, const member_token = tree.nodeData(h).node_and_token;
         const field = self.fieldTypeNode(file, ungrouped(tree, of), tree.tokenSlice(member_token)) orelse return false;
         if (field.file != file) return false;
-        return self.sameWrittenType(file, field.node, names.subject);
+        return fixed and self.sameWrittenType(file, field.node, names.subject);
     }
     if (tree.nodeTag(h) != .identifier) return false;
     const record = self.declarationAt(file, h) orelse return false;
     switch (record.kind) {
         .parameter => if (self.parameterTypeNode(.{ .file = file, .index = (self.project.at(file).model.reference(h) orelse return false).declaration.? })) |t| {
-            if (self.sameName(file, writtenPointee(tree, t), subject)) return true;
+            if (fixed and self.sameName(file, writtenPointee(tree, t), subject)) return true;
         },
         .variable => if (tree.fullVarDecl(record.node)) |variable| {
-            if (variable.ast.type_node.unwrap()) |t| if (self.sameName(file, writtenPointee(tree, t), subject)) return true;
+            if (variable.ast.type_node.unwrap()) |t| if (fixed and self.sameName(file, writtenPointee(tree, t), subject)) return true;
             if (self.tagTypeOf(file, variable.ast.init_node.unwrap() orelse return false, names.info)) return true;
         },
         .capture => {
@@ -4470,36 +4509,12 @@ fn valueIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     }
 }
 
-/// The struct whose field names `node` ranges over: a `for`'s only capture over
-/// `@typeInfo(T).@"struct".field_names`, `T` a struct the program declares.
+/// The container whose field or tag names `node` is one of (`namesOf`), where the program
+/// declares it: what a name drawn from its type information's `field_names` or `fields` may be.
 fn fieldNamesOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Container {
-    const tree = &self.project.at(file).file.tree;
-    const model = &self.project.at(file).model;
-    if (tree.nodeTag(node) != .identifier) return null;
-    const decl = (model.reference(node) orelse return null).declaration orelse return null;
-    const record = model.declarations[@backingInt(decl)];
-    if (record.kind != .capture) return null;
-    var at = record.node;
-    const loop = while (true) {
-        if (tree.fullFor(at)) |found| break found;
-        at = model.parentOf(at) orelse return null;
-    };
-    if (loop.ast.inputs.len != 1 or loop.payload_token != record.token) return null;
-    const names = loop.ast.inputs[0];
-    if (tree.nodeTag(names) != .field_access) return null;
-    const info, const names_member = tree.nodeData(names).node_and_token;
-    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(names_member)), "field_names")) return null;
-    if (tree.nodeTag(info) != .field_access) return null;
-    const call, const kind_member = tree.nodeData(info).node_and_token;
-    if (!std.mem.eql(u8, try self.memberName(tree.tokenSlice(kind_member)), "struct")) return null;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const args = builtinArgs(tree, call, &buffer);
-    switch (tree.nodeTag(call)) {
-        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
-        else => return null,
-    }
-    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(call)), "@typeInfo") or args.len != 1) return null;
-    return switch (try self.resolve(file, args[0])) {
+    const names = (try self.namesOf(file, node, 0)) orelse return null;
+    if (self.namesVar(file, self.throughConsts(file, names.subject))) return null;
+    return switch (try self.resolve(file, names.subject)) {
         .container => |found| found,
         else => null,
     };
@@ -5770,12 +5785,168 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         }
         if (variable.ast.init_node.unwrap()) |value| {
             const initial = try self.resolve(decl.file, value);
-            if (!mutable or !callable(initial)) return initial;
+            if (!mutable) return initial;
+            // A `var` that holds types (`comptime var X: type = S;`) is each type it is given,
+            // wherever it is read: one declaration, several types over its life.
+            const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) else false;
+            if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
+                const given = (try self.givenValues(decl)) orelse return .{ .unknown = .unresolved };
+                return self.choose(given);
+            }
+            if (!callable(initial)) return initial;
             return self.identity(initial, try self.givenValues(decl));
         }
         if (model.parentOf(declaration_record.node)) |parent| if (tree.nodeTag(parent) == .assign_destructure) return self.destructured(decl.file, parent, declaration_record.node);
     }
     return .{ .unknown = .unsupported };
+}
+
+/// Whether `value` is a type or holds one: a container, a type built from its fields' types,
+/// or an aggregate of them.
+fn holdsTypeValue(self: *Facts, value: Value, depth: u8) ResolveError!bool {
+    if (depth >= 8) return true;
+    switch (value) {
+        .container => return true,
+        .reified => |built| return !built.value,
+        // An array, an optional or an error union of types, a pointer to them, or a choice with
+        // one.
+        .array, .optional, .error_union => |inner| return self.holdsTypeValue(inner.*, depth + 1),
+        .pointer => |inner| return self.holdsTypeValue(inner.child.*, depth + 1),
+        .alternatives => |each| {
+            for (each) |one| if (try self.holdsTypeValue(one, depth + 1)) return true;
+            return false;
+        },
+        // A typeless literal holds types where a part of it may be one (`.{S}`).
+        // Type information holds the types it describes (`info.pointer.child`).
+        .reflected => return true,
+        .literal => |key| {
+            const tree = &self.project.at(key.file).file.tree;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const parts: []const Ast.Node.Index = if (tree.fullArrayInit(&buffer, key.node)) |init| init.ast.elements else if (tree.fullStructInit(&buffer, key.node)) |init| init.ast.fields else return true;
+            for (parts) |part| {
+                const held = try self.resolve(key.file, part);
+                if (try self.holdsTypeValue(held, depth + 1)) return true;
+                if (mayBeType(held) and !try self.initIsValue(key.file, part, 0)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Whether `value` may be read as a type as well as a value of one: a primitive, a pointer, an
+/// array, an optional, an error union or a function type, which an unannotated `var` may hold
+/// as a type (`var X = []const u8;` in a type function Zig runs at compile time, with no
+/// `comptime` of its own). `initIsValue` tells a value apart.
+fn mayBeType(value: Value) bool {
+    return switch (value) {
+        .primitive, .pointer, .array, .optional, .error_union, .fn_type => true,
+        else => false,
+    };
+}
+
+/// Whether a `var` is one Zig evaluates at compile time, where alone it may hold a type
+/// ("variable of type 'type' must be const or comptime"): declared `comptime var`, in a
+/// `comptime` scope, or in a function whose result is `type`. A function called only at
+/// compile time with none of these is not read so: the value model does not yet tell a pointer
+/// or array type from a value of one, which reading it would need.
+fn compileTime(self: *Facts, decl: Decl) bool {
+    const source = self.project.at(decl.file);
+    const tree = &source.file.tree;
+    const record = source.model.declarations[@backingInt(decl.index)];
+    if (record.token >= 2 and tree.tokenTag(record.token - 2) == .keyword_comptime) return true;
+    var at: ?Model.Scope.Id = record.scope;
+    while (at) |id| : (at = source.model.scopes[@backingInt(id)].parent) {
+        const scope = source.model.scopes[@backingInt(id)];
+        switch (scope.kind) {
+            .@"comptime" => return true,
+            .function => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buffer, scope.node) orelse return false;
+                const result = proto.ast.return_type.unwrap() orelse return false;
+                return namesType(tree, result);
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether a `var`'s initializer is a value, never a type, by what it is written as: an
+/// address or a slice; an element, a dereference or an unwrap of a value (`try`, `catch` and
+/// `orelse` of one); a number or string literal; an initializer written with a type that holds
+/// no types; a builtin whose result is a value by its own kind; a call whose result type is
+/// known and holds no types; or a name of a declaration whose declared type is so (a const by
+/// its own initializer). False where it may be a type: the caller then reads every value the
+/// var is given.
+fn initIsValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: u8) ResolveError!bool {
+    if (depth >= 8) return false;
+    const tree = &self.project.at(file).file.tree;
+    const at = ungrouped(tree, node);
+    // An address or a slice points into memory: what it points at is read through its owner.
+    if (tree.fullSlice(at) != null) return true;
+    // An initializer is a value where the type it is written with holds no types; one with
+    // none (`.{S}`) may hold types.
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buffer, at)) |init| return knownValueType(try self.resolve(file, init.ast.type_expr.unwrap() orelse return false));
+    if (tree.fullStructInit(&buffer, at)) |init| return knownValueType(try self.resolve(file, init.ast.type_expr.unwrap() orelse return false));
+    switch (tree.nodeTag(at)) {
+        .address_of, .string_literal, .multiline_string_literal, .number_literal, .char_literal => return true,
+        // An element, a pointee or a payload is a value where what holds it is.
+        .array_access => return self.initIsValue(file, tree.nodeData(at).node_and_node[0], depth + 1),
+        .deref => return self.initIsValue(file, tree.nodeData(at).node, depth + 1),
+        .unwrap_optional => return self.initIsValue(file, tree.nodeData(at).node_and_token[0], depth + 1),
+        // What an error union or an optional holds: a value where the operand is one.
+        .@"try" => return self.initIsValue(file, tree.nodeData(at).node, depth + 1),
+        .@"catch", .@"orelse" => return self.initIsValue(file, tree.nodeData(at).node_and_node[0], depth + 1),
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            // The builtins whose result is a value by their own kind, whatever they are given;
+            // any other (`@as(type, T)`, `@call`, `@field`, one Zig adds later) may give a type.
+            const values = [_][]const u8{ "@addWithOverflow", "@addrSpaceCast", "@alignCast", "@alignOf", "@atomicLoad", "@atomicRmw", "@bitCast", "@bitOffsetOf", "@intFromBool", "@bitSizeOf", "@mulAdd", "@byteSwap", "@bitReverse", "@offsetOf", "@clz", "@cmpxchgStrong", "@cmpxchgWeak", "@constCast", "@ctz", "@cVaArg", "@divExact", "@divFloor", "@divCeil", "@divTrunc", "@embedFile", "@intFromEnum", "@errorName", "@errorReturnTrace", "@intFromError", "@errorCast", "@extern", "@fieldParentPtr", "@floatCast", "@intFromFloat", "@frameAddress", "@hasDecl", "@hasField", "@inComptime", "@intCast", "@backingInt", "@fromBackingInt", "@enumFromInt", "@errorFromInt", "@floatFromInt", "@ptrFromInt", "@max", "@min", "@mod", "@mulWithOverflow", "@popCount", "@ptrCast", "@intFromPtr", "@rem", "@returnAddress", "@select", "@shlExact", "@shlWithOverflow", "@shrExact", "@shuffle", "@sizeOf", "@splat", "@reduce", "@src", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@log", "@abs", "@floor", "@ceil", "@trunc", "@round", "@subWithOverflow", "@tagName", "@truncate", "@typeInfo", "@typeName", "@unionInit", "@volatileCast" };
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            // By kind, and where what it gives holds no types (`@typeInfo(T)` holds T's parts).
+            for (values) |one| if (std.mem.eql(u8, one, name)) return !try self.holdsTypeValue(try self.resolve(file, at), 0);
+            // `@as(T, v)` is a value of `T`: one where `T` holds no types.
+            if (std.mem.eql(u8, name, "@as")) {
+                var args_buffer: [2]Ast.Node.Index = undefined;
+                const args = builtinArgs(tree, at, &args_buffer);
+                return args.len == 2 and knownValueType(try self.resolve(file, args[0]));
+            }
+            return false;
+        },
+        .identifier, .field_access => {},
+        else => {
+            var call_buffer: [1]Ast.Node.Index = undefined;
+            const call = tree.fullCall(&call_buffer, at) orelse return false;
+            const proto = self.prototype(try self.resolve(file, call.ast.fn_expr)) orelse return false;
+            return knownValueType(try self.resultOf(proto));
+        },
+    }
+    const decl = switch (try self.definition(file, at)) {
+        .decl => |d| d,
+        .none, .unknown => return false,
+    };
+    const source = self.project.at(decl.file);
+    const record = source.model.declarations[@backingInt(decl.index)];
+    switch (record.kind) {
+        .function => return true,
+        .parameter => return knownValueType(try self.resolve(decl.file, self.parameterTypeNode(decl) orelse return false)),
+        .field => {
+            const field = source.model.containerField(&source.file.tree, record.node) orelse return false;
+            return knownValueType(try self.resolve(decl.file, field.ast.type_expr.unwrap() orelse return false));
+        },
+        .variable => {
+            const variable = source.file.tree.fullVarDecl(record.node) orelse return false;
+            if (variable.ast.type_node.unwrap()) |t| return knownValueType(try self.resolve(decl.file, t));
+            return self.initIsValue(decl.file, constInit(&source.file.tree, record) orelse return false, depth + 1);
+        },
+        .capture => return false,
+    }
+}
+
+/// Whether a type is known and holds no types as values: what a value of it never is, a type.
+fn knownValueType(value: Value) bool {
+    return value != .unknown and value != .alternatives and !holdsTypes(value);
 }
 
 /// Whether `value` is a function or a pointer to one, by its identity or its type: what a call
@@ -14268,4 +14439,46 @@ test "a condition read inside a cycle is not kept: asked again once the cycle cl
     const argument = try facts.resolve(file, node.of(tree, "Plain"));
     const env = try facts.keptReading(.{ .function = g, .args = &.{argument}, .depth = 0, .values = &.{false} });
     try std.testing.expectEqual(@as(?bool, true), try facts.comptimeTruth(env, file, condition));
+}
+
+test "a @field name of the holder's own fields or tags names no declaration, for a type parameter, its value, @TypeOf and a container" {
+    const source =
+        \\const S = struct { a: u8, b: u8 };
+        \\const T = struct { a: u8 };
+        \\const E = enum { a, b };
+        \\pub fn same(comptime X: type, value: X) void {
+        \\    switch (@typeInfo(X)) {
+        \\        .@"struct" => |s| inline for (s.field_names, 0..) |name, i| { _ = i; _ = @field(value, name); },
+        \\        else => {},
+        \\    }
+        \\}
+        \\pub fn other(comptime X: type, comptime Y: type) void {
+        \\    inline for (@typeInfo(X).@"struct".field_names) |name| _ = @field(Y, name);
+        \\}
+        \\pub fn concrete(s: S, t: T) void {
+        \\    inline for (@typeInfo(S).@"struct".field_names) |name| _ = @field(s, name);
+        \\    inline for (@typeInfo(S).@"struct".field_names) |name| _ = @field(t, name);
+        \\}
+        \\pub fn tags(comptime e: E, v: anytype) void {
+        \\    _ = @field(E, @tagName(e));
+        \\    _ = @field(v, @typeInfo(@TypeOf(v)).@"struct".field_names[0]);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    var found: std.ArrayList(bool) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .builtin_call_two) continue;
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) continue;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const args = builtinArgs(tree, node, &buffer);
+        try found.append(arena.allocator(), try facts.fieldNameOwn(project.sources[0].id, args[0], args[1]));
+    }
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false, true, true }, found.items);
 }
