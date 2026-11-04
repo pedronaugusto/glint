@@ -1208,7 +1208,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
         const value = if (copy.crowded)
             Facts.Value{ .unknown = .budget }
         else if (copy.source != null)
-            try c.facts.boundCopy(call, function, copy)
+            (try c.facts.boundCopy(call, function, copy)) orelse continue
         else if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
             continue
         else

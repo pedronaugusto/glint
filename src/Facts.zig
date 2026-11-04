@@ -1636,8 +1636,10 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
 /// What a copy `function` makes holds at the binding `call` (`calls`): the binding's argument
 /// read through the copy's `path` to its `source`, each call's arguments read with the bindings
 /// of the one before (`bindTo`: a receiver the call passes first, each argument as its parameter
-/// is typed). Arguments not known leave it unknown.
-pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!Value {
+/// is typed). Arguments not known leave it unknown. Null where the binding makes no such copy:
+/// a call on its path, or its source, is one no instantiation it makes compiles
+/// (`reachedUnder`: a `switch` on its type information that takes another prong).
+pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!?Value {
     const bound = switch (try self.bindCall(&call, function, null)) {
         .reading => |reading| reading,
         .unknown => |why| return .{ .unknown = why },
@@ -1645,9 +1647,10 @@ pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: Parameter
     // A choice of types bound to a type parameter (an `inline for`'s pass) is one instantiation
     // per type: each is read, and what they hold chosen as one.
     const readings = try self.instantiations(bound);
-    const values = try self.gpa.alloc(Value, readings.len);
-    for (readings, values) |reading, *value| value.* = try self.copyIn(reading, copy);
-    return self.choose(values);
+    var values: std.ArrayList(Value) = .empty;
+    for (readings) |reading| if (try self.copyIn(reading, copy)) |value| try values.append(self.gpa, value);
+    if (values.items.len == 0) return null;
+    return try self.choose(values.items);
 }
 
 /// How many instantiations a binding's choices of types are read as, at most: past it the
@@ -1691,11 +1694,13 @@ fn choiceOfTypes(value: Value) bool {
     return true;
 }
 
-/// `boundCopy` in one instantiation `env` of the copy's function.
-fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!Value {
+/// `boundCopy` in one instantiation `env` of the copy's function; null where the instantiation
+/// does not reach a call on the path or the source.
+fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Value {
     const source = copy.source.?;
     var env = start;
     for (copy.path) |step| {
+        if (!try self.reachedUnder(env, step.file, step.node)) return null;
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
         const inner = step_tree.fullCall(&step_buffer, step.node) orelse return .{ .unknown = .unsupported };
@@ -1711,7 +1716,28 @@ fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!Val
         };
         env = try self.bind(step.file, inner, target, env);
     }
-    return self.resolveIn(env, source.file, source.node);
+    if (!try self.reachedUnder(env, source.file, source.node)) return null;
+    const value = try self.resolveIn(env, source.file, source.node);
+    if (value != .unknown) return value;
+    // What a copy writes is a value of its place's type, as Zig coerces it there: `return value`
+    // in a function returning `E!T` writes a `T`, `slot.* = v` a `slot`'s pointee, each read in
+    // this reading. A place that gives no type (an untyped `const`, an `anytype` argument) keeps
+    // the value unknown.
+    const placed = try self.castTypeIn(env, source.file, source.node);
+    if (!placeTyped(placed)) return value;
+    return try self.instance(placed);
+}
+
+/// Whether `place`, a place's type (`literalTypeIn`), names one: neither unknown nor `.scalar`
+/// (no result type), nor a choice holding either.
+fn placeTyped(place: Value) bool {
+    return switch (place) {
+        .unknown, .scalar => false,
+        .alternatives => |each| for (each) |one| {
+            if (!placeTyped(one)) break false;
+        } else true,
+        else => true,
+    };
 }
 
 /// Whether `node`, an identifier, names a `comptime` parameter.
@@ -5058,7 +5084,7 @@ fn branches(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node
     } else if (tree.fullIf(node)) |whole| {
         const otherwise = whole.ast.else_expr.unwrap() orelse return null;
         // A condition known at compile time: Zig analyses only the branch it takes.
-        const taken: []const Ast.Node.Index = if (whole.payload_token == null and whole.error_token == null) if (self.truth(env, file, whole.ast.cond_expr)) |t|
+        const taken: []const Ast.Node.Index = if (whole.payload_token == null and whole.error_token == null) if (try self.comptimeTruth(env, file, whole.ast.cond_expr)) |t|
             if (t) &.{whole.ast.then_expr} else &.{otherwise}
         else
             &.{ whole.ast.then_expr, otherwise } else &.{ whole.ast.then_expr, otherwise };
@@ -14108,12 +14134,12 @@ test "the walk decides a bool function's call by its body in the call's reading,
         \\fn plainEither(comptime T: type) void {
         \\    _ = T;
         \\}
-        \\fn pick() bool {
-        \\    return true;
+        \\fn pick(n: u8) bool {
+        \\    return n > 3;
         \\}
         \\pub fn main() void {
         \\    parse(Parsed);
-        \\    either(if (pick()) Parsed else Plain);
+        \\    either(if (pick(5)) Parsed else Plain);
         \\}
     ;
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
@@ -14139,7 +14165,8 @@ test "the walk decides a bool function's call by its body in the call's reading,
     try std.testing.expect(try facts.analyzed(named.decl(model, file, "parsed")));
     try std.testing.expect(!try facts.analyzed(named.decl(model, file, "plain")));
     // An argument that is one of two types is read as each (reachEach): both branches are taken,
-    // each in its own reading.
+    // each in its own reading. (`pick(5)`'s `n > 3` is not decided; a `pick` whose body returns
+    // `true` would be, and `either` read with `Parsed` alone.)
     try std.testing.expect(try facts.analyzed(named.decl(model, file, "parsedEither")));
     try std.testing.expect(try facts.analyzed(named.decl(model, file, "plainEither")));
     const readings = (try facts.analyzedReadings(named.decl(model, file, "either"))) orelse return error.TestUnexpectedResult;
@@ -14373,7 +14400,7 @@ test "a method of a value a type parameter types is made per binding: each bindi
     try std.testing.expect(try facts.resolveBound(env2, file, tree.nodeData(access).node_and_token[0]) == .instance);
     try std.testing.expect(try facts.resolveBound(env2, file, access) == .function);
     const binding = (try calls.at(&facts, file, node.of(tree, "facts.fieldsHold(IoProbe, .{ .key = 1 }, 3)"))).?;
-    const value = try facts.boundCopy(binding, hold, found.?);
+    const value = (try facts.boundCopy(binding, hold, found.?)).?;
     try std.testing.expect(value == .error_union and value.error_union.* == .instance);
 }
 
@@ -14666,4 +14693,61 @@ test "an array of types a block fills through a loop's pointer captures is what 
         try std.testing.expect(fields == .alternatives);
         for (fields.alternatives) |one| try std.testing.expect(one == .primitive);
     }
+}
+
+test "a generic's copy is read in a binding only along the routes it compiles, and an unresolved copy as a value of its place's type" {
+    const source =
+        \\fn dup(comptime T: type, v: T) T {
+        \\    return T.clone(v);
+        \\}
+        \\fn keep(comptime T: type, v: T) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => return dup(T, v),
+        \\        else => return v,
+        \\    }
+        \\}
+        \\fn made(comptime T: type, v: T, r: anytype) T {
+        \\    _ = v;
+        \\    return r.unknown();
+        \\}
+        \\pub fn main() void {
+        \\    _ = keep(bool, true);
+        \\    _ = made(bool, true, 0);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const routed = struct {
+        fn copyAt(f: *Facts, function: Decl, at: Ast.Node.Index) !ParameterCopy {
+            for (try f.parameterCopies(function)) |copy| if (copy.source != null and copy.source.?.node == at) return copy;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const binding = (try calls.at(&facts, file, node.of(tree, "keep(bool, true)"))).?;
+    const keep = binding.callee.function;
+    // The route through `dup` is the union's prong: a bool's instantiation compiles none of it.
+    const through_dup = try routed.copyAt(&facts, keep, node.of(tree, "T.clone(v)"));
+    try std.testing.expectEqual(1, through_dup.path.len);
+    try std.testing.expectEqual(@as(?Value, null), try facts.boundCopy(binding, keep, through_dup));
+    // `r.unknown()` does not resolve; `made` returns it as its `T`, a bool in this binding.
+    const made_call = (try calls.at(&facts, file, node.of(tree, "made(bool, true, 0)"))).?;
+    const made_fn = made_call.callee.function;
+    const unresolved = try routed.copyAt(&facts, made_fn, node.of(tree, "r.unknown()"));
+    const value = (try facts.boundCopy(made_call, made_fn, unresolved)).?;
+    try std.testing.expect(value != .unknown);
 }
