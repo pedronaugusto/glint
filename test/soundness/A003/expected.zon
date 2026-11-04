@@ -15,5 +15,7 @@
         "unwrap/glintb-optional/twin.zig",
         // warp-fast precision: A003's flow does not read std's File.closeMany of a slice of a local's address as its release (A015's released does)
         "memory/wf-closemany-slice/twin.zig",
+        // aegis precision: a binding that makes an owner of what a generic acquires by its type parameter has its cleanup not walked per binding (undecided, never clear)
+        "call/aegis-bound-acquire/twin.zig",
     },
 }
