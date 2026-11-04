@@ -3075,6 +3075,31 @@ test "A010 leaves what a number's range holds: arithmetic that cannot overflow i
     , 4);
 }
 
+test "A010 reads @min and @max at the type Zig gives them: the narrowest that holds every value they can take, a constant operand by its value" {
+    // `@min(a: u8, b: u64)` and `@min(b, 255)` are `u8`s: a step past 255 overflows them. An
+    // `inline` function's constant result narrows `@min` to a `u3`, its value not read here.
+    // Stored in a `u64`, or `@max(a, 300)` (a `u9` of 300 at most), a step fits.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\inline fn seven(x: u64) u64 {
+        \\    _ = x;
+        \\    return 7;
+        \\}
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    const a = try r.takeByte();
+        \\    const b = try r.takeInt(u64, 0);
+        \\    const low = @min(a, b);
+        \\    _ = low + 1;
+        \\    var capped = @min(b, 255);
+        \\    capped += 1;
+        \\    _ = @min(b, seven(b)) + 1;
+        \\    const wide: u64 = @min(a, b);
+        \\    _ = @max(a, 300) + 1;
+        \\    return wide + 1;
+        \\}
+    , 3);
+}
+
 test "A010 reads the comparisons that hold where a number is used: an earlier check that leaves, the branch it is in, a position into memory and a remainder spelled out" {
     try expect(pack.integers,
         \\const std = @import("std");

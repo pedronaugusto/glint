@@ -1172,7 +1172,8 @@ fn typeOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16,
                 .int => |int| .{ .int = .{ .bits = int.bits, .signed = false, .wide = int.wide } },
                 else => |other| other,
             };
-            for ([_][]const u8{ "@min", "@max", "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem" }) |peer| if (std.mem.eql(u8, name, peer) and args.len == 2) {
+            if ((std.mem.eql(u8, name, "@min") or std.mem.eql(u8, name, "@max")) and args.len >= 2) return minMaxType(c, file, args, std.mem.eql(u8, name, "@min"), pointer, next);
+            for ([_][]const u8{ "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem" }) |peer| if (std.mem.eql(u8, name, peer) and args.len == 2) {
                 return Typed.peer(try typeOf(c, file, args[0], pointer, next), try typeOf(c, file, args[1], pointer, next));
             };
         },
@@ -1729,6 +1730,210 @@ fn atMost(magnitude: Magnitude, limit: Magnitude) bool {
 /// The greatest value of `bits` bits.
 fn filled(bits: u16) Magnitude {
     return if (bits >= @bitSizeOf(Magnitude)) std.math.maxInt(Magnitude) else (@as(Magnitude, 1) << @intCast(bits)) - 1;
+}
+
+/// An integer wide enough for every value of a type of at most 256 bits, its sign included.
+const Wide = i258;
+
+/// The type Zig gives `@min` (`smallest`) or `@max` of integers: the narrowest that holds
+/// every value the result can take (`std.math.IntFittingRange` over the operands' ranges), a
+/// comptime-known operand read by its value and a runtime one by its type's range:
+/// `@min(a: u8, b: u64)` is a `u8`, `@min(b, 255)` a `u8`, `@max(a, 300)` a `u9`, so a step
+/// past it overflows the narrower type. A comptime number where every operand is
+/// comptime-known. Unknown where an operand's range is not shown: one that may be
+/// comptime-known with a value no constant gives, or a type whose width differs between
+/// targets.
+fn minMaxType(c: *Context, file: Project.FileId, args: []const Ast.Node.Index, smallest: bool, pointer: u16, depth: u8) Context.Error!Typed {
+    var lo: Wide = 0;
+    var hi: Wide = 0;
+    var known = true;
+    for (args, 0..) |arg, i| {
+        const range = (try operandRange(c, file, arg, pointer, depth)) orelse return .unknown;
+        known = known and range.known;
+        if (i == 0) {
+            lo, hi = .{ range.lo, range.hi };
+        } else if (smallest) {
+            lo, hi = .{ @min(lo, range.lo), @min(hi, range.hi) };
+        } else {
+            lo, hi = .{ @max(lo, range.lo), @max(hi, range.hi) };
+        }
+    }
+    if (known) return .literal;
+    // The largest magnitude either end needs, its sign a bit more where the low end is below 0.
+    const largest = @max(if (lo < 0) -lo - 1 else lo, hi);
+    const magnitude: u16 = @bitSizeOf(Wide) - @as(u16, @clz(largest));
+    return .{ .int = if (lo < 0) .{ .bits = magnitude + 1, .signed = true } else .{ .bits = magnitude, .signed = false } };
+}
+
+/// The values an operand of `@min` or `@max` may have, as Zig reads them for its type: a
+/// constant's value (`known`), or a runtime value's type's range (`atRuntime`). Null where
+/// neither is shown.
+fn operandRange(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16, depth: u8) Context.Error!?struct { lo: Wide, hi: Wide, known: bool } {
+    const tree = &c.project.at(file).file.tree;
+    const at = Facts.ungrouped(tree, node);
+    if (try valueOf(c, file, at, 0)) |value| return .{ .lo = value, .hi = value, .known = true };
+    if (tree.nodeTag(at) == .negation) if (try valueOf(c, file, tree.nodeData(at).node, 0)) |value| return .{ .lo = -@as(Wide, value), .hi = -@as(Wide, value), .known = true };
+    // An array's length is its type's, known as the program compiles.
+    if (tree.nodeTag(at) == .field_access) {
+        const memory, const name = tree.nodeData(at).node_and_token;
+        if (std.mem.eql(u8, tree.tokenSlice(name), "len")) if (try fixedLength(c, file, memory)) |fixed| return .{ .lo = fixed, .hi = fixed, .known = true };
+    }
+    const int = switch (try typeOf(c, file, at, pointer, depth)) {
+        .int => |int| int,
+        else => return null,
+    };
+    if (int.wide != null or int.either or int.bits > 256 or !try atRuntime(c, file, at, null, 0)) return null;
+    if (!int.signed) return .{ .lo = 0, .hi = (@as(Wide, 1) << @intCast(int.bits)) - 1, .known = false };
+    if (int.bits == 0) return .{ .lo = 0, .hi = 0, .known = false };
+    const half = @as(Wide, 1) << @intCast(int.bits - 1);
+    return .{ .lo = -half, .hi = half - 1, .known = false };
+}
+
+/// How deep `atRuntime` follows a value through constants, conversions and `inline` calls'
+/// bodies (std's `Reader.takeInt` is three `inline` calls deep). Past it a value may be known.
+const runtime_depth = 32;
+
+/// Whether `node` is a value known only at run time, which Zig reads by its type's range: a
+/// `var`, a parameter neither `comptime`, a type nor `anytype`, a function's constant such a
+/// value initializes, a call of a function that is not `inline`, an `inline` one's whose every
+/// `return` gives such a value (its parameters read as the call's arguments, `given`), and
+/// what arithmetic, a conversion, an index, a dereference, an unwrap, a field of such a value,
+/// or an `if` or `switch` whose every branch gives one makes; a slice's `len` where the slice is
+/// one. False where it may be known as the program compiles (a literal, a container's constant,
+/// a `comptime` parameter, an array's `len`, a capture).
+fn atRuntime(c: *Context, file: Project.FileId, node: Ast.Node.Index, given: ?*const InlineCall, depth: u8) Context.Error!bool {
+    if (depth > runtime_depth) return false;
+    const tree = &c.project.at(file).file.tree;
+    const next = depth + 1;
+    switch (tree.nodeTag(node)) {
+        .grouped_expression, .unwrap_optional => return atRuntime(c, file, tree.nodeData(node).node_and_token[0], given, next),
+        .@"try", .deref, .negation, .negation_wrap, .bit_not => return atRuntime(c, file, tree.nodeData(node).node, given, next),
+        .@"orelse", .@"catch" => return atRuntime(c, file, tree.nodeData(node).node_and_node[0], given, next),
+        .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .array_access => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            return try atRuntime(c, file, lhs, given, next) or try atRuntime(c, file, rhs, given, next);
+        },
+        .@"if", .if_simple => {
+            const branch = tree.fullIf(node).?;
+            const otherwise = branch.ast.else_expr.unwrap() orelse return false;
+            return try atRuntime(c, file, branch.ast.then_expr, given, next) and try atRuntime(c, file, otherwise, given, next);
+        },
+        .@"switch", .switch_comma => {
+            const choice = tree.fullSwitch(node).?;
+            for (choice.ast.cases) |case| if (!try atRuntime(c, file, tree.fullSwitchCase(case).?.ast.target_expr, given, next)) return false;
+            return choice.ast.cases.len != 0;
+        },
+        .field_access => {
+            const receiver, const name = tree.nodeData(node).node_and_token;
+            if (!try atRuntime(c, file, receiver, given, next)) return false;
+            if (!std.mem.eql(u8, tree.tokenSlice(name), "len")) return c.facts.runtime(file, node);
+            // An array's length is its type's; a slice's is the slice's.
+            var memory = try c.facts.resolve(file, receiver);
+            if (memory == .pointer and memory.pointer.size == .one) memory = memory.pointer.child.*;
+            return memory == .pointer and memory.pointer.size == .slice;
+        },
+        .call_one, .call_one_comma, .call, .call_comma => {
+            const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
+            const callees: []const Facts.Decl = switch (call.callee) {
+                .function => |decl| &.{decl},
+                .choice => |each| each,
+                .any => return false,
+            };
+            for (callees) |callee| if (!try returnsRuntime(c, call, callee, given, next)) return false;
+            return true;
+        },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const value_builtins = [_][]const u8{ "@as", "@intCast", "@truncate", "@bitCast", "@intFromEnum", "@intFromBool", "@intFromFloat", "@intFromPtr", "@min", "@max", "@abs", "@popCount", "@ctz", "@clz", "@byteSwap", "@bitReverse", "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem", "@shlExact", "@shrExact" };
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            for (value_builtins) |each| if (std.mem.eql(u8, name, each)) {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (Facts.builtinArgs(tree, node, &buffer)) |arg| if (try atRuntime(c, file, arg, given, next)) return true;
+                return false;
+            };
+            return false;
+        },
+        .identifier => {
+            const model = &c.project.at(file).model;
+            const index = (model.reference(node) orelse return false).declaration orelse return false;
+            const record = model.declarations[@backingInt(index)];
+            switch (record.kind) {
+                .parameter => {
+                    if (c.facts.comptimeParameter(file, node)) return false;
+                    // An `inline` function's parameter is what the call gives it.
+                    if (given) |call| if (call.callee.file == file) if (call.parameterAt(c, index)) |at| {
+                        const args = call.call.args.known;
+                        if (at >= args.len) return false;
+                        return atRuntime(c, call.call.file, args[at], call.outer, next);
+                    };
+                    const type_expr = c.facts.parameterTypeNode(.{ .file = file, .index = index }) orelse return false;
+                    return !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type");
+                },
+                .variable => {
+                    const scope = model.scopes[@backingInt(record.scope)];
+                    var container: [2]Ast.Node.Index = undefined;
+                    if (scope.node == .root or tree.fullContainerDecl(&container, scope.node) != null) return false;
+                    const variable = tree.fullVarDecl(record.node) orelse return false;
+                    if (variable.comptime_token != null) return false;
+                    if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return true;
+                    return atRuntime(c, file, variable.ast.init_node.unwrap() orelse return false, given, next);
+                },
+                else => return false,
+            }
+        },
+        else => return false,
+    }
+}
+
+/// An `inline` function's call `atRuntime` reads its body in: its parameters are the call's
+/// arguments, read where the call is (`outer`).
+const InlineCall = struct {
+    call: Facts.calls.Call,
+    callee: Facts.Decl,
+    outer: ?*const InlineCall,
+
+    /// The position among the call's arguments of the callee's parameter `index`.
+    fn parameterAt(self: *const InlineCall, c: *Context, index: Model.Declaration.Id) ?usize {
+        const tree = &c.project.at(self.callee.file).file.tree;
+        const record = c.project.at(self.callee.file).model.declarations[@backingInt(index)];
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, c.project.at(self.callee.file).model.declarations[@backingInt(self.callee.index)].node) orelse return null;
+        var it = proto.iterate(tree);
+        var at: usize = 0;
+        while (it.next()) |param| : (at += 1) if (param.name_token == record.token) return at;
+        return null;
+    }
+};
+
+/// Whether a call of `callee` gives a value known only at run time: any function's but an
+/// `inline` one's, and an `inline` one's where every `return` in its body gives one, read with
+/// its parameters as the call's arguments.
+fn returnsRuntime(c: *Context, call: Facts.calls.Call, callee: Facts.Decl, outer: ?*const InlineCall, depth: u8) Context.Error!bool {
+    const declared = &c.project.at(callee.file).file.tree;
+    const model = &c.project.at(callee.file).model;
+    const record = model.declarations[@backingInt(callee.index)];
+    var proto_buffer: [1]Ast.Node.Index = undefined;
+    const proto = declared.fullFnProto(&proto_buffer, record.node) orelse return false;
+    const qualifier = proto.extern_export_inline_token orelse return true;
+    if (declared.tokenTag(qualifier) != .keyword_inline) return true;
+    if (call.args != .known) return false;
+    // A function's declaration is its prototype, its body the `fn_decl` holding it.
+    const whole = if (declared.nodeTag(record.node) == .fn_decl) record.node else model.parentOf(record.node) orelse return false;
+    if (declared.nodeTag(whole) != .fn_decl) return false;
+    const body = declared.nodeData(whole).node_and_node[1];
+    const given: InlineCall = .{ .call = call, .callee = callee, .outer = outer };
+    var returns: usize = 0;
+    const first = declared.firstToken(body);
+    const last = declared.lastToken(body);
+    for (0..declared.nodes.len) |i| {
+        const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (declared.nodeTag(at) != .@"return") continue;
+        const token = declared.nodeMainToken(at);
+        if (token < first or token > last) continue;
+        const value = declared.nodeData(at).opt_node.unwrap() orelse return false;
+        if (!try atRuntime(c, callee.file, value, &given, depth)) return false;
+        returns += 1;
+    }
+    return returns != 0;
 }
 
 /// The greatest length of memory at a pointer width: below half the address space.
