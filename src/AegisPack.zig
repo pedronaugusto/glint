@@ -1063,6 +1063,76 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
     for (functions) |function| if (try boundBy(c, tree, node, args, receiver, rule, function, name_token)) return;
 }
 
+/// Whether the cast a generic makes by its parameter's type reads a scalar's integer out (a
+/// call of `raw`, `@backingInt`, `@intFromEnum`, `@call` of `raw`, or `@bitCast`/`@ptrCast` of
+/// the value it is given), where the others make an integer into the bound type.
+fn readOut(c: *Context, copy: Facts.ParameterCopy) bool {
+    const tree = &c.project.at(copy.site.file).file.tree;
+    const name = Facts.builtinName(tree, copy.site.node) orelse return true;
+    if (std.mem.eql(u8, name, "@backingInt") or std.mem.eql(u8, name, "@intFromEnum") or std.mem.eql(u8, name, "@call")) return true;
+    if (!std.mem.eql(u8, name, "@bitCast") and !std.mem.eql(u8, name, "@ptrCast")) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = Facts.builtinArgs(tree, copy.site.node, &buffer);
+    const source = copy.source orelse return false;
+    return args.len == 1 and source.node == args[0];
+}
+
+/// Whether the integer read out at `node` is operated on as `checkScalar` reports a raw value:
+/// an operator's or a comparison's operand, the argument of a cast or of integer arithmetic, or
+/// carried unchanged (`@as`, a grouping, `try`) or through a local it initializes or is stored
+/// into, to one. An index, an argument, a store into a place other than a local and a return
+/// are its exit. A use not read here, or a chain too deep to follow, may be one.
+fn readOutOperated(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) Context.Error!bool {
+    if (depth > 6) return true;
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    switch (try Facts.accesses.useOf(c.facts, file, node)) {
+        .compared, .unknown, .address, .in_asm => return true,
+        // A `for` range's bound counts iterations, as in a function of no generic.
+        .operand => |by| return tree.nodeTag(by) != .for_range,
+        .carried => |carry| return readOutOperated(c, file, carry.into, depth + 1),
+        .builtin_argument => |arg| {
+            const name = Facts.builtinName(tree, arg.call) orelse return true;
+            if (listed(name, &scalar_casts) or listed(name, &scalar_arithmetic)) return true;
+            // The integer unchanged, or reinterpreted: what holds the result holds it.
+            if (std.mem.eql(u8, name, "@as") or std.mem.eql(u8, name, "@splat") or std.mem.eql(u8, name, "@ptrCast")) return readOutOperated(c, file, arg.call, depth + 1);
+            return false;
+        },
+        .initializes => |declared| {
+            for (model.declarations) |decl| if (decl.node == declared and decl.kind == .variable) return localOperated(c, file, decl, depth);
+            return true;
+        },
+        .stored => |store| {
+            const target = store.target orelse return true;
+            const path = try Facts.accesses.pathOf(c.facts, file, target);
+            // Stored into a field or an element: the place's own type reads it from there.
+            if (path.steps.len != 1) return false;
+            const ref = model.reference(path.steps[0].node) orelse return true;
+            const index = ref.declaration orelse return true;
+            const decl = model.declarations[@backingInt(index)];
+            if (decl.kind != .variable) return false;
+            return localOperated(c, file, decl, depth);
+        },
+        else => return false,
+    }
+}
+
+/// Whether a variable holding an integer read out is operated on where it is read. One a
+/// container declares may be read in another file: it may be.
+fn localOperated(c: *Context, file: Project.FileId, decl: Model.Declaration, depth: u8) Context.Error!bool {
+    const model = &c.project.at(file).model;
+    switch (model.scopes[@backingInt(decl.scope)].kind) {
+        .file, .container => return true,
+        else => {},
+    }
+    var each = Mentions.all(model, decl.token);
+    while (each.next()) |name| switch (try Facts.accesses.useOf(c.facts, file, name)) {
+        .written => {},
+        else => if (try readOutOperated(c, file, name, depth + 1)) return true,
+    };
+    return false;
+}
+
 /// Whether every argument of `call` moves at it: made in place, or a local nothing holds beside
 /// the call (`moved`). A bound receiver is the call's own, not an argument handed on; arguments
 /// that do not resolve may not move.
@@ -1138,6 +1208,10 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, args: []const As
         if (copy.kind == .cast) {
             // The library's own generics are its safe types' internals.
             if (try c.inLibrary(Contract.library, copy.site.file)) continue;
+            // A scalar's integer read out (`raw()`, `@backingInt`, the bits of its value) is
+            // its exit, as in a function of no generic: the binding makes it a finding only
+            // where that integer is operated on (`readOutOperated`).
+            if (readOut(c, copy) and !try readOutOperated(c, copy.site.file, copy.site.node, 0)) continue;
             switch (try perBuild(c, try instanceOf(c, value))) {
                 .owner => |k| if (k == .scalar) {
                     const span = c.spanOf(copy.site.file, c.project.at(copy.site.file).file.tree.nodeMainToken(copy.site.node));
