@@ -8672,6 +8672,60 @@ pub fn judgedAtBindings(self: *Facts, function: Decl) ResolveError!bool {
     return try self.namedCalls(function) != null;
 }
 
+/// Whether compiled code in the run binds the generic `function` (main's ruling, 2026-11-04):
+/// a call of it by name in a function that is no generic, at a container's level or in a test,
+/// or in a generic that is itself bound in the run; a call in a generic nothing compiled binds
+/// is compiled nowhere. A generic's body means nothing until it is bound: a rule judges what
+/// only a binding decides at each binding, clean at the body where this is true; where it is
+/// false the body is undecided (`unbound_generic`), judged at its consumers' bindings, its
+/// remedy a test that instantiates it. Null where a binding may be no call a run judges
+/// (`judgedAtBindings`): the body stays undecided as the rule reads it.
+pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
+    const read = try self.memo(BoundInRun);
+    // One being read (a generic that binds itself) binds nothing of its own.
+    if (read.map.get(function)) |known| return known orelse false;
+    const sites = (try self.scanCallSites(function, .program)) orelse {
+        try read.map.put(self.gpa, function, null);
+        return null;
+    };
+    try read.map.put(self.gpa, function, false);
+    var bound = false;
+    for (sites) |site| {
+        const outer = (try self.functionAround(site.file, site.holder)) orelse {
+            bound = true;
+            break;
+        };
+        if (!self.hasGenericParameter(outer) or try self.boundInRun(outer) == true) {
+            bound = true;
+            break;
+        }
+    }
+    try read.map.put(self.gpa, function, bound);
+    return bound;
+}
+
+/// What a rule writes at a generic's body that `boundInRun` says nothing compiled binds.
+pub const unbound_generic = "unbound generic: judged at its consumers' bindings";
+
+/// `boundInRun`'s answers, false while one is being read.
+const BoundInRun = struct { map: std.AutoHashMapUnmanaged(Decl, ?bool) = .empty };
+
+/// The function whose body `node` in `file` is in; null at a container's level or in a test.
+fn functionAround(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) switch (tree.nodeTag(parent)) {
+        .fn_decl => {
+            const index = (try self.partsOf(file)).declared.get(parent) orelse return null;
+            return .{ .file = file, .index = index };
+        },
+        .test_decl => return null,
+        else => {},
+    };
+    return null;
+}
+
 /// `callers` says whether a consumer calling a public function by its name is a caller no
 /// scan of the program sees (`consumers`), or one judged in the consumer's own run (`program`).
 fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, program }) ResolveError!?[]const CallSite {
@@ -13195,6 +13249,22 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.function, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; read(@ptrCast((&copy)[0..1])); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; write(@ptrCast((&copy)[0..1])); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { write(@ptrCast(@constCast((&o)[0..1]))); }\n", true));
+}
+
+test "boundInRun: a generic is bound where compiled code calls it, a test or a function that is no generic, or a generic itself bound; one bound only in an unbound generic is not" {
+    const source = "pub fn lone(x: anytype) void { _ = x; }\npub fn used(x: anytype) void { _ = x; }\npub fn tested(x: anytype) void { _ = x; }\npub fn inner(x: anytype) void { _ = x; }\npub fn outer(x: anytype) void { inner(x); }\npub fn main() void { used(@as(u8, 1)); }\ntest \"tested\" { tested(@as(u8, 2)); }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const root = facts.rootOf(project.sources[0].id);
+    try std.testing.expectEqual(@as(?bool, false), try facts.boundInRun(facts.member(root, "lone").?));
+    try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "used").?));
+    try std.testing.expectEqual(@as(?bool, true), try facts.boundInRun(facts.member(root, "tested").?));
+    // `inner` is called only in `outer`, a generic nothing compiled binds.
+    try std.testing.expectEqual(@as(?bool, false), try facts.boundInRun(facts.member(root, "inner").?));
 }
 
 test "bindCall binds f(a), x.f(a) with its receiver, T.f(a) and @call's tuple, and makes no reading of arguments not known" {
