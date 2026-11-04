@@ -257,16 +257,28 @@ pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []cons
 
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
 pub fn projectWithSources(gpa: std.mem.Allocator, consumer: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
-    return projectInPackage(gpa, consumer, "", extra, extra_imports);
+    return projectAs(gpa, consumer, .{}, extra, extra_imports);
 }
 
-/// `projectWithSources`, the consumer a file of `package`.
-pub fn projectInPackage(gpa: std.mem.Allocator, consumer: []const u8, package: []const u8, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
+/// What the consumer is in `projectAs`: a file of `package`, compiled by `compilations`.
+pub const Consumer = struct {
+    package: []const u8 = "",
+    /// `.build`: a build script, which only the build runner compiles; aegis's files and the
+    /// extra sources (std's) are then compiled by both, as std is.
+    compilations: Project.Compilations = .program,
+};
+
+/// `projectWithSources`, the consumer as `as` says.
+pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, extra: []const Extra, extra_imports: []const ExtraImport) !glint.Project {
     const inputs = try gpa.alloc(Project.Input, sources.len + 1 + extra.len);
     defer gpa.free(inputs);
-    inputs[0] = .{ .name = "consumer", .bytes = consumer, .package = package };
-    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
-    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = source.package };
+    const others: Project.Compilations = if (as.compilations == .program) .program else .both;
+    inputs[0] = .{ .name = "consumer", .bytes = consumer, .package = as.package, .compilations = as.compilations };
+    for (sources, 1..) |source, i| {
+        inputs[i] = aegisInput(source);
+        inputs[i].compilations = others;
+    }
+    for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .selected = false, .package = source.package, .compilations = others };
     const mapped = imports();
     const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len);
     defer gpa.free(all);

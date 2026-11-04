@@ -940,7 +940,11 @@ fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declara
 /// values no call of the program shows: each parameter a comptime one does not fix, and each
 /// one's length, may hold input at its most, and one whose type may hold a writer may be one
 /// that reaches a peer (`writerSlots`). Whether it holds an error's text its type says
-/// (`errorDeclared`).
+/// (`errorDeclared`). In a file only the build runner compiles (a build script), that caller is
+/// the build runner, or code the script hands its values: what it gives (`std.Build`, an option,
+/// the build's arguments) is whoever runs the build's, the operator's, never a peer's, and it
+/// hands no writer a peer reads. What the script itself reads (a fetch over the network) is
+/// still the reader's source.
 fn escaped(c: *Context, flow: *Flow) Context.Error!void {
     var by_node: std.AutoHashMapUnmanaged(Facts.Key, Model.Declaration.Id) = .empty;
     var indexed: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty;
@@ -951,8 +955,9 @@ fn escaped(c: *Context, flow: *Flow) Context.Error!void {
         }
         const d = by_node.get(.{ .file = f.file, .node = f.node }) orelse continue;
         if (!try c.facts.handedOut(.{ .file = f.file, .index = d })) continue;
-        const input: Levels = .in(flow.masks.input(), .number);
-        const writers = try writerSlots(c, flow, .{ .file = f.file, .index = d });
+        const build = c.project.at(f.file).input.compilations == .build;
+        const input: Levels = .in(if (build) flow.masks.operator else flow.masks.input(), .number);
+        const writers: Slots = if (build) .{} else try writerSlots(c, flow, .{ .file = f.file, .index = d });
         const lengthless = try lengthlessSlots(c, .{ .file = f.file, .index = d });
         for (f.levels, 0..) |*level, slot| {
             if (f.fixed.has(slot / 2) or lengthless.has(slot)) continue;

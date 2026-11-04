@@ -260,7 +260,11 @@ fn run(rule: glint.Rule, program: []const u8) !Run {
     return runWith(rule, program, &std_files, &std_imports);
 }
 fn runWith(rule: glint.Rule, program: []const u8, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
-    var project = try sources.projectWithSources(std.testing.allocator, program, extra, imports);
+    return runAs(rule, program, .{}, extra, imports);
+}
+/// `runWith`, the program compiled as `as` says.
+fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []const sources.Extra, imports: []const sources.ExtraImport) !Run {
+    var project = try sources.projectAs(std.testing.allocator, program, as, extra, imports);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
@@ -3492,6 +3496,44 @@ test "A012 names a size given through @call to a callee that does not resolve, u
     try std.testing.expectEqual(1, found.undecided);
 }
 
+test "a build script's values are the operator's: the build runner's, an option's, never a peer's; what it reads is the reader's" {
+    // What the build runner hands `build` (std.Build, an option, the build's arguments) is
+    // whoever runs the build's: A012, A009 and A010 read it as the program's own value. The
+    // same function in the program's compilation, handed out as a value, is called with what no
+    // call shows: input, a finding for each.
+    const given =
+        \\const std = @import("std");
+        \\pub const entry = &build;
+        \\pub fn build(gpa: std.mem.Allocator, n: usize, table: []const u8) !u8 {
+        \\    _ = try gpa.alloc(u8, n);
+        \\    return table[n + 1];
+        \\}
+    ;
+    // A build script that reads from a reader (a fetch) still reads a peer's number.
+    const reads =
+        \\const std = @import("std");
+        \\pub fn build(gpa: std.mem.Allocator, r: *std.Io.Reader) !void {
+        \\    const n = try r.takeInt(u32, .little);
+        \\    _ = try gpa.alloc(u8, n);
+        \\}
+    ;
+    // The program's own file, which imports std as every package's does.
+    const files = std_files ++ [_]sources.Extra{.{ .name = "src/root.zig", .bytes = "const std = @import(\"std\");\n" }};
+    const imports = std_imports ++ [_]sources.ExtraImport{.{ .from = std_files.len, .spelling = "std", .target = 0 }};
+    const build: sources.Consumer = .{ .compilations = .build };
+    for ([_]glint.Rule{ pack.bounded_work, pack.untrusted_input, pack.integers }) |rule| {
+        const program = try runWith(rule, given, &files, &imports);
+        const script = try runAs(rule, given, build, &files, &imports);
+        try std.testing.expect(program.findings > 0);
+        try std.testing.expectEqual(0, script.findings);
+        try std.testing.expectEqual(0, script.undecided);
+    }
+    for ([_]sources.Consumer{ .{}, build }) |as| {
+        const found = try runAs(pack.bounded_work, reads, as, &files, &imports);
+        try std.testing.expectEqual(1, found.findings);
+    }
+}
+
 test "A012 leaves a size std only moves a position by or compares, and finds one it allocates by" {
     // `toss` adds it to a position and `take`'s fill compares it: neither sizes work by it.
     try expect(pack.bounded_work,
@@ -3788,7 +3830,7 @@ test "A018 reads a peer writer a package declares as one wherever it is declared
         \\}
     };
     for (programs) |program| {
-        var project = try sources.projectInPackage(std.testing.allocator, program, "pkg", &(std_files ++ [_]sources.Extra{wire}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wire.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+        var project = try sources.projectAs(std.testing.allocator, program, .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{wire}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "wire.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
         defer project.deinit();
         const declared = [_]glint.Config.PeerWriter{.{ .module = "pkg", .declaration = "peer" }};
         for ([_]usize{ 0, 1 }) |given| {
