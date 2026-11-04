@@ -348,6 +348,11 @@ pub fn aliasNames(self: *Context, comptime among: AliasScope, decls: []const Fac
             const tree = &source.file.tree;
             for (source.model.declarations, 0..) |d, i| {
                 if (d.kind != .variable) continue;
+                // A function's own constant is named only in its body: an alias another file
+                // cannot spell, so one only where the run reads that file (shakedown's
+                // `const call = @field(IoCall, name);` names nothing a `.call` elsewhere reaches).
+                const scope = source.model.scopes[@backingInt(d.scope)].kind;
+                if (scope != .file and scope != .container and !source.input.selected) continue;
                 const variable = tree.fullVarDecl(d.node) orelse continue;
                 const init = variable.ast.init_node.unwrap() orelse continue;
                 // An alias is written as a declaration's path, or a comptime choice among them:

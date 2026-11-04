@@ -8965,6 +8965,39 @@ test "A007 finds std's synchronization a dependency names under its own name, he
     try std.testing.expectEqual(@as(usize, 0), unknown.findings);
 }
 
+test "A007 reads a dependency's function-local constant of a computed name as no alias, and its container-level one as any name" {
+    const program =
+        \\const dep = @import("dep");
+        \\const Kind = enum { call, none };
+        \\pub const table = [_]struct { []const u8, Kind }{ .{ "param", .call }, .{ "array_type", .none } };
+    ;
+    // shakedown's `const call = comptime @field(IoCall, name);`: named only in its function's
+    // body, so the program's `.call` reaches no lock.
+    const local = try runWithDependency(pack.shared_state, program,
+        \\const std = @import("std");
+        \\pub fn pick(comptime name: []const u8) void {
+        \\    const call = comptime @field(std.Io, name);
+        \\    _ = call;
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), local.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 0), local.findings);
+    // The same constant at the container: `dep.call` may be any of std.Io's members, a lock too,
+    // so the program's `.call` leaves undecided sites a program without it does not.
+    const container =
+        \\const std = @import("std");
+        \\pub const call = @field(std.Io, @import("missing.zig").name);
+    ;
+    const member = try runWithDependency(pack.shared_state, program, container);
+    const without = try runWithDependency(pack.shared_state,
+        \\const dep = @import("dep");
+        \\const Kind = enum { call, none };
+        \\pub const table = [_]struct { []const u8, Kind }{ .{ "array_type", .none } };
+    , container);
+    try std.testing.expect(member.undecided > without.undecided);
+    try std.testing.expectEqual(@as(usize, 0), member.findings);
+}
+
 test "A013 reads std's assert called through any alias the program declares, public too, and leaves one taken as a value undecided" {
     try expect(pack.contracts,
         \\const std = @import("std");
