@@ -5209,7 +5209,7 @@ pub const Holding = union(enum) { none, at: []const u8, maybe };
 /// and none read once the file's fact budget is spent.
 pub fn fieldsHold(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(probe)), holder: Container) (ResolveError || @TypeOf(probe).Error)!Holding {
     const state = try self.memo(HoldsMemo(@TypeOf(probe).Key));
-    const at: HoldsMemo(@TypeOf(probe).Key).Type = .{ .key = probe.key, .file = holder.file, .scope = holder.scope };
+    const at: HoldsMemo(@TypeOf(probe).Key).Type = .{ .key = probe.key, .file = holder.file, .scope = holder.scope, .made = holder.made_by };
     if (state.found.get(at)) |known| return known;
     if (state.open.contains(at)) {
         state.met_open += 1;
@@ -5231,7 +5231,9 @@ pub fn ProbeOf(comptime Probe: type) type {
 
 fn HoldsMemo(comptime ProbeKey: type) type {
     return struct {
-        const Type = struct { key: ProbeKey, file: Project.FileId, scope: Model.Scope.Id };
+        /// A type a type function made is read with that call's bindings (`made`): each making
+        /// apart.
+        const Type = struct { key: ProbeKey, file: Project.FileId, scope: Model.Scope.Id, made: ?*const Made };
         found: std.AutoHashMapUnmanaged(Type, Holding) = .empty,
         open: std.AutoHashMapUnmanaged(Type, void) = .empty,
         /// How many times one still being read was met again.
@@ -5245,7 +5247,8 @@ fn fieldsHoldOnce(self: *Facts, probe: anytype, comptime of: ProbeOf(@TypeOf(pro
         const field: Decl = .{ .file = holder.file, .index = index };
         const name = self.project.at(holder.file).model.declarations[@backingInt(index)].name;
         // A field whose value does not resolve may hold anything; a probe reads resolved values.
-        const value = try self.declaration(field);
+        // One of a type a type function made is read with that call's bindings (memberOf).
+        const value = try self.memberOf(holder, field);
         if (value == .unknown) {
             maybe = true;
             continue;
