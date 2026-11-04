@@ -620,7 +620,7 @@ fn assumptions(self: *const Facts, set: ?Assumptions.Id) []const Assumption {
 }
 
 /// The set holding exactly `items`, added if new.
-fn intern(self: *Facts, items: []const Assumption) ResolveError!Assumptions.Id {
+pub fn intern(self: *Facts, items: []const Assumption) ResolveError!Assumptions.Id {
     for (self.settled.items, 0..) |set, index| {
         if (set.held.len != items.len) continue;
         for (items) |item| {
@@ -5772,7 +5772,7 @@ pub fn sameValue(a: Value, b: Value) bool {
 /// handing itself `Field.Value`, unknown where `Field` is) is that reading again. A kept
 /// reading's depth is the chain that first made it, so a chain of ever new readings still ends
 /// (Taint's `readingAt`).
-fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
+pub fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
     const key: ReadingKey = .{ .function = draft.function, .outer = draft.outer };
     const entry = try self.readings.getOrPut(self.gpa, key);
     if (!entry.found_existing) entry.value_ptr.* = .empty;

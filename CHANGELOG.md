@@ -25,6 +25,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Added
 
+- `Summary`: a value Facts resolves written in ids that hold across runs (a file by its unit's name for it and the hash of its bytes, its declarations, scopes and nodes by index), and read back into another run's Facts, whose readings and sets of assumptions it keeps once as the run does. A stream read against other bytes, cut short or of another version is refused. The first step of summaries (designs/glint-summaries.md).
 - `glint.stdCall` and `glint.Is`: whether a call calls std's declaration at a path (`mem.eql`), read by what its callee resolves to, for a project's own rules: yes where every function it may call is that one, no where none is, unknown and why where its callee does not resolve and may be it.
 - `zig build check-rule-readers` (development, in preflight's extra checks): RULE_READERS, a compiled rule of glint's own lint, reports where one of its rules reads a value, a write, a call or a type around the shared queries (`Facts.resolve`, `Facts.accesses`, `Facts.calls`, Governed): std's text comparisons given a name a declaration may have, and a node's syntax tag tested against one that writes a value. It reports and does not gate; it gates once its list is empty.
 
