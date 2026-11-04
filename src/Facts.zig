@@ -128,7 +128,13 @@ pub const Made = struct {
 pub const Env = struct {
     function: Decl,
     args: []const Value,
+    /// How many calls deep the chain that made it is: a reader of chains bounds it (Taint's
+    /// `readingAt`).
     depth: usize,
+    /// How many type functions' evaluations it is made inside (`evaluateCall`), bounded at 8
+    /// so a type function that calls itself with ever new arguments ends; a call of a chain
+    /// (`bind`) adds none, however deep.
+    nested: usize = 0,
     /// Each argument's value as a condition, where it is a comptime-known `bool`.
     truths: []const ?bool = &.{},
     /// The reading whose function encloses this one, which binds the names it reads beyond
@@ -1489,7 +1495,7 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, call: Ast.full.Call, receiv
         var inner_args: std.ArrayList(Value) = .empty;
         if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
         for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
-        env = try self.keptReading(.{ .function = target, .args = inner_args.items, .depth = env.depth +| 1 });
+        env = try self.keptReading(.{ .function = target, .args = inner_args.items, .depth = env.depth +| 1, .nested = env.nested });
     }
     return self.resolveIn(env, source.file, source.node);
 }
@@ -3363,7 +3369,7 @@ fn madeEnv(self: *Facts, made: *const Made) ResolveError!*const Env {
             try self.boundArgument(if (outer_env) |env| try self.resolveIn(env, made.file, param) else try self.resolve(made.file, param));
         t.* = if (changed) null else self.truth(outer_env, made.file, param);
     }
-    return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled });
+    return self.keptReading(.{ .function = made.function, .args = args, .depth = if (outer_env) |e| e.depth +| 1 else 0, .nested = if (outer_env) |e| e.nested else 0, .truths = truths, .outer = self.enclosingReading(outer_env, made.function), .spelled = spelled });
 }
 
 fn passedOnChanged(self: *const Facts, function: Decl, position: usize) ResolveError!bool {
@@ -4029,7 +4035,7 @@ fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
 const ReadingKey = struct { function: Decl, outer: ?*const Env, depth: usize };
 
 fn sameEnv(a: Env, b: Env) bool {
-    if (a.args.len != b.args.len or a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
+    if (a.nested != b.nested or a.args.len != b.args.len or a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
     for (a.args, b.args) |one, other| if (!sameValue(one, other)) return false;
     for (a.truths, b.truths) |one, other| if (one != other) return false;
     for (a.spelled, b.spelled) |one, other| {
@@ -5742,7 +5748,8 @@ fn isGeneric(tree: *const Ast, function: Ast.full.FnProto) bool {
 /// caller's other means.
 fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.full.Call, decl: Decl) ResolveError!?Value {
     const depth = if (env) |e| e.depth +| 1 else 0;
-    if (depth >= 8) return null;
+    const nested = if (env) |e| e.nested +| 1 else 0;
+    if (nested >= 8) return null;
     const target_tree = &self.project.at(decl.file).file.tree;
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     var fn_buffer: [1]Ast.Node.Index = undefined;
@@ -5790,7 +5797,7 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
         try truths.append(self.gpa, self.truth(env, file, arg));
         try spelled.append(self.gpa, try self.spelledIn(env, file, arg));
     }
-    const bound = try self.keptReading(.{ .function = decl, .args = args.items, .depth = depth, .truths = truths.items, .outer = outer, .spelled = spelled.items });
+    const bound = try self.keptReading(.{ .function = decl, .args = args.items, .depth = depth, .nested = nested, .truths = truths.items, .outer = outer, .spelled = spelled.items });
     const result_tree = target_tree;
     if (returns_type) {
         const returned = finalReturn(result_tree, &self.project.at(decl.file).model, record) orelse return self.everyReturn(bound, decl, record);
@@ -5956,11 +5963,11 @@ pub fn bindTo(self: *Facts, file: Project.FileId, fn_expr: Ast.Node.Index, param
         try truths.append(self.gpa, self.truth(outer, file, arg));
         try spelled.append(self.gpa, try self.spelledIn(outer, file, arg));
     }
-    const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items };
+    const draft: Env = .{ .function = function, .args = args.items, .depth = if (outer) |o| o.depth +| 1 else 0, .nested = if (outer) |o| o.nested else 0, .truths = truths.items, .outer = reading, .spelled = spelled.items };
     if (!aligned) return self.keptReading(draft);
     // A typed parameter's argument is read in a reading of its own, then given its declared
     // type: what that reading kept is not the one made with it.
-    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled });
+    const reading_args = try self.keptReading(.{ .function = function, .args = try self.gpa.dupe(Value, args.items), .depth = draft.depth, .nested = draft.nested, .truths = draft.truths, .outer = draft.outer, .spelled = draft.spelled });
     try self.typedArguments(reading_args, function, args.items);
     return self.keptReading(draft);
 }
@@ -10726,6 +10733,56 @@ test "reachedUnder: a site past a condition a binding decides is no site of that
     }
     // With no binding, every site is reached.
     for (casts.items) |cast| try std.testing.expect(try facts.reachedUnder(null, file, cast));
+}
+
+test "a type function is evaluated in a reading however many calls deep its chain is" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\fn Opt(comptime T: type) type { return ?T; }
+        \\fn f0(x: anytype) void { f1(x); }
+        \\fn f1(x: anytype) void { f2(x); }
+        \\fn f2(x: anytype) void { f3(x); }
+        \\fn f3(x: anytype) void { f4(x); }
+        \\fn f4(x: anytype) void { f5(x); }
+        \\fn f5(x: anytype) void { f6(x); }
+        \\fn f6(x: anytype) void { f7(x); }
+        \\fn f7(x: anytype) void { f8(x); }
+        \\fn f8(x: anytype) void { f9(x); }
+        \\fn f9(x: anytype) void {
+        \\    var w: Opt(@TypeOf(x)) = undefined;
+        \\    _ = &w;
+        \\    _ = w.?;
+        \\}
+        \\pub fn main() void { f0(Foo{ .a = 1 }); }
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var env: ?*const Env = null;
+    const names = [_][]const u8{ "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9" };
+    for ([_][]const u8{ "f0(Foo{ .a = 1 })", "f1(x)", "f2(x)", "f3(x)", "f4(x)", "f5(x)", "f6(x)", "f7(x)", "f8(x)", "f9(x)" }, names) |text, name| {
+        var buffer: [1]Ast.Node.Index = undefined;
+        env = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, text)).?, facts.member(root, name).?, env);
+    }
+    try std.testing.expectEqual(@as(usize, 9), env.?.depth);
+    const value = try facts.resolveBound(env.?, file, node.of(tree, "w.?"));
+    const foo = try facts.resolve(file, node.of(tree, "Foo"));
+    try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }
 
 test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
