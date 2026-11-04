@@ -11149,8 +11149,15 @@ pub const accesses = struct {
                             };
                             try w.put(.{ .declaration = .{ .file = w.file, .index = d } }, site);
                         },
-                        // A call's result, a literal: a value of its own.
-                        else => try w.unresolved(site),
+                        // A literal is memory of its own that no place the program declares
+                        // names (`&.{}`, `&S{ .a = 1 }`): neither its address nor a store into
+                        // it reaches one. A place it holds the address of is its own `&`'s site.
+                        else => switch (formOf(tree.nodeTag(step.node))) {
+                            .array_literal, .struct_literal => {},
+                            // A call's result: a value of its own, which the call may have
+                            // been handed.
+                            else => try w.unresolved(site),
+                        },
                     }
                     break;
                 }
