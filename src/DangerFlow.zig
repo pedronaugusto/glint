@@ -76,7 +76,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
                 var decided: Decided = .{ .loop = node };
                 try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 for (decided.compared.items) |condition| {
-                    if (clears(c, condition, loop)) continue;
+                    if (try clears(c, condition, loop)) continue;
                     const lhs, const rhs = tree.nodeData(condition).node_and_node;
                     try judged(c, flow, rule, lhs, try loopOperand(c, flow, node, lhs), .number, loop_message);
                     try judged(c, flow, rule, rhs, try loopOperand(c, flow, node, rhs), .number, loop_message);
@@ -1969,50 +1969,57 @@ fn skipsIn(tree: *const Ast, statement: Ast.Node.Index) bool {
 /// `k` above zero, `x` unsigned: a negative number shifts to -1, never 0) on every pass, with
 /// nothing else in the loop writing it: it runs at most `x`'s width of times. `x` is the
 /// condition's own local, by declaration, not spelling.
-fn clears(c: *Context, condition: Ast.Node.Index, loop: Ast.full.While) bool {
+fn clears(c: *Context, condition: Ast.Node.Index, loop: Ast.full.While) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     if (tree.nodeTag(condition) != .bang_equal) return false;
     const value, const zero = tree.nodeData(condition).node_and_node;
-    if (tree.nodeTag(zero) != .number_literal or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(zero)), "0")) return false;
-    const declared = declaredBy(tree, model, value) orelse return false;
+    if (!try isZero(c, c.file, zero)) return false;
+    const declared = (try counterOf(c, c.file, value)) orelse return false;
     const record = model.declarations[@backingInt(declared)];
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, loop.ast.then_expr) orelse return false;
+    // Each statement's store as Facts.accesses reads it: its place, its operator, its value.
+    const stores = try Facts.accesses.storesIn(c.facts, c.file);
     const step = for (statements) |statement| {
         // A statement before that may end the pass leaves the bit set.
         if (skipsIn(tree, statement)) return false;
-        const target, const operand = switch (tree.nodeTag(statement)) {
-            .assign_bit_and, .assign_shr => tree.nodeData(statement).node_and_node,
-            else => continue,
+        const store = for (stores) |each| {
+            if (each.node == statement) break each;
+        } else continue;
+        if (store.kind != .update) continue;
+        if ((try counterOf(c, c.file, store.target orelse continue)) != declared) continue;
+        const operand = store.value orelse continue;
+        const op = switch (store.operator orelse continue) {
+            .op => |op| op,
+            .unknown => continue,
         };
-        if (declaredBy(tree, model, target) != declared) continue;
-        if (tree.nodeTag(statement) == .assign_shr) {
-            if (tree.nodeTag(operand) != .number_literal or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(operand)), "0")) continue;
-            const variable = tree.fullVarDecl(record.node) orelse return false;
-            const written = variable.ast.type_node.unwrap() orelse return false;
-            if (tree.nodeTag(written) != .identifier or !unsignedName(tree.tokenSlice(tree.nodeMainToken(written)))) return false;
-            break statement;
+        switch (op.op) {
+            .shr => {
+                if ((try Range.constantValue(c, c.file, operand) orelse 0) == 0) continue;
+                const variable = tree.fullVarDecl(record.node) orelse return false;
+                const written = variable.ast.type_node.unwrap() orelse return false;
+                const int = (try Range.intNamed(c, c.file, written, 64)) orelse return false;
+                if (int.signed or int.either) return false;
+                break statement;
+            },
+            .bit_and => {
+                if (tree.nodeTag(operand) != .sub) continue;
+                const minuend, const one = tree.nodeData(operand).node_and_node;
+                if ((try counterOf(c, c.file, minuend)) == declared and (try Range.constantValue(c, c.file, one)) == 1) break statement;
+            },
+            else => {},
         }
-        if (tree.nodeTag(operand) != .sub) continue;
-        const minuend, const one = tree.nodeData(operand).node_and_node;
-        if (declaredBy(tree, model, minuend) == declared and tree.nodeTag(one) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(one)), "1")) break statement;
     } else return false;
     // Any other write of it in the loop, or its address taken there, may undo the step.
     const first = tree.firstToken(loop.ast.cond_expr);
     const last = tree.lastToken(loop.ast.then_expr);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (node == step) continue;
-        const token = tree.nodeMainToken(node);
+    const sites = (try Facts.accesses.writesOf(c.facts, c.file)).places.get(.{ .declaration = .{ .file = c.file, .index = declared } }) orelse return true;
+    for (sites.items) |write| {
+        if (write.node == step or write.kind == .read or write.kind == .init) continue;
+        const token = tree.nodeMainToken(write.node);
         if (token < first or token > last) continue;
-        if (tag == .address_of and declaredBy(tree, model, rootOf(tree, tree.nodeData(node).node)) == declared) return false;
-        if (tag == .assign_destructure) {
-            for (tree.assignDestructure(node).ast.variables) |target| if (declaredBy(tree, model, rootOf(tree, target)) == declared) return false;
-            continue;
-        }
-        if (!assigns(tag)) continue;
-        if (declaredBy(tree, model, rootOf(tree, tree.nodeData(node).node_and_node[0])) == declared) return false;
+        return false;
     }
     return true;
 }
