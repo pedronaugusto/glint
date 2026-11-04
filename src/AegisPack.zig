@@ -1205,10 +1205,10 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
         // What the generic passes on of the argument (what calling it returns, what it points
         // to), read with this call's bindings; else the argument, plain data as written (a type
         // of numbers, and pointers or arrays of them, or a value of one) or as it resolves.
-        const value = if (copy.crowded)
-            Facts.Value{ .unknown = .budget }
-        else if (copy.source != null)
+        const value = if (copy.source != null)
             (try c.facts.boundCopy(call, function, copy)) orelse continue
+        else if (copy.crowded)
+            Facts.Value{ .unknown = .budget }
         else if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
             continue
         else

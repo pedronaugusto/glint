@@ -1648,7 +1648,11 @@ pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: Parameter
     // per type: each is read, and what they hold chosen as one.
     const readings = try self.instantiations(bound);
     var values: std.ArrayList(Value) = .empty;
-    for (readings) |reading| if (try self.copyIn(reading, copy)) |value| try values.append(self.gpa, value);
+    for (readings) |reading| {
+        var open: std.ArrayList(CrowdedStep) = .empty;
+        const found = if (copy.crowded) try self.crowdedIn(reading, function, copy.position, copy, 0, &open) else try self.copyIn(reading, copy);
+        if (found) |value| try values.append(self.gpa, value);
+    }
     if (values.items.len == 0) return null;
     return try self.choose(values.items);
 }
@@ -1697,7 +1701,6 @@ fn choiceOfTypes(value: Value) bool {
 /// `boundCopy` in one instantiation `env` of the copy's function; null where the instantiation
 /// does not reach a call on the path or the source.
 fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Value {
-    const source = copy.source.?;
     var env = start;
     for (copy.path) |step| {
         if (!try self.reachedUnder(env, step.file, step.node)) return null;
@@ -1716,6 +1719,13 @@ fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Va
         };
         env = try self.bind(step.file, inner, target, env);
     }
+    return self.sourceIn(env, copy);
+}
+
+/// What a copy's source holds in the reading `env` of the function it is in: null where the
+/// reading does not reach it.
+fn sourceIn(self: *Facts, env: *const Env, copy: ParameterCopy) ResolveError!?Value {
+    const source = copy.source.?;
     if (!try self.reachedUnder(env, source.file, source.node)) return null;
     const value = try self.resolveIn(env, source.file, source.node);
     if (value != .unknown) return value;
@@ -1738,6 +1748,83 @@ fn placeTyped(place: Value) bool {
         } else true,
         else => true,
     };
+}
+
+/// How many calls deep `crowdedIn` follows a crowded copy's routes; past it, unknown.
+const crowd_depth = 16;
+
+/// `copyIn` for a copy crowded past `routes`, whose routes were not all kept: found in the
+/// reading `env` of `function`, whose parameter `position` the copy is of. The source where
+/// `function` writes it itself, and each call `function` makes that passes that parameter on
+/// to a callee copying it to the same source, read where the reading reaches the call (as
+/// `copyIn`'s path). A call already being read in the same reading adds nothing new: a cycle
+/// of generics passing it round. Null where no route is reached; unknown past `crowd_depth`.
+fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, depth: usize, open: *std.ArrayList(CrowdedStep)) ResolveError!?Value {
+    if (depth >= crowd_depth) return .{ .unknown = .budget };
+    const here: CrowdedStep = .{ .env = env, .function = function, .position = position };
+    const memory = try self.memo(Crowded);
+    const key: CrowdedKey = .{ .step = here, .kind = copy.kind, .site = copy.site, .source = copy.source.? };
+    if (memory.found.get(key)) |kept| return kept;
+    for (open.items) |step| if (std.meta.eql(step, here)) {
+        memory.cuts += 1;
+        return null;
+    };
+    try open.append(self.gpa, here);
+    defer _ = open.pop();
+    const cuts = memory.cuts;
+    const found = try self.crowdedRead(env, function, position, copy, depth, open);
+    // Kept only where no route was cut at a call already being read: a cut answer holds what
+    // the read in progress adds, not yet known here.
+    if (memory.cuts == cuts and self.remaining != 0) try memory.found.put(self.gpa, key, found);
+    return found;
+}
+
+/// `crowdedIn`, read.
+fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, depth: usize, open: *std.ArrayList(CrowdedStep)) ResolveError!?Value {
+    var values: std.ArrayList(Value) = .empty;
+    for (try self.parameterCopies(function)) |own| {
+        if (own.path.len != 0 or own.position != position or !sameCopy(own, copy)) continue;
+        if (try self.sourceIn(env, own)) |value| try values.append(self.gpa, value);
+        break;
+    }
+    const t = self.syntaxOf(function.file);
+    for (try self.passings(function)) |passing| {
+        if (!try self.reachedUnder(env, function.file, passing.node)) continue;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        const call = t.fullCall(&call_buffer, passing.node).?; // unreachable: a passing is a call
+        const receiver: usize = if (self.methodCall(function.file, call, passing.target)) 1 else 0;
+        var bound: ?*const Env = null;
+        var seen: std.ArrayList(usize) = .empty;
+        for (try self.parameterCopies(passing.target)) |theirs| {
+            if (!sameCopy(theirs, copy)) continue;
+            if (theirs.position < receiver or theirs.position - receiver >= call.ast.params.len) continue;
+            if (std.mem.findScalar(usize, seen.items, theirs.position) != null) continue;
+            if (self.derivedParameter(function, call.ast.params[theirs.position - receiver], 0) != position) continue;
+            try seen.append(self.gpa, theirs.position);
+            const reading = bound orelse try self.bind(function.file, call, passing.target, env);
+            bound = reading;
+            if (try self.crowdedIn(reading, passing.target, theirs.position, copy, depth + 1, open)) |value| try values.append(self.gpa, value);
+        }
+    }
+    if (values.items.len == 0) return null;
+    return try self.choose(values.items);
+}
+
+/// A function's parameter being read for a crowded copy, in one reading.
+const CrowdedStep = struct { env: *const Env, function: Decl, position: usize };
+
+const CrowdedKey = struct { step: CrowdedStep, kind: @FieldType(ParameterCopy, "kind"), site: Key, source: Key };
+
+/// `crowdedIn`'s answers by reading, function, parameter and copy, and how many routes it cut
+/// at a call already being read.
+const Crowded = struct {
+    found: std.AutoHashMapUnmanaged(CrowdedKey, ?Value) = .empty,
+    cuts: usize = 0,
+};
+
+/// Whether two copies are of one write: the same site, kind and source.
+fn sameCopy(a: ParameterCopy, b: ParameterCopy) bool {
+    return a.kind == b.kind and std.meta.eql(a.site, b.site) and std.meta.eql(a.source, b.source);
 }
 
 /// Whether `node`, an identifier, names a `comptime` parameter.
@@ -14750,4 +14837,64 @@ test "a generic's copy is read in a binding only along the routes it compiles, a
     const unresolved = try routed.copyAt(&facts, made_fn, node.of(tree, "r.unknown()"));
     const value = (try facts.boundCopy(made_call, made_fn, unresolved)).?;
     try std.testing.expect(value != .unknown);
+}
+
+test "a copy crowded past its routes is read along the routes its binding compiles, kept or not" {
+    const source =
+        \\fn dup(comptime T: type, v: T) T {
+        \\    return T.clone(v);
+        \\}
+        \\fn keep(comptime T: type, v: T, n: u8) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => switch (n) {
+        \\            0 => return dup(T, v),
+        \\            1 => return dup(T, v),
+        \\            2 => return dup(T, v),
+        \\            else => return dup(T, v),
+        \\        },
+        \\        .@"enum" => return dup(T, v),
+        \\        else => return v,
+        \\    }
+        \\}
+        \\const E = enum {
+        \\    a,
+        \\    fn clone(e: E) E {
+        \\        return e;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    _ = keep(bool, true, 0);
+        \\    _ = keep(E, .a, 0);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const plain = (try calls.at(&facts, file, node.of(tree, "keep(bool, true, 0)"))).?;
+    const keep = plain.callee.function;
+    const clone = node.of(tree, "T.clone(v)");
+    const crowded = for (try facts.parameterCopies(keep)) |copy| {
+        if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
+    } else return error.TestUnexpectedResult;
+    // A bool's instantiation compiles none of the five routes through `dup`.
+    try std.testing.expectEqual(@as(?Value, null), try facts.boundCopy(plain, keep, crowded));
+    // An enum's compiles the fifth, on the enum's prong, past the four routes kept (the
+    // union's): `E.clone` gives an `E`.
+    const enum_call = (try calls.at(&facts, file, node.of(tree, "keep(E, .a, 0)"))).?;
+    const value = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(value == .instance);
 }
