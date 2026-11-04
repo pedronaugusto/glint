@@ -3849,7 +3849,7 @@ const Flow = struct {
             var use = try Facts.accesses.useOf(f.c.facts, f.c.file, candidate);
             switch (use) {
                 // Lent to a call that holds it again on every return: a borrow.
-                .address => |address| if (try lent(f.c, f.c.file, address, f.kind, 0)) {
+                .address => |address| if (try lent(f.c, f.c.file, address, f.kind, 0) or try f.lentDeferred(address)) {
                     found = .members;
                     continue;
                 },
@@ -3878,6 +3878,76 @@ const Flow = struct {
             found = .members;
         }
         return found;
+    }
+
+    /// `&owner` in the tuple of a function-running call (`var task = try io.concurrent(f, .{ io,
+    /// &owner })`, Facts.calls.deferredOf): lent to `f` as a call lends it (`lentTo`), and held
+    /// by the future that call gives until it ends. The future is a local the statement
+    /// declares, in the owner's block; the first later statement there that names it or the
+    /// owner awaits, cancels or joins it (`task.await(io)`), and none before that may leave the
+    /// block, which would run the owner's deferred release while `f` may still hold it.
+    fn lentDeferred(f: Flow, address: Ast.Node.Index) Context.Error!bool {
+        const c = f.c;
+        const element = switch (try Facts.accesses.useOf(c.facts, c.file, address)) {
+            .element_of => |at| at,
+            else => return false,
+        };
+        const outer_node = switch (try Facts.accesses.useOf(c.facts, c.file, element.literal)) {
+            .argument => |at| at.call,
+            else => return false,
+        };
+        const outer = (try Facts.calls.at(c.facts, c.file, outer_node)) orelse return false;
+        const later = (try Facts.calls.deferredOf(c.facts, outer)) orelse return false;
+        switch (later.args) {
+            .known => |args| if (element.position >= args.len or args[element.position] != address) return false,
+            .unknown => return false,
+        }
+        if (!try lentTo(c, c.file, later, element.position, f.kind, 0)) return false;
+        // The future, kept in a local the statement declares (`try` and the like carry it).
+        var value = outer_node;
+        const declared = while (true) switch (try Facts.accesses.useOf(c.facts, c.file, value)) {
+            .carried => |at| value = at.into,
+            .initializes => |node| break node,
+            else => return false,
+        };
+        const future = (f.tree.fullVarDecl(declared) orelse return false).ast.mut_token + 1;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const statements = f.tree.blockStatements(&buffer, f.scope) orelse return false;
+        const at = std.mem.findScalar(Ast.Node.Index, statements, declared) orelse return false;
+        for (statements[at + 1 ..]) |stmt| {
+            var futures = Mentions.of(f.model, future, f.tree, stmt);
+            var owners = Mentions.of(f.model, f.token, f.tree, stmt);
+            const names_owner = owners.next() != null;
+            if (futures.next() == null and !names_owner) {
+                if (exits(f.tree, f.model, stmt)) return false;
+                continue;
+            }
+            if (names_owner) return false;
+            return f.endsFuture(stmt, future);
+        }
+        return false;
+    }
+
+    /// Whether `stmt` is a call that ends the future `future` declares: its `await`, `cancel`
+    /// or `join` (`task.await(io)`, `_ = task.cancel(io)`, `try task.await(io)`).
+    fn endsFuture(f: Flow, stmt: Ast.Node.Index, future: Ast.TokenIndex) Context.Error!bool {
+        var value = stmt;
+        if (f.tree.nodeTag(value) == .assign) {
+            const sides = f.tree.nodeData(value).node_and_node;
+            if (f.tree.nodeTag(sides[0]) != .identifier or !std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeMainToken(sides[0])), "_")) return false;
+            value = sides[1];
+        }
+        while (Facts.accesses.carriedFrom(f.tree, value)) |inner| value = inner;
+        const call = (try Facts.calls.at(f.c.facts, f.c.file, value)) orelse return false;
+        const holder = switch (call.receiver) {
+            .bound => |holder| holder,
+            .none, .unknown => return false,
+        };
+        const ref = f.model.reference(holder) orelse return false;
+        const decl = f.model.declarations[@backingInt(ref.declaration orelse return false)];
+        if (decl.token != future) return false;
+        const name = (try memberNamed(f.c, f.c.file, call.callee_expr)) orelse return false;
+        return among(&.{ "await", "cancel", "join" }, name);
     }
 
     /// `owner = x.init(...)`, `x.adopt(...)` or any acquisition of a guard: live again;
@@ -4180,6 +4250,16 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, kind: Contr
     const position = for (args, 0..) |each, i| {
         if (each == argument) break i;
     } else return false;
+    return lentTo(c, file, call, position, kind, depth);
+}
+
+/// Whether `call` lends what it is handed at `position` of its arguments (in its callee's
+/// parameter order), an owner of `kind`: `lent`, for a call whose argument is known.
+fn lentTo(c: *Context, file: Project.FileId, call: Facts.calls.Call, position: usize, kind: Contract.Kind, depth: u8) Context.Error!bool {
+    const args = switch (call.args) {
+        .known => |each| each,
+        .unknown => return false,
+    };
     const path = try Facts.accesses.pathOf(c.facts, file, call.callee_expr);
     if (path.steps.len >= 2 and path.steps[0].kind == .field) {
         const holder = path.steps[1].node;
@@ -4195,9 +4275,9 @@ fn lent(c: *Context, file: Project.FileId, argument: Ast.Node.Index, kind: Contr
     }
     if (depth == 8) return false;
     // One that may call another function does not lend it: a use the walk leaves undecided.
-    const function = switch (try calledFunction(c, file, call_node)) {
+    const function = switch (call.callee) {
         .function => |called| called,
-        .unknown => return false,
+        .choice, .any => return false,
     };
     if (try c.inLibrary(Contract.library, function.file)) return false;
     const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
