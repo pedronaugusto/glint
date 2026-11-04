@@ -2207,14 +2207,29 @@ const Frame = struct {
         const then_value = try f.eval(then_state, full.ast.then_expr);
         var then_out = try f.assign(then_value.s, t[1], then_value.v.lin, null);
         then_out = try f.assign(then_out, tl, then_value.v.length, null);
+        then_out = try f.branchRange(then_out, t[1], full.ast.then_expr);
         var else_out = yes;
         if (full.ast.else_expr.unwrap()) |else_expr| {
             else_out = try f.capture(else_out, full.error_token, .{}, null);
             const else_value = try f.eval(else_out, else_expr);
             else_out = try f.assign(else_value.s, t[1], else_value.v.lin, null);
             else_out = try f.assign(else_out, tl, else_value.v.length, null);
+            else_out = try f.branchRange(else_out, t[1], else_expr);
         }
         return .{ .s = try f.join(then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+    }
+
+    /// `s` with a branch's value `v` between zero and the most Range shows the branch's
+    /// expression `node` reaches, where it shows it never below zero: the join of the branches
+    /// keeps what each row one branch holds the other shows, so each branch's range survives it
+    /// as the wider of them (`if (c) a else b` of a `u8` and a `u16` is at most 65535), where
+    /// the branches' own rows (`t = a`, `t = b`) do not.
+    fn branchRange(f: *Frame, s: State, v: Var, node: Ast.Node.Index) Error!State {
+        const most = (try Range.stepMost(f.c, f.file, node, f.width)) orelse return s;
+        if (most > std.math.maxInt(Coef)) return s;
+        const x = try single(f.a, v);
+        const out = try assume(f.a, s, try atLeast(f.a, x, constant(0)));
+        return assume(f.a, out, try atLeast(f.a, constant(@intCast(most)), x));
     }
 
     /// The state where an optional or error union held its payload: what the expression's
@@ -2285,6 +2300,7 @@ const Frame = struct {
             const e = try f.eval(arm, case.ast.target_expr);
             var done = try f.assign(e.s, t[1], e.v.lin, null);
             done = try f.assign(done, tl, e.v.length, null);
+            done = try f.branchRange(done, t[1], case.ast.target_expr);
             joined = try f.join(joined, done);
         }
         return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
