@@ -2175,26 +2175,147 @@ fn checkCleanup(c: *Context) Context.Error!void {
     const model = &c.project.at(c.file).model;
     for (0..tree.nodes.len) |i| try checkBinding(c, tree, @fromBackingInt(@intCast(i)), cleanup);
     for (model.declarations) |decl| {
-        const k = (try acquiredOwner(c, tree, model, decl, true)) orelse continue;
-        // A local's statements follow its declaration (a destructure's, the destructure); an
-        // `if`'s payload's are its branch's.
-        const scope = if (decl.kind == .capture) tree.fullIf(decl.node).?.ast.then_expr else model.scopes[@backingInt(decl.scope)].node; // unreachable: acquiredOwner takes only an `if`'s capture
-        var buffer: [2]Ast.Node.Index = undefined;
-        const statements = tree.blockStatements(&buffer, scope) orelse {
-            try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "an acquisition captured by a branch that is no block; no leak claimed");
+        if (try heldOwners(c, tree, model, decl)) |owners| {
+            for (owners) |owner| try follow(c, tree, model, decl, owner.kind, owner.path);
             continue;
-        };
-        const declared = model.parentOf(decl.node);
-        const at = if (decl.kind == .capture) 0 else for (statements, 0..) |stmt, i| {
-            if (stmt == decl.node or (declared != null and stmt == declared.? and Facts.accesses.formOf(tree.nodeTag(stmt)) == .destructure)) break i + 1;
-        } else continue;
-        const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = decl.token, .kind = k, .scope = scope };
-        switch (try flow.walk(statements[at..], .live)) {
-            .paths => |paths| if (paths.falls == .live) try c.at(cleanup, decl.token, "recognized local acquisition reaches block end without cleanup; review ownership obligation"),
-            .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
         }
+        const k = (try acquiredOwner(c, tree, model, decl, true)) orelse continue;
+        try follow(c, tree, model, decl, k, &.{});
     }
     for (0..tree.nodes.len) |i| try strayAcquisition(c, tree, model, @fromBackingInt(@intCast(i)));
+}
+
+/// Walks the owner the local `decl` holds, of kind `k`, from its acquisition to its block's
+/// end: the local itself, or the field of it `path` names (`heldOwners`).
+fn follow(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration, k: Contract.Kind, path: []const []const u8) Context.Error!void {
+    // A local's statements follow its declaration (a destructure's, the destructure); an
+    // `if`'s payload's are its branch's.
+    const scope = if (decl.kind == .capture) tree.fullIf(decl.node).?.ast.then_expr else model.scopes[@backingInt(decl.scope)].node; // unreachable: acquiredOwner takes only an `if`'s capture
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, scope) orelse {
+        return c.undecided(cleanup, tree.tokenStart(decl.token), .unsupported, "an acquisition captured by a branch that is no block; no leak claimed");
+    };
+    const declared = model.parentOf(decl.node);
+    const at = if (decl.kind == .capture) 0 else for (statements, 0..) |stmt, i| {
+        if (stmt == decl.node or (declared != null and stmt == declared.? and Facts.accesses.formOf(tree.nodeTag(stmt)) == .destructure)) break i + 1;
+    } else return;
+    try walkOwner(c, tree, model, decl.token, k, scope, statements[at..], path, decl.token);
+}
+
+/// Walks an owner of kind `k` held by the local `token` declares (at the field `path` names
+/// of it) over `statements` of its block `scope`: a finding at `report` where a path leaves
+/// it held at the block's end, undecided where the walk does not decide.
+fn walkOwner(c: *Context, tree: *const Ast, model: *const Model, token: Ast.TokenIndex, k: Contract.Kind, scope: Ast.Node.Index, statements: []const Ast.Node.Index, path: []const []const u8, report: Ast.TokenIndex) Context.Error!void {
+    const flow: Flow = .{ .c = c, .tree = tree, .model = model, .token = token, .kind = k, .scope = scope, .path = path };
+    switch (try flow.walk(statements, .live)) {
+        .paths => |paths| if (paths.falls == .live) try c.at(cleanup, report, if (path.len == 0) "recognized local acquisition reaches block end without cleanup; review ownership obligation" else "recognized acquisition held in a local's field reaches block end without cleanup; review ownership obligation"),
+        .split, .uncertain => try c.undecided(cleanup, tree.tokenStart(report), .unsupported, "cleanup/error exits/transfers/aliases require unsupported flow facts; no leak claimed"),
+    }
+}
+
+/// An owner a block's local holds from its start, though the local is no owner itself: in a
+/// field of a record of the program's own a call gives (`var held = lockCounted(l);`, held at
+/// `held.guard`), or as its element of a call's tuple it destructures (`var g, const n =
+/// lockCounted(l);`), by what the type holds by value (`Facts.heldFields`). Each is followed as
+/// an owner of its own, at its place. Null where the local holds none, or holds a part A003
+/// does not follow (a nested record, an array, an optional, a type that does not resolve, a
+/// tuple's owner discarded by `_`): the reading of it as an acquisition decides it.
+const HeldOwner = struct { kind: Contract.Kind, path: []const []const u8 };
+fn heldOwners(c: *Context, tree: *const Ast, model: *const Model, decl: Model.Declaration) Context.Error!?[]const HeldOwner {
+    if (decl.kind != .variable or model.scopes[@backingInt(decl.scope)].kind != .block) return null;
+    const variable = tree.fullVarDecl(decl.node) orelse return null;
+    var value: Ast.Node.Index = undefined;
+    var position: ?usize = null;
+    var destructure: ?Ast.full.AssignDestructure = null;
+    if (variable.ast.init_node.unwrap()) |init| {
+        value = init;
+    } else {
+        const parent = model.parentOf(decl.node) orelse return null;
+        if (Facts.accesses.formOf(tree.nodeTag(parent)) != .destructure) return null;
+        destructure = tree.assignDestructure(parent);
+        value = destructure.?.ast.value_expr;
+        position = std.mem.findScalar(Ast.Node.Index, destructure.?.ast.variables, decl.node) orelse return null;
+    }
+    // The call's own result, or what `try` gives of it.
+    var call = value;
+    while (true) switch (tree.nodeTag(call)) {
+        .@"try" => call = tree.nodeData(call).node,
+        .grouped_expression => call = tree.nodeData(call).node_and_token[0],
+        else => break,
+    };
+    var call_buffer: [1]Ast.Node.Index = undefined;
+    _ = tree.fullCall(&call_buffer, call) orelse return null;
+    if (c.facts.madeByParameter(c.file, call) != null) return null;
+    const whole = try c.facts.resolve(c.file, value);
+    // An array of owners of a length the function declares: each element an owner at its
+    // index (`gs[0]`, `gs[1]`); one of no known length is read whole (`acquiredOwner`).
+    if (whole == .array and position == null) {
+        const k = switch (try heldPart(c, whole.array.*)) {
+            .owner => |k| k,
+            .none, .unknown => return null,
+        };
+        const length = (try resultLength(c, call)) orelse return null;
+        if (length == 0 or length > 16) return null;
+        var each: std.ArrayList(HeldOwner) = .empty;
+        for (0..length) |i| {
+            const path = try c.allocator.alloc([]const u8, 1);
+            path[0] = try c.allocator.print("[{d}]", .{i});
+            try each.append(c.allocator, .{ .kind = k, .path = path });
+        }
+        return each.items;
+    }
+    const container = switch (whole) {
+        .instance => |container| container,
+        else => return null,
+    };
+    if (try c.inLibrary(Contract.library, container.file)) return null;
+    if (!try c.facts.program(container.file)) return null;
+    if (try typed(c, whole, 0) != .other) return null;
+    const fields = try c.facts.heldFields(container);
+    var out: std.ArrayList(HeldOwner) = .empty;
+    if (position) |at| {
+        const variables = destructure.?.ast.variables;
+        if (fields.len != variables.len) return null;
+        // Every element is decided first: an owner `_` discards, or a part not followed,
+        // leaves the call to the reading of it as an acquisition.
+        var mine: ?Contract.Kind = null;
+        for (fields, variables, 0..) |field, element, i| switch (try heldPart(c, field.value)) {
+            .none => {},
+            .owner => |k| {
+                if (tree.fullVarDecl(element) == null) return null;
+                if (i == at) mine = k;
+            },
+            .unknown => return null,
+        };
+        try out.append(c.allocator, .{ .kind = mine orelse return null, .path = &.{} });
+        return out.items;
+    }
+    for (fields) |field| switch (try heldPart(c, field.value)) {
+        .none => {},
+        .owner => |k| {
+            const named = field.decl orelse return null;
+            const name = c.project.at(named.file).model.declarations[@backingInt(named.index)].name;
+            const path = try c.allocator.alloc([]const u8, 1);
+            path[0] = name;
+            try out.append(c.allocator, .{ .kind = k, .path = path });
+        },
+        .unknown => return null,
+    };
+    return if (out.items.len == 0) null else out.items;
+}
+
+/// What a field of a record holds for A003: no owner (a pointer borrows), an owner of a kind
+/// with a release, by value, or a part not followed (an owner nested deeper, one with no
+/// release, a type a generic's binding gives or that does not resolve).
+const HeldPart = union(enum) { none, owner: Contract.Kind, unknown };
+fn heldPart(c: *Context, value: Facts.Value) Context.Error!HeldPart {
+    if (value == .pointer) return .none;
+    if (bindingTyped(value)) return .unknown;
+    return switch (try typed(c, value, 1)) {
+        .owner => |k| if (releases(k) != null) .{ .owner = k } else .unknown,
+        .unknown => .unknown,
+        .other => if (try heldInRecord(c, value, 1) == .other) .none else .unknown,
+    };
 }
 
 /// An acquisition whose owner goes anywhere but where A003 follows it: a block's local it
@@ -2247,17 +2368,20 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
                     break :blk false;
                 },
                 // Stored into memory, the owner is the holder's: memory reached through a
-                // pointer or a container's variable. A block's local holding it in a field or
-                // an element (`box.g = l.acquire()`) is not followed, nor is memory that does
-                // not resolve: undecided.
+                // pointer or a container's variable. A block's local holding it in a field
+                // (`box.g = l.acquire()`) is followed from the store, the owner that field;
+                // in an element, or in memory that does not resolve, it is not: undecided.
                 else => switch (try Facts.accesses.storedIn(c.facts, c.file, target)) {
                     .through => return,
                     .declaration => |held| {
                         const model_of = &c.project.at(held.file).model;
                         switch (model_of.scopes[@backingInt(model_of.declarations[@backingInt(held.index)].scope)].kind) {
                             .file, .container => return,
-                            else => break :blk false,
+                            else => if (!in_literal and site.value != null and site.value.? == value) {
+                                if (try storedField(c, tree, model, site.node, target, value)) return;
+                            },
                         }
+                        break :blk false;
                     },
                     .unresolved => break :blk false,
                 },
@@ -2268,6 +2392,74 @@ fn strayAcquisition(c: *Context, tree: *const Ast, model: *const Model, node: As
     _ = (try acquisitionKind(c, tree, value, true)) orelse return;
     if (discarded) return c.at(cleanup, tree.nodeMainToken(node), "an acquisition discarded with `_ =` is never released");
     try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, "an acquisition whose owner is not a block's local, returned, or stored into memory is not followed; no leak claimed");
+}
+
+/// `box.g = l.acquire()`, the statement `store` a direct one of the block that declares the
+/// local `box` by value, the target a field of it (fields of fields, by name, none through a
+/// pointer): the owner `value` acquires is walked from the next statement as that field of the
+/// local. False where the store is no such one, and nothing is walked.
+fn storedField(c: *Context, tree: *const Ast, model: *const Model, store: Ast.Node.Index, target: Ast.Node.Index, value: Ast.Node.Index) Context.Error!bool {
+    const path = try Facts.accesses.pathOf(c.facts, c.file, target);
+    if (path.steps.len < 2) return false;
+    const fields = try c.allocator.alloc([]const u8, path.steps.len - 1);
+    // The steps are the place first, the root last; the path is the root's field first.
+    for (path.steps[0 .. path.steps.len - 1], 0..) |step, i| {
+        if (step.crosses) return false;
+        fields[fields.len - 1 - i] = switch (step.kind) {
+            .field => step.name orelse return false,
+            .index => try c.allocator.print("[{d}]", .{literalIndex(tree, step.node) orelse return false}),
+            else => return false,
+        };
+    }
+    const decl = switch (path.root) {
+        .decl => |decl| decl,
+        .none, .unknown => return false,
+    };
+    if (decl.file != c.file) return false;
+    const record = model.declarations[@backingInt(decl.index)];
+    if (record.kind != .variable or model.scopes[@backingInt(record.scope)].kind != .block) return false;
+    if (try c.facts.resolve(c.file, path.steps[path.steps.len - 1].node) == .pointer) return false;
+    const scope = model.scopes[@backingInt(record.scope)].node;
+    if (model.parentOf(store) != scope) return false;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, scope) orelse return false;
+    const at = std.mem.findScalar(Ast.Node.Index, statements, store) orelse return false;
+    // One that does not resolve is reported where the store is read as not followed.
+    const k = (try acquisitionKind(c, tree, value, false)) orelse return false;
+    try walkOwner(c, tree, model, record.token, k, scope, statements[at + 1 ..], fields, tree.firstToken(value));
+    return true;
+}
+
+/// The length the function a call calls declares its result has (`fn lockBoth(...)
+/// [2]L.Guard`), where it is an integer literal; null otherwise.
+fn resultLength(c: *Context, call: Ast.Node.Index) Context.Error!?usize {
+    const function = switch (try calledFunction(c, c.file, call)) {
+        .function => |function| function,
+        .unknown => return null,
+    };
+    const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
+    if (record.kind != .function) return null;
+    const written = &c.project.at(function.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = written.fullFnProto(&buffer, record.node) orelse return null;
+    const array = (try c.facts.arrayType(function.file, proto.ast.return_type.unwrap() orelse return null)) orelse return null;
+    const length = array.length orelse return null;
+    const typed_in = &c.project.at(array.file).file.tree;
+    if (typed_in.nodeTag(length) != .number_literal) return null;
+    return std.fmt.parseInt(usize, typed_in.tokenSlice(typed_in.nodeMainToken(length)), 0) catch null;
+}
+
+/// The element a step of an owner's path names (`"[1]"`: 1); null for a field's name.
+fn pathIndex(step: []const u8) ?u64 {
+    if (step.len < 3 or step[0] != '[') return null;
+    return std.fmt.parseInt(u64, step[1 .. step.len - 1], 10) catch null;
+}
+
+/// The index the element access `element` reads where it is an integer literal (`gs[1]`).
+fn literalIndex(tree: *const Ast, element: Ast.Node.Index) ?u64 {
+    const index = tree.nodeData(element).node_and_node[1];
+    if (tree.nodeTag(index) != .number_literal) return null;
+    return std.fmt.parseInt(u64, tree.tokenSlice(tree.nodeMainToken(index)), 0) catch null;
 }
 
 /// Whether the place `parent` gives what `at` holds is a local A003 follows: a declaration's,
@@ -2290,7 +2482,9 @@ fn followedAt(c: *Context, tree: *const Ast, model: *const Model, parent: Ast.No
     } else return false;
     for (model.declarations) |decl| {
         const mine = if (payload) |token| decl.kind == .capture and decl.token == token else std.mem.findScalar(Ast.Node.Index, nodes.items, decl.node) != null;
-        if (mine and try acquiredOwner(c, tree, model, decl, false) != null) return true;
+        if (!mine) continue;
+        if (try heldOwners(c, tree, model, decl) != null) return true;
+        if (try acquiredOwner(c, tree, model, decl, false) != null) return true;
     }
     return false;
 }
@@ -2686,6 +2880,10 @@ const Flow = struct {
     /// owner in, which say whether the call takes it whatever comes of it or only when it
     /// returns.
     exits: ?*Exits = null,
+    /// The fields from the local `token` declares to the owner, where the owner is held in one
+    /// (`held.guard`, `box.g`): the owner is that place (`Facts.accesses.pathOf`), the local
+    /// its holder. Empty where the local is the owner.
+    path: []const []const u8 = &.{},
 
     /// `passed`: given by value as a call's argument (`try map.put(gpa, key, owner)`), moved
     /// into the call where nothing names the owner after it; where something does, the callee
@@ -2749,12 +2947,13 @@ const Flow = struct {
                 }
                 if (try f.uses(stmt) != .none) return .uncertain;
             }
-            if (state == .live and !f.aggregate and !f.pointer) if (try f.movedInto(stmt)) |aggregate| {
+            // A place's owner moves with its holder, which is not followed whole.
+            if (state == .live and !f.aggregate and !f.pointer and f.path.len == 0) if (try f.movedInto(stmt)) |aggregate| {
                 f.token = aggregate;
                 f.aggregate = true;
                 continue;
             };
-            if (state == .live and !f.aggregate and !f.pointer) if (try f.copiedInto(stmt)) |copy| {
+            if (state == .live and !f.aggregate and !f.pointer and f.path.len == 0) if (try f.copiedInto(stmt)) |copy| {
                 f.token = copy;
                 continue;
             };
@@ -2797,7 +2996,7 @@ const Flow = struct {
             }
             const tag = f.tree.nodeTag(stmt);
             const deferred = !f.aggregate and tag == .@"defer" and try f.releasesIn(f.tree.nodeData(stmt).node);
-            if (deferred or (!f.aggregate and try release(f.c, stmt, f.token, f.kind))) {
+            if (deferred or (!f.aggregate and try f.releaseAt(stmt))) {
                 if (state != .live) try f.c.at(cleanup, f.tree.nodeMainToken(stmt), if (deferred) "same local capability has repeated cleanup scheduled on this straight-line path" else "same local capability is cleaned twice on this straight-line path");
                 state = if (deferred) .deferred else .released;
                 continue;
@@ -2855,9 +3054,10 @@ const Flow = struct {
         switch (f.tree.nodeTag(stmt)) {
             .@"return" => if (state == .live and !f.pointer) if (f.tree.nodeData(stmt).opt_node.unwrap()) |value| {
                 // The owner itself, returned held, or carried by value in what is returned (a
-                // field of a returned literal, an argument of the call that makes it): its
-                // release is the caller's.
-                if (f.mine(value)) return ends;
+                // field of a returned literal, an argument of the call that makes it), or a
+                // holder of it by value (`return held;` of `held.guard`): its release is the
+                // caller's.
+                if (f.mine(value) or f.carriesOwner(value)) return ends;
                 switch (try f.carried(value)) {
                     .yes => return ends,
                     .unknown => return .uncertain,
@@ -3254,7 +3454,7 @@ const Flow = struct {
     /// consumed (`own.Owned.move`): `owner.move()`, or `if (owner) |o| o.move() else null` of
     /// an optional one, or of an optional pointer to one.
     fn moves(f: Flow, node: Ast.Node.Index) Context.Error!bool {
-        if (f.kind != .owned or f.aggregate) return false;
+        if (f.kind != .owned or f.aggregate or f.path.len != 0) return false;
         if (try f.moveCall(node, null)) return true;
         const branch = f.tree.fullIf(node) orelse return false;
         const payload = branch.payload_token orelse return false;
@@ -3292,7 +3492,7 @@ const Flow = struct {
     /// array literal in it holds as a field or element, nested in turn. The owner is named
     /// nowhere else in `value` but through its members, before the move; null where it is.
     fn kept(f: Flow, value: Ast.Node.Index) Context.Error!?Ast.Node.Index {
-        if (f.kind != .owned or f.aggregate) return null;
+        if (f.kind != .owned or f.aggregate or f.path.len != 0) return null;
         var found: ?Ast.Node.Index = null;
         var named_in = Mentions.of(f.model, f.token, f.tree, value);
         while (named_in.next()) |candidate| {
@@ -3499,16 +3699,110 @@ const Flow = struct {
 
     /// Whether `node` is a name of the owner, by the model's resolution of it.
     fn mine(f: Flow, node: Ast.Node.Index) bool {
-        return declaringToken(f.model, node) == f.token;
+        return declaringToken(f.model, f.readBelow(node, f.path) orelse return false) == f.token;
+    }
+
+    /// The holder `node` reads the fields `fields` from (`box.g` of `.{"g"}`: `box`), each a
+    /// member read by that name; null where it is no such read. A field and a declaration of
+    /// one container are never named alike, so the name is the field.
+    fn readBelow(f: Flow, node: Ast.Node.Index, fields: []const []const u8) ?Ast.Node.Index {
+        var at = node;
+        var left = fields.len;
+        while (left != 0) : (left -= 1) {
+            if (pathIndex(fields[left - 1])) |index| {
+                if (f.tree.nodeTag(at) != .array_access or literalIndex(f.tree, at) != index) return null;
+                at = f.tree.nodeData(at).node_and_node[0];
+                continue;
+            }
+            if (f.tree.nodeTag(at) != .field_access) return null;
+            const holder, const name = f.tree.nodeData(at).node_and_token;
+            if (!std.mem.eql(u8, f.tree.tokenSlice(name), fields[left - 1])) return null;
+            at = holder;
+        }
+        return at;
+    }
+
+    /// Whether `node` is a holder of the owner by value: the local, or a field of it on the
+    /// owner's path short of the owner (`box` of `box.g`). Given or returned whole, it carries
+    /// the owner.
+    fn carriesOwner(f: Flow, node: Ast.Node.Index) bool {
+        for (0..f.path.len) |short| {
+            if (declaringToken(f.model, f.readBelow(node, f.path[0..short]) orelse continue) == f.token) return true;
+        }
+        return false;
+    }
+
+    /// What a name of the owner's local (`mention`) reaches, read up through the members the
+    /// owner's path names: the owner itself (`box.g`), a holder of it used otherwise (`box`
+    /// given, copied, its address taken, a method called on it), or a field beside the path
+    /// (`box.n`), which holds no part of the owner.
+    const Reached = union(enum) { owner: Ast.Node.Index, holder, apart };
+    fn reach(f: Flow, mention: Ast.Node.Index) Context.Error!Reached {
+        var at = mention;
+        for (f.path) |field| {
+            // An element at a constant index (`gs[1]`): one at another is apart, one at an
+            // index that is no literal may be the owner.
+            if (pathIndex(field)) |index| {
+                const element = switch (try Facts.accesses.useOf(f.c.facts, f.c.file, at)) {
+                    .element => |element| element,
+                    else => return .holder,
+                };
+                if (f.tree.nodeTag(element) != .array_access) return .holder;
+                if ((literalIndex(f.tree, element) orelse return .holder) != index) return .apart;
+                at = element;
+                continue;
+            }
+            const read = switch (try Facts.accesses.useOf(f.c.facts, f.c.file, at)) {
+                .member => |read| read,
+                else => return .holder,
+            };
+            if (f.tree.nodeTag(read) != .field_access) return .holder;
+            if (std.mem.eql(u8, f.tree.tokenSlice(f.tree.nodeData(read).node_and_token[1]), field)) {
+                at = read;
+                continue;
+            }
+            // Another field of the holder's type, by its declaration; a method, or a member
+            // that does not resolve, may reach the owner.
+            switch (try f.c.facts.definition(f.c.file, read)) {
+                .decl => |decl| if (f.c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field) return .apart,
+                .none, .unknown => {},
+            }
+            return .holder;
+        }
+        return .{ .owner = at };
+    }
+
+    /// The member `node` calls on the owner (`owner.deinit()`, `box.g.deinit()`), if it is
+    /// such a call.
+    fn calledOwner(f: Flow, node: Ast.Node.Index) Context.Error!?[]const u8 {
+        if (f.path.len == 0) return ownerCall(f.c, node, f.token);
+        const call = (try Facts.calls.at(f.c.facts, f.c.file, node)) orelse return null;
+        if (f.tree.nodeTag(call.callee_expr) != .field_access) return null;
+        if (!f.mine(f.tree.nodeData(call.callee_expr).node_and_token[0])) return null;
+        return memberNamed(f.c, f.c.file, call.callee_expr);
+    }
+
+    /// `owner.<release>(...)` at `node` (`release`), of the owner where it is a place.
+    fn releaseAt(f: Flow, node: Ast.Node.Index) Context.Error!bool {
+        if (f.path.len == 0) return release(f.c, node, f.token, f.kind);
+        // `for (&owners) |*owner| owner.deinit();` releases each element of the local array.
+        if (f.path.len == 1 and pathIndex(f.path[0]) != null and try releasedEach(f.c, node, f.token, f.kind)) return true;
+        return releaseName(f.kind, (try f.calledOwner(node)) orelse return false);
     }
 
     const Use = enum { none, members, other };
     /// How `node` uses the owner: not at all, only through its members (a nested release
-    /// counts as other), or otherwise.
+    /// counts as other), or otherwise. Where the owner is a place, its local's fields beside the
+    /// path are no use; the local, or a holder on the path, used otherwise is.
     fn uses(f: Flow, node: Ast.Node.Index) Context.Error!Use {
         var found: Use = .none;
         var each = Mentions.of(f.model, f.token, f.tree, node);
-        while (each.next()) |candidate| {
+        while (each.next()) |mention| {
+            const candidate = switch (try f.reach(mention)) {
+                .owner => |owner| owner,
+                .holder => return .other,
+                .apart => continue,
+            };
             var use = try Facts.accesses.useOf(f.c.facts, f.c.file, candidate);
             switch (use) {
                 // Lent to a call that holds it again on every return: a borrow.
@@ -3556,21 +3850,46 @@ const Flow = struct {
         return givesOwner(f.c, value);
     }
 
-    /// `owner.handOff()` kept in a local, assigned or returned: the guard's release passes to
-    /// the hand-off, an owner of its own, released once by its `release` (a local of it is
-    /// walked from its acquisition as any owner is, the caller's where it is returned).
+    /// `owner.handOff()` kept in a local (a destructure's among them), assigned or returned:
+    /// the guard's release passes to the hand-off, an owner of its own, released once by its
+    /// `release` (a local of it is walked from its acquisition as any owner is, the caller's
+    /// where it is returned).
     /// Discarded (`_ = owner.handOff()`), the hand-off is the leak, reported there.
     fn handedOff(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         const value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else switch (Facts.accesses.formOf(f.tree.nodeTag(stmt))) {
             .@"return" => f.tree.nodeData(stmt).opt_node.unwrap() orelse return false,
             .assign => f.tree.nodeData(stmt).node_and_node[1],
+            .destructure => return f.handedOffInto(stmt),
             else => return false,
         };
+        return f.handOffCall(value);
+    }
+
+    /// `owner.handOff()`, called on the owner with nothing passed.
+    fn handOffCall(f: Flow, value: Ast.Node.Index) Context.Error!bool {
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return false;
         if (call.ast.params.len != 0) return false;
-        const called = (try calledOn(f.c, f.c.file, value)) orelse return false;
-        return called.on == f.token and std.mem.eql(u8, called.name, handsOn(.guard).?);
+        return std.mem.eql(u8, (try f.calledOwner(value)) orelse return false, handsOn(.guard).?);
+    }
+
+    /// `var h, const m = .{ owner.handOff(), n };`: a destructure of a literal of as many
+    /// elements, one of them the hand-off, kept by a local its element declares (a local
+    /// walked as any hand-off is, `acquiredFrom`). The owner named nowhere else in it.
+    fn handedOffInto(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        const destructure = f.tree.assignDestructure(stmt);
+        var buffer: [2]Ast.Node.Index = undefined;
+        const literal = f.tree.fullArrayInit(&buffer, destructure.ast.value_expr) orelse return false;
+        if (literal.ast.elements.len != destructure.ast.variables.len) return false;
+        var named: usize = 0;
+        var named_in = Mentions.of(f.model, f.token, f.tree, stmt);
+        while (named_in.next()) |_| named += 1;
+        if (named != 1) return false;
+        for (literal.ast.elements, destructure.ast.variables) |element, variable| {
+            if (!try f.handOffCall(element)) continue;
+            return f.tree.fullVarDecl(variable) != null;
+        }
+        return false;
     }
 
     /// A statement that is a call, or keeps or tries its result, with the owner itself among
@@ -3580,6 +3899,7 @@ const Flow = struct {
     /// dependency's among them, is not walked for what it does with its parameter, so a call to
     /// one stays undecided.
     fn argument(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
+        if (f.path.len != 0) return false;
         var value = if (f.tree.fullVarDecl(stmt)) |v| v.ast.init_node.unwrap() orelse return false else if (Facts.accesses.formOf(f.tree.nodeTag(stmt)) == .assign) f.tree.nodeData(stmt).node_and_node[1] else stmt;
         if (f.tree.nodeTag(value) == .@"try") value = f.tree.nodeData(value).node;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -3611,7 +3931,7 @@ const Flow = struct {
     /// finding or an undecided site in that reading, a path that leaves it held but an error
     /// exit, or error exits that disagree, and the call does not take it.
     fn consumed(f: Flow, value: Ast.Node.Index) Context.Error!?Taking {
-        if (f.depth == 8) return null;
+        if (f.depth == 8 or f.path.len != 0) return null;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = f.tree.fullCall(&buffer, value) orelse return null;
         // The owner's address: `&owner`, or the pointer itself where the walk has one.
@@ -3722,14 +4042,14 @@ const Flow = struct {
     /// that makes it once at its top level, the owner named before it only through its members
     /// and not at all after it.
     fn releasesIn(f: Flow, body: Ast.Node.Index) Context.Error!bool {
-        if (try release(f.c, body, f.token, f.kind)) return true;
+        if (try f.releaseAt(body)) return true;
         // `defer session.releaseWrite(&held)`: a function that releases it on every path.
         if (try f.consumed(body) == .always) return true;
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = f.tree.blockStatements(&buffer, body) orelse return false;
         var released = false;
         for (statements) |stmt| {
-            if (!released and try release(f.c, stmt, f.token, f.kind)) {
+            if (!released and try f.releaseAt(stmt)) {
                 released = true;
                 continue;
             }
@@ -3753,7 +4073,7 @@ const Flow = struct {
     /// `owner.deinit()` of a result obligation: the check that its discharge came.
     fn tornDown(f: Flow, stmt: Ast.Node.Index) Context.Error!bool {
         const name = teardown(f.kind) orelse return false;
-        return std.mem.eql(u8, (try ownerCall(f.c, stmt, f.token)) orelse return false, name);
+        return std.mem.eql(u8, (try f.calledOwner(stmt)) orelse return false, name);
     }
 
     /// `_ = &owner;`
