@@ -121,6 +121,10 @@ pub const Made = struct {
     /// Args }` in std's `Thread.spawn`), read in one reading of it: that reading, whose bindings
     /// its names read (`madeEnv`). `call` is then the container's own node.
     reading: ?*const Env = null,
+    /// The reading that binds the type function to this call's arguments (`madeEnv`): what
+    /// the made type is, as Zig makes one type per function and comptime arguments, wherever
+    /// the call is written (`sameMaking`).
+    bound: ?*const Env = null,
 };
 /// One call of a generic function being read: its parameters bound to the call's arguments,
 /// in order (a method's receiver first). A type it returns, or a result type written in terms
@@ -128,8 +132,8 @@ pub const Made = struct {
 pub const Env = struct {
     function: Decl,
     args: []const Value,
-    /// How many calls deep the chain that made it is: a reader of chains bounds it (Taint's
-    /// `readingAt`).
+    /// How many calls deep the chain that first made it is: a reader of chains bounds it
+    /// (Taint's `readingAt`). Not part of what the reading is (`keptReading`).
     depth: usize,
     /// How many type functions' evaluations it is made inside (`evaluateCall`), bounded at 8
     /// so a type function that calls itself with ever new arguments ends; a call of a chain
@@ -3315,6 +3319,7 @@ fn making(self: *Facts, outer: Made) ResolveError!*const Made {
         inner.* = .{ .function = next.function, .file = current.function.file, .call = next.call, .via = current, .assumed = current.assumed };
         current = inner;
     }
+    current.bound = try self.madeEnv(current);
     return current;
 }
 
@@ -3977,13 +3982,16 @@ fn isUnion(self: *const Facts, container: Container) bool {
     return tree.tokenTag(tree.nodeMainToken(scope.node)) == .keyword_union;
 }
 
-/// Whether two readings of a container a type function made are one type: the same call read
-/// with the same bindings (`Line(Plain)` and `Line(Guarded)` are two).
+/// Whether two readings of a container a type function made are one type: the same function
+/// bound to the same arguments (`Line(Plain)` and `Line(Guarded)` are two), wherever each call
+/// is written, as Zig makes one type per function and comptime arguments. A making whose
+/// binding is not read is the same call read with the same bindings.
 fn sameMaking(a: ?*const Made, b: ?*const Made, depth: usize) bool {
     const x = a orelse return b == null;
     const y = b orelse return false;
     if (x == y) return true;
     if (depth >= 64) return false;
+    if (x.bound) |bx| if (y.bound) |by| return sameInstantiation(bx, by, depth + 1);
     if (!std.meta.eql(x.function, y.function) or x.file != y.file or x.call != y.call or x.assumed != y.assumed or x.reading != y.reading) return false;
     if (!sameMaking(x.via, y.via, depth + 1)) return false;
     const ex = x.env orelse return y.env == null;
@@ -4018,11 +4026,15 @@ pub fn sameValue(a: Value, b: Value) bool {
     };
 }
 
-/// The reading `draft` describes, made once: one already made with the same function, depth,
-/// outer reading, arguments (`sameValue`), truths and spellings, or a new one. What `resolveIn`
-/// keeps by a reading's address is then shared by every call that makes it.
+/// The reading `draft` describes, made once: one already made with the same function, outer
+/// reading, arguments (`sameValue`), truths and spellings, however many calls deep each chain
+/// reaching it is, or a new one. What `resolveIn` keeps by a reading's address is then shared
+/// by every call that makes it, and a call of a function in its own reading (`dataField`
+/// handing itself `Field.Value`, unknown where `Field` is) is that reading again. A kept
+/// reading's depth is the chain that first made it, so a chain of ever new readings still ends
+/// (Taint's `readingAt`).
 fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
-    const key: ReadingKey = .{ .function = draft.function, .outer = draft.outer, .depth = draft.depth };
+    const key: ReadingKey = .{ .function = draft.function, .outer = draft.outer };
     const entry = try self.readings.getOrPut(self.gpa, key);
     if (!entry.found_existing) entry.value_ptr.* = .empty;
     for (entry.value_ptr.items) |kept| if (sameEnv(kept.*, draft)) return kept;
@@ -4032,11 +4044,26 @@ fn keptReading(self: *Facts, draft: Env) ResolveError!*const Env {
     return env;
 }
 
-const ReadingKey = struct { function: Decl, outer: ?*const Env, depth: usize };
+const ReadingKey = struct { function: Decl, outer: ?*const Env };
 
 fn sameEnv(a: Env, b: Env) bool {
-    if (a.nested != b.nested or a.args.len != b.args.len or a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
+    if (a.nested != b.nested or a.args.len != b.args.len) return false;
     for (a.args, b.args) |one, other| if (!sameValue(one, other)) return false;
+    return sameComptime(a, b);
+}
+
+/// Whether two readings bind one function to the same arguments in the same enclosing reading,
+/// however many calls deep each is: one instantiation. An unknown argument is never the same.
+fn sameInstantiation(a: *const Env, b: *const Env, depth: usize) bool {
+    if (a == b) return true;
+    if (!std.meta.eql(a.function, b.function) or a.outer != b.outer or a.args.len != b.args.len) return false;
+    for (a.args, b.args) |one, other| if (!same(one, other, depth)) return false;
+    return sameComptime(a.*, b.*);
+}
+
+/// Whether two readings' arguments are the same as conditions and as spelled names and numbers.
+fn sameComptime(a: Env, b: Env) bool {
+    if (a.truths.len != b.truths.len or a.spelled.len != b.spelled.len) return false;
     for (a.truths, b.truths) |one, other| if (one != other) return false;
     for (a.spelled, b.spelled) |one, other| {
         if ((one == null) != (other == null)) return false;
@@ -6291,7 +6318,7 @@ fn readBound(self: *Facts, e: *const Env, file: Project.FileId, node: Ast.Node.I
     if (tree.fullContainerDecl(&container_buffer, node) != null) if (try self.symbolicAt(file, node)) |found| {
         if (self.enclosed(file, found.container.scope, self.scopeNode(e.function))) {
             const made = try self.gpa.create(Made);
-            made.* = .{ .function = e.function, .file = file, .call = node, .reading = e, .assumed = self.assumed };
+            made.* = .{ .function = e.function, .file = file, .call = node, .reading = e, .assumed = self.assumed, .bound = e };
             var out = found.container;
             out.made_by = made;
             return .{ .container = out };
@@ -10783,6 +10810,88 @@ test "a type function is evaluated in a reading however many calls deep its chai
     const value = try facts.resolveBound(env.?, file, node.of(tree, "w.?"));
     const foo = try facts.resolve(file, node.of(tree, "Foo"));
     try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
+}
+
+test "a generic calling itself with what its reading leaves unknown is that reading again, not one more per call" {
+    const source =
+        \\const lib = @import("lib");
+        \\fn data(buffer: []const u32, comptime Field: type) void {
+        \\    data(buffer, Field.Value);
+        \\}
+        \\pub fn main() void {
+        \\    const buffer: []const u32 = &.{};
+        \\    data(buffer, lib.Field);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const data = facts.member(root, "data").?;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const first = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, "data(buffer, lib.Field)")).?, data, null);
+    const inner = tree.fullCall(&buffer, node.of(tree, "data(buffer, Field.Value)")).?;
+    const second = try facts.bind(file, inner, data, first);
+    try std.testing.expect(second.args[1] == .unknown);
+    const third = try facts.bind(file, inner, data, second);
+    try std.testing.expect(third == second);
+}
+
+test "a type function's call written at two sites makes one type: a generic given either is read once" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\const Bar = struct { b: u16 };
+        \\fn Box(comptime T: type) type { return struct { value: T }; }
+        \\fn use(box: anytype) void { _ = box.value; }
+        \\pub fn main() void {
+        \\    const x: Box(Foo) = undefined;
+        \\    const y: Box(Foo) = undefined;
+        \\    const z: Box(Bar) = undefined;
+        \\    use(x);
+        \\    use(y);
+        \\    use(z);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var readings: [3]*const Env = undefined;
+    for ([_][]const u8{ "use(x)", "use(y)", "use(z)" }, &readings) |text, *reading| {
+        var buffer: [1]Ast.Node.Index = undefined;
+        reading.* = try facts.bind(file, tree.fullCall(&buffer, node.of(tree, text)).?, facts.member(root, "use").?, null);
+    }
+    try std.testing.expect(readings[0].args[0] == .instance);
+    try std.testing.expect(readings[0] == readings[1]);
+    try std.testing.expect(readings[0] != readings[2]);
 }
 
 test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
