@@ -2109,6 +2109,17 @@ const Frame = struct {
             bounded = try assume(f.a, bounded, try atLeast(f.a, constant(1), t));
             return .{ .s = bounded, .v = .{ .lin = t } };
         }
+        if (is(which, "@popCount") or is(which, "@ctz") or is(which, "@clz")) {
+            // A count of bits, whatever type it is read in: at most its operand's width, as
+            // Range shows it.
+            const most = (try Range.stepMost(f.c, f.file, node, f.width)) orelse return f.fresh(out, node, 0);
+            if (most > std.math.maxInt(Coef)) return f.fresh(out, node, 0);
+            const made = try f.temp(out, node, 0);
+            const t = try single(f.a, made[1]);
+            var bounded = try assume(f.a, made[0], try atLeast(f.a, t, constant(0)));
+            bounded = try assume(f.a, bounded, try atLeast(f.a, constant(@intCast(most)), t));
+            return .{ .s = bounded, .v = .{ .lin = t } };
+        }
         if (is(which, "@min") or is(which, "@max")) {
             const made = try f.fresh(out, node, 0);
             out = made.s;

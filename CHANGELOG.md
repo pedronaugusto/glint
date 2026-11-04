@@ -31,6 +31,7 @@ All notable changes are documented here, following Keep a Changelog 1.1.0.
 
 ### Fixed
 
+- A010 reads a count of bits (`@popCount`, `@ctz`, `@clz`) a variable holds as at most its operand's width: `var n: u64 = @popCount(x); n += @popCount(y)` takes its step.
 - A010 reads an `if`'s or a `switch`'s value as the wider of its branches' ranges: `var i: u32 = if (c) a else b` of a `u8` and a `u16` is at most 65535, and a step fits. Each branch's own rows (`t = a`) did not survive the join of the branches, which left the value anywhere in its type.
 - A010, A009, A012 and every rule the input fact feeds read a `std.Io.Reader`'s `buffer` field as what the reader read: a peer's bytes, as `buffered()` gives them, but a `Reader.fixed` reader's over the program's own bytes. A read of `r.buffer` was clean, so a count over it (`for (r.buffer) |c| n += @popCount(c)`) was never judged.
 - A018 takes as the writer only a value whose type may hold one: bytes, a list or a number the peer-writer fact reached through std's writes, its results or a branch (an allocation's buffer, `header[0..8]` given to `std.mem.writeInt`) are written, never the writer. Every allocator call in a function a peer writer's bytes reached (`gpa.free(window)`, `points.append(gpa, x)`) was an error's name written to a peer: 353 failing in warp's package lint, 143 in conduit's.

@@ -3052,6 +3052,25 @@ test "A010 finds arithmetic on input that may overflow its type: a byte's sum an
     try expect(pack.integers, input_program, 4);
 }
 
+test "A010 reads a count of bits a variable holds as at most its operand's width" {
+    // Two words' counts stored in a `u64` take a step; in the `u7` `@popCount` gives, they may
+    // pass it.
+    try expect(pack.integers,
+        \\const std = @import("std");
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    const x = try r.takeInt(u64, 0);
+        \\    const y = try r.takeInt(u64, 0);
+        \\    var n: u64 = @popCount(x);
+        \\    n += @popCount(y);
+        \\    var m: u64 = @ctz(x);
+        \\    m += @clz(y);
+        \\    var k = @popCount(x);
+        \\    k += @popCount(y);
+        \\    return n ^ m ^ k;
+        \\}
+    , 1);
+}
+
 test "A010 reads an if's or a switch's value as the wider of its branches' ranges" {
     // A byte or a short stored in a `u32` takes a step; a byte or 255 stored in a `u8` does not.
     try expect(pack.integers,
