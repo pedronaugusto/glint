@@ -414,6 +414,9 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 unknown = unknown or level == .unknown;
             }
             if (!unbounded and !by_input and !unknown) continue;
+            // Passes shown within memory the function holds are no more than the work a peer
+            // sent, whatever the condition reads (A009's reading).
+            if (try Proof.passes(c, c.file, node)) continue;
             if (try cancels(c, c.file, body, 0, .{})) continue;
             if (after) |each| if (try cancels(c, c.file, each, 0, .{})) continue;
             // A bound the input fact cannot read may be one a peer sets: never cleared.
@@ -1334,7 +1337,9 @@ fn endsLoop(tree: *const Ast, model: *const Model, body: Ast.Node.Index, target:
 }
 
 /// Whether a branch in a loop's body runs every so many passes: `if (x % k == 0)` with `k` a
-/// constant other than zero and `x` stepped by one every pass, or a countdown `if (x == 0)`
+/// constant other than zero, or `if (x & m == 0)` with `m` a constant (true at least once in
+/// every 2^b passes, b the bits `m` spans), each with `x` stepped by one every pass, or a
+/// countdown `if (x == 0)`
 /// that sets `x` to a constant other than zero on every path through the branch, with `x`
 /// stepped down every pass. Any other condition may hold once, or never.
 fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.Node.Index) Context.Error!bool {
@@ -1347,6 +1352,13 @@ fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.No
         const counter, const by = tree.nodeData(compared).node_and_node;
         // The divisor a constant the program fixes (Range.constantValue), other than zero.
         if ((try Range.constantValue(c, file, by) orelse return false) == 0) return false;
+        return stepped(c, file, (try counterOf(c, file, counter)) orelse return false, body, .add, null);
+    }
+    if (tree.nodeTag(compared) == .bit_and) {
+        const counter, const mask = tree.nodeData(compared).node_and_node;
+        // The mask a constant the program fixes (Range.constantValue): any one holds at least
+        // once in every 2^b passes of a counter stepped by one.
+        _ = (try Range.constantValue(c, file, mask)) orelse return false;
         return stepped(c, file, (try counterOf(c, file, counter)) orelse return false, body, .add, null);
     }
     return stepped(c, file, (try counterOf(c, file, compared)) orelse return false, body, .sub, branch.ast.then_expr);
