@@ -19,6 +19,9 @@ known: ?Package = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
+/// Each condition's truth on a reading (`comptimeTruth`), by the interned reading (`keptReading`)
+/// and the comptime conditions settled around it.
+truths: std.AutoHashMapUnmanaged(TruthKey, ?bool) = .empty,
 /// Each reading made (`keptReading`), by its function, outer reading and depth.
 readings: std.AutoHashMapUnmanaged(ReadingKey, std.ArrayList(*const Env)) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
@@ -82,6 +85,11 @@ building_analysis: bool = false,
 /// How many answers were given wider than the analysis gives once built (`building_analysis`):
 /// what one is read on, whatever reads it while the count grows, is not memoized.
 wide: usize = 0,
+/// How many times a query met one still in progress and answered unknown for it: a resolution
+/// in progress or past its depth, a field's stores being read. An unknown read meanwhile is
+/// provisional: the core's one signal for it, which every memo that keeps an unknown checks
+/// (snapshot before the read, keep the unknown only where it did not move), as `comptimeTruth` does.
+open_met: usize = 0,
 /// The analysis being built (`analysis`): a store of a function-pointer field counts once the
 /// walk reaches its part (`storeCounts`).
 walk: ?*Analysis = null,
@@ -93,6 +101,7 @@ pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
 const Settled = struct { key: Key, assumed: ?Assumptions.Id };
 const Bound = struct { env: *const Env, settled: Settled };
+const TruthKey = struct { key: Key, env: ?*const Env, assumed: ?Assumptions.Id };
 /// A set of settled assumptions, held once in `settled`.
 const Assumptions = struct {
     held: []const Assumption,
@@ -560,10 +569,16 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     if (self.project.at(file).file.status != .parsed) return .{ .unknown = .invalid_front_end };
     const key: Settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed };
     if (self.cache.get(key)) |value| return value;
-    if (self.active.count() >= 128) return .{ .unknown = .budget };
+    if (self.active.count() >= 128) {
+        self.open_met += 1;
+        return .{ .unknown = .budget };
+    }
     if (self.remaining == 0) return .{ .unknown = .budget };
     self.remaining -= 1;
-    if (self.active.contains(key)) return .{ .unknown = .cycle };
+    if (self.active.contains(key)) {
+        self.open_met += 1;
+        return .{ .unknown = .cycle };
+    }
     try self.active.put(self.gpa, key, {});
     defer _ = self.active.remove(key);
     const outer = self.assumed;
@@ -2084,6 +2099,21 @@ pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 /// `info.is_tuple` (`isTuple`); and a call to a function returning `bool` whose body decides
 /// it (`callTruth`).
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
+    const key: TruthKey = .{ .key = .{ .file = file, .node = node }, .env = env, .assumed = self.assumed };
+    if (self.truths.get(key)) |kept| return kept;
+    const wide = self.wide;
+    const met = self.open_met;
+    const answer = try self.comptimeTruthRead(env, file, node);
+    // Kept as `resolve` keeps a value: read with budget left and on no answer wider than the built
+    // analysis gives (`wideSince`). A known truth holds whatever a query in progress gave inside
+    // it: `and`, `or` and `!` know an answer only where the unknown side cannot change it. An
+    // unknown is kept only where it met none (`open_met`): one that did is asked again.
+    if (self.remaining != 0 and !self.wideSince(wide) and (answer != null or self.open_met == met)) try self.truths.put(self.gpa, key, answer);
+    return answer;
+}
+
+/// `comptimeTruth`, read.
+fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     if (self.truth(env, file, node)) |known| return known;
     const tree = &self.project.at(file).file.tree;
     const condition = conditionOf(tree, node);
@@ -3195,7 +3225,10 @@ fn storedFunctions(self: *Facts, container: Container, name: []const u8) Resolve
     const field = self.member(container, name) orelse return null;
     if (self.project.at(field.file).model.declarations[@backingInt(field.index)].kind != .field) return null;
     if (self.stored.get(field)) |known| return known;
-    if (self.storing.contains(field)) return null;
+    if (self.storing.contains(field)) {
+        self.open_met += 1;
+        return null;
+    }
     try self.storing.put(self.gpa, field, {});
     defer _ = self.storing.remove(field);
     const wide = self.wide;
@@ -13704,4 +13737,50 @@ test "a memo the walk was handed is replaced once the analysis is built, one it 
     try std.testing.expect(try facts.memo(accesses.State) != index);
     try std.testing.expect(try facts.memo(Untouched) == untouched and untouched.n == 7);
     try std.testing.expect(try facts.analysis() == found);
+}
+
+test "a condition read inside a cycle is not kept: asked again once the cycle closes, on its reading or another, it is decided" {
+    const source =
+        \\const Plain = struct {};
+        \\const T = Plain;
+        \\fn g(comptime X: type) void {
+        \\    _ = X;
+        \\    if (T == Plain) {}
+        \\}
+        \\
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root.zig", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const model = &project.sources[0].model;
+    const condition = node.of(tree, "T == Plain");
+    const named = tree.nodeData(condition).node_and_node[0];
+    // `T` is being read: the condition asked meanwhile meets the cycle and is not decided.
+    const reading: Settled = .{ .key = .{ .file = file, .node = named }, .assumed = facts.assumed };
+    try facts.active.put(facts.gpa, reading, {});
+    try std.testing.expectEqual(@as(?bool, null), try facts.comptimeTruth(null, file, condition));
+    _ = facts.active.remove(reading);
+    // That unknown was provisional, not kept: asked again once the cycle closes, it is decided.
+    try std.testing.expectEqual(@as(?bool, true), try facts.comptimeTruth(null, file, condition));
+    // As another reading of `g` decides it.
+    const g = for (model.declarations, 0..) |d, i| {
+        if (d.kind == .function and std.mem.eql(u8, d.name, "g")) break Decl{ .file = file, .index = @fromBackingInt(@intCast(i)) };
+    } else unreachable; // unreachable: the source declares g
+    const argument = try facts.resolve(file, node.of(tree, "Plain"));
+    const env = try facts.keptReading(.{ .function = g, .args = &.{argument}, .depth = 0, .values = &.{false} });
+    try std.testing.expectEqual(@as(?bool, true), try facts.comptimeTruth(env, file, condition));
 }
