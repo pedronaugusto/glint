@@ -1224,7 +1224,7 @@ fn madeReleased(c: *Context, file: Project.FileId, node: Ast.Node.Index, name: [
         // An `if`'s or a `while`'s condition, by each read of what it captures of it.
         .tested => |branch| return madeCaptured(c, file, branch, node, name, holder, next),
         .switched => |at| return madeSwitched(c, file, at, name, next),
-        .stored => |store| if (try madeStored(c, file, store.node, name, holder, next)) |answer| return answer,
+        .stored => |store| if (try madeStored(c, file, store, name, holder, next)) |answer| return answer,
         // Kept in another literal's field (`.{ .lent = dir }`, held.Parent's): where each read
         // of that field of the literal's type gives it, a prong's capture of it among them.
         .field_of => |field| {
@@ -1264,8 +1264,14 @@ fn madeSwitched(c: *Context, file: Project.FileId, at: Ast.Node.Index, name: []c
         const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
         if (case.payload_token == null) continue;
         var others = case.ast.values.len != 0 and case.inline_token == null;
+        // A prong naming only other tags (Facts.tagNamed) does not take it; one naming it, or a
+        // value naming no tag known, may.
         for (case.ast.values) |value| {
-            if (tree.nodeTag(value) != .enum_literal or std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), name)) others = false;
+            const tag = (try c.facts.tagNamed(file, value)) orelse {
+                others = false;
+                continue;
+            };
+            if (std.mem.eql(u8, tag.name, name)) others = false;
         }
         if (others) continue;
         for (model.declarations, 0..) |decl, i| {
@@ -1277,28 +1283,38 @@ fn madeSwitched(c: *Context, file: Project.FileId, at: Ast.Node.Index, name: []c
     return result;
 }
 
-/// `madeReleased` of a value the assignment `store` stores: into a local, by each read of it;
-/// into a field, by that field's reads (`keptReleased`); null for another target.
-fn madeStored(c: *Context, file: Project.FileId, store: Ast.Node.Index, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!?Stored {
-    const tree = &c.project.at(file).file.tree;
+/// `madeReleased` of a value the store `store` writes, by the place its target names
+/// (Facts.accesses.pathOf): a local of the function, by each read of it; a field, by that
+/// field's reads (`keptReleased`); null for another place. A variable outside a function may be
+/// read from any file: unknown.
+fn madeStored(c: *Context, file: Project.FileId, store: Facts.accesses.Site, name: []const u8, holder: ?Facts.Container, depth: u8) Context.Error!?Stored {
     const model = &c.project.at(file).model;
-    if (tree.nodeTag(store) != .assign) return null;
-    const target = tree.nodeData(store).node_and_node[0];
-    switch (tree.nodeTag(target)) {
-        .identifier => {
-            const id = (model.reference(target) orelse return .unknown).declaration orelse return .unknown;
+    const target = store.target orelse return null;
+    const path = try Facts.accesses.pathOf(c.facts, file, target);
+    const place = path.steps[0];
+    switch (place.kind) {
+        .root => {
+            const id = switch (path.root) {
+                .decl => |d| d,
+                .none => return null,
+                .unknown => return .unknown,
+            };
+            if (id.file != file) return .unknown;
+            switch (model.scopes[@backingInt(model.declarations[@backingInt(id.index)].scope)].kind) {
+                .file, .container => return .unknown,
+                else => {},
+            }
             var result: Stored = .no;
             for (model.references) |reference| {
-                if (reference.declaration != id or reference.node == target) continue;
+                if (reference.declaration != id.index or reference.node == target) continue;
                 result = join(result, try madeReleased(c, file, reference.node, name, holder, depth));
                 if (result == .yes) return .yes;
             }
             return result;
         },
-        .field_access => {
-            const receiver, const token = tree.nodeData(target).node_and_token;
-            const keeper = byPointer(try c.facts.resolve(file, receiver)) orelse return .unknown;
-            return try keptReleased(c, keeper, tree.tokenSlice(token), name, holder);
+        .field => {
+            const keeper = byPointer(place.holder orelse return .unknown) orelse return .unknown;
+            return try keptReleased(c, keeper, place.name orelse return .unknown, name, holder);
         },
         else => return null,
     }
@@ -1463,8 +1479,8 @@ fn keptReads(c: *Context, keeper: Facts.Container, field: []const u8, name: []co
 const Prong = struct { file: Project.FileId, subject: Ast.Node.Index, case: Ast.Node.Index };
 
 /// The prongs of the program's switches that capture a payload, made once per run
-/// (`Facts.memo`): by each tag a prong names, and those that name one otherwise or none
-/// (`else`, `inline else`, a tag named through its type), which may capture any.
+/// (`Facts.memo`): by each tag a prong names (Facts.tagNamed), and those that name none known
+/// (`else`, `inline else`, a value whose tag does not resolve), which may capture any.
 const UnionProngs = struct {
     built: bool = false,
     named: std.StringHashMapUnmanaged(std.ArrayList(Prong)) = .empty,
@@ -1487,11 +1503,11 @@ fn unionProngs(c: *Context) Context.Error!*const UnionProngs {
                 const prong: Prong = .{ .file = source.id, .subject = chosen.ast.condition, .case = case_node };
                 var by_literal = case.ast.values.len != 0 and case.inline_token == null;
                 for (case.ast.values) |value| {
-                    if (tree.nodeTag(value) != .enum_literal) {
+                    const tag = (try c.facts.tagNamed(source.id, value)) orelse {
                         by_literal = false;
                         continue;
-                    }
-                    const entry = try index.named.getOrPut(gpa, try gpa.dupe(u8, tree.tokenSlice(tree.nodeMainToken(value))));
+                    };
+                    const entry = try index.named.getOrPut(gpa, try gpa.dupe(u8, tag.name));
                     if (!entry.found_existing) entry.value_ptr.* = .empty;
                     try entry.value_ptr.append(gpa, prong);
                 }
@@ -3052,7 +3068,7 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
         const model = &c.project.at(use.file).model;
         var at = use.node;
         const parent = while (model.parentOf(at)) |parent| : (at = parent) {
-            if (madeOf(tree, parent, at, name)) continue;
+            if (try madeOf(c, use.file, parent, at, name)) continue;
             break parent;
         } else null;
         const node = parent orelse continue;
@@ -3087,7 +3103,8 @@ fn carried(c: *Context, uses: *std.ArrayList(Facts.Key), name: []const u8) Conte
 /// `state` on (`carried`). A value a `switch` or an `if` on it chooses carries it unless each it
 /// may choose is read from another place (`otherPlace`): `if (p.len == 1) p.one else
 /// table[p.start + i]` gives a code point, not the state.
-fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index, state: []const u8) bool {
+fn madeOf(c: *Context, file: Project.FileId, parent: Ast.Node.Index, at: Ast.Node.Index, state: []const u8) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
     switch (tree.nodeTag(parent)) {
         .unwrap_optional, .grouped_expression, .deref, .address_of, .bool_not => return true,
         .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => return true,
@@ -3105,24 +3122,25 @@ fn madeOf(tree: *const Ast, parent: Ast.Node.Index, at: Ast.Node.Index, state: [
     if (tree.fullCall(&buffer, parent)) |call| return tree.nodeTag(call.ast.fn_expr) == .field_access and call.ast.fn_expr == at and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(at).node_and_token[1]), "load");
     if (tree.fullSwitch(parent)) |choice| {
         if (choice.ast.condition != at) return false;
-        for (choice.ast.cases) |case| if (!otherPlace(tree, tree.fullSwitchCase(case).?.ast.target_expr, state)) return true; // unreachable: a switch's cases are cases
+        for (choice.ast.cases) |case| if (!try otherPlace(c, file, tree.fullSwitchCase(case).?.ast.target_expr, state)) return true; // unreachable: a switch's cases are cases
         return false;
     }
     if (tree.fullIf(parent)) |branch| {
         if (branch.ast.cond_expr != at or branch.payload_token != null) return false;
         const otherwise = branch.ast.else_expr.unwrap() orelse return true;
-        return !otherPlace(tree, branch.ast.then_expr, state) or !otherPlace(tree, otherwise, state);
+        return !try otherPlace(c, file, branch.ast.then_expr, state) or !try otherPlace(c, file, otherwise, state);
     }
     return false;
 }
 
-/// Whether `value` is read from a place other than the state `name`: another field of a holder
-/// (`p.one`), or an element (`table[i]`).
-fn otherPlace(tree: *const Ast, value: Ast.Node.Index, name: []const u8) bool {
-    return switch (tree.nodeTag(value)) {
-        .grouped_expression => otherPlace(tree, tree.nodeData(value).node_and_token[0], name),
-        .field_access => !std.mem.eql(u8, tree.tokenSlice(tree.nodeData(value).node_and_token[1]), name),
-        .array_access => true,
+/// Whether `value` is read from a place other than the state `name`, by the place it names
+/// (Facts.accesses.pathOf): another field of a holder (`p.one`), or an element (`table[i]`). A
+/// field `@field` names by a name it computes may be the state.
+fn otherPlace(c: *Context, file: Project.FileId, value: Ast.Node.Index, name: []const u8) Context.Error!bool {
+    const place = (try Facts.accesses.pathOf(c.facts, file, value)).steps[0];
+    return switch (place.kind) {
+        .field => !std.mem.eql(u8, place.name orelse return false, name),
+        .index => true,
         else => false,
     };
 }
