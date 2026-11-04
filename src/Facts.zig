@@ -22,6 +22,10 @@ bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
 /// Each condition's truth on a reading (`comptimeTruth`), by the interned reading (`keptReading`)
 /// and the comptime conditions settled around it.
 truths: std.AutoHashMapUnmanaged(TruthKey, ?bool) = .empty,
+/// The conditions `comptimeTruth` is reading: one asked again inside its own reading is unknown.
+truths_open: std.AutoHashMapUnmanaged(TruthKey, void) = .empty,
+/// How many `callTruth`s are being read, one inside another.
+truth_calls: u8 = 0,
 /// Each reading made (`keptReading`), by its function, outer reading and depth.
 readings: std.AutoHashMapUnmanaged(ReadingKey, std.ArrayList(*const Env)) = .empty,
 active: std.AutoHashMapUnmanaged(Settled, void) = .empty,
@@ -327,6 +331,7 @@ pub fn deinit(self: *Facts) void {
     self.bound.deinit(self.gpa);
     self.readings.deinit(self.gpa);
     self.active.deinit(self.gpa);
+    self.truths_open.deinit(self.gpa);
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
     self.copier_names.deinit(self.gpa);
@@ -2193,6 +2198,13 @@ pub fn literalOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resol
 fn comptimeTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!?bool {
     const key: TruthKey = .{ .key = .{ .file = file, .node = node }, .env = env, .assumed = self.assumed };
     if (self.truths.get(key)) |kept| return kept;
+    // A condition that decides itself (a `bool` function asking itself on the same reading)
+    // is not known by its own reading: unknown, and kept by no reading in progress.
+    if ((try self.truths_open.getOrPut(self.gpa, key)).found_existing) {
+        self.open_met += 1;
+        return null;
+    }
+    defer _ = self.truths_open.remove(key);
     const wide = self.wide;
     const met = self.open_met;
     const answer = try self.comptimeTruthRead(env, file, node);
@@ -2232,6 +2244,18 @@ fn comptimeTruthRead(self: *Facts, env: ?*const Env, file: Project.FileId, node:
         },
         .other => |value| value,
     };
+    // A `switch` or an `if` giving a `bool`: the branch the bindings take, where they take one.
+    if (tree.fullSwitch(at)) |choice| {
+        const taken = (try self.takenProng(env, file, choice)) orelse return null;
+        if (taken.other != null) return null;
+        return self.comptimeTruth(env, file, tree.fullSwitchCase(choice.ast.cases[taken.one]).?.ast.target_expr); // unreachable: a switch's cases are cases
+    }
+    if (tree.fullIf(at)) |branch| {
+        if (branch.payload_token != null or branch.error_token != null) return null;
+        const otherwise = branch.ast.else_expr.unwrap() orelse return null;
+        const taken = (try self.comptimeTruth(env, file, branch.ast.cond_expr)) orelse return null;
+        return self.comptimeTruth(env, file, if (taken) branch.ast.then_expr else otherwise);
+    }
     if (try self.isTuple(env, file, at)) |known| return known;
     if (try self.callTruth(env, file, at)) |known| return known;
     if (!isBuiltin(tree, at, "@hasDecl")) return null;
@@ -7665,6 +7689,9 @@ fn kindCompared(self: *Facts, env: ?*const Env, file: Project.FileId, left: Ast.
     return std.mem.eql(u8, kind, try self.memberName(tree.tokenSlice(tree.nodeMainToken(tag))));
 }
 
+/// How many `callTruth`s are read one inside another, at most.
+const truth_call_limit = 8;
+
 /// What a call to a function returning `bool` gives on the reading `env` binds, where its body
 /// decides it as the program compiles (`std.meta.hasFn(T, "jsonParse")`): its statements read
 /// in the reading the call makes, each `if` and `switch` there settled by its bindings, up to
@@ -7673,7 +7700,14 @@ fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     const tree = &self.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     _ = tree.fullCall(&buffer, node) orelse return null;
-    if (env) |e| if (e.depth >= 8) return null;
+    // Bounded by how many are read one inside another, not by how deep the caller's reading
+    // is: a cut answer is unknown and kept by no reading in progress.
+    if (self.truth_calls >= truth_call_limit) {
+        self.open_met += 1;
+        return null;
+    }
+    self.truth_calls += 1;
+    defer self.truth_calls -= 1;
     const read = (try calls.under(self, env, file, node)) orelse return null;
     const decl = switch (read.callee) {
         .function => |d| d,
@@ -7689,7 +7723,7 @@ fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     const result = proto.ast.return_type.unwrap() orelse return null;
     if (held.nodeTag(result) != .identifier or !std.mem.eql(u8, held.tokenSlice(held.nodeMainToken(result)), "bool")) return null;
     const bound = (try self.readingFrom(file, node, decl, env)) orelse return null;
-    return switch (try self.decidedReturn(bound, decl.file, held.nodeData(whole).node_and_node[1])) {
+    return switch (try self.decidedReturn(bound, decl.file, held.nodeData(whole).node_and_node[1], decided_forks)) {
         .returns => |value| value,
         .falls, .unknown => null,
     };
@@ -7699,16 +7733,14 @@ fn callTruth(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
 /// through to the next, or is not known to do either.
 const Decided = union(enum) { returns: bool, falls, unknown };
 
-fn decidedReturn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index) ResolveError!Decided {
+/// How many `if`s whose condition the bindings do not settle `decidedReturn` reads both ways of,
+/// one inside another: past it, unknown.
+const decided_forks = 4;
+
+fn decidedReturn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, forks: u8) ResolveError!Decided {
     const tree = &self.project.at(file).file.tree;
     var buffer: [2]Ast.Node.Index = undefined;
-    if (tree.blockStatements(&buffer, node)) |statements| {
-        for (statements) |statement| switch (try self.decidedReturn(env, file, statement)) {
-            .falls => continue,
-            else => |decided| return decided,
-        };
-        return .falls;
-    }
+    if (tree.blockStatements(&buffer, node)) |statements| return self.decidedSequence(env, file, statements, forks);
     if (tree.nodeTag(node) == .@"return") {
         const value = tree.nodeData(node).opt_node.unwrap() orelse return .unknown;
         return if (try self.comptimeTruth(env, file, value)) |known| .{ .returns = known } else .unknown;
@@ -7717,16 +7749,48 @@ fn decidedReturn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast
     if (tree.fullIf(node)) |branch| {
         if (branch.payload_token != null or branch.error_token != null) return unsettled;
         const taken = (try self.comptimeTruth(env, file, branch.ast.cond_expr)) orelse return unsettled;
-        if (taken) return self.decidedReturn(env, file, branch.ast.then_expr);
-        return if (branch.ast.else_expr.unwrap()) |otherwise| self.decidedReturn(env, file, otherwise) else .falls;
+        if (taken) return self.decidedReturn(env, file, branch.ast.then_expr, forks);
+        return if (branch.ast.else_expr.unwrap()) |otherwise| self.decidedReturn(env, file, otherwise, forks) else .falls;
     }
     if (tree.fullSwitch(node)) |choice| {
         const taken = (try self.takenProng(env, file, choice)) orelse return unsettled;
         // An array may take a vector's prong too: decided only where one is taken.
         if (taken.other != null) return unsettled;
-        return self.decidedReturn(env, file, tree.fullSwitchCase(choice.ast.cases[taken.one]).?.ast.target_expr); // unreachable: a switch's cases are cases
+        return self.decidedReturn(env, file, tree.fullSwitchCase(choice.ast.cases[taken.one]).?.ast.target_expr, forks); // unreachable: a switch's cases are cases
     }
     return unsettled;
+}
+
+/// `decidedReturn` of statements run in order: the first that does not fall through decides.
+/// An `if` whose condition the bindings do not settle is read both ways, each followed by the
+/// statements after it where it falls through, and decides where both ways do alike:
+/// `if (unsettled) return false;` before a `return false` the bindings reach.
+fn decidedSequence(self: *Facts, env: ?*const Env, file: Project.FileId, statements: []const Ast.Node.Index, forks: u8) ResolveError!Decided {
+    const tree = &self.project.at(file).file.tree;
+    for (statements, 0..) |statement, n| switch (try self.decidedReturn(env, file, statement, forks)) {
+        .falls => continue,
+        .returns => |value| return .{ .returns = value },
+        .unknown => {
+            if (forks == 0) return .unknown;
+            const branch = tree.fullIf(statement) orelse return .unknown;
+            if (branch.payload_token != null or branch.error_token != null) return .unknown;
+            if (try self.comptimeTruth(env, file, branch.ast.cond_expr) != null) return .unknown;
+            const rest = statements[n + 1 ..];
+            const then = try self.decidedThen(env, file, branch.ast.then_expr, rest, forks - 1);
+            const otherwise = if (branch.ast.else_expr.unwrap()) |other| try self.decidedThen(env, file, other, rest, forks - 1) else try self.decidedSequence(env, file, rest, forks - 1);
+            if (std.meta.eql(then, otherwise)) return then;
+            return .unknown;
+        },
+    };
+    return .falls;
+}
+
+/// `decidedReturn` of a branch, then of the statements after it where it falls through.
+fn decidedThen(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.Index, rest: []const Ast.Node.Index, forks: u8) ResolveError!Decided {
+    return switch (try self.decidedReturn(env, file, node, forks)) {
+        .falls => self.decidedSequence(env, file, rest, forks),
+        else => |decided| decided,
+    };
 }
 
 /// Whether `node` holds a `return`.
@@ -14436,6 +14500,89 @@ test "reachedUnder: a binding decides a type's kind, whether a struct is a tuple
     for (rows) |row| {
         const env = try arena.allocator().create(Env);
         env.* = .{ .function = named.decl(model, file, row.function), .args = &.{row.bound}, .depth = 0 };
+        try std.testing.expectEqual(row.reached, try facts.reachedUnder(env, file, casts.items[row.cast]));
+    }
+}
+
+test "reachedUnder: a bool function's body decides by the branch a switch or an if takes, both ways of a condition it does not settle where they agree, and however deep the caller's reading is" {
+    const source =
+        \\fn kind(comptime T: type) ?u8 {
+        \\    _ = T;
+        \\    return null;
+        \\}
+        \\fn scalar(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .int => true,
+        \\        else => false,
+        \\    };
+        \\}
+        \\fn guarded(comptime T: type) bool {
+        \\    if (kind(T) != null) return true;
+        \\    return @typeInfo(T) == .int;
+        \\}
+        \\fn asking(comptime T: type) bool {
+        \\    if (kind(T) != null) return asking(T);
+        \\    return false;
+        \\}
+        \\fn bySwitch(comptime T: type) T {
+        \\    if (comptime scalar(T)) return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+        \\fn byBoth(comptime T: type) T {
+        \\    if (comptime guarded(T)) return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+        \\fn byItself(comptime T: type) T {
+        \\    if (comptime asking(T)) return undefined;
+        \\    return @enumFromInt(0);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    const model = &project.sources[0].model;
+    const named = struct {
+        fn decl(m: *const Model, f: Project.FileId, name: []const u8) Decl {
+            for (m.declarations, 0..) |d, i| if (std.mem.eql(u8, d.name, name) and d.kind != .parameter) return .{ .file = f, .index = @fromBackingInt(@intCast(i)) };
+            unreachable; // unreachable: the source declares each name asked
+        }
+    };
+    const int: Value = .{ .primitive = "u32" };
+    const float: Value = .{ .primitive = "f32" };
+    // Each `@enumFromInt`, in the order the functions declare them.
+    var casts: std.ArrayList(Ast.Node.Index) = .empty;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if ((tag == .builtin_call_two or tag == .builtin_call_two_comma) and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@enumFromInt")) try casts.append(arena.allocator(), node);
+    }
+    std.mem.sort(Ast.Node.Index, casts.items, tree, struct {
+        fn less(t: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+            return t.nodeMainToken(a) < t.nodeMainToken(b);
+        }
+    }.less);
+    try std.testing.expectEqual(3, casts.items.len);
+    const Row = struct { function: []const u8, cast: usize, bound: Value, depth: usize = 0, reached: bool };
+    const rows = [_]Row{
+        // `return switch (@typeInfo(T))`: the prong the binding takes gives the value.
+        .{ .function = "bySwitch", .cast = 0, .bound = int, .reached = false },
+        .{ .function = "bySwitch", .cast = 0, .bound = float, .reached = true },
+        // `kind(T) != null` is not settled; both ways return true for an int, and they differ
+        // for a float (true, or false past it): undecided, so reached.
+        .{ .function = "byBoth", .cast = 1, .bound = int, .reached = false },
+        .{ .function = "byBoth", .cast = 1, .bound = float, .reached = true },
+        // A caller's reading deep in a chain of calls decides it all the same.
+        .{ .function = "byBoth", .cast = 1, .bound = int, .depth = 12, .reached = false },
+        // `asking(T)` asks itself on the same reading: not known by its own reading.
+        .{ .function = "byItself", .cast = 2, .bound = int, .reached = true },
+    };
+    for (rows) |row| {
+        const env = try arena.allocator().create(Env);
+        env.* = .{ .function = named.decl(model, file, row.function), .args = &.{row.bound}, .depth = row.depth };
         try std.testing.expectEqual(row.reached, try facts.reachedUnder(env, file, casts.items[row.cast]));
     }
 }
