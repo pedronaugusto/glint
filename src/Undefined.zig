@@ -1194,9 +1194,11 @@ const Walk = struct {
             for (loop.ast.inputs) |input| if (try passes(w.c, w.file, input)) return body;
             return state;
         }
-        // A `bool` constant keeps what its being true shows: `const ok = n == 64 and if
-        // (fill(&buf)) |_| true else |_| false`.
-        const past = try w.simple(node, state);
+        // A declaration whose value chooses or is a labeled block is walked as that value: each
+        // prong from what precedes it, a block's statements in order, a break taking what it
+        // holds to the block's end. A `bool` constant keeps what its being true shows: `const ok
+        // = n == 64 and if (fill(&buf)) |_| true else |_| false`.
+        const past = if (w.choosingValue(node)) |value| try w.statement(value, state) else try w.simple(node, state);
         if (past.at != .unwritten) return past;
         if (tree.fullVarDecl(node)) |variable| if (tree.tokenTag(variable.ast.mut_token) == .keyword_const) {
             const value = variable.ast.init_node.unwrap() orelse return past;
@@ -1204,6 +1206,22 @@ const Walk = struct {
             try w.flags.append(w.c.allocator, .{ .decl = decl, .state = try w.whenTrue(value, past) });
         };
         return past;
+    }
+
+    /// The value the declaration at `node` is given, where it is a `switch`, an `if` or a
+    /// labeled block and the only part of the declaration that mentions the local (`const
+    /// values = switch (tag) { 0 => blk: { one[0] = v; break :blk &one; }, else => continue };`).
+    fn choosingValue(w: *const Walk, node: Ast.Node.Index) ?Ast.Node.Index {
+        const tree = w.tree;
+        const variable = tree.fullVarDecl(node) orelse return null;
+        const value = Facts.ungrouped(tree, variable.ast.init_node.unwrap() orelse return null);
+        if (tree.fullSwitch(value) == null and tree.fullIf(value) == null and !(isBlock(tree, value) and blockLabel(tree, value) != null)) return null;
+        for (w.mentions.items) |mention| {
+            const token = tree.nodeMainToken(mention);
+            if (token < tree.firstToken(node) or token > tree.lastToken(node)) continue;
+            if (token < tree.firstToken(value) or token > tree.lastToken(value)) return null;
+        }
+        return value;
     }
 
     /// The state past a `switch`: each prong walked from what its condition leaves, the

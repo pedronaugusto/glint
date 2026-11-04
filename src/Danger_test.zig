@@ -1343,7 +1343,9 @@ test "A019 writes an array whole by a store at each index of its length, also in
     // whose break gives its address (3), in a loop (4), with an `orelse continue` that leaves
     // before the read (5), an array of two written at both indices in a block (6). Unsafe: an
     // array of two written at one index in a block (7), in a loop (8), and one written past a
-    // statement that may break with it unwritten (9).
+    // statement that may break with it unwritten (9). A `switch` whose prongs are labeled blocks,
+    // the value of a declaration: each prong writing it before its break (10, safe), one prong
+    // handing it on unwritten (11, unsafe); an `if` whose branches do the same (12 safe, 13 unsafe).
     const found = try run(pack.unsafe_set,
         \\fn sum(x: [1]u32) u32 { return x[0]; } fn all(values: []const u32) u32 { var total: u32 = 0; for (values) |v| total +%= v; return total; }
         \\pub fn case_a(v: u32) u32 { var one: [1]u32 = undefined; one[0] = v; return sum(one); }
@@ -1354,8 +1356,12 @@ test "A019 writes an array whole by a store at each index of its length, also in
         \\pub fn case_f(v: u32) u32 { var two: [2]u32 = undefined; const values: []const u32 = blk: { two[0] = v; break :blk &two; }; return all(values); }
         \\pub fn case_g(items: []const u32) u32 { var total: u32 = 0; for (items) |item| { var two: [2]u32 = undefined; const values: []const u32 = blk: { two[1] = item; break :blk &two; }; total +%= all(values); } return total; }
         \\pub fn case_h(v: u32, k: bool) u32 { var one: [1]u32 = undefined; const values: []const u32 = blk: { if (k) break :blk &one; one[0] = v; break :blk &one; }; return all(values); }
+        \\pub fn case_i(items: []const ?u32, tag: u8) u32 { var total: u32 = 0; for (items) |item| { var one: [1]u32 = undefined; const values: []const u32 = switch (tag) { 0 => blk: { one[0] = item orelse continue; break :blk &one; }, 1 => blk: { one[0] = 7; break :blk &one; }, else => continue }; total +%= all(values); } return total; }
+        \\pub fn case_j(items: []const ?u32, tag: u8) u32 { var total: u32 = 0; for (items) |item| { var one: [1]u32 = undefined; const values: []const u32 = switch (tag) { 0 => blk: { one[0] = item orelse continue; break :blk &one; }, 1 => blk: { break :blk &one; }, else => continue }; total +%= all(values); } return total; }
+        \\pub fn case_k(v: u32, k: bool) u32 { var one: [1]u32 = undefined; const values: []const u32 = if (k) blk: { one[0] = v; break :blk &one; } else blk: { one[0] = 1; break :blk &one; }; return all(values); }
+        \\pub fn case_l(v: u32, k: bool) u32 { var one: [1]u32 = undefined; const values: []const u32 = if (k) blk: { one[0] = v; break :blk &one; } else &one; return all(values); }
     );
-    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9 }, found.lines[0..found.findings]);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9, 11, 13 }, found.lines[0..found.findings]);
 }
 
 test "A019 reads hexToBytes as writing all of its output where it succeeds on an input every path shows twice as long, and a flag as what its being true showed" {
