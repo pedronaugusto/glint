@@ -73,7 +73,7 @@ compiled_with: std.AutoHashMapUnmanaged(Project.FileId, Files) = .empty,
 /// What a compilation of the program analyzes (`analysis`): per file, the parts Zig analyzes
 /// as one; the functions and container-level constants by name; and the budget of resolutions
 /// that reading spends, its own as a fact of the whole run.
-file_parts: std.AutoHashMapUnmanaged(Project.FileId, FileParts) = .empty,
+file_parts: std.AutoHashMapUnmanaged(Project.FileId, *const FileParts) = .empty,
 declarations_named: ?std.StringHashMapUnmanaged(std.ArrayList(Decl)) = null,
 remaining: usize = 100_000,
 /// Whether this Facts is the one building the analysis (`analysis`): it reads each declaration
@@ -3292,7 +3292,7 @@ fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     // `dropMemos` drops what one kept regardless.
     self.wide += 1;
     if (found.everything) return true;
-    const part = self.partOf(file, node) orelse return true;
+    const part = try self.partOf(file, node) orelse return true;
     const index = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
         .test_decl => try self.program(file),
         else => true,
@@ -3306,7 +3306,7 @@ fn storeCounts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
 /// and its operand's each hold no value of it (`create(T)` with `T` a `u32`; a `[*]u16` field
 /// given a `*anyopaque`'s bytes). False where a reading is not known, or a type does not resolve.
 fn castMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, field: Decl) ResolveError!bool {
-    const part = self.partOf(file, node) orelse return false;
+    const part = try self.partOf(file, node) orelse return false;
     const index = (try self.partsOf(file)).declared.get(part) orelse return false;
     const function: Decl = .{ .file = file, .index = index };
     if (!self.instantiated(function)) return self.castMissesIn(null, file, node, field);
@@ -3335,7 +3335,7 @@ fn castMissesIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.
 /// name names a field of the holder's own type only. False where a reading is not known or the
 /// holder does not resolve.
 fn holderMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, holder: Ast.Node.Index, field: Decl) ResolveError!bool {
-    const part = self.partOf(file, node) orelse return false;
+    const part = try self.partOf(file, node) orelse return false;
     const index = (try self.partsOf(file)).declared.get(part) orelse return false;
     const function: Decl = .{ .file = file, .index = index };
     if (!self.genericFunction(function)) return false;
@@ -3413,6 +3413,8 @@ pub const Analysis = struct {
 pub const FileParts = struct {
     nodes: std.AutoHashMapUnmanaged(Ast.Node.Index, std.ArrayList(Ast.Node.Index)) = .empty,
     declared: std.AutoHashMapUnmanaged(Ast.Node.Index, Model.Declaration.Id) = .empty,
+    /// Each node's part, by its index: `.root` where it is in none (`partOf` null).
+    of: []const Ast.Node.Index = &.{},
 };
 
 /// A part to read and the reading it is read in.
@@ -3529,7 +3531,7 @@ pub fn analyzed(self: *Facts, decl: Decl) ResolveError!bool {
 /// declaration is; a `comptime` block or a loose part of a file is; a test is in the program's
 /// files.
 pub fn analyzedAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    const part = self.partOf(file, node) orelse return true;
+    const part = try self.partOf(file, node) orelse return true;
     const d = (try self.partsOf(file)).declared.get(part) orelse return switch (self.project.at(file).file.tree.nodeTag(part)) {
         .test_decl => try self.program(file),
         else => true,
@@ -3556,7 +3558,7 @@ fn reachDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRea
     const model = &self.project.at(decl.file).model;
     const record = model.declarations[@backingInt(decl.index)];
     if (record.kind != .function and record.kind != .variable) return;
-    const part = self.partOf(decl.file, record.node) orelse return;
+    const part = try self.partOf(decl.file, record.node) orelse return;
     // Only a part's own declaration: a local reaches nothing beyond its function.
     if ((try self.partsOf(decl.file)).declared.get(part) != decl.index) return;
     // A member of a container a function declares, reached with no instance known: read in
@@ -3595,7 +3597,7 @@ fn readDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead
     const members = (found.members.get(decl) orelse return).items;
     for (members) |held| {
         const member_record = self.project.at(held.file).model.declarations[@backingInt(held.index)];
-        const member_part = self.partOf(held.file, member_record.node) orelse continue;
+        const member_part = try self.partOf(held.file, member_record.node) orelse continue;
         try self.readDeclaration(found, next, held, member_part, reading);
     }
 }
@@ -4300,7 +4302,14 @@ fn reachNamed(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), na
 /// `extern` prototype), its container-level constant (with the fields and members of a
 /// container it declares outside their own functions and constants), its container-level
 /// `comptime` block, or its test. Null: the file's own fields and loose parts.
-fn partOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
+/// Read once per file, in `partsOf`'s index.
+fn partOf(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Ast.Node.Index {
+    const part = (try self.partsOf(file)).of[@backingInt(node)];
+    return if (part == .root) null else part;
+}
+
+/// `partOf` by the parent walk: what `partsOf`'s index holds for each node.
+fn partWalk(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.Index {
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
     var at = node;
@@ -4330,27 +4339,34 @@ fn containerLevel(tree: *const Ast, model: *const Model, node: Ast.Node.Index) b
 /// A file's parts (`partOf`) with their nodes, and the part each function and container-level
 /// constant is, found once.
 fn partsOf(self: *Facts, file: Project.FileId) ResolveError!*const FileParts {
-    const entry = try self.file_parts.getOrPut(self.gpa, file);
-    if (entry.found_existing) return entry.value_ptr;
-    entry.value_ptr.* = .{};
+    if (self.file_parts.get(file)) |kept| return kept;
+    // Boxed: a caller holds one while `partOf` indexes another file.
+    const parts = try self.gpa.create(FileParts);
+    parts.* = .{};
     const tree = &self.project.at(file).file.tree;
+    const of = try self.gpa.alloc(Ast.Node.Index, tree.nodes.len);
+    of[0] = .root;
     for (1..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const group = try entry.value_ptr.nodes.getOrPut(self.gpa, self.partOf(file, node) orelse .root);
+        of[i] = self.partWalk(file, node) orelse .root;
+        const group = try parts.nodes.getOrPut(self.gpa, of[i]);
         if (!group.found_existing) group.value_ptr.* = .empty;
         try group.value_ptr.append(self.gpa, node);
     }
     const model = &self.project.at(file).model;
     for (model.declarations, 0..) |record, d| {
         if (record.kind != .function and record.kind != .variable) continue;
-        const part = self.partOf(file, record.node) orelse continue;
+        const part = of[@backingInt(record.node)];
+        if (part == .root) continue;
         const is_own = switch (tree.nodeTag(part)) {
             .fn_decl => record.kind == .function and model.parentOf(record.node) == part,
             else => part == record.node,
         };
-        if (is_own) try entry.value_ptr.declared.put(self.gpa, part, @fromBackingInt(@intCast(d)));
+        if (is_own) try parts.declared.put(self.gpa, part, @fromBackingInt(@intCast(d)));
     }
-    return entry.value_ptr;
+    parts.of = of;
+    try self.file_parts.put(self.gpa, file, parts);
+    return parts;
 }
 
 /// The reading the call at `node` in `file` makes of `decl`, made in `env`: none where `env`
@@ -13628,6 +13644,30 @@ test "a store counts for a call through its field once the walk reaches its part
     try std.testing.expect(late.real and late.other);
     try std.testing.expect(!late.everything);
     try std.testing.expectEqual(.any, late.call);
+}
+
+test "a node's part is read off the file's index, as the parent walk finds it: every node of a file, another file's index made between" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "Facts.zig", .bytes = @embedFile("Facts.zig") },
+        .{ .name = "small.zig", .bytes = "const S = struct {\n    x: u32 = 0,\n    fn f() void {}\n};\ncomptime {\n    _ = S;\n}\ntest \"t\" {}\n" },
+    }, &.{}, .{});
+    defer project.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const big = project.sources[0].id;
+    const small = project.sources[1].id;
+    const held = try facts.partsOf(big);
+    for (0..project.sources[1].file.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        try std.testing.expectEqual(facts.partWalk(small, node), try facts.partOf(small, node));
+    }
+    try std.testing.expect(held == try facts.partsOf(big));
+    for (0..project.sources[0].file.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        try std.testing.expectEqual(facts.partWalk(big, node), try facts.partOf(big, node));
+    }
 }
 
 test "a memo the walk was handed is replaced once the analysis is built, one it never asked for kept" {
