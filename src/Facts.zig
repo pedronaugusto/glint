@@ -2316,11 +2316,26 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         for (targets, roots) |target, *root| root.* = .{ .container = self.rootOf(target) };
         return if (roots.len == 1) roots[0] else self.choose(roots);
     }
+    // The container the call is in. One a function declares (a type function's `struct`) is
+    // the one its reading made: its declaration read in the reading of the function declaring
+    // it, as `readBound` attaches its making, so its fields read that reading's bindings.
     if (std.mem.eql(u8, name, "@This")) {
         var scope: ?Model.Scope.Id = model.scopeOf(tree.nodeMainToken(node));
         while (scope) |s| {
-            if (model.scopes[@backingInt(s)].kind == .container or model.scopes[@backingInt(s)].kind == .file) return .{ .container = .{ .file = file, .scope = s } };
-            scope = model.scopes[@backingInt(s)].parent;
+            const record = model.scopes[@backingInt(s)];
+            if (record.kind == .file) return .{ .container = .{ .file = file, .scope = s } };
+            if (record.kind == .container) {
+                // The reading that declares it: this one, or one it is read within (a method's
+                // reading is within its made container's).
+                if (declaredInFunction(model, s)) {
+                    var reading = env;
+                    while (reading) |r| : (reading = r.outer) {
+                        if (self.enclosed(file, s, self.scopeNode(r.function))) return self.resolveIn(r, file, record.node);
+                    }
+                }
+                return .{ .container = .{ .file = file, .scope = s } };
+            }
+            scope = record.parent;
         }
     }
     if ((std.mem.eql(u8, name, "@field") or std.mem.eql(u8, name, "@hasDecl")) and args.len == 2) {
@@ -6605,6 +6620,18 @@ fn functionOf(self: *const Facts, parameter: Decl) ?Decl {
         if (self.scopeNode(candidate) == scope.node) return candidate;
     }
     return null;
+}
+
+/// Whether the container `scope` is declared in a function's body (a type function's `struct`,
+/// a generic's local type), not at a file's or another container's level alone.
+fn declaredInFunction(model: *const Model, scope: Model.Scope.Id) bool {
+    var at = model.scopes[@backingInt(scope)].parent;
+    while (at) |up| : (at = model.scopes[@backingInt(up)].parent) switch (model.scopes[@backingInt(up)].kind) {
+        .function => return true,
+        .container, .file => return false,
+        else => {},
+    };
+    return false;
 }
 
 /// The node a function's scope is recorded at: its declaration with a body, else its prototype.
@@ -11149,6 +11176,54 @@ test "a type function's call written at two sites makes one type: a generic give
     try std.testing.expect(readings[0].args[0] == .instance);
     try std.testing.expect(readings[0] == readings[1]);
     try std.testing.expect(readings[0] != readings[2]);
+}
+
+test "@This() in a made container's method is the container its reading made: its fields read that reading's bindings" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\fn List(comptime Elem: type) type {
+        \\    return struct {
+        \\        items: []const Elem,
+        \\        fn first(list: @This()) Elem {
+        \\            return list.items[0];
+        \\        }
+        \\    };
+        \\}
+        \\pub fn main() void {
+        \\    const foos: []const Foo = &.{};
+        \\    const list: List(Foo) = .{ .items = foos };
+        \\    _ = list.first();
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node.of(tree, "list.first()")).?;
+    const first = switch (try facts.definition(file, call.ast.fn_expr)) {
+        .decl => |decl| decl,
+        .none, .unknown => unreachable, // unreachable: the call names the method
+    };
+    const env = try facts.bind(file, call, first, null);
+    const this = try facts.resolveBound(env, file, node.of(tree, "@This()"));
+    try std.testing.expect(this == .container and this.container.made_by != null);
+    const value = try facts.resolveBound(env, file, node.of(tree, "list.items[0]"));
+    const foo = try facts.resolve(file, node.of(tree, "Foo"));
+    try std.testing.expect(value == .instance and foo == .container and value.instance.scope == foo.container.scope);
 }
 
 test "a container a generic declares in its body is its reading's: its fields read that reading's bindings" {
