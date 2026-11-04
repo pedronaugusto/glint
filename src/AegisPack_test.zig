@@ -1565,6 +1565,23 @@ test "an aegis with one name each for its ring and ring buffer, as 0.3 has, is r
     }
 }
 
+test "an aegis whose pools are 0.3's SlotPool and RunPool, with 0.2's Pool and SlotMap gone, is recognized with no drift" {
+    const gpa = std.testing.allocator;
+    const pinned = aegis_sources.pinned("src/handle.zig").?;
+    const no_pool = try std.mem.replaceOwned(u8, gpa, pinned, "pub const Pool = @import(\"handle/pool.zig\").Pool;\n", "");
+    defer gpa.free(no_pool);
+    const pools = try std.mem.replaceOwned(u8, gpa, no_pool, "pub const SlotMap = @import(\"handle/slot_map.zig\").SlotMap;\n", "pub fn SlotPool(comptime T: type) type {\n    return struct {\n        /// Private.\n        count: u32 = 0,\n        /// Private.\n        used: u32 = 0,\n        held: ?*T = null,\n        pub fn deinit(self: *@This()) void {\n            self.* = undefined;\n        }\n    };\n}\npub fn RunPool(comptime T: type) type {\n    return struct {\n        /// Private.\n        end: u32 = 0,\n        held: ?*T = null,\n        pub fn deinit(self: *@This()) void {\n            self.* = undefined;\n        }\n    };\n}\n");
+    defer gpa.free(pools);
+    try std.testing.expect(pools.len != no_pool.len);
+    const program = "const handle = @import(\"aegis\").handle;\npub fn f(p: *handle.SlotPool(u8), r: *handle.RunPool(u8)) u32 { return p.count + p.used + r.end; }";
+    var project = try aegis_sources.projectRevised(gpa, program, "src/handle.zig", pools);
+    defer project.deinit();
+    var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.access, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(@as(usize, 3), count(report, pack.access));
+}
+
 test "bounded storage, budgets and reservations keep their state behind their operations" {
     const head = "const aegis = @import(\"aegis\");\nconst bounded = aegis.bounded;\n";
     // The initialized prefix and its cursors, the buffer's extent and owner, a limit's maximum.

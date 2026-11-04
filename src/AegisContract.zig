@@ -36,7 +36,8 @@ pub const Kind = enum {
     lent,
     must_use,
     shared,
-    /// Generational storage: `Pool`, `SlotMap`, `DenseSlotMap`, `SecondaryMap`.
+    /// Storage on a region or a buffer its holder owns: `SlotPool` (0.2's `Pool` and `SlotMap`),
+    /// `RunPool`, `DenseSlotMap`, `SecondaryMap`.
     slots,
     /// `handle.Domain`, which issues instances.
     issuer,
@@ -160,8 +161,12 @@ const root_members = [_]Lib.Member{
     .{ .path = "own.OwnedIo", .role = .owned },
     .{ .path = "own.Lent", .role = .lent, .required = false },
     .{ .path = "own.MustUse", .role = .must_use },
-    .{ .path = "handle.Pool", .role = .slots },
-    .{ .path = "handle.SlotMap", .role = .slots },
+    // 0.3 folds 0.2's `Pool` and `SlotMap` into `SlotPool`, on a region the pool owns, and adds
+    // `RunPool`; each name is in one revision only.
+    .{ .path = "handle.SlotPool", .role = .slots, .required = false },
+    .{ .path = "handle.RunPool", .role = .slots, .required = false },
+    .{ .path = "handle.Pool", .role = .slots, .required = false },
+    .{ .path = "handle.SlotMap", .role = .slots, .required = false },
     .{ .path = "handle.DenseSlotMap", .role = .slots },
     .{ .path = "handle.SecondaryMap", .role = .slots },
     .{ .path = "handle.Domain", .role = .issuer },

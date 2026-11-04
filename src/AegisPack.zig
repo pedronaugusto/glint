@@ -770,7 +770,8 @@ fn backingFields(k: Contract.Kind) []const []const u8 {
         .lent => &.{"data"},
         .must_use => &.{ "data", "pending", "live" },
         .shared => &.{ "block", "live" },
-        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries" },
+        // 0.3's `SlotPool` and `RunPool` keep their region and their counts; 0.2's pools, their arrays.
+        .slots => &.{ "slots", "storage", "primary", "values", "keys", "free_head", "entries", "region", "count", "used", "retired", "items", "end", "free_spans", "runs" },
         .stage => &.{ "live", "payload" },
         .machine => &.{"state"},
         .table => &.{ "slots", "free_head", "used_up", "open_count" },
