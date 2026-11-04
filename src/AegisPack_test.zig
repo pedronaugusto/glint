@@ -1993,11 +1993,14 @@ test "A001 refutes an unresolved receiver by the other members the file reads of
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| _ = p.value; }", pack.access, false, 0);
 }
 
-test "A003 leaves an unresolved acquisition undecided even where no aegis function can be it: the program's own may return an owner" {
+test "A003 leaves an unresolved acquisition undecided even where no aegis function can be it: the program's own may return an owner, decided at each binding where a generic's parameter gives it" {
     // No aegis `read` takes two arguments, but `access` may be the program's own type, whose
-    // `read` returns an owner.
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, false, 0);
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
+    // `read` returns an owner: a method of an `anytype` parameter's value gives what each
+    // binding makes, checked at the binding, as a type parameter's function does (below).
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, true, 0);
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, true, 0);
+    // A `comptime` value holds nothing at run time: a call on it is judged where it is written.
+    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(comptime access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, false, 0);
     // A function of a type parameter gives what each binding makes, checked at the binding.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, true, 0);

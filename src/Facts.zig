@@ -969,10 +969,8 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         // A `comptime` block runs as the program compiles: its locals copy nothing at run time.
         if (inComptime(t, model, d.node)) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
-        if (self.madeByParameter(function.file, init)) |position| {
-            try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node }, .kind = .made });
-            continue;
-        }
+        // What a call a parameter decides makes is no copy of it (`madeCalls`).
+        if (self.madeByParameter(function.file, init) != null) continue;
         if (t.nodeTag(init) == .identifier) {
             const named = (model.reference(init) orelse continue).declaration orelse continue;
             const position = self.valueOfParameter(function, named) orelse continue;
@@ -1002,6 +1000,29 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
     }
     try self.storedCopies(function, out);
     try self.scalarCasts(function, out);
+    try self.madeCalls(function, out);
+}
+
+/// Each call in `function`'s body, outside `comptime`, whose generic parameter decides what it
+/// makes (`madeBy`): a `made` copy, its source the call itself, so each binding reads what that
+/// call makes with its own arguments (`boundCopy`).
+fn madeCalls(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) ResolveError!void {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    const whole = self.scopeNode(function);
+    const first = t.firstToken(whole);
+    const last = t.lastToken(whole);
+    for (0..t.nodes.len) |i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        const at = t.nodeMainToken(node);
+        if (at < first or at > last) continue;
+        var call_buffer: [1]Ast.Node.Index = undefined;
+        if (t.fullCall(&call_buffer, node) == null) continue;
+        const made = self.madeBy(function.file, node) orelse continue;
+        if (!std.meta.eql(made.function, function) or inComptime(t, model, node)) continue;
+        const site: Key = .{ .file = function.file, .node = node };
+        try out.append(self.gpa, .{ .position = made.position, .site = site, .kind = .made, .source = site });
+    }
 }
 
 /// What `function`'s own `return`s, assignments, destructures and calls write of a generic
@@ -1434,9 +1455,17 @@ pub fn boundAtBinding(self: *Facts, file: Project.FileId, site: Ast.Node.Index, 
     return self.judgedAtBindings(function);
 }
 
-/// The position of the type parameter whose function `value` calls (`T.init(...)`, through
-/// `try` or `catch`), a parameter of the function the call is in declared `comptime T: type`.
+/// The position of the generic parameter that decides what the call `value` makes (through
+/// `try` or `catch`), a parameter of the function the call is in: a function of a type parameter
+/// (`T.init(...)`, `comptime T: type`), or a method of a value of one (`probe.of(...)`,
+/// `probe: Probe`) or of an `anytype` parameter, whose type its argument gives. Each binding
+/// makes its own (`parameterCopies`' `made`).
 pub fn madeByParameter(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?usize {
+    return (self.madeBy(file, value) orelse return null).position;
+}
+
+/// `madeByParameter`'s parameter and the function it is of.
+fn madeBy(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?struct { function: Decl, position: usize } {
     const t = self.syntaxOf(file);
     const made = switch (t.nodeTag(value)) {
         .@"try" => t.nodeData(value).node,
@@ -1451,8 +1480,12 @@ pub fn madeByParameter(self: *const Facts, file: Project.FileId, value: Ast.Node
     const model = &self.project.at(file).model;
     const index = (model.reference(receiver) orelse return null).declaration orelse return null;
     const function = self.functionOf(.{ .file = file, .index = index }) orelse return null;
-    if (self.anytypeAt(function, model.declarations[@backingInt(index)].token) != null) return null;
-    return self.genericPosition(function, index);
+    // A type parameter's own function (`T.init()`), or a method of a value a binding types:
+    // an `anytype` parameter's or one typed by a type parameter (`valueOfParameter`). A
+    // `comptime` value holds nothing at run time, so nothing a call on it makes is a binding's.
+    const anytype_value = self.anytypeAt(function, model.declarations[@backingInt(index)].token) != null;
+    const position = (if (anytype_value) null else self.genericPosition(function, index)) orelse self.valueOfParameter(function, index) orelse return null;
+    return .{ .function = function, .position = position };
 }
 
 /// A call in a generic's body passing one of its generic parameters on, or a part of one, and
@@ -1580,15 +1613,70 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
     return false;
 }
 
-/// What a copy `function` makes holds at a binding in `file` of arguments `bound`, in its
-/// parameter order with a bound receiver first (`calls.Args.known`): the binding's argument
+/// What a copy `function` makes holds at the binding `call` (`calls`): the binding's argument
 /// read through the copy's `path` to its `source`, each call's arguments read with the bindings
-/// of the one before.
-pub fn boundCopy(self: *Facts, file: Project.FileId, bound: []const Ast.Node.Index, function: Decl, copy: ParameterCopy) ResolveError!Value {
+/// of the one before (`bindTo`: a receiver the call passes first, each argument as its parameter
+/// is typed). Arguments not known leave it unknown.
+pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!Value {
+    const bound = switch (call.args) {
+        .known => |args| args,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    // `bindTo` takes the receiver from the callee as written.
+    const params = if (call.receiver == .bound) bound[1..] else bound;
+    // A choice of types bound to a type parameter (an `inline for`'s pass) is one instantiation
+    // per type: each is read, and what they hold chosen as one.
+    const readings = try self.instantiations(try self.bindTo(call.file, call.callee_expr, params, function, null));
+    const values = try self.gpa.alloc(Value, readings.len);
+    for (readings, values) |reading, *value| value.* = try self.copyIn(reading, copy);
+    return self.choose(values);
+}
+
+/// How many instantiations a binding's choices of types are read as, at most: past it the
+/// binding is read once, its choices as they are.
+const instantiation_limit = 16;
+
+/// The instantiations a reading stands for: one per type of each choice of types it binds a
+/// parameter to (`choiceOfTypes`), as Zig compiles one per type; the reading itself where it
+/// binds none, or more than `instantiation_limit` would be made.
+fn instantiations(self: *Facts, env: *const Env) ResolveError![]const *const Env {
+    var count: usize = 1;
+    for (env.args) |arg| if (choiceOfTypes(arg)) {
+        count *|= arg.alternatives.len;
+    };
+    if (count == 1 or count > instantiation_limit) return try self.gpa.dupe(*const Env, &.{env});
+    const found = try self.gpa.alloc(*const Env, count);
+    for (found, 0..) |*one, n| {
+        const args = try self.gpa.dupe(Value, env.args);
+        var rest = n;
+        for (args) |*arg| if (choiceOfTypes(arg.*)) {
+            const each = arg.alternatives;
+            arg.* = each[rest % each.len];
+            rest /= each.len;
+        };
+        var draft = env.*;
+        draft.args = args;
+        one.* = try self.keptReading(draft);
+    }
+    return found;
+}
+
+/// Whether `value` is a choice among types, each a type itself (a container, a type built from
+/// its fields' types, a primitive), never a value of one.
+fn choiceOfTypes(value: Value) bool {
+    if (value != .alternatives) return false;
+    for (value.alternatives) |one| switch (one) {
+        .container, .primitive => {},
+        .reified => |built| if (built.value) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// `boundCopy` in one instantiation `env` of the copy's function.
+fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!Value {
     const source = copy.source.?;
-    var args: std.ArrayList(Value) = .empty;
-    for (bound) |arg| try args.append(self.gpa, try self.resolve(file, arg));
-    var env = try self.keptReading(.{ .function = function, .args = args.items, .depth = 0 });
+    var env = start;
     for (copy.path) |step| {
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
@@ -1603,10 +1691,7 @@ pub fn boundCopy(self: *Facts, file: Project.FileId, bound: []const Ast.Node.Ind
             .none => return .{ .unknown = .unresolved },
             .unknown => |why| return .{ .unknown = why },
         };
-        var inner_args: std.ArrayList(Value) = .empty;
-        if (self.methodCall(step.file, inner, target)) try inner_args.append(self.gpa, try self.resolveIn(env, step.file, step_tree.nodeData(inner.ast.fn_expr).node_and_token[0]));
-        for (inner.ast.params) |arg| try inner_args.append(self.gpa, try self.resolveIn(env, step.file, arg));
-        env = try self.keptReading(.{ .function = target, .args = inner_args.items, .depth = env.depth +| 1, .nested = env.nested });
+        env = try self.bind(step.file, inner, target, env);
     }
     return self.resolveIn(env, source.file, source.node);
 }
@@ -6231,7 +6316,7 @@ fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) 
     var position: usize = 0;
     while (it.next()) |param| : (position += 1) {
         if (position >= args.len) return;
-        if (namesFunction(args[position]) or args[position] == .literal or param.anytype_ellipsis3 != null) continue;
+        if (namesFunction(args[position]) or try self.literalNamesFunction(args[position]) or param.anytype_ellipsis3 != null) continue;
         if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) continue;
         const type_expr = param.type_expr orelse continue;
         if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) continue;
@@ -6241,6 +6326,14 @@ fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) 
         if (args[position] != .unknown and sameContainer(args[position], typed)) continue;
         args[position] = typed;
     }
+}
+
+/// Whether `value` is an anonymous literal a field or element of which may name a function,
+/// itself or in a literal it holds (`.{ .run = worker }`).
+fn literalNamesFunction(self: *Facts, value: Value) ResolveError!bool {
+    if (value != .literal) return false;
+    for (try self.literalParts(value.literal)) |part| if (namesFunction(part) or try self.literalNamesFunction(part)) return true;
+    return false;
 }
 
 /// `node` in `file` read under `env`, a reading `bind` made: a parameter is its argument, a
@@ -11601,4 +11694,83 @@ test "a call on what a generic's context binds resolves in the instantiation its
     try std.testing.expect(bound.receiver == .bound);
     // Read in no instantiation, the context is each binding's: what it calls is not known.
     try std.testing.expect((try calls.at(&facts, file, hash)).?.callee == .any);
+}
+
+test "a method of a value a type parameter types is made per binding: each binding reads what the call makes with its arguments" {
+    const source =
+        \\pub const Probed = union(enum) { is, none };
+        \\pub const Facts = struct {
+        \\    hits: u32 = 0,
+        \\    pub fn fieldsHold(self: *Facts, comptime Probe: type, probe: Probe, n: u32) (error{Bad} || Probe.Error)!Probed {
+        \\        return self.fieldsHoldOnce(Probe, probe, n);
+        \\    }
+        \\    fn fieldsHoldOnce(self: *Facts, comptime Probe: type, probe: Probe, n: u32) (error{Bad} || Probe.Error)!Probed {
+        \\        switch (try probe.of(self, n)) {
+        \\            .is => return .is,
+        \\            .none => return .none,
+        \\        }
+        \\    }
+        \\};
+        \\const IoProbe = struct {
+        \\    key: u32,
+        \\    pub const Error = error{};
+        \\    pub fn of(probe: IoProbe, facts: *Facts, n: u32) Error!Probed {
+        \\        _ = facts;
+        \\        return if (probe.key == n) .is else .none;
+        \\    }
+        \\};
+        \\pub fn main() !void {
+        \\    var facts: Facts = .{};
+        \\    _ = try facts.fieldsHold(IoProbe, .{ .key = 1 }, 3);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const made = node.of(tree, "probe.of(self, n)");
+    // The generic's own call is its binding's: a made copy of `fieldsHold`, through its call of
+    // `fieldsHoldOnce`, its source the call.
+    const hold = switch (try facts.definition(file, node.of(tree, "facts.fieldsHold"))) {
+        .decl => |decl| decl,
+        .none, .unknown => unreachable, // unreachable: the call names the method
+    };
+    try std.testing.expect(facts.madeByParameter(file, made) != null);
+    const copies = try facts.parameterCopies(hold);
+    var found: ?ParameterCopy = null;
+    for (copies) |copy| if (copy.kind == .made and copy.source != null and copy.source.?.node == made) {
+        found = copy;
+    };
+    try std.testing.expect(found != null);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node.of(tree, "facts.fieldsHold(IoProbe, .{ .key = 1 }, 3)")).?;
+    const env = try facts.bind(file, call, hold, null);
+    var inner_buffer: [1]Ast.Node.Index = undefined;
+    const inner = tree.fullCall(&inner_buffer, node.of(tree, "self.fieldsHoldOnce(Probe, probe, n)")).?;
+    const once = switch (try facts.definition(file, inner.ast.fn_expr)) {
+        .decl => |decl| decl,
+        .none, .unknown => unreachable, // unreachable: the call names the method
+    };
+    const env2 = try facts.bind(file, inner, once, env);
+    // In that reading the literal is the probe its parameter's type names, so its method is
+    // that type's.
+    const access = node.of(tree, "probe.of");
+    try std.testing.expect(try facts.resolveBound(env2, file, tree.nodeData(access).node_and_token[0]) == .instance);
+    try std.testing.expect(try facts.resolveBound(env2, file, access) == .function);
+    const binding = (try calls.at(&facts, file, node.of(tree, "facts.fieldsHold(IoProbe, .{ .key = 1 }, 3)"))).?;
+    const value = try facts.boundCopy(binding, hold, found.?);
+    try std.testing.expect(value == .error_union and value.error_union.* == .instance);
 }

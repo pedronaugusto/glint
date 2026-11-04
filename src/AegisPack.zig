@@ -1058,13 +1058,12 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call spelled as a generic that copies its parameters does not resolve: its binding may copy an owner");
         },
     };
-    // A method call's receiver is its first parameter.
-    const args = switch (call.args) {
-        .known => |args| args,
+    // A method call's receiver is its first parameter (`boundBy` reads the known arguments).
+    switch (call.args) {
+        .known => {},
         .unknown => |why| return c.undecided(rule, tree.tokenStart(name_token), if (why == .budget) .budget_exhausted else .unresolved, "a call spelled as a generic that copies its parameters may or may not bind its receiver: its binding may copy an owner"),
-    };
-    const receiver = call.receiver == .bound;
-    for (functions) |function| if (try boundBy(c, tree, node, args, receiver, rule, function, name_token)) return;
+    }
+    for (functions) |function| if (try boundBy(c, tree, call, rule, function, name_token)) return;
 }
 
 /// Whether the cast a generic makes by its parameter's type reads a scalar's integer out (a
@@ -1154,8 +1153,12 @@ fn argumentsMove(c: *Context, call: Facts.calls.Call) Context.Error!bool {
     return true;
 }
 
-/// `checkBinding` of `function`, one the call at `node` may call: whether it reported a copy.
-fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, args: []const Ast.Node.Index, receiver: bool, rule: Rule, function: Facts.Decl, name_token: Ast.TokenIndex) Context.Error!bool {
+/// `checkBinding` of `function`, one `call` may call, its arguments known: whether it reported
+/// a copy.
+fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, function: Facts.Decl, name_token: Ast.TokenIndex) Context.Error!bool {
+    const node = call.node;
+    const args = call.args.known;
+    const receiver = call.receiver == .bound;
     const made = try c.facts.parameterCopies(function);
     if (made.len == 0) return false;
     const written = &c.project.at(function.file).file.tree;
@@ -1181,7 +1184,6 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, args: []const As
         // A cast by a parameter's type is A004's; a copy A002's, an acquisition A003's.
         if ((copy.kind == .cast) != (rule == scalar)) continue;
         if (copy.kind != .cast and (copy.kind == .made) != (rule == cleanup)) continue;
-        if (copy.kind == .made and !try acquiring(c, copy.site)) continue;
         // The receiver is bound as written, never a type or a value the call writes for it.
         if ((receiver and copy.position == 0) or copy.position >= args.len) continue;
         if (!types[copy.position] and !values[copy.position]) continue;
@@ -1205,7 +1207,7 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, args: []const As
         const value = if (copy.crowded)
             Facts.Value{ .unknown = .budget }
         else if (copy.source != null)
-            try c.facts.boundCopy(c.file, args, function, copy)
+            try c.facts.boundCopy(call, function, copy)
         else if (if (types[copy.position]) try plainType(c, c.file, argument, 0) else try plainValue(c, c.file, argument, 0))
             continue
         else
@@ -1239,7 +1241,9 @@ fn boundBy(c: *Context, tree: *const Ast, node: Ast.Node.Index, args: []const As
         if (copy.kind == .made) {
             const site = c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
-            switch (try perBuild(c, bound)) {
+            // A std resource by value is an acquisition's, by its type alone (`acquiresHandle`).
+            const owner: Typed = if (try Shapes.holdsHandle(c, cleanup, bound)) .{ .owner = .std_handle } else try perBuild(c, bound);
+            switch (owner) {
                 .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},
                 .unknown => if (!bindingTyped(bound)) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a generic that acquires by its type parameter is bound to a type that does not resolve"),
@@ -2679,18 +2683,6 @@ fn followsCleanup(c: *Context, decl: Model.Declaration) Context.Error!bool {
     if (try c.inLibrary(Contract.library, c.file)) return false;
     const tree = try c.project.syntax(try c.source());
     return try acquiredOwner(c, tree, &c.project.at(c.file).model, decl, false) != null;
-}
-
-/// Whether the local declared at `site` is initialised by an acquisition: an owner's
-/// constructor or an operation that gives one by its name.
-fn acquiring(c: *Context, site: Facts.Key) Context.Error!bool {
-    const tree = &c.project.at(site.file).file.tree;
-    const v = tree.fullVarDecl(site.node) orelse return false;
-    const init = v.ast.init_node.unwrap() orelse return false;
-    var value = init;
-    while (Facts.accesses.carriedFrom(tree, value)) |inner| value = inner;
-    const published = (try publishedCall(c, site.file, value)) orelse return false;
-    return acquires(published.name);
 }
 
 /// Whether `call` gives a value of a type the library declares and the contract does not list,

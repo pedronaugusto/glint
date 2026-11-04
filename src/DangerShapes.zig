@@ -1747,6 +1747,14 @@ pub fn acquiresHandle(c: *Context, rule: Rule, node: Ast.Node.Index) Context.Err
     return !try viewed(c, resources, c.file, node, 0, null);
 }
 
+/// Whether `value` holds a std resource by value, as an acquisition's result does
+/// (`acquiresHandle`): one a generic's binding makes may be acquired there, a view of one held
+/// or not.
+pub fn holdsHandle(c: *Context, rule: Rule, value: Facts.Value) Context.Error!bool {
+    const held = byValue(value) orelse return false;
+    return find(try containersOf(c, rule, &resource_paths), held) != null;
+}
+
 /// A call of the program's function whose returns `views` reads: there a parameter of the
 /// callee is the argument the call passes at it, read where the call is (`outer` the binding in
 /// force there).
