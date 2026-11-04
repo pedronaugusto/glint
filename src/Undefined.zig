@@ -4464,19 +4464,35 @@ fn jumpTarget(tree: *const Ast, model: *const Model, node: Ast.Node.Index) ?Ast.
 }
 
 /// Whether what `inner` does runs on some paths through `top` only: in a branch of an `if` or a
-/// `switch`, past `orelse` or `catch`, `and` or `or`, in a loop, or in a labeled block a `break`
-/// may leave early.
+/// `switch`, past `orelse` or `catch`, `and` or `or`, in a loop, or in a labeled block past a
+/// statement a `break` in it may leave early by.
 fn conditional(tree: *const Ast, model: *const Model, inner: Ast.Node.Index, top: Ast.Node.Index) bool {
     var at = inner;
     while (at != top) : (at = model.parentOf(at).?) {
         const up = model.parentOf(at) orelse return true;
         switch (Model.runsWith(tree, up, at)) {
             .always, .sequenced, .compile_time, .deferred => {},
+            // A labeled block's statement runs wherever the block does unless one before it may
+            // break: a `continue`, `return` or `try` before it leaves what holds the block too
+            // (`one[0] = v; break :blk &one;` writes `one` before the break hands it on).
+            .labeled => if (breaksBefore(tree, up, at)) return true,
             // Never run here: `@TypeOf`'s operand, another function's body.
-            .labeled, .branch, .loop, .unevaluated, .function => return true,
+            .branch, .loop, .unevaluated, .function => return true,
         }
     }
     return false;
+}
+
+/// Whether a statement of `block` before `statement` holds a `break`.
+fn breaksBefore(tree: *const Ast, block: Ast.Node.Index, statement: Ast.Node.Index) bool {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return true;
+    for (statements) |each| {
+        if (each == statement) return false;
+        var token = tree.firstToken(each);
+        while (token <= tree.lastToken(each)) : (token += 1) if (tree.tokenTag(token) == .keyword_break) return true;
+    }
+    return true;
 }
 
 /// Whether a `for` input is a range of literals with a pass in it (`0..2`).
