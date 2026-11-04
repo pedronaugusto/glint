@@ -393,7 +393,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
             var after: ?Ast.Node.Index = null;
             const body = if (tree.fullWhile(node)) |loop| body: {
                 after = loop.ast.cont_expr.unwrap();
-                unbounded = forever(tree, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
+                unbounded = try forever(c, c.file, loop.ast.cond_expr) or invariant(c, loop.ast.cond_expr, node);
                 if (!unbounded) try decides(c, loop.ast.cond_expr, loop.payload_token != null, &decided, 0);
                 break :body loop.ast.then_expr;
             } else if (tree.fullFor(node)) |loop| body: {
@@ -1043,7 +1043,7 @@ fn always(c: *Context, file: Project.FileId, node: Ast.Node.Index, body: Ast.Nod
             } else if (tree.fullWhile(parent)) |loop| {
                 // A `while (true)` runs its body's first pass whatever comes before, and a jump
                 // out of it before `node` is a statement that may skip.
-                if (loop.ast.cond_expr != at and !(pass.through_loops and at == loop.ast.then_expr and forever(tree, loop.ast.cond_expr))) return false;
+                if (loop.ast.cond_expr != at and !(pass.through_loops and at == loop.ast.then_expr and try forever(c, file, loop.ast.cond_expr))) return false;
             } else if (tree.fullFor(parent)) |loop| {
                 if (std.mem.findScalar(Ast.Node.Index, loop.ast.inputs, at) == null) return false;
             },
@@ -1140,9 +1140,9 @@ fn jumpTarget(tree: *const Ast, model: *const Model, jump: Ast.Node.Index) ?Ast.
     return null;
 }
 
-/// Whether a loop's condition is `true`: its first pass runs.
-fn forever(tree: *const Ast, cond: Ast.Node.Index) bool {
-    return tree.nodeTag(cond) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(cond)), "true");
+/// Whether a loop's condition is known true (Facts.knownBool): its first pass runs.
+fn forever(c: *Context, file: Project.FileId, cond: Ast.Node.Index) Context.Error!bool {
+    return (try c.facts.knownBool(file, cond)) == true;
 }
 
 /// Whether every error a call in the loop body `body` returns ends that loop: under a `try` or
@@ -1339,32 +1339,41 @@ fn endsLoop(tree: *const Ast, model: *const Model, body: Ast.Node.Index, target:
 /// stepped down every pass. Any other condition may hold once, or never.
 fn periodic(c: *Context, file: Project.FileId, branch: Ast.full.If, body: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
-    var condition = branch.ast.cond_expr;
-    while (tree.nodeTag(condition) == .grouped_expression) condition = tree.nodeData(condition).node_and_token[0];
+    const condition = Facts.ungrouped(tree, branch.ast.cond_expr);
     if (tree.nodeTag(condition) != .equal_equal) return false;
     const lhs, const rhs = tree.nodeData(condition).node_and_node;
-    const compared = if (isZero(tree, rhs)) lhs else if (isZero(tree, lhs)) rhs else return false;
-    var value = compared;
-    while (tree.nodeTag(value) == .grouped_expression) value = tree.nodeData(value).node_and_token[0];
-    if (tree.nodeTag(value) == .mod) {
-        const counter, const by = tree.nodeData(value).node_and_node;
-        if (tree.nodeTag(counter) != .identifier or tree.nodeTag(by) != .number_literal or isZero(tree, by)) return false;
-        return stepped(c, file, counter, body, .assign_add, null);
+    const compared = Facts.ungrouped(tree, if (try isZero(c, file, rhs)) lhs else if (try isZero(c, file, lhs)) rhs else return false);
+    if (tree.nodeTag(compared) == .mod) {
+        const counter, const by = tree.nodeData(compared).node_and_node;
+        // The divisor a constant the program fixes (Range.constantValue), other than zero.
+        if ((try Range.constantValue(c, file, by) orelse return false) == 0) return false;
+        return stepped(c, file, (try counterOf(c, file, counter)) orelse return false, body, .add, null);
     }
-    if (tree.nodeTag(value) != .identifier) return false;
-    return stepped(c, file, value, body, .assign_sub, branch.ast.then_expr);
+    return stepped(c, file, (try counterOf(c, file, compared)) orelse return false, body, .sub, branch.ast.then_expr);
 }
 
-/// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`) every pass of the loop whose body is
-/// `body`, by its continue expression or a statement on every pass, and nothing else in the
-/// loop assigns it but, where `reset` is given, a constant other than zero set on every path
-/// through that branch. The counter is a variable of the function, declared before the loop,
-/// whose address is never taken: one any other code may write (a container's, or one written
-/// through a pointer) is none, and so is one declared in the loop, made again each pass.
-fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast.Node.Index, step: Ast.Node.Tag, reset: ?Ast.Node.Index) Context.Error!bool {
+/// The variable of the function `node` names whole (Facts.accesses.pathOf): no member, element
+/// or other place of it.
+fn counterOf(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+    const path = try Facts.accesses.pathOf(c.facts, file, node);
+    if (path.steps.len != 1) return null;
+    const d = switch (path.root) {
+        .decl => |d| d,
+        .none, .unknown => return null,
+    };
+    return if (d.file == file) d.index else null;
+}
+
+/// Whether `counter` is stepped by `step` (`+= 1`, `-= 1`, as Facts.accesses reads each store)
+/// every pass of the loop whose body is `body`, by its continue expression or a statement on
+/// every pass, and nothing else in the loop stores into it but, where `reset` is given, a
+/// constant other than zero set on every path through that branch. The counter is a variable
+/// of the function, declared before the loop, whose address is never taken: one any other code
+/// may write (a container's, or one written through a pointer) is none, and so is one declared
+/// in the loop, made again each pass.
+fn stepped(c: *Context, file: Project.FileId, declared: Model.Declaration.Id, body: Ast.Node.Index, step: enum { add, sub }, reset: ?Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(file).file.tree;
     const model = &c.project.at(file).model;
-    const declared = (model.reference(counter) orelse return false).declaration orelse return false;
     if (!localVariable(c, file, declared)) return false;
     const loop_node = model.parentOf(body) orelse return false;
     // One declared in the loop starts again each pass: it counts no passes.
@@ -1373,23 +1382,34 @@ fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast
     const cont: ?Ast.Node.Index = if (tree.fullWhile(loop_node)) |loop| loop.ast.cont_expr.unwrap() else null;
     var steps = false;
     var resets = false;
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!assigns(tag)) continue;
-        const token = tree.nodeMainToken(node);
+    for (try Facts.accesses.storesIn(c.facts, file)) |store| {
+        const token = tree.nodeMainToken(store.node);
         if (token < tree.firstToken(loop_node) or token > tree.lastToken(loop_node)) continue;
-        const written, const value = tree.nodeData(node).node_and_node;
-        const target = rootOf(tree, written);
-        if (tree.nodeTag(target) != .identifier) continue;
-        if ((model.reference(target) orelse continue).declaration != declared) continue;
-        if (target != written) return false;
-        const one = tree.nodeTag(value) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(value)), "1");
-        if (tag == step and one and (node == cont or try always(c, file, node, body, .{}))) {
+        const target = store.target orelse continue;
+        const path = try Facts.accesses.pathOf(c.facts, file, target);
+        const d = switch (path.root) {
+            .decl => |d| d,
+            .none, .unknown => continue,
+        };
+        if (d.file != file or d.index != declared) continue;
+        // Part of it stored (a field, an element): no count.
+        if (path.steps.len != 1) return false;
+        const value = store.value orelse return false;
+        const constant = try Range.constantValue(c, file, value);
+        const by_step = if (store.operator) |update| switch (update) {
+            .op => |op| op.overflow == .checked and switch (op.op) {
+                .add => step == .add,
+                .sub => step == .sub,
+                else => false,
+            },
+            .unknown => false,
+        } else false;
+        if (store.kind == .update and by_step and constant == 1 and (store.node == cont or try always(c, file, store.node, body, .{}))) {
             if (steps) return false;
             steps = true;
             continue;
         }
-        if (reset) |branch| if (tag == .assign and tree.nodeTag(value) == .number_literal and !isZero(tree, value) and try always(c, file, node, branch, .{})) {
+        if (reset) |branch| if (store.kind == .set and (constant orelse 0) != 0 and try always(c, file, store.node, branch, .{})) {
             resets = true;
             continue;
         };
@@ -1398,8 +1418,9 @@ fn stepped(c: *Context, file: Project.FileId, counter: Ast.Node.Index, body: Ast
     return steps and (reset == null or resets);
 }
 
-fn isZero(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .number_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "0");
+/// Whether `node` is a constant the program fixes at zero (Range.constantValue).
+fn isZero(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return (try Range.constantValue(c, file, node)) == 0;
 }
 
 fn namesCanceled(tree: *const Ast, node: Ast.Node.Index) bool {
