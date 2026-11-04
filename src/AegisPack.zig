@@ -4340,11 +4340,17 @@ fn insideLoop(tree: *const Ast, model: *const Model, token: Ast.TokenIndex, root
     return false;
 }
 
-/// Whether `jumping`, a `return` or a `try`, leaves by an error, which an `errdefer` sees: a
+/// Whether `jumping`, a jump out of the walk, leaves by an error, which an `errdefer` sees: a
 /// `try`, or a `return` of an error (`error.Name`, or a value of an error set, such as a call
-/// that maps one).
+/// that maps one); never a `break` or a `continue`.
 fn failing(c: *Context, tree: *const Ast, jumping: Ast.Node.Index) Context.Error!bool {
-    if (tree.nodeTag(jumping) == .@"try") return true;
+    switch (tree.nodeTag(jumping)) {
+        .@"try" => return true,
+        .@"return" => {},
+        // A `break` or a `continue` past the walk lands in a block or a loop of the function:
+        // it never leaves the function by an error, so no `errdefer` runs on it.
+        else => return false,
+    }
     const value = tree.nodeData(jumping).opt_node.unwrap() orelse return false;
     if (try c.facts.literalOf(c.file, value)) |literal| if (literal == .error_value) return true;
     return try c.facts.resolve(c.file, value) == .error_set;
