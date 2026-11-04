@@ -909,8 +909,28 @@ fn copied(c: *Context, value: Facts.Value, depth: usize) Context.Error!Typed {
             for (each) |one| found = joined(found, try copied(c, one, depth + 1));
             break :blk found;
         },
+        // A record of the program copied copies what it holds by value in its fields
+        // (`struct { s: Secret(u32) }`), as `heldInRecord` reads them for A003.
+        .instance => |container| blk: {
+            const found = try typed(c, value, depth + 1);
+            if (found != .other) break :blk found;
+            break :blk recordCopied(c, container, depth + 1);
+        },
         else => typed(c, value, depth + 1),
     };
+}
+/// What a copy of a value of the program's record `container` duplicates of its fields, by
+/// `copied`. aegis's own types hold what their contract says; std's records are std's.
+fn recordCopied(c: *Context, container: Facts.Container, depth: usize) Context.Error!Typed {
+    if (try c.inLibrary(Contract.library, container.file)) return .other;
+    if (!try c.facts.program(container.file)) return .other;
+    var found: Typed = .other;
+    for (try c.facts.heldFields(container)) |field| {
+        // A field typed only by a generic's binding is judged where that is bound.
+        if (bindingTyped(field.value)) continue;
+        found = joined(found, try copied(c, field.value, depth + 1));
+    }
+    return found;
 }
 /// The role of the published aegis type `container` is declared inside, as a guarded value's
 /// guard is: its own operations belong to that type's contract.

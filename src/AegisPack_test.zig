@@ -993,6 +993,15 @@ test "A002 follows a generic's copy through any number of generics passing it on
     try expectJudged(chain.items, pack.copies, true, 1);
 }
 
+test "A002 judges a generic's copy bound to a record of the program by the owners its fields hold" {
+    // glint-c's n1e: copying the record copies the owner it holds by value; a field pointing
+    // at the owner is an alias, which A002 leaves out.
+    const head = "const S = @import(\"aegis\").Secret(u32);\nfn keep(comptime T: type, v: T) [2]T { return .{ v, v }; }\n";
+    try expectJudged(head ++ "const H = struct { s: S, n: u32 };\npub fn f() void { const h: H = .{ .s = S.init(1), .n = 2 }; _ = keep(H, h); }", pack.copies, true, 1);
+    try expectJudged(head ++ "const H = struct { inner: struct { s: S } };\npub fn f() void { const h: H = .{ .inner = .{ .s = S.init(1) } }; _ = keep(H, h); }", pack.copies, true, 1);
+    try expectJudged(head ++ "const H = struct { s: *const S, n: u32 };\npub fn f(s: *const S) void { const h: H = .{ .s = s, .n = 2 }; _ = keep(H, h); }", pack.copies, true, 0);
+}
+
 test "A002 records for a generic's bindings only a copy whose value a binding settles" {
     // gantry's `scan(context: anytype, comptime read: anytype)` shapes, bound to a function
     // and a pointer: a `comptime` block's locals, what `@TypeOf` is given, a copy into a type
