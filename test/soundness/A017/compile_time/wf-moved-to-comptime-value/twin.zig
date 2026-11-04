@@ -15,3 +15,8 @@ pub const Job = struct {
         };
     }
 };
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+pub fn started() Job {
+    return Job.make(.running);
+}

@@ -20,6 +20,22 @@ fn count(report: glint.Report, id: glint.Rule) usize {
     };
     return total;
 }
+/// What the pack writes at a public generic nothing the run binds (`Facts.unbound_generic`).
+const unbound_generic = "unbound generic: judged at its consumers' bindings";
+/// A rule's undecided sites in a run: the unbound notes, and every other.
+const Undecided = struct { unbound: usize, other: usize };
+fn undecidedOf(report: glint.Report, id: glint.Rule) Undecided {
+    var found: Undecided = .{ .unbound = 0, .other = 0 };
+    for (report.coverage) |entry| if (entry.rule == id) {
+        if (std.mem.eql(u8, entry.detail, unbound_generic)) found.unbound += 1 else found.other += 1;
+    };
+    return found;
+}
+/// A run with `rule` gated is complete or not, with `findings` of it.
+fn expectReport(report: glint.Report, rule: glint.Rule, complete: bool, findings: usize) !void {
+    try std.testing.expectEqual(complete, report.complete);
+    try std.testing.expectEqual(findings, count(report, rule));
+}
 test "aegis pack access copies scalar and capacity reports" {
     var project = try fixture(
         \\const Secret = @import("aegis").Secret;
@@ -223,7 +239,8 @@ test "a copy of plain data is decided by what the copy or its source declares" {
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.copies, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expect(report.complete);
+    // `f` is a public generic nothing binds: undecided at its name alone, every copy in it decided.
+    try std.testing.expectEqual(Undecided{ .unbound = 1, .other = 0 }, undecidedOf(report, pack.copies));
     // The owner copied into a declared owner is still the one witness.
     try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len); // safe: one owner copy in the fixture.
     try std.testing.expectEqual(@as(u32, 28), report.diagnostics[0].span.line); // safe: the fixture's owner-copy line fits u32.
@@ -485,7 +502,7 @@ test "A004 reads a scalar's raw integer by meaning, through every place it is pu
     try expectJudged(head ++ "const Color = enum(u8) { red, _ };\nvar a: aegis.Atomic(Color) = .init(@fromBackingInt(0));\nvar b: aegis.Atomic(Index) = .init(@fromBackingInt(0));\nvar d: aegis.Atomic(Index) = aegis.Atomic(Index).init(@fromBackingInt(0));\npub fn f() void { _ = &a; _ = &b; _ = &d; }", pack.scalar, true, 2);
     // A cast by a generic parameter's type is each binding's: decided where it is bound.
     const generic = "fn Lib(comptime R: type) type { return struct { pub const Role = R; roles: []const R }; }\nfn role(library: anytype, n: u32) @TypeOf(library).Role { const Role = @TypeOf(library).Role; return @as(Role, @fromBackingInt(@as(u16, @intCast(n)))); }\nfn total(library: anytype) u32 { var sum: u32 = 0; for (library.roles) |r| sum += @intCast(@backingInt(r)); return sum; }\n";
-    try expectJudged(head ++ generic ++ "pub fn open(library: anytype, n: u32) @TypeOf(library).Role { return role(library, n); }", pack.scalar, true, 0);
+    try expectUnbound(head ++ generic ++ "pub fn open(library: anytype, n: u32) @TypeOf(library).Role { return role(library, n); }", pack.scalar, 1, 0);
     try expectJudged(head ++ generic ++ "const Kind = enum(u16) { a, _ };\nconst lib: Lib(Kind) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 0);
     try expectJudged(head ++ generic ++ "const lib: Lib(Index) = .{ .roles = &.{} };\npub fn f() u32 { _ = role(lib, 1); return total(lib); }", pack.scalar, true, 2);
     // An enum of the program's own, an array's length, a comparison of scalars: no raw integer.
@@ -656,8 +673,7 @@ fn expectWithBytes(source: []const u8, rule: glint.Rule, complete: bool, finding
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
+    try expectReport(report, rule, complete, findings);
 }
 
 test "A001 reads a public source rewritten by a destructure, or through its whole address handed where it is written" {
@@ -769,17 +785,28 @@ test "A004 strict: every operator, compound assignment and cast on a raw value, 
 }
 
 /// One rule gated over `source`: whether the run decided every site, and how many findings.
-fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findings: usize } {
+fn judged(source: []const u8, rule: glint.Rule) !struct { complete: bool, findings: usize, undecided: Undecided } {
     var project = try fixture(source);
     defer project.deinit();
     try std.testing.expectEqual(.parsed, project.sources[0].file.status);
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    return .{ .complete = report.complete, .findings = count(report, rule) };
+    return .{ .complete = report.complete, .findings = count(report, rule), .undecided = undecidedOf(report, rule) };
 }
 fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
+    var project = try fixture(source);
+    defer project.deinit();
+    try std.testing.expectEqual(.parsed, project.sources[0].file.status);
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try expectReport(report, rule, complete, findings);
+}
+/// `expectJudged` for a program whose public generic nothing binds, as the row means it to be:
+/// `notes` unbound notes at generics' names (`unbound_generic`), every other site decided.
+fn expectUnbound(source: []const u8, rule: glint.Rule, notes: usize, findings: usize) !void {
     const got = try judged(source, rule);
-    try std.testing.expectEqual(complete, got.complete);
+    try std.testing.expectEqual(notes, got.undecided.unbound);
+    try std.testing.expectEqual(@as(usize, 0), got.undecided.other);
     try std.testing.expectEqual(findings, got.findings);
 }
 /// A std of the parts a rule names by declaration (std's allocator), beside aegis.
@@ -798,8 +825,7 @@ fn expectJudgedStd(source: []const u8, rule: glint.Rule, complete: bool, finding
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
+    try expectReport(report, rule, complete, findings);
 }
 
 test "receivers bound by captures are decided by what they bind" {
@@ -974,7 +1000,7 @@ test "A002 follows a copy's value through every shape it is written in to the pl
     // A part of a generic's value, chosen or wrapped, is each binding's copy where only the
     // binding settles it; where its callers settle it (a private generic), each part is
     // decided where it is written.
-    try expectJudged(head ++ "pub fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, true, 0);
+    try expectUnbound(head ++ "pub fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }", pack.copies, 1, 0);
     try expectJudged(head ++ "fn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; copy.deinit(); }\npub fn g(h: *H) void { f(h, true); }", pack.copies, true, 2);
     try expectJudged(head ++ "const P = struct { s: u32, t: u32 };\nfn f(h: anytype, c: bool) void { var copy = if (c) h.s else h.t; _ = &copy; }\npub fn g(h: *P) void { f(h, true); }", pack.copies, true, 0);
     // Plain data written any of these ways is decided.
@@ -1114,30 +1140,30 @@ test "cleanup paths through branches, deferred releases and loops are decided" {
 test "a guard through a loop is decided by the states its back edge and its exits agree on" {
     const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\nfn ready() bool { return true; }\nfn wait() void {}\n";
     // Released and acquired again around a wait, left released by a return: a spare's wait.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) u32 { var held = b.acquireUncancelable(io); const value = held.value(); while (true) { if (value.* != 0) { const v = value.*; held.deinit(io); return v; } else {} held.deinit(io); wait(); held = b.acquireUncancelable(io); } }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) u32 { var held = b.acquireUncancelable(io); const value = held.value(); while (true) { if (value.* != 0) { const v = value.*; held.deinit(io); return v; } else {} held.deinit(io); wait(); held = b.acquireUncancelable(io); } }", pack.cleanup, 1, 0);
     // Returned held from inside a loop that never ends otherwise: the caller's to release.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) B.Guard { var held = b.acquireUncancelable(io); if (!ready()) return held; _ = held.value(); while (true) { if (ready()) return held; wait(); } }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) B.Guard { var held = b.acquireUncancelable(io); if (!ready()) return held; _ = held.value(); while (true) { if (ready()) return held; wait(); } }", pack.cleanup, 1, 0);
     // Its caller holds what it returns: released, or a finding.
     const give = "fn give(io: anytype, b: *B) B.Guard { var held = b.acquireUncancelable(io); _ = held.value(); return held; }\n";
-    try expectJudged(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); defer held.deinit(io); }", pack.cleanup, true, 0);
-    try expectJudged(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); _ = held.value(); }", pack.cleanup, true, 1);
+    try expectUnbound(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); defer held.deinit(io); }", pack.cleanup, 1, 0);
+    try expectUnbound(head ++ give ++ "pub fn f(io: anytype, b: *B) void { var held = give(io, b); _ = held.value(); }", pack.cleanup, 1, 1);
     try expectJudged("const S = @import(\"aegis\").Secret;\nfn make() !S(u32) { return S(u32).init(1); }\npub fn f() !void { var s = try make(); _ = s.expose(); }", pack.cleanup, true, 1);
     // A pointer to an owner is no owner of the caller's.
     try expectJudged(head ++ "fn at(held: *B.Guard) *B.Guard { return held; }\npub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); defer held.deinit(io); const p = at(&held); _ = p; }", pack.cleanup, false, 0);
     // Released inside, left by `break`, released again after: decided, and a second release a witness.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (ready()) { held.deinit(io); if (ready()) break; held = b.acquireUncancelable(io); } else held.deinit(io); }", pack.cleanup, true, 0);
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) { held.deinit(io); break; } } held.deinit(io); }", pack.cleanup, true, 1);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (ready()) { held.deinit(io); if (ready()) break; held = b.acquireUncancelable(io); } else held.deinit(io); }", pack.cleanup, 1, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) { held.deinit(io); break; } } held.deinit(io); }", pack.cleanup, 1, 1);
     // Every way out of the loop held, and no release after it: a finding.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) break; _ = held.value(); wait(); } }", pack.cleanup, true, 1);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (true) { if (ready()) break; _ = held.value(); wait(); } }", pack.cleanup, 1, 1);
     // Ways out in different states, or a body that comes back released: undecided.
     try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); while (ready()) { if (ready()) { held.deinit(io); break; } } held.deinit(io); }", pack.cleanup, false, 0);
     try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); for (0..2) |_| { held.deinit(io); continue; } }", pack.cleanup, false, 0);
     // A release the body defers runs as each pass ends.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { while (ready()) { var held = b.acquireUncancelable(io); defer held.deinit(io); if (ready()) continue; } }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { while (ready()) { var held = b.acquireUncancelable(io); defer held.deinit(io); if (ready()) continue; } }", pack.cleanup, 1, 0);
     // A jump to an outer loop of the walk is not followed.
     try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); outer: while (ready()) { while (ready()) { if (ready()) continue :outer; } } held.deinit(io); }", pack.cleanup, false, 0);
     // A `break` of the walk's loop inside an expression is one of its ways out.
-    try expectJudged(head ++ "fn next() ?u32 { return null; }\npub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); defer held.deinit(io); while (true) { const n = next() orelse break; _ = n; } }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "fn next() ?u32 { return null; }\npub fn f(io: anytype, b: *B) void { var held = b.acquireUncancelable(io); defer held.deinit(io); while (true) { const n = next() orelse break; _ = n; } }", pack.cleanup, 1, 0);
 }
 
 test "a guard's release handed off is a declared transfer" {
@@ -1212,8 +1238,7 @@ fn expectJudgedWithDependency(source: []const u8, dependency: []const u8, rule: 
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
+    try expectReport(report, rule, complete, findings);
 }
 
 /// `expectJudged` with `other` beside the program as `other.zig`, imported by its path and not
@@ -1223,8 +1248,7 @@ fn expectJudgedWithFile(source: []const u8, other: []const u8, rule: glint.Rule,
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
+    try expectReport(report, rule, complete, findings);
 }
 
 fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
@@ -1232,8 +1256,7 @@ fn expectJudgedWithLib(source: []const u8, lib: []const u8, rule: glint.Rule, co
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
+    try expectReport(report, rule, complete, findings);
 }
 
 test "a public generic's parameters are each binding's, a consumer's among them; a private one's are its callers'" {
@@ -1486,7 +1509,7 @@ test "a guard read in a condition before its release, and one waited on through 
     // Lent anywhere else, its release may move: undecided.
     try expectJudged(head ++ "var kept: ?*anyopaque = null;\nfn keep(g: anytype) void { kept = @ptrCast(g); }\npub fn f(io: anytype, b: *aegis.BlockingGuarded(u32)) !void { var held = try b.acquire(io); defer held.deinit(io); keep(&held); }", pack.cleanup, false, 0);
     // A guard never released is still a finding when it was read in a condition.
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } }", pack.cleanup, true, 1);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *aegis.BlockingGuarded(?u32)) void { var held = b.acquireUncancelable(io); if (held.value().*) |v| { _ = v; } }", pack.cleanup, 1, 1);
 }
 
 test "a guard lent to the program's own function is a borrow when every path hands it back held" {
@@ -1495,7 +1518,7 @@ test "a guard lent to the program's own function is a borrow when every path han
     // Released and held again, a wait on the way, a loan on to another that does the same.
     try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { held.deinit(io); held.* = b.acquireUncancelable(io); again(io, b, c, held); }\nfn again(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { while (held.value().* == 0) { held.deinit(io); held.* = b.acquireUncancelable(io); held.wait(c, io, .none) catch return; } }\n" ++ owner, pack.cleanup, true, 0);
     // A method of the program's own, through its receiver.
-    try expectJudged(head ++ "const S = struct { b: *B, fn give(s: *S, io: anytype, held: anytype) void { if (held.value().* == 0) return; held.deinit(io); held.* = s.b.acquireUncancelable(io); } };\npub fn f(io: anytype, s: *S) void { var held = s.b.acquireUncancelable(io); defer held.deinit(io); s.give(io, &held); }", pack.cleanup, true, 0);
+    try expectUnbound(head ++ "const S = struct { b: *B, fn give(s: *S, io: anytype, held: anytype) void { if (held.value().* == 0) return; held.deinit(io); held.* = s.b.acquireUncancelable(io); } };\npub fn f(io: anytype, s: *S) void { var held = s.b.acquireUncancelable(io); defer held.deinit(io); s.give(io, &held); }", pack.cleanup, 1, 0);
     // One path returns with it released: no loan, undecided.
     try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { _ = c; held.deinit(io); if (held == held) return; held.* = b.acquireUncancelable(io); }\n" ++ owner, pack.cleanup, false, 0);
     try expectJudged(head ++ "fn give(io: anytype, b: *B, c: *aegis.Condition, held: anytype) void { _ = b; _ = c; held.deinit(io); }\n" ++ owner, pack.cleanup, false, 0);
@@ -1505,8 +1528,8 @@ test "a guard lent to the program's own function is a borrow when every path han
 
 test "an acquisition whose failure is caught is checked as one by `try` is" {
     const head = "const aegis = @import(\"aegis\");\nconst B = aegis.BlockingGuarded(u32);\n";
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; defer held.deinit(io); _ = held.value(); }", pack.cleanup, true, 0);
-    try expectJudged(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; _ = held.value(); }", pack.cleanup, true, 1);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; defer held.deinit(io); _ = held.value(); }", pack.cleanup, 1, 0);
+    try expectUnbound(head ++ "pub fn f(io: anytype, b: *B) void { var held = b.acquire(io) catch return; _ = held.value(); }", pack.cleanup, 1, 1);
 }
 
 test "values initialized once and values one task owns keep their state behind their operations" {
@@ -1892,7 +1915,7 @@ test "a member read of a backing field that is an array, a slice or a number is 
 test "receivers through comptime values, struct literals, calls by @call and a choice behind a pointer are decided" {
     const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32, values: []const u8 = &.{} };\n";
     // `++` of two slices is an array of their elements.
-    try expectJudged(head ++ "const Opt = struct { index: usize };\nconst Info = struct { options: []const Opt, positionals: []const Opt };\npub fn f(comptime info: Info) usize { var n: usize = 0; inline for (info.options ++ info.positionals) |o| n += o.index; return n; }", pack.access, true, 0);
+    try expectUnbound(head ++ "const Opt = struct { index: usize };\nconst Info = struct { options: []const Opt, positionals: []const Opt };\npub fn f(comptime info: Info) usize { var n: usize = 0; inline for (info.options ++ info.positionals) |o| n += o.index; return n; }", pack.access, 1, 0);
     // `comptime x` has `x`'s type.
     try expectJudged(head ++ "fn all(comptime T: type) []const Plain { _ = T; return &.{}; }\npub fn f() usize { const ps = comptime all(u8); var n: usize = 0; inline for (ps) |p| n += p.values.len; return n; }", pack.access, true, 0);
     // A block's value given by an untyped struct literal is that literal's anonymous struct.
@@ -1908,11 +1931,11 @@ test "receivers through comptime values, struct literals, calls by @call and a c
 test "a function's callers are found past members of values that only fields can be" {
     const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32 };\nfn run(c: anytype) u32 { return c.data; }\npub fn f(p: *Plain) u32 { return run(p); }\n";
     // Zig has no bound methods: a member of a value used other than by a call is a field.
-    try expectJudged(head ++ "pub fn g(o: anytype) void { const s = &o.request; _ = &s.run; }", pack.access, true, 0);
+    try expectUnbound(head ++ "pub fn g(o: anytype) void { const s = &o.request; _ = &s.run; }", pack.access, 1, 0);
     // A member written to, or read as a number, is a field.
-    try expectJudged(head ++ "pub fn g(o: anytype, n: u32) void { o.run = n; if (o.run > 1) o.run -= 1; }", pack.access, true, 0);
+    try expectUnbound(head ++ "pub fn g(o: anytype, n: u32) void { o.run = n; if (o.run > 1) o.run -= 1; }", pack.access, 1, 0);
     // An `anytype` parameter dereferenced is a pointer: its member passed on is a field.
-    try expectJudged(head ++ "fn take(_: anytype) void {}\npub fn g(o: anytype) void { const T = @TypeOf(o.*); _ = T; take(o.run); }", pack.access, true, 0);
+    try expectUnbound(head ++ "fn take(_: anytype) void {}\npub fn g(o: anytype) void { const T = @TypeOf(o.*); _ = T; take(o.run); }", pack.access, 1, 0);
     // A receiver that may be a type may name the function itself: undecided.
     try expectJudged(head ++ "fn take(_: anytype) void {}\npub fn g(o: anytype) void { take(o.run); }", pack.access, false, 0);
 }
@@ -1949,10 +1972,10 @@ test "the private fields of staged payloads, machines, scopes, references, secon
 test "type information of a type that does not resolve is still type information" {
     const head = "const aegis = @import(\"aegis\");\nconst Tag = struct {};\nconst S = enum { open, done };\nconst E = enum { finish };\nconst Machine = aegis.state.Machine(S, E, .{ .initial = .open, .terminal = &.{.done}, .edges = &.{.{ .from = .open, .on = .finish, .to = .done }} });\n";
     // `@typeInfo` of an unbound type parameter: its parts are `std.builtin.Type` values.
-    try expectJudged(head ++ "pub fn F(comptime R: type) type { return @typeInfo(R).error_union.payload; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn F(comptime R: type) type { return switch (@typeInfo(R)) { .error_union => |eu| eu.payload, else => R }; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn F(comptime R: type) usize { return switch (@typeInfo(R)) { .@\"struct\" => |s| s.fields.len, .error_union, .optional => |x| @sizeOf(@TypeOf(x)), else => 0 }; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn F(comptime R: type) usize { const info = @typeInfo(R).@\"struct\"; return info.fields.len; }", pack.access, true, 0);
+    try expectUnbound(head ++ "pub fn F(comptime R: type) type { return @typeInfo(R).error_union.payload; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn F(comptime R: type) type { return switch (@typeInfo(R)) { .error_union => |eu| eu.payload, else => R }; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn F(comptime R: type) usize { return switch (@typeInfo(R)) { .@\"struct\" => |s| s.fields.len, .error_union, .optional => |x| @sizeOf(@TypeOf(x)), else => 0 }; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn F(comptime R: type) usize { const info = @typeInfo(R).@\"struct\"; return info.fields.len; }", pack.access, 1, 0);
 }
 
 test "receivers through a guard's resolved type, builtins, destructuring, loop values and choices a build leaves out are decided" {
@@ -2101,7 +2124,7 @@ test "A001 finds public text built by a literal, by the type the literal takes f
     try expectJudged(head ++ "pub fn f(b: []const u8) void { show(err.PublicSource.classify(\"a reviewed name\", b)); }", pack.access, true, 0);
     try expectJudged(head ++ "pub fn f(b: []const u8) void { take(.{ .bytes = b }); const o: Other = .{ .bytes = b }; _ = o; const a = .{ .bytes = b }; _ = a; }", pack.access, true, 0);
     // A literal naming other fields cannot be one; a place that does not resolve is undecided.
-    try expectJudged(head ++ "pub fn f(b: []const u8, sink: anytype) void { sink.put(.{ .bytes = b, .more = 1 }); }", pack.access, true, 0);
+    try expectUnbound(head ++ "pub fn f(b: []const u8, sink: anytype) void { sink.put(.{ .bytes = b, .more = 1 }); }", pack.access, 1, 0);
     try expectJudged(head ++ "pub fn f(b: []const u8, sink: anytype) void { sink.put(.{ .bytes = b }); }", pack.access, false, 0);
 }
 
@@ -2169,7 +2192,7 @@ test "a made container's declaration naming a type another call makes is read wi
 
 test "A001 refutes an unresolved receiver by the other members the file reads of the same expression" {
     // `p.name` beside `p.value`: no aegis type with a `value` field has a `name`.
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| { _ = p.name; _ = p.value; } }", pack.access, true, 0);
+    try expectUnbound("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| { _ = p.name; _ = p.value; } }", pack.access, 1, 0);
     // Without another member the receiver stays undecided.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) void { for (access.pairs()) |p| _ = p.value; }", pack.access, false, 0);
 }
@@ -2178,18 +2201,18 @@ test "A003 leaves an unresolved acquisition undecided even where no aegis functi
     // No aegis `read` takes two arguments, but `access` may be the program's own type, whose
     // `read` returns an owner: a method of an `anytype` parameter's value gives what each
     // binding makes, checked at the binding, as a type parameter's function does (below).
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, true, 0);
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, true, 0);
+    try expectUnbound("const aegis = @import(\"aegis\");\npub fn f(access: anytype) !void { const text = try access.read([]const u8, 4); _ = text; }", pack.cleanup, 1, 0);
+    try expectUnbound("const aegis = @import(\"aegis\");\npub fn f(access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, 1, 0);
     // A `comptime` value holds nothing at run time: a call on it is judged where it is written.
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(comptime access: anytype, io: anytype) !void { var g = try access.read(io); _ = &g; }", pack.cleanup, false, 0);
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(raw: *anyopaque, io: anytype, id: u32, comptime T: type) !void { const owner: T = @ptrCast(@alignCast(raw)); const got = try owner.read(io, id); _ = got; }", pack.cleanup, false, 0);
     // A function of a type parameter gives what each binding makes, checked at the binding.
-    try expectJudged("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, true, 0);
+    try expectUnbound("const aegis = @import(\"aegis\");\npub fn f(io: anytype, id: u32, comptime T: type) !void { const got = try T.read(io, id); _ = got; }", pack.cleanup, 1, 0);
 }
 
 test "A002 reads operators and a tuple written in place" {
     // An operator gives no struct: a copy of its result copies no owner, nor an `if` one of whose branches is one.
-    try expectJudged("pub fn f(comptime Int: type, a: Int, b: Int, g: fn () Int) void { const d = a - b; var x = if (a > b) g() + 1 else g(); const e = d; const y = x; _ = e; _ = y; _ = &x; }", pack.copies, true, 0);
+    try expectUnbound("pub fn f(comptime Int: type, a: Int, b: Int, g: fn () Int) void { const d = a - b; var x = if (a > b) g() + 1 else g(); const e = d; const y = x; _ = e; _ = y; _ = &x; }", pack.copies, 1, 0);
     // An `inline for` over `.{ a, b }` takes each element in turn.
     try expectJudged("pub fn f() void { inline for (.{ @as(u8, 1), @as(u16, 2) }) |v| { var copy = v; _ = &copy; } }", pack.copies, true, 0);
 }
@@ -2197,44 +2220,44 @@ test "A002 reads operators and a tuple written in place" {
 test "a comptime condition settled on the path decides a receiver chosen by it" {
     const head = "const aegis = @import(\"aegis\");\nconst Direct = struct { data: u64, lock: bool };\n";
     // The direct side after `if (wrapped) return ...;`, in an `else`, or under `if (!wrapped)`.
-    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) { var held = owner.acquire(); defer held.deinit(); return held.value().*; } return owner.data; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) return 0 else return owner.data; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) { owner.lock = true; } return 0; }", pack.access, true, 0);
+    try expectUnbound(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) { var held = owner.acquire(); defer held.deinit(); return held.value().*; } return owner.data; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (wrapped) return 0 else return owner.data; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) { owner.lock = true; } return 0; }", pack.access, 1, 0);
     // Through a type function of the condition: `Owner(wrapped)` read with what the path settles.
-    try expectJudged(head ++ "fn Owner(comptime wrapped: bool) type { return if (wrapped) aegis.Guarded(u64) else Direct; }\npub fn f(comptime wrapped: bool, owner: *Owner(wrapped)) u64 { if (wrapped) return 0; return owner.data; }", pack.access, true, 0);
+    try expectUnbound(head ++ "fn Owner(comptime wrapped: bool) type { return if (wrapped) aegis.Guarded(u64) else Direct; }\npub fn f(comptime wrapped: bool, owner: *Owner(wrapped)) u64 { if (wrapped) return 0; return owner.data; }", pack.access, 1, 0);
     // A container a type function makes with the condition, its field chosen by it.
-    try expectJudged(head ++ "fn State(comptime wrapped: bool) type { return struct { m: if (wrapped) aegis.Guarded(u64) else Direct }; }\npub fn f(comptime wrapped: bool, s: *State(wrapped)) u64 { if (wrapped) return 0; const owner = &s.m; return owner.data; }", pack.access, true, 0);
+    try expectUnbound(head ++ "fn State(comptime wrapped: bool) type { return struct { m: if (wrapped) aegis.Guarded(u64) else Direct }; }\npub fn f(comptime wrapped: bool, s: *State(wrapped)) u64 { if (wrapped) return 0; const owner = &s.m; return owner.data; }", pack.access, 1, 0);
     // On the wrapped side the same access is the aegis owner's backing field.
-    try expectJudged(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) return 0; return owner.data; }", pack.access, true, 1);
+    try expectUnbound(head ++ "pub fn f(comptime wrapped: bool, owner: if (wrapped) *aegis.Guarded(u64) else *Direct) u64 { if (!wrapped) return 0; return owner.data; }", pack.access, 1, 1);
     // Two instantiations of one type function are two alternatives, each read with its call.
-    try expectJudged(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(aegis.Guarded(u64)) else Line(Direct)) u64 { return line.value.data; }", pack.access, true, 1);
-    try expectJudged(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(Direct) else Line(Direct)) u64 { return line.value.data; }", pack.access, true, 0);
+    try expectUnbound(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(aegis.Guarded(u64)) else Line(Direct)) u64 { return line.value.data; }", pack.access, 1, 1);
+    try expectUnbound(head ++ "fn Line(comptime T: type) type { return struct { value: T }; }\npub fn f(comptime wrapped: bool, line: if (wrapped) Line(Direct) else Line(Direct)) u64 { return line.value.data; }", pack.access, 1, 0);
 }
 
 test "a switch prong on a comptime enum parameter settles it for what the prong reads" {
     const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { data: u32 };\nfn Line(comptime T: type) type { return struct { value: T }; }\nconst A = struct { fn next(_: *A) ?Line(Plain) { return null; } };\nconst C = struct { fn next(_: *C, n: u32) Line(aegis.Guarded(u32)) { _ = n; return undefined; } };\nconst D = enum { a, c };\n";
     // Inside `.a`, the reader the earlier switch on `d` chose is `A`'s alone.
-    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; return switch (d) { .a => r.next().?.value.data, .c => 0 }; }", pack.access, true, 0);
-    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; _ = line; return switch (d) { .a => 0, .c => r.next(1).value.data }; }", pack.access, true, 1);
+    try expectUnbound(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; return switch (d) { .a => r.next().?.value.data, .c => 0 }; }", pack.access, 1, 0);
+    try expectUnbound(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; _ = line; return switch (d) { .a => 0, .c => r.next(1).value.data }; }", pack.access, 1, 1);
     // Read outside a prong, the receiver is either reader's.
-    try expectJudged(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; return line.value.data; }", pack.access, true, 1);
+    try expectUnbound(head ++ "pub fn f(comptime d: D) u32 { var r = switch (d) { .a => A{}, .c => C{} }; const line = switch (d) { .a => r.next().?, .c => r.next(1) }; return line.value.data; }", pack.access, 1, 1);
 }
 
 test "a generic's copies of its parameter are decided where the parameter is bound" {
     const head = "const aegis = @import(\"aegis\");\npub fn clone(comptime T: type, value: T) T { var result = value; _ = &result; return result; }\npub fn outer(comptime T: type, value: T) T { return clone(T, value); }\n";
     // At the definition the copy is the bindings' obligation.
-    try expectJudged(head, pack.copies, true, 0);
+    try expectUnbound(head, pack.copies, 2, 0);
     // A binding to a plain type copies no owner; one to an owner does, there or through a
     // generic that passes it on.
     try expectJudged(head ++ "const P = struct { n: u8 };\npub fn f(p: P) void { _ = clone(P, p); _ = outer(P, p); }", pack.copies, true, 0);
-    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = clone(aegis.Secret(u32), s); }", pack.copies, true, 1);
+    try expectUnbound(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = clone(aegis.Secret(u32), s); }", pack.copies, 1, 1);
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { _ = outer(aegis.Secret(u32), s); }", pack.copies, true, 1);
 }
 
 test "what a generic acquires by its type parameter is decided where the parameter is bound" {
     const head = "const aegis = @import(\"aegis\");\nconst Plain = struct { n: u8, fn init(_: struct {}) Plain { return .{ .n = 0 }; } };\nfn digest(comptime Hash: type) void { var h = Hash.init(.{}); _ = &h; }\npub fn sign(comptime Hash: type) void { digest(Hash); }\n";
     // At the definition, and through a generic passing the parameter on, it is each binding's.
-    try expectJudged(head, pack.cleanup, true, 0);
+    try expectUnbound(head, pack.cleanup, 1, 0);
     try expectJudged(head ++ "pub fn f() void { sign(Plain); digest(Plain); }", pack.cleanup, true, 0);
     // A binding to an owner with a release leaves it undecided there: the generic's paths are
     // not walked per binding. A guarded value owes none; its guard does.
@@ -2248,23 +2271,23 @@ test "what a generic acquires by its type parameter is decided where the paramet
 test "a generic's copies of its anytype parameter are decided where the argument is bound" {
     const head = "const aegis = @import(\"aegis\");\npub fn keep(value: anytype) void { var copy = value; _ = &copy; }\npub fn on(value: anytype) void { keep(value); }\nconst P = struct { n: u8 };\n";
     // At the definition the copy is the arguments' obligation, also through a generic passing it on.
-    try expectJudged(head, pack.copies, true, 0);
+    try expectUnbound(head, pack.copies, 2, 0);
     try expectJudged(head ++ "pub fn f(p: P) void { keep(p); on(p); }", pack.copies, true, 0);
-    try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 1);
+    try expectUnbound(head ++ "pub fn f(s: aegis.Secret(u32)) void { keep(s); }", pack.copies, 1, 1);
     try expectJudged(head ++ "pub fn f(s: aegis.Secret(u32)) void { on(s); }", pack.copies, true, 1);
     // A pointer's copies are aliases.
-    try expectJudged(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, true, 0);
+    try expectUnbound(head ++ "pub fn f(s: *aegis.Secret(u32)) void { keep(s); }", pack.copies, 1, 0);
     // What a generic passes on of its parameter other than the parameter itself (what calling
     // it returns, what it points to) is read where the parameter is bound, also from a function
     // declared in the generic and through a generic passing the parameter on (parley's typed
     // tool handler, its result written out).
     const handlers = head ++ "fn Sig(comptime h: anytype) type { return struct { const Args = @typeInfo(@TypeOf(h)).@\"fn\".params.len; }; }\npub fn typed(comptime handler: anytype) fn () anyerror!void { const S = Sig(handler); const E = struct { fn call() anyerror!void { const out = if (S.Args == 0) handler() else blk: { break :blk handler(1); }; const value = out catch |err| return err; keep(value); } }; return E.call; }\npub fn add(comptime handler: anytype) void { _ = typed(handler); }\npub fn direct(comptime handler: anytype) void { const value = handler() catch return; keep(value); }\npub fn through(p: anytype) void { keep(p.*); }\n";
-    try expectJudged(handlers, pack.copies, true, 0);
-    try expectJudged(handlers ++ "fn plain() !P { return undefined; }\npub fn f() void { direct(plain); _ = typed(plain); add(plain); }", pack.copies, true, 0);
-    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { direct(secret); }", pack.copies, true, 1);
-    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { _ = typed(secret); }", pack.copies, true, 1);
-    try expectJudged(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { add(secret); }", pack.copies, true, 1);
-    try expectJudged(handlers ++ "pub fn f(s: *aegis.Secret(u32), p: *P) void { through(s); through(p); }", pack.copies, true, 1);
+    try expectUnbound(handlers, pack.copies, 5, 0);
+    try expectUnbound(handlers ++ "fn plain() !P { return undefined; }\npub fn f() void { direct(plain); _ = typed(plain); add(plain); }", pack.copies, 2, 0);
+    try expectUnbound(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { direct(secret); }", pack.copies, 4, 1);
+    try expectUnbound(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { _ = typed(secret); }", pack.copies, 4, 1);
+    try expectUnbound(handlers ++ "fn secret() !aegis.Secret(u32) { return undefined; }\npub fn f() void { add(secret); }", pack.copies, 3, 1);
+    try expectUnbound(handlers ++ "pub fn f(s: *aegis.Secret(u32), p: *P) void { through(s); through(p); }", pack.copies, 4, 1);
     // An argument that does not resolve leaves the call undecided.
     try expectJudged(head ++ "pub fn f(g: fn () @import(\"missing\").T) void { keep(g()); }", pack.copies, false, 0);
     // A `comptime` parameter's value holds nothing at run time: its copies are no owner's.
@@ -2273,24 +2296,24 @@ test "a generic's copies of its anytype parameter are decided where the argument
     // Arguments plain as written: a vector, an enum's or a union's tag, `{}`, a tuple of plain
     // values, an element of a typed array of plain tuples.
     const shapes = head ++ "const Color = enum { red, @\"with space\" };\nconst Shape = union(enum) { circle: f32, empty };\n";
-    try expectJudged(shapes ++ "pub fn f() void { keep(@as(@Vector(3, u8), @splat(1))); keep(Color.red); keep(Color.@\"with space\"); keep(Shape.empty); keep({}); keep(.{ 1, \"two\" }); }", pack.copies, true, 0);
-    try expectJudged(shapes ++ "pub fn f() void { const cases = [_]struct { f64, []const u8 }{ .{ 0.5, \"0.5\" } }; for (cases) |case| keep(case[0]); }", pack.copies, true, 0);
+    try expectUnbound(shapes ++ "pub fn f() void { keep(@as(@Vector(3, u8), @splat(1))); keep(Color.red); keep(Color.@\"with space\"); keep(Shape.empty); keep({}); keep(.{ 1, \"two\" }); }", pack.copies, 1, 0);
+    try expectUnbound(shapes ++ "pub fn f() void { const cases = [_]struct { f64, []const u8 }{ .{ 0.5, \"0.5\" } }; for (cases) |case| keep(case[0]); }", pack.copies, 1, 0);
     // A tuple holding an owner holds that owner: its copy is a finding.
-    try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32)) void { keep(.{ s, 1 }); }", pack.copies, true, 1);
+    try expectUnbound(shapes ++ "pub fn f(s: aegis.Secret(u32)) void { keep(.{ s, 1 }); }", pack.copies, 1, 1);
     // A tuple holding what does not resolve is undecided.
     try expectJudged(shapes ++ "pub fn f(s: aegis.Secret(u32), g: fn () @import(\"missing\").T) void { keep(.{ s, g() }); }", pack.copies, false, 0);
     // A choice of types whose pointers, and arrays of them, are aliases.
-    try expectJudged(head ++ "pub fn f(comptime n: u8) void { const T = switch (n) { 0 => [*]const u8, 1 => [0]*const u8, else => P }; const v: T = undefined; keep(v); }", pack.copies, true, 0);
+    try expectUnbound(head ++ "pub fn f(comptime n: u8) void { const T = switch (n) { 0 => [*]const u8, 1 => [0]*const u8, else => P }; const v: T = undefined; keep(v); }", pack.copies, 3, 0);
     // A tuple's element, by its number, also where an `inline for` gives the tuple.
     const typed = head ++ "fn take(comptime T: type, value: T) void { var copy = value; _ = &copy; }\n";
-    try expectJudged(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ u8, 2 } }) |case| take(case[0], undefined); }", pack.copies, true, 0);
-    try expectJudged(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ aegis.Secret(u32), 2 } }) |case| take(case[0], undefined); }", pack.copies, true, 1);
+    try expectUnbound(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ u8, 2 } }) |case| take(case[0], undefined); }", pack.copies, 2, 0);
+    try expectUnbound(typed ++ "pub fn f() void { inline for (.{ .{ P, 1 }, .{ aegis.Secret(u32), 2 } }) |case| take(case[0], undefined); }", pack.copies, 2, 1);
     // A type built from field types holds what they do: `@Struct`, `@Tuple`, through `@as` of
     // types and `@splat`, and made by a type function of no parameter.
-    try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{P}, &@splat(.{}));\npub fn f(b: Built, t: @Tuple(&@as([2]type, @splat(P)))) void { keep(b); keep(t); }", pack.copies, true, 0);
-    try expectJudged(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, true, 1);
-    try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 0);
-    try expectJudged(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, true, 1);
+    try expectUnbound(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{P}, &@splat(.{}));\npub fn f(b: Built, t: @Tuple(&@as([2]type, @splat(P)))) void { keep(b); keep(t); }", pack.copies, 1, 0);
+    try expectUnbound(head ++ "const Built = @Struct(.auto, null, &.{\"a\"}, &.{aegis.Secret(u32)}, &@splat(.{}));\npub fn f(b: Built) void { keep(b); }", pack.copies, 1, 1);
+    try expectUnbound(head ++ "fn Made() type { var types: [1]type = @splat(P); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, 1, 0);
+    try expectUnbound(head ++ "fn Made() type { var types: [1]type = @splat(aegis.Secret(u32)); _ = &types; return @Struct(.auto, null, &.{\"a\"}, &types, &@splat(.{})); }\npub fn f(m: Made()) void { keep(m); }", pack.copies, 1, 1);
     // `@Pointer(...)` makes a pointer: a copy of what `Untrusted.readForParse` gives is an
     // alias (relic's credential answer read a line at a time).
     try expectJudged("const aegis = @import(\"aegis\");\npub fn f(answer: aegis.input.Untrusted([]const u8)) usize { var rest = answer.readForParse(); var line = rest; rest = rest[1..]; line = line[0..1]; return line.len + rest.len; }", pack.copies, true, 0);
@@ -2298,13 +2321,13 @@ test "a generic's copies of its anytype parameter are decided where the argument
     // field types, each a function pointer, give their parameters' types (shakedown's
     // simulated `Io` calls); one of them an owner makes a copy of the parameter a finding.
     const vtable = "pub fn slot(comptime name: []const u8) @FieldType(VTable, name) {\n    const info = @typeInfo(@typeInfo(@FieldType(VTable, name)).pointer.child).@\"fn\";\n    const params = info.param_types;\n    return &struct {\n        fn f(u: ?*anyopaque, a: params[1].?) void {\n            _ = u;\n            keep(.{a});\n        }\n    }.f;\n}\n";
-    try expectJudged(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, P) void };\n" ++ vtable, pack.copies, true, 0);
-    try expectJudged(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, aegis.Secret(u32)) void };\n" ++ vtable, pack.copies, true, 1);
+    try expectUnbound(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, P) void };\n" ++ vtable, pack.copies, 2, 0);
+    try expectUnbound(head ++ "const VTable = struct { crash: *const fn (?*anyopaque) void, open: *const fn (?*anyopaque, u32) void, close: *const fn (?*anyopaque, aegis.Secret(u32)) void };\n" ++ vtable, pack.copies, 2, 1);
     // A field's type read by `@FieldType` of a made container is the making call's, also in a
     // generic's result written in terms of its `anytype` parameter (chronicle's journal state
     // seen through its owner).
     const layered = head ++ "fn Inner(comptime E: type) type { return struct { pub const Record = struct { event: E }; pub fn copy(r: Record) void { keep(r.event); } }; }\nfn Outer(comptime E: type) type { return struct { const State = Inner(E); pub const Record = State.Record; }; }\nfn state(owner: anytype) *Inner(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, \"event\")) { return @ptrCast(owner); }\nfn quiet(owner: anytype) void { _ = state(owner); }\n";
-    try expectJudged(layered ++ "pub fn f() void { var o: Outer(P) = undefined; quiet(&o); }", pack.copies, true, 0);
+    try expectUnbound(layered ++ "pub fn f() void { var o: Outer(P) = undefined; quiet(&o); }", pack.copies, 1, 0);
 }
 
 test "an owner whose address a function of the program releases on every path is released by the call" {
@@ -2406,11 +2429,8 @@ test "A002 decides a shim whose parameters' types are reflected from a function 
     var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 0), count(report, pack.copies));
-    var undecided: usize = 0;
-    for (report.coverage) |entry| if (entry.rule != null and entry.rule.? == pack.copies) {
-        undecided += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 0), undecided);
+    // `slot` is a public generic nothing binds: undecided at its name alone, the shim decided.
+    try std.testing.expectEqual(Undecided{ .unbound = 1, .other = 0 }, undecidedOf(report, pack.copies));
 }
 
 test "A006 names each call that untrusted input reaches and that does not resolve, by its place and spelling" {
@@ -2607,4 +2627,50 @@ test "the private fields aegis's first list missed are A001's: a reader-writer o
     try expectJudged(head ++ "pub fn f(g: *aegis.RwGuarded(u32)) usize { return g.limit; }", pack.access, true, 1);
     try expectJudged(head ++ "pub fn f(m: *aegis.handle.DenseSlotMap(u32, Tag)) void { _ = m.value_region; _ = m.key_room; }", pack.access, true, 2);
     try expectJudged(head ++ "pub fn f(m: *aegis.handle.SecondaryMap(P, u8)) void { _ = m.index; _ = m.first; _ = m.room; _ = m.gpa; }", pack.access, true, 3);
+}
+
+test "a public generic nothing the run compiles binds is undecided at its name for each rule of the pack, and gates where one gates" {
+    const program =
+        \\pub fn unbound(x: anytype) void { _ = x; }
+        \\pub fn bound(x: anytype) void { _ = x; }
+        \\fn private(x: anytype) void { _ = x; }
+        \\const Hidden = struct { pub fn hidden(x: anytype) void { _ = x; } };
+        \\pub fn List(comptime T: type) type {
+        \\    return struct { pub fn push(_: *@This(), x: anytype) void { _ = x; _ = T; } };
+        \\}
+        \\pub const Params = struct { a: u32 };
+        \\pub fn Curve(comptime params: Params) type {
+        \\    return struct { pub fn order() u32 { return params.a; } };
+        \\}
+        \\pub fn Kept(comptime params: Params) type {
+        \\    return struct { pub fn order() u32 { return params.a; } };
+        \\}
+        \\pub fn main() void {
+        \\    bound(@as(u8, 1));
+        \\    _ = Kept(.{ .a = 1 }).order();
+        \\    _ = Hidden;
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    var project = try fixture(program);
+    defer project.deinit();
+    for ([_]bool{ false, true }) |gates| {
+        var report = try glint.runConfigured(gpa, &project, .{ .enabled = @splat(false), .selections = &.{ .{ .rule = pack.access, .level = if (gates) .gate else .report }, .{ .rule = pack.cleanup, .level = .report } } }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        var noted: std.ArrayList(u8) = .empty;
+        defer noted.deinit(gpa);
+        for (report.coverage) |entry| if (std.mem.eql(u8, entry.detail, unbound_generic)) {
+            const tree = &project.at(entry.file).file.tree;
+            const token = for (0..tree.tokens.len) |t| {
+                if (tree.tokenStart(@intCast(t)) == entry.start) break t;
+            } else unreachable; // unreachable: a note starts at its generic's name
+            try noted.print(gpa, "{s} {s}\n", .{ entry.rule_name, tree.tokenSlice(@intCast(token)) });
+        };
+        // `unbound`, the type functions `List` (its method `push` is noted at it) and `Curve`, whose
+        // `comptime` parameter is no type (Zig's one definition of a generic), by each rule;
+        // `bound`, `Kept`, the private and the unreachable ones not, nor aegis's own generics, files
+        // no rule of the pack checks.
+        try std.testing.expectEqualStrings("A001 unbound\nA001 List\nA001 Curve\nA003 unbound\nA003 List\nA003 Curve\n", noted.items);
+        if (gates) try std.testing.expect(!report.complete);
+    }
 }

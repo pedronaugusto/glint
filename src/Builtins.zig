@@ -309,7 +309,7 @@ fn amendedPolicies(self: *Context) RunError!void {
     // variable's type, written or inferred, and a field of a container the surface reaches.
     if (self.config.has(.Z012)) for (source.model.declarations, 0..) |decl, i| {
         if (decl.kind != .field and !decl.public and !decl.exported) continue;
-        if (!try reached(self, self.file, decl.scope)) continue;
+        if (!try self.facts.onSurface(self.file, decl.scope)) continue;
         const signature: Signature = .{ .site = decl.token, .scope = decl.scope };
         switch (decl.kind) {
             .function => {
@@ -461,70 +461,6 @@ fn inert(tree: *const Ast, written: Ast.Node.Index, depth: usize) bool {
     }
 }
 
-/// Whether a caller outside the file can name what is declared in `scope`: each container around
-/// it held by a public or exported declaration, up to the file. A container a private declaration
-/// holds is named by nobody outside, so its `pub` methods are no public signature (reactor's
-/// backend sinks, called through `anytype`; a test's harness).
-fn reachable(model: *const Model, scope: Model.Scope.Id) bool {
-    return privateHolder(model, scope) == null;
-}
-
-/// Whether a caller outside the file can name what is declared in `scope`: `reachable`, or a
-/// container a private declaration holds that a public constant the surface reaches names
-/// (`pub const Api = Impl;`, or a labeled block's container a public constant holds): the
-/// alias is its name, and its fields and methods are the alias's.
-fn reached(self: *Context, file: Project.FileId, scope: Model.Scope.Id) RunError!bool {
-    const model = &self.project.at(file).model;
-    var at: ?Model.Scope.Id = scope;
-    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
-        if (model.scopes[@backingInt(s)].kind != .container) continue;
-        const holder = holderOf(model, model.scopes[@backingInt(s)].node) orelse continue;
-        const decl = model.declarations[@backingInt(holder)];
-        if (decl.public or decl.exported) continue;
-        return aliased(self, file, s);
-    }
-    return true;
-}
-
-/// Whether a public constant the surface reaches holds the container whose scope is `scope`.
-fn aliased(self: *Context, file: Project.FileId, scope: Model.Scope.Id) RunError!bool {
-    const model = &self.project.at(file).model;
-    for (model.declarations, 0..) |alias, i| {
-        if (!alias.public or alias.kind != .variable or !reachable(model, alias.scope)) continue;
-        const named = try self.facts.declaration(.{ .file = file, .index = @fromBackingInt(@intCast(i)) });
-        if (named == .container and named.container.file == file and named.container.scope == scope and !named.container.symbolic) return true;
-    }
-    return false;
-}
-
-/// The first declaration, from `scope` outward, that holds a container around it and is neither
-/// public nor exported: what keeps callers outside the file from naming the scope.
-fn privateHolder(model: *const Model, scope: Model.Scope.Id) ?Model.Declaration.Id {
-    var at: ?Model.Scope.Id = scope;
-    while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
-        if (model.scopes[@backingInt(s)].kind != .container) continue;
-        const holder = holderOf(model, model.scopes[@backingInt(s)].node) orelse continue;
-        const decl = model.declarations[@backingInt(holder)];
-        if (!decl.public and !decl.exported) return holder;
-    }
-    return null;
-}
-
-/// The declaration a container written at `node` is reached through: the nearest one around it,
-/// whatever expression writes the container (`(struct {..})`, a labeled block's break,
-/// `@as(type, ..)`), a variable that holds it or a function whose signature or body writes it.
-/// Null for the file's own container.
-fn holderOf(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
-    var at = node;
-    while (true) {
-        if (@backingInt(at) >= model.node_parents.len) return null;
-        at = model.node_parents[@backingInt(at)] orelse return null;
-        for (model.declarations, 0..) |decl, i| {
-            if ((decl.kind == .variable or decl.kind == .function) and decl.node == at) return @fromBackingInt(@intCast(i));
-        }
-    }
-}
-
 /// The scope a container written at `node` opens.
 fn scopeOf(model: *const Model, node: Ast.Node.Index) ?Model.Scope.Id {
     for (model.scopes, 0..) |scope, i| if (scope.kind == .container and scope.node == node) return @fromBackingInt(@intCast(i));
@@ -562,7 +498,7 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, writt
         const model = &self.project.at(file).model;
         const scope = scopeOf(model, node) orelse return undecidedType(self, signature, file, node, .unsupported);
         // A tuple's fields are no declarations: they are read here, reached or not.
-        const named = try reached(self, file, scope);
+        const named = try self.facts.onSurface(file, scope);
         for (container.ast.members) |member| if (model.containerField(tree, member)) |field| {
             if (named and !field.ast.tuple_like) continue;
             if (field.ast.type_expr.unwrap()) |t| try privateType(self, signature, file, t, depth + 1);
@@ -577,7 +513,7 @@ fn privateType(self: *Context, signature: Signature, file: Project.FileId, writt
                     // A type parameter is the caller's own; a public declaration callers reach is
                     // named by its path.
                     if (decl.kind == .parameter) return;
-                    if ((decl.public or decl.exported) and reachable(&self.project.at(definition.file).model, decl.scope)) return;
+                    if ((decl.public or decl.exported) and self.project.at(definition.file).model.surfaceReachable(decl.scope)) return;
                     const value = try self.facts.resolve(file, node);
                     if (value == .unknown) if (initOf(self, definition)) |init| return privateType(self, signature, definition.file, init, depth + 1);
                     return exposedValue(self, signature, file, node, value, depth + 1);
@@ -650,7 +586,7 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
     if (container.made_by) |made| {
         // A made container is named by its type function's call: the function and each argument.
         const maker = self.project.at(made.function.file).model.declarations[@backingInt(made.function.index)];
-        if (!(maker.public or maker.exported) or !reachable(&self.project.at(made.function.file).model, maker.scope))
+        if (!(maker.public or maker.exported) or !self.project.at(made.function.file).model.surfaceReachable(maker.scope))
             return self.atDefinition(.Z012, signature.site, try self.allocator.print("public signature exposes private type function '{s}'", .{maker.name}), made.function);
         var buffer: [1]Ast.Node.Index = undefined;
         const call = self.project.at(made.file).file.tree.fullCall(&buffer, made.call) orelse return undecidedType(self, signature, file, node, .unsupported);
@@ -658,8 +594,8 @@ fn exposedContainer(self: *Context, signature: Signature, file: Project.FileId, 
         return;
     }
     if (container.symbolic) return undecidedType(self, signature, file, node, .comptime_dependent);
-    const holder = privateHolder(model, container.scope) orelse return;
-    if (try aliased(self, container.file, container.scope)) return;
+    const holder = model.privateHolder(container.scope) orelse return;
+    if (try self.facts.aliasedOnSurface(container.file, container.scope)) return;
     const decl = model.declarations[@backingInt(holder)];
     const message = if (decl.kind == .function)
         try self.allocator.print("public signature exposes a type private function '{s}' writes", .{decl.name})
@@ -749,7 +685,7 @@ fn namedDeclaration(self: *Context, signature: Signature, definition: Facts.Decl
     const model = &self.project.at(definition.file).model;
     const decl = model.declarations[@backingInt(definition.index)];
     if (decl.kind == .parameter) return;
-    if ((decl.public or decl.exported) and reachable(model, decl.scope)) return;
+    if ((decl.public or decl.exported) and model.surfaceReachable(decl.scope)) return;
     try self.atDefinition(.Z012, signature.site, try self.allocator.print("public signature names private declaration '{s}'", .{decl.name}), definition);
 }
 
@@ -850,7 +786,7 @@ fn exposedInferred(self: *Context, signature: Signature, file: Project.FileId, n
             // An alias of a function: its signature, named through the alias.
             const model = &self.project.at(function.file).model;
             const decl = model.declarations[@backingInt(function.index)];
-            if ((decl.public or decl.exported) and reachable(model, decl.scope)) return;
+            if ((decl.public or decl.exported) and model.surfaceReachable(decl.scope)) return;
             var prototype: [1]Ast.Node.Index = undefined;
             const proto = self.project.at(function.file).file.tree.fullFnProto(&prototype, decl.node) orelse return undecidedType(self, signature, file, node, .unsupported);
             try privateSignature(self, signature, function.file, proto, depth + 1);

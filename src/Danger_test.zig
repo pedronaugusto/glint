@@ -282,7 +282,20 @@ const std_imports = [_]sources.ExtraImport{
 };
 
 /// `program`'s findings of `rule` at report level, and its undecided sites of it.
-const Run = struct { findings: usize, undecided: usize, lines: [32]u32 = @splat(0) };
+/// A run's findings and undecided sites of a rule; `unbound` of the undecided are the pack's
+/// note at a public generic nothing the run binds.
+const Run = struct {
+    findings: usize,
+    undecided: usize,
+    unbound: usize = 0,
+    lines: [32]u32 = @splat(0),
+    fn countUndecided(result: *Run, report: glint.Report, rule: glint.Rule) void {
+        for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
+            result.undecided += 1;
+            if (std.mem.eql(u8, item.detail, "unbound generic: judged at its consumers' bindings")) result.unbound += 1;
+        };
+    }
+};
 fn run(rule: glint.Rule, program: []const u8) !Run {
     return runWith(rule, program, &std_files, &std_imports);
 }
@@ -302,10 +315,16 @@ fn runAs(rule: glint.Rule, program: []const u8, as: sources.Consumer, extra: []c
         if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
         result.findings += 1;
     };
-    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
-        result.undecided += 1;
-    };
+    result.countUndecided(report, rule);
     return result;
+}
+/// `expect` for a program whose public generics nothing binds, as the row means them to be:
+/// undecided only by `notes` notes at their names.
+fn expectNoted(rule: glint.Rule, program: []const u8, notes: usize, findings: usize) !void {
+    const result = try run(rule, program);
+    try std.testing.expectEqual(notes, result.undecided);
+    try std.testing.expectEqual(notes, result.unbound);
+    try std.testing.expectEqual(findings, result.findings);
 }
 fn expect(rule: glint.Rule, program: []const u8, findings: usize) !void {
     const result = try run(rule, program);
@@ -603,7 +622,9 @@ test "A007 and A008 judge a local known only as the program compiles at each cal
         \\}
     ;
     const found = try runWith(pack.shared_state, program, &std_files, &std_imports);
-    try std.testing.expectEqual(@as(usize, 1), found.undecided);
+    try std.testing.expectEqual(@as(usize, 2), found.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), found.unbound);
     try std.testing.expectEqual(@as(usize, 3), found.findings);
     const keys =
         \\const std = @import("std");
@@ -629,7 +650,9 @@ test "A007 and A008 judge a local known only as the program compiles at each cal
         \\}
     ;
     const secret = try runWith(pack.secrets, keys, &std_files, &std_imports);
-    try std.testing.expectEqual(@as(usize, 1), secret.undecided);
+    try std.testing.expectEqual(@as(usize, 2), secret.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), secret.unbound);
     try std.testing.expectEqual(@as(usize, 1), secret.findings);
 }
 
@@ -913,13 +936,13 @@ test "A013 finds a catch unreachable whose call may fail there: a divisor a peer
 }
 
 test "A013 leaves what runs as the program compiles, and tests, alone" {
-    try expect(pack.contracts,
+    try expectNoted(pack.contracts,
         \\const std = @import("std");
         \\pub fn Make(comptime n: usize) type { if (n == 0) unreachable; return struct { pub fn get() usize { return n; } }; }
         \\const table = blk: { if (false) unreachable; break :blk 1; };
         \\pub fn f() void { comptime std.debug.assert(true); }
         \\test { std.debug.assert(true); }
-    , 0);
+    , 1, 0);
 }
 
 test "A010 finds conversions of input and division by it, not of the program's own values or a truncation" {
@@ -1005,7 +1028,7 @@ test "A014 finds a pointer into the frame carried out of the call" {
 test "A014 leaves static storage, pointers, copies and a store a defer clears on every exit alone" {
     try expect(pack.lifetimes, "pub fn f() []const u8 { const table = [_]u8{ 1, 2 }; return table[0..]; }", 0);
     try expect(pack.lifetimes, "pub fn f() []const u8 { comptime { var buf: [2]u8 = .{ 1, 2 }; buf[0] = 3; const out = buf; return &out; } }", 0);
-    try expect(pack.lifetimes, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 0);
+    try expectNoted(pack.lifetimes, "pub fn Make(comptime n: usize) type { var x: [n]u8 = undefined; x[0] = 1; _ = &x; return struct {}; }", 1, 0);
     try expect(pack.lifetimes, "const N = struct { v: u32 }; pub fn f(head: *N) *u32 { var node: *N = head; node.v += 1; return &node.v; }", 0);
     try expect(pack.lifetimes, "pub fn f(items: []u8) []u8 { var s: []u8 = items; s = s[1..]; return s[0..1]; }", 0);
     try expect(pack.lifetimes, "pub fn f() [4]u8 { var buf: [4]u8 = undefined; buf[0] = 1; return buf; }", 0);
@@ -1083,9 +1106,7 @@ fn runWithStd(rule: glint.Rule, program: []const u8, root: []const u8) !Run {
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var result: Run = .{ .findings = report.diagnostics.len, .undecided = 0 };
-    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
-        result.undecided += 1;
-    };
+    result.countUndecided(report, rule);
     return result;
 }
 
@@ -1098,7 +1119,7 @@ test "A015 judges a public generic at each binding, a consumer's among them, and
         \\pub fn make(comptime T: type) T { return undefined; }
         \\pub fn use() u32 { return make(u32); }
     ;
-    try expect(pack.ownership, lib, 0);
+    try expectNoted(pack.ownership, lib, 1, 0);
     // A consumer binding them to a file: a field its type function releases holds an owner by
     // hand, and a result hands one over; a field nothing releases is a borrow.
     const result = try runWithDependency(pack.ownership,
@@ -4857,7 +4878,9 @@ test "A002 reads a type std computes from root, as std's VTable's handles are, a
         \\    };
         \\}
     );
-    try std.testing.expectEqual(@as(usize, 0), result.undecided);
+    try std.testing.expectEqual(@as(usize, 1), result.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), result.unbound);
     try std.testing.expectEqual(@as(usize, 0), result.findings);
 }
 
@@ -7430,7 +7453,7 @@ test "A012 reads a take, peek or discard on a fixed reader as no work a peer siz
 
 test "A008 decides a method called through a generic's bound type where the binding names it" {
     // parallax's interner: its context's equality, whatever context a consumer binds.
-    try expect(pack.secrets,
+    try expectNoted(pack.secrets,
         \\const std = @import("std");
         \\pub fn Interner(comptime T: type, comptime Context: type) type {
         \\    return struct {
@@ -7442,7 +7465,7 @@ test "A008 decides a method called through a generic's bound type where the bind
         \\        }
         \\    };
         \\}
-    , 0);
+    , 1, 0);
     // A binding that names std's timing-safe comparison is found where it names it.
     try expect(pack.secrets,
         \\const std = @import("std");
@@ -7489,7 +7512,9 @@ test "A011 keeps a method a generic's bound type gives undecided, as std's own t
         \\    };
         \\}
     );
-    try std.testing.expectEqual(@as(usize, 1), result.undecided);
+    try std.testing.expectEqual(@as(usize, 2), result.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), result.unbound);
 }
 
 test "A009 reads a constant margin: a cursor at most the length less a constant, then parts within the constant" {
@@ -8285,9 +8310,7 @@ fn runWithDependency(rule: glint.Rule, program: []const u8, dependency: []const 
     for (report.diagnostics) |d| if (d.rule == rule) {
         result.findings += 1;
     };
-    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
-        result.undecided += 1;
-    };
+    result.countUndecided(report, rule);
     return result;
 }
 
@@ -8764,7 +8787,9 @@ test "A020 judges a function whose Io a field's field holds, and leaves undecide
         \\}
     );
     try std.testing.expectEqual(@as(usize, 0), found.findings);
-    try std.testing.expectEqual(@as(usize, 5), found.undecided);
+    try std.testing.expectEqual(@as(usize, 6), found.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), found.unbound);
     // One that holds no Io, nor anything that may be one, is not given one: a type reached
     // through `std.Io` as a namespace is not an Io.
     const none = try run(pack.cancellation,
@@ -9617,7 +9642,9 @@ test "A007 finds std's synchronization a dependency names under its own name, he
         \\pub fn Made() type { return dep.Lock; }
         \\pub fn open(io: std.Io, word: *u32) void { io.futexWake(u32, word, 1); }
     , dependency);
-    try std.testing.expectEqual(@as(usize, 0), found.undecided); // safe: fixture counts are representable.
+    try std.testing.expectEqual(@as(usize, 1), found.undecided); // safe: fixture counts are representable.
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), found.unbound);
     try std.testing.expectEqual(@as(usize, 7), found.findings);
     // Borrowed, a type the dependency makes that holds no lock, test code.
     const clean = try runWithDependency(pack.shared_state,
@@ -9928,7 +9955,9 @@ test "A015 reads a field by meaning: @field with its name, a destructure's place
         \\pub fn byName(s: *ByName, comptime name: []const u8) void { @field(s, name).close(); }
     );
     try std.testing.expectEqual(@as(usize, 0), computed.findings);
-    try std.testing.expectEqual(@as(usize, 1), computed.undecided);
+    try std.testing.expectEqual(@as(usize, 2), computed.undecided);
+    // One of them the note at a public generic nothing the run binds.
+    try std.testing.expectEqual(@as(usize, 1), computed.unbound);
     // At another file's type, the same writes and release are flagged where this file does them.
     const lib: sources.Extra = .{ .name = "lib.zig", .bytes =
         \\const std = @import("std");
@@ -10146,9 +10175,7 @@ fn runWithFile(rule: glint.Rule, program: []const u8, other: []const u8) !Run {
         if (result.findings < result.lines.len) result.lines[result.findings] = d.span.line;
         result.findings += 1;
     };
-    for (report.coverage) |item| if (item.rule != null and item.rule.? == rule) {
-        result.undecided += 1;
-    };
+    result.countUndecided(report, rule);
     return result;
 }
 

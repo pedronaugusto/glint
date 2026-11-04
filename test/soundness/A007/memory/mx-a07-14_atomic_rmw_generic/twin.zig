@@ -8,3 +8,9 @@ pub fn Flag(comptime T: type) type {
         }
     };
 }
+
+/// A binding: the ruling's remedy for a public generic nothing else binds.
+const State = enum(u8) { off, on };
+pub fn setFlag(f: *Flag(State)) State {
+    return f.set(.on);
+}
