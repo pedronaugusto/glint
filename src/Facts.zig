@@ -1638,15 +1638,13 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
 /// of the one before (`bindTo`: a receiver the call passes first, each argument as its parameter
 /// is typed). Arguments not known leave it unknown.
 pub fn boundCopy(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!Value {
-    const bound = switch (call.args) {
-        .known => |args| args,
+    const bound = switch (try self.bindCall(&call, function, null)) {
+        .reading => |reading| reading,
         .unknown => |why| return .{ .unknown = why },
     };
-    // `bindTo` takes the receiver from the callee as written.
-    const params = if (call.receiver == .bound) bound[1..] else bound;
     // A choice of types bound to a type parameter (an `inline for`'s pass) is one instantiation
     // per type: each is read, and what they hold chosen as one.
-    const readings = try self.instantiations(try self.bindTo(call.file, call.callee_expr, params, function, null));
+    const readings = try self.instantiations(bound);
     const values = try self.gpa.alloc(Value, readings.len);
     for (readings, values) |reading, *value| value.* = try self.copyIn(reading, copy);
     return self.choose(values);
@@ -4390,16 +4388,14 @@ pub fn readingAt(self: *Facts, file: Project.FileId, node: Ast.Node.Index, decl:
 }
 
 /// The reading the call at `node` makes of `decl`, made in `outer` or in none (a function read
-/// once), at any depth (the walk bounds a declaration's readings by number): none where an
-/// `@call`'s arguments are not known.
+/// once), at any depth (the walk bounds a declaration's readings by number): none where its
+/// arguments or receiver are not known (`bindCall`).
 pub fn readingFrom(self: *Facts, file: Project.FileId, node: Ast.Node.Index, decl: Decl, outer: ?*const Env) ResolveError!?*const Env {
-    const tree = &self.project.at(file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&buffer, node)) |call| return try self.bind(file, call, decl, outer);
-    // `@call`: its callee and its tuple's elements, which bind no receiver.
     const call = (try calls.under(self, outer, file, node)) orelse return null;
-    if (call.args != .known or call.receiver != .none) return null;
-    return try self.bindTo(file, call.callee_expr, call.args.known, decl, outer);
+    return switch (try self.bindCall(&call, decl, outer)) {
+        .reading => |reading| reading,
+        .unknown => null,
+    };
 }
 
 /// Whether `node`, read in `env`, is a value, never a type, whatever its type: an address, a
@@ -7710,6 +7706,27 @@ fn writtenElements(self: *Facts, env: ?*const Env, file: Project.FileId, index: 
 pub fn bind(self: *Facts, file: Project.FileId, call: Ast.full.Call, function: Decl, outer: ?*const Env) ResolveError!*const Env {
     return self.bindTo(file, call.ast.fn_expr, call.ast.params, function, outer);
 }
+
+/// The reading of `function` at `call` as Facts.calls reads it (`f(a)`, `x.f(a)`, `T.f(a)`,
+/// `@call`'s callee and tuple), under `outer`, the reading the call is itself in: its arguments
+/// bound by `bindTo`, which takes a bound receiver from the callee as written. The one way a
+/// reading is made of a call: a rule judging a generic's body at each binding reads it under
+/// this. Arguments or a receiver not known give no reading, never one of partial arguments.
+pub fn bindCall(self: *Facts, call: *const calls.Call, function: Decl, outer: ?*const Env) ResolveError!Binding {
+    const args = switch (call.args) {
+        .known => |args| args,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    const params = switch (call.receiver) {
+        .none => args,
+        .bound => args[1..],
+        .unknown => |why| return .{ .unknown = why },
+    };
+    return .{ .reading = try self.bindTo(call.file, call.callee_expr, params, function, outer) };
+}
+
+/// A binding's reading (`bindCall`), or why the call binds what is not known.
+pub const Binding = union(enum) { reading: *const Env, unknown: Unknown };
 
 /// `bind` of a call written as its callee `fn_expr` and its arguments `params`, a bound
 /// receiver not among them: `f(a)`'s, or `@call`'s callee and its tuple's elements.
@@ -12987,6 +13004,43 @@ test "a call through a function-pointer field reaches the functions stored there
     try std.testing.expectEqual(.function, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; read(@ptrCast((&copy)[0..1])); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: *const Ops) void { var copy = o.*; write(@ptrCast((&copy)[0..1])); }\n", true));
     try std.testing.expectEqual(.any, try fieldRead(head ++ sink ++ "pub fn g(o: Ops) void { write(@ptrCast(@constCast((&o)[0..1]))); }\n", true));
+}
+
+test "bindCall binds f(a), x.f(a) with its receiver, T.f(a) and @call's tuple, and makes no reading of arguments not known" {
+    const source = "const S = struct { n: u8 = 0, pub fn get(s: S, k: anytype) u8 { _ = k; return s.n; } pub fn of(k: anytype) u8 { _ = k; return 0; } };\npub fn f(k: anytype) u8 { _ = k; return 1; }\npub fn main(t: anytype) void { const s: S = .{}; _ = f(s); _ = s.get(s); _ = S.of(s); _ = @call(.auto, f, .{s}); _ = @call(.auto, f, t); }";
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const root = facts.rootOf(file);
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const f = facts.member(root, "f").?;
+    const s_type = (try facts.resolve(file, node.of(tree, "S"))).container;
+    const get = facts.member(s_type, "get").?;
+    const of = facts.member(s_type, "of").?;
+    // Each binds its one argument, `s`, an `S`; `x.f(a)` binds `s` first as its receiver.
+    for ([_]struct { []const u8, Decl, usize }{ .{ "f(s)", f, 1 }, .{ "s.get(s)", get, 2 }, .{ "S.of(s)", of, 1 }, .{ "@call(.auto, f, .{s})", f, 1 } }) |row| {
+        const text, const function, const len = row;
+        const call = (try calls.at(&facts, file, node.of(tree, text))).?;
+        const reading = (try facts.bindCall(&call, function, null)).reading;
+        try std.testing.expectEqual(len, reading.args.len);
+        for (reading.args) |arg| try std.testing.expect(arg == .instance);
+    }
+    // A tuple not written: its elements are not known, so no reading is made.
+    const unknown = (try calls.at(&facts, file, node.of(tree, "@call(.auto, f, t)"))).?;
+    try std.testing.expect(try facts.bindCall(&unknown, f, null) == .unknown);
 }
 
 test "a reading bound call by call reads a generic's value as the chain of calls passes it" {

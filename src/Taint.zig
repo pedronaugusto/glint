@@ -4272,15 +4272,7 @@ fn readingFor(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Ind
 /// is none, an `@call`'s arguments are not known, or the chain is past 32 calls deep (each
 /// binding's then).
 fn readingAt(c: *Context, file: Project.FileId, node: Ast.Node.Index, decl: Facts.Decl, env: ?*const Facts.Env) Context.Error!?*const Facts.Env {
-    const outer = env orelse return null;
-    if (outer.depth >= 32) return null;
-    const tree = &c.project.at(file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    if (tree.fullCall(&buffer, node)) |call| return try c.facts.bind(file, call, decl, outer);
-    // `@call`: its callee and its tuple's elements, which bind no receiver.
-    const call = (try Facts.calls.under(c.facts, outer, file, node)) orelse return null;
-    if (call.args != .known or call.receiver != .none) return null;
-    return try c.facts.bindTo(file, call.callee_expr, call.args.known, decl, outer);
+    return c.facts.readingAt(file, node, decl, env);
 }
 
 /// Adds the function `decl` declares to a summary, its nodes owned, unless it is an
