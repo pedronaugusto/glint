@@ -328,7 +328,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     const fact = try Taint.get(c, Danger.error_text);
     var reported: ?Ast.Node.Index = null;
     for (try Taint.sinkSites(c, fact, c.file)) |written| {
-        if (!site(c, written.at) or reported == written.at) continue;
+        if (!readNow(c, fact, written.at) or reported == written.at) continue;
         // Read in a file the run does not select: what the written value takes from its
         // function's parameters, judged at the calls into it; the writer is a peer's where a
         // caller anywhere in the program hands it one, else the site is none.

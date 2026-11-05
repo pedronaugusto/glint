@@ -951,7 +951,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         if (tag != .unreachable_literal and !unwrap) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = if (unwrap) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
-        if (c.inTest(token) or !atRuntime(c, node)) continue;
+        if (!Taint.readHere(flow, c.file, node) or c.inTest(token) or !atRuntime(c, node)) continue;
         // A `.?` of a value known not to be null never reaches its `unreachable`.
         if (unwrap and (try present.unwrapped(node) or try Proof.present(c, c.file, node))) continue;
         // A prong no path takes never runs what it holds (`else => unreachable` past what
@@ -1100,7 +1100,7 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
-        if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
+        if (!Taint.readHere(flow, c.file, node) or c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
         const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: each is a call `Facts.calls` read
         const args = switch (call.args) {
             .known => |each| each,
