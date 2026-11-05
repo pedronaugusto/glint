@@ -4,9 +4,5 @@
         "address/m-a12-address_store/twin.zig",
         // matrix precision: a ceiling through @atomicStore and @atomicLoad is not carried; Range's move onto Facts.accesses
         "memory/m-a12-atomic_store/twin.zig",
-        // matrix precision: aegis's check bounds `n`, but std's `Io.Limit.limited(n)` gives the limit no ceiling Range reads (Range through std's calls)
-        "call/ps2-a12-alloc_remaining_limited/twin.zig",
-        // matrix precision: aegis's check bounds `n`, but a typed literal's field (`.reserve_amount = n`) carries no ceiling Range reads at the call
-        "aggregate/ps2-a12-struct_literal_option/twin.zig",
     },
 }

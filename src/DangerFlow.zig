@@ -1499,10 +1499,20 @@ fn sink(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.Index, comptim
     try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, node), .data, message);
 }
 
-/// Whether a comparison holding where `node` is read puts it at most a clean value.
+/// Whether `node` is at most a clean value: a comparison holding where it is read puts it at
+/// most one, or each part of it input reaches is so (a literal's fields and elements, the
+/// argument whose value a call's result keeps, `Range.keptArgument`): `.{ .reserve_amount = n
+/// }` and `.limited(n)` after `try limit.check(n)`.
 fn capped(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!bool {
     for (try Range.ceilings(c, c.file, node)) |limit| if (try Taint.levelAt(c, flow, c.file, limit) == .clean) return true;
-    return false;
+    const tree = &c.project.at(c.file).file.tree;
+    var two: [2]Ast.Node.Index = undefined;
+    const parts: []const Ast.Node.Index = if (tree.fullStructInit(&two, node)) |init| init.ast.fields else if (tree.fullArrayInit(&two, node)) |init| init.ast.elements else {
+        const kept = (try Range.keptArgument(c, c.file, node)) orelse return false;
+        return capped(c, flow, kept);
+    };
+    for (parts) |part| if (try Taint.levelAt(c, flow, c.file, part) != .clean and !try capped(c, flow, part)) return false;
+    return true;
 }
 
 /// The level of `node`, a number counting no more than a short or the memory the function

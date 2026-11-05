@@ -4250,6 +4250,25 @@ pub fn boundsAt(c: *Context, file: Project.FileId, at: Ast.Node.Index, value: As
     return out.items;
 }
 
+/// The argument whose value a call's result keeps, at most: std's `Io.Limit.limited(n)` and
+/// `limited64(n)`, a limit of `n` (the latter at most `maxInt(usize)`), by their declarations.
+/// Null where the callee is none of them, or std's `Io.Limit` does not resolve.
+pub fn keptArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    if (call.ast.params.len != 1) return null;
+    const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |decl| decl,
+        else => return null,
+    };
+    for ([_][]const u8{ "Io.Limit.limited", "Io.Limit.limited64" }) |path| switch (try Governed.declarations(c, "std", path)) {
+        .decls => |decls| for (decls) |each| if (each.file == decl.file and each.index == decl.index) return call.ast.params[0],
+        .none, .unknown => {},
+    };
+    return null;
+}
+
 /// What the comparisons holding where `node` is read put it at most: the larger sides, for a
 /// sink that asks whether one is the program's own limit.
 pub fn ceilings(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {
