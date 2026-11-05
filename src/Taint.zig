@@ -3159,10 +3159,18 @@ fn prongFields(c: *Context, file: Project.FileId, operand: Ast.Node.Index, case_
 
 /// Every `Link` the program makes: each pointer-valued expression kept somewhere, by the places
 /// it points into and the places it is kept in. What each function returns a pointer into
-/// (`Function.returned`) is found with them, until none changes.
+/// (`Function.returned`) is found with them, until none changes. Each pass reads every function
+/// again on memory of its own, given back when the pass ends; the run's memory keeps only what
+/// a pass raises (the links, what a function returns a pointer into).
 fn linksOf(c: *Context, flow: *Flow) Context.Error!void {
+    var pass: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer pass.deinit();
+    const run_memory = c.allocator;
+    defer c.allocator = run_memory;
     while (true) {
         flow.links.clearRetainingCapacity();
+        _ = pass.reset(.free_all);
+        c.allocator = pass.allocator();
         var changed = false;
         for (flow.functions.items, 0..) |f, i| {
             if (f.settled) continue;
@@ -3201,9 +3209,6 @@ fn keeps(tree: *const Ast, parent: Ast.Node.Index, node: Ast.Node.Index) bool {
 /// Links `owners` to where `node`'s value is kept, walking up through what passes it on.
 /// Returns whether what the function returns a pointer into grew.
 fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, node: Ast.Node.Index) Context.Error!bool {
-    // What it keeps in the run's solve stays for the run.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
     const f = &flow.functions.items[@backingInt(function)];
     const tree = &c.project.at(f.file).file.tree;
     const model = &c.project.at(f.file).model;
@@ -3223,13 +3228,13 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
         },
         .@"return" => for (owners) |place| switch (place) {
             .param => |index| if (!f.returned.has(index)) {
-                f.returned = try f.returned.with(c.allocator, index);
+                f.returned = try f.returned.with(c.facts.gpa, index);
                 grew = true;
             },
             .global => |decl| if (!for (f.returned_globals.items) |each| {
                 if (std.meta.eql(each, decl)) break true;
             } else false) {
-                try f.returned_globals.append(c.allocator, decl);
+                try f.returned_globals.append(c.facts.gpa, decl);
                 grew = true;
             },
             // A local's own memory is gone once the function returns.
@@ -3298,14 +3303,11 @@ fn hold(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, 
 }
 
 fn link(c: *Context, flow: *Flow, function: Function.Id, owners: []const Place, holders: []const Place) Context.Error!void {
-    // What it keeps in the run's solve stays for the run.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
     for (owners) |owner_place| {
         if (owner_place == .unknown) continue;
         for (holders) |holder| {
             if (std.meta.eql(owner_place, holder)) continue;
-            try flow.links.append(c.allocator, .{ .function = function, .owner = owner_place, .holder = holder });
+            try flow.links.append(c.facts.gpa, .{ .function = function, .owner = owner_place, .holder = holder });
         }
     }
     return;
@@ -4809,8 +4811,42 @@ fn solveBytes(n: usize, callee_first: bool) !usize {
         for (1..48) |k| try program.print(gpa, "    const a{d} = a{d} +% {d};\n", .{ k, k - 1, k });
         try program.appendSlice(gpa, "    for (0..a47) |_| t +%= 1;\n    return a47 +% t;\n}\n");
     }
+    return solveAsks(program.items);
+}
+
+test "the links' passes keep what they raise, not each pass's work: a chain whose returns a pass per call finds holds what the same chain declared callee first does" {
+    // Declared caller first, `step0` reads what `step1` returns a pointer into before the pass
+    // that finds it: a pass per call (34 over 32 calls), callee first 2. Each pass's work is
+    // given back when the pass ends, so the run holds the same either way.
+    const forward = try linksBytes(32, false);
+    const callee_first = try linksBytes(32, true);
+    try std.testing.expect(forward > 0);
+    try std.testing.expectEqual(callee_first, forward);
+}
+
+/// The bytes the input fact's solve asks of the run's memory over a chain of `n` calls, each
+/// returning a part of what the next returns, the last a part of its parameter, each function
+/// keeping 16 parts of it in locals.
+fn linksBytes(n: usize, callee_first: bool) !usize {
+    const gpa = std.testing.allocator;
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(gpa);
+    try program.appendSlice(gpa, "const std = @import(\"std\");\npub fn main(r: *std.Io.Reader, s: []u8) u8 {\n    _ = r;\n    return step0(s)[0];\n}\n");
+    for (0..n + 1) |at| {
+        const i = if (callee_first) n - at else at;
+        try program.print(gpa, "fn step{d}(s: []u8) []u8 {{\n    const a0 = s[1..];\n", .{i});
+        for (1..16) |k| try program.print(gpa, "    const a{d} = a{d}[1..];\n", .{ k, k - 1 });
+        if (i == n) try program.appendSlice(gpa, "    return a15;\n}\n") else try program.print(gpa, "    return step{d}(a15);\n}}\n", .{i + 1});
+    }
+    return solveAsks(program.items);
+}
+
+/// The bytes the input fact's solve asks of the run's memory over `program`, whose `std` has
+/// a reader whose `takeInt` returns input.
+fn solveAsks(program: []const u8) !usize {
+    const gpa = std.testing.allocator;
     const inputs = [_]Project.Input{
-        .{ .name = "root", .bytes = program.items },
+        .{ .name = "root", .bytes = program },
         .{ .name = "std/std.zig", .bytes = "pub const Io = @import(\"Io.zig\");\n", .selected = false },
         .{ .name = "std/Io.zig", .bytes = "pub const Reader = @import(\"Io/Reader.zig\");\n", .selected = false },
         .{ .name = "std/Io/Reader.zig", .bytes = "buffer: []u8 = &.{},\npub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }\n", .selected = false },
