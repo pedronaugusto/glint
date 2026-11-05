@@ -2668,8 +2668,14 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
             .missing_mapping };
         // A file both compilations compile, each binding the name apart: either root, as each
         // reads it, a member read in both.
+        // A ZON file is a value, never a container: the one expression it holds, read as the same
+        // expression written in place is (a struct literal is a `.literal`).
         const roots = try self.gpa.alloc(Value, targets.len);
-        for (targets, roots) |target, *root| root.* = .{ .container = self.rootOf(target) };
+        for (targets, roots) |target, *root| root.* = switch (self.project.at(target).input.kind) {
+            .zig => .{ .container = self.rootOf(target) },
+            // Only a parsed tree has its expression at the root.
+            .zon => if (self.project.at(target).file.status != .parsed) .{ .unknown = .invalid_front_end } else try self.resolve(target, self.project.at(target).file.tree.nodeData(.root).node),
+        };
         return if (roots.len == 1) roots[0] else self.choose(roots);
     }
     // The container the call is in. One a function declares (a type function's `struct`) is
@@ -9520,6 +9526,8 @@ pub fn throughModule(self: *const Facts, file: Project.FileId, node: Ast.Node.In
     const args = builtinArgs(tree, init, &buffer);
     if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return false;
     if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init)), "@import")) return false;
+    // A ZON file's value is a value, no module's declarations.
+    if (importKind(tree, init) != .namespace) return false;
     return !std.mem.endsWith(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), ".zig\"");
 }
 
@@ -9553,6 +9561,24 @@ pub fn builtinName(tree: *const Ast, node: Ast.Node.Index) ?[]const u8 {
 /// Whether `node` calls the builtin `name` (`builtinName`).
 pub fn isBuiltin(tree: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
     return std.mem.eql(u8, builtinName(tree, node) orelse return false, name);
+}
+
+/// What an `@import` gives, as Zig decides it by the name imported: a ZON file's
+/// (`@import("build.zig.zon")`) is the value the file holds, data that may be any; any other (a
+/// module, std, a `.zig` path) is a file's namespace, a type, which holds no runtime value. Null
+/// where `node`, its parentheses aside, is no `@import`. A name not written as one string
+/// literal, or one this cannot read (longer than a path, an invalid escape), may be either: data.
+pub fn importKind(tree: *const Ast, node: Ast.Node.Index) ?enum { namespace, data } {
+    const call = ungrouped(tree, node);
+    if (!isBuiltin(tree, call, "@import")) return null;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const args = builtinArgs(tree, call, &buffer);
+    if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return .data;
+    var name: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&name);
+    const parsed = std.zig.string_literal.parseWrite(&out, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch return .data;
+    if (parsed != .success) return .data;
+    return if (std.mem.endsWith(u8, out.buffered(), ".zon")) .data else .namespace;
 }
 
 /// The functions each found a view of (`viewOf`).
@@ -13085,6 +13111,55 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(project.sources[0].id, first)).unknown);
     const dep = project.sources[0].file.tree.fullVarDecl(project.sources[0].model.declarations[2].node).?.ast.init_node.unwrap().?;
     try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(project.sources[0].id, dep)).unknown);
+}
+
+test "facts read a ZON import as the value its file holds" {
+    const root =
+        \\const K = struct { bytes: [2]u8 };
+        \\const k: K = @import("k.zon");
+        \\const data = @import("k.zon");
+        \\const bytes = data.bytes;
+        \\const n = @import("n.zon");
+        \\const gone = @import("gone.zon");
+        \\const text = @import("text.zig");
+    ;
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root.zig", .bytes = root },
+        .{ .name = "k.zon", .bytes = ".{ .bytes = .{ 1, 2 } }", .kind = .zon },
+        .{ .name = "n.zon", .bytes = "42", .kind = .zon },
+        .{ .name = "text.zig", .bytes = "pub const x = 1;" },
+    }, &.{
+        .{ .from = 0, .spelling = "k.zon", .target = 1 },
+        .{ .from = 0, .spelling = "n.zon", .target = 2 },
+        .{ .from = 0, .spelling = "text.zig", .target = 3 },
+    }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const Of = struct {
+        fn decl(p: *const Project, name: []const u8) Decl {
+            for (p.sources[0].model.declarations, 0..) |d, i| if (d.kind == .variable and std.mem.eql(u8, d.name, name)) return .{ .file = p.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+            unreachable; // the test's source declares each name it asks for
+        }
+    };
+    const zon = project.sources[1].id;
+    // Typed by its declaration, as a literal written in place is: K's instance.
+    const k = try facts.declaration(Of.decl(&project, "k"));
+    const k_type = try facts.declaration(Of.decl(&project, "K"));
+    try std.testing.expect(k_type == .container and k == .instance and std.meta.eql(k.instance, k_type.container));
+    // Untyped: the file's struct literal, and a field of it the literal it gives that field.
+    const data = try facts.declaration(Of.decl(&project, "data"));
+    try std.testing.expect(data == .literal and data.literal.file == zon);
+    const part = try facts.declaration(Of.decl(&project, "bytes"));
+    try std.testing.expect(part == .literal and part.literal.file == zon and project.sources[1].file.tree.nodeTag(part.literal.node) == .array_init_dot_two);
+    // A number, as one written in place.
+    try std.testing.expectEqual(Value.scalar, try facts.declaration(Of.decl(&project, "n")));
+    // A ZON file the run did not load stays unmapped, never empty.
+    try std.testing.expectEqual(Unknown.missing_mapping, (try facts.declaration(Of.decl(&project, "gone"))).unknown);
+    // A Zig file's import is its namespace.
+    try std.testing.expect(try facts.declaration(Of.decl(&project, "text")) == .container);
 }
 
 test "a function stores through a parameter, or returns, what another holds or its own address, through captures, branches and callees' results, recursion read as the least answer" {

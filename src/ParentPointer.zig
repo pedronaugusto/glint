@@ -2270,7 +2270,7 @@ fn functionDecl(model: *const Model, proto: Ast.Node.Index) ?Model.Declaration.I
     return null;
 }
 
-/// Whether `node` names a type, not a value: a constant an `@import` of a file makes, a
+/// Whether `node` names a type, not a value: a constant an `@import` of a Zig file makes, a
 /// builtin that makes a type (`@Enum`, `@Struct`, …), or a call of a function declared to
 /// return `type`, or one naming such a constant (`const T = mod.T`). A member of a type, read
 /// by name or `@field`, is its declaration, never a field of a value.
@@ -2293,11 +2293,8 @@ fn namesType(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
         const variable = written.fullVarDecl(record.node) orelse return false;
         if (written.tokenTag(variable.ast.mut_token) != .keyword_const) return false;
         const init = Facts.ungrouped(written, variable.ast.init_node.unwrap() orelse return false);
-        if (Facts.isBuiltin(written, init, "@import")) {
-            var buffer: [2]Ast.Node.Index = undefined;
-            const args = Facts.builtinArgs(written, init, &buffer);
-            return args.len == 1 and written.nodeTag(args[0]) == .string_literal;
-        }
+        // A module's or Zig file's namespace; a ZON file's value is none.
+        if (Facts.importKind(written, init)) |kind| return kind == .namespace;
         for ([_][]const u8{ "@This", "@TypeOf", "@Type", "@Int", "@Float", "@Vector", "@Pointer", "@Fn", "@Tuple", "@Struct", "@Union", "@Enum", "@EnumLiteral" }) |name| {
             if (Facts.isBuiltin(written, init, name)) return true;
         }

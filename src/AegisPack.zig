@@ -1582,7 +1582,9 @@ fn sharedReturn(c: *Context, tree: *const Ast, node: Ast.Node.Index) Context.Err
 
 /// Whether `node` is a builtin call that gives a type.
 fn typeBuiltin(tree: *const Ast, node: Ast.Node.Index) bool {
-    for ([_][]const u8{ "@TypeOf", "@This", "@import", "@typeInfo", "@Type", "@FieldType" }) |name| {
+    // A module's or Zig file's namespace; a ZON file's value is none.
+    if (Facts.importKind(tree, node)) |kind| return kind == .namespace;
+    for ([_][]const u8{ "@TypeOf", "@This", "@typeInfo", "@Type", "@FieldType" }) |name| {
         if (Facts.isBuiltin(tree, node, name)) return true;
     }
     return false;

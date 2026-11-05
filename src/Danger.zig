@@ -114,8 +114,9 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         // A block's local or a capture that exists only as the program compiles (in a type
         // function, a `comptime` block) holds no material, as A007 reads it.
         if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !atRuntime(c, decl.node)) continue;
-        // A module or file `@import` gives: a namespace, a type, which holds no material.
-        if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.isBuiltin(tree, Facts.ungrouped(tree, init), "@import")) continue;
+        // A module or Zig file `@import` gives: a namespace, a type, which holds no material. A
+        // ZON file's is a value, read as any.
+        if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.importKind(tree, init) == .namespace) continue;
         const value: Facts.Value = switch (decl.kind) {
             .variable, .parameter, .capture, .field => try c.facts.declaration(.{ .file = c.file, .index = @fromBackingInt(@intCast(d)) }),
             // What calling it gives, as Zig reads its result type (`!T`, a made type).
@@ -1369,8 +1370,8 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
             .variable, .parameter, .field => blk: {
                 // One whose declaration spells a governed name is judged at that site.
                 if (within(tree, found.tokens, decl.node) or within(tree, found.named, decl.node)) continue;
-                // A module or file `@import` gives: a namespace, a type, which holds no state.
-                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.isBuiltin(tree, Facts.ungrouped(tree, init), "@import")) continue;
+                // A module or Zig file `@import` gives: a namespace, a type, which holds no state.
+                if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.importKind(tree, init) == .namespace) continue;
                 // Typed by a declaration of this file whose own site is reported (the program's
                 // alias of a lock): judged there.
                 if (namesHeld(tree, model, decl.node, found.tokens)) continue;

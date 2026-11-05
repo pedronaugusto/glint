@@ -41,6 +41,10 @@ pub const Handle = struct { file: FileId, snapshot: u64 };
 pub const Input = struct {
     name: []const u8,
     bytes: []const u8,
+    /// What the bytes are, as the caller states it: Zig source, or ZON data a Zig file imports
+    /// (`@import("build.zig.zon")`). A ZON file is data, never code: it is parsed, not lowered,
+    /// and no rule reads it but through the value an import of it resolves to.
+    kind: File.Kind = .zig,
     stem: []const u8 = "",
     selected: bool = true,
     classification: enum { production, @"test", generated } = .production,
@@ -116,15 +120,15 @@ pub const Options = struct {
 };
 
 /// Files read once and shared by every project made with this store: what a file means on its
-/// own, its bytes, tree, ZIR and per-file model, kept by its bytes and the limits and lowering
-/// it was read under. Nothing a program's other files decide is kept here: what the analyses
+/// own, its bytes, tree, ZIR and per-file model, kept by its bytes and the kind, limits and
+/// lowering it was read under. Nothing a program's other files decide is kept here: what the analyses
 /// find of a program is each run's own. The caller owns it, and it outlives every project made
 /// with it; one thread uses it at a time.
 pub const Store = struct {
     gpa: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(u64, std.ArrayList(*Entry)) = .empty,
 
-    const Entry = struct { file: File, model: Model, limits: File.Limits, lowering: bool };
+    const Entry = struct { file: File, model: Model, limits: File.Limits, lowering: bool, kind: File.Kind };
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .gpa = gpa };
@@ -143,21 +147,22 @@ pub const Store = struct {
         self.* = undefined;
     }
 
-    /// The file `bytes` are, read under `limits`: the one this store read before from the same
-    /// bytes so, or one read now.
-    fn read(self: *Store, bytes: []const u8, limits: File.Limits, lowering: bool) (File.InitError || Model.InitError)!*const Entry {
+    /// The file `bytes` are, read as `kind` under `limits`: the one this store read before from
+    /// the same bytes so, or one read now. The same bytes read as Zig and as ZON are two files.
+    fn read(self: *Store, bytes: []const u8, limits: File.Limits, lowering: bool, kind: File.Kind) (File.InitError || Model.InitError)!*const Entry {
         const found = try self.entries.getOrPut(self.gpa, std.hash.Wyhash.hash(0, bytes));
         if (!found.found_existing) found.value_ptr.* = .empty;
         for (found.value_ptr.items) |entry| {
-            if (entry.lowering == lowering and std.meta.eql(entry.limits, limits) and std.mem.eql(u8, entry.file.source, bytes)) return entry;
+            if (entry.kind == kind and entry.lowering == lowering and std.meta.eql(entry.limits, limits) and std.mem.eql(u8, entry.file.source, bytes)) return entry;
         }
         const entry = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(entry);
-        entry.file = try File.initWithLowering(self.gpa, bytes, limits, lowering);
+        entry.file = try File.initWithLowering(self.gpa, bytes, limits, lowering, kind);
         errdefer entry.file.deinit();
         entry.model = try Model.init(&entry.file);
         entry.limits = limits;
         entry.lowering = lowering;
+        entry.kind = kind;
         try found.value_ptr.append(self.gpa, entry);
         return entry;
     }
@@ -185,7 +190,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
     for (sources, inputs, 0..) |*each, input, index| {
         if (options.io) |io| try io.checkCancel();
         each.id = @fromBackingInt(@intCast(index));
-        const entry = try store.read(input.bytes, options.limits, options.lowering);
+        const entry = try store.read(input.bytes, options.limits, options.lowering, input.kind);
         each.file = &entry.file;
         each.model = entry.model;
         each.input = input;
@@ -435,4 +440,21 @@ test "project stale handles survive allocator address reuse without aliasing" {
     var replacement = try init(allocator.allocator(), &.{.{ .name = "two", .bytes = "const x = 2;" }}, &.{}, .{});
     defer replacement.deinit();
     try std.testing.expectError(error.InvalidHandle, replacement.source(stale));
+}
+
+test "a ZON input is read as ZON, and the same bytes as Zig are another file" {
+    var store: Store = .init(std.testing.allocator);
+    defer store.deinit();
+    const bytes = ".{ .a = 1 }";
+    var project = try init(std.testing.allocator, &.{ .{ .name = "a.zon", .bytes = bytes, .kind = .zon }, .{ .name = "a.zig", .bytes = bytes } }, &.{}, .{ .store = &store });
+    defer project.deinit();
+    try std.testing.expect(project.sources[0].file != project.sources[1].file);
+    try std.testing.expectEqual(File.Status.parsed, project.sources[0].file.status);
+    try std.testing.expect(project.sources[0].file.zir == null);
+    try std.testing.expectEqual(0, project.sources[0].model.declarations.len);
+    try std.testing.expectEqual(File.Status.invalid_lowering, project.sources[1].file.status);
+    // Read again as ZON: the store's entry.
+    var again = try init(std.testing.allocator, &.{.{ .name = "b.zon", .bytes = bytes, .kind = .zon }}, &.{}, .{ .store = &store });
+    defer again.deinit();
+    try std.testing.expectEqual(project.sources[0].file, again.sources[0].file);
 }

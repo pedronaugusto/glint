@@ -14,6 +14,9 @@ lines: []const u32,
 end: u32,
 
 pub const Status = enum { parsed, invalid_syntax, invalid_lowering, budget_exhausted };
+/// What the bytes are, as the caller states it: Zig source, or ZON data (`build.zig.zon`, a
+/// `@import("x.zon")`), which std parses as one expression and AstGen never lowers.
+pub const Kind = std.zig.Ast.Mode;
 pub const Limits = struct {
     bytes: usize = 16 * 1024 * 1024,
     nodes: usize = 1_000_000,
@@ -25,23 +28,32 @@ pub const Comment = struct { start: u32, end: u32, line: u32 };
 pub const InitError = std.mem.Allocator.Error || error{ SourceTooLarge, SourceTooComplex };
 
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits) InitError!File {
-    return initWithLowering(gpa, bytes, limits, true);
+    return initWithLowering(gpa, bytes, limits, true, .zig);
 }
 
-pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits, lower: bool) InitError!File {
+/// The file `bytes` are, read as `kind` says. A ZON file is parsed and checked as ZON, never
+/// lowered: it has no ZIR, and its status is `parsed`, or `invalid_syntax` where it is not ZON.
+pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limits, lower: bool, kind: Kind) InitError!File {
     if (bytes.len > limits.bytes or bytes.len > std.math.maxInt(u32)) return error.SourceTooLarge;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     const source = try a.dupeSentinel(u8, bytes, 0);
-    const front = try aegis.input.Untrusted([:0]const u8).init(source).parse(Reading{ .a = a, .limits = limits }, parseZig);
+    const front = try aegis.input.Untrusted([:0]const u8).init(source).parse(Reading{ .a = a, .limits = limits, .kind = kind }, parseSource);
     const tree = front.tree;
     var status: Status = if (tree.errors.len == 0) .parsed else .invalid_syntax;
     var zir: ?std.zig.Zir = null;
     if (bytes.len > limits.bytes or tree.nodes.len > limits.nodes) {
         status = .budget_exhausted;
     } else if (status == .parsed and !safeCharacters(&tree)) {
-        status = .invalid_lowering;
+        // ZON is never lowered: such a literal is a file std's ZON reader rejects.
+        status = if (kind == .zon) .invalid_syntax else .invalid_lowering;
+    } else if (status == .parsed and kind == .zon) {
+        // std's parser takes any expression in ZON mode; std's ZON reader refuses what ZON is
+        // not (a call, a name, a declaration), as the compiler does. So a ZON file that parses
+        // holds data alone, and nothing in it is code.
+        const zoir = try std.zig.ZonGen.generate(a, tree, .{});
+        if (zoir.hasCompileErrors()) status = .invalid_syntax;
     } else if (status == .parsed and lower) {
         zir = try std.zig.AstGen.generate(a, tree);
         if (zir.?.hasCompileErrors()) status = .invalid_lowering;
@@ -50,18 +62,18 @@ pub fn initWithLowering(gpa: std.mem.Allocator, bytes: []const u8, limits: Limit
     return .{ .arena = arena, .source = source, .tree = tree, .zir = zir, .status = status, .lines = front.lines, .comments = front.comments, .end = front.end };
 }
 
-/// What a file's bytes are once read as Zig, and the input boundary of all glint builds from
-/// them: the tree, each line's start and each comment's span.
+/// What a file's bytes are once read as Zig or ZON, and the input boundary of all glint builds
+/// from them: the tree, each line's start and each comment's span.
 const Front = struct { tree: std.zig.Ast, lines: []const u32, comments: []const Comment, end: u32 };
-const Reading = struct { a: std.mem.Allocator, limits: Limits };
+const Reading = struct { a: std.mem.Allocator, limits: Limits, kind: Kind };
 
-/// The check is std's Zig parser, behind the lexical budget that keeps its work bounded: every
-/// node and token index its tree holds indexes the tree's own tables, and every line start
-/// and comment span this scan records is a position in the source. What the rules read of
+/// The check is std's parser, in the mode the caller states, behind the lexical budget that
+/// keeps its work bounded: every node and token index its tree holds indexes the tree's own
+/// tables, and every line start and comment span this scan records is a position in the source. What the rules read of
 /// them is the tree's, not a peer's choice.
-fn parseZig(reading: Reading, source: [:0]const u8) InitError!Front {
+fn parseSource(reading: Reading, source: [:0]const u8) InitError!Front {
     try sourceComplexity(source, reading.limits);
-    const tree = try std.zig.Ast.parse(reading.a, source, .{});
+    const tree = try std.zig.Ast.parse(reading.a, source, .{ .mode = reading.kind });
     var lines: std.ArrayList(u32) = .empty;
     try lines.append(reading.a, 0);
     for (source, 0..) |byte, offset| if (byte == '\n') {
@@ -228,4 +240,20 @@ test "morning cut UTF8 character literal never reaches unsafe std lowering" {
     var file = try init(std.testing.allocator, bytes, .{});
     defer file.deinit();
     try std.testing.expect(file.status != .parsed);
+}
+
+test "a ZON file is parsed and checked as ZON, never lowered" {
+    var data = try initWithLowering(std.testing.allocator, ".{ .bytes = .{ 1, 2 }, .name = \"k\" }", .{}, true, .zon);
+    defer data.deinit();
+    try std.testing.expectEqual(Status.parsed, data.status);
+    try std.testing.expect(data.zir == null);
+    try std.testing.expectEqual(Kind.zon, data.tree.mode);
+    // A syntax error, and an expression ZON is not (a call std's parser takes), are refused alike.
+    var syntax = try initWithLowering(std.testing.allocator, ".{ .bytes = }", .{}, true, .zon);
+    defer syntax.deinit();
+    try std.testing.expectEqual(Status.invalid_syntax, syntax.status);
+    var code = try initWithLowering(std.testing.allocator, "f(1)", .{}, true, .zon);
+    defer code.deinit();
+    try std.testing.expectEqual(Status.invalid_syntax, code.status);
+    try std.testing.expect(code.zir == null);
 }

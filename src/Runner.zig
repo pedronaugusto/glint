@@ -92,7 +92,9 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer scratch.deinit();
     for (project.sources) |*source| {
-        if (!source.input.selected) continue;
+        // A ZON file is data, not code: no rule runs on it and no coverage is reported for it;
+        // what it holds is read through the value an import of it resolves to.
+        if (!source.input.selected or source.input.kind == .zon) continue;
         if (options.io) |io| try io.checkCancel();
         runner.file = source.id;
         runner.config = config;
@@ -329,4 +331,14 @@ test "core diagnostics suppression cannot hide incomplete lowering" {
     defer report.deinit();
     try std.testing.expect(!report.complete);
     try std.testing.expectEqual(.invalid_lowering, report.coverage[0].reason);
+}
+
+test "a ZON file is data: no rule runs on it and no coverage is reported for it" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "k.zon", .bytes = ".{ .bytes = .{ 1, 2 } }", .kind = .zon }}, &.{}, .{});
+    defer project.deinit();
+    var report = try run(std.testing.allocator, &project, .{});
+    defer report.deinit();
+    try std.testing.expect(report.complete);
+    try std.testing.expectEqual(0, report.coverage.len);
+    try std.testing.expectEqual(0, report.diagnostics.len);
 }

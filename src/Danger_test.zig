@@ -423,7 +423,7 @@ test "A007 and A008 read a tuple by its parts, a chain of orelse to its payload,
     , 2);
     try expect(pack.secrets,
         \\const std = @import("std");
-        \\const zon = @import("build.zig.zon");
+        \\const dep = @import("dep.zig");
         \\const Error = error{Gone};
         \\const Failure = Error || error{Lost};
         \\const Ed25519 = std.crypto.sign.Ed25519;
@@ -437,6 +437,14 @@ test "A007 and A008 read a tuple by its parts, a chain of orelse to its payload,
         \\    return n;
         \\}
     , 2);
+    // A ZON file's import is its value, which may be a key: one the run did not load is
+    // undecided, never clean.
+    const unloaded = try run(pack.secrets,
+        \\const data = @import("data.zon");
+        \\pub fn f() void { _ = data; }
+    );
+    try std.testing.expectEqual(@as(usize, 0), unloaded.findings);
+    try std.testing.expectEqual(@as(usize, 1), unloaded.undecided);
 }
 
 /// A dependency's records and type functions: what it holds is the program's, judged where the

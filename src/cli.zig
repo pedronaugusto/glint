@@ -72,7 +72,7 @@ const Loader = struct {
         const basename = std.Io.Dir.path.basename(path);
         const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else basename;
         const package = try self.packageOf(canonical);
-        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .bytes = bytes, .selected = selected, .package = package.name, .fingerprint = package.fingerprint });
+        try self.inputs.append(self.a, .{ .name = path, .stem = stem, .kind = if (std.mem.endsWith(u8, basename, ".zon")) .zon else .zig, .bytes = bytes, .selected = selected, .package = package.name, .fingerprint = package.fingerprint });
         try self.canonical_paths.append(self.a, canonical);
         try self.paths.put(self.a, canonical, position);
         return position;
@@ -163,7 +163,8 @@ const Loader = struct {
             return try std.Io.Dir.path.join(self.a, &.{ lib, "std", "std.zig" });
         }
         for (self.options.modules.items) |module| if (std.mem.eql(u8, spelling.text, module.name)) return module.path;
-        if (!std.mem.endsWith(u8, spelling.text, ".zig")) return null;
+        // A relative path names a Zig file or a ZON one (`@import("data.zon")`), read as ZON.
+        if (!std.mem.endsWith(u8, spelling.text, ".zig") and !std.mem.endsWith(u8, spelling.text, ".zon")) return null;
         if (spelling.from >= self.canonical_paths.items.len) return null;
         const path = try std.Io.Dir.path.resolveAlloc(self.a, &.{ std.Io.Dir.path.dirname(self.canonical_paths.items[spelling.from]) orelse ".", spelling.text });
         for (self.roots.items) |root| if (within(root, path)) return path;

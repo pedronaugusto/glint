@@ -84,7 +84,9 @@ pub fn init(file: *File) InitError!Model {
     var scopes: std.ArrayList(Scope) = .empty;
     try scopes.append(a, .{ .kind = .file, .node = .root, .first = 0, .last = @intCast(tree.tokens.len - 1) });
     const node_parents = if (tree.errors.len == 0) try parents(a, tree) else try a.alloc(?Ast.Node.Index, 0);
-    if (tree.errors.len == 0) try collectScopes(a, tree, node_parents, &scopes);
+    // A ZON file is one expression of data: its file scope, and no declarations or names.
+    const code = tree.errors.len == 0 and tree.mode == .zig;
+    if (code) try collectScopes(a, tree, node_parents, &scopes);
     std.mem.sort(Scope, scopes.items[1..], {}, scopeLess);
     for (scopes.items, 0..) |*scope, i| scope.id = @fromBackingInt(@intCast(i));
     const token_scopes = try a.alloc(Scope.Id, tree.tokens.len);
@@ -100,7 +102,7 @@ pub fn init(file: *File) InitError!Model {
         const decl = zir.getDeclaration(instruction);
         try lowered.append(a, .{ .instruction = instruction, .node = decl.src_node, .name = zir.nullTerminatedString(decl.name), .public = decl.is_pub, .type_body = decl.type_body, .value_body = decl.value_body });
     };
-    if (tree.errors.len == 0) try collectDeclarations(a, tree, node_parents, token_scopes, scopes.items, &declarations);
+    if (code) try collectDeclarations(a, tree, node_parents, token_scopes, scopes.items, &declarations);
     const by_node = try a.alloc(?std.zig.Zir.Inst.Index, tree.nodes.len);
     @memset(by_node, null);
     for (lowered.items) |decl| {
@@ -116,7 +118,7 @@ pub fn init(file: *File) InitError!Model {
     var model: Model = .{ .scopes = scopes.items, .declarations = declarations.items, .references = &.{}, .token_scopes = token_scopes, .node_references = node_references, .node_parents = node_parents, .zir_declarations = lowered.items, .zir_references = &.{}, .operations = &.{}, .node_operations = node_operations, .unknown_references = 0, .import_nodes = &.{}, .lowered_coverage = if (file.status != .parsed) .invalid_front_end else if (file.zir == null) .not_requested else .partial };
     var references: std.ArrayList(Reference) = .empty;
     var import_nodes: std.ArrayList(Ast.Node.Index) = .empty;
-    for (tree.nodes.items(.tag), 0..) |tag, index| {
+    if (code) for (tree.nodes.items(.tag), 0..) |tag, index| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(index));
         switch (tag) {
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) try import_nodes.append(a, node),
@@ -140,7 +142,7 @@ pub fn init(file: *File) InitError!Model {
         }
         try references.append(a, ref_record);
         node_references[index] = @fromBackingInt(@intCast(references.items.len - 1));
-    }
+    };
     model.references = try references.toOwnedSlice(a);
     model.import_nodes = try import_nodes.toOwnedSlice(a);
     if (file.status == .parsed and file.zir != null) {
