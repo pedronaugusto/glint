@@ -4372,6 +4372,41 @@ test "A013 judges a dependency's contracts at the call that gives them input: an
     }
 }
 
+test "A018 judges a dependency's peer writes at the call that gives them an error's name, through the dependency's own call too" {
+    // `dep.zig` is a dependency's file the run does not select (main's provenance ruling): it
+    // writes what it is given to a peer; `send(stream, "busy")` gives it the program's text.
+    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
+        \\const std = @import("std");
+        \\pub fn send(stream: std.Io.net.Stream, text: []const u8) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    try w.print("{s}", .{text});
+        \\}
+        \\pub fn via(stream: std.Io.net.Stream, text: []const u8) !void {
+        \\    try send(stream, text);
+        \\}
+    };
+    var project = try sources.projectAs(std.testing.allocator,
+        \\const std = @import("std");
+        \\const dep = @import("dep.zig");
+        \\pub fn f(stream: std.Io.net.Stream, err: anyerror) !void {
+        \\    try dep.send(stream, @errorName(err));
+        \\    try dep.via(stream, @errorName(err));
+        \\    try dep.send(stream, "busy");
+        \\}
+    , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    for (report.coverage) |entry| try std.testing.expect(entry.rule == null);
+    const lines = [_]u32{ 4, 5 };
+    try std.testing.expectEqual(lines.len, report.diagnostics.len);
+    for (report.diagnostics, lines) |found, line| {
+        try std.testing.expectEqual(line, found.span.line);
+        try std.testing.expect(std.mem.find(u8, found.message, "input passed to ") != null);
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,
