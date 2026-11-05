@@ -1777,12 +1777,31 @@ fn choiceOfTypes(value: Value) bool {
     return true;
 }
 
-/// `boundCopy` in one instantiation `env` of the copy's function; null where the instantiation
-/// does not reach a call on the path or the source.
-fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Value {
+/// The readings of the function a copy is in, as `call` binds `function` and the copy's path
+/// passes the parameter on (`boundCopy`'s walk): one per instantiation that reaches the copy's
+/// site, none where none does. Unknown where the binding or a call on the path does not resolve,
+/// and for a crowded copy, which `boundCopy` reads by its routes, not one path.
+pub fn copyReadings(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!union(enum) { readings: []const *const Env, unknown: Unknown } {
+    if (copy.crowded) return .{ .unknown = .budget };
+    const bound = switch (try self.bindCall(&call, function, null)) {
+        .reading => |reading| reading,
+        .unknown => |why| return .{ .unknown = why },
+    };
+    var found: std.ArrayList(*const Env) = .empty;
+    for (try self.instantiations(bound)) |reading| switch (try self.pathIn(reading, copy)) {
+        .reading => |env| if (try self.reachedUnder(env, copy.site.file, copy.site.node)) try found.append(self.gpa, env),
+        .unreached => {},
+        .unknown => |why| return .{ .unknown = why },
+    };
+    return .{ .readings = found.items };
+}
+
+/// The reading of the function a copy is in, from `start`, the reading of the function the
+/// binding binds, through each call on the copy's path.
+fn pathIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!union(enum) { reading: *const Env, unreached, unknown: Unknown } {
     var env = start;
     for (copy.path) |step| {
-        if (!try self.reachedUnder(env, step.file, step.node)) return null;
+        if (!try self.reachedUnder(env, step.file, step.node)) return .unreached;
         const step_tree = self.syntaxOf(step.file);
         var step_buffer: [1]Ast.Node.Index = undefined;
         const inner = step_tree.fullCall(&step_buffer, step.node) orelse return .{ .unknown = .unsupported };
@@ -1798,7 +1817,17 @@ fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Va
         };
         env = try self.bind(step.file, inner, target, env);
     }
-    return self.sourceIn(env, copy);
+    return .{ .reading = env };
+}
+
+/// `boundCopy` in one instantiation `env` of the copy's function; null where the instantiation
+/// does not reach a call on the path or the source.
+fn copyIn(self: *Facts, start: *const Env, copy: ParameterCopy) ResolveError!?Value {
+    return switch (try self.pathIn(start, copy)) {
+        .reading => |env| self.sourceIn(env, copy),
+        .unreached => null,
+        .unknown => |why| .{ .unknown = why },
+    };
 }
 
 /// What a copy's source holds in the reading `env` of the function it is in: null where the

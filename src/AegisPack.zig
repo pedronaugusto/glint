@@ -1121,6 +1121,20 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
     for (functions) |function| if (try boundBy(c, tree, call, rule, function, name_token)) return;
 }
 
+/// Whether a std resource a generic makes by its parameter (`store.gitDir()` on `store:
+/// anytype`) is lent in every reading the binding makes of its site (`Shapes.lentUnder`): there
+/// the call resolves, and a getter that returns a field of what it is given hands out a loan of
+/// that holder's owner, no acquisition. A reading that does not resolve, or none, is no loan.
+fn madeLent(c: *Context, call: Facts.calls.Call, function: Facts.Decl, copy: Facts.ParameterCopy) Context.Error!bool {
+    const readings = switch (try c.facts.copyReadings(call, function, copy)) {
+        .readings => |readings| readings,
+        .unknown => return false,
+    };
+    if (readings.len == 0) return false;
+    for (readings) |env| if (!try Shapes.lentUnder(c, cleanup, env, copy.site.file, copy.site.node)) return false;
+    return true;
+}
+
 /// Whether the cast a generic makes by its parameter's type reads a scalar's integer out (a
 /// call of `raw`, `@backingInt`, `@intFromEnum`, `@call` of `raw`, or `@bitCast`/`@ptrCast` of
 /// the value it is given), where the others make an integer into the bound type.
@@ -1323,8 +1337,14 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
         if (copy.kind == .made) {
             const site = c.project.at(copy.site.file).file;
             const line = site.line(site.tree.tokenStart(site.tree.firstToken(copy.site.node))) + 1;
-            // A std resource by value is an acquisition's, by its type alone (`acquiresHandle`).
-            const owner: Typed = if (try Shapes.holdsHandle(c, cleanup, bound)) .{ .owner = .std_handle } else try perBuild(c, bound);
+            // A std resource by value is an acquisition's, by its type alone (`acquiresHandle`),
+            // unless the binding makes the site a loan (`madeLent`).
+            const owner: Typed = if (!try Shapes.holdsHandle(c, cleanup, bound))
+                try perBuild(c, bound)
+            else if (try madeLent(c, call, function, copy))
+                .other
+            else
+                .{ .owner = .std_handle };
             switch (owner) {
                 .owner => |k| if (releases(k) != null) try c.undecided(cleanup, tree.tokenStart(tree.nodeMainToken(node)), .unsupported, try c.allocator.print("this binding makes an owner of what {s}:{d} acquires by the generic's type parameter; its cleanup is not walked per binding", .{ c.project.at(copy.site.file).input.name, line })),
                 .other => {},

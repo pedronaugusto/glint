@@ -1773,6 +1773,15 @@ pub fn holdsHandle(c: *Context, rule: Rule, value: Facts.Value) Context.Error!bo
     return find(try containersOf(c, rule, &resource_paths), held) != null;
 }
 
+/// Whether what the call `node` gives in the reading `env` (a generic's binding) is lent, as
+/// `acquiresHandle` reads a call it does not acquire by (`callViewed`), its callee the one the
+/// binding makes it: `store.gitDir()` on `store: anytype` bound to a store whose `gitDir`
+/// returns its field. No call there, or one that does not resolve, is no loan.
+pub fn lentUnder(c: *Context, rule: Rule, env: *const Facts.Env, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const call = (try Facts.calls.under(c.facts, env, file, node)) orelse return false;
+    return callViewed(c, try containersOf(c, rule, &resource_paths), file, &call, 0, null);
+}
+
 /// A call of the program's function whose returns `views` reads: there a parameter of the
 /// callee is the argument the call passes at it, read where the call is (`outer` the binding in
 /// force there).
