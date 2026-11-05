@@ -1566,6 +1566,8 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
     // Read in a file the run does not select: what the sink takes from its function's
     // parameters, judged at the calls into it (`judgedAtCalls`).
     if (flow) |fact| if (fact.flow.recording) |list| {
+        // Null outside the functions the fact reads: a container's declaration, evaluated as the
+        // program compiles, which no input reaches.
         const function = Taint.functionKey(fact, c.file, node) orelse return;
         const given = (try Taint.givenAt(c, fact, c.file, node)) orelse return;
         // Through a call that does not resolve, what it takes from the parameters is not known.
@@ -1591,14 +1593,37 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
     try c.at(rule, tree.nodeMainToken(node), text.items);
 }
 
-/// What a rule reports while it reads a file the run does not select: nothing. The file's
-/// sinks go into `Taint.Flow.recording` instead (`passedSinks`).
+/// What a rule reports while it reads a file the run does not select: its sinks go into
+/// `Taint.Flow.recording` (`passedSinks`), judged at the selected calls into their functions.
+/// Nothing it reports there is dropped: a finding or a site it leaves undecided in a function
+/// read is a sink of that function, undecided at every selected call into it (taking each
+/// parameter, at its least clean), so the reading never hides what it could not keep as a
+/// sink; one outside any function makes every call into the reading undecided (`outside`).
 const Quiet = struct {
     sink: Context.Sink = .{ .diagnostic = diagnostic, .coverage = coverage, .config = config },
     inner: *Context.Sink,
+    c: *Context,
+    flow: Taint.Fact,
+    /// A site left undecided outside any function of the file read.
+    outside: bool = false,
 
-    fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
-    fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+    fn diagnostic(own: *Context.Sink, _: Rule, start: u32, _: u32, message: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {
+        const quiet: *Quiet = @fieldParentPtr("sink", own);
+        return quiet.undecidedAt(quiet.c.file, start, message);
+    }
+    fn coverage(own: *Context.Sink, item: @import("Report.zig").Coverage) Context.Error!void {
+        const quiet: *Quiet = @fieldParentPtr("sink", own);
+        return quiet.undecidedAt(item.file, item.start, item.detail);
+    }
+    /// The site at `start` of `file`, undecided at every selected call into its function.
+    fn undecidedAt(quiet: *Quiet, file: Project.FileId, start: u32, message: []const u8) Context.Error!void {
+        const list = quiet.flow.flow.recording.?; // unreachable: Quiet is the sink only while a file is read, and `recording` set
+        const around = (try Taint.functionAround(quiet.c, quiet.flow, file, start)) orelse {
+            quiet.outside = true;
+            return;
+        };
+        try list.append(quiet.c.allocator, .{ .at = .{ .file = file, .node = around.node }, .holder = around.id, .given = around.every, .least = .clean, .message = message, .undecided = true });
+    }
     fn config(own: *Context.Sink, file: Project.FileId) RuleConfig {
         const quiet: *Quiet = @fieldParentPtr("sink", own);
         return quiet.inner.config(quiet.inner, file);
@@ -1636,7 +1661,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
     var fresh: std.AutoHashMapUnmanaged(u32, void) = .empty;
     try taken.put(c.allocator, callee, {});
     try fresh.put(c.allocator, callee, {});
-    var quiet: Quiet = .{ .inner = c.sink };
+    var quiet: Quiet = .{ .inner = c.sink, .c = c, .flow = flow };
     const saved_file, const saved_sink, const saved_recording, const saved_calls, const saved_within = .{ c.file, c.sink, flow.flow.recording, flow.flow.recording_calls, flow.flow.recording_within };
     c.file = file;
     c.sink = &quiet.sink;
@@ -1698,6 +1723,11 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
                 }
             }
         }
+    }
+    // A site left undecided outside any function: every function read is undecided at its calls.
+    if (quiet.outside) {
+        var each = taken.keyIterator();
+        while (each.next()) |function| try list.append(c.allocator, .{ .at = .{ .file = file, .node = .root }, .holder = function.*, .given = try Taint.everyParameterOf(c, flow, function.*), .least = .clean, .message = "a site outside its functions the rule could not judge", .undecided = true });
     }
     _ = flow.flow.reading_sinks.remove(reading);
     // Each function read keeps the sinks it holds; one read before keeps its own.
@@ -1792,7 +1822,7 @@ fn passedReport(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index,
         return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s}, whose parameters this call's arguments are not known for, may reach a sink it reads ({s}:{d}{s})", .{ name, held_name, line, others }));
     };
     const level = Taint.levelOf(flow, c.file, call, given);
-    if (one.undecided or level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s} may reach a sink its binding or a call back into its file decides ({s}:{d}{s})", .{ name, held_name, line, others }));
+    if (one.undecided or level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s} may reach a site its binding, a call back into its file or the rule's reading there leaves undecided ({s}:{d}: {s}{s})", .{ name, held_name, line, one.message, others }));
     try c.at(rule, tree.nodeMainToken(call), try c.allocator.print("input passed to {s} reaches {s}:{d}: {s}{s}", .{ name, held_name, line, one.message, others }));
 }
 

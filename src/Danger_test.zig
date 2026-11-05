@@ -4151,6 +4151,49 @@ test "A009 and A010 judge a dependency's sinks at the call that gives them input
     }
 }
 
+test "A009 keeps what it leaves undecided in a dependency's function: every call into it is undecided, none clean" {
+    // `dep.zig`'s loop is bounded through `pred.zig`'s predicate, a call A009 does not follow
+    // there: undecided while the file is read, so undecided at each selected call into `spin`,
+    // the program's own value too (what the site depends on is not read). `idle` loops on nothing.
+    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
+        \\const pred = @import("pred.zig");
+        \\pub fn spin(n: u64) u64 {
+        \\    var i: u64 = 0;
+        \\    var sum: u64 = 0;
+        \\    while (pred.below(i, n)) : (i += 1) sum +%= i;
+        \\    return sum;
+        \\}
+        \\pub fn idle(n: u64) u64 {
+        \\    return n;
+        \\}
+    };
+    const pred: sources.Extra = .{ .name = "pred.zig", .package = "dep", .bytes =
+        \\pub fn below(a: u64, b: u64) bool {
+        \\    return a < b;
+        \\}
+    };
+    var project = try sources.projectAs(std.testing.allocator,
+        \\const std = @import("std");
+        \\const dep = @import("dep.zig");
+        \\pub fn f(r: *std.Io.Reader) !u64 {
+        \\    const n = try r.takeByte();
+        \\    _ = dep.idle(n);
+        \\    _ = dep.spin(3);
+        \\    return dep.spin(n);
+        \\}
+    , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{ dep, pred }), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "pred.zig", .target = std_files.len + 1 } }));
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var undecided: usize = 0;
+    for (report.coverage) |entry| if (entry.rule != null) {
+        try std.testing.expect(std.mem.find(u8, entry.detail, "input passed to spin") != null);
+        undecided += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), undecided);
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,

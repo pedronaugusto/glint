@@ -2805,10 +2805,16 @@ pub fn everyParameter(c: *Context, decl: Facts.Decl) Context.Error!Dep {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{};
-    var out: Dep = .{};
+    var count: usize = 0;
     var it = proto.iterate(tree);
-    var position: usize = 0;
-    while (it.next()) |_| : (position += 1) {
+    while (it.next()) |_| count += 1;
+    return everySlot(c, count);
+}
+
+/// A Dep taking each of `count` parameters at its most (`everyParameter`).
+fn everySlot(c: *Context, count: usize) Context.Error!Dep {
+    var out: Dep = .{};
+    for (0..count) |position| {
         for ([_]usize{ valueSlot(position), lengthSlot(position) }) |slot| {
             out.params = try out.params.with(c.allocator, slot);
             out.numbers = try out.numbers.with(c.allocator, slot);
@@ -2816,6 +2822,37 @@ pub fn everyParameter(c: *Context, decl: Facts.Decl) Context.Error!Dep {
         }
     }
     return out;
+}
+
+/// A Dep taking every parameter of the function `function` (`functionKey`) at its most.
+pub fn everyParameterOf(c: *Context, fact: Fact, function: u32) Context.Error!Dep {
+    return everySlot(c, fact.flow.functions.items[function].params.len);
+}
+
+/// The function a site at the source position `start` of `file` belongs to, as an id the fact
+/// keeps for the run, with a Dep taking each of its parameters at its most: the innermost
+/// function the fact reads around it, by the file's scopes. Null outside any (a container's
+/// declarations, a `comptime` block).
+pub fn functionAround(c: *Context, fact: Fact, file: Project.FileId, start: u32) Context.Error!?struct { id: u32, node: Ast.Node.Index, every: Dep } {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
+    const starts = tree.tokens.items(.start);
+    // The last token starting at or before `start`.
+    var low: usize = 0;
+    var high: usize = starts.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (starts[mid] <= start) low = mid + 1 else high = mid;
+    }
+    if (low == 0) return null;
+    var scope: ?Model.Scope.Id = model.scopeOf(@intCast(low - 1));
+    while (scope) |s| : (scope = model.scopes[@backingInt(s)].parent) {
+        const each = model.scopes[@backingInt(s)];
+        if (each.kind != .function) continue;
+        const function = fact.flow.by_node.get(.{ .file = file, .node = each.node }) orelse continue;
+        return .{ .id = @backingInt(function), .node = each.node, .every = try everyParameterOf(c, fact, @backingInt(function)) };
+    }
+    return null;
 }
 
 /// The level of a counter `loop` steps, as it decides how many passes the loop takes: what it
