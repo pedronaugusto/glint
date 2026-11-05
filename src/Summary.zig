@@ -663,12 +663,10 @@ fn sameSites(a: []const Site, b: []const Site) bool {
 const RunNames = struct { names: ?Names = null };
 
 /// The cross-check `Facts.check_records` runs: each kind of record read back as it is built.
-pub const check: Facts.RecordCheck = .{ .accesses = checkAccesses };
+pub const check: Facts.RecordCheck = .{ .accesses = checkAccesses, .copies = checkCopies };
 
-/// Summaries' cross-check (`Facts.check_records`): `index`, `file`'s access index, written and
-/// read back into the same run, must be the same index. A difference is a record that leaves
-/// out what the live answer holds, so it stops the run rather than let a record answer for it.
-pub fn checkAccesses(facts: *Facts, file: Project.FileId, index: *const accesses.File, of: []const u8) Facts.ResolveError!void {
+/// A writer naming each file by its run id, for a check that reads back into the run.
+fn checkWriter(facts: *Facts) Facts.ResolveError!Writer {
     const kept = try facts.memo(RunNames);
     if (kept.names == null) {
         const of_file = try facts.gpa.alloc(?[]const u8, facts.project.sources.len);
@@ -679,19 +677,98 @@ pub fn checkAccesses(facts: *Facts, file: Project.FileId, index: *const accesses
         }
         kept.names = names;
     }
-    var w = Writer.init(facts.gpa, facts, &kept.names.?) catch |err| switch (err) {
+    return Writer.init(facts.gpa, facts, &kept.names.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unnamed => unreachable, // unreachable: every file of the run is named
     };
+}
+
+/// Summaries' cross-check (`Facts.check_records`): `index`, `file`'s access index, written and
+/// read back into the same run, must be the same index. A difference is a record that leaves
+/// out what the live answer holds, so it stops the run rather than let a record answer for it.
+pub fn checkAccesses(facts: *Facts, file: Project.FileId, index: *const accesses.File, of: []const u8) Facts.ResolveError!void {
+    var w = try checkWriter(facts);
     defer w.deinit();
     writeAccesses(&w, index) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unnamed => unreachable, // unreachable: every file of the run is named
     };
-    var r = Reader.init(facts, &kept.names.?, w.bytes.items) catch |err| std.debug.panic("summary cross-check: {s} of {s} does not read back: {t}", .{ of, facts.project.at(file).input.name, err });
+    var r = Reader.init(facts, w.names, w.bytes.items) catch |err| std.debug.panic("summary cross-check: {s} of {s} does not read back: {t}", .{ of, facts.project.at(file).input.name, err });
     defer r.deinit();
     const back = readAccesses(&r) catch |err| std.debug.panic("summary cross-check: {s} of {s} does not read back: {t}", .{ of, facts.project.at(file).input.name, err });
     if (!r.done() or !sameAccesses(index, back)) std.debug.panic("summary cross-check: {s} of {s} reads back other sites", .{ of, facts.project.at(file).input.name });
+}
+
+// The copies each generic function makes of its parameters' values (`Facts.parameterCopies`),
+// closed over the calls that pass a parameter on: a unit's record holds them for its functions,
+// read as the run reads them.
+const ParameterCopy = Facts.ParameterCopy;
+
+pub fn writeCopies(w: *Writer, copies: *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy)) WriteError!void {
+    try w.number(@intCast(copies.count()));
+    var each = copies.iterator();
+    while (each.next()) |entry| {
+        try w.decl(entry.key_ptr.*);
+        try w.number(@intCast(entry.value_ptr.len));
+        for (entry.value_ptr.*) |copy| {
+            try w.wide(copy.position);
+            try w.key(copy.site);
+            try w.number(@backingInt(copy.kind));
+            try w.number(@intFromBool(copy.source != null));
+            if (copy.source) |source| try w.key(source);
+            try w.number(@intCast(copy.path.len));
+            for (copy.path) |step| try w.key(step);
+            try w.number(@intFromBool(copy.crowded));
+        }
+    }
+}
+
+pub fn readCopies(r: *Reader) ReadError!std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) {
+    const gpa = r.facts.gpa;
+    var copies: std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = .empty;
+    for (0..try r.count()) |_| {
+        const function = try r.decl();
+        const list = try gpa.alloc(ParameterCopy, try r.count());
+        for (list) |*copy| {
+            const position = try r.wide();
+            const site = try r.key();
+            const kind = try r.enumeration(@FieldType(ParameterCopy, "kind"));
+            const source: ?Facts.Key = if (try r.flag()) try r.key() else null;
+            const path = try gpa.alloc(Facts.Key, try r.count());
+            for (path) |*step| step.* = try r.key();
+            copy.* = .{ .position = position, .site = site, .kind = kind, .source = source, .path = path, .crowded = try r.flag() };
+        }
+        try copies.putNoClobber(gpa, function, list);
+    }
+    return copies;
+}
+
+pub fn sameCopies(a: *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy), b: *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy)) bool {
+    if (a.count() != b.count()) return false;
+    var each = a.iterator();
+    while (each.next()) |entry| {
+        const other = b.get(entry.key_ptr.*) orelse return false;
+        if (other.len != entry.value_ptr.len) return false;
+        for (entry.value_ptr.*, other) |x, y| {
+            if (x.position != y.position or !std.meta.eql(x.site, y.site) or x.kind != y.kind or !std.meta.eql(x.source, y.source) or x.crowded != y.crowded) return false;
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(x.path), std.mem.sliceAsBytes(y.path))) return false;
+        }
+    }
+    return true;
+}
+
+/// `checkAccesses`'s cross-check, of the run's closed parameter copies.
+pub fn checkCopies(facts: *Facts, copies: *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy)) Facts.ResolveError!void {
+    var w = try checkWriter(facts);
+    defer w.deinit();
+    writeCopies(&w, copies) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the run is named
+    };
+    var r = Reader.init(facts, w.names, w.bytes.items) catch |err| std.debug.panic("summary cross-check: parameter copies do not read back: {t}", .{err});
+    defer r.deinit();
+    const back = readCopies(&r) catch |err| std.debug.panic("summary cross-check: parameter copies do not read back: {t}", .{err});
+    if (!r.done() or !sameCopies(copies, &back)) std.debug.panic("summary cross-check: parameter copies read back other copies", .{});
 }
 
 fn toEnum(comptime E: type, n: u32) error{Malformed}!E {

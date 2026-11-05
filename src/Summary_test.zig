@@ -40,6 +40,18 @@ const lib =
     \\    const q: Plain = p.*;
     \\    _ = q;
     \\}
+    \\pub fn keep(comptime T: type, value: T) T {
+    \\    var local = value;
+    \\    local = local;
+    \\    return local;
+    \\}
+    \\pub fn hand(comptime T: type, v: T) T {
+    \\    return keep(T, v);
+    \\}
+    \\pub fn each(any: anytype) void {
+    \\    const held = any;
+    \\    _ = held;
+    \\}
     \\const std = @import("std");
 ;
 
@@ -252,4 +264,27 @@ test "a file's access index reads back into another run of the same sources as t
         try std.testing.expect(Summary.sameAccesses(try Facts.accesses.readsOf(&second.facts, id), try Summary.readAccesses(&reader)));
     }
     try std.testing.expect(reader.done());
+}
+
+test "a run's parameter copies, closed over the calls that pass a parameter on, read back into another run of the same sources as the copies it finds" {
+    var first: Run = undefined;
+    try first.init(true, lib);
+    defer first.deinit();
+    var second: Run = undefined;
+    try second.init(false, lib);
+    defer second.deinit();
+    first.facts.check_records = &Summary.check;
+    const handed = try first.facts.parameterCopies(first.declared("hand"));
+    // `hand` copies nothing itself: what it has, it has through the call that passes `v` on.
+    try std.testing.expect(handed.len != 0);
+    try std.testing.expect((try first.facts.parameterCopies(first.declared("each"))).len != 0);
+    var writer = try Summary.Writer.init(std.testing.allocator, &first.facts, &first.names);
+    defer writer.deinit();
+    try Summary.writeCopies(&writer, &first.facts.copies.?);
+    var reader = try Summary.Reader.init(&second.facts, &second.names, writer.bytes.items);
+    defer reader.deinit();
+    const back = try Summary.readCopies(&reader);
+    try std.testing.expect(reader.done());
+    _ = try second.facts.parameterCopies(second.declared("hand"));
+    try std.testing.expect(Summary.sameCopies(&second.facts.copies.?, &back));
 }

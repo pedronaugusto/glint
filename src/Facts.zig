@@ -107,6 +107,7 @@ check_records: ?*const RecordCheck = null,
 /// What reads a record back for the cross-check (`check_records`), one for each kind of record.
 pub const RecordCheck = struct {
     accesses: *const fn (*Facts, Project.FileId, *const accesses.File, []const u8) ResolveError!void,
+    copies: *const fn (*Facts, *const std.AutoHashMapUnmanaged(Decl, []const ParameterCopy)) ResolveError!void,
 };
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
@@ -861,6 +862,7 @@ fn findCopies(self: *Facts) ResolveError!void {
         const slot = try self.copier_names.getOrPut(self.gpa, name);
         if (!slot.found_existing or kind == .copies) slot.value_ptr.* = kind;
     }
+    if (self.check_records) |check| try check.copies(self, &self.copies.?);
 }
 
 /// What a function named `name` may do with a generic parameter's values.
