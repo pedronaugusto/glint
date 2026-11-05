@@ -4269,6 +4269,24 @@ pub fn keptArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) Con
     return null;
 }
 
+/// The parameter of the call `node` whose value its result's length is, the receiver first:
+/// std's `Io.Reader.take(r, n)` and `peek(r, n)`, which give `n` bytes or fail, by their
+/// declarations. Null where the callee is neither, or std's reader does not resolve.
+pub fn lengthArgument(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!?usize {
+    const tree = &c.project.at(file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node) orelse return null;
+    const decl = switch (try c.facts.resolve(file, call.ast.fn_expr)) {
+        .function => |decl| decl,
+        else => return null,
+    };
+    for ([_][]const u8{ "Io.Reader.take", "Io.Reader.peek" }) |path| switch (try Governed.declarations(c, "std", path)) {
+        .decls => |decls| for (decls) |each| if (each.file == decl.file and each.index == decl.index) return 1,
+        .none, .unknown => {},
+    };
+    return null;
+}
+
 /// What the comparisons holding where `node` is read put it at most: the larger sides, for a
 /// sink that asks whether one is the program's own limit.
 pub fn ceilings(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error![]const Ast.Node.Index {

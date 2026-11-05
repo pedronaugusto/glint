@@ -2983,7 +2983,14 @@ const Frame = struct {
         const t = made.v.lin;
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
         out = try forget(f.a, out, tl);
-        const summed = summary orelse return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        const summed = summary orelse {
+            // std's own, known by declaration: a result as long as an argument says
+            // (`Range.lengthArgument`: a reader's `take(n)`).
+            if (try Range.lengthArgument(f.c, f.file, node)) |position| if (position < args.items.len) if (args.items[position].lin) |n| {
+                out = try f.equal(out, tl, n);
+            };
+            return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        };
         // A place's exit holds where the success is read at once: a callee that cannot fail, or
         // `try`; a result unwrapped later may meet a store to the place first.
         const at_once = !summed.fails or if (f.model.parentOf(node)) |parent| f.tree.nodeTag(parent) == .@"try" else false;

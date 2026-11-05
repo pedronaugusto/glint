@@ -5691,11 +5691,11 @@ test "A010 reads a remainder by the length of memory input sized as input's divi
         \\    return table[i % table.len] +% ring[i % ring.len];
         \\}
     , 0);
-    // An empty read divides by zero.
+    // A read input sizes may be empty: it divides by zero. (`take(16)` gives sixteen bytes or fails.)
     try expect(pack.integers,
         \\const std = @import("std");
         \\pub fn f(r: *std.Io.Reader) !u8 {
-        \\    const ring = try r.take(16);
+        \\    const ring = try r.take(try r.takeByte());
         \\    const i: usize = try r.takeInt(u32, .little);
         \\    return ring[i % ring.len];
         \\}
@@ -5812,7 +5812,7 @@ test "A009 reads an array's length as its type spells it: a comptime width, a co
         \\    return .{ r, s };
         \\}
         \\pub fn f(r: *std.Io.Reader) !void {
-        \\    const v = try r.take(8);
+        \\    const v = try r.take(try r.takeByte());
         \\    var out: [32]u8 = @splat(0);
         \\    try rightAligned(32, v, &out);
         \\    try rightAlignedType(Curve, v, &out);
