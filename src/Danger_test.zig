@@ -624,6 +624,60 @@ test "A013 finds contracts input reaches: an assert on it, an unreachable it cho
     , 5);
 }
 
+test "A013 leaves an unreachable in a switch prong no path takes: an else past every value the subject can have, by Bounds and Range" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\pub fn clamped(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@max(4, @min(b, 7))) { inline 4, 5, 6, 7 => |m| m, else => unreachable };
+        \\}
+        \\pub fn spans(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@min(b, 9)) { 0...2 => 0, 3 => 1, 4...9 => 2, else => unreachable };
+        \\}
+        \\pub fn checked(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    if (b > 2) return error.Bad;
+        \\    return switch (b) { 0, 1, 2 => b, else => unreachable };
+        \\}
+        \\pub fn past(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@max(4, @min(b, 8))) { inline 4, 5, 6, 7 => |m| m, else => unreachable };
+        \\}
+        \\pub fn gap(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@min(b, 7)) { 0...2 => 0, 4...7 => 1, else => unreachable };
+        \\}
+        \\pub fn below(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@min(b, 7)) { 1...7 => 1, else => unreachable };
+        \\}
+        \\pub fn unbounded(r: *std.Io.Reader, n: u8) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@min(b, n)) { 0...7 => 1, else => unreachable };
+        \\}
+        \\pub fn signed(r: *std.Io.Reader) !u8 {
+        \\    const v = try r.takeInt(i32, .little);
+        \\    return switch (@min(v, 7)) { 0...7 => 1, else => unreachable };
+        \\}
+        \\fn Capped(comptime k: u8) type {
+        \\    return struct {
+        \\        pub fn pick(r: *std.Io.Reader) !u8 {
+        \\            const b = try r.takeByte();
+        \\            return switch (@min(b, k)) { 0...7 => 1, else => unreachable };
+        \\        }
+        \\    };
+        \\}
+        \\pub fn generic(r: *std.Io.Reader) !u8 {
+        \\    return try Capped(7).pick(r) + try Capped(9).pick(r);
+        \\}
+        \\pub fn inlined(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    return switch (@min(b, 3)) { inline 0...3 => |k| k, inline 4...7 => unreachable, else => unreachable };
+        \\}
+    , 7);
+}
+
 test "A013 leaves what runs as the program compiles, and tests, alone" {
     try expect(pack.contracts,
         \\const std = @import("std");

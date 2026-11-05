@@ -13,6 +13,7 @@ const Context = @import("RuleContext.zig");
 const Governed = @import("Governed.zig");
 const Escapes = @import("Escapes.zig");
 const Facts = @import("Facts.zig");
+const Proof = @import("Proof.zig");
 const Model = @import("Model.zig");
 const ParentPointer = @import("ParentPointer.zig");
 const Present = @import("Present.zig");
@@ -928,6 +929,9 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         // A `.?` of a value known not to be null never reaches its `unreachable`.
         if (unwrap and try present.unwrapped(node)) continue;
+        // A prong no path takes never runs what it holds (`else => unreachable` past what
+        // the subject can be).
+        if (try inUntaken(c, node)) continue;
         // `x.?` is `x orelse unreachable`: what makes `x` null chooses it too.
         const chosen = try chosenBy(c, flow, node);
         switch (if (unwrap) chosen.join(try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?)) else chosen) { // unreachable: a `.?` carries its operand
@@ -936,6 +940,20 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
             .data, .number => try c.at(rule, token, "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error"),
         }
     }
+}
+
+/// Whether `node` is in the result of a switch prong Proof shows no path takes, up to its
+/// function.
+fn inUntaken(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(c.file).file.tree;
+    const model = &c.project.at(c.file).model;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        if (tree.nodeTag(parent) == .fn_decl) return false;
+        const case = tree.fullSwitchCase(parent) orelse continue;
+        if (case.ast.target_expr == at and try Proof.untaken(c, c.file, parent)) return true;
+    }
+    return false;
 }
 
 /// How far input chooses the path to `node`: the conditions of the branches and loops it is

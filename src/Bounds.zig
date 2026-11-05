@@ -324,6 +324,9 @@ pub const Kind = enum {
     /// the loop does not change: no more passes than the work a peer already sent, whatever
     /// decides them. Keyed by the loop.
     passes,
+    /// A switch prong no path takes: no value the subject can have there is one of its items,
+    /// or, for an `else`, every value it can have is another prong's. Keyed by the prong.
+    untaken,
 };
 
 const Site = struct { node: Ast.Node.Index, kind: Kind };
@@ -2286,7 +2289,12 @@ const Frame = struct {
         const subject = try f.eval(s, full.ast.condition);
         const t = try f.temp(subject.s, node, 0);
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
-        const base = try forget(f.a, t[0], tl);
+        var base = try forget(f.a, t[0], tl);
+        // Range's greatest value of a subject never below zero (`@max(4, @min(n, 7))` at most 7).
+        if (subject.v.lin) |x| if (try Range.stepMost(f.c, f.file, full.ast.condition, f.width)) |most| if (most <= std.math.maxInt(Coef)) {
+            base = try assume(f.a, base, try atLeast(f.a, constant(@intCast(most)), x));
+        };
+        try f.prongsTaken(base, full, subject.v.lin);
         var joined: State = State.unreachable_state;
         for (full.ast.cases) |case_node| {
             const case = f.tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases
@@ -2315,6 +2323,75 @@ const Frame = struct {
             joined = try f.join(joined, done);
         }
         return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+    }
+
+    /// Records whether each prong of a switch on a number is taken on no path from `base`
+    /// (Kind.untaken): each item a constant (a literal or a range of them) the subject cannot
+    /// equal there, and an `else` where the subject can take no value between or beside the
+    /// other prongs' items, inline ones' too. An inline prong, a prong an item of which is not
+    /// an integer constant, and every prong of a subject that is not linear (an enum, a value
+    /// of unknown reach) are taken as far as this reading knows.
+    fn prongsTaken(f: *Frame, base: State, full: Ast.full.Switch, subject: ?Lin) Error!void {
+        if (f.trial > 0 or base.dead) return;
+        const x = subject orelse {
+            for (full.ast.cases) |case| try f.record(case, .untaken, false);
+            return;
+        };
+        const Span = struct { low: Coef, high: Coef };
+        var spans: std.ArrayList(Span) = .empty;
+        var constants = true;
+        for (full.ast.cases) |case_node| {
+            const case = f.tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases
+            // An inline prong is compiled for each of its items: taken, though its items
+            // still count against the `else`.
+            var untaken = case.ast.values.len > 0 and case.inline_token == null;
+            for (case.ast.values) |item| {
+                const span = (try f.constantSpan(item)) orelse {
+                    constants = false;
+                    untaken = false;
+                    continue;
+                };
+                try spans.append(f.a, .{ .low = span[0], .high = span[1] });
+                if (untaken) untaken = try f.excludes(base, x, span[0], span[1]);
+            }
+            if (case.ast.values.len > 0) try f.record(case_node, .untaken, untaken);
+        }
+        const other = for (full.ast.cases) |case_node| {
+            if (f.tree.fullSwitchCase(case_node).?.ast.values.len == 0) break case_node; // unreachable: a switch's cases
+        } else return;
+        if (!constants) return f.record(other, .untaken, false);
+        std.mem.sort(Span, spans.items, {}, struct {
+            fn less(_: void, p: Span, q: Span) bool {
+                return p.low < q.low;
+            }
+        }.less);
+        // The values no item names: below the first, between two, above the last.
+        var next: ?Coef = null;
+        for (spans.items) |span| {
+            if (next) |from| {
+                if (from < span.low and !try f.excludes(base, x, from, span.low - 1)) return f.record(other, .untaken, false);
+            } else if (!try f.excludes(base, x, null, span.low - 1)) return f.record(other, .untaken, false);
+            next = if (next) |from| @max(from, span.high +| 1) else span.high +| 1;
+        }
+        if (next) |from| if (!try f.excludes(base, x, from, null)) return f.record(other, .untaken, false);
+        try f.record(other, .untaken, true);
+    }
+
+    /// The constant an item is, or the constants a range of them spans.
+    fn constantSpan(f: *Frame, item: Ast.Node.Index) Error!?[2]Coef {
+        const low, const high = if (f.tree.nodeTag(item) == .switch_range) f.tree.nodeData(item).node_and_node else .{ item, item };
+        const a = (try Range.constantValue(f.c, f.file, low)) orelse return null;
+        const b = (try Range.constantValue(f.c, f.file, high)) orelse return null;
+        // u64 items: no overflow in i128, nor in `span.low - 1` and `span.high +| 1` below.
+        return .{ @intCast(a), @intCast(b) };
+    }
+
+    /// Whether `s` leaves `x` no value from `low` to `high` (either open where null) in `s`.
+    fn excludes(f: *Frame, s: State, x: Lin, low: ?Coef, high: ?Coef) Error!bool {
+        var in = s;
+        if (low) |k| in = try assume(f.a, in, try atLeast(f.a, x, constant(k)));
+        if (high) |k| in = try assume(f.a, in, try atLeast(f.a, constant(k), x));
+        return in.dead;
     }
 
     //------------------------------------------------------------------

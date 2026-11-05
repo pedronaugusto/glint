@@ -47,3 +47,9 @@ pub fn counts(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.E
 pub fn passes(c: *Context, file: Project.FileId, loop: Ast.Node.Index) Context.Error!bool {
     return Bounds.cleared(c, file, loop, .passes);
 }
+
+/// A switch prong no path takes, by Bounds' reading of its subject on every path to it: its
+/// items, or for an `else` every value outside the other prongs', never the subject's there.
+pub fn untaken(c: *Context, file: Project.FileId, prong: Ast.Node.Index) Context.Error!bool {
+    return Bounds.cleared(c, file, prong, .untaken);
+}

@@ -4375,7 +4375,7 @@ pub fn longest(pointer: u16) Magnitude {
 }
 
 /// The greatest value `node` can have where it is never below zero, read as a step a loop
-/// takes (Bounds): null where either is not shown.
+/// takes or a switch's subject (Bounds): null where either is not shown.
 pub fn stepMost(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u16) Context.Error!?Magnitude {
     if (!try nonnegative(c, file, node, pointer)) return null;
     return bound(c, file, node, pointer, 0);
