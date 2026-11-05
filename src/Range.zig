@@ -1037,9 +1037,12 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     const record = model.declarations[@backingInt(decl.index)];
     _ = model.containerField(tree, record.node) orelse return false;
     const container_node = model.scopes[@backingInt(record.scope)].node;
-    var buffer: [2]Ast.Node.Index = undefined;
-    const holder = tree.fullContainerDecl(&buffer, container_node) orelse return false;
-    if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
+    // A file's own fields are an auto-layout struct's, as Zig reads every file.
+    if (container_node != .root) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const holder = tree.fullContainerDecl(&buffer, container_node) orelse return false;
+        if (holder.layout_token != null or tree.tokenTag(holder.ast.main_token) != .keyword_struct) return false;
+    }
     const given = try givenTypes(c);
     if (given.any or given.shapes.contains(.{ decl.file, record.scope })) return false;
     var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
@@ -1056,6 +1059,22 @@ pub fn placeable(c: *Context, decl: Facts.Decl) Context.Error!bool {
     var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
     while (try found_sites.next()) |site| {
         if (site.kind == .address and (site.reach == .exact or site.reach == .named)) return false;
+    }
+    return true;
+}
+
+/// Whether an optional field is null or not only by stores through its name: its writes are
+/// all shown (`storesShown`) and no pointer to the optional itself is taken (`&x.field`). A
+/// pointer to its payload (`&x.field.?`, `if (x.field) |*p|`) writes the payload, never whether
+/// there is one (Bounds' presence).
+pub fn presenceable(c: *Context, decl: Facts.Decl) Context.Error!bool {
+    if (!try storesShown(c, decl)) return false;
+    var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
+    while (try found_sites.next()) |site| {
+        if (site.kind != .address or site.part) continue;
+        const tree = &c.project.at(site.file).file.tree;
+        // The capture of a branch or a loop over the optional points to its payload.
+        if (Facts.accesses.formOf(tree.nodeTag(site.node)) == .address_of) return false;
     }
     return true;
 }

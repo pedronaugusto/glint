@@ -678,6 +678,94 @@ test "A013 leaves an unreachable in a switch prong no path takes: an else past e
     , 7);
 }
 
+test "A013 leaves a .? whose optional holds a value on every path: checked or set, a capture's else that sets it, a bool that says so (Bounds' presence)" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\const D = struct { closing: ?u8 = null, n: u8 = 0 };
+        \\pub fn place(d: *D, r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    if (d.closing == null) d.closing = b;
+        \\    return d.closing.?;
+        \\}
+        \\pub fn local(r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    var x: ?u8 = null;
+        \\    if (b > 3) x = b;
+        \\    if (x == null) x = 0;
+        \\    return x.?;
+        \\}
+        \\pub fn captured(d: *D, r: *std.Io.Reader) !u8 {
+        \\    const b = try r.takeByte();
+        \\    if (d.closing) |*k| k.* +%= 1 else d.closing = b;
+        \\    return d.closing.?;
+        \\}
+        \\pub fn flagged(r: *std.Io.Reader, workers: []const bool) !u8 {
+        \\    const b = try r.takeByte();
+        \\    const got: ?u8 = if (b > 3) b else null;
+        \\    var refused = got == null;
+        \\    for (workers) |w| refused = refused or w;
+        \\    if (!refused) return got.?;
+        \\    return 0;
+        \\}
+        \\pub fn after(d: *D, r: *std.Io.Reader) !u8 {
+        \\    d.closing = try r.takeByte();
+        \\    d.n = d.closing.?;
+        \\    return d.closing.?;
+        \\}
+    , 0);
+}
+
+test "A013 finds a .? whose optional any write may null after the check: another pointer, a callee that writes it or anything, its address taken, a bool read past a call that writes it, the first of two" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\const D = struct { closing: ?u8 = null };
+        \\const E = struct { closing: ?u8 = null };
+        \\fn reset(d: *D) void {
+        \\    d.closing = null;
+        \\}
+        \\pub fn alias(d: *D, e: *D, r: *std.Io.Reader) !u8 {
+        \\    if (d.closing == null) d.closing = try r.takeByte();
+        \\    e.closing = null;
+        \\    return d.closing.?;
+        \\}
+        \\pub fn callee(d: *D, r: *std.Io.Reader) !u8 {
+        \\    if (d.closing == null) d.closing = try r.takeByte();
+        \\    reset(d);
+        \\    return d.closing.?;
+        \\}
+        \\pub fn any(d: *D, e: *D, r: *std.Io.Reader) !u8 {
+        \\    if (d.closing == null) d.closing = try r.takeByte();
+        \\    std.mem.swap(D, d, e);
+        \\    return d.closing.?;
+        \\}
+        \\pub fn addressed(e: *E, r: *std.Io.Reader) !u8 {
+        \\    if (e.closing == null) e.closing = try r.takeByte();
+        \\    const q = &e.closing;
+        \\    q.* = null;
+        \\    return e.closing.?;
+        \\}
+        \\pub fn across(d: *D, r: *std.Io.Reader) !u8 {
+        \\    d.closing = try r.takeByte();
+        \\    const ok = d.closing != null;
+        \\    reset(d);
+        \\    if (ok) return d.closing.?;
+        \\    return 0;
+        \\}
+        \\const G = struct { closing: ?u8 = null };
+        \\pub fn twice(d: *G, r: *std.Io.Reader) !u8 {
+        \\    d.closing = if (try r.takeByte() > 3) 1 else null;
+        \\    const first = d.closing.?;
+        \\    return first + d.closing.?;
+        \\}
+        \\pub fn local(r: *std.Io.Reader) !u8 {
+        \\    var x: ?u8 = try r.takeByte();
+        \\    const px = &x;
+        \\    px.* = null;
+        \\    return x.?;
+        \\}
+    , 7);
+}
+
 test "A013 leaves what runs as the program compiles, and tests, alone" {
     try expect(pack.contracts,
         \\const std = @import("std");

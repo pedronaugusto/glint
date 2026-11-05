@@ -928,7 +928,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         const token = if (unwrap) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
         if (c.inTest(token) or !atRuntime(c, node)) continue;
         // A `.?` of a value known not to be null never reaches its `unreachable`.
-        if (unwrap and try present.unwrapped(node)) continue;
+        if (unwrap and (try present.unwrapped(node) or try Proof.present(c, c.file, node))) continue;
         // A prong no path takes never runs what it holds (`else => unreachable` past what
         // the subject can be).
         if (try inUntaken(c, node)) continue;

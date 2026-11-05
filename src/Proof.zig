@@ -53,3 +53,9 @@ pub fn passes(c: *Context, file: Project.FileId, loop: Ast.Node.Index) Context.E
 pub fn untaken(c: *Context, file: Project.FileId, prong: Ast.Node.Index) Context.Error!bool {
     return Bounds.cleared(c, file, prong, .untaken);
 }
+
+/// A `.?` whose operand holds a value on every path to it (Bounds' presence): no null reaches
+/// its `unreachable`.
+pub fn present(c: *Context, file: Project.FileId, unwrap: Ast.Node.Index) Context.Error!bool {
+    return Bounds.cleared(c, file, unwrap, .present);
+}

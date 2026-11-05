@@ -327,6 +327,9 @@ pub const Kind = enum {
     /// A switch prong no path takes: no value the subject can have there is one of its items,
     /// or, for an `else`, every value it can have is another prong's. Keyed by the prong.
     untaken,
+    /// A `.?` whose operand holds a value on every path: no null reaches its `unreachable`.
+    /// Keyed by the unwrap.
+    present,
 };
 
 const Site = struct { node: Ast.Node.Index, kind: Kind };
@@ -774,6 +777,13 @@ const Key = union(enum) {
     /// A place of a parameter's as the function was entered (`Frame.placeValue`).
     place_entry: Place,
     place_entry_length: Place,
+    /// Whether a tracked optional holds a value: 1 where it does, 0 where it is null.
+    presence: Model.Declaration.Id,
+    /// Whether an optional field of a place holds a value (`Frame.presencePlaceOf`).
+    place_presence: Place,
+    /// A tracked `bool`, 1 for true: read only where Zig reads a bool (a condition, a bool's
+    /// operand), never as a number.
+    boolean: Model.Declaration.Id,
 };
 
 const Place = struct { root: Model.Declaration.Id, field: Facts.Decl };
@@ -789,6 +799,10 @@ const Value = struct {
     /// pointer sliced (`p[0..n]`), or a length stored (`s.len = n`). Such a length counts no
     /// work the function holds (`counted`).
     claimed: bool = false,
+    /// Whether an optional holds a value, 1 or 0, where that is linear in what the state knows.
+    present: ?Lin = null,
+    /// A `bool`'s value, 1 or 0, where it is linear in what the state knows (`Frame.truthOf`).
+    truth: ?Lin = null,
 };
 
 const Target = struct {
@@ -832,6 +846,9 @@ const Frame = struct {
     claimed: std.AutoHashMapUnmanaged(Var, void) = .empty,
     /// Each place's variable, its value's or its length's (`placeVar`).
     places: std.array_hash_map.Auto(Var, Place) = .empty,
+    /// Each optional place's presence variable (`presencePlaceVar`): forgotten with the place,
+    /// never a summary's.
+    presences: std.array_hash_map.Auto(Var, Place) = .empty,
     /// Whether the function returns an integer, or an error union or optional of one.
     returns_int: bool = false,
     /// Whether the memory the function returns holds elements that take room.
@@ -1389,10 +1406,11 @@ const Frame = struct {
     fn declare(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
         const local = f.tree.fullVarDecl(node).?; // unreachable: the tag is a declaration's
         const init = local.ast.init_node.unwrap() orelse return s;
-        const e = try f.eval(s, init);
+        var e = if (f.condition(init)) try f.truthOf(s, init) else try f.eval(s, init);
         const d = f.decls.get(local.ast.mut_token + 1) orelse return e.s;
         if (!f.tracked(d)) return e.s;
         try f.counted(e.s, init, e.v.lin);
+        e.v.present = try f.presentOf(init, e.v);
         const int = if (local.ast.type_node.unwrap()) |t| try Range.intNamed(f.c, f.file, t, f.width) else try f.intOf(init);
         return f.bind(e.s, d, e.v, int);
     }
@@ -1406,7 +1424,8 @@ const Frame = struct {
         const length = try f.variable(.{ .length = d });
         out = try f.assign(out, length, value.length, null);
         if (value.claimed) try f.claimed.put(f.a, length, {}) else _ = f.claimed.remove(length);
-        return out;
+        out = try f.assign(out, try f.variable(.{ .presence = d }), value.present, null);
+        return f.assign(out, try f.variable(.{ .boolean = d }), value.truth, null);
     }
 
     fn assignment(f: *Frame, s: State, node: Ast.Node.Index) RunError!State {
@@ -1414,15 +1433,23 @@ const Frame = struct {
         const target, const rhs = f.tree.nodeData(node).node_and_node;
         const d = f.trackedName(target) orelse {
             if (try f.lengthStored(target)) |memory| return f.storeLength(s, node, target, rhs, memory);
+            // An optional field: the store writes it as any store does, and it then holds a
+            // value where what it is given does.
+            if (tag == .assign) if (try f.presencePlaceOf(target)) |p| {
+                const e = try f.eval(s, rhs);
+                const out = try f.storedThrough(e.s, target);
+                return f.assign(out, try f.presencePlaceVar(p), try f.presentOf(rhs, e.v), null);
+            };
             if (try f.placeOf(target)) |p| return f.storePlace(s, node, target, rhs, p);
             // A store to memory: what it reads is evaluated, and no tracked variable changes.
             const place = try f.eval(s, target);
             return f.storedThrough((try f.eval(place.s, rhs)).s, target);
         };
-        const e = try f.eval(s, rhs);
+        var e = if (tag == .assign and f.condition(rhs)) try f.truthOf(s, rhs) else try f.eval(s, rhs);
         const int = try f.intOf(target);
         if (tag == .assign) {
             try f.counted(e.s, rhs, e.v.lin);
+            e.v.present = try f.presentOf(rhs, e.v);
             return f.bind(e.s, d, e.v, int);
         }
         const v = try f.variable(.{ .value = d });
@@ -1458,13 +1485,24 @@ const Frame = struct {
     /// or of the struct it points to, that only stores through its name change
     /// (`Range.placeable`): no pointer reaches it, and no byte view or reflection writes it.
     fn placeOf(f: *Frame, node: Ast.Node.Index) Error!?Place {
+        return f.fieldPlace(node, .number);
+    }
+
+    /// The field `node` names of a tracked declaration's struct, or of the struct it points to,
+    /// where only stores through its name change it: its value (`Range.placeable`) or, for an
+    /// optional, whether it holds one (`Range.presenceable`).
+    fn fieldPlace(f: *Frame, node: Ast.Node.Index, comptime held: enum { number, presence }) Error!?Place {
         if (f.tree.nodeTag(node) != .field_access) return null;
         const holder = f.tree.nodeData(node).node_and_token[0];
         const root = f.trackedName(holder) orelse return null;
+        if (held == .presence and try f.c.facts.resolve(f.file, node) != .optional) return null;
         const decl = ((try f.c.facts.definition(f.file, node)).orNull()) orelse return null;
         const member = ((try f.c.facts.origin(decl)).orNull()) orelse decl;
-        if (!try Range.placeable(f.c, member)) return null;
-        return .{ .root = root, .field = member };
+        const shown = switch (held) {
+            .number => try Range.placeable(f.c, member),
+            .presence => try Range.presenceable(f.c, member),
+        };
+        return if (shown) .{ .root = root, .field = member } else null;
     }
 
     /// A place's value, within its type, or the length of the memory it holds.
@@ -1546,15 +1584,32 @@ const Frame = struct {
                 // A field that does not resolve (`p.at` of an `anytype` `p`) may be any place's.
                 const decl = ((try f.c.facts.definition(f.file, target)).orNull()) orelse return f.wrote(s, null, null);
                 const value = try f.c.facts.resolve(f.file, target);
-                if (value == .scalar or value == .pointer) return f.wrote(s, ((try f.c.facts.origin(decl)).orNull()) orelse decl, null);
+                if (value == .scalar or value == .pointer or try f.flatOptional(value)) return f.wrote(s, ((try f.c.facts.origin(decl)).orNull()) orelse decl, null);
             },
             // `@field(x, "at") = v`: a field by a name read as the program compiles.
             .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => return f.wrote(s, null, null),
             else => {},
         }
-        return switch (try f.c.facts.resolve(f.file, target)) {
+        const value = try f.c.facts.resolve(f.file, target);
+        // An optional of a number or a pointer stored through a pointer writes an optional no
+        // place is: a place's field, and an optional one's (`presencePlaceOf`), never has its
+        // address taken. One of a struct may hold a place a pointer to its payload names.
+        if (try f.flatOptional(value)) return s;
+        return switch (value) {
             .scalar, .pointer => s,
+            // A number's store, its type read where the value does not resolve or resolves as
+            // its type's name (`k.*` of a capture's pointer), writes no place.
+            // A field's store is recorded as its field's above, or as any.
+            .unknown, .primitive => if (f.tree.nodeTag(target) != .field_access and try f.intOf(target) != null) s else f.wrote(s, null, null),
             else => f.wrote(s, null, null),
+        };
+    }
+
+    /// Whether `value` is an optional of a number or a pointer: its store holds no place.
+    fn flatOptional(_: *Frame, value: Facts.Value) Error!bool {
+        return switch (value) {
+            .optional => |child| child.* == .scalar or child.* == .pointer,
+            else => false,
         };
     }
 
@@ -1593,6 +1648,12 @@ const Frame = struct {
             out = try forget(f.a, out, v);
             _ = f.typed_vars.remove(v);
             _ = f.claimed.remove(v);
+        }
+        for (f.presences.keys(), f.presences.values()) |v, p| {
+            if (root) |r| if (p.root != r) continue;
+            if (member) |d| if (!std.meta.eql(p.field, d)) continue;
+            if (except) |r| if (p.root == r) continue;
+            out = try forget(f.a, out, v);
         }
         return out;
     }
@@ -1737,6 +1798,15 @@ const Frame = struct {
                     else => tree.nodeData(node).node,
                 };
                 const e = try f.eval(s, operand);
+                if (tree.nodeTag(node) == .unwrap_optional) {
+                    // Proven where the operand holds a value on the path; past it, it does (a
+                    // safe build traps otherwise).
+                    const p = e.v.present;
+                    const goal: ?Lin = if (p) |x| try atLeast(f.a, x, constant(1)) else null;
+                    try f.record(node, .present, if (goal) |g| try f.shows(e.s, g) else false);
+                    const after = if (p) |x| try f.same(e.s, x, constant(1)) else e.s;
+                    return f.fresh(after, node, 0);
+                }
                 return f.fresh(e.s, node, 0);
             },
             .less_than, .less_or_equal, .greater_than, .greater_or_equal, .equal_equal, .bang_equal, .bool_and, .bool_or, .bool_not => {
@@ -1811,8 +1881,13 @@ const Frame = struct {
     /// An identifier: a tracked variable's value, within its type; a constant's value; or
     /// nothing known.
     fn name(f: *Frame, s: State, node: Ast.Node.Index) Error!Eval {
+        if (Facts.isNull(f.tree, node)) return .{ .s = s, .v = .{ .present = constant(0) } };
         const reference = f.model.reference(node) orelse return .{ .s = s };
         const d = reference.declaration orelse return .{ .s = s };
+        if (f.tracked(d) and try f.c.facts.resolve(f.file, node) == .optional) {
+            const u = try f.unit(s, .{ .presence = d });
+            return .{ .s = u[0], .v = .{ .present = try single(f.a, u[1]) } };
+        }
         if (f.tracked(d)) {
             const int = (try f.intOf(node)) orelse return .{ .s = s };
             const v = try f.variable(.{ .value = d });
@@ -1833,6 +1908,10 @@ const Frame = struct {
         const e = try f.eval(s, holder);
         // `len` is a slice's or an array's length; a struct's own field of that name is a field.
         if (!std.mem.eql(u8, f.tree.tokenSlice(field_token), "len") or !try f.holdsLength(holder) or try f.c.facts.memoryField(f.file, node) == .field) {
+            if (try f.presencePlaceOf(node)) |p| {
+                const v = try f.presencePlaceVar(p);
+                return .{ .s = try f.within(e.s, v), .v = .{ .present = try single(f.a, v) } };
+            }
             if (try f.placeOf(node)) |p| return f.placeValue(e.s, node, p);
             return f.fresh(e.s, node, 0);
         }
@@ -2166,6 +2245,18 @@ const Frame = struct {
                 const base = right.s;
                 try f.counted(base, compared.left, left.v.lin);
                 try f.counted(base, compared.right, right.v.lin);
+                // A comparison with `null`: whether the other side holds a value.
+                const null_right = Facts.isNull(tree, compared.right);
+                if (null_right or Facts.isNull(tree, compared.left)) {
+                    const p = (if (null_right) left.v.present else right.v.present) orelse return .{ .yes = base, .no = base };
+                    const absent = try f.same(base, p, constant(0));
+                    const held = try f.same(base, p, constant(1));
+                    return switch (compared.order) {
+                        .equal => .{ .yes = absent, .no = held },
+                        .not_equal => .{ .yes = held, .no = absent },
+                        else => .{ .yes = base, .no = base },
+                    };
+                }
                 const x = left.v.lin orelse return .{ .yes = base, .no = base };
                 const y = right.v.lin orelse return .{ .yes = base, .no = base };
                 return switch (compared.order) {
@@ -2181,6 +2272,12 @@ const Frame = struct {
                 const spelled = tree.tokenSlice(tree.nodeMainToken(at));
                 if (std.mem.eql(u8, spelled, "true")) return .{ .yes = s, .no = State.unreachable_state };
                 if (std.mem.eql(u8, spelled, "false")) return .{ .yes = State.unreachable_state, .no = s };
+                // A tracked `bool`: 1 where it holds, 0 where it does not.
+                if (f.trackedName(at)) |d| {
+                    const u = try f.unit(s, .{ .boolean = d });
+                    const b = try single(f.a, u[1]);
+                    return .{ .yes = try f.same(u[0], b, constant(1)), .no = try f.same(u[0], b, constant(0)) };
+                }
             },
         }
         const e = try f.eval(s, node);
@@ -2210,6 +2307,10 @@ const Frame = struct {
             // An optional or error union: whether it holds a value says nothing linear.
             const e = try f.eval(s, full.ast.cond_expr);
             split = .{ .yes = try f.unwrap(e.s, e.v), .no = e.s };
+            // An optional's capture: it holds a value in the then, none in the else.
+            if (full.error_token == null) if (e.v.present) |p| {
+                split = .{ .yes = try f.same(split.yes, p, constant(1)), .no = try f.same(split.no, p, constant(0)) };
+            };
             payload = .{ .lin = e.v.lin, .length = e.v.length };
         } else split = try f.cond(s, full.ast.cond_expr);
         const t = try f.temp(split.yes, node, 0);
@@ -2219,18 +2320,21 @@ const Frame = struct {
         var then_state = try forget(f.a, t[0], tl);
         then_state = try f.capture(then_state, full.payload_token, payload, try f.intOf(full.ast.cond_expr));
         const then_value = try f.eval(then_state, full.ast.then_expr);
+        const tp = try f.variable(.{ .temp = .{ .node = node, .part = 2 } });
         var then_out = try f.assign(then_value.s, t[1], then_value.v.lin, null);
         then_out = try f.assign(then_out, tl, then_value.v.length, null);
         then_out = try f.branchRange(then_out, t[1], full.ast.then_expr);
-        var else_out = yes;
+        then_out = try f.assign(then_out, tp, try f.presentOf(full.ast.then_expr, then_value.v), null);
+        var else_out = try forget(f.a, yes, tp);
         if (full.ast.else_expr.unwrap()) |else_expr| {
             else_out = try f.capture(else_out, full.error_token, .{}, null);
             const else_value = try f.eval(else_out, else_expr);
             else_out = try f.assign(else_value.s, t[1], else_value.v.lin, null);
             else_out = try f.assign(else_out, tl, else_value.v.length, null);
             else_out = try f.branchRange(else_out, t[1], else_expr);
+            else_out = try f.assign(else_out, tp, try f.presentOf(else_expr, else_value.v), null);
         }
-        return .{ .s = try f.join(then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+        return .{ .s = try f.join(then_out, else_out), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl), .present = try single(f.a, tp) } };
     }
 
     /// `s` with a branch's value `v` between zero and the most Range shows the branch's
@@ -2267,11 +2371,18 @@ const Frame = struct {
         const e = try f.eval(s, lhs);
         const t = try f.temp(e.s, node, 0);
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
-        const base = try forget(f.a, t[0], tl);
+        const tp = try f.variable(.{ .temp = .{ .node = node, .part = 2 } });
+        const base = try forget(f.a, try forget(f.a, t[0], tl), tp);
         var held = try f.unwrap(base, e.v);
+        var missing = base;
+        // `x orelse y`: `x` holds a value where its payload is given, none where `y` runs.
+        if (f.tree.nodeTag(node) == .@"orelse") if (e.v.present) |p| {
+            held = try f.same(held, p, constant(1));
+            missing = try f.same(missing, p, constant(0));
+        };
         held = try f.assign(held, t[1], e.v.lin, null);
         held = try f.assign(held, tl, e.v.length, null);
-        var missing = base;
+        held = try f.assign(held, tp, try f.payloadPresent(lhs), null);
         if (f.tree.nodeTag(node) == .@"catch") {
             const after = f.tree.nodeMainToken(node) + 1;
             if (f.tree.tokenTag(after) == .pipe) missing = try f.capture(missing, after + 1, .{}, null);
@@ -2279,7 +2390,8 @@ const Frame = struct {
         const fallback = try f.eval(missing, rhs);
         missing = try f.assign(fallback.s, t[1], fallback.v.lin, null);
         missing = try f.assign(missing, tl, fallback.v.length, null);
-        return .{ .s = try f.join(held, missing), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+        missing = try f.assign(missing, tp, try f.presentOf(rhs, fallback.v), null);
+        return .{ .s = try f.join(held, missing), .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl), .present = try single(f.a, tp) } };
     }
 
     fn switchOn(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
@@ -2289,7 +2401,8 @@ const Frame = struct {
         const subject = try f.eval(s, full.ast.condition);
         const t = try f.temp(subject.s, node, 0);
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
-        var base = try forget(f.a, t[0], tl);
+        const tp = try f.variable(.{ .temp = .{ .node = node, .part = 2 } });
+        var base = try forget(f.a, try forget(f.a, t[0], tl), tp);
         // Range's greatest value of a subject never below zero (`@max(4, @min(n, 7))` at most 7).
         if (subject.v.lin) |x| if (try Range.stepMost(f.c, f.file, full.ast.condition, f.width)) |most| if (most <= std.math.maxInt(Coef)) {
             base = try assume(f.a, base, try atLeast(f.a, constant(@intCast(most)), x));
@@ -2320,9 +2433,176 @@ const Frame = struct {
             var done = try f.assign(e.s, t[1], e.v.lin, null);
             done = try f.assign(done, tl, e.v.length, null);
             done = try f.branchRange(done, t[1], case.ast.target_expr);
+            done = try f.assign(done, tp, try f.presentOf(case.ast.target_expr, e.v), null);
             joined = try f.join(joined, done);
         }
-        return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl) } };
+        return .{ .s = joined, .v = .{ .lin = try single(f.a, t[1]), .length = try single(f.a, tl), .present = try single(f.a, tp) } };
+    }
+
+    //------------------------------------------------------------------
+    // Presence and booleans.
+    //------------------------------------------------------------------
+
+    /// `s` with `v` between 0 and 1: a presence or a `bool`.
+    fn within(f: *Frame, s: State, v: Var) Error!State {
+        const x = try single(f.a, v);
+        const out = try assume(f.a, s, try atLeast(f.a, x, constant(0)));
+        return assume(f.a, out, try atLeast(f.a, constant(1), x));
+    }
+
+    /// The 0/1 variable of `key`, held between 0 and 1 in the state.
+    fn unit(f: *Frame, s: State, key: Key) Error!struct { State, Var } {
+        const v = try f.variable(key);
+        return .{ try f.within(s, v), v };
+    }
+
+    /// The optional field a tracked declaration's struct holds, or the struct it points to,
+    /// whose presence only stores through its name change (`Range.presenceable`).
+    fn presencePlaceOf(f: *Frame, node: Ast.Node.Index) Error!?Place {
+        return f.fieldPlace(node, .presence);
+    }
+
+    /// A place's presence variable, recorded so a write of the field forgets it.
+    fn presencePlaceVar(f: *Frame, p: Place) Error!Var {
+        const v = try f.variable(.{ .place_presence = p });
+        try f.presences.put(f.a, v, p);
+        return v;
+    }
+
+    /// Whether `node`, valued `value`, holds a value as an optional: what evaluating it gave,
+    /// or 1 for a value of a type that is not an optional (a struct literal is never null).
+    fn presentOf(f: *Frame, node: Ast.Node.Index, value: Value) Error!?Lin {
+        if (value.present) |p| return p;
+        return if (try f.neverNull(node)) constant(1) else null;
+    }
+
+    /// Whether what `node` gives is never null: a struct or array literal, a number literal, a
+    /// value whose type resolves to a struct, a pointer, an array or a function, or one whose
+    /// written type (`exprType`) is not an optional's. A scalar is never read so: `null`
+    /// resolves as one (`const nothing = null`), and an optional integer's type as its payload's.
+    fn neverNull(f: *Frame, node: Ast.Node.Index) Error!bool {
+        const at = Facts.ungrouped(f.tree, node);
+        switch (Facts.accesses.formOf(f.tree.nodeTag(at))) {
+            .struct_literal, .array_literal => return true,
+            else => {},
+        }
+        if (f.tree.nodeTag(at) == .number_literal or f.tree.nodeTag(at) == .char_literal) return true;
+        switch (try f.c.facts.resolve(f.file, at)) {
+            .instance, .pointer, .array, .function => return true,
+            else => {},
+        }
+        const t = (try exprType(f.c, f.file, at, 0)) orelse return false;
+        return typeNeverNull(f.c, t, f.width, 0);
+    }
+
+    /// Whether the payload of an optional or an error union `node` gives holds a value: 1 for
+    /// a payload whose written type is not an optional, else unknown.
+    fn payloadPresent(f: *Frame, node: Ast.Node.Index) Error!?Lin {
+        const t = (try exprType(f.c, f.file, node, 0)) orelse return null;
+        const tree = &f.c.project.at(t.file).file.tree;
+        const payload: TypeRef = switch (tree.nodeTag(t.node)) {
+            .optional_type => .{ .file = t.file, .node = tree.nodeData(t.node).node },
+            .error_union => .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] },
+            else => return null,
+        };
+        return if (try typeNeverNull(f.c, payload, f.width, 0)) constant(1) else null;
+    }
+
+    /// Whether Zig reads `node` as a `bool`: a comparison, a negation, `and` or `or`.
+    fn condition(f: *Frame, node: Ast.Node.Index) bool {
+        return Facts.conditionOf(f.tree, node) != .other;
+    }
+
+    /// A `bool` expression's value: 1 on the paths where it holds and 0 where it fails,
+    /// joined, and what it is of what the state knows (`truth`).
+    fn truthOf(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
+        const split = try f.cond(s, node);
+        const t = try f.variable(.{ .temp = .{ .node = node, .part = 4 } });
+        const b = try single(f.a, t);
+        const yes = try f.same(try forget(f.a, split.yes, t), b, constant(1));
+        const no = try f.same(try forget(f.a, split.no, t), b, constant(0));
+        var out = try f.within(try f.join(yes, no), t);
+        if (try f.truth(out, node)) |held| out = try f.same(held[0], b, held[1]);
+        return .{ .s = out, .v = .{ .truth = b } };
+    }
+
+    /// `truth` of `node`, or where it cannot read it, a fresh variable of any of 0 and 1, whatever
+    /// an earlier pass over it held.
+    fn truthOrAny(f: *Frame, s: State, node: Ast.Node.Index) Error!struct { State, Lin } {
+        if (try f.truth(s, node)) |r| return r;
+        const v = try f.variable(.{ .temp = .{ .node = node, .part = 4 } });
+        return .{ try f.within(try forget(f.a, s, v), v), try single(f.a, v) };
+    }
+
+    /// What a `bool` expression is of the state's variables, reading no more than they hold
+    /// (no call, no store): a comparison with `null` is 1 less the other side's presence (or
+    /// it), a negation 1 less its operand, `a or b` at least each and at most their sum, `a
+    /// and b` at most each and at least their sum less 1, a literal 1 or 0, a tracked bool its
+    /// variable. An operand it cannot read is any of 0 and 1.
+    fn truth(f: *Frame, s: State, node: Ast.Node.Index) Error!?struct { State, Lin } {
+        const tree = f.tree;
+        switch (Facts.conditionOf(tree, node)) {
+            .not => |inner| {
+                const r = (try f.truth(s, inner)) orelse return null;
+                return .{ r[0], (try minus(f.a, constant(1), r[1])) orelse return null };
+            },
+            .both, .either => |sides| {
+                const left = try f.truthOrAny(s, sides[0]);
+                const right = try f.truthOrAny(left[0], sides[1]);
+                var out = right[0];
+                const parts: [2]Lin = .{ left[1], right[1] };
+                const made_var = try f.variable(.{ .temp = .{ .node = node, .part = 2 } });
+                const made: struct { State, Var } = .{ try f.within(try forget(f.a, out, made_var), made_var), made_var };
+                out = made[0];
+                const u = try single(f.a, made[1]);
+                const sum = (try plus(f.a, parts[0], parts[1])) orelse return null;
+                if (Facts.conditionOf(tree, node) == .either) {
+                    out = try assume(f.a, out, try atLeast(f.a, u, parts[0]));
+                    out = try assume(f.a, out, try atLeast(f.a, u, parts[1]));
+                    out = try assume(f.a, out, try atLeast(f.a, sum, u));
+                } else {
+                    out = try assume(f.a, out, try atLeast(f.a, parts[0], u));
+                    out = try assume(f.a, out, try atLeast(f.a, parts[1], u));
+                    out = try assume(f.a, out, try atLeast(f.a, u, (try minus(f.a, sum, constant(1))) orelse return null));
+                }
+                return .{ out, u };
+            },
+            .compare => |compared| {
+                const null_right = Facts.isNull(tree, compared.right);
+                if (!null_right and !Facts.isNull(tree, compared.left)) return null;
+                const other = if (null_right) compared.left else compared.right;
+                const read = (try f.presenceRead(s, other)) orelse return null;
+                return switch (compared.order) {
+                    .equal => .{ read[0], (try minus(f.a, constant(1), read[1])) orelse return null },
+                    .not_equal => read,
+                    else => null,
+                };
+            },
+            .other => |at| {
+                if (tree.nodeTag(at) != .identifier) return null;
+                const spelled = tree.tokenSlice(tree.nodeMainToken(at));
+                if (std.mem.eql(u8, spelled, "true")) return .{ s, constant(1) };
+                if (std.mem.eql(u8, spelled, "false")) return .{ s, constant(0) };
+                const d = f.trackedName(at) orelse return null;
+                const u = try f.unit(s, .{ .boolean = d });
+                return .{ u[0], try single(f.a, u[1]) };
+            },
+        }
+    }
+
+    /// The presence an expression holds, read without evaluating it: `null`'s 0, a tracked
+    /// optional's or an optional place's variable.
+    fn presenceRead(f: *Frame, s: State, node: Ast.Node.Index) Error!?struct { State, Lin } {
+        const at = Facts.ungrouped(f.tree, node);
+        if (Facts.isNull(f.tree, at)) return .{ s, constant(0) };
+        if (f.trackedName(at)) |d| {
+            if (try f.c.facts.resolve(f.file, at) != .optional) return null;
+            const u = try f.unit(s, .{ .presence = d });
+            return .{ u[0], try single(f.a, u[1]) };
+        }
+        const p = (try f.presencePlaceOf(at)) orelse return null;
+        const v = try f.presencePlaceVar(p);
+        return .{ try f.within(s, v), try single(f.a, v) };
     }
 
     /// Records whether each prong of a switch on a number is taken on no path from `base`
@@ -3233,6 +3513,26 @@ fn exprType(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) 
         },
         else => return null,
     }
+}
+
+/// Whether a value of the written type `t` is never null: an integer type, `bool`, a pointer
+/// that is not optional, a container, or an error union whose payload is one of these (as the
+/// union or as `try` gives its payload: neither is null; `exprType` reads `try x` as `x`'s
+/// type). An optional, a name that does not resolve to one of these (an alias may be an
+/// optional) and anything else may be null.
+fn typeNeverNull(c: *Context, t: TypeRef, width: u16, depth: u8) Error!bool {
+    if (depth > type_depth) return false;
+    const tree = &c.project.at(t.file).file.tree;
+    switch (tree.nodeTag(t.node)) {
+        .grouped_expression => return typeNeverNull(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_token[0] }, width, depth + 1),
+        .error_union => return typeNeverNull(c, .{ .file = t.file, .node = tree.nodeData(t.node).node_and_node[1] }, width, depth + 1),
+        .optional_type => return false,
+        else => {},
+    }
+    if (tree.fullPtrType(t.node) != null) return true;
+    if (Facts.accesses.formOf(tree.nodeTag(t.node)) == .body) return true;
+    if (try Range.intNamed(c, t.file, t.node, width) != null) return true;
+    return tree.nodeTag(t.node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t.node)), "bool");
 }
 
 /// What indexing memory of type `t` checks.
