@@ -13162,6 +13162,42 @@ test "facts read a ZON import as the value its file holds" {
     try std.testing.expect(try facts.declaration(Of.decl(&project, "text")) == .container);
 }
 
+test "facts read a ZON file's literals as the same literals placed in place, or not at all" {
+    // ZON's names (`true`, `null`, `inf`, `nan`) are no references of a Model: what each part
+    // of the ZON literal resolves to is what it does placed in a Zig file, or unknown.
+    const parts = ".t = true, .f = false, .z = null, .e = .tag, .c = 'x', .s = \"str\", .n = 7, .x = 1.5, .a = .{ 1, 2 }";
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root.zig", .bytes = "const v = .{ " ++ parts ++ " };\nconst data = @import(\"v.zon\");\n" },
+        .{ .name = "v.zon", .bytes = ".{ " ++ parts ++ ", .i = inf, .m = -inf, .q = nan }", .kind = .zon },
+    }, &.{.{ .from = 0, .spelling = "v.zon", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const root = project.sources[0].id;
+    const in_place = try facts.declaration(facts.member(facts.rootOf(root), "v").?);
+    const from_zon = try facts.declaration(facts.member(facts.rootOf(root), "data").?);
+    try std.testing.expect(in_place == .literal and from_zon == .literal);
+    const placed = try facts.literalParts(in_place.literal);
+    const read = try facts.literalParts(from_zon.literal);
+    try std.testing.expectEqual(placed.len + 3, read.len);
+    // ZON's `inf`, `-inf` and `nan`, which Zig code does not spell: a number, or unknown.
+    for (read[placed.len..]) |r| try std.testing.expect(r == .scalar or r == .unknown);
+    for (placed, read[0..placed.len], 0..) |w, r, i| {
+        if (r == .unknown or std.meta.eql(w, r) or (w == .literal and r == .literal)) continue;
+        std.debug.print("part {d}: in place {t}, from ZON {t}\n", .{ i, w, r });
+        return error.TestUnexpectedResult;
+    }
+    // A bool std's ZON reader takes is known as placed, or not known: never the other.
+    const zon_tree = &project.sources[1].file.tree;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const fields = zon_tree.fullStructInit(&buffer, from_zon.literal.node).?.ast.fields;
+    try std.testing.expect((try facts.knownBool(project.sources[1].id, fields[0])) orelse true);
+    try std.testing.expect(!((try facts.knownBool(project.sources[1].id, fields[1])) orelse false));
+    try std.testing.expect(isNull(zon_tree, fields[2]));
+}
+
 test "a function stores through a parameter, or returns, what another holds or its own address, through captures, branches and callees' results, recursion read as the least answer" {
     const source =
         \\const N = struct { next: ?*N = null, v: u8 = 0 };

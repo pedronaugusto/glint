@@ -925,3 +925,29 @@ test "shared 4: a view handed to a function the program holds that writes throug
     }
     try std.testing.expect(at_put);
 }
+
+test "accesses: a ZON file's literal writes the fields it initializes, whatever type the import gives it" {
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root.zig", .bytes = "const K = struct { n: u8 };\nconst k: K = @import(\"k.zon\");\npub fn f() u8 { return k.n; }\n" },
+        .{ .name = "k.zon", .bytes = ".{ .n = 200 }\n", .kind = .zon },
+    }, &.{.{ .from = 0, .spelling = "k.zon", .target = 1 }}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const root = project.sources[0].id;
+    const zon = project.sources[1].id;
+    const k = (try facts.declaration(facts.member(facts.rootOf(root), "K").?)).container;
+    var init_site: ?accesses.Site = null;
+    var writes = accesses.writes(&facts, .{ .field = facts.member(k, "n").? }, &.{ root, zon });
+    while (try writes.next()) |site| if (site.file == zon) {
+        init_site = site;
+    };
+    const site = init_site orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(accesses.Kind.init, site.kind);
+    // The walk of the ZON file does not know the type the import gives the literal: a member
+    // so named on a holder whose type is not known there, read by every query for such a field.
+    try std.testing.expectEqual(accesses.Reach.named, site.reach);
+    try std.testing.expectEqualStrings("200", project.sources[1].file.tree.getNodeSource(site.value.?));
+}
