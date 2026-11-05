@@ -1566,9 +1566,10 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
     // Read in a file the run does not select: what the sink takes from its function's
     // parameters, judged at the calls into it (`judgedAtCalls`).
     if (flow) |fact| if (fact.flow.recording) |list| {
+        const function = Taint.functionKey(fact, c.file, node) orelse return;
         const given = (try Taint.givenAt(c, fact, c.file, node)) orelse return;
-        const holder = Taint.functionKey(fact, c.file, node) orelse return;
-        try list.append(c.allocator, .{ .at = .{ .file = c.file, .node = node }, .holder = holder, .given = given, .least = least, .message = message });
+        // Through a call that does not resolve, what it takes from the parameters is not known.
+        try list.append(c.allocator, .{ .at = .{ .file = c.file, .node = node }, .holder = function, .given = given, .least = least, .message = message, .undecided = try Taint.unknownAt(c, fact, c.file, node) });
         return;
     };
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
@@ -1644,10 +1645,10 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
                 const one = list.items[at];
                 if (one.holder != callee) continue;
                 const through = try Taint.throughCall(c, flow, file, call.node, one.given);
-                const given = if (through) |d| Taint.parametersOnly(d) else (try Taint.givenAt(c, flow, file, call.node)) orelse Taint.Dep{};
-                const undecided = one.undecided or generic or through == null;
+                const given = (try Taint.givenThrough(c, flow, file, call.node, one.given)) orelse (try Taint.givenAt(c, flow, file, call.node)) orelse Taint.Dep{};
+                const undecided = one.undecided or generic or through == null or Taint.throughUnknown(flow, through.?);
                 const held = for (list.items) |*entry| {
-                    if (entry.holder == caller and entry.at.file == one.at.file and entry.at.node == one.at.node and entry.message.ptr == one.message.ptr) break entry;
+                    if (entry.holder == caller and entry.at.file == one.at.file and entry.at.node == one.at.node and std.mem.eql(u8, entry.message, one.message)) break entry;
                 } else null;
                 if (held) |entry| {
                     if (try Taint.joinInto(c.allocator, &entry.given, given)) changed = true;
@@ -1720,8 +1721,8 @@ fn passedAt(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index, dec
     if (flow.flow.recording) |list| {
         const caller = Taint.functionKey(flow, c.file, call) orelse return;
         const through = try Taint.throughCall(c, flow, c.file, call, one.given);
-        const given = if (through) |d| Taint.parametersOnly(d) else (try Taint.givenAt(c, flow, c.file, call)) orelse Taint.Dep{};
-        try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = one.undecided or through == null });
+        const given = (try Taint.givenThrough(c, flow, c.file, call, one.given)) orelse (try Taint.givenAt(c, flow, c.file, call)) orelse Taint.Dep{};
+        try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = one.undecided or through == null or Taint.throughUnknown(flow, through.?) });
         return;
     }
     if (try reaches(c, flow, call, one)) try passedReport(c, flow, rule, call, decl, one, 0);

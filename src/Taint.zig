@@ -2701,10 +2701,45 @@ pub fn joinInto(gpa: Allocator, held: *Dep, more: Dep) Allocator.Error!bool {
 }
 
 /// What `node`'s value takes from the parameters of the function holding it, the function's
-/// own input left out. Null outside the functions the fact reads.
+/// own input left out; every parameter at its most where it passed through a call that does
+/// not resolve (`throughUnknown`), which may hand it any of them. Null outside the functions
+/// the fact reads.
 pub fn givenAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Dep {
     const function = owner(fact.flow, file, node) orelse return null;
-    return parametersOnly(try dep(c, fact.flow, function, node));
+    return try fromParameters(c, fact, function, try dep(c, fact.flow, function, node));
+}
+
+/// `given`, a Dep of `function`, as `givenAt` keeps it.
+fn fromParameters(c: *Context, fact: Fact, function: Function.Id, given: Dep) Context.Error!Dep {
+    if (!throughUnknown(fact, given)) return parametersOnly(given);
+    var out = parametersOnly(given);
+    for (0..fact.flow.functions.items[@backingInt(function)].levels.len) |slot| {
+        out.params = try out.params.with(c.allocator, slot);
+        out.numbers = try out.numbers.with(c.allocator, slot);
+        out.counted_numbers = try out.counted_numbers.with(c.allocator, slot);
+    }
+    return out;
+}
+
+/// `given` read through the call `node` makes (`throughCall`), kept as `givenAt` keeps a Dep
+/// of the function holding the call; null where the call reaches no one function of the
+/// program whose parameters its arguments are known for.
+pub fn givenThrough(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep) Context.Error!?Dep {
+    const function = owner(fact.flow, file, node) orelse return null;
+    const read = (try throughCall(c, fact, file, node, given)) orelse return null;
+    return try fromParameters(c, fact, function, read);
+}
+
+/// Whether the value `node` holds passed through a call that does not resolve (`throughUnknown`).
+pub fn unknownAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const function = owner(fact.flow, file, node) orelse return false;
+    return throughUnknown(fact, try dep(c, fact.flow, function, node));
+}
+
+/// Whether `given` passed through a call that does not resolve in the fact's lane: what it
+/// takes from the parameters is not known, which `parametersOnly` would drop.
+pub fn throughUnknown(fact: Fact, given: Dep) bool {
+    return given.level.at(fact.lane) == .unknown or given.length.at(fact.lane) == .unknown or given.unchecked.at(fact.lane) == .unknown;
 }
 
 /// `given` without the function's own input: only what its parameters give.
@@ -2742,8 +2777,8 @@ pub fn functionOf(c: *Context, fact: Fact, decl: Facts.Decl) ?u32 {
     return @backingInt(function);
 }
 
-/// A Dep taking every parameter of `decl` as given: what a sink takes where the reading cannot
-/// tell which.
+/// A Dep taking every parameter of `decl` at its most (as given, as a number, as a count's
+/// number): what a sink takes where the reading cannot tell which.
 pub fn everyParameter(c: *Context, decl: Facts.Decl) Context.Error!Dep {
     const tree = &c.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
@@ -2752,8 +2787,11 @@ pub fn everyParameter(c: *Context, decl: Facts.Decl) Context.Error!Dep {
     var it = proto.iterate(tree);
     var position: usize = 0;
     while (it.next()) |_| : (position += 1) {
-        out.params = try out.params.with(c.allocator, valueSlot(position));
-        out.params = try out.params.with(c.allocator, lengthSlot(position));
+        for ([_]usize{ valueSlot(position), lengthSlot(position) }) |slot| {
+            out.params = try out.params.with(c.allocator, slot);
+            out.numbers = try out.numbers.with(c.allocator, slot);
+            out.counted_numbers = try out.counted_numbers.with(c.allocator, slot);
+        }
     }
     return out;
 }

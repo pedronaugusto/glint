@@ -4097,10 +4097,11 @@ test "A018 reads a peer writer a package declares as one wherever it is declared
     }
 }
 
-test "A009 and A010 judge a dependency's sinks at the call that gives them input: an index, a step, and one through the dependency's own call" {
+test "A009 and A010 judge a dependency's sinks at the call that gives them input: an index, a step, one through the dependency's own call, and one through a call that does not resolve" {
     // `dep.zig` is a dependency's file the run does not select: its body is judged where a
     // selected call gives it input (main's provenance ruling). `pick(buf, 3)` and `grow(1)`
-    // take the program's own values.
+    // take the program's own values. `through` hands its index to a function pointer first:
+    // what reaches the index is not known, so the call giving it input is undecided.
     const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
         \\pub fn pick(buf: []const u8, i: usize) u8 {
         \\    return buf[i];
@@ -4111,10 +4112,16 @@ test "A009 and A010 judge a dependency's sinks at the call that gives them input
         \\pub fn via(n: u8) u8 {
         \\    return grow(n);
         \\}
+        \\pub fn through(buf: []const u8, i: usize, f: *const fn (usize) usize) u8 {
+        \\    return buf[f(i)];
+        \\}
     };
     var project = try sources.projectAs(std.testing.allocator,
         \\const std = @import("std");
         \\const dep = @import("dep.zig");
+        \\fn same(x: usize) usize {
+        \\    return x;
+        \\}
         \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
         \\    const i: usize = try r.takeInt(u32, 0);
         \\    const n = try r.takeByte();
@@ -4122,15 +4129,20 @@ test "A009 and A010 judge a dependency's sinks at the call that gives them input
         \\    _ = dep.via(n);
         \\    _ = dep.grow(1);
         \\    _ = dep.pick(buf, 3);
+        \\    _ = dep.through(buf, i, &same);
         \\    return dep.pick(buf, i);
         \\}
     , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep.zig", .target = std_files.len }}));
     defer project.deinit();
-    for ([_]struct { glint.Rule, []const u32 }{ .{ pack.untrusted_input, &.{10} }, .{ pack.integers, &.{ 6, 7 } } }) |row| {
-        const rule, const lines = row;
+    for ([_]struct { glint.Rule, []const u32, usize }{ .{ pack.untrusted_input, &.{14}, 1 }, .{ pack.integers, &.{ 9, 10 }, 0 } }) |row| {
+        const rule, const lines, const undecided = row;
         var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
         defer report.deinit();
-        for (report.coverage) |entry| try std.testing.expect(entry.rule == null);
+        var open: usize = 0;
+        for (report.coverage) |entry| if (entry.rule != null) {
+            open += 1;
+        };
+        try std.testing.expectEqual(undecided, open);
         try std.testing.expectEqual(lines.len, report.diagnostics.len);
         for (report.diagnostics, lines) |found, line| {
             try std.testing.expectEqual(line, found.span.line);
