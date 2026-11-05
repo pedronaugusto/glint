@@ -779,6 +779,8 @@ const Follow = struct {
             }
             return false;
         }
+        // `const a, const b = .{ x, p }`: the local it is destructured into.
+        if (try f.destructured(file, parent, node)) |kept| return kept;
         // `.{ .w = p }`: the field of the literal's type it is put in.
         var fields: [2]Ast.Node.Index = undefined;
         if (tree.fullStructInit(&fields, parent)) |literal| {
@@ -788,6 +790,27 @@ const Follow = struct {
             const container = (if (literal.ast.type_expr.unwrap()) |t| held(try c.facts.resolve(file, t)) else try c.facts.resultContainer(file, parent)) orelse return false;
             const decl = c.facts.member(container, try Model.identifier(c.allocator, tree.tokenSlice(first - 2))) orelse return false;
             return f.field(decl);
+        }
+        return false;
+    }
+
+    /// `node`, an element of the tuple literal `literal` destructured where it is made (`const
+    /// a, const b = .{ x, p };`): followed as the local it goes to, as `const b = p;` is; into
+    /// a place, not shown. Null where `literal` is no such literal.
+    fn destructured(f: *Follow, file: Project.FileId, literal: Ast.Node.Index, node: Ast.Node.Index) Context.Error!?bool {
+        const tree = &f.c.project.at(file).file.tree;
+        const model = &f.c.project.at(file).model;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const elements = (tree.fullArrayInit(&buffer, literal) orelse return null).ast.elements;
+        const whole = model.parentOf(literal) orelse return null;
+        if (tree.nodeTag(whole) != .assign_destructure) return null;
+        const full = tree.assignDestructure(whole);
+        if (full.ast.value_expr != literal or full.ast.variables.len != elements.len) return null;
+        const target = full.ast.variables[std.mem.findScalar(Ast.Node.Index, elements, node) orelse return null];
+        const variable = tree.fullVarDecl(target) orelse return false;
+        if (variable.ast.type_node.unwrap()) |declared| if (!f.pointer(try f.c.facts.resolve(file, declared))) return false;
+        for (model.declarations, 0..) |each, d| {
+            if (each.node == target and each.kind == .variable) return try f.local(file, @fromBackingInt(@intCast(d)));
         }
         return false;
     }
