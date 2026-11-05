@@ -328,7 +328,11 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
         if (fact.flow.recording != null) {
             const given = (try Taint.givenAt(c, fact, c.file, written.value)) orelse continue;
             const undecided = !written.decided or try Taint.unknownAt(c, fact, c.file, written.value);
-            try Taint.recordSink(c, fact, c.file, written.at, given, undecided, .data, written_message);
+            // An error the function writes whole of its own (`errorShown`) shows its name
+            // whatever the call gives; whether its writer is the peer's the call decides, which
+            // this reading does not keep: undecided at every call (`least` clean).
+            const own = given.clean() and try Taint.errorShown(c, c.file, written.value) != .clean;
+            try Taint.recordSink(c, fact, c.file, written.at, given, undecided or own, if (own) .clean else .data, written_message);
             continue;
         }
         const level = (try Taint.levelAt(c, fact, c.file, written.value)).join(try Taint.errorShown(c, c.file, written.value));
