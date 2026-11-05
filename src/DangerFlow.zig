@@ -16,6 +16,7 @@ const Danger = @import("Danger.zig");
 const Governed = @import("Governed.zig");
 const Streams = @import("Streams.zig");
 const Rule = @import("Rule.zig").Rule;
+const RuleConfig = @import("Rule.zig").Config;
 const Ast = std.zig.Ast;
 
 /// A009: input that indexes, slices, bounds a loop or names a path before an aegis
@@ -111,6 +112,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
             },
         }
     }
+    try judgedAtCalls(c, flow, rule, input);
 }
 
 const loop_message = "a number from input bounds a loop: a peer chooses how long it runs; parse it into a refined type with aegis input.Untrusted";
@@ -194,6 +196,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             else => {},
         }
     }
+    try judgedAtCalls(c, flow, rule, integers);
 }
 
 /// Whether a shift of `operand` takes no amount past its width: an integer whose width is a
@@ -1560,6 +1563,14 @@ fn countered(c: *Context, flow: Taint.Fact, loop: Ast.Node.Index, node: Ast.Node
 /// `file.readAll``), so a package fixes each source once at its parser.
 fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, level: Taint.Level, least: Taint.Level, message: []const u8) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
+    // Read in a file the run does not select: what the sink takes from its function's
+    // parameters, judged at the calls into it (`judgedAtCalls`).
+    if (flow) |fact| if (fact.flow.recording) |list| {
+        const given = (try Taint.givenAt(c, fact, c.file, node)) orelse return;
+        const holder = Taint.functionKey(fact, c.file, node) orelse return;
+        try list.append(c.allocator, .{ .at = .{ .file = c.file, .node = node }, .holder = holder, .given = given, .least = least, .message = message });
+        return;
+    };
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;
     const fact = flow orelse return c.at(rule, tree.nodeMainToken(node), message);
@@ -1577,6 +1588,168 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
     if (sources.len > shown) try text.appendSlice(c.allocator, ", and more");
     try text.append(c.allocator, ')');
     try c.at(rule, tree.nodeMainToken(node), text.items);
+}
+
+/// What a rule reports while it reads a file the run does not select: nothing. The file's
+/// sinks go into `Taint.Flow.recording` instead (`passedSinks`).
+const Quiet = struct {
+    sink: Context.Sink = .{ .diagnostic = diagnostic, .coverage = coverage, .config = config },
+    inner: *Context.Sink,
+
+    fn diagnostic(_: *Context.Sink, _: Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+    fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+    fn config(own: *Context.Sink, file: Project.FileId) RuleConfig {
+        const quiet: *Quiet = @fieldParentPtr("sink", own);
+        return quiet.inner.config(quiet.inner, file);
+    }
+};
+
+/// The sinks `check` reads in `file`, a file the run does not select, each with what it takes
+/// from its function's parameters (`Taint.PassedSink`): `check` run over the file with its
+/// reports kept from the run, then the file's calls into its own functions composed until
+/// nothing more is added (a recursion reaches its fixpoint). Read once per rule and file; null
+/// where the reading of `file` is already under way (a call back into it from another file).
+fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void, file: Project.FileId) Context.Error!?[]const Taint.PassedSink {
+    // What it keeps stays for the run: each later call into the file reads it.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const key = .{ @intFromEnum(rule), file };
+    if (flow.flow.reached_sinks.get(key)) |known| return known;
+    if (flow.flow.reading_sinks.contains(key)) return null;
+    try flow.flow.reading_sinks.put(c.allocator, key, {});
+    var list: std.ArrayList(Taint.PassedSink) = .empty;
+    var calls: std.ArrayList(Taint.PassedCall) = .empty;
+    var quiet: Quiet = .{ .inner = c.sink };
+    const saved_file, const saved_sink, const saved_recording, const saved_calls = .{ c.file, c.sink, flow.flow.recording, flow.flow.recording_calls };
+    c.file = file;
+    c.sink = &quiet.sink;
+    flow.flow.recording = &list;
+    flow.flow.recording_calls = &calls;
+    defer {
+        c.file = saved_file;
+        c.sink = saved_sink;
+        flow.flow.recording = saved_recording;
+        flow.flow.recording_calls = saved_calls;
+    }
+    try check(c, rule);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (calls.items) |call| {
+            const callee = Taint.functionOf(c, flow, call.decl) orelse continue;
+            const caller = Taint.functionKey(flow, file, call.node) orelse continue;
+            const generic = c.facts.hasGenericParameter(call.decl);
+            var at: usize = 0;
+            while (at < list.items.len) : (at += 1) {
+                const one = list.items[at];
+                if (one.holder != callee) continue;
+                const through = try Taint.throughCall(c, flow, file, call.node, one.given);
+                const given = if (through) |d| Taint.parametersOnly(d) else (try Taint.givenAt(c, flow, file, call.node)) orelse Taint.Dep{};
+                const undecided = one.undecided or generic or through == null;
+                const held = for (list.items) |*entry| {
+                    if (entry.holder == caller and entry.at.file == one.at.file and entry.at.node == one.at.node and entry.message.ptr == one.message.ptr) break entry;
+                } else null;
+                if (held) |entry| {
+                    if (try Taint.joinInto(c.allocator, &entry.given, given)) changed = true;
+                    if (undecided and !entry.undecided) {
+                        entry.undecided = true;
+                        changed = true;
+                    }
+                } else {
+                    try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = undecided });
+                    changed = true;
+                }
+            }
+        }
+    }
+    _ = flow.flow.reading_sinks.remove(key);
+    try flow.flow.reached_sinks.put(c.allocator, key, list.items);
+    return list.items;
+}
+
+/// Each call `c.file` makes into a function of a file the run does not select (a dependency's,
+/// which a consumer's lint reads): each sink `check` reads in that function, judged at the call
+/// with what the call gives it (main's provenance ruling, designs/glint-provenance.md part 1).
+/// Read while a file is recorded, a sink reached through its calls is that file's function's,
+/// in its parameters' terms; a call into the file itself waits for its own sinks
+/// (`passedSinks`). A generic's sinks its binding decides: undecided where input reaches one;
+/// so is a call back into a file being read.
+fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        switch (tag) {
+            .call_one, .call_one_comma, .call, .call_comma => {},
+            else => continue,
+        }
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (!site(c, node)) continue;
+        const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
+        const decl = reached.decl orelse continue;
+        if (reached.std or c.project.at(decl.file).input.selected or !try c.facts.program(decl.file)) continue;
+        if (flow.flow.recording != null and decl.file == c.file) {
+            try flow.flow.recording_calls.?.append(c.allocator, .{ .node = node, .decl = decl }); // unreachable: set beside `recording`
+            continue;
+        }
+        const callee = Taint.functionOf(c, flow, decl) orelse continue;
+        const generic = c.facts.hasGenericParameter(decl);
+        const sinks = (try passedSinks(c, flow, rule, check, decl.file)) orelse {
+            try passedAt(c, flow, rule, node, decl, .{ .at = .{ .file = decl.file, .node = node }, .holder = callee, .given = try Taint.everyParameter(c, decl), .least = .data, .message = "", .undecided = true });
+            continue;
+        };
+        var first: ?Taint.PassedSink = null;
+        var more: usize = 0;
+        for (sinks) |one| {
+            if (one.holder != callee) continue;
+            var each = one;
+            if (generic) each.undecided = true;
+            if (flow.flow.recording != null) {
+                try passedAt(c, flow, rule, node, decl, each);
+                continue;
+            }
+            // One report a call: the first sink its input reaches, and how many more.
+            if (!try reaches(c, flow, node, each)) continue;
+            if (first == null) first = each else more += 1;
+        }
+        if (first) |one| try passedReport(c, flow, rule, node, decl, one, more);
+    }
+}
+
+/// `one`, read at the call `call` of `decl`: recorded in the terms of the function holding
+/// the call where a file is being read, else judged at the call.
+fn passedAt(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index, decl: Facts.Decl, one: Taint.PassedSink) Context.Error!void {
+    if (flow.flow.recording) |list| {
+        const caller = Taint.functionKey(flow, c.file, call) orelse return;
+        const through = try Taint.throughCall(c, flow, c.file, call, one.given);
+        const given = if (through) |d| Taint.parametersOnly(d) else (try Taint.givenAt(c, flow, c.file, call)) orelse Taint.Dep{};
+        try list.append(c.allocator, .{ .at = one.at, .holder = caller, .given = given, .least = one.least, .message = one.message, .undecided = one.undecided or through == null });
+        return;
+    }
+    if (try reaches(c, flow, call, one)) try passedReport(c, flow, rule, call, decl, one, 0);
+}
+
+/// Whether what the call `call` gives `sink` may be input it takes: its level at the call at
+/// the sink's least, or not known.
+fn reaches(c: *Context, flow: Taint.Fact, call: Ast.Node.Index, one: Taint.PassedSink) Context.Error!bool {
+    const given = (try Taint.throughCall(c, flow, c.file, call, one.given)) orelse return true;
+    const level = Taint.levelOf(flow, c.file, call, given);
+    return level == .unknown or level.reaches(one.least) or (one.undecided and level != .clean);
+}
+
+/// The report at the call `call` of `decl` for the sink its input reaches: a finding, or
+/// undecided where the sink's reading or the call's is not known.
+fn passedReport(c: *Context, flow: Taint.Fact, rule: Rule, call: Ast.Node.Index, decl: Facts.Decl, one: Taint.PassedSink, more: usize) Context.Error!void {
+    const tree = &c.project.at(c.file).file.tree;
+    const name = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].name;
+    const held = c.project.at(one.at.file).file;
+    const held_name = c.project.at(one.at.file).input.name;
+    const line = held.line(held.tree.tokenStart(held.tree.nodeMainToken(one.at.node))) + 1;
+    const others = if (more == 0) "" else try c.allocator.print(", and {d} more", .{more});
+    const given = (try Taint.throughCall(c, flow, c.file, call, one.given)) orelse {
+        return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s}, whose parameters this call's arguments are not known for, may reach a sink it reads ({s}:{d}{s})", .{ name, held_name, line, others }));
+    };
+    const level = Taint.levelOf(flow, c.file, call, given);
+    if (one.undecided or level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(call)), .unresolved, try c.allocator.print("input passed to {s} may reach a sink its binding or a call back into its file decides ({s}:{d}{s})", .{ name, held_name, line, others }));
+    try c.at(rule, tree.nodeMainToken(call), try c.allocator.print("input passed to {s} reaches {s}:{d}: {s}{s}", .{ name, held_name, line, one.message, others }));
 }
 
 /// A call as `file:line `callee``, the callee as written on one line: a chain split over lines

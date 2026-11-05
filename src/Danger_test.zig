@@ -4097,6 +4097,48 @@ test "A018 reads a peer writer a package declares as one wherever it is declared
     }
 }
 
+test "A009 and A010 judge a dependency's sinks at the call that gives them input: an index, a step, and one through the dependency's own call" {
+    // `dep.zig` is a dependency's file the run does not select: its body is judged where a
+    // selected call gives it input (main's provenance ruling). `pick(buf, 3)` and `grow(1)`
+    // take the program's own values.
+    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
+        \\pub fn pick(buf: []const u8, i: usize) u8 {
+        \\    return buf[i];
+        \\}
+        \\pub fn grow(n: u8) u8 {
+        \\    return n + 1;
+        \\}
+        \\pub fn via(n: u8) u8 {
+        \\    return grow(n);
+        \\}
+    };
+    var project = try sources.projectAs(std.testing.allocator,
+        \\const std = @import("std");
+        \\const dep = @import("dep.zig");
+        \\pub fn f(r: *std.Io.Reader, buf: []const u8) !u8 {
+        \\    const i: usize = try r.takeInt(u32, 0);
+        \\    const n = try r.takeByte();
+        \\    _ = dep.grow(n);
+        \\    _ = dep.via(n);
+        \\    _ = dep.grow(1);
+        \\    _ = dep.pick(buf, 3);
+        \\    return dep.pick(buf, i);
+        \\}
+    , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "dep.zig", .target = std_files.len }}));
+    defer project.deinit();
+    for ([_]struct { glint.Rule, []const u32 }{ .{ pack.untrusted_input, &.{10} }, .{ pack.integers, &.{ 6, 7 } } }) |row| {
+        const rule, const lines = row;
+        var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .report }} }, .{ .project_rules = &pack.rules });
+        defer report.deinit();
+        for (report.coverage) |entry| try std.testing.expect(entry.rule == null);
+        try std.testing.expectEqual(lines.len, report.diagnostics.len);
+        for (report.diagnostics, lines) |found, line| {
+            try std.testing.expectEqual(line, found.span.line);
+            try std.testing.expect(std.mem.find(u8, found.message, "input passed to ") != null);
+        }
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,

@@ -456,6 +456,19 @@ pub const Flow = struct {
     walked: usize = 0,
     /// Of the summary every instantiation reads, the summaries of one instantiation each
     /// (`instanceSizes`), by the reading of the program's call that roots it.
+    /// The sinks a rule reads in each file the run does not select (a dependency's), by the rule
+    /// and the file, read once: what each takes from its function's parameters, judged at the
+    /// calls that reach it (`PassedSink`, designs/glint-provenance.md part 1).
+    reached_sinks: std.AutoHashMapUnmanaged(struct { u16, Project.FileId }, []const PassedSink) = .empty,
+    /// The files a rule's reading of them is under way for: a call back into one meets no list
+    /// yet, which is undecided.
+    reading_sinks: std.AutoHashMapUnmanaged(struct { u16, Project.FileId }, void) = .empty,
+    /// Where a rule reading a file the run does not select puts what its sinks take, in place of
+    /// a report (`PassedSink`).
+    recording: ?*std.ArrayList(PassedSink) = null,
+    /// The calls into the file being read that its own functions make, composed once the
+    /// file's own sinks are in (`PassedCall`).
+    recording_calls: ?*std.ArrayList(PassedCall) = null,
     instances: std.ArrayList(struct { env: *const Facts.Env, flow: *Flow }) = .empty,
     /// For a summary of one instantiation, every instantiation's (`instanceSizes`).
     shared: ?*Flow = null,
@@ -2652,6 +2665,97 @@ fn decodes(c: *Context, decl: Facts.Decl) bool {
 pub fn levelAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
     const function = owner(fact.flow, file, node) orelse return .clean;
     return concrete(fact.flow, function, try dep(c, fact.flow, function, node)).at(fact.lane);
+}
+
+/// A sink a rule reads in a function of a file the run does not select, and what its value
+/// takes from that function's parameters (`given`, the function's own input left out: that
+/// input is the dependency's own lint's), judged at each call a selected file makes into it with
+/// what the call gives (main's provenance ruling, designs/glint-provenance.md part 1).
+/// `undecided` where what it takes is not read: a sink of a generic, which its binding decides,
+/// or one met through a call back into a file being read.
+pub const PassedSink = struct {
+    at: Site,
+    /// The function whose parameters `given` is in (`functionKey`): the sink's own, or a caller
+    /// in the file the sink was reached through.
+    holder: u32,
+    given: Dep,
+    least: Level,
+    message: []const u8,
+    undecided: bool = false,
+};
+
+/// A call a function of the file being read makes into a function of that file.
+pub const PassedCall = struct { node: Ast.Node.Index, decl: Facts.Decl };
+
+/// The function holding `node`, as an id the fact keeps for the run; null outside them.
+pub fn functionKey(fact: Fact, file: Project.FileId, node: Ast.Node.Index) ?u32 {
+    return if (owner(fact.flow, file, node)) |function| @backingInt(function) else null;
+}
+
+/// `held` joined with `more`: whether that added any slot or level.
+pub fn joinInto(gpa: Allocator, held: *Dep, more: Dep) Allocator.Error!bool {
+    const joined = try held.join(gpa, more);
+    const same = joined.eql(held.*);
+    held.* = joined;
+    return !same;
+}
+
+/// What `node`'s value takes from the parameters of the function holding it, the function's
+/// own input left out. Null outside the functions the fact reads.
+pub fn givenAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Dep {
+    const function = owner(fact.flow, file, node) orelse return null;
+    return parametersOnly(try dep(c, fact.flow, function, node));
+}
+
+/// `given` without the function's own input: only what its parameters give.
+pub fn parametersOnly(given: Dep) Dep {
+    var out = given;
+    out.level = .clean;
+    out.length = .clean;
+    out.unchecked = .clean;
+    return out;
+}
+
+/// `given`, in the parameters' terms of the callee of the call `node` makes, read in the
+/// terms of the function holding the call: each slot as the call's argument there, the
+/// arguments' own facts with them. Null where the call reaches no one function of the program
+/// whose parameters its arguments are known for.
+pub fn throughCall(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep) Context.Error!?Dep {
+    const function = owner(fact.flow, file, node) orelse return null;
+    const callee = (try resolveCall(c, fact.flow, file, node)) orelse return null;
+    if (callee.kind != .program) return null;
+    return try summarized(c, fact.flow, function, callee, given);
+}
+
+/// The level `given`, a Dep in the terms of the function holding `node`, has as its callers
+/// give that function's parameters.
+pub fn levelOf(fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep) Level {
+    const function = owner(fact.flow, file, node) orelse return given.level.at(fact.lane);
+    return concrete(fact.flow, function, given).at(fact.lane);
+}
+
+/// The function `decl` declares, as an id the fact keeps for the run (`functionKey`); null
+/// where the fact reads no body of it.
+pub fn functionOf(c: *Context, fact: Fact, decl: Facts.Decl) ?u32 {
+    const body = fnDecl(c, decl) orelse return null;
+    const function = fact.flow.by_node.get(.{ .file = decl.file, .node = body }) orelse return null;
+    return @backingInt(function);
+}
+
+/// A Dep taking every parameter of `decl` as given: what a sink takes where the reading cannot
+/// tell which.
+pub fn everyParameter(c: *Context, decl: Facts.Decl) Context.Error!Dep {
+    const tree = &c.project.at(decl.file).file.tree;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, c.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return .{};
+    var out: Dep = .{};
+    var it = proto.iterate(tree);
+    var position: usize = 0;
+    while (it.next()) |_| : (position += 1) {
+        out.params = try out.params.with(c.allocator, valueSlot(position));
+        out.params = try out.params.with(c.allocator, lengthSlot(position));
+    }
+    return out;
 }
 
 /// The level of a counter `loop` steps, as it decides how many passes the loop takes: what it

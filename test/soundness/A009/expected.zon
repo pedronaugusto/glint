@@ -2,7 +2,5 @@
     .open = .{
         // matrix precision: Bounds does not carry a checked value through a struct literal's field to its read (`h.at`)
         "aggregate/m-a09-struct_literal/twin.zig",
-        // matrix hole: a sink in a file the run does not select is judged nowhere; the flow engine reports it at the selected call (M6)
-        "call/u-a09-unselected_sink/hole.zig",
     },
 }
