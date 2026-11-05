@@ -6330,8 +6330,23 @@ fn givenValues(self: *Facts, decl: Decl) ResolveError!?[]const Value {
 /// program does not hold writes, its address taken (but dropped, `_ = &x`), a store with no
 /// one value, one that reaches it by no name of its own, a public `var` another file may
 /// write, one whose file's writes are being read. A local `var`'s whole values are read by its
-/// mentions (`accesses.givenByName`), a global's and parts from its file's walk.
+/// mentions (`accesses.givenByName`), a global's and parts from its file's walk. Read once per
+/// declaration and `parts`: a flow's rounds ask it of the same names each round.
 pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key {
+    const kept_by = try self.memo(Given);
+    if (kept_by.found.get(.{ decl, parts })) |kept| return kept;
+    var lasting = true;
+    const found = try self.givenFrom(decl, parts, &lasting);
+    // What a resolve the budget refused gave is not kept, as `resolve` keeps none; nor what
+    // was read while its file's writes are.
+    if (lasting and self.remaining != 0) try kept_by.found.put(self.gpa, .{ decl, parts }, found);
+    return found;
+}
+
+const Given = struct { found: std.AutoHashMapUnmanaged(struct { Decl, bool }, ?[]const Key) = .empty };
+
+/// `givenTo`'s answer, read anew; `lasting` false where it holds only for now.
+fn givenFrom(self: *Facts, decl: Decl, parts: bool, lasting: *bool) ResolveError!?[]const Key {
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     const variable = self.syntaxOf(decl.file).fullVarDecl(record.node) orelse return null;
     // A local `var` is written only by its name and the pointers its address gives; whole
@@ -6343,7 +6358,10 @@ pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key 
     if (record.public) return null;
     // Read while its file's writes are (a store's callee, an `extern`'s shape): its stores are
     // not all known yet.
-    if (try accesses.walking(self, decl.file)) return null;
+    if (try accesses.walking(self, decl.file)) {
+        lasting.* = false;
+        return null;
+    }
     const in_file = [_]Project.FileId{decl.file};
     var found_sites = accesses.writes(self, .{ .declaration = decl }, &in_file);
     while (try found_sites.next()) |site| {
