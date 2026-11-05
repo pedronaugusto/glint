@@ -4054,6 +4054,14 @@ fn valueOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, depth: u8) C
                 else => std.math.mul(u64, a, b) catch null,
             };
         },
+        // `1 << 16`: exact, or none where bits would be lost.
+        .shl => {
+            const lhs, const rhs = tree.nodeData(at).node_and_node;
+            const a = (try valueOf(c, file, lhs, depth + 1)) orelse return null;
+            const b = (try valueOf(c, file, rhs, depth + 1)) orelse return null;
+            const by = std.math.cast(u6, b) orelse return null;
+            return std.math.shlExact(u64, a, by) catch null;
+        },
         .identifier, .field_access => {
             const decl = ((try c.facts.definition(file, at)).orNull()) orelse return null;
             const model = &c.project.at(decl.file).model;
@@ -4413,6 +4421,16 @@ pub fn intOf(c: *Context, file: Project.FileId, node: Ast.Node.Index, pointer: u
 /// The integer type a type expression names at a pointer width (Bounds).
 pub fn intNamed(c: *Context, file: Project.FileId, type_node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
     return named(c, file, type_node, pointer);
+}
+
+/// The integer type `type_node` names in `reading`, one reading of a call of the function it is
+/// in (`comptime T: type` given `usize`), or as written where there is none (Bounds).
+pub fn intNamedIn(c: *Context, reading: ?*const Facts.Env, file: Project.FileId, type_node: Ast.Node.Index, pointer: u16) Context.Error!?Int {
+    const env = reading orelse return named(c, file, type_node, pointer);
+    return switch (integer(try c.facts.resolveBound(env, file, type_node), pointer)) {
+        .int => |int| int,
+        else => null,
+    };
 }
 
 /// The value of a constant expression, where the program fixes one (Bounds).

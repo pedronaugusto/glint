@@ -931,8 +931,8 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         // A `.?` of a value known not to be null never reaches its `unreachable`.
         if (unwrap and (try present.unwrapped(node) or try Proof.present(c, c.file, node))) continue;
         // A prong no path takes never runs what it holds (`else => unreachable` past what
-        // the subject can be).
-        if (try inUntaken(c, node)) continue;
+        // the subject can be), nor does a `catch` whose call never fails there.
+        if (try neverRuns(c, node)) continue;
         // `x.?` is `x orelse unreachable`: what makes `x` null chooses it too.
         const chosen = try chosenBy(c, flow, node);
         switch (if (unwrap) chosen.join(try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?)) else chosen) { // unreachable: a `.?` carries its operand
@@ -943,14 +943,19 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     }
 }
 
-/// Whether `node` is in the result of a switch prong Proof shows no path takes, up to its
-/// function.
-fn inUntaken(c: *Context, node: Ast.Node.Index) Context.Error!bool {
+/// Whether `node` is in what never runs, by Proof, up to its function: the result of a switch
+/// prong no path takes, or the answer of a `catch` whose operand never fails there.
+fn neverRuns(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         if (tree.nodeTag(parent) == .fn_decl) return false;
+        // The answer of a `catch` whose operand never fails there.
+        if (tree.nodeTag(parent) == .@"catch" and tree.nodeData(parent).node_and_node[1] == at) {
+            if (try Proof.unfailing(c, c.file, parent)) return true;
+            continue;
+        }
         const case = tree.fullSwitchCase(parent) orelse continue;
         if (case.ast.target_expr == at and try Proof.untaken(c, c.file, parent)) return true;
     }

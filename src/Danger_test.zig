@@ -108,16 +108,16 @@ const std_files = [_]sources.Extra{
     \\end: usize = 0,
     \\pub const Limit = enum(usize) { unlimited = 0, _ };
     \\pub fn fixed(bytes: []const u8) @This() { _ = bytes; return .{}; }
-    \\pub fn takeByte(r: *@This()) !u8 { _ = r; return 0; }
-    \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }
+    \\pub fn takeByte(r: *@This()) !u8 { if (r.seek == r.end) return error.EndOfStream; return 0; }
+    \\pub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = endian; if (r.seek == r.end) return error.EndOfStream; return 0; }
     \\pub fn fill(r: *@This(), n: usize) !void { if (r.seek + n > r.end) return error.EndOfStream; }
     \\pub fn take(r: *@This(), n: usize) ![]u8 { try r.fill(n); return r.buffer; }
     \\pub fn toss(r: *@This(), n: usize) void { r.seek += n; assert(r.seek <= r.end); }
     \\fn assert(ok: bool) void { if (!ok) unreachable; }
-    \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { _ = r; _ = buffer; }
-    \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { _ = r; return buffer.len; }
+    \\pub fn readSliceAll(r: *@This(), buffer: []u8) !void { if (buffer.len > r.end - r.seek) return error.EndOfStream; }
+    \\pub fn readSliceShort(r: *@This(), buffer: []u8) !usize { if (r.seek == r.end) return error.ReadFailed; return buffer.len; }
     \\pub fn limited(r: *@This(), limit: Limit, buffer: []u8) @This() { _ = r; _ = limit; _ = buffer; return .{}; }
-    \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; return r.buffer; }
+    \\pub fn allocRemaining(r: *@This(), gpa: anytype, limit: Limit) ![]u8 { _ = gpa; _ = limit; if (r.seek == r.end) return error.ReadFailed; return r.buffer; }
     \\pub fn readAlloc(r: *@This(), gpa: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return gpa.alloc(u8, len); }
     \\pub fn readArena(r: *@This(), arena: @import("../mem.zig").Allocator, len: usize) ![]u8 { _ = r; return arena.alloc(u8, len); }
     },
@@ -147,6 +147,15 @@ const std_files = [_]sources.Extra{
     \\pub const s_per_week = s_per_day * 7;
     },
     .{ .name = "std/math.zig", .bytes =
+    \\pub fn minInt(comptime T: type) comptime_int { const info = @typeInfo(T); const bit_count = info.int.bits; if (info.int.signedness == .unsigned) return 0; if (bit_count == 0) return 0; return -(1 << (bit_count - 1)); }
+    \\pub fn divCeil(comptime T: type, numerator: T, denominator: T) !T {
+    \\    @setRuntimeSafety(false);
+    \\    if (denominator == 0) return error.DivisionByZero;
+    \\    if (@typeInfo(T) == .int and numerator == minInt(T) and denominator == -1) {
+    \\        return error.Overflow;
+    \\    }
+    \\    return @divCeil(numerator, denominator);
+    \\}
     \\pub inline fn maxInt(comptime T: type) comptime_int { const info = @typeInfo(T); const bit_count = info.int.bits; if (bit_count == 0) return 0; return (1 << (bit_count - @intFromBool(info.int.signedness == .signed))) - 1; }
     },
     .{ .name = "std/zig.zig", .bytes =
@@ -772,6 +781,94 @@ test "A013 finds a .? whose optional any write may null after the check: another
         \\    return x.?;
         \\}
     , 7);
+}
+
+test "A013 leaves a catch unreachable whose call never fails there: a divisor at least 1 to std's divCeil read at the call's binding, a program callee's failing exit ruled out, a comptime false that returns first" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\const tile = 1 << 16;
+        \\fn outer(d: usize) !usize {
+        \\    if (d == 0) return error.Zero;
+        \\    return d;
+        \\}
+        \\fn load(comptime careful: bool, have: usize, n: usize) !usize {
+        \\    if (!careful) return n;
+        \\    if (have < n) return error.NeedInput;
+        \\    return n;
+        \\}
+        \\pub fn constant(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return std.math.divCeil(usize, in[0], tile) catch unreachable;
+        \\}
+        \\pub fn plus(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return std.math.divCeil(usize, in[0], @as(usize, in[1]) + 1) catch unreachable;
+        \\}
+        \\pub fn program(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return outer(@as(usize, in[0]) + 1) catch unreachable;
+        \\}
+        \\pub fn fast(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return load(false, in[0], in[1]) catch unreachable;
+        \\}
+    , 0);
+}
+
+test "A013 finds a catch unreachable whose call may fail there: a divisor a peer's byte may make zero, an error passed on by return, try or a caught capture, one held in a variable, a comptime true" {
+    try expect(pack.contracts,
+        \\const std = @import("std");
+        \\fn inner(d: usize) !usize {
+        \\    if (d == 3) return error.Three;
+        \\    return d;
+        \\}
+        \\fn returned(d: usize) !usize {
+        \\    if (d == 0) return error.Zero;
+        \\    return inner(d);
+        \\}
+        \\fn tried(d: usize) !usize {
+        \\    if (d == 0) return error.Zero;
+        \\    return (try inner(d)) + 1;
+        \\}
+        \\fn caught(d: usize) !usize {
+        \\    const x = inner(d) catch |e| return e;
+        \\    return x;
+        \\}
+        \\fn held(d: usize) !usize {
+        \\    const refused: anyerror = error.Refused;
+        \\    if (d == 3) return refused;
+        \\    return d;
+        \\}
+        \\fn load(comptime careful: bool, have: usize, n: usize) !usize {
+        \\    if (!careful) return n;
+        \\    if (have < n) return error.NeedInput;
+        \\    return n;
+        \\}
+        \\pub fn byZero(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return std.math.divCeil(usize, in[0], in[1]) catch unreachable;
+        \\}
+        \\pub fn byReturn(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return returned(@as(usize, in[0]) + 1) catch unreachable;
+        \\}
+        \\pub fn byTry(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return tried(@as(usize, in[0]) + 1) catch unreachable;
+        \\}
+        \\pub fn byCapture(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return caught(@as(usize, in[0]) + 1) catch unreachable;
+        \\}
+        \\pub fn byVariable(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return held(@as(usize, in[0]) + 1) catch unreachable;
+        \\}
+        \\pub fn byTrue(r: *std.Io.Reader) !usize {
+        \\    const in = try r.take(8);
+        \\    return load(true, in[0], in[1]) catch unreachable;
+        \\}
+    , 6);
 }
 
 test "A013 leaves what runs as the program compiles, and tests, alone" {

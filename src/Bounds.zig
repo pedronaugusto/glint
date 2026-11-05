@@ -330,6 +330,9 @@ pub const Kind = enum {
     /// A `.?` whose operand holds a value on every path: no null reaches its `unreachable`.
     /// Keyed by the unwrap.
     present,
+    /// A `catch` whose operand never fails there: on every path, what the call it gives is
+    /// given rules out each of its callee's failing exits. Keyed by the `catch`.
+    unfailing,
 };
 
 const Site = struct { node: Ast.Node.Index, kind: Kind };
@@ -357,12 +360,18 @@ const Callee = struct { file: Project.FileId, function: Ast.Node.Index };
 /// parameter's at entry and, through a pointer, at its exit (`placeSlot`).
 const Summary = struct {
     rows: []const Lin,
+    /// What every failing exit gives of the parameters' slots at entry (`never` where none
+    /// fails): an error path of a call is read past only where these hold.
+    failing: []const Lin = &never,
     params: usize,
     places: []const SlotPlace = &.{},
     /// The fields of the program's structs the function may write, through any pointer; null
     /// where it may write any.
     written: ?[]const Facts.Decl = null,
 };
+
+/// `-1 ≥ 0`: the summary of a function that never succeeds, or never fails.
+const never = [_]Lin{constant(-1)};
 
 /// A field of a parameter's struct, or of the struct it points to, a summary reads.
 const SlotPlace = struct {
@@ -394,17 +403,25 @@ fn placeSlot(params: u16, k: u3, exit: bool, length: bool) Var {
 }
 
 const Analyses = struct {
-    map: std.AutoHashMapUnmanaged(struct { Project.FileId, Ast.Node.Index, u16 }, *Analysis) = .empty,
+    /// Each function at a width, read alone or at one reading of a call (`Facts.bindCall`).
+    map: std.AutoHashMapUnmanaged(struct { Project.FileId, Ast.Node.Index, u16, ?*const Facts.Env }, *Analysis) = .empty,
     /// How deep summaries are being read through calls.
     depth: u8 = 0,
 };
 
 fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: u16) Error!*Analysis {
+    return analysisIn(c, null, file, function, width);
+}
+
+/// `function` read at `bound`, one reading of a call of it, its parameters typed by what the
+/// call binds (`comptime T: type` given `usize`): only its summary is read from it, never a
+/// verdict, which holds for the function's every call (`cleared`).
+fn analysisIn(c: *Context, bound: ?*const Facts.Env, file: Project.FileId, function: Ast.Node.Index, width: u16) Error!*Analysis {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Analyses);
-    const key = .{ file, function, width };
+    const key = .{ file, function, width, bound };
     if (memo.map.get(key)) |found| return found;
     const made = try c.allocator.create(Analysis);
     made.* = .{};
@@ -416,29 +433,37 @@ fn analysis(c: *Context, file: Project.FileId, function: Ast.Node.Index, width: 
     }
     memo.depth += 1;
     defer memo.depth -= 1;
-    try readInto(c, made, file, function, width, null);
+    try readInto(c, made, file, function, width, null, bound);
     return made;
 }
 
 /// One reading of `function` into `made`, its parameters starting from their types and, where
 /// given, `entry`: constraints over their slots that every call of it in the program holds.
-fn readInto(c: *Context, made: *Analysis, file: Project.FileId, function: Ast.Node.Index, width: u16, given: ?[]const Lin) Error!void {
+fn readInto(c: *Context, made: *Analysis, file: Project.FileId, function: Ast.Node.Index, width: u16, given: ?[]const Lin, bound: ?*const Facts.Env) Error!void {
     // On `backing`: the run's arena would keep each reading's scratch to the run's end.
     var scratch: std.heap.ArenaAllocator = .init(c.backing);
     defer scratch.deinit();
-    var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .width = width, .function = function, .entry = given };
+    var frame: Frame = .{ .c = c, .a = scratch.allocator(), .file = file, .tree = &c.project.at(file).file.tree, .model = &c.project.at(file).model, .width = width, .function = function, .entry = given, .bound = bound };
     frame.run() catch |err| switch (err) {
         error.Unsupported => return,
         else => |e| return e,
     };
     made.supported = true;
+    // A reading at a binding, or of std's code, is asked only for its summary (`summaryOf`):
+    // what it gives its callees and its verdicts are never read, so they are not kept.
+    if (bound == null and try Program.owns(c, file)) try keepReading(c, made, &frame);
+    if (frame.summary) |summary| made.summary = .{ .rows = try persisted(c.allocator, summary.rows), .failing = try persisted(c.allocator, summary.failing), .params = summary.params, .places = try c.allocator.dupe(SlotPlace, summary.places), .written = if (summary.written) |fields| try c.allocator.dupe(Facts.Decl, fields) else null };
+}
+
+/// What a reading of the program's own function gives the run beyond its summary: what it
+/// gives each callee, the calls it reached, its verdicts.
+fn keepReading(c: *Context, made: *Analysis, frame: *const Frame) Error!void {
     var calls = frame.calls.iterator();
     while (calls.next()) |call| try made.calls.put(c.allocator, call.key_ptr.*, if (call.value_ptr.*) |rows| try persisted(c.allocator, rows) else null);
     var reached = frame.reached.keyIterator();
     while (reached.next()) |call| try made.reached.put(c.allocator, call.*, {});
     var it = frame.verdicts.iterator();
     while (it.next()) |entry| try made.verdicts.put(c.allocator, entry.key_ptr.*, entry.value_ptr.*);
-    if (frame.summary) |summary| made.summary = .{ .rows = try persisted(c.allocator, summary.rows), .params = summary.params, .places = try c.allocator.dupe(SlotPlace, summary.places), .written = if (summary.written) |fields| try c.allocator.dupe(Facts.Decl, fields) else null };
 }
 
 /// Rows copied out of a reading's scratch memory.
@@ -505,7 +530,7 @@ fn byCallers(c: *Context, file: Project.FileId, function: Ast.Node.Index, width:
     };
     const made = try c.allocator.create(Analysis);
     made.* = .{};
-    try readInto(c, made, file, function, width, rows);
+    try readInto(c, made, file, function, width, rows, null);
     try memo.map.put(c.allocator, key, made);
     return made;
 }
@@ -795,6 +820,9 @@ const Value = struct {
     lin: ?Lin = null,
     length: ?Lin = null,
     unwrapped: []const Lin = &.{},
+    /// What holds where it is an error: a call's callee's failing rows, applied to what the
+    /// call gives it (`Summary.failing`). Empty where nothing is known.
+    failed: []const Lin = &.{},
     /// Its length is the program's word, not memory shown to hold it: a many-item or C
     /// pointer sliced (`p[0..n]`), or a length stored (`s.len = n`). Such a length counts no
     /// work the function holds (`counted`).
@@ -827,6 +855,12 @@ const Ran = struct { body: State, exit: State };
 const Deferred = struct { body: Ast.Node.Index, on_error: bool };
 
 const Exit = struct { state: State, failed: bool };
+
+/// Whether a function leaves with an error where it returns a value (`Frame.failingOf`).
+const Failing = enum { no, maybe, yes };
+
+/// The builtins that give a number, never an error.
+const numeric_builtins = [_][]const u8{ "@divCeil", "@divFloor", "@divTrunc", "@divExact", "@mod", "@rem", "@intCast", "@truncate", "@min", "@max", "@intFromEnum", "@intFromBool", "@intFromPtr", "@sizeOf", "@bitSizeOf", "@alignOf", "@popCount", "@ctz", "@clz", "@abs", "@shlExact", "@shrExact" };
 
 const Frame = struct {
     c: *Context,
@@ -874,6 +908,11 @@ const Frame = struct {
     summary: ?Summary = null,
     /// What every caller gives the parameters' slots (`entryOf`), assumed from the start.
     entry: ?[]const Lin = null,
+    /// The reading of a call it is read at: its parameters' types are read in it.
+    bound: ?*const Facts.Env = null,
+    /// Each parameter's integer type, as its declaration names it in the reading (`bound`),
+    /// where an expression's own type does not (`comptime T: type`'s `n: T`).
+    param_ints: std.AutoHashMapUnmanaged(Model.Declaration.Id, Range.Int) = .empty,
     /// What this function gives each program function it calls (`Analysis.calls`).
     calls: std.AutoHashMapUnmanaged(Callee, ?[]const Lin) = .empty,
     /// The calls reached on a path not being tried.
@@ -893,7 +932,8 @@ const Frame = struct {
         var params: std.ArrayList(?Model.Declaration.Id) = .empty;
         var s: State = .{};
         var it = proto.iterate(f.tree);
-        while (it.next()) |param| {
+        var index: usize = 0;
+        while (it.next()) |param| : (index += 1) {
             const name_token = param.name_token orelse {
                 try params.append(f.a, null);
                 continue;
@@ -905,8 +945,15 @@ const Frame = struct {
             };
             try params.append(f.a, found);
             const d = found orelse continue;
-            if (param.type_expr) |type_node| if (try Range.intNamed(f.c, f.file, type_node, f.width)) |int| {
+            if (param.type_expr) |type_node| if (try Range.intNamedIn(f.c, f.bound, f.file, type_node, f.width)) |int| {
                 s = try f.typed(s, try f.variable(.{ .value = d }), int);
+                try f.param_ints.put(f.a, d, int);
+            };
+            // A `comptime` bool the reading binds (`fill(false, n)`): 1 or 0 throughout, as a
+            // parameter is never assigned.
+            if (f.bound) |reading| if (index < reading.truths.len) if (reading.truths[index]) |bound_truth| {
+                const u = try f.unit(s, .{ .boolean = d });
+                s = try f.same(u[0], try single(f.a, u[1]), constant(@intFromBool(bound_truth)));
             };
         }
         f.params = params.items;
@@ -916,7 +963,7 @@ const Frame = struct {
             var t = result;
             if (f.tree.nodeTag(t) == .error_union) t = f.tree.nodeData(t).node_and_node[1];
             if (f.tree.nodeTag(t) == .optional_type) t = f.tree.nodeData(t).node;
-            f.returns_int = try Range.intNamed(f.c, f.file, t, f.width) != null;
+            f.returns_int = try Range.intNamedIn(f.c, f.bound, f.file, t, f.width) != null;
         }
         const body = f.tree.nodeData(f.function).node_and_node[1];
         const out = try f.exec(s, body);
@@ -1285,9 +1332,6 @@ const Frame = struct {
         if (f.trial == 0) try f.exits.append(f.a, .{ .state = out, .failed = failed });
     }
 
-    /// `-1 ≥ 0`: the summary of a function that never succeeds.
-    const never = [_]Lin{constant(-1)};
-
     /// The summary: what the successful exits give of the parameters' slots and the result's.
     fn summarize(f: *Frame) Error!void {
         // The places of parameters, each once, its value and length at entry and exit.
@@ -1304,18 +1348,22 @@ const Frame = struct {
             }
         };
         f.slot_places = places.items;
+        const failing = try f.exitsJoined(true);
+        // No successful exit: every call that succeeds is unreachable.
+        const rows: []const Lin = if (try f.exitsJoined(false)) |s| s.rows else &never;
+        f.summary = .{ .rows = rows, .failing = if (failing) |s| s.rows else &never, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
+    }
+
+    /// The join of the exits that fail, or of those that succeed, projected onto the slots;
+    /// null where there is none.
+    fn exitsJoined(f: *Frame, failed: bool) Error!?State {
         var joined: ?State = null;
         for (f.exits.items) |exit| {
-            if (exit.failed or exit.state.dead) continue;
+            if (exit.failed != failed or exit.state.dead) continue;
             const projected = try f.project(exit.state);
             joined = if (joined) |j| try f.joinIn(.slots, j, projected) else projected;
         }
-        const s = joined orelse {
-            // No successful exit: every call that succeeds is unreachable.
-            f.summary = .{ .rows = &never, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
-            return;
-        };
-        f.summary = .{ .rows = s.rows, .params = f.params.len, .places = f.slot_places, .written = if (f.writes_any) null else f.writes.items };
+        return joined;
     }
 
     /// A state's constraints on the slots alone, each variable renamed to its slot.
@@ -1889,7 +1937,7 @@ const Frame = struct {
             return .{ .s = u[0], .v = .{ .present = try single(f.a, u[1]) } };
         }
         if (f.tracked(d)) {
-            const int = (try f.intOf(node)) orelse return .{ .s = s };
+            const int = (try f.intOf(node)) orelse f.param_ints.get(d) orelse return .{ .s = s };
             const v = try f.variable(.{ .value = d });
             var out = s;
             if (!f.typed_vars.contains(v)) {
@@ -1913,6 +1961,8 @@ const Frame = struct {
                 return .{ .s = try f.within(e.s, v), .v = .{ .present = try single(f.a, v) } };
             }
             if (try f.placeOf(node)) |p| return f.placeValue(e.s, node, p);
+            // A constant a namespace declares (`frame.legacy_block_len`), as a name's.
+            if (try Range.constantValue(f.c, f.file, node)) |value| if (value <= std.math.maxInt(Coef)) return .{ .s = e.s, .v = .{ .lin = constant(@intCast(value)) } };
             return f.fresh(e.s, node, 0);
         }
         const measured = try f.lengthOf(e.s, holder, e.v);
@@ -2360,8 +2410,10 @@ const Frame = struct {
 
     fn tried(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         const e = try f.eval(s, f.tree.nodeData(node).node);
-        // The error leaves the function.
-        try f.leave(e.s, true);
+        // The error leaves the function, where the callee can fail.
+        var failing = e.s;
+        for (e.v.failed) |row| failing = try assume(f.a, failing, row);
+        try f.leave(failing, true);
         return .{ .s = try f.unwrap(e.s, e.v), .v = .{ .lin = e.v.lin, .length = e.v.length } };
     }
 
@@ -2384,6 +2436,9 @@ const Frame = struct {
         held = try f.assign(held, tl, e.v.length, null);
         held = try f.assign(held, tp, try f.payloadPresent(lhs), null);
         if (f.tree.nodeTag(node) == .@"catch") {
+            // Where it fails, the call's callee left by a failing exit.
+            for (e.v.failed) |row| missing = try assume(f.a, missing, row);
+            if (!base.dead) try f.record(node, .unfailing, missing.dead);
             const after = f.tree.nodeMainToken(node) + 1;
             if (f.tree.tokenTag(after) == .pipe) missing = try f.capture(missing, after + 1, .{}, null);
         }
@@ -2680,18 +2735,67 @@ const Frame = struct {
 
     fn returned(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         var out = s;
-        var failed = false;
+        var failing: Failing = .no;
         if (f.tree.nodeData(node).opt_node.unwrap()) |operand| {
             const e = try f.eval(out, operand);
             out = e.s;
-            failed = f.tree.nodeTag(operand) == .error_value;
+            failing = try f.failingOf(operand);
             const result = try f.variable(.result);
             out = try f.assign(out, result, if (f.returns_int) e.v.lin else null, null);
             const result_length = try f.variable(.result_length);
             out = try f.assign(out, result_length, e.v.length, null);
         }
-        try f.leave(out, failed);
+        // A value that may be an error leaves either way: with the function's errdefers run
+        // where it is one.
+        if (failing != .yes) try f.leave(out, false);
+        if (failing != .no) try f.leave(out, true);
         return .{ .s = State.unreachable_state };
+    }
+
+    /// Whether a returned value is an error: `error.X` is; a value no error can be (a `try`'s
+    /// payload, a literal, what an operator or an arithmetic builtin gives, a value of a kind
+    /// that holds no error, `failingValue`) is not; anything else may be.
+    fn failingOf(f: *Frame, operand: Ast.Node.Index) Error!Failing {
+        switch (f.tree.nodeTag(operand)) {
+            .error_value => return .yes,
+            .@"try", .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal => return .no,
+            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bit_not, .negation, .negation_wrap, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => return .no,
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+                const called = f.tree.tokenSlice(f.tree.nodeMainToken(operand));
+                for (numeric_builtins) |each| if (std.mem.eql(u8, called, each)) return .no;
+            },
+            else => {},
+        }
+        // A name declared of an integer type is never an error (an expression's own type,
+        // `Range.intOf`, is a call's payload's, whether or not it failed).
+        if (try f.declaredInt(operand)) return .no;
+        return failingValue(try f.c.facts.resolve(f.file, operand));
+    }
+
+    /// Whether `node` names a parameter or a local declared of an integer type, as written
+    /// (`d: usize`, `const n: u32 = …`) or bound in the reading (`n: T`).
+    fn declaredInt(f: *Frame, node: Ast.Node.Index) Error!bool {
+        if (f.tree.nodeTag(node) != .identifier) return false;
+        const d = (f.model.reference(node) orelse return false).declaration orelse return false;
+        if (f.param_ints.contains(d)) return true;
+        const decl = f.model.declarations[@backingInt(d)];
+        if (decl.kind != .variable) return false;
+        const local = f.tree.fullVarDecl(decl.node) orelse return false;
+        const type_node = local.ast.type_node.unwrap() orelse return false;
+        return try Range.intNamedIn(f.c, f.bound, f.file, type_node, f.width) != null;
+    }
+
+    /// Whether a value of what `value` resolves to is an error: only a number, a pointer, a
+    /// struct's or an array's value, an optional or a function is none; one that may be a
+    /// type's name (`anyerror`) or of a kind not read may be one.
+    fn failingValue(value: Facts.Value) Failing {
+        return switch (value) {
+            .scalar, .pointer, .instance, .array, .optional, .function => .no,
+            .alternatives => |each| for (each) |one| {
+                if (failingValue(one) != .no) break .maybe;
+            } else .no,
+            else => .maybe,
+        };
     }
 
     fn jump(f: *Frame, s: State, node: Ast.Node.Index, breaks: bool) RunError!Eval {
@@ -3229,7 +3333,7 @@ const Frame = struct {
             try args.append(f.a, arg);
         }
         try f.recordCall(out, node, full.ast.fn_expr, args.items);
-        const summary = try f.summaryOf(full.ast.fn_expr);
+        const summary = try f.summaryOf(node, full.ast.fn_expr);
         // The places the summary reads, each where an argument holds it: what it held before the
         // call, kept in the call's temporaries, and the place itself after.
         const places: []const SlotPlace = if (summary) |callee| callee.places else &.{};
@@ -3274,35 +3378,15 @@ const Frame = struct {
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
         out = try forget(f.a, out, tl);
         const summed = summary orelse return .{ .s = try f.lengthGiven(out, node, args.items, tl), .v = .{ .lin = t, .length = try single(f.a, tl) } };
+        // A std callee's length, as with no summary: from its declaration.
+        if (!summed.own) out = try f.lengthGiven(out, node, args.items, tl);
         // A place's exit holds where the success is read at once: a callee that cannot fail, or
         // `try`; a result unwrapped later may meet a store to the place first.
         const at_once = !summed.fails or if (f.model.parentOf(node)) |parent| f.tree.nodeTag(parent) == .@"try" else false;
-        var rows: std.ArrayList(Lin) = .empty;
-        each: for (summed.rows) |row| {
-            var applied: Lin = constant(row.c);
-            for (row.terms) |term| {
-                const param = term.v / 2;
-                const length = term.v % 2 == 1;
-                const given: ?Lin = if (param == summed.params)
-                    (if (length) try single(f.a, tl) else t)
-                else if (param < summed.params)
-                    (if (param < args.items.len) (if (length) args.items[param].length else args.items[param].lin) else null)
-                else at: {
-                    const width = std.math.cast(u16, summed.params) orelse break :at null;
-                    const offset = std.math.sub(Var, term.v, placeSlot(width, 0, false, false)) catch break :at null;
-                    const k = offset / 4;
-                    if (k >= entries.len) break :at null;
-                    if (offset % 4 < 2) break :at entries[k].before[@intFromBool(length)];
-                    if (!at_once) break :at null;
-                    const p = entries[k].place orelse break :at null;
-                    break :at try single(f.a, try f.placeVar(p, length));
-                };
-                const lin = given orelse continue :each;
-                applied = (try combine(f.a, applied, 1, lin, term.k)) orelse continue :each;
-            }
-            try rows.append(f.a, applied);
-        }
-        const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows.items };
+        const rows = try f.appliedRows(summed.rows, summed.params, args.items, &entries, .{ .result = .{ t, try single(f.a, tl) }, .exits = at_once });
+        // Where it fails: what the call gave, never a result or what it leaves in a place.
+        const failed: []const Lin = if (summed.fails) try f.appliedRows(summed.failing, summed.params, args.items, &entries, .{}) else &.{};
+        const value: Value = .{ .lin = t, .length = try single(f.a, tl), .unwrapped = rows, .failed = failed };
         if (summed.fails) return .{ .s = out, .v = value };
         // A callee that cannot fail returns where it succeeds.
         return .{ .s = try f.unwrap(out, value), .v = .{ .lin = t, .length = value.length } };
@@ -3310,6 +3394,43 @@ const Frame = struct {
 
     /// A place a call's summary reads, where an operand holds it, and what it held before.
     const Given = struct { place: ?Place = null, before: [2]?Lin = .{ null, null } };
+
+    /// What a call's slots stand for in its caller, past its parameters: its result's value and
+    /// length, and whether a place's exit is read (where the success is read at once).
+    const Applied = struct { result: ?struct { ?Lin, ?Lin } = null, exits: bool = false };
+
+    /// A summary's `rows` over a call's slots, read in the caller: each parameter's slot as
+    /// what the call gave it (`args`), a place's entry as what it held before (`entries`),
+    /// the result's and a place's exit as `applied` gives them. A row naming a slot with
+    /// nothing for it is dropped.
+    fn appliedRows(f: *Frame, rows: []const Lin, params: usize, args: []const Value, entries: []const Given, applied: Applied) Error![]const Lin {
+        var out: std.ArrayList(Lin) = .empty;
+        each: for (rows) |row| {
+            var made: Lin = constant(row.c);
+            for (row.terms) |term| {
+                const param = term.v / 2;
+                const length = term.v % 2 == 1;
+                const given: ?Lin = if (param == params)
+                    (if (applied.result) |result| (if (length) result[1] else result[0]) else null)
+                else if (param < params)
+                    (if (param < args.len) (if (length) args[param].length else args[param].lin) else null)
+                else at: {
+                    const width = std.math.cast(u16, params) orelse break :at null;
+                    const offset = std.math.sub(Var, term.v, placeSlot(width, 0, false, false)) catch break :at null;
+                    const k = offset / 4;
+                    if (k >= entries.len) break :at null;
+                    if (offset % 4 < 2) break :at entries[k].before[@intFromBool(length)];
+                    if (!applied.exits) break :at null;
+                    const p = entries[k].place orelse break :at null;
+                    break :at try single(f.a, try f.placeVar(p, length));
+                };
+                const lin = given orelse continue :each;
+                made = (try combine(f.a, made, 1, lin, term.k)) orelse continue :each;
+            }
+            try out.append(f.a, made);
+        }
+        return out.items;
+    }
 
     /// `value`, where it reads a place, or with `later` any variable, held in the call's own
     /// temporaries for its `ordinal`th operand (the receiver's first, `2 * ordinal` and the
@@ -3364,32 +3485,55 @@ const Frame = struct {
     }
 
     /// The summary of the one function of the program a call reaches, at this pointer width.
-    fn summaryOf(f: *Frame, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool } {
+    fn summaryOf(f: *Frame, node: Ast.Node.Index, callee: Ast.Node.Index) Error!?struct { rows: []const Lin, failing: []const Lin, params: usize, places: []const SlotPlace, written: ?[]const Facts.Decl, fails: bool, own: bool } {
         const decl = switch (try f.c.facts.resolve(f.file, callee)) {
             .function => |d| d,
             else => return null,
         };
-        if (!try Program.owns(f.c, decl.file)) return null;
+        // std's functions are read only where the program calls them, and give only their
+        // failing exits: what they succeed with and write stays unknown.
+        const own = try Program.owns(f.c, decl.file);
+        if (!own and !try Program.owns(f.c, f.file)) return null;
         const callee_tree = &f.c.project.at(decl.file).file.tree;
         const callee_model = &f.c.project.at(decl.file).model;
         const proto = callee_model.declarations[@backingInt(decl.index)].node;
         const function = callee_model.parentOf(proto) orelse return null;
         if (callee_tree.nodeTag(function) != .fn_decl) return null;
-        const read = try analysis(f.c, decl.file, function, f.width);
-        if (!read.supported) return null;
-        const summary = read.summary orelse return null;
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const full = callee_tree.fullFnProto(&proto_buffer, proto) orelse return null;
+        // A generic std function is read at this call's binding, its parameters typed by what
+        // the call gives (`divCeil(usize, n, d)` reads `d` as a usize).
+        const bound: ?*const Facts.Env = if (!generic(callee_tree, full)) null else bound: {
+            const made = (try Facts.calls.at(f.c.facts, f.file, node)) orelse return null;
+            break :bound switch (try f.c.facts.bindCall(&made, decl, f.bound)) {
+                .reading => |reading| reading,
+                .unknown => return null,
+            };
+        };
+        const read = try analysisIn(f.c, bound, decl.file, function, f.width);
+        if (!read.supported) return null;
+        const summary = read.summary orelse return null;
         const result = full.ast.return_type.unwrap() orelse return null;
         const fails = callee_tree.nodeTag(result) == .error_union or
             (callee_tree.firstToken(result) > 0 and callee_tree.tokenTag(callee_tree.firstToken(result) - 1) == .bang) or
             try mayFail(f.c, decl.file, result);
-        return .{ .rows = summary.rows, .params = summary.params, .places = summary.places, .written = summary.written, .fails = fails };
+        if (!own) return .{ .rows = &.{}, .failing = summary.failing, .params = summary.params, .places = &.{}, .written = null, .fails = fails, .own = false };
+        return .{ .rows = summary.rows, .failing = summary.failing, .params = summary.params, .places = summary.places, .written = summary.written, .fails = fails, .own = true };
     }
 
     /// Whether a result type named rather than written in place (`R`, `Result(u64)`) may be an
     /// error union: it resolves to one, to a choice among types one of which is, or to nothing
     /// known.
+    /// Whether a function is generic: a parameter it takes at compile time or of any type.
+    fn generic(tree: *const Ast, proto: Ast.full.FnProto) bool {
+        var it = proto.iterate(tree);
+        while (it.next()) |param| {
+            if (param.anytype_ellipsis3 != null) return true;
+            if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
+        }
+        return false;
+    }
+
     fn mayFail(c: *Context, file: Project.FileId, node: Ast.Node.Index) Error!bool {
         return switch (try c.facts.resolve(file, node)) {
             .error_union, .unknown => true,

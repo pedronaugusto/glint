@@ -59,3 +59,9 @@ pub fn untaken(c: *Context, file: Project.FileId, prong: Ast.Node.Index) Context
 pub fn present(c: *Context, file: Project.FileId, unwrap: Ast.Node.Index) Context.Error!bool {
     return Bounds.cleared(c, file, unwrap, .present);
 }
+
+/// A `catch` whose operand never fails on any path to it (Bounds' failing exits of its call's
+/// callee, ruled out by what the call is given): its answer never runs.
+pub fn unfailing(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    return Bounds.cleared(c, file, node, .unfailing);
+}
