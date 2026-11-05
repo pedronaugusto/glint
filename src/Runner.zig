@@ -11,6 +11,7 @@ const Context = @import("RuleContext.zig");
 const Fix = @import("Fix.zig");
 const Builtins = @import("Builtins.zig");
 const Metrics = @import("Metrics.zig");
+const Summary = @import("Summary.zig");
 const Contract = @import("AegisContract.zig");
 const AegisPack = @import("AegisPack.zig");
 
@@ -49,6 +50,9 @@ pub const Options = struct {
     /// a canceled run is `Canceled`. Null: none is asked, and a canceller
     /// waits for the whole project.
     io: ?std.Io = null,
+    /// Summaries' cross-check (`Facts.check_records`): every record a query builds is read back
+    /// and compared with the live answer, and any difference stops the run.
+    summary_check: bool = false,
 };
 pub const FileConfig = struct { file: Project.FileId, config: rules.Config };
 
@@ -76,7 +80,7 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
     }
     try validateRules(config, definitions);
     const known = try knownRules(a, definitions);
-    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = Contract.package, .remaining = config.fact_budget } };
+    var runner: Runner = .{ .a = a, .project = project, .config = config, .base = config, .files = options.files, .definitions = definitions, .facts = .{ .project = project, .gpa = a, .known = Contract.package, .remaining = config.fact_budget, .check_records = if (options.summary_check) &Summary.check else null } };
     defer runner.facts.deinit();
     var metrics: std.ArrayList(Report.Metrics.File) = .empty;
     var total: Report.Metrics.Counts = .{};

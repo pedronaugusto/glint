@@ -338,6 +338,13 @@ pub const Reader = struct {
         return @fromBackingInt(@intCast(index));
     }
 
+    fn optionalNode(self: *Reader, file: Project.FileId) ReadError!?Ast.Node.Index {
+        const n = try self.number();
+        if (n == 0) return null;
+        if (n - 1 >= self.facts.project.at(file).file.tree.nodes.len) return error.Malformed;
+        return @fromBackingInt(@intCast(n - 1));
+    }
+
     /// What a `Writer.seen` reference names: the number of one read before, or null where the
     /// thing itself follows.
     fn reference(self: *Reader, len: usize) ReadError!?usize {
@@ -490,6 +497,202 @@ pub const Reader = struct {
         return n;
     }
 };
+
+// A file's access index (`accesses.writesOf`, `accesses.readsOf`): every site of the file that
+// may write or read a place, each in ids alone. Built from the file and what it resolves to, so
+// one summary's record serves every run of the same sources.
+const accesses = Facts.accesses;
+const Site = accesses.Site;
+const Shape = accesses.Shape;
+
+pub fn writeAccesses(w: *Writer, index: *const accesses.File) WriteError!void {
+    try w.number(@intCast(index.places.count()));
+    var places = index.places.iterator();
+    while (places.next()) |entry| {
+        try w.number(@backingInt(std.meta.activeTag(entry.key_ptr.*)));
+        switch (entry.key_ptr.*) {
+            inline else => |d| try w.decl(d),
+        }
+        try writeSites(w, entry.value_ptr.items);
+    }
+    try w.number(@intCast(index.shapes.count()));
+    var shapes = index.shapes.iterator();
+    while (shapes.next()) |entry| {
+        try writeShape(w, entry.key_ptr.*);
+        try writeSites(w, entry.value_ptr.items);
+    }
+    try w.number(@intCast(index.named.count()));
+    var named = index.named.iterator();
+    while (named.next()) |entry| {
+        try w.string(entry.key_ptr.*);
+        try writeSites(w, entry.value_ptr.items);
+    }
+    try writeSites(w, index.unresolved.items);
+    try writeSites(w, index.stores.items);
+    try w.number(@intCast(index.through.count()));
+    var through = index.through.iterator();
+    while (through.next()) |entry| {
+        try w.number(@backingInt(entry.key_ptr.*));
+        try w.number(@intCast(entry.value_ptr.items.len));
+        for (entry.value_ptr.items) |one| try writeShape(w, one);
+    }
+}
+
+fn writeShape(w: *Writer, shape: Shape) WriteError!void {
+    try w.source(shape.file);
+    try w.number(@backingInt(shape.scope));
+}
+
+fn writeSites(w: *Writer, sites: []const Site) WriteError!void {
+    try w.number(@intCast(sites.len));
+    for (sites) |site| {
+        try w.source(site.file);
+        try w.number(@backingInt(site.node));
+        try w.number(if (site.target) |t| @backingInt(t) + 1 else 0);
+        try w.number(@backingInt(site.kind));
+        try w.number(if (site.value) |v| @backingInt(v) + 1 else 0);
+        try w.number(@backingInt(site.reach));
+        try w.number(@as(u32, @intFromBool(site.part)) | (@as(u32, @intFromBool(site.through)) << 1) | (@as(u32, @intFromBool(site.deferred)) << 2) | (@as(u32, @intFromBool(site.computed)) << 3));
+        const operator = site.operator orelse {
+            try w.number(0);
+            continue;
+        };
+        switch (operator) {
+            .op => |o| {
+                try w.number(1);
+                try w.number(@backingInt(o.op));
+                try w.number(@backingInt(o.overflow));
+            },
+            .unknown => |why| {
+                try w.number(2);
+                try w.number(@backingInt(why));
+            },
+        }
+    }
+}
+
+/// A file's access index as `writeAccesses` wrote it, made on `r.facts.gpa`.
+pub fn readAccesses(r: *Reader) ReadError!*accesses.File {
+    const gpa = r.facts.gpa;
+    const index = try gpa.create(accesses.File);
+    index.* = .{};
+    for (0..try r.count()) |_| {
+        const place: accesses.Place = switch (try r.enumeration(std.meta.Tag(accesses.Place))) {
+            inline else => |tag| @unionInit(accesses.Place, @tagName(tag), try r.decl()),
+        };
+        try index.places.putNoClobber(gpa, place, try readSites(r));
+    }
+    for (0..try r.count()) |_| {
+        const shape = try readShape(r);
+        try index.shapes.putNoClobber(gpa, shape, try readSites(r));
+    }
+    for (0..try r.count()) |_| {
+        const name = try r.string();
+        try index.named.putNoClobber(gpa, name, try readSites(r));
+    }
+    index.unresolved = try readSites(r);
+    index.stores = try readSites(r);
+    for (0..try r.count()) |_| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(try r.number()));
+        var held: std.ArrayList(Shape) = .empty;
+        for (0..try r.count()) |_| try held.append(gpa, try readShape(r));
+        try index.through.putNoClobber(gpa, node, held);
+    }
+    return index;
+}
+
+fn readShape(r: *Reader) ReadError!Shape {
+    const file = try r.source();
+    const scope = try r.number();
+    if (scope >= r.facts.project.at(file).model.scopes.len) return error.Malformed;
+    return .{ .file = file, .scope = @fromBackingInt(scope) };
+}
+
+fn readSites(r: *Reader) ReadError!std.ArrayList(Site) {
+    var sites: std.ArrayList(Site) = .empty;
+    const n = try r.count();
+    try sites.ensureTotalCapacityPrecise(r.facts.gpa, n);
+    for (0..n) |_| {
+        const file = try r.source();
+        const node = try r.node(file);
+        const target = try r.optionalNode(file);
+        const kind = try r.enumeration(accesses.Kind);
+        const value = try r.optionalNode(file);
+        const reach = try r.enumeration(accesses.Reach);
+        const flags = try r.number();
+        if (flags >= 16) return error.Malformed;
+        const operator: ?accesses.Update = switch (try r.number()) {
+            0 => null,
+            1 => blk: {
+                const op = try r.enumeration(@FieldType(accesses.Operator, "op"));
+                break :blk .{ .op = .{ .op = op, .overflow = try r.enumeration(@FieldType(accesses.Operator, "overflow")) } };
+            },
+            2 => .{ .unknown = try r.enumeration(Facts.Unknown) },
+            else => return error.Malformed,
+        };
+        sites.appendAssumeCapacity(.{ .file = file, .node = node, .target = target, .kind = kind, .value = value, .reach = reach, .part = flags & 1 != 0, .through = flags & 2 != 0, .deferred = flags & 4 != 0, .computed = flags & 8 != 0, .operator = operator });
+    }
+    return sites;
+}
+
+/// Whether two access indexes hold the same sites, each list in the same order.
+pub fn sameAccesses(a: *const accesses.File, b: *const accesses.File) bool {
+    if (a.places.count() != b.places.count() or a.shapes.count() != b.shapes.count() or a.named.count() != b.named.count() or a.through.count() != b.through.count()) return false;
+    var places = a.places.iterator();
+    while (places.next()) |entry| if (!sameSites(entry.value_ptr.items, (b.places.get(entry.key_ptr.*) orelse return false).items)) return false;
+    var shapes = a.shapes.iterator();
+    while (shapes.next()) |entry| if (!sameSites(entry.value_ptr.items, (b.shapes.get(entry.key_ptr.*) orelse return false).items)) return false;
+    var named = a.named.iterator();
+    while (named.next()) |entry| if (!sameSites(entry.value_ptr.items, (b.named.get(entry.key_ptr.*) orelse return false).items)) return false;
+    var through = a.through.iterator();
+    while (through.next()) |entry| {
+        const other = (b.through.get(entry.key_ptr.*) orelse return false).items;
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(entry.value_ptr.items), std.mem.sliceAsBytes(other))) return false;
+    }
+    return sameSites(a.unresolved.items, b.unresolved.items) and sameSites(a.stores.items, b.stores.items);
+}
+
+fn sameSites(a: []const Site, b: []const Site) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.meta.eql(x, y)) return false;
+    return true;
+}
+
+/// Each file by its run id: a run's own names, for a check that reads back into the run that
+/// wrote (`check`).
+const RunNames = struct { names: ?Names = null };
+
+/// The cross-check `Facts.check_records` runs: each kind of record read back as it is built.
+pub const check: Facts.RecordCheck = .{ .accesses = checkAccesses };
+
+/// Summaries' cross-check (`Facts.check_records`): `index`, `file`'s access index, written and
+/// read back into the same run, must be the same index. A difference is a record that leaves
+/// out what the live answer holds, so it stops the run rather than let a record answer for it.
+pub fn checkAccesses(facts: *Facts, file: Project.FileId, index: *const accesses.File, of: []const u8) Facts.ResolveError!void {
+    const kept = try facts.memo(RunNames);
+    if (kept.names == null) {
+        const of_file = try facts.gpa.alloc(?[]const u8, facts.project.sources.len);
+        var names: Names = .{ .of = of_file };
+        for (facts.project.sources, of_file) |source, *name| {
+            name.* = try facts.gpa.print("{d}", .{@backingInt(source.id)});
+            try names.files.put(facts.gpa, name.*.?, source.id);
+        }
+        kept.names = names;
+    }
+    var w = Writer.init(facts.gpa, facts, &kept.names.?) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the run is named
+    };
+    defer w.deinit();
+    writeAccesses(&w, index) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the run is named
+    };
+    var r = Reader.init(facts, &kept.names.?, w.bytes.items) catch |err| std.debug.panic("summary cross-check: {s} of {s} does not read back: {t}", .{ of, facts.project.at(file).input.name, err });
+    defer r.deinit();
+    const back = readAccesses(&r) catch |err| std.debug.panic("summary cross-check: {s} of {s} does not read back: {t}", .{ of, facts.project.at(file).input.name, err });
+    if (!r.done() or !sameAccesses(index, back)) std.debug.panic("summary cross-check: {s} of {s} reads back other sites", .{ of, facts.project.at(file).input.name });
+}
 
 fn toEnum(comptime E: type, n: u32) error{Malformed}!E {
     return std.enums.fromInt(E, n) orelse error.Malformed;

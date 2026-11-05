@@ -100,6 +100,14 @@ walk: ?*Analysis = null,
 /// The memos (`memo`) handed out while the analysis is built, made then or before: each is
 /// replaced once it is built (`dropMemos`).
 walked: std.AutoHashMapUnmanaged(usize, void) = .empty,
+/// Summaries' cross-check (`Summary.check`): set, each record a query builds is written and
+/// read back, and a record that reads back other than the live answer stops the run.
+check_records: ?*const RecordCheck = null,
+
+/// What reads a record back for the cross-check (`check_records`), one for each kind of record.
+pub const RecordCheck = struct {
+    accesses: *const fn (*Facts, Project.FileId, *const accesses.File, []const u8) ResolveError!void,
+};
 
 pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
@@ -10891,7 +10899,7 @@ pub const accesses = struct {
     }
 
     /// A container by its identity.
-    const Shape = struct { file: Project.FileId, scope: Model.Scope.Id };
+    pub const Shape = struct { file: Project.FileId, scope: Model.Scope.Id };
     /// A container reached while collecting, and whether its own memory is written there.
     const Seen = struct { shape: Shape, own: bool };
 
@@ -11337,6 +11345,7 @@ pub const accesses = struct {
         try state.writes.put(facts.gpa, file, index);
         _ = state.walked.remove(file);
         try walk.settle();
+        if (facts.check_records) |check| try check.accesses(facts, file, index, "writes");
         return index;
     }
 
@@ -11368,6 +11377,7 @@ pub const accesses = struct {
         var walk: Walk = .{ .facts = facts, .file = file, .index = index };
         try walk.reads();
         try state.reads.put(facts.gpa, file, index);
+        if (facts.check_records) |check| try check.accesses(facts, file, index, "reads");
         return index;
     }
 

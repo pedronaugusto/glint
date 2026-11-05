@@ -26,6 +26,8 @@ const Options = struct {
     fix: bool = false,
     /// The escapes of a run before, by which the fix names an escape in the older form.
     escapes_before: []const Fix.Escaped = &.{},
+    /// Summaries' cross-check (`Runner.Options.summary_check`).
+    summary_check: bool = false,
     /// Whether the aegis pack runs: on by itself where a file imports aegis, on whatever the
     /// files import (`--aegis`, the `aegis` profile), or as `--only` selects its rules.
     aegis: enum { imported, forced, selected } = .imported,
@@ -240,6 +242,7 @@ pub const Arguments = struct {
     metrics: bool = false,
     fix: bool = false,
     escapes_before: ?[]const u8 = null,
+    summary_check: bool = false,
     zig_lib_path: ?[]const u8 = null,
     module: []const []const u8 = &.{},
     root: []const []const u8 = &.{},
@@ -267,6 +270,7 @@ pub const Arguments = struct {
             .strict_suppressions = .{ .negatable = false, .help = "A suppression that suppresses nothing makes the run incomplete" },
             .metrics = .{ .negatable = false, .help = "Count each file's functions and assertion calls into the report" },
             .fix = .{ .negatable = false, .help = "Apply each finding's deterministic fix to its file (the aegis pack's), and remove escapes that cover nothing; the report is the run before them" },
+            .summary_check = .{ .negatable = false, .help = "Check that every record of the run's facts reads back as it was built (summaries' cross-check); a difference stops the run" },
             .escapes_before = .{ .value_name = "FILE", .hint = .file, .help = "The escapes a run before reported (its text report, or preflight's escapes.txt): --fix names an escape in the older form, at that place with those words, with only the rules listed for it there that find something now, and leaves one not listed to its owner; never with --only" },
             .zig_lib_path = .{ .value_name = "DIR", .hint = .directory, .section = "Inputs", .help = "Zig's library, for std's imports" },
             .module = .{ .value_name = "NAME=FILE", .section = "Inputs", .help = "A module the files import by name, and its root file, repeated" },
@@ -309,6 +313,7 @@ fn options(a: std.mem.Allocator, io: std.Io, arguments: Arguments, definitions: 
     if (arguments.max_line_length) |n| result.config.max_line_length = n;
     if (arguments.max_function_lines) |n| result.config.max_function_lines = n;
     if (arguments.fact_budget) |n| result.config.fact_budget = n;
+    result.summary_check = arguments.summary_check;
     if (arguments.strict_suppressions) result.config.strict_suppressions = true;
     if (arguments.metrics) result.config.metrics = true;
     result.fix = arguments.fix;
@@ -445,7 +450,7 @@ fn executeInner(gpa: std.mem.Allocator, result_a: std.mem.Allocator, io: std.Io,
     var config = configured.config;
     const importer = if (configured.aegis == .imported) try AegisPack.importer(gpa, &project) else null;
     if (importer != null) try packOn(a, &config, definitions);
-    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io });
+    var report = try Runner.runConfigured(gpa, &project, config, .{ .project_rules = project_rules, .io = io, .summary_check = configured.summary_check });
     defer report.deinit();
     record.outcome = .output_failure;
     var rendered: std.Io.Writer.Allocating = .init(a);

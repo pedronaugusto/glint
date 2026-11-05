@@ -27,8 +27,20 @@ const lib =
     \\    if (on) return Box(if (on) u8 else u16);
     \\    return Box(u32);
     \\}
-    \\pub const Plain = struct { x: u32 };
+    \\pub const Plain = struct { x: u32, next: ?*Plain = null, f: *const fn () void = plain };
     \\pub fn plain() void {}
+    \\pub var global: Plain = .{ .x = 1 };
+    \\pub fn set(p: *Plain, any: anytype, bytes: []u8) void {
+    \\    p.x = 2;
+    \\    global.x +%= 1;
+    \\    p.next = &global;
+    \\    any.thing = 3;
+    \\    @memcpy(bytes, std.mem.asBytes(p));
+    \\    defer p.f = plain;
+    \\    const q: Plain = p.*;
+    \\    _ = q;
+    \\}
+    \\const std = @import("std");
 ;
 
 const root =
@@ -210,4 +222,34 @@ test "a stream is refused against other sources, cut short, or of another versio
     var other = try first.arena.allocator().dupe(u8, bytes);
     other[0] = Summary.version + 1;
     try std.testing.expectError(error.Version, first.read(other, live.len));
+}
+
+test "a file's access index reads back into another run of the same sources as the index that run builds" {
+    var first: Run = undefined;
+    try first.init(true, lib);
+    defer first.deinit();
+    var second: Run = undefined;
+    try second.init(false, lib);
+    defer second.deinit();
+    first.facts.check_records = &Summary.check;
+    var writer = try Summary.Writer.init(std.testing.allocator, &first.facts, &first.names);
+    defer writer.deinit();
+    var sites: usize = 0;
+    for (first.project.sources) |source| {
+        const writes = try Facts.accesses.writesOf(&first.facts, source.id);
+        const reads = try Facts.accesses.readsOf(&first.facts, source.id);
+        sites += writes.stores.items.len + reads.places.count();
+        try Summary.writeAccesses(&writer, writes);
+        try Summary.writeAccesses(&writer, reads);
+    }
+    try std.testing.expect(sites > 8);
+    var reader = try Summary.Reader.init(&second.facts, &second.names, writer.bytes.items);
+    defer reader.deinit();
+    // In the order the first run wrote them: lib, then root.
+    for ([_][]const u8{ "lib.zig", "root.zig" }) |name| {
+        const id = second.names.files.get(name).?;
+        try std.testing.expect(Summary.sameAccesses(try Facts.accesses.writesOf(&second.facts, id), try Summary.readAccesses(&reader)));
+        try std.testing.expect(Summary.sameAccesses(try Facts.accesses.readsOf(&second.facts, id), try Summary.readAccesses(&reader)));
+    }
+    try std.testing.expect(reader.done());
 }
