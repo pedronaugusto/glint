@@ -17,8 +17,8 @@
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=review-0.18.6#bf1ffd79c9864d5d0db4f56356b50d6c7b0c3e55",
-            .hash = "preflight-0.18.6-LX1ZwrYKGAAxFzKCRnsR9_b4EdKezpl_XJG2ZkMRVc7A",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=bay-zon-inputs#8d34d5782840534c5159900e28dd67967d68104f",
+            .hash = "preflight-0.18.6-LX1Zwl4UGAC-nadC030vzxG43P7pCwBDvmLDXMP-hjMw",
         },
 
         .shakedown = .{

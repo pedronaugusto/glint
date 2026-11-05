@@ -454,6 +454,29 @@ test "A007 and A008 read a tuple by its parts, a chain of orelse to its payload,
     );
     try std.testing.expectEqual(@as(usize, 0), unloaded.findings);
     try std.testing.expectEqual(@as(usize, 1), unloaded.undecided);
+    // The same import of a manifest the run loads is the value its ZON gives, read as any
+    // value is: a build script's `@import("build.zig.zon")` holds strings, a number, enum
+    // literals and records of them, no lock and no key.
+    const manifest: sources.Extra = .{ .name = "build.zig.zon", .kind = .zon, .bytes =
+        \\.{
+        \\    .name = .pkg,
+        \\    .version = "0.1.0",
+        \\    .fingerprint = 0x77d01758a12937de,
+        \\    .paths = .{ "build.zig", "build.zig.zon", "src" },
+        \\    .dependencies = .{ .dep = .{ .url = "git+https://example.com/dep?ref=v1#00", .hash = "dep-1.0.0-AAAA" } },
+        \\}
+    };
+    const build_script =
+        \\const zon = @import("build.zig.zon");
+        \\pub fn version() []const u8 {
+        \\    return zon.version;
+        \\}
+    ;
+    for ([_]glint.Rule{ pack.shared_state, pack.secrets }) |rule| {
+        const loaded = try runWith(rule, build_script, &(std_files ++ [_]sources.Extra{manifest}), &(std_imports ++ [_]sources.ExtraImport{.{ .spelling = "build.zig.zon", .target = std_files.len }}));
+        try std.testing.expectEqual(@as(usize, 0), loaded.findings);
+        try std.testing.expectEqual(@as(usize, 0), loaded.undecided);
+    }
 }
 
 /// A dependency's records and type functions: what it holds is the program's, judged where the
