@@ -4322,6 +4322,56 @@ test "A009 keeps what it leaves undecided in a dependency's function: every call
     try std.testing.expectEqual(@as(usize, 2), undecided);
 }
 
+test "A013 judges a dependency's contracts at the call that gives them input: an assert, an unreachable a branch chooses, a `.?`, and one through the dependency's own call" {
+    // `dep.zig` is a dependency's file the run does not select (main's provenance ruling):
+    // `check(1)`, `choose(2)` and `first(0)` take the program's own values; `own` reads
+    // its own input, which the dependency's own lint judges.
+    const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
+        \\const std = @import("std");
+        \\pub fn check(n: u8) void {
+        \\    std.debug.assert(n < 10);
+        \\}
+        \\pub fn choose(n: u8) u8 {
+        \\    if (n > 3) unreachable;
+        \\    return n;
+        \\}
+        \\pub fn first(x: ?u8) u8 {
+        \\    return x.?;
+        \\}
+        \\pub fn via(n: u8) void {
+        \\    check(n);
+        \\}
+        \\pub fn own(r: *std.Io.Reader) !void {
+        \\    std.debug.assert(try r.takeByte() < 10);
+        \\}
+    };
+    var project = try sources.projectAs(std.testing.allocator,
+        \\const std = @import("std");
+        \\const dep = @import("dep.zig");
+        \\pub fn f(r: *std.Io.Reader) !void {
+        \\    const n = try r.takeByte();
+        \\    dep.check(n);
+        \\    _ = dep.choose(n);
+        \\    _ = dep.first(n);
+        \\    dep.via(n);
+        \\    dep.check(1);
+        \\    _ = dep.choose(2);
+        \\    _ = dep.first(0);
+        \\    try dep.own(r);
+        \\}
+    , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.contracts, .level = .report }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    for (report.coverage) |entry| try std.testing.expect(entry.rule == null);
+    const lines = [_]u32{ 5, 6, 7, 8 };
+    try std.testing.expectEqual(lines.len, report.diagnostics.len);
+    for (report.diagnostics, lines) |found, line| {
+        try std.testing.expectEqual(line, found.span.line);
+        try std.testing.expect(std.mem.find(u8, found.message, "input passed to ") != null);
+    }
+}
+
 test "A020 finds a loop on input or without bound that gives its Io to nothing, or drops the cancel it checks for" {
     // `quiet` leaves on a cancel but hands its caller no error.Canceled: the task runs on.
     try expect(pack.cancellation,

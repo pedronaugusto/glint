@@ -199,6 +199,13 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
     try judgedAtCalls(c, flow, rule, integers);
 }
 
+/// A013 (`Danger.contracts`), with each contract of a dependency's function judged at the calls
+/// that give it input (`judgedAtCalls`).
+pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
+    try Danger.contracts(c, rule);
+    try judgedAtCalls(c, try Taint.get(c, Danger.peer_input), rule, contracts);
+}
+
 /// Whether a shift of `operand` takes no amount past its width: an integer whose width is a
 /// power of two, whose amount type (`Log2Int`) holds only amounts below it.
 fn amountFits(c: *Context, operand: Ast.Node.Index) Context.Error!bool {
@@ -1565,14 +1572,12 @@ fn judged(c: *Context, flow: ?Taint.Fact, rule: Rule, node: Ast.Node.Index, leve
     const tree = &c.project.at(c.file).file.tree;
     // Read in a file the run does not select: what the sink takes from its function's
     // parameters, judged at the calls into it (`judgedAtCalls`).
-    if (flow) |fact| if (fact.flow.recording) |list| {
+    if (flow) |fact| if (fact.flow.recording != null) {
         // Null outside the functions the fact reads: a container's declaration, evaluated as the
         // program compiles, which no input reaches.
-        const function = Taint.functionKey(fact, c.file, node) orelse return;
         const given = (try Taint.givenAt(c, fact, c.file, node)) orelse return;
         // Through a call that does not resolve, what it takes from the parameters is not known.
-        try list.append(c.allocator, .{ .at = .{ .file = c.file, .node = node }, .holder = function, .given = given, .least = least, .message = message, .undecided = try Taint.unknownAt(c, fact, c.file, node) });
-        return;
+        return Taint.recordSink(c, fact, c.file, node, given, try Taint.unknownAt(c, fact, c.file, node), least, message);
     };
     if (level == .unknown) return c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "a value that passed through a call that does not resolve may be input here");
     if (!level.reaches(least)) return;

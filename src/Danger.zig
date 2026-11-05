@@ -937,7 +937,9 @@ fn comparison(tree: *const Ast, node: Ast.Node.Index) bool {
 /// `unreachable` on a branch input chooses, a `catch unreachable` or `orelse unreachable` on a
 /// call that reads input or is given it. Input must meet an error, never a panic, or undefined
 /// behaviour in a consumer's ReleaseFast build. An internal invariant no input reaches is the
-/// program's to state, as Zig's own checks are; ReleaseFast is the consumer's choice.
+/// program's to state, as Zig's own checks are; ReleaseFast is the consumer's choice. In a file
+/// the run does not select, each contract is kept with what it takes from its function's
+/// parameters, judged at the calls into it (`DangerFlow.contracts`).
 pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
     const flow = try Taint.get(c, peer_input);
     try asserts(c, rule, flow);
@@ -955,12 +957,15 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         // A prong no path takes never runs what it holds (`else => unreachable` past what
         // the subject can be), nor does a `catch` whose call never fails there.
         if (try neverRuns(c, node)) continue;
+        const message = "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error";
+        var reads: Reads = .{};
+        try chosenBy(c, flow, node, &reads);
         // `x.?` is `x orelse unreachable`: what makes `x` null chooses it too.
-        const chosen = try chosenBy(c, flow, node);
-        switch (if (unwrap) chosen.join(try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?)) else chosen) { // unreachable: a `.?` carries its operand
+        if (unwrap) try failedBy(c, flow, Facts.accesses.carriedFrom(tree, node).?, &reads); // unreachable: a `.?` carries its operand
+        switch ((try contractLevel(c, flow, node, reads, message)) orelse continue) {
             .clean => {},
             .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a branch that passed through a call that does not resolve may be input's to choose"),
-            .data, .number => try c.at(rule, token, "unreachable on a path input chooses: a peer reaches a panic, or undefined behaviour in a consumer's ReleaseFast build; return an error"),
+            .data, .number => try c.at(rule, token, message),
         }
     }
 }
@@ -984,50 +989,77 @@ fn neverRuns(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     return false;
 }
 
-/// How far input chooses the path to `node`: the conditions of the branches and loops it is
-/// in, the operands of the switches whose prongs hold it, and a `catch` or `orelse` it is the
-/// answer of, through the call before it (what the call reads and is given), up to its
+/// What A013's verdict on a contract reads: the values whose level it takes, whether a value
+/// past what is followed may hold any (`deep`), and whether a call it follows reads a peer
+/// itself (`read`).
+const Reads = struct {
+    values: std.ArrayList(Ast.Node.Index) = .empty,
+    deep: bool = false,
+    read: bool = false,
+};
+
+/// The level of input at the contract `node` from what it reads: null in a file the run does
+/// not select, where the contract is kept with what it takes from its function's parameters
+/// (`Taint.recordSink`; the function's own input is the dependency's own lint's), undecided
+/// where a value is not followed or passed through a call that does not resolve.
+fn contractLevel(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, reads: Reads, message: []const u8) Context.Error!?Taint.Level {
+    if (flow.flow.recording != null) {
+        var given: Taint.Dep = .{};
+        var undecided = reads.deep;
+        for (reads.values.items) |value| {
+            given = try given.join(c.allocator, (try Taint.givenAt(c, flow, c.file, value)) orelse continue);
+            if (try Taint.unknownAt(c, flow, c.file, value)) undecided = true;
+        }
+        try Taint.recordSink(c, flow, c.file, node, given, undecided, .data, message);
+        return null;
+    }
+    var out: Taint.Level = if (reads.deep) .unknown else .clean;
+    if (reads.read) out = out.join(.data);
+    for (reads.values.items) |value| out = out.join(try Taint.levelAt(c, flow, c.file, value));
+    return out;
+}
+
+/// What chooses the path to `node`, put in `reads`: the conditions of the branches and loops
+/// it is in, the operands of the switches whose prongs hold it, and a `catch` or `orelse` it is
+/// the answer of, through the call before it (what the call reads and is given), up to its
 /// function.
-fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!Taint.Level {
+fn chosenBy(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, reads: *Reads) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    var out: Taint.Level = .clean;
     var at = node;
     while (model.parentOf(at)) |parent| : (at = parent) {
         switch (tree.nodeTag(parent)) {
             .fn_decl => break,
             .@"catch", .@"orelse" => {
                 const lhs, const rhs = tree.nodeData(parent).node_and_node;
-                if (rhs == at) out = out.join(try failedBy(c, flow, lhs));
+                if (rhs == at) try failedBy(c, flow, lhs, reads);
             },
             else => {},
         }
         if (tree.fullIf(parent)) |branch| {
-            if (branch.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, branch.ast.cond_expr));
+            if (branch.ast.cond_expr != at) try Taint.conditionValues(c, c.file, branch.ast.cond_expr, &reads.values);
         } else if (tree.fullWhile(parent)) |loop| {
-            if (loop.ast.cond_expr != at) out = out.join(try Taint.conditionAt(c, flow, c.file, loop.ast.cond_expr));
+            if (loop.ast.cond_expr != at) try Taint.conditionValues(c, c.file, loop.ast.cond_expr, &reads.values);
         } else if (tree.fullSwitchCase(parent) != null) {
             const choice = model.parentOf(parent) orelse continue;
             const whole = tree.fullSwitch(choice) orelse continue;
-            out = out.join(try Taint.levelAt(c, flow, c.file, whole.ast.condition));
+            try reads.values.append(c.allocator, whole.ast.condition);
         }
     }
-    return out;
 }
 
-/// How far input can make `expression` fail: what it holds, and what each call whose result
-/// it gives (`Facts.copiedParts`: through parentheses, `try`, a branch, `orelse`) reads and is
-/// given; a value nested past what is followed may hold any.
-fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index) Context.Error!Taint.Level {
-    var out = try Taint.levelAt(c, flow, c.file, expression);
+/// What can make `expression` fail, put in `reads`: what it holds, and what each call whose
+/// result it gives (`Facts.copiedParts`: through parentheses, `try`, a branch, `orelse`) reads
+/// and is given; a value nested past what is followed may hold any.
+fn failedBy(c: *Context, flow: Taint.Fact, expression: Ast.Node.Index, reads: *Reads) Context.Error!void {
+    try reads.values.append(c.allocator, expression);
     const copied = try c.facts.copiedParts(c.file, expression);
-    if (copied.deep != null) out = out.join(.unknown);
+    if (copied.deep != null) reads.deep = true;
     for (copied.results) |call| {
         const reached = (try Taint.reached(c, flow, c.file, call)) orelse continue;
-        for (reached.args) |arg| out = out.join(try Taint.levelAt(c, flow, c.file, arg));
-        if (try Taint.isRead(c, flow, c.file, call)) out = out.join(.data);
+        try reads.values.appendSlice(c.allocator, reached.args);
+        if (try Taint.isRead(c, flow, c.file, call)) reads.read = true;
     }
-    return out;
 }
 
 /// A013's `std.debug.assert` sites whose condition holds input, each with its fix where the
@@ -1079,7 +1111,9 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
         };
         if (args.len != 1) continue;
         const token = tree.firstToken(node);
-        switch (try Taint.conditionAt(c, flow, c.file, args[0])) {
+        var reads: Reads = .{};
+        try Taint.conditionValues(c, c.file, args[0], &reads.values);
+        switch ((try contractLevel(c, flow, node, reads, message)) orelse continue) {
             .clean => {},
             .unknown => try c.undecided(rule, tree.tokenStart(token), .unresolved, "a condition that passed through a call that does not resolve may hold input"),
             .data, .number => {

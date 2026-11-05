@@ -113,7 +113,7 @@ fn checkUnits(c: *Context) Context.Error!void {
     if (try begin(c, units)) try Danger.units(c, units);
 }
 fn checkContracts(c: *Context) Context.Error!void {
-    if (try begin(c, contracts)) try Danger.contracts(c, contracts);
+    if (try begin(c, contracts)) try Flows.contracts(c, contracts);
 }
 fn checkLifetimes(c: *Context) Context.Error!void {
     if (!try begin(c, lifetimes)) return;

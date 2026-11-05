@@ -2750,6 +2750,15 @@ pub fn readHere(fact: Fact, file: Project.FileId, node: Ast.Node.Index) bool {
     return within.contains(@backingInt(function));
 }
 
+/// Where a rule reads a file the run does not select (`Flow.recording`), the sink at `node`
+/// kept with what it takes from its function's parameters (`given`, as `givenAt` keeps it), to
+/// be judged at the calls into that function; a sink outside a function is kept by none.
+pub fn recordSink(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep, undecided: bool, least: Level, message: []const u8) Allocator.Error!void {
+    const list = fact.flow.recording orelse return;
+    const function = functionKey(fact, file, node) orelse return;
+    try list.append(c.allocator, .{ .at = .{ .file = file, .node = node }, .holder = function, .given = given, .least = least, .message = message, .undecided = undecided });
+}
+
 /// The function holding `node`, as an id the fact keeps for the run; null outside them.
 pub fn functionKey(fact: Fact, file: Project.FileId, node: Ast.Node.Index) ?u32 {
     return if (owner(fact.flow, file, node)) |function| @backingInt(function) else null;
@@ -2979,15 +2988,15 @@ pub fn reached(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Ind
     return .{ .decl = decl, .args = callee.args, .std = in_std };
 }
 
-/// The level of what a condition reads: its comparisons' and its logic's operands, each as
-/// the fact reads it (a comparison's own result is clean; what it compares is not).
-pub fn conditionAt(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index) Context.Error!Level {
+/// The values a condition reads, put in `out`: its comparisons' and its logic's operands (a
+/// comparison's own result is clean; what it compares is not), each to be read by the fact.
+pub fn conditionValues(c: *Context, file: Project.FileId, node: Ast.Node.Index, out: *std.ArrayList(Ast.Node.Index)) Allocator.Error!void {
     const tree = &c.project.at(file).file.tree;
     switch (Facts.conditionOf(tree, node)) {
-        .both, .either => |sides| return (try conditionAt(c, fact, file, sides[0])).join(try conditionAt(c, fact, file, sides[1])),
-        .compare => |compared| return (try conditionAt(c, fact, file, compared.left)).join(try conditionAt(c, fact, file, compared.right)),
-        .not => |inner| return conditionAt(c, fact, file, inner),
-        .other => |value| return levelAt(c, fact, file, value),
+        .both, .either => |sides| for (sides) |side| try conditionValues(c, file, side, out),
+        .compare => |compared| for ([_]Ast.Node.Index{ compared.left, compared.right }) |side| try conditionValues(c, file, side, out),
+        .not => |inner| try conditionValues(c, file, inner, out),
+        .other => |value| try out.append(c.allocator, value),
     }
 }
 
