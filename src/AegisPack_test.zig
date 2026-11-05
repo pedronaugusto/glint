@@ -757,7 +757,8 @@ fn expectJudged(source: []const u8, rule: glint.Rule, complete: bool, findings: 
     try std.testing.expectEqual(complete, got.complete);
     try std.testing.expectEqual(findings, got.findings);
 }
-/// A std of the parts a rule names by declaration (std's allocator), beside aegis.
+/// A std of a generic's shape a row is about (std calling the program's context back), beside
+/// aegis; every other row reads this Zig's std.
 const std_fixture = [_]aegis_sources.Extra{
     .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\npub const Io = struct { pub const File = struct {}; pub const Dir = struct {}; pub const net = struct { pub const Stream = struct {}; pub const Server = struct {}; }; };\npub const process = struct { pub const Child = struct {}; };" },
     .{ .name = "std/mem.zig", .bytes = "pub const Allocator = @import(\"mem/Allocator.zig\");" },
@@ -768,14 +769,6 @@ const std_fixture_imports = [_]aegis_sources.ExtraImport{
     .{ .from = 0, .spelling = "mem.zig", .target = 1 },
     .{ .from = 1, .spelling = "mem/Allocator.zig", .target = 2 },
 };
-fn expectJudgedStd(source: []const u8, rule: glint.Rule, complete: bool, findings: usize) !void {
-    var project = try aegis_sources.projectWithSources(std.testing.allocator, source, &std_fixture, &std_fixture_imports);
-    defer project.deinit();
-    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
-    defer report.deinit();
-    try std.testing.expectEqual(complete, report.complete);
-    try std.testing.expectEqual(findings, count(report, rule));
-}
 
 test "receivers bound by captures are decided by what they bind" {
     const head = "const G = @import(\"aegis\").Guarded;\nconst Plain = struct { data: u32, lock: u32 };\n";
@@ -1640,7 +1633,7 @@ test "owners, result obligations and shared values are released once and never c
     try expectJudged(head ++ "pub fn f(o: *O, m: *M, s: *S) void { _ = o.data; _ = o.state; _ = m.pending; _ = s.block; }", pack.access, true, 4);
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); defer o.deinit(); const copy = o; _ = copy; }", pack.copies, true, 1);
     // A shared value's copy with `=` instead of `retain`.
-    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); const copy = s; _ = copy; }", pack.copies, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); const copy = s; _ = copy; }", pack.copies, true, 1);
     // Owned: released, taken out or moved; left live it is a finding.
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); _ = o.borrow(); }", pack.cleanup, true, 1);
     try expectJudged(head ++ "pub fn f() void { var o = O.init(1); defer o.deinit(); _ = o.borrow(); }", pack.cleanup, true, 0);
@@ -1651,8 +1644,8 @@ test "owners, result obligations and shared values are released once and never c
     // Its deinit after the discharge is the check that the discharge came.
     try expectJudged(head ++ "pub fn f(out: *u32) void { var m = M.init(1); m.take(out); m.deinit(); }", pack.cleanup, true, 0);
     // Shared: each handle, the created one and each retained one, is released.
-    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); _ = other.get(); }", pack.cleanup, true, 1);
-    try expectJudgedStd(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); defer other.release(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); _ = other.get(); }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: @import(\"std\").mem.Allocator) !void { var s = try S.create(gpa, 1); defer s.release(); var other = s.retain(); defer other.release(); }", pack.cleanup, true, 0);
 }
 
 test "generational storage, staged payloads, machines, scopes, unparsed input and decisions keep their contracts" {
@@ -1704,41 +1697,41 @@ test "a secret's writer borrows the owner it writes into; the owner keeps its re
 
 test "an adoption of an allocation freed, changed or kept elsewhere before it is reported" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); gpa.free(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
     // A function it is handed to, whatever it returns: one that keeps it, frees it, or frees
     // it by its pointer; and its address kept as a number.
-    try expectJudgedStd(head ++ "var kept: []u8 = &.{};\nfn stash(p: []u8) void { kept = p; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); stash(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "fn drop(gpa: std.mem.Allocator, p: []u8) void { gpa.free(p); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); drop(gpa, buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "fn release(gpa: std.mem.Allocator, p: [*]u8, len: usize) usize { gpa.free(p[0..len]); return len; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); _ = release(gpa, buffer.ptr, buffer.len); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "var where: usize = 0;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); where = @intFromPtr(buffer.ptr); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "var kept: []u8 = &.{};\nfn stash(p: []u8) void { kept = p; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); stash(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "fn drop(gpa: std.mem.Allocator, p: []u8) void { gpa.free(p); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); drop(gpa, buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "fn release(gpa: std.mem.Allocator, p: [*]u8, len: usize) usize { gpa.free(p[0..len]); return len; }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); _ = release(gpa, buffer.ptr, buffer.len); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "var where: usize = 0;\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); where = @intFromPtr(buffer.ptr); return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
     // One that only fills it and gives back nothing, and its address compared, leave it whole.
-    try expectJudgedStd(head ++ "fn fill(p: []u8) void { @memset(p, 0); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); fill(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (@intFromPtr(buffer.ptr) == 0) unreachable; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize, keep: *[]u8) !Bytes { const buffer = try gpa.alloc(u8, n); keep.* = buffer; return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "fn fill(p: []u8) void { @memset(p, 0); }\npub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); fill(buffer); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (@intFromPtr(buffer.ptr) == 0) unreachable; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.len = 1; return Bytes.adopt(buffer, 1); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer.ptr += 1; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { var buffer = try gpa.alloc(u8, n); buffer = buffer[1..]; return Bytes.adopt(buffer, n - 1); }", pack.capacity, true, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize, keep: *[]u8) !Bytes { const buffer = try gpa.alloc(u8, n); keep.* = buffer; return Bytes.adopt(buffer, n); }", pack.capacity, true, 1);
     // Two owners of one allocation: the second adoption is reported, the first is not handed
     // over alone.
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) ![2]Bytes { const buffer = try gpa.alloc(u8, n); return .{ try Bytes.adopt(buffer, n), try Bytes.adopt(buffer, n) }; }", pack.capacity, false, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) ![2]Bytes { const buffer = try gpa.alloc(u8, n); return .{ try Bytes.adopt(buffer, n), try Bytes.adopt(buffer, n) }; }", pack.capacity, false, 1);
     // Its elements written and its length read leave it whole.
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (buffer.len != n) return error.Short; buffer[0] = 1; @memset(buffer[1..], 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); if (buffer.len != n) return error.Short; buffer[0] = 1; @memset(buffer[1..], 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
 }
 
 test "an adoption of a whole byte allocation, handed over alone, is decided" {
     const head = "const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\n";
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
-    try expectJudgedStd(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); @memset(buffer, 0); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "const S = struct { gpa: std.mem.Allocator };\npub fn f(s: *S, n: usize) !Bytes { const buffer = s.gpa.alloc(u8, n) catch return error.OutOfMemory; return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     // The owner is unmanaged: which allocator made the allocation is the caller's to give its
     // deinit, so another allocator's allocation is decided at the adoption too.
-    try expectJudgedStd(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
+    try expectJudged(head ++ "pub fn f(other: std.mem.Allocator, n: usize) !Bytes { const buffer = try other.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, true, 0);
     // A pending errdefer, a later use or an element wider than a byte stay review sites.
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); errdefer gpa.free(buffer); const b = try Bytes.adopt(buffer, n); return b; }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); const b = try Bytes.adopt(buffer, n); buffer[0] = 1; return b; }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator, n: usize) !Bytes { const buffer = try gpa.alloc(u8, n); return Bytes.adopt(buffer[0..n], n); }", pack.capacity, false, 1);
     // std's allocator by its declaration: a pool of the program's own with an `alloc` of the
     // same shape hands out a part of its buffer, no whole allocation.
-    try expectJudgedStd(head ++ "const Pool = struct { buffer: [64]u8 = undefined, used: usize = 0, fn alloc(p: *Pool, comptime T: type, n: usize) ![]T { const part = p.buffer[p.used..][0..n]; p.used += n; return part; } };\npub fn f(pool: *Pool, n: usize) !Bytes { const buffer = try pool.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
+    try expectJudged(head ++ "const Pool = struct { buffer: [64]u8 = undefined, used: usize = 0, fn alloc(p: *Pool, comptime T: type, n: usize) ![]T { const part = p.buffer[p.used..][0..n]; p.used += n; return part; } };\npub fn f(pool: *Pool, n: usize) !Bytes { const buffer = try pool.alloc(u8, n); return Bytes.adopt(buffer, n); }", pack.capacity, false, 0);
 }
 
 test "an adoption of a private function's parameter is decided by every call's argument, through what a function returns" {
@@ -1746,12 +1739,12 @@ test "an adoption of a private function's parameter is decided by every call's a
     const session = "const S = struct {\n    gpa: std.mem.Allocator,\n    fn ask(s: *S, quiet: bool) !?[]u8 { if (quiet) { if (try s.helper()) |answer| return answer; return null; } const copy = try s.gpa.dupe(u8, \"x\"); return copy; }\n    fn helper(s: *S) !?[]u8 { if (s.gpa.vtable == undefined) return error.Unavailable; return try s.gpa.dupe(u8, \"y\"); }\n};\n";
     // Each argument a whole allocation: printed, duplicated, allocated into a local used only
     // before, and returned by a method on every path that gives one.
-    try expectJudgedStd(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(s.gpa); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(buffer); b.deinit(s.gpa); var c = adopted(try s.ask(true) orelse return); c.deinit(s.gpa); }", pack.capacity, true, 0);
+    try expectJudged(head ++ session ++ "pub fn f(s: *S, n: usize) !void { var a = adopted(s.gpa.print(\"{d}\", .{n}) catch return error.OutOfMemory); a.deinit(s.gpa); const buffer = try s.gpa.alloc(u8, n); @memset(buffer, 0); var b = adopted(buffer); b.deinit(s.gpa); var c = adopted(try s.ask(true) orelse return); c.deinit(s.gpa); }", pack.capacity, true, 0);
     // A public function, a returned local a `defer` frees, or a local read after the call stay
     // review sites.
-    try expectJudgedStd("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try gpa.dupe(u8, \"x\")); a.deinit(gpa); }", pack.capacity, false, 0);
-    try expectJudgedStd(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try made(gpa)); a.deinit(gpa); }", pack.capacity, false, 0);
-    try expectJudgedStd(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(buffer); a.deinit(gpa); buffer[0] = 0; }", pack.capacity, false, 0);
+    try expectJudged("const std = @import(\"std\");\nconst Bytes = @import(\"aegis\").SecretBytes;\npub fn adopted(bytes: []u8) Bytes { return Bytes.adopt(bytes, bytes.len) catch unreachable; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try gpa.dupe(u8, \"x\")); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudged(head ++ "fn made(gpa: std.mem.Allocator) ![]u8 { const copy = try gpa.dupe(u8, \"x\"); defer gpa.free(copy); return copy; }\npub fn f(gpa: std.mem.Allocator) !void { var a = adopted(try made(gpa)); a.deinit(gpa); }", pack.capacity, false, 0);
+    try expectJudged(head ++ "pub fn f(gpa: std.mem.Allocator) !void { const buffer = try gpa.dupe(u8, \"x\"); var a = adopted(buffer); a.deinit(gpa); buffer[0] = 0; }", pack.capacity, false, 0);
 }
 
 test "an owner released on error by errdefer, carried out in what is returned, or moved out of a dead local is decided" {
@@ -1822,9 +1815,9 @@ test "an owner moved into a local aggregate is that aggregate's obligation" {
 
 test "a reservation consumed is discharged" {
     const head = "const std = @import(\"std\");\nconst Budget = @import(\"aegis\").bounded.Budget(usize);\n";
-    try expectJudgedStd(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); charge.consume(); return m; }", pack.cleanup, true, 0);
     // Kept past its success, the reservation leaves with the result: no claim either way.
-    try expectJudgedStd(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f(b: *Budget, gpa: std.mem.Allocator) ![]u8 { var charge = b.reserve(4) catch return error.Limit; errdefer charge.release(); const m = try gpa.alloc(u8, 4); return m; }", pack.cleanup, false, 0);
 }
 
 test "the private fields of staged payloads, machines, scopes, references, secondary maps and unparsed input" {
@@ -2004,26 +1997,26 @@ test "A001 reads a runtime machine's state as its backing field" {
 test "A003 releases std's Server by its deinit" {
     // std.Io.net.Server closes its socket in `deinit`, its one release (reactor's tests).
     const head = "const std = @import(\"std\");\nfn listen() std.Io.net.Server { return .{}; }\n";
-    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); defer s.deinit(); }", pack.cleanup, true, 0);
-    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); s.deinit(); }", pack.cleanup, true, 0);
-    try expectJudgedStd(head ++ "pub fn f() void { var s = listen(); _ = &s; }", pack.cleanup, true, 1);
+    try expectJudged(head ++ "pub fn f() void { var s = listen(); defer s.deinit(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = listen(); s.deinit(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = listen(); _ = &s; }", pack.cleanup, true, 1);
 }
 
 test "A003 lends an owner to a callee by its kind's release, through a call or @call's tuple" {
     // A callee that closes a std handle it is lent releases it (a guard's `deinit` does not);
     // one that reads only its members or discards it hands it back held.
     const head = "const std = @import(\"std\");\nfn connect() std.Io.net.Stream { return .{}; }\nfn shut(s: *std.Io.net.Stream) void { s.close(); }\nfn peek(s: *std.Io.net.Stream) void { _ = s.handle; }\nfn ignore(s: *std.Io.net.Stream) void { _ = s; }\n";
-    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); shut(&s); }", pack.cleanup, false, 0);
-    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); peek(&s); ignore(&s); }", pack.cleanup, true, 0);
-    try expectJudgedStd(head ++ "pub fn f() void { var s = connect(); defer s.close(); @call(.auto, peek, .{&s}); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = connect(); defer s.close(); shut(&s); }", pack.cleanup, false, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = connect(); defer s.close(); peek(&s); ignore(&s); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var s = connect(); defer s.close(); @call(.auto, peek, .{&s}); }", pack.cleanup, true, 0);
 }
 
 test "A003 releases an array of std handles by closing each copy a loop takes" {
     // A std handle is a value: `for (pair) |s| s.close()` closes each of the pair's handles, as
     // `for (&pair) |*s| s.close()` does; a loop that only reads them closes none.
     const head = "const std = @import(\"std\");\nfn pairOf() [2]std.Io.net.Stream { return .{ .{}, .{} }; }\n";
-    try expectJudgedStd(head ++ "pub fn f() void { const pair = pairOf(); defer for (pair) |s| s.close(); }", pack.cleanup, true, 0);
-    try expectJudgedStd(head ++ "pub fn f() void { var pair = pairOf(); defer for (&pair) |*s| s.close(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { const pair = pairOf(); defer for (pair) |s| s.close(); }", pack.cleanup, true, 0);
+    try expectJudged(head ++ "pub fn f() void { var pair = pairOf(); defer for (&pair) |*s| s.close(); }", pack.cleanup, true, 0);
 }
 
 test "A001 reads a literal's place through a field default and optional and error-union results" {

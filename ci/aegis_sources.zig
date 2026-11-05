@@ -1,9 +1,86 @@
 //! The pinned aegis revision's own sources, as glint project inputs for the pack's tests and
 //! benchmark: every file of its module, so each import among them is mapped as aegis's build
-//! wires it; std and every other import stay unmapped.
+//! wires it; every other import stays unmapped. std is this Zig's own, as every run has it:
+//! each fixture maps `std` to it, read once for the whole step.
 const std = @import("std");
 const glint = @import("glint");
+const options = @import("aegis_sources_options");
 const Project = glint.Project;
+
+/// std as this Zig has it: every file its root reaches by a relative import, with those imports
+/// and each one's `@import("std")`, read from Zig's library once for the whole step.
+const Std = struct { inputs: []const Project.Input, imports: []const Project.Import };
+var std_read: ?Std = null;
+var shared_store: ?Project.Store = null;
+
+/// The store every fixture reads its files through: each, std's among them, is parsed once for
+/// the whole step, never per test. It lives as long as the step.
+fn store() *Project.Store {
+    if (shared_store == null) shared_store = .init(std.heap.page_allocator);
+    return &shared_store.?;
+}
+
+fn stdFiles() !Std {
+    if (std_read) |known| return known;
+    const gpa = std.heap.page_allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var inputs: std.ArrayList(Project.Input) = .empty;
+    var paths: std.StringHashMapUnmanaged(usize) = .empty;
+    var edges: std.ArrayList(Project.Import) = .empty;
+    _ = try readStd(gpa, io, try std.Io.Dir.path.join(gpa, &.{ options.zig_lib, "std", "std.zig" }), &inputs, &paths);
+    var cursor: usize = 0;
+    while (cursor < inputs.items.len) : (cursor += 1) {
+        const bytes = inputs.items[cursor].bytes;
+        var rest = bytes;
+        while (std.mem.find(u8, rest, "@import(\"")) |at| {
+            rest = rest[at + "@import(\"".len ..];
+            const end = std.mem.findScalar(u8, rest, '"') orelse break;
+            const spelling = rest[0..end];
+            const target = if (std.mem.eql(u8, spelling, "std"))
+                0
+            else if (std.mem.endsWith(u8, spelling, ".zig"))
+                try readStd(gpa, io, try std.Io.Dir.path.resolveAlloc(gpa, &.{ std.Io.Dir.path.dirname(inputs.items[cursor].name) orelse ".", spelling }), &inputs, &paths)
+            else
+                continue;
+            const known = for (edges.items) |edge| {
+                if (edge.from == cursor and std.mem.eql(u8, edge.spelling, spelling)) break true;
+            } else false;
+            if (!known) try edges.append(gpa, .{ .from = cursor, .spelling = spelling, .target = target });
+        }
+    }
+    std_read = .{ .inputs = inputs.items, .imports = edges.items };
+    return std_read.?;
+}
+
+/// The position of std's file at `path`, read now where it is not yet.
+fn readStd(gpa: std.mem.Allocator, io: std.Io, path: []const u8, inputs: *std.ArrayList(Project.Input), paths: *std.StringHashMapUnmanaged(usize)) !usize {
+    if (paths.get(path)) |known| return known;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024));
+    const basename = std.Io.Dir.path.basename(path);
+    try inputs.append(gpa, .{ .name = path, .stem = basename[0 .. basename.len - ".zig".len], .bytes = bytes, .selected = false });
+    try paths.put(gpa, path, inputs.items.len - 1);
+    return inputs.items.len - 1;
+}
+
+/// The project of `inputs` and `imports`, std's files after them in `compilations`: `std`
+/// mapped from each of them that imports it, every file read through the shared store.
+fn withStd(gpa: std.mem.Allocator, inputs: []const Project.Input, imports_given: []const Project.Import, compilations: Project.Compilations) !Project {
+    // A caller's own std, a shape of it a row is about (a std missing what a rule names, a
+    // generic of std's calling the program back), stands in this Zig's place.
+    for (imports_given) |edge| if (std.mem.eql(u8, edge.spelling, "std")) return Project.init(gpa, inputs, imports_given, .{ .store = store() });
+    const lib = try stdFiles();
+    const all_inputs = try gpa.alloc(Project.Input, inputs.len + lib.inputs.len);
+    defer gpa.free(all_inputs);
+    @memcpy(all_inputs[0..inputs.len], inputs);
+    @memcpy(all_inputs[inputs.len..], lib.inputs);
+    for (all_inputs[inputs.len..]) |*each| each.compilations = compilations;
+    var all: std.ArrayList(Project.Import) = .empty;
+    defer all.deinit(gpa);
+    try all.appendSlice(gpa, imports_given);
+    for (inputs, 0..) |each, i| if (std.mem.find(u8, each.bytes, "@import(\"std\")") != null) try all.append(gpa, .{ .from = i, .spelling = "std", .target = inputs.len });
+    for (lib.imports) |edge| try all.append(gpa, .{ .from = inputs.len + edge.from, .spelling = edge.spelling, .target = inputs.len + edge.target });
+    return Project.init(gpa, all_inputs, all.items, .{ .store = store() });
+}
 
 const Source = struct { name: []const u8, bytes: []const u8 };
 const sources = [_]Source{
@@ -193,7 +270,7 @@ pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     var inputs: [sources.len + 1]Project.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
     for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
-    return Project.init(gpa, &inputs, &imports(), .{});
+    return withStd(gpa, &inputs, &imports(), .program);
 }
 
 /// `project`, with a second source of the program's own, imported by the consumer as `lib`
@@ -218,7 +295,7 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     @memcpy(all[0..mapped.len], &mapped);
     all[mapped.len] = .{ .from = 0, .spelling = "lib", .target = lib_file };
     all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = root };
-    return Project.init(gpa, &inputs, &all, .{});
+    return withStd(gpa, &inputs, &all, .program);
 }
 
 /// A source of another module beside aegis's, such as a fixture standing for std, in the
@@ -275,7 +352,7 @@ pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []cons
     }
     if (!revised) return error.FileNotFound;
     const mapped = imports();
-    return Project.init(gpa, &inputs, &mapped, .{});
+    return withStd(gpa, &inputs, &mapped, .program);
 }
 
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
@@ -312,7 +389,7 @@ pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, ext
         aegis_file => root,
         else => first + entry.target,
     } };
-    return Project.init(gpa, inputs, all, .{});
+    return withStd(gpa, inputs, all, others);
 }
 
 /// An aegis source as a caller states it: not selected, a file of aegis's package.

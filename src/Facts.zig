@@ -3257,6 +3257,10 @@ pub const Written = enum { type, other, unknown };
 /// The one reading of a written `type`; nothing reads its spelling. One that does not resolve
 /// is unknown, never another type: an alias may name `type`, or a parameter be bound to it.
 pub fn writesType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Written {
+    // A primitive's name is the primitive (Zig lets nothing shadow one): read with no fact spent.
+    const tree = &self.project.at(file).file.tree;
+    if (tree.nodeTag(node) == .identifier) if (self.project.at(file).model.reference(node)) |reference| if (reference.unknown == .primitive)
+        return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type")) .type else .other;
     const answer = writtenOf(try self.resolve(file, node));
     if (answer == .unknown and try self.writtenInGeneric(file, node)) return .other;
     return answer;
@@ -17508,17 +17512,20 @@ test "a reader's question past its steps, or code read lazily that imports what 
     try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
 }
 
-test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve or is read through @typeInfo is unknown" {
+test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve or is read through @typeInfo is unknown; a quoted name is its declaration, never the primitive" {
     const source =
         \\const Type = type;
         \\const Kind = u8;
         \\const Far = @import("missing").Type;
         \\const Read = @typeInfo(*const type).pointer.child;
+        \\const @"u8" = type;
         \\fn a(comptime T: type) void { _ = T; }
         \\fn b(comptime T: Type) void { _ = T; }
         \\fn c(comptime n: Kind) void { _ = n; }
         \\fn d(comptime T: Far) void { _ = T; }
         \\fn e(comptime T: Read) void { _ = T; }
+        \\fn g(comptime T: @"u8") void { _ = T; }
+        \\fn h(n: u8) void { _ = n; }
     ;
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
     defer project.deinit();
@@ -17535,5 +17542,5 @@ test "a written type is `type` by what it resolves to: an alias of it is, an ali
         var it = tree.fullFnProto(&buffer, record.node).?.iterate(tree);
         try answers.append(arena.allocator(), try facts.writesType(id, it.next().?.type_expr.?));
     }
-    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown, .unknown }, answers.items);
+    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown, .unknown, .type, .other }, answers.items);
 }

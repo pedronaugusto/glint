@@ -226,6 +226,10 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
 fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
     const sources = b.createModule(.{ .root_source_file = p.path("ci/aegis_sources.zig"), .target = target });
     sources.addImport("glint", glint);
+    // std as this Zig has it, read where the tests run: a path, never std's bytes hashed in.
+    const options = b.addOptions();
+    options.addOptionPathUntracked("zig_lib", .zig_lib);
+    sources.addImport("aegis_sources_options", options.createModule());
     const files = [_][2][]const u8{
         .{ "aegis-root", "src/root.zig" },
         .{ "aegis-assert", "src/assert.zig" },
