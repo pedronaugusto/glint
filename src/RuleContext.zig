@@ -22,7 +22,7 @@ sink: *Sink,
 /// The run's compiled rules: the facts they declare are the ones `Taint` solves together.
 compiled: []const Rule = &.{},
 
-pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection };
+pub const Error = Facts.ResolveError || Project.QueryError || error{ AmbiguousSuppression, InvalidSelection, SolveShort };
 
 /// Makes `allocator` the run's own (`Facts.gpa`) and returns the one it was: what a function
 /// that fills a `Facts.memo` computes, its callees' memory among it, is kept for the run, as a

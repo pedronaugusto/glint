@@ -119,7 +119,7 @@ pub fn declarations(self: *Context, source: []const u8, path: []const u8) Contex
     const found = try lookup(self, source, path);
     // A walk the fact budget cut short may have missed a declaration: it is unknown, and asked
     // again.
-    if (self.facts.remaining == 0 and found != .decls) return .{ .unknown = .budget };
+    if (found != .decls and self.facts.budgetSpent()) return .{ .unknown = .budget };
     const answer = found;
     const paths = try memo.found.getOrPut(self.allocator, source);
     if (!paths.found_existing) {
@@ -163,7 +163,7 @@ pub fn declarationsOfPackage(self: *Context, package: []const u8, path: []const 
     }
     if (roots.items.len == 0) return .none;
     const found = try walk(self, roots.items, path, true);
-    return if (self.facts.remaining == 0 and found != .decls) .{ .unknown = .budget } else found;
+    return if (found != .decls and self.facts.budgetSpent()) .{ .unknown = .budget } else found;
 }
 
 /// Every reference in the checked file that reaches a governed declaration, into `out`; a

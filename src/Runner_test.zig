@@ -135,6 +135,26 @@ test "each file's analysis has its own fact budget" {
     };
 }
 
+test "a rule whose flow facts are not solved within their budget is reported at each file that asks, never silently clean" {
+    const source = "pub fn at(s: []const u8, i: usize) u8 {\n    return s[i];\n}\n";
+    const pack = glint.AegisPack;
+    var project = try glint.Project.init(std.testing.allocator, &.{ .{ .name = "one", .bytes = source }, .{ .name = "two", .bytes = source } }, &.{}, .{});
+    defer project.deinit();
+    var config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.untrusted_input, .level = .report }} };
+    config.fact_budget = 1;
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    // No clean verdict: the run is incomplete, and each file's rule is reported unjudged.
+    try std.testing.expect(!report.complete);
+    var asked: usize = 0;
+    for (report.coverage) |item| {
+        if (item.reason == .budget_exhausted and item.rule != null and item.rule.? == pack.untrusted_input) asked += 1;
+    }
+    try std.testing.expectEqual(2, asked);
+    // No finding is made of facts not solved.
+    for (report.diagnostics) |diagnostic| try std.testing.expect(diagnostic.rule != pack.untrusted_input);
+}
+
 test "compatibility suppression rejects multiple distinct binding sites" {
     var project = try glint.Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const a = @import(\"a\"); const b = @import(\"b\"); // glint-ignore: Z013 -- one site only\n" }}, &.{}, .{});
     defer project.deinit();

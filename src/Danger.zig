@@ -1280,7 +1280,7 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         var verdict: ParentPointer.Verdict = if (std.mem.eql(u8, name, "@fieldParentPtr"))
             try ParentPointer.cleared(c, node)
         else if (std.mem.eql(u8, name, "@alignCast")) try ParentPointer.clearedAlignment(c, node) else .open;
-        if (verdict == .open and before != 0 and c.facts.remaining == 0) verdict = .undecided;
+        if (verdict == .open and before != 0 and c.facts.budgetSpent()) verdict = .undecided;
         switch (verdict) {
             .shown => continue,
             .undecided => {

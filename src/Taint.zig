@@ -503,18 +503,31 @@ pub const Flow = struct {
 /// its callers, read as undecided).
 const Link = struct { function: Function.Id, owner: Place, holder: Place };
 
-/// The run's solve: the facts the enabled rules declare, and any other a rule asked since.
-const Solved = struct { flow: ?*Flow = null };
+/// The run's solve: the facts the enabled rules declare, and any other a rule asked since. It
+/// lasts through `Facts.forget`: a solve kept is complete (`get`), and a short one is marked.
+const Solved = struct {
+    pub const lasting = {};
+    flow: ?*Flow = null,
+    /// The solve ran short of its own budget: nothing is kept, and no later file solves again.
+    short: bool = false,
+};
 
 /// The fact `spec` describes, solved with every other the run's enabled rules declare the
 /// first time one is asked. A rule asks only the facts it declares (`Context.Rule.facts`);
-/// another is `error.InvalidSelection`.
+/// another is `error.InvalidSelection`. `error.SolveShort` where the solve ran short of its
+/// budget, or would read what the asking file's work built short of one: the rule's check of
+/// the file stops there, and the Runner reports the file's budget exhausted.
 pub fn get(c: *Context, spec: Spec) Context.Error!Fact {
     // What it keeps in its memo stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
     const memo = try c.facts.memo(Solved);
+    if (memo.short) return error.SolveShort;
     const flow = memo.flow orelse solved: {
+        // What was built short of a budget would answer the solve as if complete (C1), and
+        // what the asking file's check holds of it may not be dropped under it: a later file
+        // solves, once the Runner has forgotten it (`Facts.forget`).
+        if (c.facts.short) return error.SolveShort;
         var specs: std.ArrayList(Spec) = .empty;
         for (c.compiled) |rule| {
             if (!try enabled(c, rule)) continue;
@@ -522,8 +535,22 @@ pub fn get(c: *Context, spec: Spec) Context.Error!Fact {
         }
         // The run's rules fit the lanes (`fits`): the Runner refuses a set that does not.
         const flow = try c.allocator.create(Flow);
-        flow.* = .{ .specs = specs.items, .masks = masksOf(specs.items) };
-        try solve(c, flow);
+        flow.* = .{ .specs = specs.items, .masks = masksOf(specs.items), .program = try Program.get(c) };
+        // The solve is the run's, never the asking file's: a unit on a budget of its own, a
+        // file's per program file it reads (designs/glint-summaries.md, "One budget model").
+        var files: usize = 0;
+        for (c.project.sources) |*each| {
+            if (solves(c, flow, each)) files += 1;
+        }
+        const budget = std.math.mul(usize, c.config.fact_budget, @max(files, 1)) catch std.math.maxInt(usize);
+        const asker = c.facts.enter(budget);
+        const solved = solve(c, flow);
+        const short = c.facts.leave(asker);
+        try solved;
+        if (short) {
+            memo.short = true;
+            return error.SolveShort;
+        }
         flow.solved = true;
         memo.flow = flow;
         break :solved flow;
@@ -582,16 +609,9 @@ fn masksOf(specs: []const Spec) Masks {
 }
 
 fn solve(c: *Context, flow: *Flow) Context.Error!void {
-    flow.program = try Program.get(c);
     try known(c, flow);
     for (c.project.sources) |*each| {
-        if (each.input.classification == .@"test") continue;
-        const file = each.id;
-        if (!flow.own(file)) continue;
-        // A file whose rules ask no fact (a tool the package develops with) is no part of the
-        // program the facts describe.
-        if (!asks(c, c.configOf(file))) continue;
-        try functionsOf(c, flow, file);
+        if (solves(c, flow, each)) try functionsOf(c, flow, each.id);
     }
     try parsers(c, flow);
     try escaped(c, flow);
@@ -633,6 +653,13 @@ fn rounds(c: *Context, flow: *Flow, comptime reads: enum { facts, sizes }) Conte
         _ = round.reset(.free_all);
         if (!flow.changed) break;
     }
+}
+
+/// Whether the solve reads `source`'s functions: the program's files but its tests, whose rules
+/// ask a fact. A file whose rules ask none (a tool the package develops with) is no part of the
+/// program the facts describe.
+fn solves(c: *Context, flow: *const Flow, each: *const Project.Source) bool {
+    return each.input.classification != .@"test" and flow.own(each.id) and asks(c, c.configOf(each.id));
 }
 
 /// Whether a file's rules ask a fact.
@@ -4438,9 +4465,11 @@ fn openSizes(c: *Context, decl: Facts.Decl) Context.Error!?Summary {
 /// runs out, each function first read here (from `first` on) is `exhausted`.
 fn closeOpen(c: *Context, unit: *OpenUnit, unit_flow: *Flow, next: *std.ArrayList(Queued), first: usize) Context.Error!void {
     if (next.items.len == 0) return;
-    unit.facts.remaining = c.config.fact_budget;
-    try closeSummary(&unit.context, unit_flow, next);
-    if (unit.facts.remaining != 0) return;
+    const asker = unit.facts.enter(c.config.fact_budget);
+    const closed = closeSummary(&unit.context, unit_flow, next);
+    const short = unit.facts.leave(asker);
+    try closed;
+    if (!short) return;
     // What std's Facts built short of the budget (an index, a memo) would answer a later
     // closing as if complete, as the Runner's `Facts.forget` knows of a file's: later closings
     // read on a Facts of their own. This one is left whole, for what the summary already holds
@@ -4526,11 +4555,11 @@ fn checkSizes(c: *Context, flow: *const Flow) Context.Error!void {
         const f = flow.functions.items[@backingInt(id)];
         if (!one.sure.eql(f.sizes) or !one.ranged.eql(f.ranged_sizes) or !one.maybe.eql(f.maybe_sizes) or !one.fixed.eql(f.fixed)) std.debug.panic("summary cross-check: a size summary reads back other sizes", .{});
     }
-    // The summary of every instantiation is what a unit's record answers for. One closed past
-    // the file's budget is no measure of it: what came back unknown(budget) sizes as it may, so
+    // The summary of every instantiation is what a unit's record answers for. One closed short
+    // of the file's budget (`Facts.short`) is no measure of it: what came back unknown(budget) sizes as it may, so
     // std's record, closed on a budget of its own, may decide further than it; the file is
     // exhausted, and the Runner's `Facts.forget` drops the summary before another file reads it.
-    if (flow.shared == null and c.facts.remaining != 0) try checkOpen(c, flow);
+    if (flow.shared == null and !c.facts.short) try checkOpen(c, flow);
 }
 
 /// std read alone, in the open world (`Facts.open_world`): what a unit's size record holds, for
@@ -5298,14 +5327,7 @@ fn linksBytes(n: usize, callee_first: bool) !usize {
 /// a reader whose `takeInt` returns input.
 fn solveAsks(program: []const u8) !usize {
     const gpa = std.testing.allocator;
-    const inputs = [_]Project.Input{
-        .{ .name = "root", .bytes = program },
-        .{ .name = "std/std.zig", .bytes = "pub const Io = @import(\"Io.zig\");\n", .selected = false },
-        .{ .name = "std/Io.zig", .bytes = "pub const Reader = @import(\"Io/Reader.zig\");\n", .selected = false },
-        .{ .name = "std/Io/Reader.zig", .bytes = "buffer: []u8 = &.{},\npub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }\n", .selected = false },
-    };
-    const imports = [_]Project.Import{ .{ .from = 0, .spelling = "std", .target = 1 }, .{ .from = 1, .spelling = "Io.zig", .target = 2 }, .{ .from = 2, .spelling = "Io/Reader.zig", .target = 3 } };
-    var project = try Project.init(gpa, &inputs, &imports, .{});
+    var project = try readerProject(gpa, program);
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -5316,21 +5338,112 @@ fn solveAsks(program: []const u8) !usize {
     // A rule's own memory for the file, as the Runner gives it: not the run's.
     var own: std.heap.ArenaAllocator = .init(gpa);
     defer own.deinit();
-    const Quiet = struct {
-        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").untrusted_input, .level = .report }} };
-        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
-        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
-        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
-            return config;
-        }
-        fn check(_: *Context) Context.Error!void {}
-    };
-    const peer_input = @import("Danger.zig").peer_input;
-    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input" }, .check = Quiet.check, .facts = &.{peer_input} };
-    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
-    var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
-    _ = try get(&c, peer_input);
+    var sink = InputRun.sink;
+    var c = InputRun.context(&project, &facts, own.allocator(), &sink, InputRun.config);
+    _ = try get(&c, InputRun.peer_input);
     return run_memory.allocated_bytes;
+}
+
+/// `program` as the root of a project whose `std` has a reader whose `takeInt` returns input.
+fn readerProject(gpa: Allocator, program: []const u8) !Project {
+    const inputs = [_]Project.Input{
+        .{ .name = "root", .bytes = program },
+        .{ .name = "std/std.zig", .bytes = "pub const Io = @import(\"Io.zig\");\n", .selected = false },
+        .{ .name = "std/Io.zig", .bytes = "pub const Reader = @import(\"Io/Reader.zig\");\n", .selected = false },
+        .{ .name = "std/Io/Reader.zig", .bytes = "buffer: []u8 = &.{},\npub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }\n", .selected = false },
+    };
+    const imports = [_]Project.Import{ .{ .from = 0, .spelling = "std", .target = 1 }, .{ .from = 1, .spelling = "Io.zig", .target = 2 }, .{ .from = 2, .spelling = "Io/Reader.zig", .target = 3 } };
+    return Project.init(gpa, &inputs, &imports, .{});
+}
+
+/// A run of A009 alone, whose findings and coverage go nowhere: what the input fact's solve does.
+const InputRun = struct {
+    const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").untrusted_input, .level = .report }} };
+    const peer_input = @import("Danger.zig").peer_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input" }, .check = check, .facts = &.{peer_input} };
+    const sink: Context.Sink = .{ .diagnostic = diagnostic, .coverage = coverage, .config = configOf };
+    fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+    fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+    fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+        return config;
+    }
+    fn check(_: *Context) Context.Error!void {}
+    /// The root's check, a rule's own memory `own`.
+    fn context(project: *const Project, facts: *Facts, own: Allocator, reports: *Context.Sink, with: @import("Rule.zig").Config) Context {
+        return .{ .allocator = own, .project = project, .file = project.sources[0].id, .config = with, .facts = facts, .definitions = &.{}, .sink = reports, .compiled = &.{rule} };
+    }
+};
+
+test "the program's solve is a unit of its own: never charged to the file that asks, and once complete, kept through a forget with nothing it holds dropped" {
+    const gpa = std.testing.allocator;
+    var project = try readerProject(gpa, "const std = @import(\"std\");\npub fn main(r: *std.Io.Reader, s: []const u8) u8 {\n    const n = step(r);\n    return s[n];\n}\nfn step(r: *std.Io.Reader) u32 {\n    return r.takeInt(u32, 0) catch 0;\n}\n");
+    defer project.deinit();
+    // The run's memory, each allocation on pages of its own, unmapped when it is freed: a flow
+    // holding a part of an index `forget` frees faults where it is read afterwards. What the
+    // run keeps (its memos) is the process's until it ends, as a Runner's arena holds it.
+    var facts: Facts = .{ .project = &project, .gpa = std.heap.page_allocator };
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var sink = InputRun.sink;
+    var c = InputRun.context(&project, &facts, own.allocator(), &sink, InputRun.config);
+    // The asking file's budget is its own whatever the solve spends.
+    facts.remaining = 7;
+    const fact = try get(&c, InputRun.peer_input);
+    try std.testing.expectEqual(7, facts.remaining);
+    try std.testing.expect(!facts.short);
+    const file = project.sources[0].id;
+    const nodes = project.at(file).file.tree.nodes.len;
+    var before: std.ArrayList(Level) = .empty;
+    defer before.deinit(gpa);
+    for (0..nodes) |i| try before.append(gpa, try levelAt(&c, fact, file, @fromBackingInt(@intCast(i))));
+    try std.testing.expect(std.mem.findScalar(Level, before.items, .number) != null);
+    facts.forget();
+    const kept = try get(&c, InputRun.peer_input);
+    try std.testing.expectEqual(fact.flow, kept.flow);
+    for (before.items, 0..) |level, i| try std.testing.expectEqual(level, try levelAt(&c, kept, file, @fromBackingInt(@intCast(i))));
+}
+
+test "a solve that runs short of its budget is marked and never redone: each file that asks is told so, and the asking file's budget is untouched" {
+    const gpa = std.testing.allocator;
+    var project = try readerProject(gpa, "const std = @import(\"std\");\npub fn main(r: *std.Io.Reader, s: []const u8) u8 {\n    return s[r.takeInt(u32, 0) catch 0];\n}\n");
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var sink = InputRun.sink;
+    var config = InputRun.config;
+    config.fact_budget = 1;
+    var c = InputRun.context(&project, &facts, own.allocator(), &sink, config);
+    facts.remaining = 7;
+    try std.testing.expectError(error.SolveShort, get(&c, InputRun.peer_input));
+    try std.testing.expectEqual(7, facts.remaining);
+    // What the short solve built, no later file reads; the mark stays.
+    try std.testing.expect(facts.short);
+    facts.forget();
+    try std.testing.expect(!facts.short);
+    c.config.fact_budget = 100_000;
+    try std.testing.expectError(error.SolveShort, get(&c, InputRun.peer_input));
+    try std.testing.expect(!facts.short);
+}
+
+test "a file whose own work ran short does not solve: what it built would answer the solve as if complete" {
+    const gpa = std.testing.allocator;
+    var project = try readerProject(gpa, "const std = @import(\"std\");\npub fn main(r: *std.Io.Reader, s: []const u8) u8 {\n    return s[r.takeInt(u32, 0) catch 0];\n}\n");
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var sink = InputRun.sink;
+    var c = InputRun.context(&project, &facts, own.allocator(), &sink, InputRun.config);
+    facts.short = true;
+    try std.testing.expectError(error.SolveShort, get(&c, InputRun.peer_input));
+    // The Runner forgets at the file's end; the next file solves.
+    facts.forget();
+    _ = try get(&c, InputRun.peer_input);
 }
 
 /// How many functions of the closed size summary `program` reaches in std's `mem.zig` size work;
@@ -5363,9 +5476,11 @@ fn summarySizing(gpa: Allocator, program: []const u8, mem: []const u8, how: stru
     var own: std.heap.ArenaAllocator = .init(gpa);
     defer own.deinit();
     var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
-    if (how.unit_budget) |budget| c.config.fact_budget = budget;
+    // The file's budget, which its size summaries close on.
     if (how.file_budget) |budget| facts.remaining = budget;
     const fact = try get(&c, bounded_input);
+    // The closings' budget, a file's: the program's solve has its own, made of the files'.
+    if (how.unit_budget) |budget| c.config.fact_budget = budget;
     var undecided: usize = 0;
     for (try sinkSites(&c, fact, project.sources[0].id)) |site| if (!site.decided) {
         undecided += 1;

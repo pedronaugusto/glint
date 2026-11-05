@@ -67,6 +67,14 @@ dereferences: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 dereferences_found: std.AutoHashMapUnmanaged(Project.FileId, void) = .empty,
 /// Per-run state rules keep across files, by the key they name it with (`memo`).
 memos: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
+/// The memos whose type declares `lasting`, which `forget` keeps: what each holds was read on
+/// a budget of its own (`enter`) with nothing built short, or marks that it was not.
+lasting: std.AutoHashMapUnmanaged(usize, *anyopaque) = .empty,
+/// Whether a query answered unknown(budget) for want of budget, or past the depth of resolutions
+/// in progress, since this Facts was made or last forgot (`forget`): what was built meanwhile
+/// may have been built short of it. A walk's own step or depth limit does not set it: it answers
+/// the same whoever asks.
+short: bool = false,
 /// Every member access in the program's files, by the member's name, found once (`memberUses`).
 member_uses: ?std.StringHashMapUnmanaged(std.ArrayList(Key)) = null,
 /// For each field that holds a function pointer, the functions the program stores in it
@@ -574,20 +582,62 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
     };
 }
 
-/// What a file whose budget ran out kept, dropped: its memos and indexes may have been built
-/// short of it (a part that came back unknown(budget)), which its file reports as exhausted but
-/// which would answer a later file as if complete (C1). What `resolve` keeps stays: it keeps
-/// only what was read with budget left, and the sets of assumptions its keys name; so does what
-/// `resolveIn` keeps, by readings that are never freed.
+/// What was built since a query answered unknown(budget) for want of budget (`short`), dropped:
+/// its memos and indexes may have been built short of it, which would answer a later query as
+/// if complete (C1). What `resolve` keeps stays: it keeps only what was read with budget left,
+/// and the sets of assumptions its keys name; so does what `resolveIn` keeps, by readings that
+/// are never freed; and each `lasting` memo: a unit read on a budget of its own that read
+/// nothing built short (the program's solve, `Taint.get`), or the mark that it ran short. What
+/// one keeps is the run's (`gpa`), never a part of an index dropped here.
 pub fn forget(self: *Facts) void {
-    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled };
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
     self.cache = .empty;
     self.bound = .empty;
     self.readings = .empty;
     self.settled = .empty;
+    self.lasting = .empty;
     self.deinit();
     fresh.active = .empty;
     self.* = fresh;
+}
+
+/// A query's answer where the budget is spent: unknown(budget), and this Facts is `short`.
+fn spent(self: *Facts) Value {
+    _ = self.budgetSpent();
+    return .{ .unknown = .budget };
+}
+
+/// Whether the budget is spent: what a query read before may have been cut short of it, which
+/// it answers as unknown(budget), and this Facts is then `short`.
+pub fn budgetSpent(self: *Facts) bool {
+    if (self.remaining != 0) return false;
+    self.short = true;
+    return true;
+}
+
+/// What the asker of a unit of solving had when the unit started (`enter`), given back when it
+/// ends (`leave`): its budget and whether it was `short`.
+pub const Asker = struct { remaining: usize, short: bool };
+
+/// Starts a unit of solving on a budget of its own, `budget` resolutions: the asker's budget is
+/// neither charged for it nor given to it (designs/glint-summaries.md, "One budget model"). The
+/// file's analysis, each of its readings, std's closings and the program's solve are each one.
+/// Each ends with `leave`, on an error's way out too.
+pub fn enter(self: *Facts, budget: usize) Asker {
+    const asker: Asker = .{ .remaining = self.remaining, .short = self.short };
+    self.remaining = budget;
+    self.short = false;
+    return asker;
+}
+
+/// Ends the unit `enter` started, the asker's budget its own again. Returns whether the unit
+/// ran short: a query in it answered unknown(budget) for want of budget. This Facts is then
+/// `short` where the asker was or the unit ran short.
+pub fn leave(self: *Facts, asker: Asker) bool {
+    const short = self.short;
+    self.remaining = asker.remaining;
+    self.short = asker.short or short;
+    return short;
 }
 
 pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Value {
@@ -595,10 +645,13 @@ pub fn resolve(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Resolve
     const key: Settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed };
     if (self.cache.get(key)) |value| return value;
     if (self.active.count() >= 128) {
+        // How deep the asker is decides it, not the node: what is built over it may be built
+        // short, as past the budget (`short`).
         self.open_met += 1;
+        self.short = true;
         return .{ .unknown = .budget };
     }
-    if (self.remaining == 0) return .{ .unknown = .budget };
+    if (self.remaining == 0) return self.spent();
     self.remaining -= 1;
     if (self.active.contains(key)) {
         self.open_met += 1;
@@ -3687,8 +3740,6 @@ pub fn analysis(self: *Facts) ResolveError!*const Analysis {
         found.everything = true;
         return found;
     }
-    const file_budget = self.remaining;
-    defer self.remaining = file_budget;
     // What the walk asks of the analysis while it is built is answered as if anything may be
     // analyzed (`building_analysis`); what is read on that answer is not kept (`wide`). Once
     // built, what a query in progress reads of it is exact.
@@ -3698,7 +3749,12 @@ pub fn analysis(self: *Facts) ResolveError!*const Analysis {
     defer self.building_analysis = false;
     self.walk = found;
     defer self.walk = null;
-    try self.reachAll(found);
+    // The walk is a unit of solving on a budget of its own, as each reading in it is
+    // (`reachAll`): it is never charged to whoever asks first.
+    const asker = self.enter(reading_budget);
+    const walked = self.reachAll(found);
+    if (self.leave(asker)) found.everything = true;
+    try walked;
     self.dropMemos();
     return found;
 }
@@ -3713,6 +3769,7 @@ fn dropMemos(self: *Facts) void {
     var each = self.walked.keyIterator();
     while (each.next()) |key| if (key.* != kept) {
         _ = self.memos.remove(key.*);
+        _ = self.lasting.remove(key.*);
     };
     self.walked = .empty;
 }
@@ -3743,20 +3800,26 @@ fn reachAll(self: *Facts, found: *Analysis) ResolveError!void {
             if (loose or tree.nodeTag(part.*) == .@"comptime" or (own and tree.nodeTag(part.*) == .test_decl)) try next.append(self.gpa, .{ .file = file, .part = part.*, .env = null });
         }
     }
-    // Each reading has its own budget; what it reads is memoized for the others.
+    // Each reading is a unit on a budget of its own; what it reads is memoized for the others.
     while (next.pop()) |reading| {
-        self.remaining = reading_budget;
-        const nodes = (try self.partsOf(reading.file)).nodes.get(reading.part) orelse continue;
-        for (nodes.items) |node| {
-            // A branch the reading's bindings rule out is not analyzed in it (`.array`
-            // of a `switch (@typeInfo(T))` reading a pointer `T`).
-            if (!try self.reachedUnder(reading.env, reading.file, node)) continue;
-            try self.reachFrom(found, &next, reading.file, node, reading.env);
-        }
-        if (self.remaining == 0) {
-            try found.limits.append(self.gpa, .{ .file = reading.file, .node = reading.part, .why = .budget });
-            found.everything = true;
-        }
+        const asker = self.enter(reading_budget);
+        const read = self.readPart(found, &next, reading);
+        const short = self.leave(asker);
+        try read;
+        if (!short) continue;
+        try found.limits.append(self.gpa, .{ .file = reading.file, .node = reading.part, .why = .budget });
+        found.everything = true;
+    }
+}
+
+/// Reads one part in its reading (`reachAll`).
+fn readPart(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), reading: PartRead) ResolveError!void {
+    const nodes = (try self.partsOf(reading.file)).nodes.get(reading.part) orelse return;
+    for (nodes.items) |node| {
+        // A branch the reading's bindings rule out is not analyzed in it (`.array`
+        // of a `switch (@typeInfo(T))` reading a pointer `T`).
+        if (!try self.reachedUnder(reading.env, reading.file, node)) continue;
+        try self.reachFrom(found, next, reading.file, node, reading.env);
     }
 }
 
@@ -7077,11 +7140,14 @@ fn memberName(self: *Facts, raw: []const u8) ResolveError![]const u8 {
 
 /// The `T` this run keeps, made with its defaults the first time it is asked for: what a rule
 /// computes once for the whole project and reads from each file's check. A type is its own key,
-/// so one rule's state is never another's. It lives as long as the run.
+/// so one rule's state is never another's. It lives as long as the run, or until `forget` drops
+/// it, unless `T` declares `lasting`: what it holds must then be complete whatever a later
+/// `forget` drops, or mark itself as not.
 pub fn memo(self: *Facts, comptime T: type) ResolveError!*T {
     const key = comptime std.hash.Wyhash.hash(0, @typeName(T));
     if (self.walk != null) try self.walked.put(self.gpa, key, {});
-    const entry = try self.memos.getOrPut(self.gpa, key);
+    const memos = if (@hasDecl(T, "lasting")) &self.lasting else &self.memos;
+    const entry = try memos.getOrPut(self.gpa, key);
     if (!entry.found_existing) {
         const made = try self.gpa.create(T);
         made.* = .{};
@@ -8565,7 +8631,7 @@ fn resolveIn(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
     // (`x.sqn(..).mul(..)`) reads each receiver once, not again at each call it holds.
     const key: Bound = .{ .env = e, .settled = .{ .key = .{ .file = file, .node = node }, .assumed = self.assumed } };
     if (self.bound.get(key)) |value| return value;
-    if (self.remaining == 0) return .{ .unknown = .budget };
+    if (self.remaining == 0) return self.spent();
     self.remaining -= 1;
     const wide = self.wide;
     const value = try self.readBound(e, file, node);

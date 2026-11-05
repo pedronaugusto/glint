@@ -143,13 +143,24 @@ pub fn runConfigured(gpa: std.mem.Allocator, project: *const Project, config: ru
         _ = scratch.reset(.free_all);
         if (file.status == .parsed) for (options.project_rules) |rule| {
             if (!runner.config.has(rule.definition.id)) continue;
-            try rule.check(&context);
+            rule.check(&context) catch |err| switch (err) {
+                // The program's solve ran short of its budget, or could not be made at this
+                // file (`Taint.get`): what the rule reads of it here is not judged.
+                error.SolveShort => try runner.addCoverage(.{ .file = runner.file, .rule = rule.definition.id, .reason = .budget_exhausted, .detail = "the program's flow facts were not solved within their budget" }),
+                else => |e| return e,
+            };
             _ = scratch.reset(.free_all);
         };
         if (file.status != .parsed) runner.complete = false;
         try runner.judgeSuppressions(file, known);
         runner.covered.clearRetainingCapacity();
-        if (runner.facts.remaining == 0) try runner.exhausted();
+        if (runner.facts.remaining == 0) {
+            try runner.exhausted();
+        } else if (runner.facts.short) {
+            // A unit of solving in the file's work ran short of its own budget (`Facts.enter`):
+            // it reports what it left undecided; what it built, no later file reads.
+            runner.facts.forget();
+        }
     }
     if (config.strict_suppressions and runner.stale.items.len != 0) runner.complete = false;
     std.mem.sort(Report.Diagnostic, runner.diagnostics.items, project, diagnosticLess);
@@ -294,6 +305,11 @@ fn sinkConfig(sink: *Context.Sink, file: Project.FileId) rules.Config {
 }
 fn sinkCoverage(sink: *Context.Sink, coverage: Report.Coverage) Context.Error!void {
     const runner: *Runner = @fieldParentPtr("sink", sink);
+    try runner.addCoverage(coverage);
+}
+/// Records `coverage`: a file's budget exhausted, or a site a gated rule could not judge, makes
+/// the run incomplete.
+fn addCoverage(runner: *Runner, coverage: Report.Coverage) Context.Error!void {
     var owned = coverage;
     owned.detail = try runner.a.dupe(u8, coverage.detail);
     if (coverage.rule) |id| owned.rule_name = (rules.definition(id, runner.definitions) orelse return error.InvalidSelection).name;
