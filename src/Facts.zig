@@ -2236,7 +2236,8 @@ fn comptimeBool(tree: *const Ast, record: Model.Declaration) bool {
 /// Whether `file` declares a comptime `bool` or enum parameter, whose conditions paths can settle.
 fn hasConditions(self: *Facts, file: Project.FileId) ResolveError!bool {
     if (self.conditional_files.get(file)) |known| return known;
-    // Read again while its parameters' types resolve: it may have them.
+    // Read again while its parameters' types resolve: it may have them. A re-entry's answer is
+    // only a filter, each site asking `comptimeNamed` again, so the superset is sound.
     try self.conditional_files.put(self.gpa, file, true);
     const tree = &self.project.at(file).file.tree;
     const any = for (self.project.at(file).model.declarations) |record| {
@@ -3256,13 +3257,50 @@ pub const Written = enum { type, other, unknown };
 /// The one reading of a written `type`; nothing reads its spelling. One that does not resolve
 /// is unknown, never another type: an alias may name `type`, or a parameter be bound to it.
 pub fn writesType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Written {
-    return writtenOf(try self.resolve(file, node));
+    const answer = writtenOf(try self.resolve(file, node));
+    if (answer == .unknown and try self.writtenInGeneric(file, node)) return .other;
+    return answer;
+}
+
+/// Whether `node`, a parameter's or a result's type in a function's prototype, names one of
+/// that function's generic parameters (`anytype`, `comptime`, or of a type resolving to `type`):
+/// each binding's type, which the binding reads.
+fn writtenInGeneric(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var at = node;
+    const proto_node = while (model.parentOf(at)) |parent| : (at = parent) {
+        var probe: [1]Ast.Node.Index = undefined;
+        if (tree.fullFnProto(&probe, parent) != null) break parent;
+        if (tree.nodeTag(parent) == .fn_decl or tree.nodeTag(parent) == .block or tree.nodeTag(parent) == .block_semicolon or tree.nodeTag(parent) == .block_two or tree.nodeTag(parent) == .block_two_semicolon) return false;
+    } else return false;
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, proto_node).?;
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    var it = proto.iterate(tree);
+    while (it.next()) |param| {
+        const generic = param.anytype_ellipsis3 != null or
+            (if (param.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false) or
+            (if (param.type_expr) |t| writtenOf(try self.resolve(file, t)) == .type else false);
+        if (!generic) continue;
+        const name = tree.tokenSlice(param.name_token orelse continue);
+        var token = first;
+        while (token <= last) : (token += 1) {
+            if (tree.tokenTag(token) == .identifier and std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
+        }
+    }
+    return false;
 }
 
 fn writtenOf(value: Value) Written {
     return switch (value) {
         .primitive => |name| if (std.mem.eql(u8, name, "type")) .type else .other,
-        .unknown => .unknown,
+        // One written in a generic's own parameters (`v: T`) is each binding's, which the
+        // binding reads; one that does not resolve otherwise may be `type`, as may a type read
+        // through `@typeInfo` (`@typeInfo(*const type).pointer.child`).
+        .unknown => |why| if (why == .generic) .other else .unknown,
+        .reflected => .unknown,
         .alternatives => |all| {
             var each: ?Written = null;
             for (all) |one| {
@@ -9438,7 +9476,7 @@ fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) 
         if (namesFunction(args[position]) or try self.literalNamesFunction(args[position]) or param.anytype_ellipsis3 != null) continue;
         if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) continue;
         const type_expr = param.type_expr orelse continue;
-        if (try self.writesType(function.file, type_expr) != .other) continue;
+        if (try self.writesType(function.file, type_expr) == .type) continue;
         const declared = try self.resolveIn(env, function.file, type_expr);
         if (declared == .unknown) continue;
         const typed = try self.instance(declared);
@@ -17470,15 +17508,17 @@ test "a reader's question past its steps, or code read lazily that imports what 
     try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
 }
 
-test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve is unknown" {
+test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve or is read through @typeInfo is unknown" {
     const source =
         \\const Type = type;
         \\const Kind = u8;
         \\const Far = @import("missing").Type;
+        \\const Read = @typeInfo(*const type).pointer.child;
         \\fn a(comptime T: type) void { _ = T; }
         \\fn b(comptime T: Type) void { _ = T; }
         \\fn c(comptime n: Kind) void { _ = n; }
         \\fn d(comptime T: Far) void { _ = T; }
+        \\fn e(comptime T: Read) void { _ = T; }
     ;
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
     defer project.deinit();
@@ -17495,5 +17535,5 @@ test "a written type is `type` by what it resolves to: an alias of it is, an ali
         var it = tree.fullFnProto(&buffer, record.node).?.iterate(tree);
         try answers.append(arena.allocator(), try facts.writesType(id, it.next().?.type_expr.?));
     }
-    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown }, answers.items);
+    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown, .unknown }, answers.items);
 }
