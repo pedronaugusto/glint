@@ -44,7 +44,7 @@ pub fn check(c: *Context, rule: Rule) Context.Error!void {
         const operand = each.operand;
         const stored = each.stored;
         if (c.inTest(tree.nodeMainToken(node))) continue;
-        const function = self.enclosing(node) orelse continue;
+        const function = (try self.enclosing(node)) orelse continue;
         if (stored) |target| if (!try self.outlives(target)) continue;
         const reached = try self.escaping(operand, function, 0);
         if (reached == .none) continue;
@@ -81,7 +81,7 @@ const Walk = struct {
 
     /// The function whose body holds `node`, or null outside one, inside `comptime`, or in a
     /// function returning `type`: all comptime frames.
-    fn enclosing(self: Walk, node: Ast.Node.Index) ?Ast.Node.Index {
+    fn enclosing(self: Walk, node: Ast.Node.Index) Context.Error!?Ast.Node.Index {
         var at = node;
         while (self.model.parentOf(at)) |parent| : (at = parent) {
             switch (self.tree.nodeTag(parent)) {
@@ -90,7 +90,7 @@ const Walk = struct {
                     var buffer: [1]Ast.Node.Index = undefined;
                     const proto = self.tree.fullFnProto(&buffer, self.tree.nodeData(parent).node_and_node[0]) orelse return null;
                     const result = proto.ast.return_type.unwrap() orelse return null;
-                    if (self.tree.nodeTag(result) == .identifier and std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(result)), "type")) return null;
+                    if (try self.c.facts.writesType(self.c.file, result) == .type) return null;
                     return parent;
                 },
                 else => {},
@@ -101,12 +101,12 @@ const Walk = struct {
 
     /// The declaration an identifier names, when it is one of `function`'s own: declared in its
     /// body, outside any nested function or `comptime`.
-    fn own(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
+    fn own(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
         const reference = self.model.reference(identifier) orelse return null;
         const d = reference.declaration orelse return null;
         const decl = self.model.declarations[@backingInt(d)];
         if (decl.kind != .variable) return null;
-        if (self.enclosing(decl.node) != function) return null;
+        if (try self.enclosing(decl.node) != function) return null;
         return d;
     }
 
@@ -120,15 +120,15 @@ const Walk = struct {
                 const inner = tree.nodeData(node).node;
                 const root = (try self.storage(inner)) orelse return .none;
                 // The local itself is its frame's memory, whatever its type.
-                if (root == Facts.ungrouped(tree, inner)) return reach(self.variable(root, function));
-                const d = self.variable(root, function) orelse return .none;
+                if (root == Facts.ungrouped(tree, inner)) return reach(try self.variable(root, function));
+                const d = (try self.variable(root, function)) orelse return .none;
                 return if (try self.value(d)) .{ .local = d } else .none;
             },
             .slice_open, .slice, .slice_sentinel => {
                 const sliced = (tree.fullSlice(node) orelse return .none).ast.sliced;
                 const root = (try self.storage(sliced)) orelse return .none;
                 if (root != Facts.ungrouped(tree, sliced)) return .none;
-                const d = self.variable(root, function) orelse return .none;
+                const d = (try self.variable(root, function)) orelse return .none;
                 if (try self.array(d)) return .{ .local = d };
                 // A pointer's slice points where the pointer does: what the local is given, but
                 // a slice of itself (`s = s[1..]`), which holds no memory it did not.
@@ -143,7 +143,7 @@ const Walk = struct {
             // what a `const` holds; a store that may give it any value may give it a local's
             // address.
             .identifier => {
-                const d = self.own(node, function) orelse return .none;
+                const d = (try self.own(node, function)) orelse return .none;
                 // A value that holds no pointer (`[4]u8` returned whole) points nowhere.
                 if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
                 const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
@@ -187,8 +187,8 @@ const Walk = struct {
 
     /// A local of `function`'s own in its frame: a `var` not comptime, or a `const` whose value
     /// is no literal the program compiles in.
-    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) ?Model.Declaration.Id {
-        const d = self.own(identifier, function) orelse return null;
+    fn variable(self: Walk, identifier: Ast.Node.Index, function: Ast.Node.Index) Context.Error!?Model.Declaration.Id {
+        const d = (try self.own(identifier, function)) orelse return null;
         const decl = self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node) orelse return null;
         if (decl.comptime_token != null) return null;
         if (self.tree.tokenTag(decl.ast.mut_token) == .keyword_const) {
@@ -275,7 +275,7 @@ const Walk = struct {
         for (tree.nodes.items(.tag), 0..) |tag, i| {
             if (tag != .@"defer") continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-            if (self.enclosing(node) != function) continue;
+            if (try self.enclosing(node) != function) continue;
             const deferred = tree.nodeData(node).node;
             var buffer: [2]Ast.Node.Index = undefined;
             const statements = tree.blockStatements(&buffer, deferred) orelse &.{deferred};

@@ -157,24 +157,16 @@ fn compileTime(self: *Walk, f: Facts.Decl) Context.Error!bool {
     const tree = &self.c.project.at(f.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, self.c.project.at(f.file).model.declarations[@backingInt(f.index)].node) orelse return false;
-    if (proto.ast.return_type.unwrap()) |result| if (try typeKeyword(self.c, f.file, result)) return true;
+    if (proto.ast.return_type.unwrap()) |result| if (try self.c.facts.writesType(f.file, result) == .type) return true;
     var parameters = proto.iterate(tree);
     var any = false;
     while (parameters.next()) |parameter| {
         any = true;
         const declared = if (parameter.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false;
-        const typed = if (parameter.type_expr) |expr| try typeKeyword(self.c, f.file, expr) else false;
+        const typed = if (parameter.type_expr) |expr| try self.c.facts.writesType(f.file, expr) == .type else false;
         if (!declared and !typed) return false;
     }
     return any;
-}
-
-/// Whether a type expression is the type `type`, by what it resolves to.
-fn typeKeyword(c: *Context, file: @import("Project.zig").FileId, node: Ast.Node.Index) Context.Error!bool {
-    return switch (try c.facts.resolve(file, node)) {
-        .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
-        else => false,
-    };
 }
 
 /// The cycle `looped` (the stack from the function called again) makes back to its first

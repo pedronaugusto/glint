@@ -543,7 +543,7 @@ fn typeValue(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const decl = c.project.at(declared.file).model.declarations[@backingInt(declared.index)];
     if (declared.file != c.file) return false;
     const written = if (decl.kind == .parameter) decl.node else if (tree.fullVarDecl(decl.node)) |v| v.ast.type_node.unwrap() orelse return false else return false;
-    return c.facts.typeIsType(c.file, written);
+    return try c.facts.writesType(c.file, written) == .type;
 }
 
 /// Whether `field` (`x.name`, a backing field's name) cannot be an aegis owner's backing field,
@@ -1409,7 +1409,7 @@ fn anyArgumentBinds(c: *Context, call: Facts.calls.Call) Context.Error!bool {
     };
     for (args, 0..) |argument, position| {
         if (call.receiver == .bound and position == 0) continue;
-        if (c.facts.fromParameter(c.file, argument)) continue;
+        if (try c.facts.fromParameter(c.file, argument)) continue;
         // Of a type that resolves to no owner, in any build (`n`, `@as(u8, 3)`, `u8`): what a
         // binding to it copies, casts or makes is plain, as `boundBy` judges it. Which
         // parameter takes a type is not known here, so a type stands for its values
@@ -1443,7 +1443,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
             try c.undecided(rule, tree.tokenStart(name_token), .unsupported, "a generic of more parameters than are read here copies some: its binding may copy an owner");
             return false;
         }
-        types[count] = if (param.type_expr) |t| try typeKeyword(c, function.file, t) else false;
+        types[count] = if (param.type_expr) |t| try c.facts.writesType(function.file, t) != .other else false;
         values[count] = param.anytype_ellipsis3 != null;
     }
     // The generic's casts this binding makes an aegis scalar's: one finding at the binding,
@@ -1458,7 +1458,7 @@ fn boundBy(c: *Context, tree: *const Ast, call: Facts.calls.Call, rule: Rule, fu
         if (!types[copy.position] and !values[copy.position]) continue;
         const argument = args[copy.position];
         // A parameter of a generic this call is in, passed on: decided where that is bound.
-        if (c.facts.fromParameter(c.file, argument)) continue;
+        if (try c.facts.fromParameter(c.file, argument)) continue;
         // A parameter the generic moves into storage (`out.* = x`): the argument moves there
         // where it is made in place, or is a local nothing holds beside the call (`moved`); a
         // live local read again, or one passed on each pass of a loop, is copied.
@@ -2383,7 +2383,7 @@ fn ownedValue(c: *Context, node: Ast.Node.Index, depth: usize) Context.Error!boo
     const v = tree.fullVarDecl(decl.node) orelse return false;
     if (v.ast.type_node.unwrap()) |t| {
         if (tree.fullPtrType(t) != null) return false;
-        if (try typeKeyword(c, c.file, t)) return false;
+        if (try c.facts.writesType(c.file, t) == .type) return false;
         return try Contract.owner(c, t) != null;
     }
     var init = v.ast.init_node.unwrap() orelse return false;
@@ -2531,7 +2531,7 @@ fn heldOwners(c: *Context, tree: *const Ast, model: *const Model, decl: Model.De
     };
     var call_buffer: [1]Ast.Node.Index = undefined;
     _ = tree.fullCall(&call_buffer, call) orelse return null;
-    if (c.facts.madeByParameter(c.file, call) != null) return null;
+    if (try c.facts.madeByParameter(c.file, call) != null) return null;
     const whole = try c.facts.resolve(c.file, value);
     // An array of owners of a length the function declares: each element an owner at its
     // index (`gs[0]`, `gs[1]`); one of no known length is read whole (`acquiredOwner`).
@@ -2926,7 +2926,7 @@ fn acquisitionOwner(c: *Context, tree: *const Ast, acquisition: Ast.Node.Index, 
     var call_buffer: [1]Ast.Node.Index = undefined;
     const acquired = tree.fullCall(&call_buffer, acquisition) orelse return null;
     // By a function of the generic's type parameter: each binding's, checked at the binding.
-    if (c.facts.madeByParameter(c.file, acquisition) != null) return null;
+    if (try c.facts.madeByParameter(c.file, acquisition) != null) return null;
     // A std handle acquired raw (`dir.openFile`): released by its `close`.
     if (try Shapes.acquiresHandle(c, cleanup, acquisition)) return .std_handle;
     const named = if (try publishedCall(c, c.file, acquisition)) |published| acquires(published.name) else false;
@@ -4880,14 +4880,6 @@ fn memberNamed(c: *Context, file: Project.FileId, read: Ast.Node.Index) Context.
     }
     const path = try Facts.accesses.pathOf(c.facts, file, read);
     return if (path.steps[0].kind == .field) path.steps[0].name else null;
-}
-
-/// Whether `node` names the type `type`, by what it resolves to.
-fn typeKeyword(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    return switch (try c.facts.resolve(file, node)) {
-        .primitive => |primitive| std.mem.eql(u8, primitive, "type"),
-        else => false,
-    };
 }
 
 /// The token declaring the local or global the name `node` reaches, by the model's resolution;

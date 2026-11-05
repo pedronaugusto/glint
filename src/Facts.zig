@@ -752,7 +752,7 @@ fn pathFacts(self: *Facts, file: Project.FileId, node: Ast.Node.Index, found: *s
             if (whole.ast.else_expr.unwrap() == child and !try self.holds(file, whole.ast.cond_expr, false, found)) return false;
         };
         if (tree.fullSwitchCase(parent)) |case| if (case.ast.target_expr == child) if (model.parentOf(parent)) |at| if (tree.fullSwitch(at)) |whole| {
-            if (self.switchParameter(file, whole.ast.condition)) |parameter| if (!try self.prong(tree, whole, case, parameter, found)) return false;
+            if (try self.switchParameter(file, whole.ast.condition)) |parameter| if (!try self.prong(tree, whole, case, parameter, found)) return false;
         };
         var buffer: [2]Ast.Node.Index = undefined;
         const statements = tree.blockStatements(&buffer, parent) orelse continue;
@@ -830,7 +830,7 @@ pub fn branchesOnCondition(self: *Facts, file: Project.FileId, node: Ast.Node.In
         if (at < first or at > last) continue;
         switch (tag) {
             .@"if", .if_simple => if (self.namesCondition(file, tree.fullIf(branch).?.ast.cond_expr, 0)) return true,
-            .@"switch", .switch_comma => if (self.switchParameter(file, tree.fullSwitch(branch).?.ast.condition) != null) return true,
+            .@"switch", .switch_comma => if (try self.switchParameter(file, tree.fullSwitch(branch).?.ast.condition) != null) return true,
             else => {},
         }
     }
@@ -895,7 +895,7 @@ fn findCopies(self: *Facts) ResolveError!void {
             if (d.kind != .function) continue;
             const decl: Decl = .{ .file = id, .index = @fromBackingInt(@intCast(i)) };
             if (self.syntaxOf(id).nodeTag(self.scopeNode(decl)) != .fn_decl) continue;
-            if (!self.hasGenericParameter(decl)) continue;
+            if (!try self.hasGenericParameter(decl)) continue;
             try functions.append(self.gpa, decl);
             var direct: std.ArrayList(ParameterCopy) = .empty;
             try self.directCopies(decl, &direct);
@@ -1044,7 +1044,7 @@ pub const FileSet = std.AutoHashMapUnmanaged(u32, void);
 
 /// The position of each parameter of `function` that takes a type or `anytype`, by its
 /// declaration's index; null for any other parameter.
-fn genericPosition(self: *const Facts, function: Decl, parameter: Model.Declaration.Id) ?usize {
+fn genericPosition(self: *Facts, function: Decl, parameter: Model.Declaration.Id) ResolveError!?usize {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(parameter)];
     if (record.kind != .parameter or model.scopes[@backingInt(record.scope)].node != self.scopeNode(function)) return null;
@@ -1056,8 +1056,9 @@ fn genericPosition(self: *const Facts, function: Decl, parameter: Model.Declarat
     while (it.next()) |param| : (position += 1) {
         if (param.name_token != record.token) continue;
         if (param.anytype_ellipsis3 != null) return position;
+        // One whose type does not resolve may take a type: a binding's, as one of `type` is.
         const type_expr = param.type_expr orelse return null;
-        return if (typeKeyword(t, type_expr)) position else null;
+        return if (try self.writesType(function.file, type_expr) != .other) position else null;
     }
     return null;
 }
@@ -1075,14 +1076,15 @@ pub fn anytypeAt(self: *const Facts, function: Decl, token: Ast.TokenIndex) ?usi
     return null;
 }
 
-pub fn hasGenericParameter(self: *const Facts, function: Decl) bool {
+/// Whether `function` takes a type or `anytype`: one whose type does not resolve may.
+pub fn hasGenericParameter(self: *Facts, function: Decl) ResolveError!bool {
     const t = self.syntaxOf(function.file);
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const proto = t.fullFnProto(&fn_buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
     var it = proto.iterate(t);
     while (it.next()) |param| {
         if (param.anytype_ellipsis3 != null) return true;
-        if (param.type_expr) |type_expr| if (typeKeyword(t, type_expr)) return true;
+        if (param.type_expr) |type_expr| if (try self.writesType(function.file, type_expr) != .other) return true;
     }
     return false;
 }
@@ -1090,7 +1092,7 @@ pub fn hasGenericParameter(self: *const Facts, function: Decl) bool {
 /// The generic parameter whose value `value` is: a parameter of `function` declared `T` of a
 /// type parameter, or an `anytype` parameter, its own argument's value. A `comptime` one's
 /// value is known as the program compiles and holds nothing at run time: none.
-fn valueOfParameter(self: *const Facts, function: Decl, value: Model.Declaration.Id) ?usize {
+fn valueOfParameter(self: *Facts, function: Decl, value: Model.Declaration.Id) ResolveError!?usize {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(value)];
     if (record.kind != .parameter or model.scopes[@backingInt(record.scope)].node != self.scopeNode(function)) return null;
@@ -1099,7 +1101,7 @@ fn valueOfParameter(self: *const Facts, function: Decl, value: Model.Declaration
     if (self.anytypeAt(function, record.token)) |position| return position;
     if (t.nodeTag(record.node) != .identifier) return null;
     const named = (model.reference(record.node) orelse return null).declaration orelse return null;
-    return self.genericPosition(function, named);
+    return try self.genericPosition(function, named);
 }
 
 /// `const x = v;` in `function`'s own body, `v` a value of a generic parameter.
@@ -1116,10 +1118,10 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         if (inComptime(t, model, d.node)) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
         // What a call a parameter decides makes is no copy of it (`madeCalls`).
-        if (self.madeByParameter(function.file, init) != null) continue;
+        if (try self.madeByParameter(function.file, init) != null) continue;
         if (t.nodeTag(init) == .identifier) {
             const named = (model.reference(init) orelse continue).declaration orelse continue;
-            const position = self.valueOfParameter(function, named) orelse continue;
+            const position = try self.valueOfParameter(function, named) orelse continue;
             try out.append(self.gpa, .{ .position = position, .site = .{ .file = function.file, .node = d.node } });
             continue;
         }
@@ -1127,14 +1129,14 @@ fn directCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
         // place it reads that a generic parameter gives, read with the binding's arguments.
         // Into a type written apart from the parameters (`const kind: Kind = ...`) it is the
         // same copy in every binding, decided where it is written.
-        if (v.ast.type_node.unwrap()) |declared| if (self.derivedParameter(function, declared, 0) == null) continue;
+        if (v.ast.type_node.unwrap()) |declared| if (try self.derivedParameter(function, declared, 0) == null) continue;
         const parts = try self.copiedParts(function.file, init);
         for (parts.places) |place| {
-            const position = self.runtimeParameter(function, place, 0) orelse continue;
+            const position = try self.runtimeParameter(function, place, 0) orelse continue;
             // The parameter itself is its argument, read as written where it is bound
             // (`const both: [2]@TypeOf(x) = .{ x, x }`); a part whose value resolves where it
             // is written is the same copy in every binding, decided there.
-            const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| self.valueOfParameter(function, named) != null else false else false;
+            const itself = t.nodeTag(place) == .identifier and if (model.reference(place)) |ref| if (ref.declaration) |named| try self.valueOfParameter(function, named) != null else false else false;
             if (!itself and try self.resolve(function.file, place) != .unknown) continue;
             // The parameter itself held once, in no loop, by a local nothing else holds it in
             // is moved there (`const held: [1]@TypeOf(x) = .{x};`), as a write is.
@@ -1164,7 +1166,7 @@ fn madeCalls(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)) R
         if (at < first or at > last) continue;
         var call_buffer: [1]Ast.Node.Index = undefined;
         if (t.fullCall(&call_buffer, node) == null) continue;
-        const made = self.madeBy(function.file, node) orelse continue;
+        const made = try self.madeBy(function.file, node) orelse continue;
         if (!std.meta.eql(made.function, function) or inComptime(t, model, node)) continue;
         const site: Key = .{ .file = function.file, .node = node };
         try out.append(self.gpa, .{ .position = made.position, .site = site, .kind = .made, .source = site });
@@ -1232,11 +1234,11 @@ fn storedCopies(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy)
             const handed = tag != .@"return" and tag != .assign and tag != .assign_destructure and tag != .address_of;
             const parts = try self.copiedParts(function.file, value);
             for (parts.places) |place| {
-                const position = self.runtimeParameter(function, place, 0) orelse continue;
+                const position = try self.runtimeParameter(function, place, 0) orelse continue;
                 const named: ?Model.Declaration.Id = if (t.nodeTag(place) == .identifier) if (model.reference(place)) |ref| ref.declaration else null else null;
                 // The parameter itself is its argument, read as written where it is bound; a part
                 // whose value resolves where it is written is the same copy in every binding.
-                const itself = if (named) |index| self.valueOfParameter(function, index) != null else false;
+                const itself = if (named) |index| try self.valueOfParameter(function, index) != null else false;
                 if (!itself and try self.resolve(function.file, place) != .unknown) continue;
                 // A call takes the parameter itself only, as a pass-on reads a part.
                 if (handed and !itself) continue;
@@ -1346,7 +1348,7 @@ fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy))
                 // Bits reinterpreted: a value one gives read as another type, or a type written
                 // in terms of one made out of another's bits.
                 if ((std.mem.eql(u8, name, "@bitCast") or std.mem.eql(u8, name, "@ptrCast")) and args.len == 1) {
-                    if (self.runtimeParameter(function, args[0], 0) != null) break :blk args[0];
+                    if (try self.runtimeParameter(function, args[0], 0) != null) break :blk args[0];
                     break :blk self.writtenType(function.file, node, 0) orelse continue;
                 }
                 // `@call(modifier, T.raw, .{x})`: the value it is given.
@@ -1370,7 +1372,7 @@ fn scalarCasts(self: *Facts, function: Decl, out: *std.ArrayList(ParameterCopy))
             },
             else => continue,
         };
-        const position = self.derivedParameter(function, source, 0) orelse continue;
+        const position = try self.derivedParameter(function, source, 0) orelse continue;
         const site: Key = .{ .file = function.file, .node = node };
         try out.append(self.gpa, .{ .position = position, .site = site, .kind = .cast, .source = .{ .file = function.file, .node = source } });
         try self.cast_sites.put(self.gpa, site, function);
@@ -1584,12 +1586,12 @@ pub fn boundAtBinding(self: *Facts, file: Project.FileId, site: Ast.Node.Index, 
 /// (`T.init(...)`, `comptime T: type`), or a method of a value of one (`probe.of(...)`,
 /// `probe: Probe`) or of an `anytype` parameter, whose type its argument gives. Each binding
 /// makes its own (`parameterCopies`' `made`).
-pub fn madeByParameter(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?usize {
-    return (self.madeBy(file, value) orelse return null).position;
+pub fn madeByParameter(self: *Facts, file: Project.FileId, value: Ast.Node.Index) ResolveError!?usize {
+    return (try self.madeBy(file, value) orelse return null).position;
 }
 
 /// `madeByParameter`'s parameter and the function it is of.
-fn madeBy(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?struct { function: Decl, position: usize } {
+fn madeBy(self: *Facts, file: Project.FileId, value: Ast.Node.Index) ResolveError!?struct { function: Decl, position: usize } {
     const t = self.syntaxOf(file);
     const made = switch (t.nodeTag(value)) {
         .@"try" => t.nodeData(value).node,
@@ -1608,7 +1610,7 @@ fn madeBy(self: *const Facts, file: Project.FileId, value: Ast.Node.Index) ?stru
     // an `anytype` parameter's or one typed by a type parameter (`valueOfParameter`). A
     // `comptime` value holds nothing at run time, so nothing a call on it makes is a binding's.
     const anytype_value = self.anytypeAt(function, model.declarations[@backingInt(index)].token) != null;
-    const position = (if (anytype_value) null else self.genericPosition(function, index)) orelse self.valueOfParameter(function, index) orelse return null;
+    const position = (if (anytype_value) null else try self.genericPosition(function, index)) orelse try self.valueOfParameter(function, index) orelse return null;
     return .{ .function = function, .position = position };
 }
 
@@ -1630,7 +1632,7 @@ fn passings(self: *Facts, function: Decl) ResolveError![]const Passing {
         const at = t.nodeMainToken(node);
         if (at < first or at > last) continue;
         var passes = false;
-        for (call.ast.params) |arg| if (self.derivedParameter(function, arg, 0) != null) {
+        for (call.ast.params) |arg| if (try self.derivedParameter(function, arg, 0) != null) {
             passes = true;
         };
         if (!passes) continue;
@@ -1658,7 +1660,7 @@ fn passedCopies(self: *Facts, function: Decl, passing: []const Passing, out: *st
         for (theirs) |copy| {
             if (copy.position < receiver or copy.position - receiver >= call.ast.params.len) continue;
             const argument = call.ast.params[copy.position - receiver];
-            const mine = self.derivedParameter(function, argument, 0) orelse continue;
+            const mine = try self.derivedParameter(function, argument, 0) orelse continue;
             // A path through this call again is a cycle of generics passing it round.
             if (copy.source != null and onPath(copy.path, .{ .file = function.file, .node = node })) continue;
             // A route past those read stays past them for each caller.
@@ -1669,7 +1671,7 @@ fn passedCopies(self: *Facts, function: Decl, passing: []const Passing, out: *st
                 .source = source,
                 .path = try std.mem.concat(self.gpa, Key, &.{ &.{.{ .file = function.file, .node = node }}, copy.path }),
                 .crowded = copy.crowded,
-            } else if (self.readThrough(function, argument, 0))
+            } else if (try self.readThrough(function, argument, 0))
                 .{ .position = mine, .site = copy.site, .kind = copy.kind, .source = .{ .file = function.file, .node = argument }, .crowded = copy.crowded }
             else
                 .{ .position = mine, .site = copy.site, .kind = copy.kind, .crowded = copy.crowded };
@@ -1713,7 +1715,7 @@ fn samePath(a: []const Key, b: []const Key) bool {
 /// hold: what calling it, or a method of it, returns, or what it points to. What it holds (a
 /// field, an element, the payload of an optional or an error union) is the binding's argument's,
 /// read whole where it is bound.
-fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) bool {
+fn readThrough(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize) ResolveError!bool {
     if (depth == 8) return false;
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
@@ -1723,7 +1725,7 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
         if (t.tokenTag(token) != .identifier) continue;
         const index = self.lexical(function.file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
         const record = model.declarations[@backingInt(index)];
-        if (self.genericPosition(function, index) != null or self.valueOfParameter(function, index) != null) {
+        if (try self.genericPosition(function, index) != null or try self.valueOfParameter(function, index) != null) {
             // `p(...)`, `p.f(...)`, `p.*`, `p.f.*`.
             var next = token + 1;
             while (next + 1 <= last and t.tokenTag(next) == .period and t.tokenTag(next + 1) == .identifier) next += 2;
@@ -1732,7 +1734,7 @@ fn readThrough(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: 
         }
         if (record.kind != .variable or !self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
         const init = (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue;
-        if (init != node and self.readThrough(function, init, depth + 1)) return true;
+        if (init != node and try self.readThrough(function, init, depth + 1)) return true;
     }
     return false;
 }
@@ -1964,7 +1966,7 @@ fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, c
             if (!sameCopy(theirs, copy)) continue;
             if (theirs.position < receiver or theirs.position - receiver >= call.ast.params.len) continue;
             if (std.mem.findScalar(usize, seen.items, theirs.position) != null) continue;
-            if (self.derivedParameter(function, call.ast.params[theirs.position - receiver], 0) != position) continue;
+            if (try self.derivedParameter(function, call.ast.params[theirs.position - receiver], 0) != position) continue;
             try seen.append(self.gpa, theirs.position);
             const reading = bound orelse try self.bind(function.file, call, passing.target, env);
             bound = reading;
@@ -2017,18 +2019,18 @@ pub fn comptimeParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Inde
 
 /// Whether `node`, an identifier, names a value of a type parameter of its function (`value`
 /// of `value: T`): a copy of it is each binding's.
-pub fn parameterValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+pub fn parameterValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     const model = &self.project.at(file).model;
     if (self.syntaxOf(file).nodeTag(node) != .identifier) return false;
     const index = (model.reference(node) orelse return false).declaration orelse return false;
     const function = self.functionOf(.{ .file = file, .index = index }) orelse return false;
-    return self.valueOfParameter(function, index) != null;
+    return try self.valueOfParameter(function, index) != null;
 }
 
 /// Whether `node` names a value of a generic parameter of a function whose bindings are all
 /// calls a run judges, each deciding a copy of it (`parameterValue`, `judgedAtBindings`).
 pub fn parameterAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    if (!self.parameterValue(file, node)) return false;
+    if (!try self.parameterValue(file, node)) return false;
     const model = &self.project.at(file).model;
     const index = model.reference(node).?.declaration.?; // unreachable: `parameterValue` holds only for a parameter's name
     return self.judgedAtBindings(self.functionOf(.{ .file = file, .index = index }).?); // unreachable: as above
@@ -2036,7 +2038,7 @@ pub fn parameterAtBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Ind
 
 /// Whether `node`, written in a generic function, is or is a part of one of its generic
 /// parameters: a binding passed on, which the binding of that parameter decides.
-pub fn fromParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+pub fn fromParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     const t = self.syntaxOf(file);
     const model = &self.project.at(file).model;
     var up = model.parentOf(node);
@@ -2046,7 +2048,7 @@ pub fn fromParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) b
             if (d.kind != .function) continue;
             const candidate: Decl = .{ .file = file, .index = @fromBackingInt(@intCast(i)) };
             if (self.scopeNode(candidate) != parent) continue;
-            if (self.derivedParameter(candidate, node, 0) != null) return true;
+            if (try self.derivedParameter(candidate, node, 0) != null) return true;
             break;
         }
     }
@@ -2068,7 +2070,7 @@ fn methodCall(self: *const Facts, file: Project.FileId, call: Ast.full.Call, tar
 
 /// The generic parameter of `function` that `node` is or is a part of: the parameter itself, a
 /// value of it, or what a capture or a constant reads of its type information.
-fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) ?usize {
+fn derivedParameter(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize) ResolveError!?usize {
     if (depth == 8) return null;
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
@@ -2080,8 +2082,8 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         const scope = model.scopeOf(token);
         const index = self.lexical(function.file, scope, t.tokenSlice(token)) orelse continue;
         const record = model.declarations[@backingInt(index)];
-        if (self.genericPosition(function, index)) |position| return position;
-        if (self.valueOfParameter(function, index)) |position| return position;
+        if (try self.genericPosition(function, index)) |position| return position;
+        if (try self.valueOfParameter(function, index)) |position| return position;
         if (!self.enclosed(function.file, record.scope, self.scopeNode(function))) continue;
         const source: Ast.Node.Index = switch (record.kind) {
             .variable => (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue,
@@ -2089,7 +2091,7 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
             else => continue,
         };
         if (source == node) continue;
-        if (self.derivedParameter(function, source, depth + 1)) |position| return position;
+        if (try self.derivedParameter(function, source, depth + 1)) |position| return position;
     }
     return null;
 }
@@ -2098,7 +2100,7 @@ fn derivedParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
 /// through a local: a value of one (`value: T`, `anytype`), or what calling one returns
 /// (`handler()`, `T.init()`). A type parameter's declarations, a `comptime` parameter's parts
 /// and what `@typeInfo` tells of them are known as the program compiles: none.
-fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, depth: usize) ?usize {
+fn runtimeParameter(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize) ResolveError!?usize {
     if (depth == 8) return null;
     const t = self.syntaxOf(function.file);
     const model = &self.project.at(function.file).model;
@@ -2115,8 +2117,8 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         if (t.tokenTag(token) != .identifier) continue;
         const index = self.lexical(function.file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
         const record = model.declarations[@backingInt(index)];
-        if (self.valueOfParameter(function, index)) |position| return position;
-        if (self.genericPosition(function, index)) |position| {
+        if (try self.valueOfParameter(function, index)) |position| return position;
+        if (try self.genericPosition(function, index)) |position| {
             // `p(...)`, `p.f(...)`.
             var next = token + 1;
             while (next + 1 <= last and t.tokenTag(next) == .period and t.tokenTag(next + 1) == .identifier) next += 2;
@@ -2128,7 +2130,7 @@ fn runtimeParameter(self: *const Facts, function: Decl, node: Ast.Node.Index, de
         if (v.comptime_token != null) continue;
         const init = v.ast.init_node.unwrap() orelse continue;
         if (init == node) continue;
-        if (self.runtimeParameter(function, init, depth + 1)) |position| return position;
+        if (try self.runtimeParameter(function, init, depth + 1)) |position| return position;
     }
     return null;
 }
@@ -2204,23 +2206,27 @@ fn conditionParameter(self: *const Facts, file: Project.FileId, node: Ast.Node.I
 
 /// The comptime enum parameter a `switch` operand names: one declared `comptime x: T` with `T`
 /// a named type other than `type` and `bool`, whose prongs name its tags.
-fn switchParameter(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) ?Decl {
+fn switchParameter(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!?Decl {
     const tree = &self.project.at(file).file.tree;
     if (tree.nodeTag(node) != .identifier) return null;
     const model = &self.project.at(file).model;
     const index = (model.reference(node) orelse return null).declaration orelse return null;
     const record = model.declarations[@backingInt(index)];
-    if (record.kind != .parameter or !comptimeNamed(tree, record)) return null;
+    if (record.kind != .parameter or !try self.comptimeNamed(file, record)) return null;
     return .{ .file = file, .index = index };
 }
 
-fn comptimeNamed(tree: *const Ast, record: Model.Declaration) bool {
+/// Whether a parameter is `comptime` of a named type other than `bool` that is not `type`, by
+/// what it resolves to: one that does not resolve settles no prong.
+fn comptimeNamed(self: *Facts, file: Project.FileId, record: Model.Declaration) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
     if (record.token == 0 or tree.tokenTag(record.token - 1) != .keyword_comptime) return false;
-    return switch (tree.nodeTag(record.node)) {
-        .identifier => !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "type") and !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "bool"),
-        .field_access => true,
-        else => false,
-    };
+    switch (tree.nodeTag(record.node)) {
+        .identifier => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(record.node)), "bool")) return false,
+        .field_access => {},
+        else => return false,
+    }
+    return try self.writesType(file, record.node) == .other;
 }
 
 fn comptimeBool(tree: *const Ast, record: Model.Declaration) bool {
@@ -2230,9 +2236,11 @@ fn comptimeBool(tree: *const Ast, record: Model.Declaration) bool {
 /// Whether `file` declares a comptime `bool` or enum parameter, whose conditions paths can settle.
 fn hasConditions(self: *Facts, file: Project.FileId) ResolveError!bool {
     if (self.conditional_files.get(file)) |known| return known;
+    // Read again while its parameters' types resolve: it may have them.
+    try self.conditional_files.put(self.gpa, file, true);
     const tree = &self.project.at(file).file.tree;
     const any = for (self.project.at(file).model.declarations) |record| {
-        if (record.kind == .parameter and (comptimeBool(tree, record) or comptimeNamed(tree, record))) break true;
+        if (record.kind == .parameter and (comptimeBool(tree, record) or try self.comptimeNamed(file, record))) break true;
     } else false;
     try self.conditional_files.put(self.gpa, file, any);
     return any;
@@ -2735,7 +2743,7 @@ fn namedType(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Nod
             const reference = model.reference(at) orelse return null;
             const decl = reference.declaration orelse return if (std.zig.primitives.isPrimitive(tree.tokenSlice(tree.nodeMainToken(at)))) value else null;
             const kind = self.parameterTypeNode(.{ .file = file, .index = decl }) orelse return null;
-            if (tree.nodeTag(kind) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type")) return null;
+            if (try self.writesType(file, kind) != .type) return null;
             return value;
         },
         .builtin_call_two, .builtin_call_two_comma => return if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(at)), "@TypeOf")) value else null,
@@ -3240,11 +3248,32 @@ fn stdMember(self: *Facts, path: []const []const u8) ResolveError!Value {
     return value;
 }
 
+/// What a written type is of `type` itself.
+pub const Written = enum { type, other, unknown };
+
 /// Whether the type written at `node` is `type` itself, by what it resolves to: `comptime
-/// T: type`, a function returning `type`, `const Kind = type;` named for it.
-pub fn typeIsType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
-    const value = try self.resolve(file, node);
-    return value == .primitive and std.mem.eql(u8, value.primitive, "type");
+/// T: type`, a function returning `type`, an alias of it (`const Type = type;`) named for it.
+/// The one reading of a written `type`; nothing reads its spelling. One that does not resolve
+/// is unknown, never another type: an alias may name `type`, or a parameter be bound to it.
+pub fn writesType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Written {
+    return writtenOf(try self.resolve(file, node));
+}
+
+fn writtenOf(value: Value) Written {
+    return switch (value) {
+        .primitive => |name| if (std.mem.eql(u8, name, "type")) .type else .other,
+        .unknown => .unknown,
+        .alternatives => |all| {
+            var each: ?Written = null;
+            for (all) |one| {
+                const it = writtenOf(one);
+                if (each != null and each.? != it) return .unknown;
+                each = it;
+            }
+            return each orelse .unknown;
+        },
+        else => .other,
+    };
 }
 
 /// An integer type's width and sign across the targets of one pointer width (`integerType`):
@@ -3821,7 +3850,7 @@ pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Val
     // a field's type is, the template's reading standing where that reading is unknown.
     if (record.kind != .field) {
         // One typed `type` (`pub const Key: type = E;`) names a type as an untyped one does.
-        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.type_node == .none or namesType(tree, variable.ast.type_node.unwrap().?)) if (variable.ast.init_node.unwrap()) |init| {
+        if (record.kind == .variable) if (tree.fullVarDecl(record.node)) |variable| if (variable.ast.type_node == .none or try self.writesType(decl.file, variable.ast.type_node.unwrap().?) != .other) if (variable.ast.init_node.unwrap()) |init| {
             const value = try self.substituted(decl.file, init, made);
             if (value != .unknown) return self.madeWithin(value, container, made);
         };
@@ -3837,11 +3866,6 @@ pub fn memberOf(self: *Facts, container: Container, decl: Decl) ResolveError!Val
         return if (template_value == .alternatives) value else template_value;
     }
     return self.valueOf(try self.madeWithin(value, container, made));
-}
-
-/// Whether a type expression is `type`.
-fn namesType(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// A member read through a value (`x.name`). Called through a field that holds a function
@@ -4022,7 +4046,7 @@ fn castMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, field: D
     const part = try self.partOf(file, node) orelse return false;
     const index = (try self.partsOf(file)).declared.get(part) orelse return false;
     const function: Decl = .{ .file = file, .index = index };
-    if (!self.instantiated(function)) return self.castMissesIn(null, file, node, field);
+    if (!try self.instantiated(function)) return self.castMissesIn(null, file, node, field);
     for ((try self.analyzedReadings(function)) orelse return false) |reading| {
         if (!try self.castMissesIn(reading, file, node, field)) return false;
     }
@@ -4051,7 +4075,7 @@ fn holderMisses(self: *Facts, file: Project.FileId, node: Ast.Node.Index, holder
     const part = try self.partOf(file, node) orelse return false;
     const index = (try self.partsOf(file)).declared.get(part) orelse return false;
     const function: Decl = .{ .file = file, .index = index };
-    if (!self.genericFunction(function)) return false;
+    if (!try self.genericFunction(function)) return false;
     const readings = (try self.analyzedReadings(function)) orelse return false;
     const scope = self.project.at(field.file).model.declarations[@backingInt(field.index)].scope;
     for (readings) |reading| {
@@ -4491,7 +4515,7 @@ fn lazyDecl(self: *Facts, found: *Analysis, decl: Decl) ResolveError!bool {
     if (!found.files.contains(decl.file) and !try self.lazilyEntered(found, decl.file)) return false;
     // A member of a container a function declares exists only in that function's instances
     // (`reachDeclaration`): analyzed where the function is, in its readings.
-    if (self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
+    if (try self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
         if (!found.reached.contains(outer) and !try self.lazilyAnalyzed(found, outer)) return false;
     };
     if (found.named.contains(record.name)) return true;
@@ -4561,7 +4585,7 @@ fn lazilyRead(self: *Facts, found: *Analysis, site: Key) ResolveError!bool {
 /// read the function in each it has (code it did not read analyzes the function nowhere, so
 /// makes no other instance); otherwise null, each one's (binding nothing).
 fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
-    if (!self.instantiated(decl)) return null;
+    if (!try self.instantiated(decl)) return null;
     const outer = self.enclosingFunction(decl) orelse return null;
     const readings = found.reached.get(outer) orelse return null;
     if (readings.every or try self.lazilyAnalyzed(found, outer)) return null;
@@ -4685,7 +4709,7 @@ fn reachDeclaration(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRea
     // too, its own comptime parameters unbound there; none while nothing reaches the function,
     // since no instance exists until it is evaluated, and every evaluation names it (a call, or
     // the function handed as a value, each of which reaches it).
-    if (env == null and self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
+    if (env == null and try self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| {
         const pending = try found.members.getOrPut(self.gpa, outer);
         if (!pending.found_existing) pending.value_ptr.* = .empty;
         for (pending.value_ptr.items) |known| {
@@ -4805,7 +4829,7 @@ fn reachFrom(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), fil
 /// makes of it (`readingFrom`), a member of a container a type function made in that
 /// container's instantiation (`instanceOf`), anything else once.
 fn reachCalled(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), file: Project.FileId, node: Ast.Node.Index, decl: Decl, env: ?*const Env) ResolveError!void {
-    if (self.genericFunction(decl)) return self.reachEach(found, next, decl, try self.readingFrom(file, node, decl, env), 0);
+    if (try self.genericFunction(decl)) return self.reachEach(found, next, decl, try self.readingFrom(file, node, decl, env), 0);
     var holder: ?Container = null;
     var buffer: [1]Ast.Node.Index = undefined;
     const tree = &self.project.at(file).file.tree;
@@ -4831,7 +4855,7 @@ fn reachEach(self: *Facts, found: *Analysis, next: *std.ArrayList(PartRead), dec
         if (position < from or bound.args[position] != .alternatives) continue;
         const instantiates = param.anytype_ellipsis3 != null or
             (if (param.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false) or
-            (if (param.type_expr) |t| namesType(tree, t) else false);
+            (if (param.type_expr) |t| try self.writesType(decl.file, t) != .other else false);
         if (!instantiates) continue;
         for (bound.args[position].alternatives) |one| {
             const args = try self.gpa.dupe(Value, bound.args);
@@ -4857,19 +4881,19 @@ fn madeHolder(value: Value) ?Container {
 
 /// Whether `decl` is a function with a `comptime`, `type` or `anytype` parameter: Zig
 /// analyzes it once per instantiation, each a call's.
-fn genericFunction(self: *const Facts, decl: Decl) bool {
+fn genericFunction(self: *Facts, decl: Decl) ResolveError!bool {
     const record = self.project.at(decl.file).model.declarations[@backingInt(decl.index)];
     if (record.kind != .function) return false;
     const tree = &self.project.at(decl.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
-    return isGeneric(tree, proto);
+    return self.isGeneric(decl.file, proto);
 }
 
 /// Whether Zig analyzes `decl` once per instantiation: a generic function, or a member of a
 /// container a function declares (a type function's), which its parameters fix.
-fn instantiated(self: *const Facts, decl: Decl) bool {
-    if (self.genericFunction(decl)) return true;
+fn instantiated(self: *Facts, decl: Decl) ResolveError!bool {
+    if (try self.genericFunction(decl)) return true;
     const model = &self.project.at(decl.file).model;
     var at: ?Model.Scope.Id = model.declarations[@backingInt(decl.index)].scope;
     while (at) |s| : (at = model.scopes[@backingInt(s)].parent) {
@@ -4883,7 +4907,7 @@ fn instantiated(self: *const Facts, decl: Decl) bool {
 /// `env` is made in whose function declares it; none (each one's) where neither is known, and
 /// for a declaration read once.
 fn instanceOf(self: *Facts, decl: Decl, holder: ?Container, env: ?*const Env) ResolveError!?*const Env {
-    if (self.genericFunction(decl) or !self.instantiated(decl)) return null;
+    if (try self.genericFunction(decl) or !try self.instantiated(decl)) return null;
     if (holder) |k| if (k.made_by) |made| return try self.madeEnv(made);
     const scope = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].scope;
     var at = env;
@@ -5665,7 +5689,7 @@ fn isType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError
     const decl = (model.reference(node) orelse return false).declaration orelse return false;
     if (model.declarations[@backingInt(decl)].kind != .parameter) return false;
     const kind = self.parameterTypeNode(.{ .file = file, .index = decl }) orelse return false;
-    return tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type");
+    return try self.writesType(file, kind) == .type;
 }
 
 /// Adds what `node`, stored in a function-pointer field, may call: the function it names
@@ -5823,7 +5847,7 @@ fn written(self: *Facts, generic: Generic, node: Ast.Node.Index, depth: usize) R
         const comptime_token = param.comptime_noalias orelse return null;
         if (target_tree.tokenTag(comptime_token) != .keyword_comptime) return null;
         const type_expr = param.type_expr orelse return null;
-        if (target_tree.nodeTag(type_expr) != .identifier or !std.mem.eql(u8, target_tree.tokenSlice(target_tree.nodeMainToken(type_expr)), "type")) return null;
+        if (try self.writesType(generic.decl.file, type_expr) != .type) return null;
         if (position < generic.receiver or position - generic.receiver >= generic.call.ast.params.len) return null;
         return try self.instance(try self.resolve(generic.file, generic.call.ast.params[position - generic.receiver]));
     }
@@ -5887,10 +5911,10 @@ fn madeResultOn(self: *Facts, receiver: Value, decl: Decl) ResolveError!?Value {
     const function = target_tree.fullFnProto(&fn_buffer, record.node) orelse return null;
     const result_node = function.ast.return_type.unwrap() orelse return null;
     // A type function declared in it makes its own container: read as a template.
-    if (typeKeyword(target_tree, result_node)) return null;
+    if (try self.writesType(decl.file, result_node) != .other) return null;
     // A result written in terms of the method's own generic parameters (`Result(parser)`) is
     // this call's: the container's bindings alone would read them as every call's.
-    if (namesGenericParameter(target_tree, function, result_node)) return null;
+    if (try self.namesGenericParameter(decl.file, function, result_node)) return null;
     var result = try self.substituted(decl.file, result_node, made);
     if (result == .unknown) return null;
     // A container declared beside the receiver's own in what the call made (an iterator's
@@ -6983,7 +7007,7 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
             // A `var` that holds types (`comptime var X: type = S;`) is each type it is given,
             // wherever it is read: one declaration, several types over its life.
             const declared_types = if (variable.ast.type_node.unwrap()) |t| holdsTypes(try self.resolve(decl.file, t)) else false;
-            if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
+            if (declared_types or try self.holdsTypeValue(initial, 0) or (variable.ast.type_node == .none and mayBeType(initial) and try self.compileTime(decl) and !try self.initIsValue(decl.file, value, 0))) {
                 const given = (try self.givenValues(decl)) orelse return .{ .unknown = .unresolved };
                 return self.choose(given);
             }
@@ -7044,7 +7068,7 @@ fn mayBeType(value: Value) bool {
 /// `comptime` scope, or in a function whose result is `type`. A function called only at
 /// compile time with none of these is not read so: the value model does not yet tell a pointer
 /// or array type from a value of one, which reading it would need.
-fn compileTime(self: *Facts, decl: Decl) bool {
+fn compileTime(self: *Facts, decl: Decl) ResolveError!bool {
     const source = self.project.at(decl.file);
     const tree = &source.file.tree;
     const record = source.model.declarations[@backingInt(decl.index)];
@@ -7058,7 +7082,7 @@ fn compileTime(self: *Facts, decl: Decl) bool {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buffer, scope.node) orelse return false;
                 const result = proto.ast.return_type.unwrap() orelse return false;
-                return namesType(tree, result);
+                return try self.writesType(decl.file, result) != .other;
             },
             else => {},
         }
@@ -9067,15 +9091,13 @@ fn resultOf(self: *Facts, proto: Key) ResolveError!Value {
 /// Whether a function takes a parameter only a call settles: `comptime` or `anytype`.
 /// Whether the expression `node` names one of `function`'s generic parameters (`comptime`,
 /// `anytype` or of type `type`).
-fn namesGenericParameter(tree: *const Ast, function: Ast.full.FnProto, node: Ast.Node.Index) bool {
+fn namesGenericParameter(self: *Facts, file: Project.FileId, function: Ast.full.FnProto, node: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
     var it = function.iterate(tree);
     while (it.next()) |param| {
-        const generic = param.anytype_ellipsis3 != null or
-            (if (param.comptime_noalias) |token| tree.tokenTag(token) == .keyword_comptime else false) or
-            (if (param.type_expr) |t| tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type") else false);
-        if (!generic) continue;
+        if (!try self.settledByCall(file, param)) continue;
         const name = tree.tokenSlice(param.name_token orelse continue);
         var token = first;
         while (token <= last) : (token += 1) {
@@ -9085,14 +9107,20 @@ fn namesGenericParameter(tree: *const Ast, function: Ast.full.FnProto, node: Ast
     return false;
 }
 
-fn isGeneric(tree: *const Ast, function: Ast.full.FnProto) bool {
-    var it = function.iterate(tree);
-    while (it.next()) |param| {
-        if (param.anytype_ellipsis3 != null) return true;
-        if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
-        if (param.type_expr) |t| if (tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type")) return true;
-    }
+fn isGeneric(self: *Facts, file: Project.FileId, function: Ast.full.FnProto) ResolveError!bool {
+    var it = function.iterate(&self.project.at(file).file.tree);
+    while (it.next()) |param| if (try self.settledByCall(file, param)) return true;
     return false;
+}
+
+/// Whether a call settles the parameter `param` of a function in `file`: `anytype`, `comptime`,
+/// or of type `type` (comptime by its type); one whose type does not resolve may be.
+fn settledByCall(self: *Facts, file: Project.FileId, param: Ast.full.FnProto.Param) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
+    if (param.anytype_ellipsis3 != null) return true;
+    if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
+    const type_expr = param.type_expr orelse return false;
+    return try self.writesType(file, type_expr) != .other;
 }
 
 /// What calling the generic function `decl` returns with its parameters bound to the call's
@@ -9109,11 +9137,11 @@ fn evaluateCall(self: *Facts, env: ?*const Env, file: Project.FileId, call: Ast.
     var fn_buffer: [1]Ast.Node.Index = undefined;
     const function = target_tree.fullFnProto(&fn_buffer, record.node) orelse return null;
     const result_node = function.ast.return_type.unwrap() orelse return null;
-    const returns_type = target_tree.nodeTag(result_node) == .identifier and std.mem.eql(u8, target_tree.tokenSlice(target_tree.nodeMainToken(result_node)), "type");
+    const returns_type = try self.writesType(decl.file, result_node) != .other;
     // A bare function type: the function its returns give, the same in every instantiation.
     if (bareFunctionType(target_tree, result_node)) return self.returnedFunction(decl, record);
     // A function of no parameter only a call settles is evaluated only for the type it makes.
-    if (!isGeneric(target_tree, function) and !returns_type) return null;
+    if (!try self.isGeneric(decl.file, function) and !returns_type) return null;
     const tree = &self.project.at(file).file.tree;
     var args: std.ArrayList(Value) = .empty;
     var truths: std.ArrayList(?bool) = .empty;
@@ -9410,7 +9438,7 @@ fn typedArguments(self: *Facts, env: *const Env, function: Decl, args: []Value) 
         if (namesFunction(args[position]) or try self.literalNamesFunction(args[position]) or param.anytype_ellipsis3 != null) continue;
         if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) continue;
         const type_expr = param.type_expr orelse continue;
-        if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) continue;
+        if (try self.writesType(function.file, type_expr) != .other) continue;
         const declared = try self.resolveIn(env, function.file, type_expr);
         if (declared == .unknown) continue;
         const typed = try self.instance(declared);
@@ -9823,8 +9851,9 @@ fn settledByCalls(self: *Facts, decl: Decl) ResolveError!?usize {
         if (param.name_token != record.token) continue;
         if (param.anytype_ellipsis3 != null) return position;
         // A `type` parameter is comptime, written so or not.
+        // One whose type does not resolve may be a `type` one.
         const type_expr = param.type_expr orelse return null;
-        if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) return position;
+        if (try self.writesType(decl.file, type_expr) != .other) return position;
         return null;
     }
     return null;
@@ -10122,7 +10151,7 @@ pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
             bound = true;
             break;
         };
-        if (!self.hasGenericParameter(outer) or try self.boundInRun(outer) == true) {
+        if (!try self.hasGenericParameter(outer) or try self.boundInRun(outer) == true) {
             bound = true;
             break;
         }
@@ -10363,7 +10392,6 @@ fn closedLocal(self: *Facts, receiver: Key) ResolveError!bool {
         .function, .capture, .field => return false,
     };
     if (tree.nodeTag(type_node) != .identifier and tree.nodeTag(type_node) != .field_access and tree.nodeTag(type_node) != .call and tree.nodeTag(type_node) != .call_one and tree.nodeTag(type_node) != .ptr_type_aligned and tree.nodeTag(type_node) != .ptr_type and tree.nodeTag(type_node) != .optional_type) return false;
-    if (tree.nodeTag(type_node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_node)), "type")) return false;
     return closedType(source, type_node, 0);
 }
 
@@ -10509,14 +10537,14 @@ fn runtimeValue(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth:
                         if (param.name_token != record.token) continue;
                         // `anytype` binds a value or a type; dereferenced, it is a pointer.
                         const type_expr = param.type_expr orelse return self.dereferenced(.{ .file = file, .index = ref.declaration.? });
-                        return !typeKeyword(tree, type_expr);
+                        return try self.writesType(file, type_expr) == .other;
                     }
                     return false;
                 },
                 .variable => {
                     const variable = tree.fullVarDecl(record.node) orelse return false;
                     if (variable.comptime_token != null) return false;
-                    if (variable.ast.type_node.unwrap()) |t| return !typeKeyword(tree, t);
+                    if (variable.ast.type_node.unwrap()) |t| return try self.writesType(file, t) == .other;
                     if (tree.tokenTag(variable.ast.mut_token) == .keyword_var) return true;
                     const init = variable.ast.init_node.unwrap() orelse return false;
                     return self.runtimeValue(file, init, depth + 1);
@@ -10546,10 +10574,6 @@ fn dereferenced(self: *Facts, decl: Decl) ResolveError!bool {
         }
     }
     return self.dereferences.contains(decl);
-}
-
-fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// Whether any container in the project declares a `comptime` field named `name`.
@@ -16262,7 +16286,7 @@ test "a method of a value a type parameter types is made per binding: each bindi
         .decl => |decl| decl,
         .none, .unknown => unreachable, // unreachable: the call names the method
     };
-    try std.testing.expect(facts.madeByParameter(file, made) != null);
+    try std.testing.expect(try facts.madeByParameter(file, made) != null);
     const copies = try facts.parameterCopies(hold);
     var found: ?ParameterCopy = null;
     for (copies) |copy| if (copy.kind == .made and copy.source != null and copy.source.?.node == made) {
@@ -17444,4 +17468,32 @@ test "a reader's question past its steps, or code read lazily that imports what 
     defer short.deinit();
     (try short.builtAnalysis()).lazy.limit = 0;
     try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
+}
+
+test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve is unknown" {
+    const source =
+        \\const Type = type;
+        \\const Kind = u8;
+        \\const Far = @import("missing").Type;
+        \\fn a(comptime T: type) void { _ = T; }
+        \\fn b(comptime T: Type) void { _ = T; }
+        \\fn c(comptime n: Kind) void { _ = n; }
+        \\fn d(comptime T: Far) void { _ = T; }
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const id = project.sources[0].id;
+    var answers: std.ArrayList(Written) = .empty;
+    for (project.sources[0].model.declarations) |record| {
+        if (record.kind != .function) continue;
+        var buffer: [1]Ast.Node.Index = undefined;
+        var it = tree.fullFnProto(&buffer, record.node).?.iterate(tree);
+        try answers.append(arena.allocator(), try facts.writesType(id, it.next().?.type_expr.?));
+    }
+    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown }, answers.items);
 }

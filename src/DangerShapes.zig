@@ -128,7 +128,7 @@ fn foreign(c: *Context, rule: Rule, resources: []const ?Facts.Container) Context
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |_, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         if (try fieldAccess(c, tree, node)) |access| {
             const name_token = access.token;
             const receiver_value = try c.facts.resolve(c.file, access.receiver);
@@ -333,7 +333,7 @@ fn bindingOf(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths
             continue;
         };
         const record = c.project.at(function.file).model.declarations[@backingInt(function.index)];
-        if (record.kind != .function or !record.public or !c.facts.hasGenericParameter(function)) continue;
+        if (record.kind != .function or !record.public or !try c.facts.hasGenericParameter(function)) continue;
         // aegis's own generics (`own.Owned`, `own.Lent`) are the answer, which holds its value.
         if (try c.inLibrary(Contract.library, function.file)) continue;
         const made = try c.facts.resolve(c.file, node);
@@ -341,12 +341,20 @@ fn bindingOf(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = written_tree.fullFnProto(&proto_buffer, record.node) orelse continue;
         const result = proto.ast.return_type.unwrap() orelse continue;
-        if (written_tree.nodeTag(result) == .identifier and std.mem.eql(u8, written_tree.tokenSlice(written_tree.nodeMainToken(result)), "type")) {
+        switch (try c.facts.writesType(function.file, result)) {
             // A type function's container: what each field holds with these arguments, a
             // container another type function made in it read the same way; a type that does
             // not resolve may hold one.
-            try madeHolds(c, rule, resources, paths, tree.nodeMainToken(node), record.name, made, 0);
-            continue;
+            .type => {
+                try madeHolds(c, rule, resources, paths, tree.nodeMainToken(node), record.name, made, 0);
+                continue;
+            },
+            // One written in the generic's parameters is this binding's, read below.
+            .unknown => if (try heldBy(c, resources, try c.facts.resolve(function.file, result), 0) != .generic) {
+                try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "the result type of the generic this binds does not resolve: it may make a type holding a std resource by value");
+                continue;
+            },
+            .other => {},
         }
         // A generic function's result, where its declared type is a parameter's: an owner handed
         // over unless each return reads one held (`views`), its parameters this call's arguments.
@@ -359,15 +367,15 @@ fn bindingOf(c: *Context, rule: Rule, resources: []const ?Facts.Container, paths
             .other => {},
             // A type the enclosing generic's parameters give is judged at its own bindings; one
             // outside any is this call's, not bound here (a choice of callees).
-            .generic => if (!inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return is not bound with its arguments: it may be a std resource by value"),
+            .generic => if (!try inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return is not bound with its arguments: it may be a std resource by value"),
             .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "what this binding makes a generic return does not resolve: it may be a std resource by value"),
         }
     }
 }
 
-/// Whether `node` is in a function with a type or `anytype` parameter, as `hasGenericParameter`
-/// reads one.
-fn inGeneric(c: *Context, node: Ast.Node.Index) bool {
+/// Whether `node` is in a function with a type or `anytype` parameter, its own bindings judging
+/// what they give: one whose type does not resolve is not known to be one.
+fn inGeneric(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var at = node;
@@ -379,7 +387,7 @@ fn inGeneric(c: *Context, node: Ast.Node.Index) bool {
     var it = proto.iterate(tree);
     while (it.next()) |param| {
         if (param.anytype_ellipsis3 != null) return true;
-        if (param.type_expr) |type_expr| if (tree.nodeTag(type_expr) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type")) return true;
+        if (param.type_expr) |type_expr| if (try c.facts.writesType(c.file, type_expr) == .type) return true;
     }
     return false;
 }
@@ -394,7 +402,7 @@ fn unnamedBinding(c: *Context, rule: Rule, resources: []const ?Facts.Container, 
     if (statementCall(tree, &c.project.at(c.file).model, node)) return;
     switch (try heldBy(c, resources, try c.facts.resolve(c.file, node), 0)) {
         .resource, .unknown => try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
-        .generic => if (!inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
+        .generic => if (!try inGeneric(c, node)) try c.undecided(rule, tree.tokenStart(tree.nodeMainToken(node)), .unresolved, "which function this call calls does not resolve, and what it makes may hold a std resource by value: it may be a generic's owner handed over"),
         .other => {},
     }
 }
@@ -2082,7 +2090,7 @@ pub fn lockOrder(c: *Context, rule: Rule) Context.Error!void {
     const model = &c.project.at(c.file).model;
     var taken: std.ArrayList(Taken) = .empty;
     for (try Facts.calls.in(c.facts, c.file)) |*call| {
-        if (c.inTest(tree.nodeMainToken(call.node)) or !Danger.atRuntime(c, call.node) or typeOnly(tree, model, call.node)) continue;
+        if (c.inTest(tree.nodeMainToken(call.node)) or !try Danger.atRuntime(c, call.node) or typeOnly(tree, model, call.node)) continue;
         const function = enclosingFunction(model, tree, call.node) orelse continue;
         // A call that does not resolve may take a guard: held as one, it is judged as one.
         const lock: Lock, const maybe: ?Facts.Unknown = switch (try acquisitionOf(c, c.file, call, 0)) {
@@ -3112,8 +3120,7 @@ fn reachedFrom(c: *Context, tree: *const Ast, model: *const Model, out: []const 
                 const proto = tree.fullFnProto(&buffer, parent).?;
                 if (tree.nodeData(parent).node_and_node[1] == child) {
                     const result = proto.ast.return_type.unwrap() orelse return false;
-                    const value = try c.facts.resolve(c.file, result);
-                    if (value != .primitive or !std.mem.eql(u8, value.primitive, "type")) return false;
+                    if (try c.facts.writesType(c.file, result) == .other) return false;
                 }
                 break :name proto.name_token orelse continue;
             },
@@ -4287,7 +4294,7 @@ pub fn borrowsStored(c: *Context, rule: Rule) Context.Error!void {
         if (tag != .assign) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const target, const value = tree.nodeData(node).node_and_node;
-        if (tree.nodeTag(target) != .field_access or c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (tree.nodeTag(target) != .field_access or c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         const what = (try borrow(c, tree, namespaces, value)) orelse continue;
         if (try settled(c, node, value)) continue;
         try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("a borrow of a std container's storage ({s}) stored in a field: the next growth moves it; aegis handle keys or scope references stay valid", .{what}));

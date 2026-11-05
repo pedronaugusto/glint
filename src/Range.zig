@@ -975,7 +975,7 @@ fn takesType(c: *Context, file: Project.FileId, callee: Ast.Node.Index, at: usiz
     while (params.next()) |param| : (k += 1) {
         if (k != at + @intFromBool(bound_receiver)) continue;
         const kind = param.type_expr orelse return true;
-        return tree.nodeTag(kind) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(kind)), "type");
+        return try c.facts.writesType(function.file, kind) != .other;
     }
     // A variadic `extern`'s or one past the list: nothing known.
     return true;
@@ -1863,7 +1863,7 @@ fn atRuntime(c: *Context, file: Project.FileId, node: Ast.Node.Index, given: ?*c
                         return atRuntime(c, call.call.file, args[at], call.outer, next);
                     };
                     const type_expr = c.facts.parameterTypeNode(.{ .file = file, .index = index }) orelse return false;
-                    return !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_expr)), "type");
+                    return try c.facts.writesType(file, type_expr) != .type;
                 },
                 .variable => {
                     const scope = model.scopes[@backingInt(record.scope)];
@@ -2889,12 +2889,16 @@ pub fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
         if (callee.fullPtrType(t)) |pointer| {
             if (pointer.const_token == null) return false;
             t = pointer.ast.child_type;
-        } else if (callee.nodeTag(t) == .identifier and std.mem.eql(u8, callee.tokenSlice(callee.nodeMainToken(t)), "type")) continue;
+        } else switch (try c.facts.writesType(decl.file, t)) {
+            .type => continue,
+            .unknown => return false,
+            .other => {},
+        }
         if (callee.nodeTag(t) != .identifier) return false;
         const name = callee.tokenSlice(callee.nodeMainToken(t));
         if (Model.primitive(name) and !std.mem.eql(u8, name, "anyopaque")) continue;
         // A type parameter's: the type the call gives it.
-        const typed_at = typeParameter(callee, proto, name) orelse return false;
+        const typed_at = (try typeParameter(c, decl.file, proto, name)) orelse return false;
         if (typed_at < skip) return false;
         const given = typed_at - skip;
         if (given >= call.ast.params.len) return false;
@@ -2905,14 +2909,15 @@ pub fn inert(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Er
 }
 
 /// The position of the `comptime T: type` parameter named `name`.
-fn typeParameter(tree: *const Ast, proto: Ast.full.FnProto, name: []const u8) ?usize {
+fn typeParameter(c: *Context, file: Project.FileId, proto: Ast.full.FnProto, name: []const u8) Context.Error!?usize {
+    const tree = &c.project.at(file).file.tree;
     var it = proto.iterate(tree);
     var index: usize = 0;
     while (it.next()) |param| : (index += 1) {
         const token = param.name_token orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(token), name)) continue;
         const declared = param.type_expr orelse return null;
-        if (tree.nodeTag(declared) != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(declared)), "type")) return null;
+        if (try c.facts.writesType(file, declared) != .type) return null;
         return index;
     }
     return null;

@@ -138,7 +138,7 @@ fn calledOnlyOnItself(c: *Context, kind: Facts.Container) Context.Error!bool {
             if (args.len != 2) continue;
             const receiver = try c.facts.resolve(each.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, kind)) continue;
-            if (receiver == .unknown and (generic(file_tree, &each.model, node) or try namesType(c, each.id, args[0]))) continue;
+            if (receiver == .unknown and (try generic(c, each.id, node) or try namesType(c, each.id, args[0]))) continue;
             for (source.model.declarations) |decl| {
                 if (decl.kind != .field or decl.scope != kind.scope) continue;
                 const declared = (source.model.containerField(tree, decl.node) orelse continue).ast.type_expr.unwrap() orelse continue;
@@ -162,7 +162,7 @@ fn tableReadInPlace(c: *Context, name: []const u8, kind: Facts.Container) Contex
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (try namesType(c, use.file, receiver) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         if (!isParent(value, kind)) continue;
@@ -212,7 +212,7 @@ fn readsCalledOnSelf(c: *Context, name: []const u8, holder: Facts.Container, thr
         const receiver = tree.nodeData(use.node).node_and_token[0];
         const value = try c.facts.resolve(use.file, receiver);
         if (value == .unknown) {
-            if (try namesType(c, use.file, receiver) or notFunction(tree, model, use.node) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, receiver) or notFunction(tree, model, use.node) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         if (!isParent(value, holder)) continue;
@@ -589,7 +589,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
         const receiver = try c.facts.resolve(use.file, tree.nodeData(use.node).node_and_token[0]);
         if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
         if (receiver == .unknown) {
-            if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or generic(tree, model, use.node)) continue;
+            if (try namesType(c, use.file, tree.nodeData(use.node).node_and_token[0]) or try generic(c, use.file, use.node)) continue;
             return false;
         }
         const parent = model.parentOf(use.node) orelse return false;
@@ -614,7 +614,7 @@ fn addressedOnly(c: *Context, field: Field, kind: Facts.Container, interface: bo
             // Of another type, it names none of C's fields.
             const receiver = try c.facts.resolve(source.id, args[0]);
             if (receiver != .unknown and !isParent(receiver, field.parent)) continue;
-            if (receiver == .unknown and (generic(tree, &source.model, node) or try namesType(c, source.id, args[0]))) continue;
+            if (receiver == .unknown and (try generic(c, source.id, node) or try namesType(c, source.id, args[0]))) continue;
             if (try namedBy(c, tree, &source.model, args[1], field.name)) return false;
         }
     }
@@ -2233,25 +2233,23 @@ fn enclosingFunction(tree: *const Ast, model: *const Model, node: Ast.Node.Index
 /// `comptime` parameter, or within a function returning a type. A member read there on what does not resolve is of what its
 /// parameters hold, which a caller hands it: an interface by pointer, followed into the body
 /// (`Follow.handed`), or a struct holding one (`Carry`). The program-wide scans leave it to them.
-fn generic(tree: *const Ast, model: *const Model, node: Ast.Node.Index) bool {
+fn generic(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const model = &c.project.at(file).model;
     var up = model.parentOf(node);
     while (up) |parent| : (up = model.parentOf(parent)) {
         if (tree.nodeTag(parent) != .fn_decl) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse continue;
-        if (proto.ast.return_type.unwrap()) |returned| if (typeKeyword(tree, returned)) return true;
+        if (proto.ast.return_type.unwrap()) |returned| if (try c.facts.writesType(file, returned) == .type) return true;
         var it = proto.iterate(tree);
         while (it.next()) |param| {
             if (param.anytype_ellipsis3 != null) return true;
             if (param.comptime_noalias) |token| if (tree.tokenTag(token) == .keyword_comptime) return true;
-            if (param.type_expr) |declared| if (typeKeyword(tree, declared)) return true;
+            if (param.type_expr) |declared| if (try c.facts.writesType(file, declared) == .type) return true;
         }
     }
     return false;
-}
-
-fn typeKeyword(tree: *const Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 /// Whether the parameter named at `token` is one of the prototype `function`'s own.
@@ -2317,7 +2315,7 @@ fn typeFunction(c: *Context, file: Project.FileId, callee: Ast.Node.Index) Conte
     const tree = &c.project.at(found.file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = tree.fullFnProto(&buffer, function.node) orelse return false;
-    return typeKeyword(tree, proto.ast.return_type.unwrap() orelse return false);
+    return try c.facts.writesType(found.file, proto.ast.return_type.unwrap() orelse return false) == .type;
 }
 
 /// The labeled block a `break :label value` gives its value to.

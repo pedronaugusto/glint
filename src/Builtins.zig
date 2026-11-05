@@ -784,7 +784,7 @@ fn publicValue(self: *Context, signature: Signature, index: Model.Declaration.Id
         const function = callee_source.file.tree.fullFnProto(&prototype, callee_source.model.declarations[@backingInt(callee.index)].node) orelse return exposedInferred(self, signature, self.file, init, value, 0);
         const result = function.ast.return_type.unwrap() orelse return;
         // A type function's call is a type: the constant names it.
-        if (try namesType(self, callee.file, result)) return;
+        if (try self.facts.writesType(callee.file, result) == .type) return;
         return privateType(self, signature, callee.file, result, 0);
     }
     try exposedInferred(self, signature, self.file, init, value, 0);
@@ -914,10 +914,11 @@ fn syntaxRules(self: *Context) RunError!void {
         if (decl.kind == .function) {
             var buffer: [1]Ast.Node.Index = undefined;
             const function = tree.fullFnProto(&buffer, decl.node).?;
-            const returns_type = if (function.ast.return_type.unwrap()) |t| try namesType(self, self.file, t) else false;
-            if (returns_type) {
-                if (!names.isPascalCase(name)) try self.at(.Z005, decl.token, "type-producing function should use TitleCase");
-            } else if (!names.isValidFunctionName(name)) try self.at(.Z001, decl.token, "callable should use camelCase");
+            switch (if (function.ast.return_type.unwrap()) |t| try self.facts.writesType(self.file, t) else .other) {
+                .type => if (!names.isPascalCase(name)) try self.at(.Z005, decl.token, "type-producing function should use TitleCase"),
+                .other => if (!names.isValidFunctionName(name)) try self.at(.Z001, decl.token, "callable should use camelCase"),
+                .unknown => try resultNaming(self, .Z001, .Z005, decl.token, name, "callable should use camelCase, or TitleCase if it produces a type"),
+            }
             if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms as ordinary words, for example readXml");
             continue;
         }
@@ -963,10 +964,11 @@ fn syntaxRules(self: *Context) RunError!void {
                             if (function.extern_export_inline_token) |token| if (target.tokenTag(token) == .keyword_extern) continue;
                         }
                         if (names.acronymIssue(name)) try self.at(.Z032, decl.token, "treat acronyms in callable aliases as ordinary words, for example readXml");
-                        const returns_type = if (function.ast.return_type.unwrap()) |t| try namesType(self, definition.file, t) else false;
-                        if (returns_type) {
-                            if (!names.isPascalCase(name)) try self.at(.Z006, decl.token, "type-producing callable alias should use TitleCase");
-                        } else if (!names.isValidFunctionName(name)) try self.at(.Z006, decl.token, "callable alias should use camelCase");
+                        switch (if (function.ast.return_type.unwrap()) |t| try self.facts.writesType(definition.file, t) else .other) {
+                            .type => if (!names.isPascalCase(name)) try self.at(.Z006, decl.token, "type-producing callable alias should use TitleCase"),
+                            .other => if (!names.isValidFunctionName(name)) try self.at(.Z006, decl.token, "callable alias should use camelCase"),
+                            .unknown => try resultNaming(self, .Z006, .Z006, decl.token, name, "callable alias should use camelCase, or TitleCase if it produces a type"),
+                        }
                     },
                     else => if (!try interfaceName(self, decl, name)) try self.at(.Z006, decl.token, "value binding should use snake_case"),
                 }
@@ -996,12 +998,18 @@ fn interfaceName(self: *Context, decl: Model.Declaration, name: []const u8) RunE
     return false;
 }
 
-/// Whether `node` of `file` is the type `type`, by what it resolves to (an alias of it too).
-fn namesType(self: *Context, file: Project.FileId, node: Ast.Node.Index) RunError!bool {
-    return switch (try self.facts.resolve(file, node)) {
-        .primitive => |name| std.mem.eql(u8, name, "type"),
-        else => false,
-    };
+/// The naming of a callable whose result type does not resolve, so whether it produces a type
+/// is not known: a name neither camelCase nor TitleCase is wrong either way; one of them is
+/// right only as the result is, undecided under each rule it would answer to.
+fn resultNaming(self: *Context, value_rule: rules.Rule, type_rule: rules.Rule, token: Ast.TokenIndex, name: []const u8, message: []const u8) RunError!void {
+    const camel = names.isValidFunctionName(name);
+    const title = names.isPascalCase(name);
+    if (!camel and !title) return self.at(value_rule, token, message);
+    if (camel and title) return;
+    const tree = &self.project.at(self.file).file.tree;
+    const detail = "whether this callable produces a type does not resolve, which decides its spelling";
+    // camelCase is wrong only for a type's maker, TitleCase only for any other callable.
+    try self.undecided(if (camel) type_rule else value_rule, tree.tokenStart(token), .unresolved, detail);
 }
 
 /// Whether a selected file reads `T.name` where `T` is a parameter that takes a type: declared
@@ -1025,7 +1033,7 @@ fn genericReads(self: *Context, name: []const u8) RunError!bool {
             const parameter = model.declarations[@backingInt(holder.index)];
             if (parameter.kind != .parameter) continue;
             // `anytype` has no type expression of its own: the parameter's node is the keyword.
-            if (tree.tokenTag(parameter.token + 2) == .keyword_anytype or try namesType(self, each.id, parameter.node)) return true;
+            if (tree.tokenTag(parameter.token + 2) == .keyword_anytype or try self.facts.writesType(each.id, parameter.node) == .type) return true;
         }
     }
     return false;
@@ -1103,7 +1111,7 @@ fn functionLengths(self: *Context) RunError!void {
         const last = tree.lastToken(node);
         var count = file.line(tree.tokenStart(last)) - file.line(tree.tokenStart(first)) + 1;
         const ret = function.ast.return_type.unwrap();
-        if (ret != null and try namesType(self, self.file, ret.?)) {
+        if (ret != null and try self.facts.writesType(self.file, ret.?) == .type) {
             var widest: u32 = 0;
             var container_buffer: [2]Ast.Node.Index = undefined;
             for (0..tree.nodes.len) |j| {

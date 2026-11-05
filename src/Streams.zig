@@ -834,7 +834,7 @@ pub fn lost(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (try Facts.calls.in(c.facts, c.file)) |call| {
         const node = call.node;
-        if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !try Danger.atRuntime(c, node)) continue;
         // An operation gives an error union; `r.interface.limited(...)` makes a reader.
         switch (try c.facts.resolve(c.file, node)) {
             .error_union, .unknown => {},

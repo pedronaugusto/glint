@@ -54,7 +54,7 @@ pub fn sharedState(c: *Context, rule: Rule) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const name = Facts.builtinName(tree, node) orelse continue;
         for ([_][]const u8{ "@atomicLoad", "@atomicStore", "@atomicRmw", "@cmpxchgWeak", "@cmpxchgStrong" }) |atomic| if (std.mem.eql(u8, name, atomic)) {
-            if (!c.inTest(tree.nodeMainToken(node)) and atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
+            if (!c.inTest(tree.nodeMainToken(node)) and try atRuntime(c, node)) try c.at(rule, tree.nodeMainToken(node), try c.allocator.print("{s}: a raw atomic; aegis Atomic holds the cell", .{name}));
         };
     }
     const model = &c.project.at(c.file).model;
@@ -116,7 +116,7 @@ pub fn secrets(c: *Context, rule: Rule) Context.Error!void {
         if (c.inTest(decl.token)) continue;
         // A block's local or a capture that exists only as the program compiles (in a type
         // function, a `comptime` block) holds no material, as A007 reads it.
-        if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !atRuntime(c, decl.node)) continue;
+        if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !try atRuntime(c, decl.node)) continue;
         // A module or Zig file `@import` gives: a namespace, a type, which holds no material. A
         // ZON file's is a value, read as any.
         if (decl.kind == .variable) if (tree.fullVarDecl(decl.node)) |variable| if (variable.ast.init_node.unwrap()) |init| if (Facts.importKind(tree, init) == .namespace) continue;
@@ -258,7 +258,7 @@ fn compiledValues(c: *Context, at: Facts.Decl) Context.Error!?[]const Facts.Valu
         const tree = &c.project.at(at.file).file.tree;
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullFnProto(&buffer, record.node)) |proto| if (proto.ast.return_type.unwrap()) |written| {
-            if (try c.facts.typeIsType(at.file, written)) return &.{};
+            if (try c.facts.writesType(at.file, written) == .type) return &.{};
         };
     }
     if (try c.facts.atBindings(at)) |each| return each;
@@ -273,7 +273,7 @@ fn compiledValues(c: *Context, at: Facts.Decl) Context.Error!?[]const Facts.Valu
 fn typeConstant(c: *Context, decl: Model.Declaration) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
-    if (decl.kind != .variable or atRuntime(c, decl.node)) return false;
+    if (decl.kind != .variable or try atRuntime(c, decl.node)) return false;
     if (model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container) return false;
     const variable = tree.fullVarDecl(decl.node) orelse return false;
     if (tree.tokenTag(variable.ast.mut_token) != .keyword_const or variable.ast.type_node != .none) return false;
@@ -286,17 +286,17 @@ fn typeConstant(c: *Context, decl: Model.Declaration) Context.Error!bool {
     const source = c.project.at(function.file);
     var proto_buffer: [1]Ast.Node.Index = undefined;
     const proto = source.file.tree.fullFnProto(&proto_buffer, source.model.declarations[@backingInt(function.index)].node) orelse return false;
-    return c.facts.typeIsType(function.file, proto.ast.return_type.unwrap() orelse return false);
+    return try c.facts.writesType(function.file, proto.ast.return_type.unwrap() orelse return false) == .type;
 }
 
 /// Whether a declaration holds state as the program runs: a field, a parameter, a function's
 /// result, a `var`, a local or a capture where it runs. A container-level constant is settled as
 /// the program compiles.
-fn runtimeState(c: *Context, decl: Model.Declaration) bool {
+fn runtimeState(c: *Context, decl: Model.Declaration) Context.Error!bool {
     return switch (decl.kind) {
         .field, .parameter, .function => true,
-        .capture => atRuntime(c, decl.node),
-        .variable => atRuntime(c, decl.node) or c.project.at(c.file).file.tree.tokenTag((c.project.at(c.file).file.tree.fullVarDecl(decl.node) orelse return true).ast.mut_token) == .keyword_var,
+        .capture => try atRuntime(c, decl.node),
+        .variable => try atRuntime(c, decl.node) or c.project.at(c.file).file.tree.tokenTag((c.project.at(c.file).file.tree.fullVarDecl(decl.node) orelse return true).ast.mut_token) == .keyword_var,
     };
 }
 
@@ -388,7 +388,7 @@ fn secretBindings(c: *Context, rule: Rule, types: []const SecretType) Context.Er
                 // A generic's own site judges what its callers bind, unless its file is no
                 // selected one's, as a dependency's: there the binding is judged here.
                 // A type parameter, or one whose type a binding gives (`value: T`, `anytype`).
-                const typed = if (param.type_expr) |t| try c.facts.typeIsType(function.file, t) else false;
+                const typed = if (param.type_expr) |t| try c.facts.writesType(function.file, t) != .other else false;
                 if (!unjudged(try c.facts.declaration(parameter)) and (source.input.selected or !(typed or param.anytype_ellipsis3 != null))) continue;
                 const argument = switch (call.args) {
                     .known => |known| known[position],
@@ -952,7 +952,7 @@ pub fn contracts(c: *Context, rule: Rule) Context.Error!void {
         if (tag != .unreachable_literal and !unwrap) continue;
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const token = if (unwrap) tree.nodeData(node).node_and_token[1] else tree.nodeMainToken(node);
-        if (c.inTest(token) or !atRuntime(c, node)) continue;
+        if (c.inTest(token) or !try atRuntime(c, node)) continue;
         // A `.?` of a value known not to be null never reaches its `unreachable`.
         if (unwrap and (try present.unwrapped(node) or try Proof.present(c, c.file, node))) continue;
         // A prong no path takes never runs what it holds (`else => unreachable` past what
@@ -1071,7 +1071,7 @@ fn asserts(c: *Context, rule: Rule, flow: Taint.Fact) Context.Error!void {
         try c.undecided(rule, tree.tokenStart(site.token), .unresolved, "std.debug.assert taken as a value: its calls are not read");
     }
     for (calls.items) |node| {
-        if (c.inTest(tree.nodeMainToken(node)) or !atRuntime(c, node)) continue;
+        if (c.inTest(tree.nodeMainToken(node)) or !try atRuntime(c, node)) continue;
         const call = (try Facts.calls.at(c.facts, c.file, node)).?; // unreachable: each is a call `Facts.calls` read
         const args = switch (call.args) {
             .known => |each| each,
@@ -1262,13 +1262,13 @@ pub fn unsafeSet(c: *Context, rule: Rule) Context.Error!void {
         const token = tree.nodeMainToken(node);
         switch (tag) {
             .asm_simple, .@"asm" => {
-                if (!c.inTest(token) and atRuntime(c, node)) try c.at(rule, token, "inline assembly: no check of what it reads or writes; keep it behind the package's one seam with its reason");
+                if (!c.inTest(token) and try atRuntime(c, node)) try c.at(rule, token, "inline assembly: no check of what it reads or writes; keep it behind the package's one seam with its reason");
                 continue;
             },
             else => {},
         }
         const name = Facts.builtinName(tree, node) orelse continue;
-        if (c.inTest(token) or !atRuntime(c, node)) continue;
+        if (c.inTest(token) or !try atRuntime(c, node)) continue;
         if (std.mem.eql(u8, name, "@setRuntimeSafety")) {
             var buffer: [2]Ast.Node.Index = undefined;
             const args = Facts.builtinArgs(tree, node, &buffer);
@@ -1394,7 +1394,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
     for (model.declarations, 0..) |decl, d| {
         if (c.inTest(decl.token)) continue;
         // A block's local or a capture that exists only as the program compiles holds no lock.
-        if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !atRuntime(c, decl.node)) continue;
+        if ((decl.kind == .capture or (decl.kind == .variable and model.scopes[@backingInt(decl.scope)].kind != .file and model.scopes[@backingInt(decl.scope)].kind != .container)) and !try atRuntime(c, decl.node)) continue;
         const at: Facts.Decl = .{ .file = c.file, .index = @fromBackingInt(@intCast(d)) };
         const value: Facts.Value = switch (decl.kind) {
             .variable, .parameter, .field => blk: {
@@ -1426,7 +1426,7 @@ fn heldUnderOtherNames(c: *Context, rule: Rule, paths: []const []const u8, found
             .unknown => |why| {
                 // A generic's parameter's is judged at each binding; a container's constant,
                 // settled as the program compiles, is no state a lock is.
-                if (why == .generic or (why == .comptime_dependent and !runtimeState(c, decl))) continue;
+                if (why == .generic or (why == .comptime_dependent and !try runtimeState(c, decl))) continue;
                 // A variable given only enum literals holds an enum's tag (or a union's with no
                 // payload): no synchronization (`const w: std.meta.Tag(V) = .a`). Not where one
                 // names a member of a synchronization type: a decl literal (`.init`) makes one,
@@ -1678,7 +1678,7 @@ fn governed(c: *Context, rule: Rule, paths: []const []const u8, operation: bool,
         // An operation is judged where it runs, or where a container's declaration names it
         // (`const eql = std.crypto.timing_safe.eql;`): the program takes it up there, whether
         // it calls it or binds it into a generic's context, whose call runs in that generic.
-        if (operation and !atRuntime(c, site.node) and !declaredAs(c, site.node)) continue;
+        if (operation and !try atRuntime(c, site.node) and !declaredAs(c, site.node)) continue;
         try c.at(rule, site.token, try c.allocator.print(message, .{paths[site.index]}));
     }
 }
@@ -1698,7 +1698,7 @@ fn declaredAs(c: *const Context, node: Ast.Node.Index) bool {
 /// Whether the code at `node` runs when the program runs: inside a function's body that does
 /// not return `type`, outside any `comptime` block and any container's declarations nested
 /// there. A container-level value or a field's default is evaluated as the program compiles.
-pub fn atRuntime(c: *const Context, node: Ast.Node.Index) bool {
+pub fn atRuntime(c: *const Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
     const model = &c.project.at(c.file).model;
     var at = node;
@@ -1710,7 +1710,7 @@ pub fn atRuntime(c: *const Context, node: Ast.Node.Index) bool {
                 var buffer: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buffer, tree.nodeData(parent).node_and_node[0]) orelse return true;
                 const result = proto.ast.return_type.unwrap() orelse return true;
-                return !(tree.nodeTag(result) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(result)), "type"));
+                return try c.facts.writesType(c.file, result) != .type;
             },
             else => {
                 var buffer: [2]Ast.Node.Index = undefined;

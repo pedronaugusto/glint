@@ -26,7 +26,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!readNow(c, flow, node)) continue;
+        if (!try readNow(c, flow, node)) continue;
         switch (tag) {
             // A position input reaches is a finding unless it is shown within the memory: a
             // table the program sized to the index's range (`[256]` by a byte) holds every
@@ -134,7 +134,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             // A sum, difference or product overflows on either operand; a quotient or a
             // remainder fails on its divisor (zero, or -1 under the minimum).
             .add, .mul, .assign_add, .assign_mul => {
-                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
+                if (!try readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 // An address moved by input reaches memory, A009's; no overflow check stops it.
                 if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -144,7 +144,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
-                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
+                if (!try readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
@@ -152,7 +152,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 try judged(c, flow, rule, node, level, .data, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
-                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
+                if (!try readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
                 if (try Proof.nonzero(c, c.file, rhs)) continue;
                 var level = try Taint.levelAt(c, flow, c.file, rhs);
@@ -166,13 +166,13 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 try judged(c, flow, rule, node, level, .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
             .negation => {
-                if (!readNow(c, flow, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
+                if (!try readNow(c, flow, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .data, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             // A shift's amount past the operand's width (one whose width is no power of two
             // takes an amount type wider than it) stops the program.
             .shl, .shr, .assign_shl, .assign_shr => {
-                if (!readNow(c, flow, node)) continue;
+                if (!try readNow(c, flow, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 if (try amountFits(c, lhs)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "a shift by an amount from input: a peer's amount past the operand's width stops the program; aegis int.Checked returns the error");
@@ -182,7 +182,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (try arithmeticBuiltin(c, flow, rule, node, name)) continue;
                 var fallible = false;
                 for ([_][]const u8{ "@intCast", "@intFromFloat", "@enumFromInt", "@fromBackingInt" }) |cast| fallible = fallible or std.mem.eql(u8, name, cast);
-                if (!fallible or !readNow(c, flow, node)) continue;
+                if (!fallible or !try readNow(c, flow, node)) continue;
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
                 if (args.len != 1) continue;
@@ -225,7 +225,7 @@ fn arithmeticBuiltin(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.I
     const operand = for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) break entry[1];
     } else return false;
-    if (!readNow(c, flow, node)) return true;
+    if (!try readNow(c, flow, node)) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return true;
@@ -252,7 +252,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, node) orelse continue;
-        if (!site(c, node)) continue;
+        if (!try site(c, node)) continue;
         const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
         const decl = reached.decl orelse continue;
         if (!reached.std or !fromReader(flow, decl) or try ownReader(c, flow, call)) continue;
@@ -265,7 +265,7 @@ pub fn boundedWork(c: *Context, rule: Rule) Context.Error!void {
     }
     // What the program hands std that std sizes memory or work by (Taint.sinkSites).
     for (try Taint.sinkSites(c, flow, c.file)) |found| {
-        if (!site(c, found.at)) continue;
+        if (!try site(c, found.at)) continue;
         var buffer: [1]Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, found.at);
         if (found.callee) |decl| {
@@ -321,7 +321,7 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     const fact = try Taint.get(c, Danger.error_text);
     var reported: ?Ast.Node.Index = null;
     for (try Taint.sinkSites(c, fact, c.file)) |written| {
-        if (!readNow(c, fact, written.at) or reported == written.at) continue;
+        if (!try readNow(c, fact, written.at) or reported == written.at) continue;
         // Read in a file the run does not select: what the written value takes from its
         // function's parameters, judged at the calls into it; the writer is a peer's where a
         // caller anywhere in the program hands it one, else the site is none.
@@ -385,7 +385,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
         for (tree.nodes.items(.tag), 0..) |_, i| {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (tree.fullSwitch(node)) |choice| {
-                if (choice.label_token == null or !within(c, node, holding.at) or !site(c, node)) continue;
+                if (choice.label_token == null or !within(c, node, holding.at) or !try site(c, node)) continue;
                 // A labeled switch that continues itself is a loop with no bound, each prong that
                 // goes on with it a pass: its point must come before every way on, read as a
                 // function's body is (no periodic form; a callee leaves before its point by no error).
@@ -419,7 +419,7 @@ pub fn cancellation(c: *Context, rule: Rule) Context.Error!void {
                 for (loop.ast.inputs) |each| if (tree.nodeTag(each) == .for_range) if (tree.nodeData(each).node_and_opt_node[1].unwrap()) |end| try decided.leaves.append(c.allocator, end);
                 break :body loop.ast.then_expr;
             } else continue;
-            if (!within(c, node, holding.at) or !site(c, node)) continue;
+            if (!within(c, node, holding.at) or !try site(c, node)) continue;
             var by_input = false;
             var unknown = false;
             for (try decided.bounds(c)) |bound| {
@@ -1776,7 +1776,7 @@ fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (
             else => continue,
         }
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!readNow(c, flow, node)) continue;
+        if (!try readNow(c, flow, node)) continue;
         const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
         const decl = reached.decl orelse continue;
         if (reached.std or c.project.at(decl.file).input.selected or !try c.facts.program(decl.file)) continue;
@@ -2337,15 +2337,15 @@ fn unsignedName(name: []const u8) bool {
     return true;
 }
 
-fn site(c: *Context, node: Ast.Node.Index) bool {
+fn site(c: *Context, node: Ast.Node.Index) Context.Error!bool {
     const tree = &c.project.at(c.file).file.tree;
-    return !c.inTest(tree.nodeMainToken(node)) and Danger.atRuntime(c, node);
+    return !c.inTest(tree.nodeMainToken(node)) and try Danger.atRuntime(c, node);
 }
 
 /// A site the rule reads now: `site`, in a function a reading of a file the run does not select
 /// takes (`Taint.readHere`).
-fn readNow(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) bool {
-    return Taint.readHere(flow, c.file, node) and site(c, node);
+fn readNow(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) Context.Error!bool {
+    return Taint.readHere(flow, c.file, node) and try site(c, node);
 }
 
 fn comparison(tag: Ast.Node.Tag) bool {

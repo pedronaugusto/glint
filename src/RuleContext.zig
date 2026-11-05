@@ -128,7 +128,7 @@ fn isType(self: *RuleContext, node: Ast.Node.Index) Error!bool {
         var proto_buffer: [1]Ast.Node.Index = undefined;
         const proto = written.fullFnProto(&proto_buffer, record.node) orelse return false;
         const result = proto.ast.return_type.unwrap() orelse return false;
-        return written.nodeTag(result) == .identifier and std.mem.eql(u8, written.tokenSlice(written.nodeMainToken(result)), "type");
+        return try self.facts.writesType(function.file, result) == .type;
     }
     switch (tree.nodeTag(node)) {
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
