@@ -2610,6 +2610,10 @@ fn builtinField(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index
     return null;
 }
 
+/// The pointer casts that keep what a pointer points at: Zig changes only its alignment,
+/// qualifiers or address space, as the result type gives them.
+pub const pointee_keeping = [_][]const u8{ "@alignCast", "@constCast", "@volatileCast", "@addrSpaceCast" };
+
 /// What an atomic or a union builtin gives, null for any other: an atomic load's value, or a
 /// read-modify-write's old one, what the pointer points at as `p.*` reads it, a value of the type
 /// the first argument names where the pointer is none; `@unionInit`'s union, a value of that type;
@@ -2705,6 +2709,9 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     if (try self.memoryBuiltin(env, file, name, args)) |value| return value;
     // Every element the operand: an array of it (a vector is indexed as one).
     if (std.mem.eql(u8, name, "@splat") and args.len == 1) return .{ .array = try self.boxed(try self.resolveIn(env, file, args[0])) };
+    // A pointer cast that keeps what it points at: Zig changes only the pointer's alignment,
+    // qualifiers or address space, which the result type gives, never its pointee.
+    for (pointee_keeping) |cast| if (std.mem.eql(u8, name, cast) and args.len == 1) return self.resolveIn(env, file, args[0]);
     // A type built from its fields' types: `@Struct(layout, backing, names, types, attributes)`,
     // `@Union(layout, tag, names, types, attributes)`, `@Tuple(types)`.
     if ((std.mem.eql(u8, name, "@Struct") or std.mem.eql(u8, name, "@Union")) and args.len == 5) return self.reified(try self.resolveIn(env, file, args[3]));
@@ -12552,7 +12559,7 @@ pub const accesses = struct {
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, at, &buffer);
                 if (args.len != 1) return at;
-                for ([_][]const u8{ "@alignCast", "@constCast", "@volatileCast" }) |keeping| {
+                for (Facts.pointee_keeping) |keeping| {
                     if (std.mem.eql(u8, name, keeping)) break;
                 } else return at;
                 at = args[0];
@@ -13393,6 +13400,50 @@ fn fnTypeParameter(self: *Facts, key: Key, position: usize) ResolveError!Value {
         return if (param.type_expr) |type_expr| self.resolve(key.file, type_expr) else .scalar;
     }
     return .{ .unknown = .unsupported };
+}
+
+test "a pointer cast that keeps what it points at gives its operand: @alignCast, @constCast, @volatileCast, @addrSpaceCast" {
+    const source =
+        \\const Foo = struct { a: u8 };
+        \\var foo: Foo = .{ .a = 1 };
+        \\pub fn main(ctx: *anyopaque) void {
+        \\    const p: *const Foo = &foo;
+        \\    const aligned: *align(1) const Foo = @alignCast(p);
+        \\    const mutable: *Foo = @constCast(p);
+        \\    const volatile_: *volatile const Foo = @volatileCast(p);
+        \\    const spaced: *const Foo = @addrSpaceCast(p);
+        \\    const back: *Foo = @ptrCast(@alignCast(ctx));
+        \\    _ = .{ aligned, mutable, volatile_, spaced, back };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable;
+        }
+    };
+    const foo = try facts.resolve(file, node.of(tree, "Foo"));
+    // Each a pointer to `Foo`, as `p` is.
+    for ([_][]const u8{ "@alignCast(p)", "@constCast(p)", "@volatileCast(p)", "@addrSpaceCast(p)" }) |cast| {
+        const value = try facts.resolve(file, node.of(tree, cast));
+        try std.testing.expect(value == .pointer and value.pointer.child.* == .instance and value.pointer.child.instance.scope == foo.container.scope);
+    }
+    // An opaque pointer's alignment changed points at the opaque still: no type it is not.
+    const opaque_ = try facts.resolve(file, node.of(tree, "@alignCast(ctx)"));
+    const ctx = try facts.resolve(file, node.of(tree, "ctx"));
+    try std.testing.expect(ctx == .pointer and opaque_ == .pointer);
+    try std.testing.expectEqual(std.meta.activeTag(ctx.pointer.child.*), std.meta.activeTag(opaque_.pointer.child.*));
 }
 
 test "a place's type in a reading reads the reading's bindings: a declaration's, a return's and @as's type written in terms of a comptime type parameter" {
