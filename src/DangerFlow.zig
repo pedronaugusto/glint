@@ -1611,13 +1611,20 @@ const Quiet = struct {
 /// nothing more is added (a recursion reaches its fixpoint). Read once per rule and file; null
 /// where the reading of `file` is already under way (a call back into it from another file).
 fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void, file: Project.FileId) Context.Error!?[]const Taint.PassedSink {
-    // What it keeps stays for the run: each later call into the file reads it.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
+    // The sinks it keeps stay for the run: each later call into the file reads them.
+    const gpa = c.facts.gpa;
     const key = .{ @intFromEnum(rule), file };
     if (flow.flow.reached_sinks.get(key)) |known| return known;
     if (flow.flow.reading_sinks.contains(key)) return null;
-    try flow.flow.reading_sinks.put(c.allocator, key, {});
+    try flow.flow.reading_sinks.put(gpa, key, {});
+    // The rule's reading of the file is its own work, given back when it is done, as its
+    // reading of a selected file is (what fills a memo keeps itself, `Context.keep`): only
+    // the sinks found are kept (`Taint.keptSink`).
+    var work: std.heap.ArenaAllocator = .init(gpa);
+    defer work.deinit();
+    const rule_memory = c.allocator;
+    c.allocator = work.allocator();
+    defer c.allocator = rule_memory;
     var list: std.ArrayList(Taint.PassedSink) = .empty;
     var calls: std.ArrayList(Taint.PassedCall) = .empty;
     var quiet: Quiet = .{ .inner = c.sink };
@@ -1664,8 +1671,10 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
         }
     }
     _ = flow.flow.reading_sinks.remove(key);
-    try flow.flow.reached_sinks.put(c.allocator, key, list.items);
-    return list.items;
+    const kept = try gpa.alloc(Taint.PassedSink, list.items.len);
+    for (kept, list.items) |*out, one| out.* = try Taint.keptSink(gpa, one);
+    try flow.flow.reached_sinks.put(gpa, key, kept);
+    return kept;
 }
 
 /// Each call `c.file` makes into a function of a file the run does not select (a dependency's,

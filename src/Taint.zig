@@ -2687,6 +2687,18 @@ pub const PassedSink = struct {
 /// A call a function of the file being read makes into a function of that file.
 pub const PassedCall = struct { node: Ast.Node.Index, decl: Facts.Decl };
 
+/// `sink` with what it holds (its Dep's slots past the first word, its message) copied into
+/// `gpa`: kept past the memory the reading that found it is given back with.
+pub fn keptSink(gpa: Allocator, sink: PassedSink) Allocator.Error!PassedSink {
+    var out = sink;
+    const info = @typeInfo(Dep).@"struct";
+    inline for (info.field_names, info.field_types) |name, kind| if (kind == Slots) {
+        @field(out.given, name).tail = try gpa.dupe(u64, @field(sink.given, name).tail);
+    };
+    out.message = try gpa.dupe(u8, sink.message);
+    return out;
+}
+
 /// The function holding `node`, as an id the fact keeps for the run; null outside them.
 pub fn functionKey(fact: Fact, file: Project.FileId, node: Ast.Node.Index) ?u32 {
     return if (owner(fact.flow, file, node)) |function| @backingInt(function) else null;
