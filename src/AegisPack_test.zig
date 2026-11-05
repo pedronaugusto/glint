@@ -995,31 +995,38 @@ test "A002 judges a generic's copy bound to a record of the program by the owner
     try expectJudged(head ++ "const H = struct { s: *const S, n: u32 };\npub fn f(s: *const S) void { const h: H = .{ .s = s, .n = 2 }; _ = keep(H, h); }", pack.copies, true, 0);
 }
 
-/// How many sites `rule` leaves undecided over `source` because a call spelled as a copying
-/// generic does not resolve.
-fn unresolvedCopiers(source: []const u8, rule: glint.Rule) !usize {
+/// How many sites `rule` leaves undecided over `source` whose detail holds `detail` (every one
+/// for "").
+fn undecidedWith(source: []const u8, rule: glint.Rule, detail: []const u8) !usize {
     var project = try fixture(source);
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = rule, .level = .gate }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
     var found: usize = 0;
-    for (report.coverage) |entry| if (entry.rule != null and entry.rule.? == rule and std.mem.find(u8, entry.detail, "spelled as a generic that copies") != null) {
+    for (report.coverage) |entry| if (entry.rule != null and entry.rule.? == rule and std.mem.find(u8, entry.detail, detail) != null) {
         found += 1;
     };
     return found;
 }
 
-test "A002, A003 and A004 leave a call to a copying generic that does not resolve undecided only where an argument may bind an owner" {
-    // strand's `access.write(n)` on an anytype receiver: plain data, a cast number or a type of
-    // plain data binds no owner, whatever `write` is; an owner, a type of one, or one cast to
-    // its own type may.
+test "A002, A003 and A004 judge a copying generic a name or member that does not resolve may call in its own body, and a computed callee where an argument may bind an owner" {
+    // strand's `access.write(n)` on an anytype receiver: `write` is named on a holder that does
+    // not resolve, so no call is all its bindings (`Facts.judgedAtBindings`) and its body's copy
+    // is judged unbound; the call adds nothing, whichever name it spells.
     const head = "const S = @import(\"aegis\").Secret(u32);\nfn write(comptime T: type, value: T) [2]T { return .{ value, value }; }\npub fn use() void { _ = write(u32, 1); }\n";
     const plain = head ++ "pub fn f(n: u64, text: []const u8, access: anytype) void { _ = access.write(u64, n); _ = access.write([]const u8, text); _ = access.write(u8, @as(u8, 3)); _ = access.write([4]u8, .{ 1, 2, 3, 4 }); }";
     const owners = head ++ "pub fn f(owned: *S, access: anytype) void { _ = access.write(S, owned.*); _ = access.write(S, @as(S, owned.*)); }";
+    const call_site = "callee does not resolve may bind a generic";
     for ([_]glint.Rule{ pack.copies, pack.cleanup, pack.scalar }) |rule| {
-        try std.testing.expectEqual(@as(usize, 0), try unresolvedCopiers(plain, rule));
-        try std.testing.expectEqual(@as(usize, 2), try unresolvedCopiers(owners, rule));
+        try std.testing.expectEqual(@as(usize, 0), try undecidedWith(plain, rule, call_site));
+        try std.testing.expectEqual(@as(usize, 0), try undecidedWith(owners, rule, call_site));
     }
+    // Never cleared: the copy is undecided in `write`'s own body.
+    try std.testing.expect(try undecidedWith(owners, pack.copies, "") > 0);
+    // A computed callee may be a generic no scan of calls sees: undecided at the call where an
+    // argument may bind an owner, never for plain data.
+    const computed = head ++ "pub fn f(owned: *S, n: u64, access: anytype) void { _ = @field(access, \"write\")(S, owned.*); _ = @field(access, \"write\")(u64, n); }";
+    try std.testing.expectEqual(@as(usize, 1), try undecidedWith(computed, pack.copies, call_site));
 }
 
 test "A002 records for a generic's bindings only a copy whose value a binding settles" {
