@@ -2790,7 +2790,8 @@ const Frame = struct {
     /// type's name (`anyerror`) or of a kind not read may be one.
     fn failingValue(value: Facts.Value) Failing {
         return switch (value) {
-            .scalar, .pointer, .instance, .array, .optional, .function => .no,
+            // An anonymous literal (`return .{ .a = d }` into `!Foo`) is a payload, never an error.
+            .scalar, .pointer, .instance, .array, .optional, .function, .literal => .no,
             .alternatives => |each| for (each) |one| {
                 if (failingValue(one) != .no) break .maybe;
             } else .no,
