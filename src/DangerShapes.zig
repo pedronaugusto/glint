@@ -3448,6 +3448,7 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
                 // `undefined` gives it no state: reading it after is illegal.
                 if (undefinedValue(tree, value)) continue;
                 if (site.reach == .holder and !try madeValue(c, site.file, value, state, 0)) continue;
+                if (try stateCopy(c, site.file, value, field, site.reach == .holder)) continue;
                 break :written value;
             } else null,
             .update => site.node,
@@ -3528,6 +3529,32 @@ fn choosesState(c: *Context, file: Project.FileId, node: Ast.Node.Index, state: 
         }
     }
     return false;
+}
+
+/// Whether a write's value gives the state as another record holds it: the state field read of a
+/// value of its holder's type (`dest.kind = edge.kind`, through parentheses), or, for a whole
+/// holder's literal (`whole`), the field's initializer such a read (`dest.* = .{ .kind =
+/// edge.kind }`). It carries the state chosen where that record's was, as a whole holder's copy
+/// does (`a = b`): no write, under whatever condition it is made; of the record it reads, no
+/// change. A literal that leaves the field to its default chooses that state here.
+fn stateCopy(c: *Context, file: Project.FileId, value: Ast.Node.Index, field: Facts.Decl, whole: bool) Context.Error!bool {
+    const tree = &c.project.at(file).file.tree;
+    const record = c.project.at(field.file).model.declarations[@backingInt(field.index)];
+    var given = value;
+    if (whole) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const literal = tree.fullStructInit(&buffer, value) orelse return false;
+        given = for (literal.ast.fields) |init| {
+            // `.name = init`: the name two tokens before the value.
+            if (std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(tree.firstToken(init) - 2)), record.name)) break init;
+        } else return false;
+    }
+    while (tree.nodeTag(given) == .grouped_expression) given = tree.nodeData(given).node_and_token[0];
+    if (tree.nodeTag(given) != .field_access) return false;
+    const holder, const name = tree.nodeData(given).node_and_token;
+    if (!std.mem.eql(u8, try Model.identifier(c.allocator, tree.tokenSlice(name)), record.name)) return false;
+    const owner = byPointer(try c.facts.resolve(file, holder)) orelse return false;
+    return owner.file == field.file and owner.scope == record.scope;
 }
 
 /// Whether `node` is `undefined`.
