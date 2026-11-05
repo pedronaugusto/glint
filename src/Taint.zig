@@ -86,6 +86,16 @@ pub const Dep = struct {
     unchecked: Levels = .clean,
     bare: Slots = .{},
 
+    /// The same value, its slots' tails on `gpa`: what a solve round keeps past the round.
+    fn kept(a: Dep, gpa: Allocator) Allocator.Error!Dep {
+        var out = a;
+        inline for (@typeInfo(Dep).@"struct".field_names) |name| if (@FieldType(Dep, name) == Slots) {
+            const tail = @field(a, name).tail;
+            if (tail.len != 0) @field(out, name).tail = try gpa.dupe(u64, tail);
+        };
+        return out;
+    }
+
     pub fn join(a: Dep, gpa: Allocator, b: Dep) Allocator.Error!Dep {
         return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .counted = try a.counted.unite(gpa, b.counted), .counted_numbers = try a.counted_numbers.unite(gpa, b.counted_numbers), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare) };
     }
@@ -424,6 +434,9 @@ pub const Flow = struct {
     /// the function).
     leaving: std.AutoHashMapUnmanaged(struct { Facts.Key, ?Ast.TokenIndex }, Dep) = .empty,
     changed: bool = false,
+    /// While the solve's rounds run, the round's own memory: what a round reads once per round
+    /// (`loops`, `leaving`) and its temporaries, given back when the round ends.
+    round: ?Allocator = null,
     /// What the functions outside the program its calls reach size work by (`sizesFlow`): a
     /// flow of its own over them, read for no fact.
     sized: ?*Flow = null,
@@ -556,13 +569,30 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     try escaped(c, flow);
     try linksOf(c, flow);
     // Every step joins, and each level and set is finite: the rounds end when one changes
-    // nothing, however long a chain of calls the fact runs through.
+    // nothing, however long a chain of calls the fact runs through. Each round works on its
+    // own memory and keeps on the run's only the facts it raises (`Dep.kept`), so a solve
+    // holds its facts once, not every round's work; its pages are unmapped when the round
+    // ends, so what a round kept by mistake faults where it is read again.
+    var round: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer round.deinit();
+    const run_memory = c.allocator;
+    defer {
+        c.allocator = run_memory;
+        flow.round = null;
+        flow.loops = .empty;
+        flow.leaving = .empty;
+    }
     while (true) {
         flow.changed = false;
-        flow.loops.clearRetainingCapacity();
-        flow.leaving.clearRetainingCapacity();
+        flow.loops = .empty;
+        flow.leaving = .empty;
+        c.allocator = round.allocator();
+        flow.round = c.allocator;
         for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @fromBackingInt(@intCast(i)));
         try takeHeld(c, flow);
+        flow.loops = .empty;
+        flow.leaving = .empty;
+        _ = round.reset(.free_all);
         if (!flow.changed) break;
     }
 }
@@ -816,7 +846,7 @@ fn bindings(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void 
                 const value = tree.nodeData(node).opt_node.unwrap() orelse continue;
                 const now = try (try flow.functions.items[@backingInt(function)].ret.join(c.allocator, try dep(c, flow, function, value))).join(c.allocator, try control(c, flow, function, node, null));
                 if (!now.eql(flow.functions.items[@backingInt(function)].ret)) {
-                    flow.functions.items[@backingInt(function)].ret = now;
+                    flow.functions.items[@backingInt(function)].ret = try now.kept(c.facts.gpa);
                     flow.changed = true;
                 }
                 if (f.parser) try unrefined(c, flow, function, value);
@@ -1071,9 +1101,11 @@ fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Er
     if (value.clean()) return;
     const entry = try flow.locals.getOrPut(c.allocator, decl);
     const before: Dep = if (entry.found_existing) entry.value_ptr.* else .{};
-    const now = try before.join(c.allocator, value);
-    entry.value_ptr.* = now;
-    if (!now.eql(before)) flow.changed = true;
+    // Joined on the caller's memory (a round's), kept on the run's only where it changed.
+    const now = try before.join(rule_memory, value);
+    if (now.eql(before)) return;
+    entry.value_ptr.* = try now.kept(c.allocator);
+    flow.changed = true;
 }
 
 /// A field or a container-level variable given a value of `level` in memory of `length`.
@@ -1378,7 +1410,7 @@ fn raise(c: *Context, flow: *Flow, function: Function.Id, place: Place, value: D
         .param => |index| {
             const now = try f.writes[index].join(c.allocator, value);
             if (!now.eql(f.writes[index])) {
-                f.writes[index] = now;
+                f.writes[index] = try now.kept(c.facts.gpa);
                 flow.changed = true;
             }
         },
@@ -3649,8 +3681,9 @@ fn controlUpTo(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.I
 /// condition's operands or its inputs' bounds and lengths, and every condition inside it, any
 /// of which may end a pass or the loop. Read once per round.
 fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index) Context.Error!Dep {
-    // What it keeps in the run's solve stays for the run.
-    const rule_memory = c.keep();
+    // Read once per round: on the round's memory while the rounds run, else the run's.
+    const rule_memory = c.allocator;
+    c.allocator = flow.round orelse c.facts.gpa;
     defer c.allocator = rule_memory;
     const f = flow.functions.items[@backingInt(function)];
     const key: Facts.Key = .{ .file = f.file, .node = loop };
@@ -3696,8 +3729,9 @@ fn passes(c: *Context, flow: *Flow, function: Function.Id, loop: Ast.Node.Index)
 /// that the jump is taken (`controlUpTo` within the statement), and whether a `try`'s operand
 /// is an error. Read once per round.
 fn leaves(c: *Context, flow: *Flow, function: Function.Id, statement: Ast.Node.Index, bound: ?Ast.TokenIndex) Context.Error!Dep {
-    // What it keeps in the run's solve stays for the run.
-    const rule_memory = c.keep();
+    // Read once per round: on the round's memory while the rounds run, else the run's.
+    const rule_memory = c.allocator;
+    c.allocator = flow.round orelse c.facts.gpa;
     defer c.allocator = rule_memory;
     const f = flow.functions.items[@backingInt(function)];
     const key = .{ Facts.Key{ .file = f.file, .node = statement }, bound };
@@ -4739,6 +4773,95 @@ fn lookupsFor(n: usize) !usize {
     var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
     _ = try get(&c, peer_input);
     return (try facts.memo(Governed.Lookups)).asked;
+}
+
+test "the input fact's solve keeps what its rounds raise, not each round's work: a chain input reaches a round per call holds what the same chain declared callee first does" {
+    // Declared caller first, `step0` reads what `step1` returns before the round that raises
+    // it: the input takes a round per call (34 rounds over 32 calls), callee first 4. Each
+    // round's work is given back when the round ends, so the run holds the same either way;
+    // it grew with the calls times the rounds (relic's odb: 18 rounds, 24.8 GB, 11-04).
+    const forward = try solveBytes(32, false);
+    const callee_first = try solveBytes(32, true);
+    try std.testing.expect(forward > 0);
+    try std.testing.expectEqual(callee_first, forward);
+}
+
+/// The bytes the input fact's solve asks of the run's memory over a chain of `n` calls, the
+/// last returning input, each function binding 48 values (a slot set past one word).
+fn solveBytes(n: usize, callee_first: bool) !usize {
+    const gpa = std.testing.allocator;
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(gpa);
+    try program.appendSlice(gpa, "const std = @import(\"std\");\npub fn main(r: *std.Io.Reader, s: []const u8) u8 {\n    return s[step0(r, s)];\n}\n");
+    for (0..n + 1) |at| {
+        const i = if (callee_first) n - at else at;
+        if (i == n) {
+            try program.print(gpa, "fn step{d}(r: *std.Io.Reader, s: []const u8) u32 {{\n    _ = s;\n    return r.takeInt(u32, 0) catch 0;\n}}\n", .{n});
+            continue;
+        }
+        try program.print(gpa, "fn step{d}(r: *std.Io.Reader, s: []const u8) u32 {{\n    var t: u32 = 0;\n    for (s) |b| t +%= b;\n    const a0 = step{d}(r, s) +% t;\n", .{ i, i + 1 });
+        for (1..48) |k| try program.print(gpa, "    const a{d} = a{d} +% {d};\n", .{ k, k - 1, k });
+        try program.appendSlice(gpa, "    for (0..a47) |_| t +%= 1;\n    return a47 +% t;\n}\n");
+    }
+    const inputs = [_]Project.Input{
+        .{ .name = "root", .bytes = program.items },
+        .{ .name = "std/std.zig", .bytes = "pub const Io = @import(\"Io.zig\");\n", .selected = false },
+        .{ .name = "std/Io.zig", .bytes = "pub const Reader = @import(\"Io/Reader.zig\");\n", .selected = false },
+        .{ .name = "std/Io/Reader.zig", .bytes = "buffer: []u8 = &.{},\npub fn takeInt(r: *@This(), comptime T: type, endian: u1) !T { _ = r; _ = endian; return 0; }\n", .selected = false },
+    };
+    const imports = [_]Project.Import{ .{ .from = 0, .spelling = "std", .target = 1 }, .{ .from = 1, .spelling = "Io.zig", .target = 2 }, .{ .from = 2, .spelling = "Io/Reader.zig", .target = 3 } };
+    var project = try Project.init(gpa, &inputs, &imports, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // What the run asks of its memory, counted.
+    const Counted = struct {
+        child: Allocator,
+        asked: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += len;
+            return self.child.rawAlloc(len, alignment, ra);
+        }
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.child.rawResize(memory, alignment, new_len, ra)) return false;
+            self.asked += new_len -| memory.len;
+            return true;
+        }
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const out = self.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
+            self.asked += new_len -| memory.len;
+            return out;
+        }
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(memory, alignment, ra);
+        }
+    };
+    var counted: Counted = .{ .child = arena.allocator() };
+    const run_memory: Allocator = .{ .ptr = &counted, .vtable = &.{ .alloc = Counted.alloc, .resize = Counted.resize, .remap = Counted.remap, .free = Counted.free } };
+    var facts: Facts = .{ .project = &project, .gpa = run_memory };
+    defer facts.deinit();
+    // A rule's own memory for the file, as the Runner gives it: not the run's.
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").untrusted_input, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+        fn check(_: *Context) Context.Error!void {}
+    };
+    const peer_input = @import("Danger.zig").peer_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").untrusted_input, .name = "A009", .group = .family_policy, .purpose = "input" }, .check = Quiet.check, .facts = &.{peer_input} };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    _ = try get(&c, peer_input);
+    return counted.asked;
 }
 
 test "a size a generic takes through its context is read in the instantiation the program's call makes" {
