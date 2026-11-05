@@ -1245,23 +1245,12 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
     const call = (try Facts.calls.at(c.facts, c.file, node)) orelse return;
     // The callee's name as written: a name (`f(x)`) or a member (`x.f()`, `T.f(x)`).
     const path = try Facts.accesses.pathOf(c.facts, c.file, call.callee_expr);
-    const name_token, const name = switch (path.steps[0].kind) {
-        .root => root: {
-            const ref = c.project.at(c.file).model.reference(path.steps[0].node) orelse return;
-            break :root .{ ref.token, try Model.identifier(c.allocator, tree.tokenSlice(ref.token)) };
-        },
-        .field => .{ tree.lastToken(path.steps[0].node), path.steps[0].name orelse return },
+    const name_token = switch (path.steps[0].kind) {
+        .root => (c.project.at(c.file).model.reference(path.steps[0].node) orelse return).token,
+        .field => tree.lastToken(path.steps[0].node),
         .index, .slice, .unwrap, .deref => return,
     };
-    switch (try c.facts.copiesBy(name)) {
-        .none => return,
-        // A generic that only moves a parameter into storage copies for A002 alone, and only
-        // what does not move at the call.
-        .moves => if (rule != copies or try argumentsMove(c, call)) return,
-        .copies => {},
-    }
-    // Each function it may call is bound by it; a callee spelled as a copying generic that
-    // does not resolve may be one.
+    // Each function it may call is bound by it.
     const functions: []const Facts.Decl = switch (call.callee) {
         .function => |function| &.{function},
         .choice => |each| each,
@@ -1270,17 +1259,36 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
             // parameters a runtime function's type cannot take, is called there.
             const callee = try c.facts.resolve(c.file, call.callee_expr);
             if (callee == .fn_type or (callee == .pointer and callee.pointer.child.* == .fn_type)) return;
-            // Whatever function it calls, a binding reports only an argument `boundBy` does not
-            // pass over: one neither the receiver, a parameter of a generic this call is in
-            // (decided where that is bound), nor plain data (`access.write(n)`, `n: u64`).
+            // A name or a member that does not resolve calls only a function the program hands
+            // on as a value (`codeOf(comptime f: anytype, ..)`'s `f`, given `wrap`) or one named
+            // so on a holder that does not resolve: `Facts.judgedAtBindings` reads neither as
+            // judged at its bindings, so its body is judged unbound and this call adds nothing.
+            const written = tree.nodeTag(call.callee_expr);
+            if (written == .identifier or written == .field_access) return;
+            // Any other callee (`@field(T, name)(x)`, a call's result) may be a generic named
+            // nowhere the program's scan of calls sees. Whatever function it calls, a binding
+            // reports only an argument `boundBy` does not pass over: one neither the receiver, a
+            // parameter of a generic this call is in (decided where that is bound), nor plain
+            // data (`access.write(n)`, `n: u64`).
             if (!try anyArgumentBinds(c, call)) return;
-            return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call spelled as a generic that copies its parameters does not resolve: its binding may copy an owner");
+            return c.undecided(rule, tree.tokenStart(name_token), .unresolved, "a call whose callee does not resolve may bind a generic that copies its parameters: its binding may copy an owner");
         },
     };
+    var copying = false;
+    for (functions) |function| switch (try c.facts.copiesOf(function)) {
+        .none => {},
+        // A generic that only moves a parameter into storage copies for A002 alone, and only
+        // what does not move at the call.
+        .moves => if (rule == copies and !try argumentsMove(c, call)) {
+            copying = true;
+        },
+        .copies => copying = true,
+    };
+    if (!copying) return;
     // A method call's receiver is its first parameter (`boundBy` reads the known arguments).
     switch (call.args) {
         .known => {},
-        .unknown => |why| return c.undecided(rule, tree.tokenStart(name_token), if (why == .budget) .budget_exhausted else .unresolved, "a call spelled as a generic that copies its parameters may or may not bind its receiver: its binding may copy an owner"),
+        .unknown => |why| return c.undecided(rule, tree.tokenStart(name_token), if (why == .budget) .budget_exhausted else .unresolved, "a call of a generic that copies its parameters may or may not bind its receiver: its binding may copy an owner"),
     }
     for (functions) |function| if (try boundBy(c, tree, call, rule, function, name_token)) return;
 }

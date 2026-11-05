@@ -37,9 +37,6 @@ settled: std.ArrayList(Assumptions) = .empty,
 assumed: ?Assumptions.Id = null,
 /// What each generic function copies of its parameters' values, found once (`parameterCopies`).
 copies: ?std.AutoHashMapUnmanaged(Decl, []const ParameterCopy) = null,
-/// The names those functions are declared under, for a quick look before a callee is resolved:
-/// what the functions so named do with the values given (`copiesBy`).
-copier_names: std.StringHashMapUnmanaged(Copies) = .empty,
 /// The places the copies `directCopies` finds in a value chosen or wrapped read, each with
 /// its copy's declaration: a copy its bindings decide (`boundAtBinding`).
 bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index }, Decl) = .empty,
@@ -359,7 +356,6 @@ pub fn deinit(self: *Facts) void {
     self.truths_open.deinit(self.gpa);
     self.settled.deinit(self.gpa);
     if (self.copies) |*found| found.deinit(self.gpa);
-    self.copier_names.deinit(self.gpa);
     self.bound_places.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
@@ -938,36 +934,27 @@ fn findCopies(self: *Facts) ResolveError!void {
         }
     }
     self.copies = found;
-    var it = found.iterator();
-    while (it.next()) |entry| {
-        const name = self.project.at(entry.key_ptr.file).model.declarations[@backingInt(entry.key_ptr.index)].name;
-        const kind: Copies = for (entry.value_ptr.*) |copy| {
-            if (copy.kind != .moved) break .copies;
-        } else .moves;
-        // Functions of one name: the one that copies decides.
-        const slot = try self.copier_names.getOrPut(self.gpa, name);
-        if (!slot.found_existing or kind == .copies) slot.value_ptr.* = kind;
-    }
     if (self.check_records) |check| try check.copies(self, &self.copies.?);
 }
 
-/// What a function named `name` may do with a generic parameter's values.
+/// What a function does with a generic parameter's values.
 pub const Copies = enum {
-    /// No function so named copies one.
+    /// It copies none.
     none,
-    /// Those so named only move a parameter's value into storage (`ParameterCopy.kind ==
-    /// .moved`): what a call gives is copied there only where the argument does not move at
-    /// the call.
+    /// It only moves a parameter's value into storage (`ParameterCopy.kind == .moved`): what a
+    /// call gives is copied there only where the argument does not move at the call.
     moves,
-    /// Some function so named copies one.
+    /// It copies one.
     copies,
 };
 
-/// What some function named `name` does with a generic parameter's values: one answer, so a
-/// reader cannot take a mover for a function that copies nothing.
-pub fn copiesBy(self: *Facts, name: []const u8) ResolveError!Copies {
-    if (self.copies == null) try self.findCopies();
-    return self.copier_names.get(name) orelse .none;
+/// What `function`, a callee `calls` resolved, does with a generic parameter's values: one
+/// answer, so a reader cannot take a mover for a function that copies nothing.
+pub fn copiesOf(self: *Facts, function: Decl) ResolveError!Copies {
+    const made = try self.parameterCopies(function);
+    if (made.len == 0) return .none;
+    for (made) |copy| if (copy.kind != .moved) return .copies;
+    return .moves;
 }
 
 fn syntaxOf(self: *const Facts, file: Project.FileId) *const Ast {
