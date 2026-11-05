@@ -2643,6 +2643,37 @@ fn memoryBuiltin(self: *Facts, env: ?*const Env, file: Project.FileId, name: []c
     return null;
 }
 
+/// What `@import(args)` in `file` gives: the imported Zig file's root container, or the value
+/// a ZON file holds; unknown where the name is computed or no mapping gives it.
+fn importValue(self: *Facts, file: Project.FileId, args: []const Ast.Node.Index) ResolveError!Value {
+    const tree = &self.project.at(file).file.tree;
+    if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return .{ .unknown = .computed_import };
+    const spelling = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return .{ .unknown = .computed_import },
+    };
+    var reached: [2]Project.FileId = undefined;
+    const targets = self.project.importedAll(file, spelling, &reached);
+    if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
+        .absent
+    else if (try self.zigOwn(file, spelling))
+        .zig_own
+    else
+        .missing_mapping };
+    // A file both compilations compile, each binding the name apart: either root, as each
+    // reads it, a member read in both.
+    // A ZON file is a value, never a container: the one expression it holds, read as the same
+    // expression written in place is (a struct literal is a `.literal`). By how its tree was
+    // parsed: a tree parsed as ZON, and only one, holds that expression at its root.
+    const roots = try self.gpa.alloc(Value, targets.len);
+    for (targets, roots) |target, *root| root.* = switch (self.project.at(target).file.tree.mode) {
+        .zig => .{ .container = self.rootOf(target) },
+        // Only a parsed tree has its expression at the root.
+        .zon => if (self.project.at(target).file.status != .parsed) .{ .unknown = .invalid_front_end } else try self.resolve(target, self.project.at(target).file.tree.nodeData(.root).node),
+    };
+    return if (roots.len == 1) roots[0] else self.choose(roots);
+}
+
 /// What a builtin call gives: an imported file, `@This()`, a reflected declaration, a type
 /// `@as` names, a value's type, a type's information; its operands read with `env`'s
 /// bindings where a generic call's reading gives them.
@@ -2652,33 +2683,7 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
     var buffer: [2]Ast.Node.Index = undefined;
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     const args = builtinArgs(tree, node, &buffer);
-    if (std.mem.eql(u8, name, "@import")) {
-        if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) return .{ .unknown = .computed_import };
-        const spelling = std.zig.string_literal.parseAlloc(self.gpa, tree.tokenSlice(tree.nodeMainToken(args[0]))) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidLiteral => return .{ .unknown = .computed_import },
-        };
-        var reached: [2]Project.FileId = undefined;
-        const targets = self.project.importedAll(file, spelling, &reached);
-        if (targets.len == 0) return .{ .unknown = if (self.project.absent(file, spelling))
-            .absent
-        else if (try self.zigOwn(file, spelling))
-            .zig_own
-        else
-            .missing_mapping };
-        // A file both compilations compile, each binding the name apart: either root, as each
-        // reads it, a member read in both.
-        // A ZON file is a value, never a container: the one expression it holds, read as the same
-        // expression written in place is (a struct literal is a `.literal`). By how its tree was
-        // parsed: a tree parsed as ZON, and only one, holds that expression at its root.
-        const roots = try self.gpa.alloc(Value, targets.len);
-        for (targets, roots) |target, *root| root.* = switch (self.project.at(target).file.tree.mode) {
-            .zig => .{ .container = self.rootOf(target) },
-            // Only a parsed tree has its expression at the root.
-            .zon => if (self.project.at(target).file.status != .parsed) .{ .unknown = .invalid_front_end } else try self.resolve(target, self.project.at(target).file.tree.nodeData(.root).node),
-        };
-        return if (roots.len == 1) roots[0] else self.choose(roots);
-    }
+    if (std.mem.eql(u8, name, "@import")) return self.importValue(file, args);
     // The container the call is in. One a function declares (a type function's `struct`) is
     // the one its reading made: its declaration read in the reading of the function declaring
     // it, as `readBound` attaches its making, so its fields read that reading's bindings.
