@@ -1126,7 +1126,7 @@ fn checkBinding(c: *Context, tree: *const Ast, node: Ast.Node.Index, rule: Rule)
 /// the call resolves, and a getter that returns a field of what it is given hands out a loan of
 /// that holder's owner, no acquisition. A reading that does not resolve, or none, is no loan.
 fn madeLent(c: *Context, call: Facts.calls.Call, function: Facts.Decl, copy: Facts.ParameterCopy) Context.Error!bool {
-    const readings = switch (try c.facts.copyReadings(call, function, copy)) {
+    const readings = switch (try c.facts.copyReadings(c.allocator, call, function, copy)) {
         .readings => |readings| readings,
         .unknown => return false,
     };

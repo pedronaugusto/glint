@@ -1780,8 +1780,9 @@ fn choiceOfTypes(value: Value) bool {
 /// The readings of the function a copy is in, as `call` binds `function` and the copy's path
 /// passes the parameter on (`boundCopy`'s walk): one per instantiation that reaches the copy's
 /// site, none where none does. Unknown where the binding or a call on the path does not resolve,
-/// and for a crowded copy, which `boundCopy` reads by its routes, not one path.
-pub fn copyReadings(self: *Facts, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!union(enum) { readings: []const *const Env, unknown: Unknown } {
+/// and for a crowded copy, which `boundCopy` reads by its routes, not one path. The list is the
+/// caller's, in `gpa`; the readings themselves are kept as every reading is.
+pub fn copyReadings(self: *Facts, gpa: std.mem.Allocator, call: calls.Call, function: Decl, copy: ParameterCopy) ResolveError!union(enum) { readings: []const *const Env, unknown: Unknown } {
     if (copy.crowded) return .{ .unknown = .budget };
     const bound = switch (try self.bindCall(&call, function, null)) {
         .reading => |reading| reading,
@@ -1789,7 +1790,7 @@ pub fn copyReadings(self: *Facts, call: calls.Call, function: Decl, copy: Parame
     };
     var found: std.ArrayList(*const Env) = .empty;
     for (try self.instantiations(bound)) |reading| switch (try self.pathIn(reading, copy)) {
-        .reading => |env| if (try self.reachedUnder(env, copy.site.file, copy.site.node)) try found.append(self.gpa, env),
+        .reading => |env| if (try self.reachedUnder(env, copy.site.file, copy.site.node)) try found.append(gpa, env),
         .unreached => {},
         .unknown => |why| return .{ .unknown = why },
     };
