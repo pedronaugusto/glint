@@ -2753,7 +2753,8 @@ pub fn readHere(fact: Fact, file: Project.FileId, node: Ast.Node.Index) bool {
 
 /// Where a rule reads a file the run does not select (`Flow.recording`), the sink at `node`
 /// kept with what it takes from its function's parameters (`given`, as `givenAt` keeps it), to
-/// be judged at the calls into that function; a sink outside a function is kept by none.
+/// be judged at the calls into that function. A sink outside a function is kept by none: a
+/// container's declarations are evaluated as the program compiles, so no input reaches them.
 pub fn recordSink(c: *Context, fact: Fact, file: Project.FileId, node: Ast.Node.Index, given: Dep, undecided: bool, least: Level, message: []const u8) Allocator.Error!void {
     const list = fact.flow.recording orelse return;
     const function = functionKey(fact, file, node) orelse return;

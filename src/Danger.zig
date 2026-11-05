@@ -1007,7 +1007,12 @@ fn contractLevel(c: *Context, flow: Taint.Fact, node: Ast.Node.Index, reads: Rea
         var given: Taint.Dep = .{};
         var undecided = reads.deep;
         for (reads.values.items) |value| {
-            given = try given.join(c.allocator, (try Taint.givenAt(c, flow, c.file, value)) orelse continue);
+            // A value whose parameters are not read is not known to take none of them.
+            const taken = (try Taint.givenAt(c, flow, c.file, value)) orelse {
+                undecided = true;
+                continue;
+            };
+            given = try given.join(c.allocator, taken);
             if (try Taint.unknownAt(c, flow, c.file, value)) undecided = true;
         }
         try Taint.recordSink(c, flow, c.file, node, given, undecided, .data, message);

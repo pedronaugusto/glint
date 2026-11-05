@@ -333,6 +333,8 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
         // function's parameters, judged at the calls into it; the writer is a peer's where a
         // caller anywhere in the program hands it one, else the site is none.
         if (fact.flow.recording != null) {
+            // Null outside the functions the fact reads: a container's declaration, evaluated as the
+            // program compiles, which no input reaches.
             const given = (try Taint.givenAt(c, fact, c.file, written.value)) orelse continue;
             const undecided = !written.decided or try Taint.unknownAt(c, fact, c.file, written.value);
             // An error the function writes whole of its own (`errorShown`) shows its name
