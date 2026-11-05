@@ -6880,6 +6880,33 @@ fn dropped(self: *Facts, site: accesses.Site) bool {
     return rhs == site.node and tree.nodeTag(lhs) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), "_");
 }
 
+/// Whether `node`'s value is a pointer by its form, whatever its type resolves to: an address
+/// taken (`&x`), or a builtin Zig types only as a pointer (`@ptrFromInt`, `@ptrCast`,
+/// `@alignCast`, `@constCast`, `@volatileCast`, `@fieldParentPtr`), through `@as` and parentheses.
+/// A local it initialises is a pointer, never memory of its own a slice of it would be.
+pub fn makesPointer(self: *const Facts, file: Project.FileId, node: Ast.Node.Index) bool {
+    const tree = &self.project.at(file).file.tree;
+    var at = node;
+    while (true) switch (tree.nodeTag(at)) {
+        .grouped_expression => at = tree.nodeData(at).node_and_token[0],
+        .address_of => return true,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const name = tree.tokenSlice(tree.nodeMainToken(at));
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, at, &buffer);
+            if (std.mem.eql(u8, name, "@as") and args.len == 2) {
+                at = args[1];
+                continue;
+            }
+            for ([_][]const u8{ "@ptrFromInt", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@fieldParentPtr" }) |made| {
+                if (std.mem.eql(u8, name, made)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    };
+}
+
 /// What a source of a callable value gives through the casts that keep an address: `@ptrCast`,
 /// `@alignCast`, `@constCast`, `@volatileCast` and `@as` of it call what it points at.
 fn throughCasts(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!Ast.Node.Index {

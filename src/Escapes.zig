@@ -129,7 +129,15 @@ const Walk = struct {
                 const root = (try self.storage(sliced)) orelse return .none;
                 if (root != Facts.ungrouped(tree, sliced)) return .none;
                 const d = self.variable(root, function) orelse return .none;
-                return if (try self.array(d)) .{ .local = d } else .none;
+                if (try self.array(d)) return .{ .local = d };
+                // A pointer's slice points where the pointer does: what the local is given, but
+                // a slice of itself (`s = s[1..]`), which holds no memory it did not.
+                if (try self.c.facts.holdsNoAddress(try self.typeOf(d))) return .none;
+                const given = (try self.c.facts.givenTo(.{ .file = self.c.file, .index = d }, true)) orelse
+                    return .{ .unknown = .{ .reason = .unresolved, .detail = "a pointer named by a local given a value no store here shows (its address taken, its bytes written) may point into a local the return frees" } };
+                var others: std.ArrayList(Facts.Key) = .empty;
+                for (given) |each| if (!try self.slicesItself(each.node, d)) try others.append(self.c.allocator, each);
+                return self.first(others.items, function, depth + 1);
             },
             // A name for a pointer: each value it or a part of it is given (`Facts.givenTo`),
             // what a `const` holds; a store that may give it any value may give it a local's
@@ -150,6 +158,16 @@ const Walk = struct {
                 return self.first(fields.items, function, depth);
             },
         }
+    }
+
+    /// Whether `given` is a slice of the local `d` itself, by its own name.
+    fn slicesItself(self: Walk, given: Ast.Node.Index, d: Model.Declaration.Id) Context.Error!bool {
+        const node = Facts.ungrouped(self.tree, given);
+        const sliced = (self.tree.fullSlice(node) orelse return false).ast.sliced;
+        const root = (try self.storage(sliced)) orelse return false;
+        if (root != Facts.ungrouped(self.tree, sliced)) return false;
+        const reference = self.model.reference(root) orelse return false;
+        return reference.declaration == d;
     }
 
     /// The first local one of `values` reaches into; else what may be one, or none.
@@ -202,10 +220,16 @@ const Walk = struct {
     }
 
     /// Whether a local is an array a slice of which is its frame's memory: its type, written
-    /// or of its value, is an array, or one the reading does not know.
+    /// or of its value, is an array, or one the reading does not know but for a local its value
+    /// makes a pointer (`Facts.makesPointer`).
     fn array(self: Walk, d: Model.Declaration.Id) Context.Error!bool {
         return switch (try self.typeOf(d)) {
-            .array, .unknown => true,
+            .array => true,
+            // Made a pointer (`@ptrFromInt`, a pointer cast), it is one whatever its type spells.
+            .unknown => if (self.tree.fullVarDecl(self.model.declarations[@backingInt(d)].node)) |decl|
+                !(if (decl.ast.init_node.unwrap()) |init| self.c.facts.makesPointer(self.c.file, init) else false)
+            else
+                true,
             else => false,
         };
     }
