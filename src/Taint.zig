@@ -568,11 +568,17 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
     try parsers(c, flow);
     try escaped(c, flow);
     try linksOf(c, flow);
-    // Every step joins, and each level and set is finite: the rounds end when one changes
-    // nothing, however long a chain of calls the fact runs through. Each round works on its
-    // own memory and keeps on the run's only the facts it raises (`Dep.kept`), so a solve
-    // holds its facts once, not every round's work; its pages are unmapped when the round
-    // ends, so what a round kept by mistake faults where it is read again.
+    try rounds(c, flow, .facts);
+}
+
+/// Reads each function of `flow` not settled, and what its links hold, round after round:
+/// every step joins, and each level and set is finite, so the rounds end when one changes
+/// nothing, however long a chain of calls a fact runs through. `.sizes`: a summary's, which
+/// also reads what each function sizes work by (`sizing`). Each round works on its own memory
+/// and keeps on the run's only the facts it raises (`Dep.kept`, `Slots.kept`), so a flow holds
+/// its facts once, not every round's work; its pages are unmapped when the round ends, so what
+/// a round kept by mistake faults where it is read again.
+fn rounds(c: *Context, flow: *Flow, comptime reads: enum { facts, sizes }) Context.Error!void {
     var round: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer round.deinit();
     const run_memory = c.allocator;
@@ -588,7 +594,11 @@ fn solve(c: *Context, flow: *Flow) Context.Error!void {
         flow.leaving = .empty;
         c.allocator = round.allocator();
         flow.round = c.allocator;
-        for (flow.functions.items, 0..) |_, i| try bindings(c, flow, @fromBackingInt(@intCast(i)));
+        for (flow.functions.items, 0..) |f, i| {
+            if (f.settled) continue;
+            try bindings(c, flow, @fromBackingInt(@intCast(i)));
+            if (reads == .sizes) try sizing(c, flow, @fromBackingInt(@intCast(i)));
+        }
         try takeHeld(c, flow);
         flow.loops = .empty;
         flow.leaving = .empty;
@@ -1408,6 +1418,7 @@ fn raise(c: *Context, flow: *Flow, function: Function.Id, place: Place, value: D
     switch (place) {
         .local => |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value),
         .param => |index| {
+            // Joined on the caller's memory (a round's), kept on the run's only where it changed.
             const now = try f.writes[index].join(c.allocator, value);
             if (!now.eql(f.writes[index])) {
                 f.writes[index] = try now.kept(c.facts.gpa);
@@ -4290,18 +4301,12 @@ fn closeSummary(c: *Context, flow: *Flow, next: *std.ArrayList(Queued)) Context.
         }
     }
     try linksOf(c, flow);
-    while (true) {
-        flow.changed = false;
-        flow.loops.clearRetainingCapacity();
-        flow.leaving.clearRetainingCapacity();
-        for (flow.functions.items, 0..) |f, i| {
-            if (f.settled) continue;
-            try bindings(c, flow, @fromBackingInt(@intCast(i)));
-            try sizing(c, flow, @fromBackingInt(@intCast(i)));
-        }
-        try takeHeld(c, flow);
-        if (!flow.changed) break;
-    }
+    try rounds(c, flow, .sizes);
+    // Closed: each function's callees are read, and what a function sizes by is its slots',
+    // which only its own body and its callees' sizes give (a container's variable holds a
+    // level, no slot). A function a later call reaches reads these; none of these reads it, so
+    // none is read again (`Function.settled`), unless a reading of its own reaches it.
+    for (flow.functions.items) |*f| f.settled = true;
 }
 
 /// The reading a summary of one instantiation reads `decl` in, called at `node` in `file` in
@@ -4442,9 +4447,10 @@ fn sizing(c: *Context, flow: *Flow, function: Function.Id) Context.Error!void {
         }
     }
     if (!sizes.sure.eql(f.sizes) or !sizes.ranged.eql(f.ranged_sizes) or !sizes.maybe.eql(f.maybe_sizes)) {
-        flow.functions.items[@backingInt(function)].sizes = sizes.sure;
-        flow.functions.items[@backingInt(function)].ranged_sizes = sizes.ranged;
-        flow.functions.items[@backingInt(function)].maybe_sizes = sizes.maybe;
+        // Found on the round's memory, kept on the run's.
+        flow.functions.items[@backingInt(function)].sizes = try sizes.sure.kept(c.facts.gpa);
+        flow.functions.items[@backingInt(function)].ranged_sizes = try sizes.ranged.kept(c.facts.gpa);
+        flow.functions.items[@backingInt(function)].maybe_sizes = try sizes.maybe.kept(c.facts.gpa);
         flow.changed = true;
     }
 }
@@ -4836,6 +4842,69 @@ fn solveBytes(n: usize, callee_first: bool) !usize {
     var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
     _ = try get(&c, peer_input);
     return run_memory.allocated_bytes;
+}
+
+test "a summary closed for one file is not read again for the next: what a later file's sites ask is what that file reaches anew" {
+    // Each file calls std's chain, closed for the first file, and a function of std's of its
+    // own. The second file's sites read only its own function: as many bytes whether the
+    // chain holds 8 functions or 64 (every file read the whole summary again, 11-04's
+    // shakedown: 100 to 1200 MB a file).
+    try std.testing.expectEqual(try laterSitesBytes(8), try laterSitesBytes(64));
+}
+
+/// The bytes the size sites of a program's second file ask of the run's memory, its first
+/// file's read, where each file calls a chain of `chain` std functions, each with a loop, the
+/// last allocating what it is given, and one function of std's of its own.
+fn laterSitesBytes(chain: usize) !usize {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem: std.ArrayList(u8) = .empty;
+    try mem.appendSlice(a, "pub const Allocator = struct {\n    pub fn rawAlloc(self: Allocator, len: usize) void {\n        _ = self;\n        _ = len;\n    }\n};\n");
+    for (0..chain - 1) |i| {
+        try mem.print(a, "pub fn step{d}(gpa: Allocator, n: usize) void {{\n    const a0 = n +% 1;\n", .{i});
+        for (1..8) |k| try mem.print(a, "    const a{d} = a{d} +% {d};\n", .{ k, k - 1, k });
+        try mem.print(a, "    var i: usize = 0;\n    while (i < a7) : (i += 1) if (i == n) break;\n    step{d}(gpa, a7);\n}}\n", .{i + 1});
+    }
+    try mem.print(a, "pub fn step{d}(gpa: Allocator, n: usize) void {{\n    gpa.rawAlloc(n);\n}}\n", .{chain - 1});
+    for (0..2) |i| try mem.print(a, "pub fn own{d}(gpa: Allocator, n: usize) void {{\n    var i: usize = 0;\n    while (i < n) : (i += 1) gpa.rawAlloc(i);\n}}\n", .{i});
+    var programs: [2][]const u8 = undefined;
+    for (&programs, 0..) |*program, i| program.* = try a.print("const std = @import(\"std\");\npub fn f(gpa: std.mem.Allocator, n: usize) void {{\n    std.mem.step0(gpa, n);\n    std.mem.own{d}(gpa, n);\n}}\npub const handed = &f;\n", .{i});
+    var project = try Project.init(gpa, &.{
+        .{ .name = "first", .bytes = programs[0] },
+        .{ .name = "second", .bytes = programs[1] },
+        .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\n", .selected = false },
+        .{ .name = "std/mem.zig", .bytes = mem.items, .selected = false },
+    }, &.{ .{ .from = 0, .spelling = "std", .target = 2 }, .{ .from = 1, .spelling = "std", .target = 2 }, .{ .from = 2, .spelling = "mem.zig", .target = 3 } }, .{});
+    defer project.deinit();
+    // The run's memory, the bytes asked of it counted.
+    var run_memory: std.testing.FailingAllocator = .init(a, .{});
+    var facts: Facts = .{ .project = &project, .gpa = run_memory.allocator() };
+    defer facts.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").bounded_work, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+        fn check(_: *Context) Context.Error!void {}
+    };
+    const bounded_input = @import("Danger.zig").bounded_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").bounded_work, .name = "A012", .group = .family_policy, .purpose = "work" }, .check = Quiet.check, .facts = &.{bounded_input} };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    // A rule's own memory for the file, as the Runner gives it: not the run's.
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    const fact = try get(&c, bounded_input);
+    // Each file's sites: the chain's allocation and its own function's loop.
+    try std.testing.expectEqual(2, (try sinkSites(&c, fact, project.sources[0].id)).len);
+    const before = run_memory.allocated_bytes;
+    c.file = project.sources[1].id;
+    try std.testing.expectEqual(2, (try sinkSites(&c, fact, project.sources[1].id)).len);
+    return run_memory.allocated_bytes - before;
 }
 
 test "a size a generic takes through its context is read in the instantiation the program's call makes" {
