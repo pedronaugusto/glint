@@ -1623,7 +1623,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
     try flow.flow.reading_sinks.put(gpa, reading, {});
     // The rule's reading of the file is its own work, given back when it is done, as its
     // reading of a selected file is (what fills a memo keeps itself, `Context.keep`): only
-    // the sinks found are kept (`Taint.keptSink`).
+    // the sinks found are kept (`Taint.PassedSink.kept`).
     var work: std.heap.ArenaAllocator = .init(gpa);
     defer work.deinit();
     const rule_memory = c.allocator;
@@ -1705,7 +1705,7 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
     while (it.next()) |function| {
         if (flow.flow.reached_sinks.contains(.{ id, function.* })) continue;
         var held: std.ArrayList(Taint.PassedSink) = .empty;
-        for (list.items) |one| if (one.holder == function.*) try held.append(gpa, try Taint.keptSink(gpa, one));
+        for (list.items) |one| if (one.holder == function.*) try held.append(gpa, try one.kept(gpa));
         try flow.flow.reached_sinks.put(gpa, .{ id, function.* }, try held.toOwnedSlice(gpa));
     }
     return flow.flow.reached_sinks.get(.{ id, callee }).?; // unreachable: `callee` is read above

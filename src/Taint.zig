@@ -2687,22 +2687,19 @@ pub const PassedSink = struct {
     least: Level,
     message: []const u8,
     undecided: bool = false,
+
+    /// The same sink, what it holds (its Dep's slots' tails, its message) on `gpa`: kept past the
+    /// memory the reading that found it is given back with.
+    pub fn kept(sink: PassedSink, gpa: Allocator) Allocator.Error!PassedSink {
+        var out = sink;
+        out.given = try sink.given.kept(gpa);
+        out.message = try gpa.dupe(u8, sink.message);
+        return out;
+    }
 };
 
 /// A call a function of the file being read makes into a function of that file.
 pub const PassedCall = struct { node: Ast.Node.Index, decl: Facts.Decl };
-
-/// `sink` with what it holds (its Dep's slots past the first word, its message) copied into
-/// `gpa`: kept past the memory the reading that found it is given back with.
-pub fn keptSink(gpa: Allocator, sink: PassedSink) Allocator.Error!PassedSink {
-    var out = sink;
-    const info = @typeInfo(Dep).@"struct";
-    inline for (info.field_names, info.field_types) |name, kind| if (kind == Slots) {
-        @field(out.given, name).tail = try gpa.dupe(u64, @field(sink.given, name).tail);
-    };
-    out.message = try gpa.dupe(u8, sink.message);
-    return out;
-}
 
 /// Whether a rule reads `node` now: every node outside a reading of a file the run does not
 /// select; within one, a node of the functions it takes (`Flow.recording_within`).
