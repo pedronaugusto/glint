@@ -150,7 +150,8 @@ pub const Dep = struct {
     fn lengthOnly(a: Dep) Dep {
         return .{ .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare };
     }
-    fn clean(a: Dep) bool {
+    /// Whether it takes nothing: no level of its own and no parameter.
+    pub fn clean(a: Dep) bool {
         return a.level.isClean() and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.ruled.empty() and a.length.isClean() and a.lengths.empty() and a.ruled_lengths.empty() and a.counted.empty() and a.counted_numbers.empty() and a.unchecked.isClean() and a.bare.empty();
     }
     fn eql(a: Dep, b: Dep) bool {

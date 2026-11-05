@@ -4372,9 +4372,10 @@ test "A013 judges a dependency's contracts at the call that gives them input: an
     }
 }
 
-test "A018 judges a dependency's peer writes at the call that gives them an error's name, through the dependency's own call too" {
+test "A018 judges a dependency's peer writes at the call that gives them an error's name, through the dependency's own call too, and undecided at a call into one writing an error of its own" {
     // `dep.zig` is a dependency's file the run does not select (main's provenance ruling): it
     // writes what it is given to a peer; `send(stream, "busy")` gives it the program's text.
+    // `fail` writes an error of its own to a writer its caller decides: undecided at the call.
     const dep: sources.Extra = .{ .name = "dep.zig", .package = "dep", .bytes =
         \\const std = @import("std");
         \\pub fn send(stream: std.Io.net.Stream, text: []const u8) !void {
@@ -4385,6 +4386,12 @@ test "A018 judges a dependency's peer writes at the call that gives them an erro
         \\pub fn via(stream: std.Io.net.Stream, text: []const u8) !void {
         \\    try send(stream, text);
         \\}
+        \\pub fn fail(stream: std.Io.net.Stream) !void {
+        \\    var buf: [64]u8 = undefined;
+        \\    var w = stream.writer(&buf);
+        \\    const e: anyerror = error.Busy;
+        \\    try w.print("{}", .{e});
+        \\}
     };
     var project = try sources.projectAs(std.testing.allocator,
         \\const std = @import("std");
@@ -4393,12 +4400,19 @@ test "A018 judges a dependency's peer writes at the call that gives them an erro
         \\    try dep.send(stream, @errorName(err));
         \\    try dep.via(stream, @errorName(err));
         \\    try dep.send(stream, "busy");
+        \\    try dep.fail(stream);
         \\}
     , .{ .package = "pkg" }, &(std_files ++ [_]sources.Extra{dep}), &(std_imports ++ [_]sources.ExtraImport{ .{ .spelling = "dep.zig", .target = std_files.len }, .{ .from = std_files.len, .spelling = "std", .target = 0 } }));
     defer project.deinit();
     var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.diagnostics, .level = .report }} }, .{ .project_rules = &pack.rules });
     defer report.deinit();
-    for (report.coverage) |entry| try std.testing.expect(entry.rule == null);
+    // One undecided: `dep.fail(stream)`, its error the dependency's own.
+    var undecided: usize = 0;
+    for (report.coverage) |entry| if (entry.rule != null) {
+        undecided += 1;
+        try std.testing.expect(std.mem.find(u8, entry.detail, "input passed to fail") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), undecided);
     const lines = [_]u32{ 4, 5 };
     try std.testing.expectEqual(lines.len, report.diagnostics.len);
     for (report.diagnostics, lines) |found, line| {
