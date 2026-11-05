@@ -5,5 +5,8 @@
     .open = .{
         // glint-b precision: A015 leaves a type function's field read by a destructure undecided
         "destructure/glintb-tuple/twin.zig",
+        // aegis: a generic's result written as its type parameter (`fn Id(comptime T: type, comptime
+        // v: T) T`) bound with `type` makes a type, which no binding reads as one: the hole is clean
+        "compile_time/aegis-id_type_result/hole.zig",
     },
 }
