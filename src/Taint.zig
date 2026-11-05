@@ -88,12 +88,7 @@ pub const Dep = struct {
 
     /// The same value, its slots' tails on `gpa`: what a solve round keeps past the round.
     fn kept(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        var out = a;
-        inline for (@typeInfo(Dep).@"struct".field_names) |name| if (@FieldType(Dep, name) == Slots) {
-            const tail = @field(a, name).tail;
-            if (tail.len != 0) @field(out, name).tail = try gpa.dupe(u64, tail);
-        };
-        return out;
+        return .{ .level = a.level, .params = try a.params.kept(gpa), .numbers = try a.numbers.kept(gpa), .ranged = try a.ranged.kept(gpa), .maybe = try a.maybe.kept(gpa), .ruled = try a.ruled.kept(gpa), .length = a.length, .lengths = try a.lengths.kept(gpa), .ruled_lengths = try a.ruled_lengths.kept(gpa), .counted = try a.counted.kept(gpa), .counted_numbers = try a.counted_numbers.kept(gpa), .unchecked = a.unchecked, .bare = try a.bare.kept(gpa) };
     }
 
     pub fn join(a: Dep, gpa: Allocator, b: Dep) Allocator.Error!Dep {
@@ -204,6 +199,11 @@ const Slots = struct {
         const tail = try gpa.alloc(u64, @max(s.tail.len, t.tail.len));
         for (tail, 0..) |*w, i| w.* = (if (i < s.tail.len) s.tail[i] else 0) | (if (i < t.tail.len) t.tail[i] else 0);
         return .{ .word = word, .tail = tail };
+    }
+
+    /// The same set, its tail on `gpa`.
+    fn kept(s: Slots, gpa: Allocator) Allocator.Error!Slots {
+        return .{ .word = s.word, .tail = if (s.tail.len == 0) &.{} else try gpa.dupe(u64, s.tail) };
     }
 
     fn all(gpa: Allocator, sets: []const Slots) Allocator.Error!Slots {
@@ -4814,35 +4814,9 @@ fn solveBytes(n: usize, callee_first: bool) !usize {
     defer project.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    // What the run asks of its memory, counted.
-    const Counted = struct {
-        child: Allocator,
-        asked: usize = 0,
-        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.asked += len;
-            return self.child.rawAlloc(len, alignment, ra);
-        }
-        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (!self.child.rawResize(memory, alignment, new_len, ra)) return false;
-            self.asked += new_len -| memory.len;
-            return true;
-        }
-        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            const out = self.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
-            self.asked += new_len -| memory.len;
-            return out;
-        }
-        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.child.rawFree(memory, alignment, ra);
-        }
-    };
-    var counted: Counted = .{ .child = arena.allocator() };
-    const run_memory: Allocator = .{ .ptr = &counted, .vtable = &.{ .alloc = Counted.alloc, .resize = Counted.resize, .remap = Counted.remap, .free = Counted.free } };
-    var facts: Facts = .{ .project = &project, .gpa = run_memory };
+    // The run's memory, the bytes asked of it counted.
+    var run_memory: std.testing.FailingAllocator = .init(arena.allocator(), .{});
+    var facts: Facts = .{ .project = &project, .gpa = run_memory.allocator() };
     defer facts.deinit();
     // A rule's own memory for the file, as the Runner gives it: not the run's.
     var own: std.heap.ArenaAllocator = .init(gpa);
@@ -4861,7 +4835,7 @@ fn solveBytes(n: usize, callee_first: bool) !usize {
     var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
     var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
     _ = try get(&c, peer_input);
-    return counted.asked;
+    return run_memory.allocated_bytes;
 }
 
 test "a size a generic takes through its context is read in the instantiation the program's call makes" {
