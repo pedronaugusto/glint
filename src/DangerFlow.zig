@@ -26,7 +26,7 @@ pub fn input(c: *Context, rule: Rule) Context.Error!void {
     const tree = &c.project.at(c.file).file.tree;
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!site(c, node)) continue;
+        if (!readNow(c, flow, node)) continue;
         switch (tag) {
             // A position input reaches is a finding unless it is shown within the memory: a
             // table the program sized to the index's range (`[256]` by a byte) holds every
@@ -134,7 +134,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             // A sum, difference or product overflows on either operand; a quotient or a
             // remainder fails on its divisor (zero, or -1 under the minimum).
             .add, .mul, .assign_add, .assign_mul => {
-                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
+                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 // An address moved by input reaches memory, A009's; no overflow check stops it.
                 if (tag == .add and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -144,7 +144,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
             },
             // A difference underflows on what it takes away, a byte of input enough.
             .sub, .assign_sub => {
-                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
+                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 if (tag == .sub and try Range.addresses(c, c.file, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 const level = (try Taint.levelAt(c, flow, c.file, lhs)).join(try Taint.levelAt(c, flow, c.file, rhs));
@@ -152,7 +152,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 try judged(c, flow, rule, node, level, .data, "a difference with input: a peer's value that underflows it stops the program; aegis int.Checked or Ranged returns the error");
             },
             .div, .mod, .assign_div, .assign_mod => {
-                if (!site(c, node) or try Range.floating(c, c.file, node)) continue;
+                if (!readNow(c, flow, node) or try Range.floating(c, c.file, node)) continue;
                 const rhs = tree.nodeData(node).node_and_node[1];
                 if (try Proof.nonzero(c, c.file, rhs)) continue;
                 var level = try Taint.levelAt(c, flow, c.file, rhs);
@@ -166,13 +166,13 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 try judged(c, flow, rule, node, level, .data, "division by input: a peer's zero stops the program; aegis int.Checked returns the error");
             },
             .negation => {
-                if (!site(c, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
+                if (!readNow(c, flow, node) or try Range.negates(c, c.file, tree.nodeData(node).node)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, tree.nodeData(node).node), .data, "negation of a number from input: a peer's minimum value overflows it and stops the program; aegis int.Checked returns the overflow");
             },
             // A shift's amount past the operand's width (one whose width is no power of two
             // takes an amount type wider than it) stops the program.
             .shl, .shr, .assign_shl, .assign_shr => {
-                if (!site(c, node)) continue;
+                if (!readNow(c, flow, node)) continue;
                 const lhs, const rhs = tree.nodeData(node).node_and_node;
                 if (try amountFits(c, lhs)) continue;
                 try judged(c, flow, rule, node, try Taint.levelAt(c, flow, c.file, rhs), .data, "a shift by an amount from input: a peer's amount past the operand's width stops the program; aegis int.Checked returns the error");
@@ -182,7 +182,7 @@ pub fn integers(c: *Context, rule: Rule) Context.Error!void {
                 if (try arithmeticBuiltin(c, flow, rule, node, name)) continue;
                 var fallible = false;
                 for ([_][]const u8{ "@intCast", "@intFromFloat", "@enumFromInt", "@fromBackingInt" }) |cast| fallible = fallible or std.mem.eql(u8, name, cast);
-                if (!fallible or !site(c, node)) continue;
+                if (!fallible or !readNow(c, flow, node)) continue;
                 var buffer: [2]Ast.Node.Index = undefined;
                 const args = Facts.builtinArgs(tree, node, &buffer);
                 if (args.len != 1) continue;
@@ -225,7 +225,7 @@ fn arithmeticBuiltin(c: *Context, flow: Taint.Fact, rule: Rule, node: Ast.Node.I
     const operand = for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) break entry[1];
     } else return false;
-    if (!site(c, node)) return true;
+    if (!readNow(c, flow, node)) return true;
     var buffer: [2]Ast.Node.Index = undefined;
     const args = Facts.builtinArgs(tree, node, &buffer);
     if (args.len != 2) return true;
@@ -1605,18 +1605,22 @@ const Quiet = struct {
     }
 };
 
-/// The sinks `check` reads in `file`, a file the run does not select, each with what it takes
-/// from its function's parameters (`Taint.PassedSink`): `check` run over the file with its
-/// reports kept from the run, then the file's calls into its own functions composed until
-/// nothing more is added (a recursion reaches its fixpoint). Read once per rule and file; null
-/// where the reading of `file` is already under way (a call back into it from another file).
-fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void, file: Project.FileId) Context.Error!?[]const Taint.PassedSink {
-    // The sinks it keeps stay for the run: each later call into the file reads them.
+/// The sinks `check` reads in the function `callee` of `file`, a file the run does not select,
+/// and through the calls it makes, each with what it takes from `callee`'s parameters
+/// (`Taint.PassedSink`). `check` runs over the file with its reports kept from the run and only
+/// the functions it takes read (`Taint.readHere`): `callee` first, then each function of the
+/// file a function read calls, until none is new; then the calls between them composed until
+/// nothing more is added (a recursion reaches its fixpoint), with the sinks of the file's
+/// functions read before. Each function's sinks are kept once per rule; null where a reading
+/// of `file` is under way (a call back into it from another file).
+fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void, file: Project.FileId, callee: u32) Context.Error!?[]const Taint.PassedSink {
+    // The sinks it keeps stay for the run: each later call into a function read reads them.
     const gpa = c.facts.gpa;
-    const key = .{ @backingInt(rule), file };
-    if (flow.flow.reached_sinks.get(key)) |known| return known;
-    if (flow.flow.reading_sinks.contains(key)) return null;
-    try flow.flow.reading_sinks.put(gpa, key, {});
+    const id: u16 = @backingInt(rule);
+    if (flow.flow.reached_sinks.get(.{ id, callee })) |known| return known;
+    const reading = .{ id, file };
+    if (flow.flow.reading_sinks.contains(reading)) return null;
+    try flow.flow.reading_sinks.put(gpa, reading, {});
     // The rule's reading of the file is its own work, given back when it is done, as its
     // reading of a selected file is (what fills a memo keeps itself, `Context.keep`): only
     // the sinks found are kept (`Taint.keptSink`).
@@ -1627,8 +1631,13 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
     defer c.allocator = rule_memory;
     var list: std.ArrayList(Taint.PassedSink) = .empty;
     var calls: std.ArrayList(Taint.PassedCall) = .empty;
+    // The functions read, and those of a round still to read.
+    var taken: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    var fresh: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    try taken.put(c.allocator, callee, {});
+    try fresh.put(c.allocator, callee, {});
     var quiet: Quiet = .{ .inner = c.sink };
-    const saved_file, const saved_sink, const saved_recording, const saved_calls = .{ c.file, c.sink, flow.flow.recording, flow.flow.recording_calls };
+    const saved_file, const saved_sink, const saved_recording, const saved_calls, const saved_within = .{ c.file, c.sink, flow.flow.recording, flow.flow.recording_calls, flow.flow.recording_within };
     c.file = file;
     c.sink = &quiet.sink;
     flow.flow.recording = &list;
@@ -1638,19 +1647,39 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
         c.sink = saved_sink;
         flow.flow.recording = saved_recording;
         flow.flow.recording_calls = saved_calls;
+        flow.flow.recording_within = saved_within;
     }
-    try check(c, rule);
+    var seen: usize = 0;
+    while (fresh.count() > 0) {
+        flow.flow.recording_within = &fresh;
+        try check(c, rule);
+        var next: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (calls.items[seen..]) |call| {
+            const reached = Taint.functionOf(c, flow, call.decl) orelse continue;
+            if (taken.contains(reached)) continue;
+            // A function read before brings its sinks; the others are read next.
+            if (flow.flow.reached_sinks.get(.{ id, reached })) |known| {
+                try list.appendSlice(c.allocator, known);
+                try taken.put(c.allocator, reached, {});
+                continue;
+            }
+            try taken.put(c.allocator, reached, {});
+            try next.put(c.allocator, reached, {});
+        }
+        seen = calls.items.len;
+        fresh = next;
+    }
     var changed = true;
     while (changed) {
         changed = false;
         for (calls.items) |call| {
-            const callee = Taint.functionOf(c, flow, call.decl) orelse continue;
+            const reached = Taint.functionOf(c, flow, call.decl) orelse continue;
             const caller = Taint.functionKey(flow, file, call.node) orelse continue;
             const generic = c.facts.hasGenericParameter(call.decl);
             var at: usize = 0;
             while (at < list.items.len) : (at += 1) {
                 const one = list.items[at];
-                if (one.holder != callee) continue;
+                if (one.holder != reached) continue;
                 const through = try Taint.throughCall(c, flow, file, call.node, one.given);
                 const given = (try Taint.givenThrough(c, flow, file, call.node, one.given)) orelse (try Taint.givenAt(c, flow, file, call.node)) orelse Taint.Dep{};
                 const undecided = one.undecided or generic or through == null or Taint.throughUnknown(flow, through.?);
@@ -1670,11 +1699,16 @@ fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*C
             }
         }
     }
-    _ = flow.flow.reading_sinks.remove(key);
-    const kept = try gpa.alloc(Taint.PassedSink, list.items.len);
-    for (kept, list.items) |*out, one| out.* = try Taint.keptSink(gpa, one);
-    try flow.flow.reached_sinks.put(gpa, key, kept);
-    return kept;
+    _ = flow.flow.reading_sinks.remove(reading);
+    // Each function read keeps the sinks it holds; one read before keeps its own.
+    var it = taken.keyIterator();
+    while (it.next()) |function| {
+        if (flow.flow.reached_sinks.contains(.{ id, function.* })) continue;
+        var held: std.ArrayList(Taint.PassedSink) = .empty;
+        for (list.items) |one| if (one.holder == function.*) try held.append(gpa, try Taint.keptSink(gpa, one));
+        try flow.flow.reached_sinks.put(gpa, .{ id, function.* }, try held.toOwnedSlice(gpa));
+    }
+    return flow.flow.reached_sinks.get(.{ id, callee }).?; // unreachable: `callee` is read above
 }
 
 /// Each call `c.file` makes into a function of a file the run does not select (a dependency's,
@@ -1692,7 +1726,7 @@ fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (
             else => continue,
         }
         const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        if (!site(c, node)) continue;
+        if (!readNow(c, flow, node)) continue;
         const reached = (try Taint.reached(c, flow, c.file, node)) orelse continue;
         const decl = reached.decl orelse continue;
         if (reached.std or c.project.at(decl.file).input.selected or !try c.facts.program(decl.file)) continue;
@@ -1702,7 +1736,7 @@ fn judgedAtCalls(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (
         }
         const callee = Taint.functionOf(c, flow, decl) orelse continue;
         const generic = c.facts.hasGenericParameter(decl);
-        const sinks = (try passedSinks(c, flow, rule, check, decl.file)) orelse {
+        const sinks = (try passedSinks(c, flow, rule, check, decl.file, callee)) orelse {
             try passedAt(c, flow, rule, node, decl, .{ .at = .{ .file = decl.file, .node = node }, .holder = callee, .given = try Taint.everyParameter(c, decl), .least = .data, .message = "", .undecided = true });
             continue;
         };
@@ -2246,6 +2280,12 @@ fn unsignedName(name: []const u8) bool {
 fn site(c: *Context, node: Ast.Node.Index) bool {
     const tree = &c.project.at(c.file).file.tree;
     return !c.inTest(tree.nodeMainToken(node)) and Danger.atRuntime(c, node);
+}
+
+/// A site the rule reads now: `site`, in a function a reading of a file the run does not select
+/// takes (`Taint.readHere`).
+fn readNow(c: *Context, flow: Taint.Fact, node: Ast.Node.Index) bool {
+    return Taint.readHere(flow, c.file, node) and site(c, node);
 }
 
 fn comparison(tag: Ast.Node.Tag) bool {

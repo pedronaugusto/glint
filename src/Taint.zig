@@ -454,12 +454,12 @@ pub const Flow = struct {
     /// that grouping read: a count a test holds to the files, not the functions.
     bodies: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index)) = .empty,
     walked: usize = 0,
-    /// Of the summary every instantiation reads, the summaries of one instantiation each
-    /// (`instanceSizes`), by the reading of the program's call that roots it.
-    /// The sinks a rule reads in each file the run does not select (a dependency's), by the rule
-    /// and the file, read once: what each takes from its function's parameters, judged at the
-    /// calls that reach it (`PassedSink`, designs/glint-provenance.md part 1).
-    reached_sinks: std.AutoHashMapUnmanaged(struct { u16, Project.FileId }, []const PassedSink) = .empty,
+    /// The sinks a rule reads in each function of a file the run does not select (a
+    /// dependency's), by the rule and the function (`functionKey`), read once: what each takes
+    /// from its function's parameters, judged at the calls that reach it (`PassedSink`,
+    /// designs/glint-provenance.md part 1). Only the functions a selected call reaches are read,
+    /// with the functions of their file they call.
+    reached_sinks: std.AutoHashMapUnmanaged(struct { u16, u32 }, []const PassedSink) = .empty,
     /// The files a rule's reading of them is under way for: a call back into one meets no list
     /// yet, which is undecided.
     reading_sinks: std.AutoHashMapUnmanaged(struct { u16, Project.FileId }, void) = .empty,
@@ -469,6 +469,11 @@ pub const Flow = struct {
     /// The calls into the file being read that its own functions make, composed once the
     /// file's own sinks are in (`PassedCall`).
     recording_calls: ?*std.ArrayList(PassedCall) = null,
+    /// The functions of the file being read whose sinks the reading takes (`readHere`): the
+    /// others are read only when a call reaches them.
+    recording_within: ?*const std.AutoHashMapUnmanaged(u32, void) = null,
+    /// Of the summary every instantiation reads, the summaries of one instantiation each
+    /// (`instanceSizes`), by the reading of the program's call that roots it.
     instances: std.ArrayList(struct { env: *const Facts.Env, flow: *Flow }) = .empty,
     /// For a summary of one instantiation, every instantiation's (`instanceSizes`).
     shared: ?*Flow = null,
@@ -2697,6 +2702,14 @@ pub fn keptSink(gpa: Allocator, sink: PassedSink) Allocator.Error!PassedSink {
     };
     out.message = try gpa.dupe(u8, sink.message);
     return out;
+}
+
+/// Whether a rule reads `node` now: every node outside a reading of a file the run does not
+/// select; within one, a node of the functions it takes (`Flow.recording_within`).
+pub fn readHere(fact: Fact, file: Project.FileId, node: Ast.Node.Index) bool {
+    const within = fact.flow.recording_within orelse return true;
+    const function = owner(fact.flow, file, node) orelse return false;
+    return within.contains(@backingInt(function));
 }
 
 /// The function holding `node`, as an id the fact keeps for the run; null outside them.
