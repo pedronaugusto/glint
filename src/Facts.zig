@@ -7193,7 +7193,16 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
     const tree = &self.project.at(decl.file).file.tree;
     if (declaration_record.kind == .function) return .{ .function = decl };
     if (declaration_record.kind == .parameter) {
-        if (try self.settledByCalls(decl)) |position| return self.boundByCallers(decl, position);
+        if (try self.settledByCalls(decl)) |position| {
+            const bound = try self.boundByCallers(decl, position);
+            // A parameter written with a type that does not resolve, of a function no call
+            // settles (one handed on as a value: `&struct { fn f(a: params[1].?) ... }.f`, typed
+            // by a function type an enclosing generic reflects), is what its written type makes
+            // where it is written, in every instantiation of what encloses it. Only `anytype`
+            // has no written type to read.
+            const type_node = self.parameterTypeNode(decl) orelse return bound;
+            if (bound != .unknown or try self.writesType(decl.file, type_node) == .type) return bound;
+        }
         const value = try self.resolve(decl.file, declaration_record.node);
         if (value == .primitive and std.mem.eql(u8, value.primitive, "type")) return .{ .unknown = .comptime_dependent };
         const typed = try self.instance(value);
