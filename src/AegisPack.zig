@@ -3284,7 +3284,7 @@ const Flow = struct {
                 if (site.reach != .exact) return false;
                 switch (site.kind) {
                     .read, .init => {},
-                    .update, .covered, .address => return false,
+                    .update, .covered, .address, .open => return false,
                     .set => {
                         const at = f.model.parentOf(site.node) orelse return false;
                         for (branches) |side| {

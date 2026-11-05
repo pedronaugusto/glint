@@ -917,6 +917,8 @@ fn owns(c: *Context, rule: Rule, resources: []const ?Facts.Container, holder: Fa
         const in_file = [_]Project.FileId{file};
         var found_sites = Facts.accesses.writes(c.facts, .{ .field = .{ .file = file, .index = @fromBackingInt(@intCast(at)) } }, &in_file);
         while (try found_sites.next()) |site| {
+            // A program the unit is read for may fill it with anything.
+            if (site.kind == .open) doubt = true;
             if (!site.part or site.kind != .set) continue;
             const value = site.value orelse {
                 doubt = true;
@@ -3455,8 +3457,10 @@ fn stateWrites(c: *Context, field: Facts.Decl, hold: StateHold, writes: *std.Arr
             // their values were, and code given a pointer to const writes none; other code over
             // the holder (`extern`) writes bytes.
             .covered => if (site.reach == .holder and try coveredRead(c, site.file, site.node, site.target)) continue else null,
+            // A program the unit is read for may write any state, by code not seen here.
+            .open => null,
         };
-        var unseen = false;
+        var unseen = site.kind == .open;
         // A view that reads the holder as other bytes, handed to a function the program holds,
         // is written there through a parameter of another type: here, not where it is made.
         const as_bytes = if (site.target) |given| try Facts.accesses.reinterprets(c.facts, site.file, given) else false;

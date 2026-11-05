@@ -38,6 +38,7 @@
 const std = @import("std");
 const Context = @import("RuleContext.zig");
 const Facts = @import("Facts.zig");
+const Records = @import("Summary.zig");
 const Model = @import("Model.zig");
 const Range = @import("Range.zig");
 const Project = @import("Project.zig");
@@ -186,6 +187,11 @@ const Slots = struct {
 
     fn empty(s: Slots) bool {
         return s.word == 0 and within(s.tail, &.{});
+    }
+
+    /// Whether every slot of `s` is in `t`.
+    fn subset(s: Slots, t: Slots) bool {
+        return (s.word & ~t.word) == 0 and within(s.tail, t.tail);
     }
 
     fn eql(s: Slots, t: Slots) bool {
@@ -362,6 +368,10 @@ const Function = struct {
     /// returns and writes are by parameter, the same whoever calls it, so it is not read again
     /// here unless a reading of its own reaches it.
     settled: bool = false,
+    /// Of std's open-world summary (`OpenUnit`): first read in a closing whose budget ran out, so
+    /// what it sizes by is not known (designs/glint-summaries.md, exhaustion): its record is
+    /// unknown, and read as undecided.
+    exhausted: bool = false,
 
     /// The position of the parameter `d` declares.
     fn position(f: Function, d: Model.Declaration.Id) ?usize {
@@ -3213,7 +3223,8 @@ const Walk = struct {
                     if (try w.from(function, value, depth + 1)) |found| return found;
                 },
                 .address, .covered => if (try w.sourceArgument(site.file, site.node)) |call| if (w.read(site.file, call)) |found| return found,
-                .read => {},
+                // No site of the unit's shows where it came from.
+                .read, .open => {},
             }
         }
         return null;
@@ -4392,9 +4403,249 @@ fn sizesOf(c: *Context, sized: *Flow, decl: ?Facts.Decl) Context.Error!Summary {
         .unknown => return .unknown,
     }
     const node = fnDecl(c, d) orelse return .unknown;
+    // std's, read as its record answers for it (`Facts.read_records`).
+    if (c.facts.read_records and sized.shared == null) if (try openSizes(c, d)) |summary| return summary;
     const id = sized.by_node.get(.{ .file = d.file, .node = node }) orelse return .unknown;
     const f = sized.functions.items[@backingInt(id)];
     return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed } };
+}
+
+/// What std's open-world record of `decl` sizes work by (`OpenUnit`), read and closed there the
+/// first time it is asked; null for a function outside std.
+fn openSizes(c: *Context, decl: Facts.Decl) Context.Error!?Summary {
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const unit = try openUnit(c);
+    const file = unit.in_unit[@backingInt(decl.file)] orelse return null;
+    const in_unit: Facts.Decl = .{ .file = file, .index = decl.index };
+    const unit_flow = try openFlow(unit);
+    const node = fnDecl(&unit.context, in_unit) orelse return .unknown;
+    if (unit_flow.by_node.get(.{ .file = file, .node = node }) == null) {
+        var next: std.ArrayList(Queued) = .empty;
+        const first = unit_flow.functions.items.len;
+        try reach(&unit.context, unit_flow, in_unit, null, &next);
+        try closeOpen(c, unit, unit_flow, &next, first);
+    }
+    const id = unit_flow.by_node.get(.{ .file = file, .node = node }) orelse return .unknown;
+    const f = unit_flow.functions.items[@backingInt(id)];
+    if (f.exhausted) return .unknown;
+    return .{ .read = .{ .sure = f.sizes, .ranged = f.ranged_sizes, .maybe = f.maybe_sizes, .fixed = f.fixed } };
+}
+
+/// Closes what `next` holds in std's open-world summary on a budget of its own, a file's as the
+/// run gives each file: an answer does not hang on what was read before it. Where the budget
+/// runs out, each function first read here (from `first` on) is `exhausted`.
+fn closeOpen(c: *Context, unit: *OpenUnit, unit_flow: *Flow, next: *std.ArrayList(Queued), first: usize) Context.Error!void {
+    if (next.items.len == 0) return;
+    unit.facts.remaining = c.config.fact_budget;
+    try closeSummary(&unit.context, unit_flow, next);
+    if (unit.facts.remaining != 0) return;
+    // What std's Facts built short of the budget (an index, a memo) would answer a later
+    // closing as if complete, as the Runner's `Facts.forget` knows of a file's: later closings
+    // read on a Facts of their own. This one is left whole, for what the summary already holds
+    // (its program, its readings) points into it.
+    const fresh = try c.facts.gpa.create(Facts);
+    fresh.* = .{ .project = &unit.project, .gpa = c.facts.gpa, .open_world = true };
+    unit.facts = fresh;
+    unit.context.facts = fresh;
+    // Each may size work by any of its parameters' values and lengths: what a function read
+    // later and calling one takes from it is undecided wherever it reaches.
+    for (unit_flow.functions.items[first..]) |*f| {
+        f.exhausted = true;
+        for (0..f.params.len) |i| {
+            f.maybe_sizes = try f.maybe_sizes.with(c.facts.gpa, valueSlot(i));
+            f.maybe_sizes = try f.maybe_sizes.with(c.facts.gpa, lengthSlot(i));
+        }
+    }
+}
+
+/// The open unit's summary of every instantiation, made the first time it is asked.
+fn openFlow(unit: *OpenUnit) Context.Error!*Flow {
+    if (unit.flow) |made| return made;
+    const made = try summaryFlow(&unit.context, try Program.get(&unit.context));
+    unit.flow = made;
+    return made;
+}
+
+/// A closed size summary's record (designs/glint-summaries.md step 4): each function it holds,
+/// by its `fn_decl`, with the slots whose value or length it sizes work by, surely, kept to a
+/// range, maybe, and its comptime ones. A function's sizes are by parameter, the same whoever
+/// calls it (`closeSummary`), so the record is the summary's whole answer for it.
+const SizeRecord = struct { at: Facts.Key, exhausted: bool = false, sure: Slots, ranged: Slots, maybe: Slots, fixed: Slots };
+
+fn writeSizes(w: *Records.Writer, flow: *const Flow) Records.WriteError!void {
+    try w.number(@intCast(flow.functions.items.len));
+    for (flow.functions.items) |f| {
+        try w.key(.{ .file = f.file, .node = f.node });
+        try w.number(@intFromBool(f.exhausted));
+        for ([_]Slots{ f.sizes, f.ranged_sizes, f.maybe_sizes, f.fixed }) |set| {
+            try w.wide(set.word);
+            try w.number(@intCast(set.tail.len));
+            for (set.tail) |word| try w.wide(word);
+        }
+    }
+}
+
+fn readSizes(r: *Records.Reader, gpa: Allocator) Records.ReadError![]const SizeRecord {
+    const out = try gpa.alloc(SizeRecord, try r.count());
+    for (out) |*one| {
+        const at = try r.key();
+        const exhausted = switch (try r.number()) {
+            0 => false,
+            1 => true,
+            else => return error.Malformed,
+        };
+        var sets: [4]Slots = undefined;
+        for (&sets) |*set| {
+            const word = try r.wide();
+            const tail = try gpa.alloc(u64, try r.count());
+            for (tail) |*t| t.* = try r.wide();
+            set.* = .{ .word = word, .tail = tail };
+        }
+        one.* = .{ .at = at, .exhausted = exhausted, .sure = sets[0], .ranged = sets[1], .maybe = sets[2], .fixed = sets[3] };
+    }
+    return out;
+}
+
+/// Summaries' cross-check (`Facts.check_records`) of a closed size summary: written and read
+/// back, each function's record is what the flow holds for it.
+fn checkSizes(c: *Context, flow: *const Flow) Context.Error!void {
+    var w = try Records.checkWriter(c.facts);
+    defer w.deinit();
+    writeSizes(&w, flow) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the run is named
+    };
+    var r = Records.Reader.init(c.facts, w.names, w.bytes.items) catch |err| std.debug.panic("summary cross-check: a size summary does not read back: {t}", .{err});
+    defer r.deinit();
+    const back = readSizes(&r, c.facts.gpa) catch |err| std.debug.panic("summary cross-check: a size summary does not read back: {t}", .{err});
+    if (!r.done() or back.len != flow.functions.items.len) std.debug.panic("summary cross-check: a size summary reads back other functions", .{});
+    for (back) |one| {
+        const id = flow.by_node.get(one.at) orelse std.debug.panic("summary cross-check: a size summary reads back a function it does not hold", .{});
+        const f = flow.functions.items[@backingInt(id)];
+        if (!one.sure.eql(f.sizes) or !one.ranged.eql(f.ranged_sizes) or !one.maybe.eql(f.maybe_sizes) or !one.fixed.eql(f.fixed)) std.debug.panic("summary cross-check: a size summary reads back other sizes", .{});
+    }
+    // The summary of every instantiation is what a unit's record answers for. One closed past
+    // the file's budget is no measure of it: what came back unknown(budget) sizes as it may, so
+    // std's record, closed on a budget of its own, may decide further than it; the file is
+    // exhausted, and the Runner's `Facts.forget` drops the summary before another file reads it.
+    if (flow.shared == null and c.facts.remaining != 0) try checkOpen(c, flow);
+}
+
+/// std read alone, in the open world (`Facts.open_world`): what a unit's size record holds, for
+/// every program that may import it (designs/glint-summaries.md, step 4). Its files are the
+/// run's std files, read from the run's store, under the names they have in the run.
+const OpenUnit = struct {
+    built: bool = false,
+    project: Project = undefined,
+    facts: *Facts = undefined,
+    context: Context = undefined,
+    /// Each file of the run's in the unit, where it is std's.
+    in_unit: []?Project.FileId = &.{},
+    /// Per unit file, each function by its `fn_decl`.
+    functions: std.AutoHashMapUnmanaged(Facts.Key, Facts.Decl) = .empty,
+    flow: ?*Flow = null,
+    /// The names each run writes and reads the unit's files by: the same names in both.
+    unit_names: Records.Names = undefined,
+    run_names: Records.Names = undefined,
+    /// The run's functions whose live sizes a record was checked against.
+    checked: std.AutoHashMapUnmanaged(Facts.Key, void) = .empty,
+};
+
+fn openUnit(c: *Context) Context.Error!*OpenUnit {
+    const unit = try c.facts.memo(OpenUnit);
+    if (unit.built) return unit;
+    unit.built = true;
+    const gpa = c.facts.gpa;
+    var inputs: std.ArrayList(Project.Input) = .empty;
+    unit.in_unit = try gpa.alloc(?Project.FileId, c.project.sources.len);
+    @memset(unit.in_unit, null);
+    for (c.project.sources) |*each| {
+        if (!try c.facts.standard(each.id)) continue;
+        unit.in_unit[@backingInt(each.id)] = @fromBackingInt(@intCast(inputs.items.len));
+        var input = each.input;
+        input.selected = false;
+        try inputs.append(gpa, input);
+    }
+    var imports: std.ArrayList(Project.Import) = .empty;
+    var root: ?Project.FileId = null;
+    var named = false;
+    for (c.project.imports) |edge| {
+        const target = unit.in_unit[@backingInt(edge.target)] orelse continue;
+        const by_name = std.mem.eql(u8, edge.spelling, "std");
+        if (by_name) root = target;
+        const from = unit.in_unit[@backingInt(edge.from)] orelse continue;
+        named = named or by_name;
+        try imports.append(gpa, .{ .from = @backingInt(from), .spelling = edge.spelling, .target = @backingInt(target), .compilation = edge.in });
+    }
+    // std's module may import itself by its name: where no file of std does, its root does, so
+    // std alone knows its files (`Facts.outside`) as a program importing it does.
+    if (!named) if (root) |file| try imports.append(gpa, .{ .from = @backingInt(file), .spelling = "std", .target = @backingInt(file) });
+    unit.project = Project.init(gpa, inputs.items, imports.items, .{ .store = c.project.store }) catch |err| std.debug.panic("summary cross-check: std alone does not make a project: {t}", .{err});
+    unit.facts = try gpa.create(Facts);
+    unit.facts.* = .{ .project = &unit.project, .gpa = gpa, .open_world = true };
+    unit.context = c.*;
+    unit.context.project = &unit.project;
+    unit.context.facts = unit.facts;
+    unit.context.allocator = gpa;
+    if (unit.project.sources.len > 0) unit.context.file = unit.project.sources[0].id;
+    unit.unit_names = try Records.Names.byInput(gpa, &unit.project);
+    unit.run_names = try Records.Names.byInput(gpa, c.project);
+    for (unit.project.sources) |*each| for (each.model.declarations, 0..) |record, d| {
+        if (record.kind != .function) continue;
+        const decl: Facts.Decl = .{ .file = each.id, .index = @fromBackingInt(@intCast(d)) };
+        const node = fnDecl(&unit.context, decl) orelse continue;
+        try unit.functions.put(gpa, .{ .file = each.id, .node = node }, decl);
+    };
+    return unit;
+}
+
+/// Summaries' cross-check of the open world: each std function of the run's closed summary of
+/// every instantiation is read again in std alone (`OpenUnit`), and its record, read back into
+/// the run, must be decided no further than the live summary for any slot. Where the live
+/// summary sizes work by a slot, surely or as it may, the record does too, surely or as it may;
+/// where only kept to a range, the record does at least that; and a slot the record holds
+/// comptime is comptime here. A record decided further would clear a site in this program, so
+/// it stops the run.
+fn checkOpen(c: *Context, flow: *const Flow) Context.Error!void {
+    const unit = try openUnit(c);
+    var next: std.ArrayList(Queued) = .empty;
+    const unit_flow = try openFlow(unit);
+    const first = unit_flow.functions.items.len;
+    for (flow.functions.items) |f| {
+        if (unit.checked.contains(.{ .file = f.file, .node = f.node })) continue;
+        const file = unit.in_unit[@backingInt(f.file)] orelse continue;
+        const decl = unit.functions.get(.{ .file = file, .node = f.node }) orelse continue;
+        try reach(&unit.context, unit_flow, decl, null, &next);
+    }
+    try closeOpen(c, unit, unit_flow, &next, first);
+    var w = Records.Writer.init(c.facts.gpa, unit.facts, &unit.unit_names) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the unit is named
+    };
+    defer w.deinit();
+    writeSizes(&w, unit_flow) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unnamed => unreachable, // unreachable: every file of the unit is named
+    };
+    var r = Records.Reader.init(c.facts, &unit.run_names, w.bytes.items) catch |err| std.debug.panic("summary cross-check: std's size records do not read into the run: {t}", .{err});
+    defer r.deinit();
+    const back = readSizes(&r, c.facts.gpa) catch |err| std.debug.panic("summary cross-check: std's size records do not read into the run: {t}", .{err});
+    for (back) |one| {
+        const id = flow.by_node.get(one.at) orelse continue;
+        if ((try unit.checked.getOrPut(c.facts.gpa, one.at)).found_existing) continue;
+        // An exhausted record answers unknown: undecided, whatever the run finds.
+        if (one.exhausted) continue;
+        const f = flow.functions.items[@backingInt(id)];
+        const sized_by = try one.sure.unite(c.facts.gpa, one.maybe);
+        const at_most = try sized_by.unite(c.facts.gpa, one.ranged);
+        if (!f.sizes.subset(sized_by) or !f.maybe_sizes.subset(sized_by) or !f.ranged_sizes.subset(at_most) or !one.fixed.subset(f.fixed)) {
+            const tree = &c.project.at(f.file).file.tree;
+            const location = tree.tokenLocation(0, tree.firstToken(f.node));
+            std.debug.panic("summary cross-check: std's open-world size record of {s}:{d} is decided further than the run's summary (sure, ranged, maybe, fixed: record {x} {x} {x} {x}, run {x} {x} {x} {x})", .{ c.project.at(f.file).input.name, location.line + 1, one.sure.word, one.ranged.word, one.maybe.word, one.fixed.word, f.sizes.word, f.ranged_sizes.word, f.maybe_sizes.word, f.fixed.word });
+        }
+    }
 }
 
 /// What a function outside the program sizes by, by slot (`sizesOf`).
@@ -4510,6 +4761,7 @@ fn closeSummary(c: *Context, flow: *Flow, next: *std.ArrayList(Queued)) Context.
     // level, no slot). A function a later call reaches reads these; none of these reads it, so
     // none is read again (`Function.settled`), unless a reading of its own reaches it.
     for (flow.functions.items) |*f| f.settled = true;
+    if (c.facts.check_records != null) try checkSizes(c, flow);
 }
 
 /// The reading a summary of one instantiation reads `decl` in, called at `node` in `file` in
@@ -5079,6 +5331,192 @@ fn solveAsks(program: []const u8) !usize {
     var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
     _ = try get(&c, peer_input);
     return run_memory.allocated_bytes;
+}
+
+/// How many functions of the closed size summary `program` reaches in std's `mem.zig` size work;
+/// with `cross_check`, under summaries' cross-check, how many of std's open-world records size work
+/// only as they may (`checkOpen`); with `records`, std's summaries read from those records
+/// (`Facts.read_records`); and how many of the program's size sites are undecided.
+fn summarySizing(gpa: Allocator, program: []const u8, mem: []const u8, how: struct { cross_check: bool = false, records: bool = false, unit_budget: ?usize = null, file_budget: ?usize = null }) !struct { live: usize, open_maybe: usize, undecided: usize, exhausted: usize = 0, exhausted_short: usize = 0, checked: bool = false } {
+    var project = try Project.init(gpa, &.{
+        .{ .name = "root", .bytes = program },
+        .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\n", .selected = false },
+        .{ .name = "std/mem.zig", .bytes = mem, .selected = false },
+    }, &.{ .{ .from = 0, .spelling = "std", .target = 1 }, .{ .from = 1, .spelling = "mem.zig", .target = 2 } }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .check_records = if (how.cross_check) &Records.check else null, .read_records = how.records };
+    defer facts.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").bounded_work, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+        fn check(_: *Context) Context.Error!void {}
+    };
+    const bounded_input = @import("Danger.zig").bounded_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").bounded_work, .name = "A012", .group = .family_policy, .purpose = "work" }, .check = Quiet.check, .facts = &.{bounded_input} };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    if (how.unit_budget) |budget| c.config.fact_budget = budget;
+    if (how.file_budget) |budget| facts.remaining = budget;
+    const fact = try get(&c, bounded_input);
+    var undecided: usize = 0;
+    for (try sinkSites(&c, fact, project.sources[0].id)) |site| if (!site.decided) {
+        undecided += 1;
+    };
+    const sized = fact.flow.sized orelse return .{ .live = 0, .open_maybe = 0, .undecided = undecided };
+    var live: usize = 0;
+    for (sized.functions.items) |f| if (!f.sizes.empty() or !f.maybe_sizes.empty()) {
+        live += 1;
+    };
+    var open_maybe: usize = 0;
+    // No unit is made where the file's budget ran out before its summary was checked.
+    if (how.cross_check) if ((try facts.memo(OpenUnit)).flow) |unit_flow| for (unit_flow.functions.items) |f| if (f.sizes.empty() and !f.maybe_sizes.empty()) {
+        open_maybe += 1;
+    };
+    // Of std's open-world summary, the functions closed past their budget, and those of them
+    // that do not size as they may by every parameter's value and length.
+    var exhausted: usize = 0;
+    var exhausted_short: usize = 0;
+    if (how.records or how.cross_check) if ((try facts.memo(OpenUnit)).flow) |unit_flow| for (unit_flow.functions.items) |f| if (f.exhausted) {
+        exhausted += 1;
+        for (0..f.params.len) |i| if (!f.maybe_sizes.has(valueSlot(i)) or !f.maybe_sizes.has(lengthSlot(i))) {
+            exhausted_short += 1;
+            break;
+        };
+    };
+    const checked = (try facts.memo(OpenUnit)).flow != null;
+    return .{ .live = live, .open_maybe = open_maybe, .undecided = undecided, .exhausted = exhausted, .exhausted_short = exhausted_short, .checked = checked };
+}
+
+test "a std function's closed sizes in a lint are the program's: what it calls through a std field is what the program stores there, so a record is built in the open world" {
+    const grows = try summarySizing(std.testing.allocator, grow_stored, mem_through_field, .{});
+    const stays = try summarySizing(std.testing.allocator, none_stored, mem_through_field, .{});
+    // `call` and `grow` with `grow` stored; none with `none`.
+    try std.testing.expectEqual(2, grows.live);
+    try std.testing.expectEqual(0, stays.live);
+}
+
+const mem_through_field = "pub const VT = struct { f: *const fn (usize) void };\npub fn call(vt: *const VT, n: usize) void {\n    vt.f(n);\n}\npub fn grow(n: usize) void {\n    var i: usize = 0;\n    while (i < n) : (i += 1) {}\n}\npub fn none(n: usize) void {\n    _ = n;\n}\n";
+const grow_stored = "const std = @import(\"std\");\nconst vt: std.mem.VT = .{ .f = std.mem.grow };\npub fn f(n: usize) void {\n    std.mem.call(&vt, n);\n}\npub const handed = &f;\n";
+const none_stored = "const std = @import(\"std\");\nconst vt: std.mem.VT = .{ .f = std.mem.none };\npub fn f(n: usize) void {\n    std.mem.call(&vt, n);\n}\npub const handed = &f;\n";
+
+test "a std size record is read in the open world: what std calls through a field any program may store into sizes as it may, and covers each program's summary" {
+    // Under the cross-check, each program's live summary is covered by std's records
+    // (`checkOpen`, which stops the run otherwise); in both, `call` sizes by `n` only as it
+    // may, whatever the program stores.
+    const grows = try summarySizing(std.testing.allocator, grow_stored, mem_through_field, .{ .cross_check = true });
+    const stays = try summarySizing(std.testing.allocator, none_stored, mem_through_field, .{ .cross_check = true });
+    try std.testing.expectEqual(2, grows.live);
+    try std.testing.expectEqual(0, stays.live);
+    try std.testing.expectEqual(1, grows.open_maybe);
+    try std.testing.expectEqual(1, stays.open_maybe);
+}
+
+test "std's size summaries read from its open-world records leave undecided what the program's stores decide live" {
+    // Live, the call into std's `call` sizes by `n` (`grow` stored): a site, decided. Read from
+    // std's record, `call` sizes by `n` only as it may: the site is undecided.
+    const live = try summarySizing(std.testing.allocator, grow_stored, mem_through_field, .{});
+    const read = try summarySizing(std.testing.allocator, grow_stored, mem_through_field, .{ .records = true });
+    try std.testing.expectEqual(0, live.undecided);
+    try std.testing.expectEqual(1, read.undecided);
+}
+
+test "a std size record covers a call std chooses by a comptime parameter (std.unicode's calcUtf16LeLen): what the chosen decoder sizes by, the value's and its length" {
+    // `lenOf` hands `implOf` a comptime kind, which picks the decoder by a `switch`; each
+    // decoder loops over its slice's length. Under the cross-check (`checkOpen`, which stops
+    // the run where the record is decided further), std's record answers as the run does.
+    const mem = "pub const Kind = enum { a, b };\nfn decodeA(s: []const u8) usize {\n    var j: usize = 0;\n    while (j < s.len) : (j += 1) {}\n    return j;\n}\nfn decodeB(s: []const u8) usize {\n    return s.len;\n}\npub fn implOf(s: []const u8, comptime kind: Kind) usize {\n    const decode = switch (kind) {\n        .a => decodeA,\n        .b => decodeB,\n    };\n    var i: usize = 0;\n    var n: usize = 0;\n    while (i < s.len) : (i += 1) n += decode(s[i..]);\n    return n;\n}\npub fn lenOf(s: []const u8) usize {\n    return implOf(s, .a);\n}\n";
+    const program = "const std = @import(\"std\");\npub fn f(s: []const u8) usize {\n    return std.mem.lenOf(s);\n}\npub const handed = &f;\n";
+    const live = try summarySizing(std.testing.allocator, program, mem, .{ .cross_check = true });
+    const read = try summarySizing(std.testing.allocator, program, mem, .{ .records = true });
+    try std.testing.expectEqual(live.undecided, read.undecided);
+}
+
+test "a std size record whose closing ran out of budget is unknown: the site it answers is undecided, never decided by a short reading" {
+    const direct = "const std = @import(\"std\");\npub fn f(n: usize) void {\n    std.mem.grow(n);\n}\npub const handed = &f;\n";
+    const live = try summarySizing(std.testing.allocator, direct, mem_through_field, .{});
+    const read = try summarySizing(std.testing.allocator, direct, mem_through_field, .{ .records = true });
+    const short = try summarySizing(std.testing.allocator, direct, mem_through_field, .{ .records = true, .unit_budget = 1 });
+    try std.testing.expectEqual(0, live.undecided);
+    try std.testing.expectEqual(0, read.undecided);
+    // Unknown, `grow` may size by `n`'s value and its length: two sites, each undecided.
+    try std.testing.expectEqual(2, short.undecided);
+    // Each function the short closing read is exhausted, and each sizes as it may by every
+    // slot: never a smaller answer than an unknown one.
+    try std.testing.expect(short.exhausted > 0);
+    try std.testing.expectEqual(0, short.exhausted_short);
+    try std.testing.expectEqual(0, read.exhausted);
+}
+
+test "a live size summary closed past the file's budget is not held to std's records: what came back unknown sizes as it may, never a soundness case" {
+    // std's record, closed on a budget of its own, keeps `clamped`'s loop to a range of `n`;
+    // read live on a budget that runs out, it sizes by `n` as it may. The cross-check
+    // (`checkOpen`) stopped the run there (bay's std/hash/crc.zig:991, conduit's
+    // std/Io/Writer.zig:1609 under the full pack); the file is exhausted instead.
+    const mem = "pub fn clamped(n: usize) void {\n    const m = @min(n, 64);\n    var i: usize = 0;\n    while (i < m) : (i += 1) {}\n}\n";
+    const program = "const std = @import(\"std\");\npub fn f(n: usize) void {\n    std.mem.clamped(n);\n}\npub const handed = &f;\n";
+    const full = try summarySizing(std.testing.allocator, program, mem, .{ .cross_check = true });
+    // On 5 facts, the live closing ends with the budget spent.
+    const short = try summarySizing(std.testing.allocator, program, mem, .{ .cross_check = true, .file_budget = 5 });
+    try std.testing.expectEqual(0, full.undecided);
+    try std.testing.expect(short.undecided >= full.undecided);
+    // Checked against std's records on the whole budget; not past it.
+    try std.testing.expect(full.checked);
+    try std.testing.expect(!short.checked);
+}
+
+test "a closed size summary's record reads back as the summary holds it: each function's slots, by its fn_decl" {
+    const gpa = std.testing.allocator;
+    var project = try Project.init(gpa, &.{
+        .{ .name = "root", .bytes = "const std = @import(\"std\");\npub fn f(gpa: std.mem.Allocator, n: usize, m: usize) void {\n    std.mem.grow(gpa, n, m);\n}\npub const handed = &f;\n" },
+        .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\n", .selected = false },
+        .{ .name = "std/mem.zig", .bytes = "pub const Allocator = struct {\n    pub fn rawAlloc(self: Allocator, len: usize) void {\n        _ = self;\n        _ = len;\n    }\n};\npub fn grow(gpa: Allocator, n: usize, m: usize) void {\n    var i: usize = 0;\n    while (i < m) : (i += 1) {}\n    twice(gpa, n);\n}\nfn twice(gpa: Allocator, k: usize) void {\n    gpa.rawAlloc(k);\n    gpa.rawAlloc(k);\n}\n", .selected = false },
+    }, &.{ .{ .from = 0, .spelling = "std", .target = 1 }, .{ .from = 1, .spelling = "mem.zig", .target = 2 } }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator(), .check_records = &Records.check };
+    defer facts.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").bounded_work, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+        fn check(_: *Context) Context.Error!void {}
+    };
+    const bounded_input = @import("Danger.zig").bounded_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").bounded_work, .name = "A012", .group = .family_policy, .purpose = "work" }, .check = Quiet.check, .facts = &.{bounded_input} };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    var own: std.heap.ArenaAllocator = .init(gpa);
+    defer own.deinit();
+    var c: Context = .{ .allocator = own.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    const fact = try get(&c, bounded_input);
+    // Closing the summary for the sites runs the cross-check (`checkSizes`).
+    _ = try sinkSites(&c, fact, project.sources[0].id);
+    const sized = fact.flow.sized.?;
+    var w = try Records.checkWriter(&facts);
+    defer w.deinit();
+    try writeSizes(&w, sized);
+    var r = try Records.Reader.init(&facts, w.names, w.bytes.items);
+    defer r.deinit();
+    const back = try readSizes(&r, arena.allocator());
+    try std.testing.expect(r.done());
+    try std.testing.expectEqual(sized.functions.items.len, back.len);
+    // `grow` sizes by `n` (through `twice`) and its loop by `m`; `twice` by `k`.
+    var sized_by: usize = 0;
+    for (back) |one| if (!one.sure.empty() or !one.maybe.empty()) {
+        sized_by += 1;
+    };
+    try std.testing.expectEqual(2, sized_by);
 }
 
 test "a summary closed for one file is not read again for the next: what a later file's sites ask is what that file reaches anew" {

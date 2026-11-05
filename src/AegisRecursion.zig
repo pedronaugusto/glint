@@ -342,7 +342,7 @@ fn monotone(self: *Walk, decl: Facts.Decl, grows: bool) Context.Error!bool {
             .holder => if (!(try ownLocal(c, site))) return false,
             .named, .unresolved => return false,
         },
-        .covered, .address => return false,
+        .covered, .address, .open => return false,
     };
     return true;
 }

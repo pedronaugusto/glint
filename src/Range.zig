@@ -866,7 +866,7 @@ fn assigned(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Erro
                 };
                 if (!empty(tree, value)) out = wider(out, try bound(c, decl.file, value, pointer, depth));
             },
-            .update, .covered, .address => out = null,
+            .update, .covered, .address, .open => out = null,
             .read => {},
         }
     }
@@ -1047,7 +1047,7 @@ pub fn storesShown(c: *Context, decl: Facts.Decl) Context.Error!bool {
     if (given.any or given.shapes.contains(.{ decl.file, record.scope })) return false;
     var found_sites = Facts.accesses.writes(c.facts, .{ .field = decl }, try programFiles(c));
     while (try found_sites.next()) |site| {
-        if (site.kind == .covered or site.computed) return false;
+        if (site.kind == .covered or site.kind == .open or site.computed) return false;
     }
     return true;
 }
@@ -1108,7 +1108,7 @@ fn stored(c: *Context, decl: Facts.Decl, pointer: u16, depth: u8) Context.Error!
                 if (site.reach == .holder or site.reach == .unresolved) if (wholeValue(try c.facts.resolve(site.file, value))) continue;
                 if (!empty(site_tree, value)) out = wider(out, try bound(c, site.file, value, pointer, depth));
             },
-            .update, .covered => out = null,
+            .update, .covered, .open => out = null,
             // A pointer to the field writes it wherever it goes; one to a whole value writes
             // the field by a member store, which is a site of its own.
             .address => if (site.reach == .exact or site.reach == .named) {
@@ -3140,6 +3140,8 @@ fn lengthWritten(c: *Context, file: Project.FileId, memory: Ast.Node.Index) Cont
     var in_file: [1]Project.FileId = undefined;
     var found_sites = try declarationWrites(c, file, d, &in_file);
     while (try found_sites.next()) |site| {
+        // A program the unit is read for may write any part of it.
+        if (site.kind == .open) return true;
         if (!site.part or site.kind == .init) continue;
         const target = site.target orelse continue;
         const site_tree = &c.project.at(site.file).file.tree;
@@ -3176,7 +3178,8 @@ fn addressed(c: *Context, file: Project.FileId, d: Model.Declaration.Id) Context
     const found = while (try found_sites.next()) |site| switch (site.kind) {
         // An address discarded (`_ = &x;`) reaches nothing.
         .address => if (!discarded(tree, model, site.node)) break true,
-        .covered => break true,
+        // A program the unit is read for may write it.
+        .covered, .open => break true,
         else => {},
     } else false;
     try memo.map.put(c.allocator, key, found);

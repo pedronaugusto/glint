@@ -16,6 +16,9 @@ imports: []const Edge,
 identity: u64,
 /// Private: the store this project made for itself when its caller gave none.
 own: ?*Store,
+/// The store its files were read through: a project made of some of them (a unit's,
+/// `Taint`'s open world) reads them from it again, parsed once.
+store: *Store,
 
 /// One source: its front end, its model (which refers only to this immutable file), and the
 /// input it was made from.
@@ -214,7 +217,7 @@ pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Impo
         for (mappings[0..index]) |earlier| if (mapping.from == earlier.from and std.mem.eql(u8, mapping.spelling, earlier.spelling) and !mapping.in.apart(earlier.in)) return error.DuplicateMapping;
     }
     const identity = try nextIdentity();
-    return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity, .own = own };
+    return .{ .arena = arena, .sources = sources, .imports = mappings, .identity = identity, .own = own, .store = store };
 }
 
 /// Releases all owned source/front-end/model storage; a store the caller gave stays.

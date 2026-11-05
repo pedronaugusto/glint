@@ -116,7 +116,7 @@ pub const Writer = struct {
         try self.number(@backingInt(d.index));
     }
 
-    fn key(self: *Writer, k: Facts.Key) WriteError!void {
+    pub fn key(self: *Writer, k: Facts.Key) WriteError!void {
         try self.source(k.file);
         try self.number(@backingInt(k.node));
     }
@@ -224,12 +224,12 @@ pub const Writer = struct {
         try self.numbered(&self.sets, @backingInt(id));
     }
 
-    fn number(self: *Writer, n: u32) WriteError!void {
+    pub fn number(self: *Writer, n: u32) WriteError!void {
         try self.wide(n);
     }
 
     /// LEB128.
-    fn wide(self: *Writer, n: usize) WriteError!void {
+    pub fn wide(self: *Writer, n: usize) WriteError!void {
         var rest: u64 = n;
         while (true) {
             const low: u8 = @truncate(rest & 0x7f);
@@ -327,7 +327,7 @@ pub const Reader = struct {
         return .{ .file = file, .index = @fromBackingInt(index) };
     }
 
-    fn key(self: *Reader) ReadError!Facts.Key {
+    pub fn key(self: *Reader) ReadError!Facts.Key {
         const file = try self.source();
         return .{ .file = file, .node = try self.node(file) };
     }
@@ -466,17 +466,17 @@ pub const Reader = struct {
     }
 
     /// A length: never more than the bytes left, as each item takes at least one.
-    fn count(self: *Reader) ReadError!usize {
+    pub fn count(self: *Reader) ReadError!usize {
         const n = try self.wide();
         if (n > self.bytes.len - self.at) return error.Malformed;
         return n;
     }
 
-    fn number(self: *Reader) ReadError!u32 {
+    pub fn number(self: *Reader) ReadError!u32 {
         return std.math.cast(u32, try self.wide()) orelse error.Malformed;
     }
 
-    fn wide(self: *Reader) ReadError!usize {
+    pub fn wide(self: *Reader) ReadError!usize {
         var n: u64 = 0;
         var shift: u7 = 0;
         while (true) {
@@ -666,7 +666,7 @@ const RunNames = struct { names: ?Names = null };
 pub const check: Facts.RecordCheck = .{ .accesses = checkAccesses, .copies = checkCopies };
 
 /// A writer naming each file by its run id, for a check that reads back into the run.
-fn checkWriter(facts: *Facts) Facts.ResolveError!Writer {
+pub fn checkWriter(facts: *Facts) Facts.ResolveError!Writer {
     const kept = try facts.memo(RunNames);
     if (kept.names == null) {
         const of_file = try facts.gpa.alloc(?[]const u8, facts.project.sources.len);

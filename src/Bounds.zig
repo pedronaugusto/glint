@@ -1068,7 +1068,7 @@ const Frame = struct {
             var found_sites = Facts.accesses.writes(f.c.facts, .{ .declaration = .{ .file = f.file, .index = d } }, &in_file);
             while (try found_sites.next()) |site| switch (site.kind) {
                 .address => if (f.tree.fullCall(&buffer, site.node) == null) try f.addressed.put(f.a, d, {}),
-                .covered => try f.addressed.put(f.a, d, {}),
+                .covered, .open => try f.addressed.put(f.a, d, {}),
                 else => {},
             };
         }

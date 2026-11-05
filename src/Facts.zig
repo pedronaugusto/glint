@@ -100,6 +100,14 @@ walk: ?*Analysis = null,
 /// The memos (`memo`) handed out while the analysis is built, made then or before: each is
 /// replaced once it is built (`dropMemos`).
 walked: std.AutoHashMapUnmanaged(usize, void) = .empty,
+/// Summaries' build mode (designs/glint-summaries.md, step 4): this Facts reads a unit (std, a
+/// dependency) for every program that may import it, never for the one it is given. A field,
+/// and a public container-level `var`, may be written by code the unit does not hold: each
+/// query of its writes also meets one site of kind `open` (`accesses.Each`).
+open_world: bool = false,
+/// std's size summaries answered by std's open-world records (`Taint.OpenUnit`), as a lint that
+/// loads them reads them: what the open world leaves undecided, measured against the live run.
+read_records: bool = false,
 /// Summaries' cross-check (`Summary.check`): set, each record a query builds is written and
 /// read back, and a record that reads back other than the live answer stops the run.
 check_records: ?*const RecordCheck = null,
@@ -3494,6 +3502,8 @@ pub fn fieldStores(self: *Facts, field: Decl, files: []const Project.FileId) Res
             .update => if (site.reach == .exact or site.reach == .named) return null,
             .address => if (site.reach == .exact or site.reach == .named) return null,
             .read => {},
+            // A program the unit is read for may store any function.
+            .open => return null,
         }
     }
     return targets.items;
@@ -3671,6 +3681,12 @@ pub fn analysis(self: *Facts) ResolveError!*const Analysis {
     const found = try self.memo(Analysis);
     if (found.built) return found;
     found.built = true;
+    // A unit read for every program that may import it: any of its declarations may be
+    // analyzed, in any reading.
+    if (self.open_world) {
+        found.everything = true;
+        return found;
+    }
     const file_budget = self.remaining;
     defer self.remaining = file_budget;
     // What the walk asks of the analysis while it is built is answered as if anything may be
@@ -6392,7 +6408,7 @@ fn givenFrom(self: *Facts, decl: Decl, parts: bool, lasting: *bool) ResolveError
                 continue;
             } else return null,
             .update => if (parts) continue else return null,
-            .covered => return null,
+            .covered, .open => return null,
         }
         try found.append(self.gpa, .{ .file = site.file, .node = site.value orelse return null });
     }
@@ -10865,6 +10881,10 @@ pub const accesses = struct {
         address,
         /// A read.
         read,
+        /// In the open world (`Facts.open_world`), a write by a program the unit is read for:
+        /// any value, any function the program may name among them, stored in any way. Its
+        /// site is the place's declaration.
+        open,
     };
 
     /// How a site reaches the place a query asks about.
@@ -11060,6 +11080,8 @@ pub const accesses = struct {
         /// How many sites each part held when the file's index was read: the sites the query
         /// gives, as a list made then would hold them.
         ends: [4]usize = @splat(0),
+        /// The open world's write (`Kind.open`) is given, after every file's.
+        opened: bool = false,
 
         pub const Of = enum { writes, field_writes, reads };
         /// A file's sites in the order a query reads them: those that name the place, then for
@@ -11071,7 +11093,14 @@ pub const accesses = struct {
         pub fn next(each: *Each) Error!?Site {
             while (true) {
                 const index = each.index orelse {
-                    if (each.file == each.files.len) return null;
+                    if (each.file == each.files.len) {
+                        if (each.opened or each.of == .reads or !each.facts.open_world or !each.opensTo()) return null;
+                        each.opened = true;
+                        const decl = switch (each.place) {
+                            inline else => |d| d,
+                        };
+                        return .{ .file = decl.file, .node = each.record().node, .kind = .open };
+                    }
                     const file = each.files[each.file];
                     each.file += 1;
                     each.index = switch (each.of) {
@@ -11102,6 +11131,20 @@ pub const accesses = struct {
                 }
                 each.index = null;
             }
+        }
+
+        /// Whether a program the unit is read for may write the place (`Facts.open_world`): any
+        /// field, of any value it is handed, and a public container-level `var`.
+        fn opensTo(each: *const Each) bool {
+            const decl = switch (each.place) {
+                .field => return true,
+                .declaration => |d| d,
+            };
+            const declared = each.record();
+            if (!declared.public or !global(each.facts, decl)) return false;
+            const tree = &each.facts.project.at(decl.file).file.tree;
+            const variable = tree.fullVarDecl(declared.node) orelse return false;
+            return tree.tokenTag(variable.ast.mut_token) == .keyword_var;
         }
 
         fn record(each: *const Each) Model.Declaration {
@@ -11918,7 +11961,7 @@ pub const accesses = struct {
             try entry.value_ptr.append(w.facts.gpa, site);
             if (!site.through or w.filter != null) return;
             switch (site.kind) {
-                .set, .update, .covered => {},
+                .set, .update, .covered, .open => {},
                 .init, .address, .read => return,
             }
             const by_node = try w.index.through.getOrPut(w.facts.gpa, site.node);
