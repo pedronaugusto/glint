@@ -2669,9 +2669,10 @@ fn builtin(self: *Facts, env: ?*const Env, file: Project.FileId, node: Ast.Node.
         // A file both compilations compile, each binding the name apart: either root, as each
         // reads it, a member read in both.
         // A ZON file is a value, never a container: the one expression it holds, read as the same
-        // expression written in place is (a struct literal is a `.literal`).
+        // expression written in place is (a struct literal is a `.literal`). By how its tree was
+        // parsed: a tree parsed as ZON, and only one, holds that expression at its root.
         const roots = try self.gpa.alloc(Value, targets.len);
-        for (targets, roots) |target, *root| root.* = switch (self.project.at(target).input.kind) {
+        for (targets, roots) |target, *root| root.* = switch (self.project.at(target).file.tree.mode) {
             .zig => .{ .container = self.rootOf(target) },
             // Only a parsed tree has its expression at the root.
             .zon => if (self.project.at(target).file.status != .parsed) .{ .unknown = .invalid_front_end } else try self.resolve(target, self.project.at(target).file.tree.nodeData(.root).node),
