@@ -322,6 +322,15 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
     var reported: ?Ast.Node.Index = null;
     for (try Taint.sinkSites(c, fact, c.file)) |written| {
         if (!site(c, written.at) or reported == written.at) continue;
+        // Read in a file the run does not select: what the written value takes from its
+        // function's parameters, judged at the calls into it; the writer is a peer's where a
+        // caller anywhere in the program hands it one, else the site is none.
+        if (fact.flow.recording != null) {
+            const given = (try Taint.givenAt(c, fact, c.file, written.value)) orelse continue;
+            const undecided = !written.decided or try Taint.unknownAt(c, fact, c.file, written.value);
+            try Taint.recordSink(c, fact, c.file, written.at, given, undecided, .data, written_message);
+            continue;
+        }
         const level = (try Taint.levelAt(c, fact, c.file, written.value)).join(try Taint.errorShown(c, c.file, written.value));
         if (level == .clean) continue;
         if (level == .unknown) {
@@ -333,9 +342,12 @@ pub fn diagnostics(c: *Context, rule: Rule) Context.Error!void {
             continue;
         }
         if (level.reaches(.data)) reported = written.at;
-        try judged(c, null, rule, written.at, level, .data, "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read");
+        try judged(c, null, rule, written.at, level, .data, written_message);
     }
+    try judgedAtCalls(c, fact, rule, diagnostics);
 }
+
+const written_message = "an error's name written to a peer: internal text crossing to the peer; aegis err.PublicText says what the peer may read";
 
 /// A020: a function given an `Io`, by a parameter or a field of one (`self.io`), whose loop runs
 /// unbounded (`while (true)`, a labeled switch that continues itself) or as long as input says,
