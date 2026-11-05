@@ -6336,10 +6336,14 @@ pub fn givenTo(self: *Facts, decl: Decl, parts: bool) ResolveError!?[]const Key 
     const kept_by = try self.memo(Given);
     if (kept_by.found.get(.{ decl, parts })) |kept| return kept;
     var lasting = true;
+    const wide = self.wide;
+    const met = self.open_met;
     const found = try self.givenFrom(decl, parts, &lasting);
-    // What a resolve the budget refused gave is not kept, as `resolve` keeps none; nor what
-    // was read while its file's writes are.
-    if (lasting and self.remaining != 0) try kept_by.found.put(self.gpa, .{ decl, parts }, found);
+    // Kept as `resolve` keeps a value: read with budget left, on no answer wider than the built
+    // analysis gives (`wideSince`), meeting no query in progress (`open_met`: the calls and
+    // loops `handedWith` and `loopedWith` resolve answer provisionally inside one), and not
+    // while its file's writes are read.
+    if (lasting and self.remaining != 0 and !self.wideSince(wide) and self.open_met == met) try kept_by.found.put(self.gpa, .{ decl, parts }, found);
     return found;
 }
 
