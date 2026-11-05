@@ -1,4 +1,8 @@
 .{
     .no_hole = .{},
     .no_twin = .{},
+    .open = .{
+        // glint-b precision: a cast after `if (T == Index) return` read at a binding whose made type the condition names (an aegis Id's own constructor); the condition's made type is not compared with the binding's (sameType never sees two made containers), so the plain binding's cast is read for the Id's too
+        "compile_time/r7-reached-made_type/twin.zig",
+    },
 }
