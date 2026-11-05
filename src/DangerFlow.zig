@@ -1613,7 +1613,7 @@ const Quiet = struct {
 fn passedSinks(c: *Context, flow: Taint.Fact, rule: Rule, comptime check: fn (*Context, Rule) Context.Error!void, file: Project.FileId) Context.Error!?[]const Taint.PassedSink {
     // The sinks it keeps stay for the run: each later call into the file reads them.
     const gpa = c.facts.gpa;
-    const key = .{ @intFromEnum(rule), file };
+    const key = .{ @backingInt(rule), file };
     if (flow.flow.reached_sinks.get(key)) |known| return known;
     if (flow.flow.reading_sinks.contains(key)) return null;
     try flow.flow.reading_sinks.put(gpa, key, {});
