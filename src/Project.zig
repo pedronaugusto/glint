@@ -175,6 +175,27 @@ pub const InitError = File.InitError || Model.InitError || std.Io.Cancelable || 
 /// A handle from another snapshot is invalid.
 pub const QueryError = error{InvalidHandle};
 
+/// Each `@import("...")` `bytes` spells, its string parsed, in order, by Zig's tokens: one
+/// written in a comment or a string is none. Discovery only, for a loader to find the files a
+/// run reads; what an import means is each model's. A long source stops when `io` is canceled.
+pub fn importSpellings(a: std.mem.Allocator, io: std.Io, bytes: [:0]const u8) (std.zig.string_literal.ParseError || std.Io.Cancelable)![]const []const u8 {
+    var found: std.ArrayList([]const u8) = .empty;
+    var lexer: std.zig.Tokenizer = .init(bytes);
+    while (true) {
+        try io.checkCancel();
+        const next = lexer.next();
+        if (next.tag == .eof) break;
+        if (next.tag != .builtin or !std.mem.eql(u8, bytes[next.loc.start..next.loc.end], "@import")) continue;
+        if (lexer.next().tag != .l_paren) continue;
+        const literal = lexer.next();
+        if (literal.tag != .string_literal) continue;
+        const spelling = try std.zig.string_literal.parseAlloc(a, bytes[literal.loc.start..literal.loc.end]);
+        if (lexer.next().tag != .r_paren) continue;
+        try found.append(a, spelling);
+    }
+    return found.items;
+}
+
 /// Copies all source inputs and lowers each valid file through std AstGen/ZIR.
 pub fn init(gpa: std.mem.Allocator, inputs: []const Input, imports: []const Import, options: Options) InitError!Project {
     if (inputs.len > options.files or inputs.len > std.math.maxInt(u32)) return error.ProjectBudgetExceeded;
@@ -368,6 +389,22 @@ test "project handles cannot refer to another snapshot" {
     const h = first.handle(try first.fileAt(0));
     try std.testing.expectError(error.InvalidHandle, second.source(h));
     try std.testing.expectEqualStrings("const x = 1;", try first.source(h));
+}
+
+test "an import is found by Zig's tokens: one a comment or a string spells is none" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // std's Build/Step/InstallDir.zig names `@import("test.zig")` in a doc comment, a file it has not.
+    const found = try importSpellings(arena.allocator(), std.testing.io,
+        \\/// `@import("test.zig")` would be a compile error.
+        \\const text = "@import(\"string.zig\")";
+        \\const a = @import("a.zig");
+        \\const b = @import("b\x2ezig");
+        \\
+    );
+    try std.testing.expectEqual(2, found.len);
+    try std.testing.expectEqualStrings("a.zig", found[0]);
+    try std.testing.expectEqualStrings("b.zig", found[1]);
 }
 
 test "project maps opaque module identities without filesystem access" {

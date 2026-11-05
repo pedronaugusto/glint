@@ -1076,16 +1076,189 @@ pub fn anytypeAt(self: *const Facts, function: Decl, token: Ast.TokenIndex) ?usi
     return null;
 }
 
-/// Whether `function` takes a type or `anytype`: one whose type does not resolve may.
+/// Whether `function` takes a type or `anytype`, so that each binding makes it again. A
+/// parameter whose written type does not resolve may take a type (an alias of `type` the run
+/// cannot read), and makes it generic where a type position names it (`namedAsType`), or where
+/// its value is read whole (`readWhole`) and its written type depends on the binding
+/// (`reachesBinding`): a binding resolves the type of what it copies or passes on there
+/// (`invoke(.{a})` in a shim typed by a function type an enclosing generic reflects), which read
+/// once is unknown. A type that depends on no binding (`fd: posix.fd_t`) is one type in every
+/// binding, read once; read only for a member (`by.raw()`, `by.f`), a parameter is neither.
 pub fn hasGenericParameter(self: *Facts, function: Decl) ResolveError!bool {
     const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
     var fn_buffer: [1]Ast.Node.Index = undefined;
-    const proto = t.fullFnProto(&fn_buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return false;
+    const proto = t.fullFnProto(&fn_buffer, model.declarations[@backingInt(function.index)].node) orelse return false;
     var it = proto.iterate(t);
     while (it.next()) |param| {
         if (param.anytype_ellipsis3 != null) return true;
-        if (param.type_expr) |type_expr| if (try self.writesType(function.file, type_expr) != .other) return true;
+        const type_expr = param.type_expr orelse continue;
+        switch (try self.writesType(function.file, type_expr)) {
+            .type => return true,
+            .other => {},
+            .unknown => {
+                const name_token = param.name_token orelse continue;
+                const parameter = for (model.declarations, 0..) |record, i| {
+                    if (record.kind == .parameter and record.token == name_token) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
+                } else return true; // unreachable: Model declares every named parameter
+                if (try self.namedAsType(function, parameter, 0) or (self.readWhole(function.file, parameter) and try self.reachesBinding(function.file, type_expr, 0))) return true;
+            },
+        }
     }
+    return false;
+}
+
+/// Whether the type expression `node` depends on a binding: it names, directly or through the
+/// locals and constants it is made of, an `anytype` or `comptime` parameter, or one of a type
+/// resolving to `type`, of the function it is written in or of an enclosing generic
+/// (`@typeInfo(@TypeOf(f)).@"fn".params[0].type.?` reaches comptime `f`). A member's name
+/// after a `.` names no declaration.
+fn reachesBinding(self: *Facts, file: Project.FileId, node: Ast.Node.Index, depth: usize) ResolveError!bool {
+    // A chain past the bound may reach one.
+    if (depth == 8) return true;
+    const t = self.syntaxOf(file);
+    const model = &self.project.at(file).model;
+    const first = t.firstToken(node);
+    for (first..t.lastToken(node) + 1) |raw| {
+        const token: Ast.TokenIndex = @intCast(raw);
+        if (t.tokenTag(token) != .identifier) continue;
+        if (token > first and t.tokenTag(token - 1) == .period) continue;
+        const named = self.lexical(file, model.scopeOf(token), t.tokenSlice(token)) orelse continue;
+        const record = model.declarations[@backingInt(named)];
+        switch (record.kind) {
+            .parameter => {
+                var buffer: [1]Ast.Node.Index = undefined;
+                const proto = t.fullFnProto(&buffer, model.scopes[@backingInt(record.scope)].node) orelse continue;
+                var it = proto.iterate(t);
+                while (it.next()) |param| {
+                    if (param.name_token != record.token) continue;
+                    if (param.anytype_ellipsis3 != null) return true;
+                    if (param.comptime_noalias) |keyword| if (t.tokenTag(keyword) == .keyword_comptime) return true;
+                    if (param.type_expr) |param_type| if (writtenOf(try self.resolve(file, param_type)) == .type) return true;
+                }
+            },
+            .variable => {
+                const init = (t.fullVarDecl(record.node) orelse continue).ast.init_node.unwrap() orelse continue;
+                if (init == node) continue;
+                if (try self.reachesBinding(file, init, depth + 1)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether `function`'s parameter `parameter` is read anywhere as a whole value, not only for a
+/// member of it (`by.raw()`, `by.f`, `@field(by, "f")`).
+fn readWhole(self: *Facts, file: Project.FileId, parameter: Model.Declaration.Id) bool {
+    const t = self.syntaxOf(file);
+    const model = &self.project.at(file).model;
+    for (model.references) |reference| {
+        if (reference.declaration != parameter) continue;
+        const parent = model.parentOf(reference.node) orelse return true;
+        if (t.nodeTag(parent) == .field_access and t.nodeData(parent).node_and_token[0] == reference.node) continue;
+        if (isBuiltin(t, parent, "@field")) {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(t, parent, &buffer);
+            if (args.len != 0 and args[0] == reference.node) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Whether a type position in `function` names `named`, a parameter or a local made of one: an
+/// expression reading it whose value is a parameter's type or the result's, a variable's or a
+/// field's type, a local's value that one names, or an argument a callee takes as a type (a
+/// `comptime` parameter, one of a type that is or may be `type`, any of a function returning
+/// `type`). `?P`, `[]P`, `P.Inner`, `Wrap(P)`, `if (c) P else Q` pass it on as what they make;
+/// a condition, a statement and a block do not.
+/// Sound for the generics this decides: a parameter's value no type position names reaches the
+/// body only through what it is read for (`by.raw()`, `by.f`), which resolve unknown in the
+/// unbound body and are undecided there whether or not the function is generic; and a type, its
+/// value, is no owner, so no copy goes unread by reading it once and not at each binding.
+fn namedAsType(self: *Facts, function: Decl, named: Model.Declaration.Id, depth: usize) ResolveError!bool {
+    // A chain of locals past the bound may name it.
+    if (depth == 8) return true;
+    const model = &self.project.at(function.file).model;
+    for (model.references) |reference| {
+        if (reference.declaration != named) continue;
+        if (try self.typePosition(function, reference.node, depth)) return true;
+    }
+    return false;
+}
+
+/// Whether the value of `node`, an expression in `function`, reaches a type position
+/// (`namedAsType`), through what each expression around it makes of it.
+fn typePosition(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize) ResolveError!bool {
+    const t = self.syntaxOf(function.file);
+    const model = &self.project.at(function.file).model;
+    var at = node;
+    while (model.parentOf(at)) |parent| : (at = parent) {
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        if (t.fullFnProto(&proto_buffer, parent) != null) return true;
+        if (t.fullContainerField(parent)) |field| return if (field.ast.type_expr.unwrap()) |field_type| field_type == at else false;
+        if (t.fullVarDecl(parent)) |variable| {
+            if (variable.ast.type_node.unwrap()) |var_type| if (var_type == at) return true;
+            const init = variable.ast.init_node.unwrap() orelse return false;
+            if (init != at) return false;
+            // A local made of it is named where it is (`const Q = ?P; var y: Q = ...`).
+            const local = for (model.declarations, 0..) |record, i| {
+                if (record.node == parent) break @as(Model.Declaration.Id, @fromBackingInt(@intCast(i)));
+            } else return true; // unreachable: Model declares every local
+            return self.namedAsType(function, local, depth + 1);
+        }
+        switch (t.nodeTag(parent)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon, .fn_decl => return false,
+            // A local given it later is made of it as one its initializer gives.
+            .assign => {
+                const target = t.nodeData(parent).node_and_node[0];
+                if (t.nodeData(parent).node_and_node[1] != at or t.nodeTag(target) != .identifier) return false;
+                const reference = model.reference(target) orelse return true;
+                return self.namedAsType(function, reference.declaration orelse return true, depth + 1);
+            },
+            else => {},
+        }
+        // What a condition reads decides a branch, never a type.
+        if (t.fullIf(parent)) |branch| if (branch.ast.cond_expr == at) return false;
+        if (t.fullWhile(parent)) |loop| if (loop.ast.cond_expr == at) return false;
+        if (t.fullSwitch(parent)) |choice| if (choice.ast.condition == at) return false;
+        if (try calls.at(self, function.file, parent)) |call| {
+            if (call.callee_expr != at) {
+                const args = switch (call.args) {
+                    .known => |known| known,
+                    .unknown => return true,
+                };
+                const callees: []const Decl = switch (call.callee) {
+                    .function => |callee| &.{callee},
+                    .choice => |each| each,
+                    .any => &.{},
+                };
+                for (args, 0..) |arg, position| if (arg == at) {
+                    for (callees) |callee| if (try self.takesType(callee, position)) return true;
+                };
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether `function` takes a type at `position`, or returns one: a `comptime` parameter, one of
+/// a type that is or may be `type`, any of a function returning `type`.
+fn takesType(self: *Facts, function: Decl, position: usize) ResolveError!bool {
+    const t = self.syntaxOf(function.file);
+    var buffer: [1]Ast.Node.Index = undefined;
+    const proto = t.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return true;
+    if (proto.ast.return_type.unwrap()) |result| if (try self.writesType(function.file, result) != .other) return true;
+    var it = proto.iterate(t);
+    var at: usize = 0;
+    while (it.next()) |param| : (at += 1) {
+        if (at != position) continue;
+        if (param.comptime_noalias) |token| if (t.tokenTag(token) == .keyword_comptime) return true;
+        const param_type = param.type_expr orelse return false;
+        return try self.writesType(function.file, param_type) != .other;
+    }
+    // Past its parameters: a variadic extern's, which takes no type.
     return false;
 }
 
@@ -3267,8 +3440,10 @@ pub fn writesType(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 }
 
 /// Whether `node`, a parameter's or a result's type in a function's prototype, names one of
-/// that function's generic parameters (`anytype`, `comptime`, or of a type resolving to `type`):
-/// each binding's type, which the binding reads.
+/// that function's generic parameters (`anytype`, `comptime`, or of a type resolving to `type`),
+/// or one of an enclosing generic's (`state: State` in a method of `Layer(comptime State: type,
+/// ...)`): each binding's type, which the binding reads. An enclosing generic's parameter is
+/// fixed in each type that generic makes; bound to `type`, its value would be a type, no owner.
 fn writtenInGeneric(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
     const tree = &self.project.at(file).file.tree;
     const model = &self.project.at(file).model;
@@ -3278,8 +3453,24 @@ fn writtenInGeneric(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Re
         if (tree.fullFnProto(&probe, parent) != null) break parent;
         if (tree.nodeTag(parent) == .fn_decl or tree.nodeTag(parent) == .block or tree.nodeTag(parent) == .block_semicolon or tree.nodeTag(parent) == .block_two or tree.nodeTag(parent) == .block_two_semicolon) return false;
     } else return false;
+    if (try self.namesTypeParameter(file, proto_node, node)) return true;
+    // The functions this one is written in, each by its declaration.
+    var up = model.parentOf(proto_node) orelse return false;
+    while (model.parentOf(up)) |parent| : (up = parent) {
+        if (tree.nodeTag(parent) != .fn_decl) continue;
+        if (try self.namesTypeParameter(file, parent, node)) return true;
+    }
+    return false;
+}
+
+/// Whether `node` names a generic parameter of the function `function` (its prototype or its
+/// declaration) declares: `anytype`, `comptime`, or of a type resolving to `type`. Read by what
+/// each type resolves to, never by `writesType` (`namesGenericParameter`'s reading), which asks
+/// this of a type it cannot resolve and would ask it again of each parameter.
+fn namesTypeParameter(self: *Facts, file: Project.FileId, function: Ast.Node.Index, node: Ast.Node.Index) ResolveError!bool {
+    const tree = &self.project.at(file).file.tree;
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, proto_node).?;
+    const proto = tree.fullFnProto(&buffer, function) orelse return false;
     const first = tree.firstToken(node);
     const last = tree.lastToken(node);
     var it = proto.iterate(tree);
@@ -17512,7 +17703,7 @@ test "a reader's question past its steps, or code read lazily that imports what 
     try std.testing.expect(try short.analyzed(testDecl(&project, 1, "deadTarget")));
 }
 
-test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one that does not resolve or is read through @typeInfo is unknown; a quoted name is its declaration, never the primitive" {
+test "a written type is `type` by what it resolves to: an alias of it is, an alias of another type is not, one read through @typeInfo is what it reads, one that does not resolve is unknown; a quoted name is its declaration, never the primitive" {
     const source =
         \\const Type = type;
         \\const Kind = u8;
@@ -17542,5 +17733,40 @@ test "a written type is `type` by what it resolves to: an alias of it is, an ali
         var it = tree.fullFnProto(&buffer, record.node).?.iterate(tree);
         try answers.append(arena.allocator(), try facts.writesType(id, it.next().?.type_expr.?));
     }
-    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown, .unknown, .type, .other }, answers.items);
+    try std.testing.expectEqualSlices(Written, &.{ .type, .type, .other, .unknown, .type, .type, .other }, answers.items);
+}
+
+test "a parameter whose written type does not resolve makes its function generic where a type position names it, or where its value is read whole and its type depends on a binding; never where it is only read for a member, or its type is one in every binding" {
+    const source =
+        \\const Alias = @import("missing").T;
+        \\const Unknown = @import("missing").U;
+        \\const Wrap = @import("missing").Wrap;
+        \\const sink = @import("missing").sink;
+        \\fn f(comptime P: Alias, x: P) void { _ = x; }
+        \\fn g(by: Unknown) void { _ = by.raw(); }
+        \\fn h(by: Unknown) void { var y: ?by = null; _ = &y; }
+        \\fn k(by: Unknown) void { const Q = *by; var z: Q = undefined; _ = &z; }
+        \\fn m(n: u8) void { _ = n; }
+        \\fn w(by: Unknown) void { const Q = Wrap(by); var z: Q = undefined; _ = &z; }
+        \\fn p(by: Unknown) void { sink(by); }
+        \\fn q(by: Unknown) void { if (by == u8) {} }
+        \\fn s(comptime F: type) type {
+        \\    return struct {
+        \\        fn call(a: @typeInfo(F).@"fn".param_types[0].?) void { sink(a); }
+        \\    };
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const id = project.sources[0].id;
+    var answers: std.ArrayList(bool) = .empty;
+    for (project.sources[0].model.declarations, 0..) |record, i| {
+        if (record.kind != .function) continue;
+        try answers.append(arena.allocator(), try facts.hasGenericParameter(.{ .file = id, .index = @fromBackingInt(@intCast(i)) }));
+    }
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, true, false, true, false, false, true, true }, answers.items);
 }

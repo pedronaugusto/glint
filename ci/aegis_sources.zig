@@ -27,15 +27,19 @@ fn stdFiles() !Std {
     var inputs: std.ArrayList(Project.Input) = .empty;
     var paths: std.StringHashMapUnmanaged(usize) = .empty;
     var edges: std.ArrayList(Project.Import) = .empty;
-    _ = try readStd(gpa, io, try std.Io.Dir.path.join(gpa, &.{ options.zig_lib, "std", "std.zig" }), &inputs, &paths);
+    // preflight's file, from the package root, holding Zig's library as the runner has it. A
+    // fixture with std unmapped is another program than the one its row is about: no read of
+    // std fails it quietly, every one stops the step by name.
+    const library = std.Io.Dir.cwd().readFileAlloc(io, options.zig_lib, gpa, .limited(4096)) catch |failure|
+        std.debug.panic("aegis_sources: {s}, the file preflight's addTestZigLib writes naming Zig's library: {t}", .{ options.zig_lib, failure });
+    const std_root = try std.Io.Dir.path.join(gpa, &.{ library, "std", "std.zig" });
+    _ = readStd(gpa, io, std_root, &inputs, &paths) catch |failure|
+        std.debug.panic("aegis_sources: std's root {s}, in the library {s} names: {t}", .{ std_root, options.zig_lib, failure });
     var cursor: usize = 0;
     while (cursor < inputs.items.len) : (cursor += 1) {
-        const bytes = inputs.items[cursor].bytes;
-        var rest = bytes;
-        while (std.mem.find(u8, rest, "@import(\"")) |at| {
-            rest = rest[at + "@import(\"".len ..];
-            const end = std.mem.findScalar(u8, rest, '"') orelse break;
-            const spelling = rest[0..end];
+        // Each import as the glint program's loader finds it, by Zig's tokens.
+        const source = try gpa.dupeSentinel(u8, inputs.items[cursor].bytes, 0);
+        for (try Project.importSpellings(gpa, io, source)) |spelling| {
             const target = if (std.mem.eql(u8, spelling, "std"))
                 0
             else if (std.mem.endsWith(u8, spelling, ".zig"))
@@ -273,6 +277,16 @@ pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     return withStd(gpa, &inputs, &imports(), .program);
 }
 
+/// `project` with std unmapped, as a benchmark reads the pinned sources: preflight runs it in a
+/// fresh directory with no input path, so it reads no Zig library, and its own check of the run
+/// (complete, every site found) fails where std's absence would tell. A test reads std.
+pub fn projectAlone(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
+    var inputs: [sources.len + 1]Project.Input = undefined;
+    inputs[0] = .{ .name = "consumer", .bytes = consumer };
+    for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
+    return Project.init(gpa, &inputs, &imports(), .{ .store = store() });
+}
+
 /// `project`, with a second source of the program's own, imported by the consumer as `lib`
 /// and importing aegis as `aegis`: a module a program reaches its types through.
 pub fn projectWith(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8) !glint.Project {
@@ -318,13 +332,14 @@ pub fn writeTree(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
         if (std.fs.path.dirnamePosix(source.name)) |parent| try dir.createDirPath(io, parent);
         try dir.writeFile(io, .{ .sub_path = source.name, .data = source.bytes });
     }
+    // Each import as the glint program's loader finds it, by Zig's tokens.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
     for (sources) |source| {
-        var rest = source.bytes;
-        while (std.mem.find(u8, rest, "@import(\"")) |at| {
-            rest = rest[at + "@import(\"".len ..];
-            const end = std.mem.findScalar(u8, rest, '"') orelse break;
-            if (!std.mem.endsWith(u8, rest[0..end], ".zig")) continue;
-            const path = try std.fs.path.resolveAllocPosix(gpa, &.{ std.fs.path.dirnamePosix(source.name) orelse ".", rest[0..end] });
+        const bytes = try arena.allocator().dupeSentinel(u8, source.bytes, 0);
+        for (try Project.importSpellings(arena.allocator(), io, bytes)) |spelling| {
+            if (!std.mem.endsWith(u8, spelling, ".zig")) continue;
+            const path = try std.fs.path.resolveAllocPosix(gpa, &.{ std.fs.path.dirnamePosix(source.name) orelse ".", spelling });
             defer gpa.free(path);
             if (pinned(path) != null) continue;
             if (std.fs.path.dirnamePosix(path)) |parent| try dir.createDirPath(io, parent);

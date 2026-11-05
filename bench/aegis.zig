@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
     var source: std.Io.Writer.Allocating = .init(init.arena.allocator());
     try source.writer.writeAll("const S = @import(\"aegis\").Secret;\n");
     for (0..n) |i| try source.writer.print("pub fn site{d}(s: *S(u32)) void {{ _ = s.material; }}\n", .{i});
-    var project = try sources.project(init.gpa, source.written());
+    var project = try sources.projectAlone(init.gpa, source.written());
     defer project.deinit();
     const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{
         .{ .rule = pack.access, .level = .report },   .{ .rule = pack.copies, .level = .report },

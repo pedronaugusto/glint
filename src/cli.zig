@@ -126,19 +126,8 @@ const Loader = struct {
             const from = cursor;
             const bytes = self.inputs.items[cursor].bytes;
             const sentinel = try self.a.dupeSentinel(u8, bytes, 0);
-            var lexer: std.zig.Tokenizer = .init(sentinel);
             // Discovery only: actual semantics comes from each model's AST/ZIR.
-            while (true) {
-                // A source as long as the limit allows is a long walk: it stops when the run does.
-                try self.io.checkCancel();
-                const token = lexer.next();
-                if (token.tag == .eof) break;
-                if (token.tag != .builtin or !std.mem.eql(u8, sentinel[token.loc.start..token.loc.end], "@import")) continue;
-                if (lexer.next().tag != .l_paren) continue;
-                const literal = lexer.next();
-                if (literal.tag != .string_literal) continue;
-                const spelling = try std.zig.string_literal.parseAlloc(self.a, sentinel[literal.loc.start..literal.loc.end]);
-                if (lexer.next().tag != .r_paren) continue;
+            for (try Project.importSpellings(self.a, self.io, sentinel)) |spelling| {
                 // The spelling is the source's: a path it names is parsed into one inside the
                 // roots before anything opens it.
                 const target_path = (try aegis.input.Untrusted(Spelling).init(.{ .from = cursor, .text = spelling }).parse(self, Loader.importPath)) orelse continue;

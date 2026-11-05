@@ -52,7 +52,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     const test_imports = [_]std.Build.Module.Import{
         .{ .name = "aegis", .module = aegis },
         .{ .name = "glint", .module = module },
-        .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) },
+        .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, tools) },
         .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
     };
     for ([_][]const u8{ "src/tests.zig", "src/test_danger.zig", "src/test_pack.zig" }) |root| {
@@ -193,7 +193,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     check.dependOn(&project_linter.step);
     tools.preflight.addCi(b, p, .{ .tests = test_step, .portable_tests = true, .bench = .{
         .programs = &.{ .{ .name = "glint-scan", .source = "bench/scan.zig" }, .{ .name = "glint-aegis", .source = "bench/aegis.zig" } },
-        .imports = benchImports,
+        .imports = Bench(tools).imports,
         .target = target,
         .optimize = optimize,
     } });
@@ -211,24 +211,29 @@ fn release(b: *std.Build) *std.Build.Module {
     return options.createModule();
 }
 
-/// `b` is the development build.
-fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
-    const p = b.dependency("glint", .{ .target = target, .optimize = optimize }).builder;
-    const module = b.createModule(.{ .root_source_file = p.path("src/glint.zig"), .target = target, .optimize = optimize });
-    const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
-    module.addImport("aegis", aegis_dependency.module("aegis"));
-    module.addImport("ensign", p.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
-    module.addImport("release", release(p));
-    return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target) } }) catch @panic("OOM");
+/// The benchmarks' imports, with preflight's `tools`, which name std to aegis's sources.
+fn Bench(comptime tools: type) type {
+    return struct {
+        /// `b` is the development build.
+        fn imports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
+            const p = b.dependency("glint", .{ .target = target, .optimize = optimize }).builder;
+            const module = b.createModule(.{ .root_source_file = p.path("src/glint.zig"), .target = target, .optimize = optimize });
+            const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
+            module.addImport("aegis", aegis_dependency.module("aegis"));
+            module.addImport("ensign", p.dependency("ensign", .{ .target = target, .optimize = optimize }).module("ensign"));
+            module.addImport("release", release(p));
+            return b.allocator.dupe(std.Build.Module.Import, &.{ .{ .name = "glint", .module = module }, .{ .name = "aegis_sources", .module = aegisSources(b, p, module, aegis_dependency, target, tools) } }) catch @panic("OOM");
+        }
+    };
 }
 
 /// The pinned aegis module's files, embedded as sources to analyze.
-fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget) *std.Build.Module {
+fn aegisSources(b: *std.Build, p: *std.Build, glint: *std.Build.Module, aegis_dependency: *std.Build.Dependency, target: std.Build.ResolvedTarget, comptime tools: type) *std.Build.Module {
     const sources = b.createModule(.{ .root_source_file = p.path("ci/aegis_sources.zig"), .target = target });
     sources.addImport("glint", glint);
-    // std as this Zig has it, read where the tests run: a path, never std's bytes hashed in.
+    // std as this Zig has it, read where the tests run (preflight names it, as each runner has it): never std's bytes hashed in.
     const options = b.addOptions();
-    options.addOptionPathUntracked("zig_lib", .zig_lib);
+    tools.preflight.addTestZigLib(b, options, "zig_lib");
     sources.addImport("aegis_sources_options", options.createModule());
     const files = [_][2][]const u8{
         .{ "aegis-root", "src/root.zig" },

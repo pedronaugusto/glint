@@ -130,7 +130,9 @@ pub fn init(file: *File) InitError!Model {
         if (tag == .identifier and namesTag(tree, node_parents, node)) continue;
         const name = try identifier(a, tree.tokenSlice(token));
         if (std.mem.eql(u8, name, "_") or std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined")) continue;
-        const decl = model.lookup(token_scopes[token], name, token);
+        // A primitive's bare name is the primitive: Zig lets nothing shadow one, and a
+        // declaration named for one (`const @"u8" = ...`) is reached by its quoted name alone.
+        const decl = if (tag == .identifier and !std.mem.startsWith(u8, tree.tokenSlice(token), "@") and primitive(name)) null else model.lookup(token_scopes[token], name, token);
         var ref_record: Reference = .{ .token = token, .node = node, .declaration = decl };
         if (tag == .enum_literal) {
             ref_record.unknown = .literal_context;
