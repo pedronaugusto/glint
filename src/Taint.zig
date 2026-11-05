@@ -4907,6 +4907,82 @@ fn laterSitesBytes(chain: usize) !usize {
     return run_memory.allocated_bytes - before;
 }
 
+test "a summary settled for one file gives a later file the sites it gives that file read alone" {
+    // Both files call std's `grow`; the second also hands it a length the first does not, and
+    // reaches std's `widen`, which writes the container variable `grow`'s loop counts to. Read
+    // after the first file, `grow` is settled: the second file's sites are the same as when it
+    // is read first, so settling hid nothing its later call changes.
+    const gpa = std.testing.allocator;
+    const after = try secondSites(gpa, true);
+    defer gpa.free(after);
+    const alone = try secondSites(gpa, false);
+    defer gpa.free(alone);
+    try std.testing.expectEqualStrings("grow 1 n value sure\ngrow 2 s length sure\nwiden 1 m value sure\n", alone);
+    try std.testing.expectEqualStrings(alone, after);
+}
+
+/// The size sites of the second of two files that call std's `grow`, read after the first
+/// file's or alone, one per line as `sizeSitesText` writes them.
+fn secondSites(gpa: Allocator, first: bool) ![]u8 {
+    const mem =
+        \\pub const Allocator = struct {
+        \\    pub fn rawAlloc(self: Allocator, len: usize) void {
+        \\        _ = self;
+        \\        _ = len;
+        \\    }
+        \\};
+        \\var limit: usize = 0;
+        \\pub fn grow(gpa: Allocator, n: usize, s: []const u8) void {
+        \\    gpa.rawAlloc(n);
+        \\    for (s) |_| {}
+        \\    var i: usize = 0;
+        \\    while (i < limit) : (i += 1) {}
+        \\}
+        \\pub fn widen(gpa: Allocator, n: usize) void {
+        \\    _ = gpa;
+        \\    limit = n;
+        \\    var i: usize = 0;
+        \\    while (i != n) : (i += 1) {}
+        \\}
+    ;
+    var project = try Project.init(gpa, &.{
+        .{ .name = "first", .bytes = "const std = @import(\"std\");\npub fn f(gpa: std.mem.Allocator, n: usize) void {\n    std.mem.grow(gpa, n, \"abc\");\n}\npub const handed = &f;\n" },
+        .{ .name = "second", .bytes = "const std = @import(\"std\");\npub fn g(gpa: std.mem.Allocator, n: usize, s: []const u8, m: usize) void {\n    std.mem.grow(gpa, n, s);\n    std.mem.widen(gpa, m);\n}\npub const handed = &g;\n" },
+        .{ .name = "std/std.zig", .bytes = "pub const mem = @import(\"mem.zig\");\n", .selected = false },
+        .{ .name = "std/mem.zig", .bytes = mem, .selected = false },
+    }, &.{ .{ .from = 0, .spelling = "std", .target = 2 }, .{ .from = 1, .spelling = "std", .target = 2 }, .{ .from = 2, .spelling = "mem.zig", .target = 3 } }, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const Quiet = struct {
+        const config: @import("Rule.zig").Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = @import("AegisRules.zig").bounded_work, .level = .report }} };
+        fn diagnostic(_: *Context.Sink, _: @import("Rule.zig").Rule, _: u32, _: u32, _: []const u8, _: []const @import("Report.zig").Span, _: []const @import("Report.zig").Edit) Context.Error!void {}
+        fn coverage(_: *Context.Sink, _: @import("Report.zig").Coverage) Context.Error!void {}
+        fn configOf(_: *Context.Sink, _: Project.FileId) @import("Rule.zig").Config {
+            return config;
+        }
+        fn check(_: *Context) Context.Error!void {}
+    };
+    const bounded_input = @import("Danger.zig").bounded_input;
+    const rule: Context.Rule = .{ .definition = .{ .id = @import("AegisRules.zig").bounded_work, .name = "A012", .group = .family_policy, .purpose = "work" }, .check = Quiet.check, .facts = &.{bounded_input} };
+    var sink: Context.Sink = .{ .diagnostic = Quiet.diagnostic, .coverage = Quiet.coverage, .config = Quiet.configOf };
+    var c: Context = .{ .allocator = arena.allocator(), .project = &project, .file = project.sources[0].id, .config = Quiet.config, .facts = &facts, .definitions = &.{}, .sink = &sink, .compiled = &.{rule} };
+    const fact = try get(&c, bounded_input);
+    if (first) try std.testing.expect((try sinkSites(&c, fact, project.sources[0].id)).len > 0);
+    c.file = project.sources[1].id;
+    const tree = &project.sources[1].file.tree;
+    var seen: std.ArrayList(u8) = .empty;
+    errdefer seen.deinit(gpa);
+    for (try sinkSites(&c, fact, project.sources[1].id)) |found| {
+        const site = (try decidedSite(&c, fact, found)) orelse continue;
+        const name = if (site.callee) |d| project.at(d.file).model.declarations[@backingInt(d.index)].name else "?";
+        try seen.print(gpa, "{s} {d} {s} {s} {s}\n", .{ name, site.position, tree.getNodeSource(site.value), if (site.length) "length" else "value", if (site.decided) "sure" else "maybe" });
+    }
+    return seen.toOwnedSlice(gpa);
+}
+
 test "a size a generic takes through its context is read in the instantiation the program's call makes" {
     const gpa = std.testing.allocator;
     const mem =
