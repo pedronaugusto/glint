@@ -2902,6 +2902,16 @@ const Frame = struct {
     /// and where it reaches one function of the program, that function's summary on the path
     /// where it returns a value, of the arguments, the result and the places the arguments
     /// hold.
+    /// `s` past the call `node`, which has no summary, with its result's length `tl` as long as
+    /// an argument says where std's own function is known by declaration
+    /// (`Range.lengthArgument`: a reader's `take(n)`).
+    fn lengthGiven(f: *Frame, s: State, node: Ast.Node.Index, args: []const Value, tl: Var) Error!State {
+        const position = (try Range.lengthArgument(f.c, f.file, node)) orelse return s;
+        if (position >= args.len) return s;
+        const n = args[position].lin orelse return s;
+        return f.equal(s, tl, n);
+    }
+
     fn call(f: *Frame, s: State, node: Ast.Node.Index) RunError!Eval {
         var buffer: [1]Ast.Node.Index = undefined;
         const full = f.tree.fullCall(&buffer, node).?; // unreachable: the tag is a call's
@@ -2983,14 +2993,7 @@ const Frame = struct {
         const t = made.v.lin;
         const tl = try f.variable(.{ .temp = .{ .node = node, .part = 1 } });
         out = try forget(f.a, out, tl);
-        const summed = summary orelse {
-            // std's own, known by declaration: a result as long as an argument says
-            // (`Range.lengthArgument`: a reader's `take(n)`).
-            if (try Range.lengthArgument(f.c, f.file, node)) |position| if (position < args.items.len) if (args.items[position].lin) |n| {
-                out = try f.equal(out, tl, n);
-            };
-            return .{ .s = out, .v = .{ .lin = t, .length = try single(f.a, tl) } };
-        };
+        const summed = summary orelse return .{ .s = try f.lengthGiven(out, node, args.items, tl), .v = .{ .lin = t, .length = try single(f.a, tl) } };
         // A place's exit holds where the success is read at once: a callee that cannot fail, or
         // `try`; a result unwrapped later may meet a store to the place first.
         const at_once = !summed.fails or if (f.model.parentOf(node)) |parent| f.tree.nodeTag(parent) == .@"try" else false;
