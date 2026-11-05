@@ -1170,8 +1170,7 @@ fn readWhole(self: *Facts, file: Project.FileId, parameter: Model.Declaration.Id
 /// Whether a type position in `function` names `named`, a parameter or a local made of one: an
 /// expression reading it whose value is a parameter's type or the result's, a variable's or a
 /// field's type, a local's value that one names, or an argument a callee takes as a type (a
-/// `comptime` parameter, one of a type that is or may be `type`, any of a function returning
-/// `type`). `?P`, `[]P`, `P.Inner`, `Wrap(P)`, `if (c) P else Q` pass it on as what they make;
+/// `comptime` parameter, one of type `type`, any of a function returning `type`). `?P`, `[]P`, `P.Inner`, `Wrap(P)`, `if (c) P else Q` pass it on as what they make;
 /// a condition, a statement and a block do not.
 /// Sound for the generics this decides: a parameter's value no type position names reaches the
 /// body only through what it is read for (`by.raw()`, `by.f`), which resolve unknown in the
@@ -1244,19 +1243,20 @@ fn typePosition(self: *Facts, function: Decl, node: Ast.Node.Index, depth: usize
 }
 
 /// Whether `function` takes a type at `position`, or returns one: a `comptime` parameter, one of
-/// a type that is or may be `type`, any of a function returning `type`.
+/// type `type`, any of a function returning `type`. One whose type does not resolve is not taken
+/// for one: what the call makes of it is followed where its result goes (`typePosition`).
 fn takesType(self: *Facts, function: Decl, position: usize) ResolveError!bool {
     const t = self.syntaxOf(function.file);
     var buffer: [1]Ast.Node.Index = undefined;
     const proto = t.fullFnProto(&buffer, self.project.at(function.file).model.declarations[@backingInt(function.index)].node) orelse return true;
-    if (proto.ast.return_type.unwrap()) |result| if (try self.writesType(function.file, result) != .other) return true;
+    if (proto.ast.return_type.unwrap()) |result| if (try self.writesType(function.file, result) == .type) return true;
     var it = proto.iterate(t);
     var at: usize = 0;
     while (it.next()) |param| : (at += 1) {
         if (at != position) continue;
         if (param.comptime_noalias) |token| if (t.tokenTag(token) == .keyword_comptime) return true;
         const param_type = param.type_expr orelse return false;
-        return try self.writesType(function.file, param_type) != .other;
+        return try self.writesType(function.file, param_type) == .type;
     }
     // Past its parameters: a variadic extern's, which takes no type.
     return false;
