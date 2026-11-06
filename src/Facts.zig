@@ -5336,8 +5336,11 @@ fn sliced(self: *Facts, value: Value, _: void) ResolveError!Value {
     return switch (value) {
         .array => self.pointerTo(value, null),
         .pointer => |p| .{ .pointer = .{ .child = p.child, .size = null } },
+        // Whatever is sliced, the slice is one (or a pointer to an array, of a length the
+        // program compiles in): its `.len` is its count, its elements what it holds.
+        .unknown => .{ .pointer = .{ .child = try self.boxed(value), .size = .slice } },
         // A string literal's bytes stay plain bytes.
-        .unknown, .scalar => value,
+        .scalar => value,
         .alternatives => self.map(value, {}, sliced),
         else => .{ .unknown = .unsupported },
     };
@@ -7321,7 +7324,8 @@ pub fn lengthOfValue(self: *Facts, value: Value, name: []const u8) ResolveError!
         // A string literal's bytes.
         .scalar => return .memory,
         .array => |each| return if (try self.sized(each.*, 0)) .memory else .unsized,
-        .pointer => |inner| switch (inner.child.*) {
+        // A slice's `.len` is its count, whatever it holds.
+        .pointer => |inner| if (inner.size == .slice and inner.child.* == .unknown) return .unsized else switch (inner.child.*) {
             // A single pointer to a container reads its field; a slice of one, its count.
             // The value is the same for both, so a container that declares `len` is read
             // as declaring it.
@@ -14208,6 +14212,35 @@ test "a function handed to code outside the program as a value escapes: its call
     // Only `less` is handed out to be called with anything: `f` is called by its name alone.
     try std.testing.expect(try facts.handedOut(less.?));
     try std.testing.expect(!try facts.handedOut(entry.?) and !try facts.handedOut(twice.?));
+}
+
+test "a slice of what does not resolve is a slice: its `.len` is its count, never a field" {
+    // `p` is `anytype`: whatever it is, slicing it gives a slice or a pointer to an array, and
+    // `.len` there counts its elements (any `usize`: they may take no room).
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes =
+        \\fn f(p: anytype, n: usize) usize {
+        \\    const s = p[0..n];
+        \\    return s.len;
+        \\}
+    }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const file = project.sources[0].id;
+    const tree = &project.sources[0].file.tree;
+    var len: ?Ast.Node.Index = null;
+    var slice: ?Ast.Node.Index = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (tag == .field_access and std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), "len")) len = node;
+        if (tag == .slice) slice = node;
+    }
+    const sliced_value = try facts.resolve(file, slice.?);
+    try std.testing.expect(sliced_value == .pointer);
+    try std.testing.expectEqual(Size.slice, sliced_value.pointer.size.?);
+    try std.testing.expectEqual(Length.unsized, try facts.memoryField(file, len.?));
 }
 
 test "a parameter's type has a length where it is or holds memory that has one" {

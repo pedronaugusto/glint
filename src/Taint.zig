@@ -407,6 +407,9 @@ pub const Flow = struct {
     /// memory it holds. A read of such memory may read any of it.
     unnamed: Levels = .clean,
     unnamed_length: Levels = .clean,
+    /// Per field and container-level variable, whether a store through memory no place names may
+    /// reach it (`reachedUnnamed`).
+    unnamed_reach: std.AutoHashMapUnmanaged(Facts.Decl, bool) = .empty,
     /// The files that are the program (`Program`).
     program: *const Program = undefined,
     /// std's namespaces whose functions make data from data: what they give holds what they take.
@@ -1006,7 +1009,7 @@ fn captured(c: *Context, flow: *Flow, function: Function.Id, decl: Model.Declara
         const choice = tree.fullSwitch(parent) orelse return .{};
         var out = try dep(c, flow, function, choice.ast.condition);
         for (try prongFields(c, f.file, choice.ast.condition, node)) |field| {
-            out = try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
+            out = try (try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean })).join(c.allocator, try throughUnnamed(c, flow, field));
         }
         return out;
     }
@@ -1240,13 +1243,13 @@ fn places(c: *Context, flow: *Flow, function: Function.Id, target: Ast.Node.Inde
             // The program's own field holds the fact by its declaration; a field of a type
             // outside it (std's writer, a dependency's list) is every instance's everywhere, so
             // the store reaches only the value it belongs to.
-            const holder, const name = tree.nodeData(target).node_and_token;
+            const holder = tree.nodeData(target).node_and_token[0];
             switch (try c.facts.definition(f.file, target)) {
                 .decl => |decl| if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind == .field and flow.own(decl.file)) return addPlace(c, out, .{ .global = decl }),
-                // A member that does not resolve, or one of a holder whose type does not, may be
-                // any of the program's fields so named.
-                .unknown => for (try fieldsNamed(c, flow, tree.tokenSlice(name))) |decl| try addPlace(c, out, .{ .global = decl }),
-                .none => if (unresolvedHolder(try c.facts.resolve(f.file, holder))) for (try fieldsNamed(c, flow, tree.tokenSlice(name))) |decl| try addPlace(c, out, .{ .global = decl }),
+                // A member that does not resolve, or one of a holder whose type does not, is
+                // memory no place names: a field it may be reads it there (`throughUnnamed`).
+                .unknown => try addPlace(c, out, .unknown),
+                .none => if (unresolvedHolder(try c.facts.resolve(f.file, holder))) try addPlace(c, out, .unknown),
             }
             return places(c, flow, function, holder, out);
         },
@@ -2098,7 +2101,11 @@ fn namedDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
     const decl = model.declarations[@backingInt(d)];
     if (decl.kind == .variable or decl.kind == .capture) {
         const scope = model.scopes[@backingInt(decl.scope)].kind;
-        if (scope == .file or scope == .container) return .{ .level = flow.globals.get(.{ .file = f.file, .index = d }) orelse .clean, .unchecked = flow.lengths.get(.{ .file = f.file, .index = d }) orelse .clean };
+        if (scope == .file or scope == .container) {
+            const global: Facts.Decl = .{ .file = f.file, .index = d };
+            const own: Dep = .{ .level = flow.globals.get(global) orelse .clean, .unchecked = flow.lengths.get(global) orelse .clean };
+            return own.join(c.allocator, try throughUnnamed(c, flow, global));
+        }
         return flow.locals.get(.{ .file = f.file, .index = d }) orelse .{};
     }
     return .{};
@@ -2126,6 +2133,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         };
         if (flow.globals.get(decl)) |level| out = try out.join(c.allocator, .{ .level = level });
         if (flow.lengths.get(decl)) |length| out = try out.join(c.allocator, Dep.measuredLength(length));
+        out = try out.join(c.allocator, try throughUnnamed(c, flow, decl));
         if (flow.zig_text.contains(decl)) out = try out.join(c.allocator, .{ .level = .in(flow.masks.peer, .data) });
         if (flow.masks.error_text != none and try errorDeclared(c, decl)) out = try out.join(c.allocator, errorText(flow));
         // A function or a type named through a value is no part of its data.
@@ -2196,7 +2204,7 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     if (std.mem.eql(u8, name, "@field") and args.len == 2) {
         var out = try dep(c, flow, function, args[0]);
         for (try namedFields(c, flow.functions.items[@backingInt(function)].file, node)) |field| {
-            out = try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
+            out = try (try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean })).join(c.allocator, try throughUnnamed(c, flow, field));
         }
         return out;
     }
@@ -2290,8 +2298,8 @@ fn composed(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
 
 /// A field read through a value whose type is one of several (a generic's result over each
 /// of its instantiations, `Untrusted.parse` over each parser): what the program stores in the
-/// field of that name in each of them. Through one whose type does not resolve, what it stores
-/// in any of its fields so named.
+/// field of that name in each of them. Through one whose type does not resolve, unknown, with
+/// what memory no place names holds, as a read of memory that does not resolve is.
 fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: Ast.Node.Index, name: []const u8) Context.Error!Levels {
     var out: Levels = .clean;
     const value = try c.facts.resolve(file, receiver);
@@ -2305,16 +2313,14 @@ fn alternativeFields(c: *Context, flow: *Flow, file: Project.FileId, receiver: A
         const container = switch (held) {
             .container, .instance => |k| k,
             .unknown => |why| {
-                if (why != .zig_own and why != .absent) for (try fieldsNamed(c, flow, name)) |decl| {
-                    out = out.join(flow.globals.get(decl) orelse .clean);
-                };
+                if (why != .zig_own and why != .absent) out = out.join(Levels.all(.unknown).join(flow.unnamed));
                 continue;
             },
             else => continue,
         };
         const decl = c.facts.member(container, name) orelse continue;
         if (c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind != .field) continue;
-        out = out.join(flow.globals.get(decl) orelse .clean);
+        out = out.join(flow.globals.get(decl) orelse .clean).join((try throughUnnamed(c, flow, decl)).level);
     }
     return out;
 }
@@ -2331,32 +2337,30 @@ fn unresolvedHolder(value: Facts.Value) bool {
     };
 }
 
-/// The program's own fields, by name, found once.
-const FieldsNamed = struct {
-    built: bool = false,
-    map: std.StringHashMapUnmanaged(std.ArrayList(Facts.Decl)) = .empty,
-};
+/// What a field or a container-level variable `decl` takes from memory no place names
+/// (`unnamed`): what every store there put, where Facts.accesses finds a write that may reach
+/// it through such memory (a member so spelled on a holder whose type does not resolve, memory
+/// that does not resolve); nothing elsewhere. Found once per declaration.
+fn throughUnnamed(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!Dep {
+    return if (try reachedUnnamed(c, flow, decl)) unnamed(flow) else .{};
+}
 
-/// The program's own fields named `name`: those a member of a holder whose type does not
-/// resolve may be.
-fn fieldsNamed(c: *Context, flow: *const Flow, name: []const u8) Context.Error![]const Facts.Decl {
-    // What it keeps in its memo stays for the run.
+fn reachedUnnamed(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!bool {
+    // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const memo = try c.facts.memo(FieldsNamed);
-    if (!memo.built) {
-        memo.built = true;
-        for (c.project.sources) |*each| {
-            if (!flow.own(each.id)) continue;
-            for (each.model.declarations, 0..) |record, d| {
-                if (record.kind != .field) continue;
-                const entry = try memo.map.getOrPut(c.allocator, record.name);
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(c.allocator, .{ .file = each.id, .index = @fromBackingInt(@intCast(d)) });
-            }
-        }
-    }
-    return if (memo.map.get(name)) |found| found.items else &.{};
+    if (flow.unnamed_reach.get(decl)) |found| return found;
+    const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
+    const place: Facts.accesses.Place = if (record.kind == .field) .{ .field = decl } else .{ .declaration = decl };
+    var files: std.ArrayList(Project.FileId) = .empty;
+    for (c.project.sources) |*each| if (flow.own(each.id)) try files.append(c.allocator, each.id);
+    var sites = Facts.accesses.writes(c.facts, place, files.items);
+    const through = while (try sites.next()) |site| {
+        if (site.kind == .read or site.kind == .init) continue;
+        if (site.reach == .named or site.reach == .unresolved) break true;
+    } else false;
+    try flow.unnamed_reach.put(c.allocator, decl, through);
+    return through;
 }
 
 /// The field declarations a struct literal's values initialize, in order, when its type
@@ -3582,7 +3586,7 @@ fn takeHeld(c: *Context, flow: *Flow) Context.Error!void {
         const f = flow.functions.items[@backingInt(each.function)];
         const value: Dep = switch (each.holder) {
             .local => |d| flow.locals.get(.{ .file = f.file, .index = d }) orelse continue,
-            .global => |decl| .{ .level = flow.globals.get(decl) orelse .clean, .unchecked = flow.lengths.get(decl) orelse .clean },
+            .global => |decl| try (Dep{ .level = flow.globals.get(decl) orelse .clean, .unchecked = flow.lengths.get(decl) orelse .clean }).join(c.allocator, try throughUnnamed(c, flow, decl)),
             .param, .unknown => .{ .level = .all(.unknown) },
         };
         // What a store through the holder writes is what the owner holds, not its length.
@@ -3602,7 +3606,7 @@ fn whole(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Index) 
         if (try Range.intOf(c, file, node, 64) != null) return out;
         return try out.join(c.allocator, .{ .level = .all(.unknown) });
     };
-    for (fields) |field| out = try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean });
+    for (fields) |field| out = try (try out.join(c.allocator, .{ .level = flow.globals.get(field) orelse .clean, .unchecked = flow.lengths.get(field) orelse .clean })).join(c.allocator, try throughUnnamed(c, flow, field));
     return out;
 }
 
