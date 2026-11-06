@@ -893,7 +893,7 @@ fn pairCall(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Err
     }
 }
 /// Whether the function the call at `node` calls declares an optional or error-union result: one
-/// that may give nothing.
+/// that may give nothing. A result whose type does not resolve may be one.
 fn fallibleResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return false;
     const decl = switch (call.callee) {
@@ -906,8 +906,8 @@ fn fallibleResult(c: *Context, file: Project.FileId, node: Ast.Node.Index) Conte
     const proto = tree.fullFnProto(&buffer, record.node) orelse return false;
     const result = proto.ast.return_type.unwrap() orelse return false;
     if (Model.inferredErrors(tree, result)) return true;
-    return switch (tree.nodeTag(result)) {
-        .optional_type, .error_union => true,
+    return switch (try c.facts.resolve(decl.file, result)) {
+        .optional, .error_union, .unknown => true,
         else => false,
     };
 }
