@@ -14,7 +14,7 @@ const std = @import("std");
 const glint = @import("glint");
 const cli = glint.cli;
 const rule_readers: glint.Rule = @fromBackingInt(1000); // safe: this linter owns extension ID 1000, validated by glint.
-pub const rules = ruled(&allowed) ++ tabled(&tables);
+pub const rules = ruled(&allowed) ++ tabled(&tables) ++ switched(&switches);
 fn ruled(comptime list: []const Allowed) [1]glint.ProjectRule {
     return .{.{ .definition = .{ .id = rule_readers, .name = "RULE_READERS", .group = .family_policy, .purpose = "a rule reads values, writes, calls and types only through glint's shared queries" }, .check = struct {
         fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
@@ -55,6 +55,310 @@ const allowed = [_]Allowed{
     .{ .file = "src/AegisPack.zig", .function = "Flow.repeat", .reason = "`while (true)` is the language's literal, which no declaration stands behind" },
     .{ .file = "src/Escapes.zig", .function = "compiledIn", .reason = "a literal as written is compiled into the program, never the frame's memory" },
 };
+
+/// VALUE_SWITCHES: a switch on a value Facts resolved (`Facts.Value`) that names no `.alternatives`
+/// prong, anywhere in glint. A choice of values is read part by part (Facts.valueParts, its
+/// answers joined by Facts.Join): a switch that names some tags and sends the rest to a default reads a choice of
+/// them, or a tag it does not name, as that default, which skips or clears it. A switch is found
+/// by what its operand resolves to (Facts.Value's own declaration), never by the tags it names; one
+/// whose operand does not resolve is undecided.
+/// A container as Facts names it: `Value.container`'s payload.
+const ValueContainer = @FieldType(glint.Value, "container");
+const value_switches: glint.Rule = @fromBackingInt(1002); // safe: this linter owns extension ID 1002, validated by glint.
+fn switched(comptime list: []const Allowed) [1]glint.ProjectRule {
+    return .{.{ .definition = .{ .id = value_switches, .name = "VALUE_SWITCHES", .group = .family_policy, .purpose = "glint reads a resolved value's choice of alternatives part by part, never through a default prong" }, .check = struct {
+        fn run(context: *glint.RuleContext) glint.RuleContext.Error!void {
+            return checkSwitches(context, list);
+        }
+    }.run }};
+}
+
+/// The switches still allowed, each by the function it is in: `pending: <owner>`, a site its
+/// owner converts to Facts' part readers (the list only shrinks), or `conservative: <why>; row:
+/// <test>`, a claim that its default is the safe answer for that function, proved by the row named.
+const switches = [_]Allowed{
+    .{ .file = "src/AegisPack.zig", .function = "Flow.unheld", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "bindingTyped", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "boundBy", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "capturedMoved", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "carried", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "fieldOwner", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "heldInRecord", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "heldOwners", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "instanceOf", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "ownerPaths", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "perBuild", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "pointerResult", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "pointerShaped", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "publishedContainer", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "recordOf", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "recordOwned", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "refuted", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "scalarShaped", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "sharedReturn", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "typeKeyword", .reason = "pending: aegis" },
+    .{ .file = "src/AegisPack.zig", .function = "unlisted", .reason = "pending: aegis" },
+    .{ .file = "src/AegisRecursion.zig", .function = "hasReceiver", .reason = "pending: warp-fast" },
+    .{ .file = "src/AegisRecursion.zig", .function = "typeKeyword", .reason = "pending: warp-fast" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.call", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.flatOptional", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.neverNull", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.recordCall", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.storedThrough", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "Frame.summaryOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "callersIndex", .reason = "pending: glint-c" },
+    .{ .file = "src/Bounds.zig", .function = "exprType", .reason = "pending: glint-c" },
+    .{ .file = "src/Builtins.zig", .function = "namesType", .reason = "pending: aegis" },
+    .{ .file = "src/Builtins.zig", .function = "reflectedImport", .reason = "pending: aegis" },
+    .{ .file = "src/Builtins.zig", .function = "syntaxRules", .reason = "pending: aegis" },
+    .{ .file = "src/Danger.zig", .function = "aegisName", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "borrowed", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "madeField", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "namesSyncMember", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "secretBindings", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "syncType", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "typeConstant", .reason = "pending: warp-fast" },
+    .{ .file = "src/Danger.zig", .function = "unjudged", .reason = "pending: warp-fast" },
+    .{ .file = "src/DangerFlow.zig", .function = "IoProbe.of", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "argumentOf", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "containerIo", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "heldIo", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "holdsNoError", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "passesParameter", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "predicate", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "spelledIo", .reason = "pending: bay" },
+    .{ .file = "src/DangerFlow.zig", .function = "spellsIo", .reason = "pending: bay" },
+    .{ .file = "src/DangerShapes.zig", .function = "acquiresHandle", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "byPointer", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "byValue", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "choosesState", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "givenPointer", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "guardGiven", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "guardHeld", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "handedOn", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "implements", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "integer", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "neverReturns", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "pointsAtGuard", .reason = "pending: glint-b" },
+    .{ .file = "src/DangerShapes.zig", .function = "writtenThrough", .reason = "pending: glint-b" },
+    .{ .file = "src/Escapes.zig", .function = "Walk.array", .reason = "pending: warp-fast" },
+    .{ .file = "src/Escapes.zig", .function = "Walk.value", .reason = "pending: warp-fast" },
+    .{ .file = "src/Facts.zig", .function = "absent", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.call", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.holdsBody", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.pointee", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.takesPointer", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.targetType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.Walk.valued", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.held", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.holderContainer", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "accesses.reinterprets", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "bindTo", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "builtinField", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "callResult", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "calls.bound", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "calls.memberNamed", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "choiceOfTypes", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "comptimeTruthRead", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "definition", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "eachReceiver", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "emptyLiteralValue", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "enumOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "evaluateCall", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "fieldNamesOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "fieldOwner", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "fieldType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "fieldTypeNode", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "hasFieldTruth", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "heldContainer", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "holderMisses", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "holdsTypes", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "identical", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "importsRead", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "indexed", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "integerType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "kindOfType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "lacksMember", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "literalDeclaration", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "literalFieldType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "madeHolder", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "madeResultOn", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "madeWithin", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "mayBeType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "memberOfChoice", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "memberValue", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "parameterType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "peered", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "placeType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "prototype", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "published", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "reachReflected", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "reflected", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "reflectedContainer", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "refusesUnlessField", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "resolveInner", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "returnedContainers", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "returnedErrors", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "role", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "same", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "sameContainer", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "sameType", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "sameValue", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "scanCallSites", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "sized", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "sizedMemory", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "switchPayload", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "tagWithin", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "takenProng", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "typeArgument", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "typeOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "unknownWithin", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "unwrapped", .reason = "pending: glint-c" },
+    .{ .file = "src/Facts.zig", .function = "valueOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Governed.zig", .function = "aliasNames", .reason = "pending: warp-fast" },
+    .{ .file = "src/PackageRules.zig", .function = "Reader.generic", .reason = "pending: warp-fast" },
+    .{ .file = "src/ParentPointer.zig", .function = "Carry.handedOn", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "Carry.holds", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "Carry.spawned", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "Follow.pointer", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "Follow.stays", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "handedInPlace", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "held", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "insertsOnlyParents", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "isParent", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "listOf", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "listsInPlace", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "namedByField", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "pointee", .reason = "pending: glint-b" },
+    .{ .file = "src/ParentPointer.zig", .function = "receiverKind", .reason = "pending: glint-b" },
+    .{ .file = "src/Present.zig", .function = "valued", .reason = "pending: warp-fast" },
+    .{ .file = "src/Range.zig", .function = "allocator", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "argument", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "backed", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "element", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "elementOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "field", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "fieldFollows", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "floating", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "identity", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "inert", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "keptArgument", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "lengthArgument", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "madeId", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "operation", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "ownId", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "placeOf", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "pointerValue", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "prongField", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "readBuffers", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "readFacts", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "structured", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "takesType", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "upperByConstant", .reason = "pending: glint-c" },
+    .{ .file = "src/Range.zig", .function = "varies", .reason = "pending: glint-c" },
+    .{ .file = "src/RuleContext.zig", .function = "accepts", .reason = "pending: warp-fast" },
+    .{ .file = "src/RuleContext.zig", .function = "isType", .reason = "pending: warp-fast" },
+    .{ .file = "src/Streams.zig", .function = "kindOf", .reason = "pending: warp-fast" },
+    .{ .file = "src/Streams.zig", .function = "mayHold", .reason = "pending: warp-fast" },
+    .{ .file = "src/Streams.zig", .function = "wrapped", .reason = "pending: warp-fast" },
+    .{ .file = "src/Taint.zig", .function = "alternativeFields", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "fixedBytes", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "givesUnlimited", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "known", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "literalFields", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "namedFields", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "parserOf", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "prongFields", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "raiseFields", .reason = "pending: bay" },
+    .{ .file = "src/Taint.zig", .function = "unresolvedHolder", .reason = "pending: bay" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.callee", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.chosen", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.countedPrefix", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.cursorAt", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.partsOf", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "Walk.partsOfValue", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "fixedBetween", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "heldField", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "holderKeptThrough", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "holderOf", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "keepsPointerAt", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "keepsWriterAt", .reason = "pending: glint-b" },
+    .{ .file = "src/Undefined.zig", .function = "vtableSlot", .reason = "pending: glint-b" },
+    .{ .file = "src/releases.zig", .function = "holderContainer", .reason = "pending: warp-fast" },
+    .{ .file = "src/releases.zig", .function = "judge", .reason = "pending: warp-fast" },
+    .{ .file = "src/releases_test.zig", .function = "fieldOf", .reason = "pending: warp-fast" },
+};
+
+fn checkSwitches(context: *glint.RuleContext, list: []const Allowed) glint.RuleContext.Error!void {
+    const tree = try context.project.syntax(try context.source());
+    const name = context.project.at(context.file).input.name;
+    const value_type = (try valueType(context)) orelse return;
+    var found: std.ArrayList(Found) = .empty;
+    for (tree.nodes.items(.tag), 0..) |_, index| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(index));
+        if (context.inTest(tree.nodeMainToken(node))) continue;
+        const full = tree.fullSwitch(node) orelse continue;
+        switch (try isValue(context, try context.facts.resolve(context.file, full.ast.condition), value_type)) {
+            .no => continue,
+            .unknown => |why| try found.append(context.allocator, .{ .node = node, .what = .{ .undecided = why } }),
+            .yes => if (!namesAlternatives(tree, full)) try found.append(context.allocator, .{ .node = node, .what = .{ .read = "a switch on a resolved value names no `.alternatives` prong: a choice of values, or a tag it does not name, falls to its default; read it part by part (Facts.valueParts, joined by Facts.Join), or allow it with the row that proves its default is the safe answer" } }),
+        }
+    }
+    const used = try context.allocator.alloc(bool, list.len);
+    @memset(used, false);
+    sites: for (found.items) |each| {
+        const function = try enclosing(context, tree, each.node);
+        for (list, used) |entry, *use| if (inFile(name, entry.file) and std.mem.eql(u8, entry.function, function)) {
+            use.* = true;
+            continue :sites;
+        };
+        switch (each.what) {
+            .read => |message| try context.at(value_switches, tree.nodeMainToken(each.node), message),
+            .undecided => |why| try context.unknown(value_switches, each.node, why),
+        }
+    }
+    for (list, used) |entry, use| if (inFile(name, entry.file) and !use) {
+        try context.at(value_switches, 0, try context.allocator.print("the allowed switches of {s} ({s}) are none of this file's: remove the entry", .{ entry.function, entry.reason }));
+    };
+}
+
+/// Facts.Value's container, by its declaration in the run's src/Facts.zig; null where the run
+/// holds no such file (a project that is not glint).
+fn valueType(context: *glint.RuleContext) glint.RuleContext.Error!?ValueContainer {
+    for (context.project.sources) |*source| {
+        if (!inFile(source.input.name, "src/Facts.zig")) continue;
+        const decl = context.facts.member(context.facts.rootOf(source.id), "Value") orelse return null;
+        return switch (try context.facts.declaration(decl)) {
+            .container => |container| container,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// Whether a resolved operand is a Facts.Value: an instance of its container, in each part of a
+/// choice; not known where a part does not resolve.
+fn isValue(context: *glint.RuleContext, value: glint.Value, value_type: ValueContainer) glint.RuleContext.Error!union(enum) { yes, no, unknown: glint.Unknown } {
+    _ = context;
+    const each: []const glint.Value = if (value == .alternatives) value.alternatives else &.{value};
+    var unknown: ?glint.Unknown = null;
+    for (each) |part| switch (part) {
+        .instance => |container| if (container.file == value_type.file and container.scope == value_type.scope) return .yes,
+        .unknown => |why| unknown = why,
+        .alternatives => unreachable, // unreachable: choose never nests alternatives
+        else => {},
+    };
+    return if (unknown) |why| .{ .unknown = why } else .no;
+}
+
+/// Whether a switch names `.alternatives` in a prong.
+fn namesAlternatives(tree: *const std.zig.Ast, full: std.zig.Ast.full.Switch) bool {
+    for (full.ast.cases) |case_node| {
+        const case = tree.fullSwitchCase(case_node).?; // unreachable: a switch's cases are cases
+        for (case.ast.values) |item| if (tree.nodeTag(item) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(item)), "alternatives")) return true;
+    }
+    return false;
+}
 
 /// NAME_TABLES: a table keyed by text, anywhere in glint (the shared queries' files included). A
 /// declaration found by its spelling in one misses what resolution sees, as a rule's comparison
@@ -578,4 +882,42 @@ test "a table keyed by text is found wherever glint makes it, by what std's map 
     }));
     // An entry no table is at is a finding.
     try std.testing.expectEqual(.{ 4, 1 }, try tablesAllowing(source, &.{.{ .file = "root", .function = "gone", .reason = "text is the identity" }}));
+}
+
+/// A run of VALUE_SWITCHES on `root` (glint's src/Rule.zig) beside a fixture src/Facts.zig that
+/// declares Value, with the switches `list` allows: its findings, and its undecided sites.
+fn switchesAllowing(root: []const u8, comptime list: []const Allowed) !struct { usize, usize } {
+    var project = try glint.Project.init(std.testing.allocator, &.{
+        .{ .name = "src/Rule.zig", .bytes = root },
+        .{ .name = "src/Facts.zig", .bytes = "pub const Value = union(enum) { unknown: u8, alternatives: []const Value, instance: u32, primitive: []const u8 };\n", .selected = false },
+    }, &.{.{ .from = 0, .target = 1, .spelling = "Facts.zig" }}, .{}); // safe: fixture constants fit the asserted integer widths.
+    defer project.deinit();
+    const config: glint.Config = .{ .enabled = @splat(false), .selections = &.{.{ .rule = value_switches, .level = .report }} };
+    var report = try glint.runConfigured(std.testing.allocator, &project, config, .{ .project_rules = &switched(list) });
+    defer report.deinit();
+    var undecided: usize = 0;
+    for (report.coverage) |item| if (item.rule) |each| {
+        if (each == value_switches) undecided += 1;
+    };
+    return .{ report.diagnostics.len, undecided };
+}
+
+test "a switch on a resolved value with no alternatives prong is a finding, found by what its operand resolves to; one naming alternatives, one on another type, and an allowed one are not; one whose operand does not resolve is undecided" {
+    const head = "const Facts = @import(\"Facts.zig\");\nconst missing = @import(\"missing\");\nconst Kind = enum { a, b };\n";
+    inline for ([_]struct { []const u8, usize, usize }{
+        .{ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, else => false }; }", 1, 0 },
+        .{ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, .alternatives => |each| each.len != 0, else => false }; }", 0, 0 },
+        .{ "pub fn f(k: Kind) bool { return switch (k) { .a => true, else => false }; }", 0, 0 },
+        .{ "pub fn f() bool { return switch (missing.value) { .instance => true, else => false }; }", 0, 1 },
+    }) |row| {
+        const source, const findings, const undecided = row;
+        const got = try switchesAllowing(head ++ source, &.{});
+        try std.testing.expectEqual(findings, got[0]);
+        try std.testing.expectEqual(undecided, got[1]);
+    }
+    // Allowed by its function: none; an entry no switch of its file is in: a finding itself.
+    const allowed_site = try switchesAllowing(head ++ "pub fn f(v: Facts.Value) bool { return switch (v) { .instance => true, else => false }; }", &.{.{ .file = "src/Rule.zig", .function = "f", .reason = "pending: warp-fast" }});
+    try std.testing.expectEqual(0, allowed_site[0]);
+    const stale = try switchesAllowing(head ++ "pub fn f(k: Kind) bool { return k == .a; }", &.{.{ .file = "src/Rule.zig", .function = "f", .reason = "pending: warp-fast" }});
+    try std.testing.expectEqual(1, stale[0]);
 }

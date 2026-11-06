@@ -8166,6 +8166,52 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
     };
 }
 
+/// The parts of a value, each read alone: a choice's alternatives, or the value itself (`value`
+/// must outlive what is given back). One way to read a value part by part, its answers joined by
+/// `Join`: a reader that names some tags and sends the rest to a default reads a choice of them
+/// wrongly.
+pub fn valueParts(value: *const Value) []const Value {
+    if (value.* != .alternatives) return value[0..1];
+    // A choice holds no choice (`choose` flattens what it is given).
+    for (value.alternatives) |part| if (part == .alternatives) unreachable; // unreachable: choose never nests alternatives
+    return value.alternatives;
+}
+
+/// The answers a reader gives each part of a value (`valueParts`), joined as one: whether any part is
+/// so (`any`, `anyOf`'s join), every part (`all`, `bothOf`'s), or what every part agrees on
+/// (`agreed`). An `.unknown` part, a part the reader cannot decide (null: a tag it does not name)
+/// and a choice of none decide neither yes nor no: the caller turns null into its conservative
+/// answer. `for (Facts.valueParts(&v)) |part| join.add(part, answer(part));`
+pub const Join = struct {
+    some: ?bool = false,
+    every: ?bool = true,
+    parts: usize = 0,
+
+    pub fn add(self: *Join, part: Value, answer: ?bool) void {
+        const given: ?bool = if (part == .unknown) null else answer;
+        self.some = anyOf(self.some, given);
+        self.every = bothOf(self.every, given);
+        self.parts += 1;
+    }
+
+    /// Yes where a part is so, no where every part is not, null otherwise.
+    pub fn any(self: Join) ?bool {
+        return if (self.parts == 0) null else self.some;
+    }
+
+    /// No where a part is not so, yes where every part is, null otherwise.
+    pub fn all(self: Join) ?bool {
+        return if (self.parts == 0) null else self.every;
+    }
+
+    /// Yes where every part is so, no where none is, null where they differ or one is not known.
+    pub fn agreed(self: Join) ?bool {
+        if (self.all() == true) return true;
+        if (self.any() == false) return false;
+        return null;
+    }
+};
+
 /// One value of `values`, each resolved: an unknown if any is, the value if they agree, else
 /// the alternatives. A part identical to one kept (`identical`: no reader can tell the two
 /// apart) is that one, so what is kept grows with what is new in a choice, never with how many
@@ -13796,6 +13842,49 @@ pub const calls = struct {
         try found.append(facts.gpa, one);
     }
 };
+
+test "a value read part by part: any part, every part, or what every part agrees on, an unknown part or a choice of none never deciding yes or no" {
+    const PartReader = struct {
+        fn scalar(part: Value) ?bool {
+            return switch (part) {
+                .scalar => true,
+                .error_set => false,
+                // A tag this reader does not name: it cannot decide.
+                else => null,
+            };
+        }
+        fn join(value: *const Value) Join {
+            var out: Join = .{};
+            for (valueParts(value)) |part| out.add(part, scalar(part));
+            return out;
+        }
+    };
+    const scalar: Value = .scalar;
+    const errors: Value = .error_set;
+    const other: Value = .{ .primitive = "u8" };
+    const unknown: Value = .{ .unknown = .unresolved };
+    for ([_]struct { []const Value, ?bool, ?bool, ?bool }{
+        // parts, any, all, agreed
+        .{ &.{scalar}, true, true, true },
+        .{ &.{errors}, false, false, false },
+        .{ &.{ scalar, errors }, true, false, null },
+        .{ &.{ errors, unknown }, null, false, null },
+        .{ &.{ scalar, unknown }, true, null, null },
+        .{ &.{ errors, other }, null, false, null },
+        .{ &.{}, null, null, null },
+    }) |row| {
+        const each, const any, const all, const agreed = row;
+        const value: Value = .{ .alternatives = each };
+        const joined = PartReader.join(&value);
+        try std.testing.expectEqual(any, joined.any());
+        try std.testing.expectEqual(all, joined.all());
+        try std.testing.expectEqual(agreed, joined.agreed());
+    }
+    // A value that is no choice is its one part.
+    try std.testing.expectEqual(@as(usize, 1), valueParts(&scalar).len);
+    try std.testing.expectEqual(true, PartReader.join(&scalar).any());
+    try std.testing.expectEqual(null, PartReader.join(&unknown).any());
+}
 
 test "facts aliases cycles and absent module mappings stay unknown" {
     var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const A = B; const B = A; const dep = @import(\"missing\");" }}, &.{}, .{});

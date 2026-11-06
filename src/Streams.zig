@@ -835,11 +835,12 @@ pub fn lost(c: *Context, rule: Rule) Context.Error!void {
     for (try Facts.calls.in(c.facts, c.file)) |call| {
         const node = call.node;
         if (c.inTest(tree.nodeMainToken(node)) or !Danger.atRuntime(c, node)) continue;
-        // An operation gives an error union; `r.interface.limited(...)` makes a reader.
-        switch (try c.facts.resolve(c.file, node)) {
-            .error_union, .unknown => {},
-            else => continue,
-        }
+        // An operation gives an error union; `r.interface.limited(...)` makes a reader. A choice
+        // of results gives one where any of them may (a generic called with two stream types).
+        const result = try c.facts.resolve(c.file, node);
+        var gives: Facts.Join = .{};
+        for (Facts.valueParts(&result)) |part| gives.add(part, part == .error_union);
+        if (gives.any() == false) continue;
         for (try operations(c, &ks, c.file, &call, 0)) |op| {
             // One it is given is its caller's to ask, whatever its type or handling.
             const origin = try originOf(c, op);

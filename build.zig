@@ -160,13 +160,14 @@ pub fn dev(b: *std.Build, tools: type) void {
     rule_lint.addArg("--module");
     rule_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
     // NAME_TABLES over every source of glint's own, the shared queries' files included: a table
-    // of declarations by their text is the class wherever it is made.
-    const table_lint = addLint(b, rule_readers, .{ .sources = ownSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for NAME_TABLES: {t}", .{err}), .directories = &.{p.path("src")}, .args = &.{ "--only", "NAME_TABLES" } });
+    // of declarations by their text is the class wherever it is made. VALUE_SWITCHES in the same
+    // run: a resolved value's choice is read part by part wherever glint switches on one.
+    const table_lint = addLint(b, rule_readers, .{ .sources = ownSources(b, p) catch |err| std.debug.panic("glint's src/ could not be listed for NAME_TABLES: {t}", .{err}), .directories = &.{p.path("src")}, .args = &.{ "--only", "NAME_TABLES", "--only", "VALUE_SWITCHES" } });
     table_lint.addArg("--zig-lib-path");
     table_lint.addDirectoryArg2(.zig_lib, .{});
     table_lint.addArg("--module");
     table_lint.addPrefixedFileArg("aegis=", aegis_dependency.path("src/root.zig"));
-    const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, and where glint keys a table by text: each report whole under zig-out/rule-readers/, their totals per rule, class and file printed");
+    const rule_readers_step = b.step("check-rule-readers", "Report where a rule reads a value, a write, a call or a type around the shared queries, where glint keys a table by text, and where it switches on a resolved value without reading its choice part by part: each report whole under zig-out/rule-readers/, their totals per rule, class and file printed");
     // Each report whole in a file, never read off the build runner's output, which it cuts.
     const reports = [_]struct { std.Build.LazyPath, []const u8 }{ .{ rule_lint.captureStdOut(.{}), "rule-readers.json" }, .{ table_lint.captureStdOut(.{}), "name-tables.json" } };
     const totals = b.addRunArtifact(b.addExecutable(.{ .name = "glint-rule-readers-totals", .root_module = b.createModule(.{
