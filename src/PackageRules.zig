@@ -52,8 +52,40 @@ pub const Deprecated = struct { decl: Reference, with: ?Reference, why: []const 
 /// What a type means: its role, by the enum literal's name, and the fields only the package may
 /// touch (A001's), by name.
 pub const Role = struct { type: Reference, role: []const u8, internal: []const []const u8 };
-/// An obligation no body shows: what acquires it and what discharges it.
-pub const Pair = struct { acquire: Reference, release: []const Reference, transfer: []const Reference };
+/// An obligation no body shows: what makes it, and what ends, moves or checks it.
+pub const Pair = struct {
+    /// Where the pair is written.
+    file: Project.FileId = undefined,
+    node: Ast.Node.Index = undefined,
+    /// The function whose result owes it; null where `type` names the owing type instead.
+    acquire: ?Reference = null,
+    /// The type every value of which owes it (`Secret`, `Guarded(T).Guard`): its operations are
+    /// written as its members (`.deinit`), each resolved once in its container.
+    type: ?Reference = null,
+    /// What discharges it.
+    release: []const Reference = &.{},
+    /// What moves it off this value, each with where to (`Transfer`).
+    transfer: []const Transfer = &.{},
+    /// What ends the value, checking that a release came first (`MustUse.deinit`).
+    teardown: []const Reference = &.{},
+};
+
+/// A member that moves an obligation off its value, and where it goes, read from the member's
+/// declaration, never declared beside it: to the call's result where the declared result (through
+/// `!` and `?`) is a pair's type (`Guard.handOff` returning `Handoff`); else into the one parameter,
+/// the receiver aside, that points to a pair's type (`moveInto(self, destination: *Self)`).
+pub const Transfer = struct {
+    member: Reference,
+    to: union(enum) {
+        /// The call's result owes it: on success where the result is an error union, and only when
+        /// not null where it is optional; otherwise the source still owes it.
+        result,
+        /// The parameter at this position (the receiver counted) is given it.
+        argument: usize,
+        /// Not settled: the member does not resolve, or the pair was refused.
+        unknown,
+    } = .unknown,
+};
 
 /// Why part of a root's rules could not be read, and where.
 pub const Problem = struct {
@@ -72,6 +104,10 @@ pub const Problem = struct {
         unresolved,
         /// A reference to a declaration outside the declaring package.
         foreign,
+        /// A pair refused as written: an operation that is no function, a transfer whose
+        /// destination its declaration does not settle (no parameter or several), or a teardown
+        /// with no release to check for.
+        refused,
     };
 };
 
@@ -100,6 +136,7 @@ pub fn of(facts: *Facts, root: Project.FileId) Facts.ResolveError!*const Rules {
     if (facts.member(facts.rootOf(root), "lint_rules")) |decl| {
         found.declared = decl;
         try reader.declaration(decl);
+        try reader.settlePairs();
         found.replaces = try reader.replaces.toOwnedSlice(facts.gpa);
         found.deprecated = try reader.deprecated.toOwnedSlice(facts.gpa);
         found.roles = try reader.roles.toOwnedSlice(facts.gpa);
@@ -247,21 +284,124 @@ const Reader = struct {
     }
 
     fn pair(r: *Reader, file: Project.FileId, node: Ast.Node.Index) Error!void {
-        var entry: Pair = .{ .acquire = .unresolved, .release = &.{}, .transfer = &.{} };
+        var entry: Pair = .{ .file = file, .node = node };
         var buffer: [2]Ast.Node.Index = undefined;
         const literal = r.tree(file).fullStructInit(&buffer, node) orelse return r.problem(file, node, .malformed);
+        // The type first, wherever it is written: the operations are its members.
+        var owing: ?Facts.Container = null;
+        for (literal.ast.fields) |field| if (std.mem.eql(u8, fieldName(r.tree(file), field), "type")) {
+            entry.type = try r.reference(file, field, .own);
+            if (entry.type.?.declaration()) |decl| owing = try r.containerOf(decl);
+            if (owing == null and entry.type.? == .decl) try r.problem(file, field, .unresolved);
+        };
         for (literal.ast.fields) |field| {
             const name = fieldName(r.tree(file), field);
+            if (std.mem.eql(u8, name, "type")) continue;
             if (std.mem.eql(u8, name, "acquire")) {
                 entry.acquire = try r.reference(file, field, .own);
-            } else if (std.mem.eql(u8, name, "release") or std.mem.eql(u8, name, "transfer")) {
-                var each: std.ArrayList(Reference) = .empty;
-                for (try r.list(file, field) orelse continue) |one| try each.append(r.facts.gpa, try r.reference(file, one, .own));
-                const owned = try each.toOwnedSlice(r.facts.gpa);
-                if (std.mem.eql(u8, name, "release")) entry.release = owned else entry.transfer = owned;
-            } else try r.problem(file, field, .unknown_field);
+                continue;
+            }
+            if (std.mem.eql(u8, name, "transfer")) {
+                var moves: std.ArrayList(Transfer) = .empty;
+                for (try r.list(file, field) orelse continue) |one| try moves.append(r.facts.gpa, .{ .member = try r.operation(file, one, owing) });
+                entry.transfer = try moves.toOwnedSlice(r.facts.gpa);
+                continue;
+            }
+            const operations: *[]const Reference = if (std.mem.eql(u8, name, "release"))
+                &entry.release
+            else if (std.mem.eql(u8, name, "teardown"))
+                &entry.teardown
+            else {
+                try r.problem(file, field, .unknown_field);
+                continue;
+            };
+            var each: std.ArrayList(Reference) = .empty;
+            for (try r.list(file, field) orelse continue) |one| try each.append(r.facts.gpa, try r.operation(file, one, owing));
+            operations.* = try each.toOwnedSlice(r.facts.gpa);
         }
         try r.pairs.append(r.facts.gpa, entry);
+    }
+
+    /// Settles each pair once every pair is read: where each transfer goes, and the pairs refused.
+    fn settlePairs(r: *Reader) Error!void {
+        var owing: std.ArrayList(Facts.Container) = .empty;
+        for (r.pairs.items) |each| {
+            const decl = (each.type orelse continue).declaration() orelse continue;
+            try owing.append(r.facts.gpa, (try r.containerOf(decl)) orelse continue);
+        }
+        for (r.pairs.items) |*each| {
+            var refused = each.teardown.len != 0 and each.release.len == 0;
+            for ([_][]const Reference{ each.release, each.teardown }) |operations| for (operations) |named| {
+                if (named.declaration()) |decl| if (try r.facts.declaration(decl) != .function) {
+                    refused = true;
+                };
+            };
+            const moves = try r.facts.gpa.dupe(Transfer, each.transfer);
+            for (moves) |*move| {
+                const decl = move.member.declaration() orelse continue;
+                move.to = (try r.destination(decl, owing.items)) orelse {
+                    refused = true;
+                    continue;
+                };
+            }
+            if (refused) {
+                for (moves) |*move| move.to = .unknown;
+                try r.problem(each.file, each.node, .refused);
+            }
+            each.transfer = moves;
+        }
+    }
+
+    /// Where the function `decl` moves an obligation: its result where its declared result
+    /// (through `!` and `?`) is an owing type; else the one parameter, the receiver aside, that
+    /// points to an owing type. Null where neither settles it.
+    fn destination(r: *Reader, decl: Facts.Decl, owing: []const Facts.Container) Error!?@FieldType(Transfer, "to") {
+        if (try r.facts.declaration(decl) != .function) return null;
+        const t = r.tree(decl.file);
+        var buffer: [1]Ast.Node.Index = undefined;
+        const proto = t.fullFnProto(&buffer, r.facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node) orelse return null;
+        if (proto.ast.return_type.unwrap()) |result| {
+            if (owes(try r.facts.resolve(decl.file, result), owing, false)) return .result;
+        }
+        var found: ?usize = null;
+        var it = proto.iterate(t);
+        var position: usize = 0;
+        while (it.next()) |param| : (position += 1) {
+            const written = param.type_expr orelse continue;
+            if (position == 0) continue; // The receiver is the value the obligation leaves.
+            if (!owes(try r.facts.resolve(decl.file, written), owing, true)) continue;
+            if (found != null) return null;
+            found = position;
+        }
+        return if (found) |at| .{ .argument = at } else null;
+    }
+
+    /// The container a type declaration names: the type itself, or the one a type function
+    /// returns. Null where it resolves to neither.
+    fn containerOf(r: *Reader, decl: Facts.Decl) Error!?Facts.Container {
+        return switch (try r.facts.declaration(decl)) {
+            .container, .instance => |c| c,
+            .function => |function| switch ((try r.facts.template(function)) orelse return null) {
+                .container, .instance => |c| c,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// An operation of a pair: a member of the owing type written as an enum literal (`.deinit`),
+    /// resolved in its container, or a reference.
+    fn operation(r: *Reader, file: Project.FileId, node: Ast.Node.Index, owing: ?Facts.Container) Error!Reference {
+        if (r.tree(file).nodeTag(node) != .enum_literal) return r.reference(file, node, .own);
+        const container = owing orelse {
+            try r.problem(file, node, .unresolved);
+            return .unresolved;
+        };
+        const found = r.facts.member(container, try r.enumLiteral(file, node)) orelse {
+            try r.problem(file, node, .unresolved);
+            return .unresolved;
+        };
+        return .{ .decl = found };
     }
 
     /// A reference: an expression naming a declaration, or `.{ .generic = F, .member = .m }`,
@@ -436,7 +576,7 @@ test "a root's lint_rules are read by declaration: std's replaced, the package's
     try std.testing.expectEqualStrings("Secret", f.name(rules.roles[1].type));
     try std.testing.expectEqualStrings("secret", rules.roles[1].role);
     try std.testing.expectEqualStrings("data", rules.roles[1].internal[0]);
-    try std.testing.expectEqualStrings("acquire", f.name(rules.pairs[0].acquire));
+    try std.testing.expectEqualStrings("acquire", f.name(rules.pairs[0].acquire.?));
     try std.testing.expectEqualStrings("publish", f.name(rules.pairs[0].release[0]));
     // Read once for the run.
     try std.testing.expectEqual(rules, try of(&f.facts, f.project.sources[1].id));
@@ -491,4 +631,91 @@ test "a fork's copy of a package is the package by its stated identity, wherever
     try std.testing.expectEqualStrings("parallax", rules.package.name);
     try std.testing.expectEqualStrings("walk", f.name(rules.deprecated[0].decl));
     try std.testing.expectEqualStrings("next", f.name(rules.deprecated[0].with.?));
+}
+
+/// Whether `value` is one of the `owing` types: a value of one, seen through `!` and `?`, or
+/// (`pointer`) a pointer to one.
+fn owes(value: Facts.Value, owing: []const Facts.Container, pointer: bool) bool {
+    var current = value;
+    while (true) switch (current) {
+        .error_union, .optional => |inner| current = inner.*,
+        .pointer => |inner| {
+            if (!pointer) return false;
+            current = inner.child.*;
+        },
+        .container, .instance => |c| {
+            for (owing) |each| if (each.file == c.file and each.scope == c.scope) return true;
+            return false;
+        },
+        else => return false,
+    };
+}
+
+test "a pair of a type names its operations as its members, and where a transfer moves the obligation is read from the member's declaration" {
+    var f: Fixture = undefined;
+    try f.init(&.{.{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes =
+        \\pub fn Guarded(comptime T: type) type {
+        \\    return struct {
+        \\        value: T,
+        \\        pub const Guard = struct {
+        \\            pub fn deinit(g: *Guard) void { _ = g; }
+        \\            pub fn handOff(g: *Guard) Handoff { _ = g; return .{}; }
+        \\            pub fn tryHandOff(g: *Guard) ?Handoff { _ = g; return null; }
+        \\        };
+        \\        pub const Handoff = struct {
+        \\            pub fn release(h: *Handoff) void { _ = h; }
+        \\        };
+        \\    };
+        \\}
+        \\pub const Reservation = struct {
+        \\    pub fn release(r: *Reservation) void { _ = r; }
+        \\    pub fn moveInto(r: *Reservation, destination: *Reservation) void { _ = r; _ = destination; }
+        \\};
+        \\pub const lint_rules = .{
+        \\    .version = 1,
+        \\    .pairs = .{
+        \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .release = .{.deinit}, .transfer = .{ .handOff, .tryHandOff } },
+        \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .release = .{.release} },
+        \\        .{ .type = Reservation, .release = .{.release}, .transfer = .{.moveInto} },
+        \\    },
+        \\};
+    }}, &.{});
+    defer f.deinit();
+    const rules = try of(&f.facts, f.project.sources[0].id);
+    try std.testing.expectEqual(@as(usize, 0), rules.problems.len);
+    try std.testing.expectEqualStrings("deinit", f.name(rules.pairs[0].release[0]));
+    // To the result: a `Handoff`, and through `?` one that may be null.
+    try std.testing.expect(rules.pairs[0].transfer[0].to == .result);
+    try std.testing.expect(rules.pairs[0].transfer[1].to == .result);
+    // Into the one parameter, the receiver aside, that points to an owing type.
+    try std.testing.expectEqual(@as(usize, 1), rules.pairs[2].transfer[0].to.argument);
+}
+
+test "a pair is refused as written where its operations do not settle: a transfer to nothing or to two places, a teardown with no release, a member that is not there or no function" {
+    const head =
+        \\pub const R = struct {
+        \\    pub const kind = 1;
+        \\    pub fn release(r: *R) void { _ = r; }
+        \\    pub fn deinit(r: *R) void { _ = r; }
+        \\    pub fn drop(r: *R) void { _ = r; }
+        \\    pub fn split(r: *R, a: *R, b: *R) void { _ = r; _ = a; _ = b; }
+        \\};
+        \\
+    ;
+    for ([_]struct { []const u8, Problem.Why }{
+        .{ ".{ .type = R, .release = .{.release}, .transfer = .{.drop} }", .refused },
+        .{ ".{ .type = R, .release = .{.release}, .transfer = .{.split} }", .refused },
+        .{ ".{ .type = R, .teardown = .{.deinit} }", .refused },
+        .{ ".{ .type = R, .release = .{.relase} }", .unresolved },
+        .{ ".{ .type = R, .release = .{.kind} }", .refused },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ head, "pub const lint_rules = .{ .version = 1, .pairs = .{", case[0], "} };\n" });
+        defer std.testing.allocator.free(source);
+        var f: Fixture = undefined;
+        try f.init(&.{.{ .name = "pkg/root.zig", .package = "pkg", .fingerprint = 7, .bytes = source }}, &.{});
+        defer f.deinit();
+        const rules = try of(&f.facts, f.project.sources[0].id);
+        try std.testing.expectEqual(@as(usize, 1), rules.problems.len);
+        try std.testing.expectEqual(case[1], rules.problems[0].why);
+    }
 }
