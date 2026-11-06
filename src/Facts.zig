@@ -26,6 +26,10 @@ role_names: ?[]const []const u8 = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
+/// What each capture holds (`declaration`), by the set of assumptions in force where it is read:
+/// a capture's name is read wherever it is written, and each reading of a tuple's element
+/// chose it afresh, in memory nothing frees.
+captures: std.AutoHashMapUnmanaged(CaptureKey, Value) = .empty,
 /// Each condition's truth and each value fixed at compile time on a reading (`comptimeMemo`), by
 /// the interned reading (`keptReading`)
 /// and the comptime conditions settled around it.
@@ -139,6 +143,7 @@ pub const Key = struct { file: Project.FileId, node: Ast.Node.Index };
 /// A node read under a set of settled comptime conditions (`assumed`).
 const Settled = struct { key: Key, assumed: ?Assumptions.Id };
 const Bound = struct { env: *const Env, settled: Settled };
+const CaptureKey = struct { decl: Decl, assumed: ?Assumptions.Id };
 const TruthKey = struct { key: Key, env: ?*const Env, assumed: ?Assumptions.Id, value: bool = false };
 /// A set of settled assumptions, held once in `settled`.
 const Assumptions = struct {
@@ -349,6 +354,7 @@ pub fn reifiedParts(self: *Facts, built: Reified) ResolveError!Value {
 pub fn deinit(self: *Facts) void {
     self.cache.deinit(self.gpa);
     self.bound.deinit(self.gpa);
+    self.captures.deinit(self.gpa);
     self.readings.deinit(self.gpa);
     self.active.deinit(self.gpa);
     self.truths_open.deinit(self.gpa);
@@ -7277,7 +7283,17 @@ pub fn declaration(self: *Facts, decl: Decl) ResolveError!Value {
         };
         return typed;
     }
-    if (declaration_record.kind == .capture) return self.captured(null, decl);
+    if (declaration_record.kind == .capture) {
+        const key: CaptureKey = .{ .decl = decl, .assumed = self.assumed };
+        if (self.captures.get(key)) |kept| return kept;
+        const wide = self.wide;
+        const met = self.open_met;
+        const value = try self.captured(null, decl);
+        // Kept as `resolve` keeps, and an unknown only where it met no query in progress
+        // (`open_met`): one that did is asked again.
+        if (self.remaining != 0 and !self.wideSince(wide) and (value != .unknown or self.open_met == met)) try self.captures.put(self.gpa, key, value);
+        return value;
+    }
     if (declaration_record.kind == .field) {
         const field = model.containerField(tree, declaration_record.node).?; // unreachable: the declaration is a field's
         if (field.ast.type_expr.unwrap()) |t| return self.instance(try self.resolve(decl.file, t));
@@ -15220,6 +15236,26 @@ test "facts aliases cycles and absent module mappings stay unknown" {
     try std.testing.expectEqual(Unknown.cycle, (try facts.resolve(project.sources[0].id, first)).unknown);
     const dep = project.sources[0].file.tree.fullVarDecl(project.sources[0].model.declarations[2].node).?.ast.init_node.unwrap().?;
     try std.testing.expectEqual(Unknown.missing_mapping, (try facts.resolve(project.sources[0].id, dep)).unknown);
+}
+
+test "a capture is read once for the run: its name read again makes nothing new (a tuple's element chosen afresh at each read grew the run's memory)" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const kinds = .{ @as(u8, 1), true };\npub fn f() void {\n    inline for (kinds) |kind| _ = kind;\n}\n" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const model = &project.sources[0].model;
+    const capture: Decl = for (model.declarations, 0..) |record, i| {
+        if (record.kind == .capture) break .{ .file = project.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+    } else unreachable; // unreachable: the source captures `kind`
+    const first = try facts.declaration(capture);
+    try std.testing.expect(first != .unknown);
+    const own = facts.gpa;
+    facts.gpa = std.mem.Allocator.failing;
+    const again = try facts.declaration(capture);
+    facts.gpa = own;
+    try std.testing.expect(sameValue(first, again));
 }
 
 test "facts read a ZON import as the value its file holds" {
