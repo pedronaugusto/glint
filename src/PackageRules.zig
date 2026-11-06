@@ -161,6 +161,93 @@ pub fn roots(facts: *Facts) Facts.ResolveError![]const Project.FileId {
     return found.toOwnedSlice(facts.gpa);
 }
 
+/// A library's declared roles in this project (`publication`): what its package's roots declare.
+/// Roles are the caller's enum values; the reader never interprets them.
+pub const Publication = struct {
+    entries: []const Entry,
+    /// Where the roles are not all read: undecided where a file imports that root, never silence.
+    gaps: []const Gap,
+    /// The library's own files: those of its package's identity. A file republishing its API,
+    /// or a copy vendored without its manifest, stays the program's.
+    files: []const Project.FileId,
+};
+pub const Entry = struct { role: u32, target: Target };
+pub const Target = union(enum) { function: Facts.Decl, container: Facts.Container };
+/// A root of the library whose roles are not all read: it declares no `lint_rules` (`problem`
+/// null), or part of what it declares could not be read (`Problem`, where it is written).
+/// Reported where a file imports that root, under whatever name.
+pub const Gap = struct { root: Project.FileId, problem: ?Problem };
+
+const Publications = struct { found: std.AutoHashMapUnmanaged(u64, *const Publication) = .empty };
+
+/// What `library`'s package declares (`Library`): each role its roots' `lint_rules` give (`of`)
+/// that the library's `Role` names, on the declaration it names; a type function's role on each
+/// container it returns too (`Facts.returnedContainers`), which its instances are. A root that
+/// declares no `lint_rules`, or whose rules are not all read (a version this reader does not know,
+/// a reference that does not resolve, a role no pack reads), is a gap: its roles may be missing,
+/// so a rule reading them is undecided where that root is imported, never plain. Found once per
+/// run and shared by every rule.
+pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Publication {
+    const Roles = @TypeOf(library).Role;
+    const vocabulary = comptime std.hash.Wyhash.hash(0, @typeName(Roles));
+    const keyed = vocabulary ^ library.package.fingerprint;
+    const memo = try facts.memo(Publications);
+    if (memo.found.get(keyed)) |known| return known;
+    var entries: std.ArrayList(Entry) = .empty;
+    var gaps: std.ArrayList(Gap) = .empty;
+    for (try facts.packageRoots(library.package)) |root| {
+        const rules = try of(facts, root);
+        if (rules.declared == null) try gaps.append(facts.gpa, .{ .root = root, .problem = null });
+        for (rules.problems) |problem| try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
+        for (rules.roles) |declared| {
+            const role_value: u32 = @intCast(@backingInt(std.meta.stringToEnum(Roles, declared.role) orelse continue));
+            const decl = declared.type.declaration() orelse continue;
+            switch (try facts.declaration(decl)) {
+                .function => |function| {
+                    try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .function = function } });
+                    // The container a type function returns is also its type: instances declared
+                    // with it are the role's, each container it may return where it chooses one
+                    // by a comptime option (aegis 0.3's `SlotPool(T, Tag, options)`).
+                    if (try facts.template(function)) |returned| for (try Facts.returnedContainers(facts.gpa, returned)) |made| {
+                        try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } });
+                    };
+                },
+                .container => |made| try entries.append(facts.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } }),
+                // A role on what is no type and no function: the declarer's own lint reports
+                // the form; for its consumers the role is not read.
+                else => try gaps.append(facts.gpa, .{ .root = root, .problem = .{ .file = decl.file, .node = facts.project.at(decl.file).model.declarations[@backingInt(decl.index)].node, .why = .malformed } }),
+            }
+        }
+    }
+    var files: std.ArrayList(Project.FileId) = .empty;
+    for (facts.project.sources) |*source| if (facts.ofPackage(source.id, library.package)) try files.append(facts.gpa, source.id);
+    const result = try facts.gpa.create(Publication);
+    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
+    try memo.found.put(facts.gpa, keyed, result);
+    return result;
+}
+
+/// The role `library`'s package declares for a function declaration, or a type or instance of a
+/// container with a role, seen through pointers, optionals and error unions.
+pub fn role(facts: *Facts, library: anytype, value: Facts.Value) Facts.ResolveError!?@TypeOf(library).Role {
+    const Roles = @TypeOf(library).Role;
+    const found = try publication(facts, library);
+    var current = value;
+    while (true) switch (current) {
+        .pointer => |inner| current = inner.child.*,
+        .array, .optional, .error_union => |inner| current = inner.*,
+        .function => |decl| {
+            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Roles, @fromBackingInt(@intCast(entry.role)));
+            return null;
+        },
+        .container, .instance => |c| {
+            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Roles, @fromBackingInt(@intCast(entry.role)));
+            return null;
+        },
+        else => return null,
+    };
+}
+
 const Reader = struct {
     facts: *Facts,
     package: Identity,
