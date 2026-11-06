@@ -389,8 +389,8 @@ pub const Flow = struct {
     specs: []const Spec = &.{},
     masks: Masks = .{},
     functions: std.ArrayList(Function) = .empty,
-    /// Per file, each node's nearest enclosing function, by its index in `functions`.
-    owners: std.AutoHashMapUnmanaged(Project.FileId, []?Function.Id) = .empty,
+    /// Per file, the functions the flow reads of it (`Owners`).
+    owners: std.AutoHashMapUnmanaged(Project.FileId, Owners) = .empty,
     by_node: std.AutoHashMapUnmanaged(Facts.Key, Function.Id) = .empty,
     /// What each call read reaches (`resolveCall`).
     callees: std.AutoHashMapUnmanaged(Facts.Key, Callee) = .empty,
@@ -463,10 +463,6 @@ pub const Flow = struct {
     /// the allocator a size; not known where std's allocator does not resolve.
     allocations: std.AutoHashMapUnmanaged(Facts.Decl, void) = .empty,
     allocations_known: bool = true,
-    /// A summary's files, each one's functions' bodies grouped once (`bodies`), and the nodes
-    /// that grouping read: a count a test holds to the files, not the functions.
-    bodies: std.AutoHashMapUnmanaged(Project.FileId, std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index)) = .empty,
-    walked: usize = 0,
     /// The sinks a rule reads in each function of a file the run does not select (a
     /// dependency's), by the rule and the function (`functionKey`), read once: what each takes
     /// from its function's parameters, judged at the calls that reach it (`PassedSink`,
@@ -677,8 +673,8 @@ fn parsers(c: *Context, flow: *Flow) Context.Error!void {
     var files = flow.owners.iterator();
     while (files.next()) |entry| {
         const file = entry.key_ptr.*;
-        for (entry.value_ptr.*, 0..) |own, i| {
-            if (own == null) continue;
+        for (0..entry.value_ptr.syntax.of.len) |i| {
+            if (entry.value_ptr.at(i) == null) continue;
             const callee = (try resolveCall(c, flow, file, @fromBackingInt(@intCast(i)))) orelse continue;
             if (callee.kind != .aegis) continue;
             if (try parserOf(c, flow, file, callee.params, callee.decl.?)) |target| flow.functions.items[@backingInt(target)].parser = true;
@@ -774,26 +770,108 @@ fn functionsOf(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!voi
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    const tree = &c.project.at(file).file.tree;
-    const owners = try c.allocator.alloc(?Function.Id, tree.nodes.len);
-    @memset(owners, null);
-    for (tree.nodes.items(.tag), 0..) |tag, i| {
-        if (tag != .fn_decl) continue;
-        _ = try addFunction(c, flow, file, @fromBackingInt(@intCast(i)));
+    const syntax = try functionsIn(c, file);
+    const ids = try c.allocator.alloc(?Function.Id, syntax.decls.len);
+    for (syntax.decls, syntax.bodies, ids) |node, body, *id| {
+        id.* = try addFunction(c, flow, file, node);
+        if (id.*) |one| flow.functions.items[@backingInt(one)].nodes = body;
     }
-    var held: std.AutoHashMapUnmanaged(Function.Id, std.ArrayList(Ast.Node.Index)) = .empty;
-    for (0..tree.nodes.len) |i| {
-        const function = enclosing(c, file, @fromBackingInt(@intCast(i))) orelse continue;
-        owners[i] = flow.by_node.get(.{ .file = file, .node = function });
-        const id = owners[i] orelse continue;
-        const entry = try held.getOrPut(c.allocator, id);
-        if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(c.allocator, @fromBackingInt(@intCast(i)));
-    }
-    var each = held.iterator();
-    while (each.next()) |entry| flow.functions.items[@backingInt(entry.key_ptr.*)].nodes = try entry.value_ptr.toOwnedSlice(c.allocator);
-    try flow.owners.put(c.allocator, file, owners);
+    try flow.owners.put(c.allocator, file, .{ .syntax = syntax, .ids = ids });
 }
+
+/// A file's functions by syntax alone (`enclosing`), found once per run however many flows
+/// read the file: each `fn_decl` in the file's order, its body (the nodes it holds outside any
+/// function nested in it), and each node's function among them.
+const FileFunctions = struct {
+    decls: []const Ast.Node.Index,
+    bodies: []const []const Ast.Node.Index,
+    /// Per node, its function's position in `decls`.
+    of: []const Position,
+
+    const Position = enum(u32) { none = std.math.maxInt(u32), _ };
+
+    /// The position of the `fn_decl` `node` in `decls`.
+    fn position(self: *const FileFunctions, node: Ast.Node.Index) ?usize {
+        return std.sort.binarySearch(Ast.Node.Index, self.decls, node, struct {
+            fn order(key: Ast.Node.Index, item: Ast.Node.Index) std.math.Order {
+                return std.math.order(@backingInt(key), @backingInt(item));
+            }
+        }.order);
+    }
+};
+
+/// The run's `FileFunctions`, by file, and the nodes their grouping read: a count a test
+/// holds to the files, not the functions or the flows that read them.
+const Functions = struct {
+    map: std.AutoHashMapUnmanaged(Project.FileId, *const FileFunctions) = .empty,
+    walked: usize = 0,
+};
+
+fn functionsIn(c: *Context, file: Project.FileId) Context.Error!*const FileFunctions {
+    // What it keeps in its memo stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    const memo = try c.facts.memo(Functions);
+    if (memo.map.get(file)) |known_functions| return known_functions;
+    const tree = &c.project.at(file).file.tree;
+    // Counted, then each list made at its size: what the run holds is the same in whatever
+    // order the file declares its functions.
+    const tags = tree.nodes.items(.tag);
+    const decls = try c.allocator.alloc(Ast.Node.Index, std.mem.count(Ast.Node.Tag, tags, &.{.fn_decl}));
+    var next_decl: usize = 0;
+    for (tags, 0..) |tag, i| if (tag == .fn_decl) {
+        decls[next_decl] = @fromBackingInt(@intCast(i));
+        next_decl += 1;
+    };
+    const of = try c.allocator.alloc(FileFunctions.Position, tree.nodes.len);
+    const made = try c.allocator.create(FileFunctions);
+    made.* = .{ .decls = decls, .bodies = &.{}, .of = of };
+    const sizes = try c.allocator.alloc(usize, decls.len);
+    @memset(sizes, 0);
+    var held: usize = 0;
+    for (of, 0..) |*slot, i| {
+        memo.walked += 1;
+        const function = enclosing(c, file, @fromBackingInt(@intCast(i))) orelse {
+            slot.* = .none;
+            continue;
+        };
+        const at = made.position(function).?; // unreachable: `enclosing` gives a `fn_decl`
+        slot.* = @fromBackingInt(@intCast(at));
+        sizes[at] += 1;
+        held += 1;
+    }
+    const nodes = try c.allocator.alloc(Ast.Node.Index, held);
+    const bodies = try c.allocator.alloc([]Ast.Node.Index, decls.len);
+    var start: usize = 0;
+    for (bodies, sizes) |*body, size| {
+        body.* = nodes[start..][0..size];
+        start += size;
+    }
+    @memset(sizes, 0);
+    for (of, 0..) |slot, i| if (slot != .none) {
+        const at = @backingInt(slot);
+        bodies[at][sizes[at]] = @fromBackingInt(@intCast(i));
+        sizes[at] += 1;
+    };
+    made.bodies = bodies;
+    try memo.map.put(c.allocator, file, made);
+    return made;
+}
+
+/// The functions a flow reads of a file: its `FileFunctions`, and the flow's function for each
+/// one it reads, by position.
+const Owners = struct {
+    syntax: *const FileFunctions,
+    ids: []?Function.Id,
+
+    /// The flow's function whose body holds the node at `index`, if the flow reads it.
+    fn at(self: Owners, index: usize) ?Function.Id {
+        if (index >= self.syntax.of.len) return null;
+        const position = self.syntax.of[index];
+        if (position == .none) return null;
+        return self.ids[@backingInt(position)];
+    }
+};
 
 /// A function of the flow for the `fn_decl` `node`, its nodes not yet given.
 fn addFunction(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Function.Id {
@@ -848,8 +926,7 @@ fn enclosing(c: *Context, file: Project.FileId, node: Ast.Node.Index) ?Ast.Node.
 /// The function whose body holds `node`, if the fact reads it.
 fn owner(flow: *const Flow, file: Project.FileId, node: Ast.Node.Index) ?Function.Id {
     const owners = flow.owners.get(file) orelse return null;
-    const index = @backingInt(node);
-    return if (index < owners.len) owners[index] else null;
+    return owners.at(@backingInt(node));
 }
 
 /// One round over a function's bindings: what each local, field, parameter and result takes.
@@ -1779,8 +1856,7 @@ fn resolveCall(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.In
 fn instanceCall(c: *Context, flow: *Flow, file: Project.FileId, node: Ast.Node.Index) Context.Error!?Facts.calls.Call {
     const call = (try Facts.calls.at(c.facts, file, node)) orelse return null;
     if (call.callee != .any and call.args == .known) return call;
-    const owners = flow.owners.get(file) orelse return call;
-    const function = owners[@backingInt(node)] orelse return call;
+    const function = owner(flow, file, node) orelse return call;
     const f = flow.functions.items[@backingInt(function)];
     if (f.every_reading or f.readings.items.len == 0) return call;
     var decls: std.ArrayList(Facts.Decl) = .empty;
@@ -3355,8 +3431,8 @@ fn callSites(c: *Context, flow: *Flow) Context.Error!*CallSites {
     var files = flow.owners.iterator();
     while (files.next()) |entry| {
         const file = entry.key_ptr.*;
-        for (entry.value_ptr.*, 0..) |own, i| {
-            const caller = own orelse continue;
+        for (0..entry.value_ptr.syntax.of.len) |i| {
+            const caller = entry.value_ptr.at(i) orelse continue;
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             const callee = (try resolveCall(c, flow, file, node)) orelse continue;
             const one = [1]Callee{callee};
@@ -4010,7 +4086,7 @@ fn leaves(c: *Context, flow: *Flow, function: Function.Id, statement: Ast.Node.I
     }
     for (jumps[low..]) |node| {
         if (tree.nodeMainToken(node) > last) break;
-        if (owners[@backingInt(node)] != function) continue;
+        if (owners.at(@backingInt(node)) != function) continue;
         const seen = switch (tree.nodeTag(node)) {
             .@"return", .@"try" => bound == null,
             .@"break", .@"continue" => if (jumpTarget(tree, model, node)) |target| tree.firstToken(target) < first and (bound == null or bound.? < tree.firstToken(target)) else true,
@@ -4154,8 +4230,8 @@ pub fn sinkSites(c: *Context, fact: Fact, file: Project.FileId) Context.Error![]
     const flow = fact.flow;
     if (flow.sink_sites.get(.{ fact.lane, file })) |known_sites| return known_sites;
     var calls: std.ArrayList(Callee) = .empty;
-    if (flow.owners.get(file)) |owners| for (owners, 0..) |own, i| {
-        if (own == null) continue;
+    if (flow.owners.get(file)) |owners| for (0..owners.syntax.of.len) |i| {
+        if (owners.at(i) == null) continue;
         try calls.append(c.allocator, (try resolveCall(c, flow, file, @fromBackingInt(@intCast(i)))) orelse continue);
     };
     var out: std.ArrayList(SinkSite) = .empty;
@@ -4830,16 +4906,16 @@ fn reach(c: *Context, flow: *Flow, decl: Facts.Decl, env: ?*const Facts.Env, nex
     const node = fnDecl(c, decl) orelse return;
     if (flow.by_node.get(.{ .file = decl.file, .node = node })) |known_id| return readIn(c, flow, known_id, env, next);
     const id = (try addFunction(c, flow, decl.file, node)) orelse return;
-    const tree = &c.project.at(decl.file).file.tree;
     const entry = try flow.owners.getOrPut(c.allocator, decl.file);
     if (!entry.found_existing) {
-        const owners = try c.allocator.alloc(?Function.Id, tree.nodes.len);
-        @memset(owners, null);
-        entry.value_ptr.* = owners;
+        const syntax = try functionsIn(c, decl.file);
+        const ids = try c.allocator.alloc(?Function.Id, syntax.decls.len);
+        @memset(ids, null);
+        entry.value_ptr.* = .{ .syntax = syntax, .ids = ids };
     }
-    const nodes = (try bodies(c, flow, decl.file)).get(node) orelse &.{};
-    for (nodes) |at| entry.value_ptr.*[@backingInt(at)] = id;
-    flow.functions.items[@backingInt(id)].nodes = nodes;
+    const at = entry.value_ptr.syntax.position(node).?; // unreachable: `fnDecl` gives a `fn_decl`
+    entry.value_ptr.ids[at] = id;
+    flow.functions.items[@backingInt(id)].nodes = entry.value_ptr.syntax.bodies[at];
     // Reached with no reading in a summary of one instantiation, it is what the summary of
     // every instantiation found, closed there: taken whole, not read again.
     if (env == null) if (flow.shared) |shared| if (shared.by_node.get(.{ .file = decl.file, .node = node })) |kept| {
@@ -4885,33 +4961,6 @@ fn readIn(c: *Context, flow: *Flow, id: Function.Id, env: ?*const Facts.Env, nex
         f.every_reading = true;
     }
     try next.append(c.allocator, .{ .id = id, .env = env });
-}
-
-/// Each `fn_decl` of a file a summary reads, by its node, with the nodes its body holds outside
-/// any function nested in it: grouped once per file, however many of its functions are read.
-fn bodies(c: *Context, flow: *Flow, file: Project.FileId) Context.Error!*const std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index) {
-    // What it keeps in the run's solve stays for the run.
-    const rule_memory = c.keep();
-    defer c.allocator = rule_memory;
-    // Grouped by syntax alone: a summary of one instantiation takes every instantiation's.
-    if (flow.shared) |shared| return bodies(c, shared, file);
-    const entry = try flow.bodies.getOrPut(c.allocator, file);
-    if (entry.found_existing) return entry.value_ptr;
-    var grouped: std.AutoHashMapUnmanaged(Ast.Node.Index, std.ArrayList(Ast.Node.Index)) = .empty;
-    const tree = &c.project.at(file).file.tree;
-    for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
-        const function = enclosing(c, file, node) orelse continue;
-        const group = try grouped.getOrPut(c.allocator, function);
-        if (!group.found_existing) group.value_ptr.* = .empty;
-        try group.value_ptr.append(c.allocator, node);
-        flow.walked += 1;
-    }
-    var out: std.AutoHashMapUnmanaged(Ast.Node.Index, []const Ast.Node.Index) = .empty;
-    var each = grouped.iterator();
-    while (each.next()) |group| try out.put(c.allocator, group.key_ptr.*, try group.value_ptr.toOwnedSlice(c.allocator));
-    entry.value_ptr.* = out;
-    return entry.value_ptr;
 }
 
 /// What a function of a summary sizes work by (`Function.sizes`): every argument of an
@@ -5229,7 +5278,8 @@ test "the sizes fact reads a std file's bodies once, however many of its functio
     const sized = fact.flow.sized.?;
     try std.testing.expectEqual(64, sized.functions.items.len);
     // One pass over the file's nodes, not one per function reached (64 here).
-    try std.testing.expect(sized.walked > 0 and sized.walked <= project.at(project.sources[2].id).file.tree.nodes.len);
+    const walked = (try facts.memo(Functions)).walked;
+    try std.testing.expect(walked > 0 and walked <= project.at(project.sources[0].id).file.tree.nodes.len + project.at(project.sources[2].id).file.tree.nodes.len);
 }
 
 test "the input fact asks a governed name once per run, however many places read a field" {
