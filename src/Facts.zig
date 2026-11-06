@@ -17,6 +17,10 @@ gpa: std.mem.Allocator,
 /// std's, are not the program's (`program`), under whatever name a program imports it. Only
 /// files the caller states are that package's: a module republishing it stays the program's.
 known: ?Package = null,
+/// The role names the run's packs read (`RuleContext.Rule.roles` and glint's own packs'), set by
+/// the run: a role a package's `lint_rules` names that none of them is, is a problem where it is
+/// written (PackageRules). Null where no run states them: no name is then judged.
+role_names: ?[]const []const u8 = null,
 cache: std.AutoHashMapUnmanaged(Settled, Value) = .empty,
 /// What a node gives in a reading (`resolveIn`), by the reading's address and the node.
 bound: std.AutoHashMapUnmanaged(Bound, Value) = .empty,
@@ -522,7 +526,7 @@ pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(
 /// nothing built short (the program's solve, `Taint.get`), or the mark that it ran short. What
 /// one keeps is the run's (`gpa`), never a part of an index dropped here.
 pub fn forget(self: *Facts) void {
-    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
+    var fresh: Facts = .{ .project = self.project, .gpa = self.gpa, .known = self.known, .role_names = self.role_names, .remaining = self.remaining, .cache = self.cache, .bound = self.bound, .readings = self.readings, .settled = self.settled, .lasting = self.lasting };
     self.cache = .empty;
     self.bound = .empty;
     self.readings = .empty;
