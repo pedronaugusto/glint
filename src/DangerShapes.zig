@@ -2689,13 +2689,22 @@ fn acquisitionOf(c: *Context, file: Project.FileId, call: *const Facts.calls.Cal
         };
         const record = c.project.at(decl.file).model.declarations[@backingInt(decl.index)];
         const owner: Facts.Value = .{ .container = .{ .file = decl.file, .scope = record.scope } };
-        if (record.kind == .function and try c.role(Contract.library, owner) == .guarded and Contract.acquisition(record.name)) {
-            const ranked = std.mem.find(u8, record.name, "Ordered") != null;
-            // Of a choice, ranked only where each is; read before `lock` is written.
-            const found: Lock = .{ .ranked = ranked and (if (lock) |earlier| earlier.ranked else true), .context = if (ranked) try contextOf(c, file, call) else null };
-            lock = found;
-            continue;
-        }
+        // A guarded owner's acquisition, by its declared result's role (`Contract.acquired`):
+        // ranked where that is an Order's capability. One whose result does not resolve may be.
+        if (record.kind == .function and try c.role(Contract.library, owner) == .guarded) switch (try Contract.acquired(c, decl)) {
+            .plain, .ranked => |how| {
+                const ranked = how == .ranked;
+                // Of a choice, ranked only where each is; read before `lock` is written.
+                const found: Lock = .{ .ranked = ranked and (if (lock) |earlier| earlier.ranked else true), .context = if (ranked) try contextOf(c, file, call) else null };
+                lock = found;
+                continue;
+            },
+            .unknown => {
+                other = true;
+                continue;
+            },
+            .no => {},
+        };
         // std's, by its value alone (`Future(Guard).await` gives one).
         if (program.std_files.contains(@backingInt(decl.file))) {
             other = true;
@@ -2895,7 +2904,11 @@ const Guard = union(enum) { no, plain, ranked, unknown: Facts.Unknown };
 /// is a guard where its declared result names one.
 fn guardValue(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!Guard {
     return switch (try guardHeld(c, try c.facts.resolve(file, node))) {
-        .unknown => |why| if (try Contract.kind(c, file, node, 0) != .guard) .{ .unknown = why } else if (try rankedForm(c, file, node)) .ranked else .plain,
+        .unknown => |why| switch ((try Contract.kind(c, file, node, 0)) orelse return .{ .unknown = why }) {
+            .guard => .plain,
+            .ranked_guard => .ranked,
+            else => .{ .unknown = why },
+        },
         else => |found| found,
     };
 }
@@ -2922,46 +2935,12 @@ fn guardHeld(c: *Context, value: Facts.Value) Context.Error!Guard {
     return guard;
 }
 
-/// Whether a call is an owner's ranked acquisition by its form (`acquireOrdered`, `readOrdered`,
-/// ...), as AegisContract.kind reads an acquisition whose value does not resolve.
-fn rankedForm(c: *Context, file: Project.FileId, node: Ast.Node.Index) Context.Error!bool {
-    const tree = &c.project.at(file).file.tree;
-    var buffer: [1]Ast.Node.Index = undefined;
-    const call = tree.fullCall(&buffer, node) orelse return false;
-    const method = (try Facts.accesses.memberRead(c.facts, file, call.ast.fn_expr)) orelse return false;
-    const name = method.name orelse return false;
-    return Contract.acquisition(name) and std.mem.find(u8, name, "Ordered") != null;
-}
-
-/// Whether a container is a guard's: declared within an aegis owner, or an Order's
-/// `Capability`.
+/// Whether a container is a guard's, by the role aegis declares for it (`Contract.isGuard`): an
+/// owner's guard, or an Order's ranked capability. A `Handoff` holds no lock.
 fn guardType(c: *Context, held: Facts.Container) Context.Error!Guard {
-    const model = &c.project.at(held.file).model;
-    const tree = &c.project.at(held.file).file.tree;
-    var scope = model.scopes[@backingInt(held.scope)].parent;
-    while (scope) |s| : (scope = model.scopes[@backingInt(s)].parent) {
-        if (model.scopes[@backingInt(s)].kind != .container) continue;
-        if (try c.role(Contract.library, .{ .container = .{ .file = held.file, .scope = s } }) != .guarded) continue;
-        // Of what an owner declares, its guards (`Guard`, `ReadGuard`, `WriteGuard`); a
-        // `Handoff` holds no lock.
-        const declared = model.parentOf(model.scopes[@backingInt(held.scope)].node) orelse return .no;
-        const variable = tree.fullVarDecl(declared) orelse return .no;
-        return if (Contract.guardType(tree.tokenSlice(variable.ast.mut_token + 1))) .plain else .no;
-    }
-    const orders = switch (try Governed.declarations(c, "aegis", "Order")) {
-        .decls => |decls| decls,
-        .none => return .no,
-        .unknown => |why| return .{ .unknown = why },
-    };
-    for (orders) |order| {
-        const decl = (try originKnown(c, order)) orelse return .{ .unknown = .unresolved };
-        if (decl.file != held.file) continue;
-        const capability = model.scopes[@backingInt(model.root())].names.get("Capability") orelse continue;
-        const function = model.parentOf(model.declarations[@backingInt(capability)].node) orelse continue;
-        const first = model.scopes[@backingInt(held.scope)].first;
-        if (first >= tree.firstToken(function) and first <= tree.lastToken(function)) return .ranked;
-    }
-    return .no;
+    const k = try c.role(Contract.library, .{ .container = held });
+    if (!Contract.isGuard(k)) return .no;
+    return if (k == .ranked_guard) .ranked else .plain;
 }
 
 /// A016: two or more identifying integers of one type meeting in one public signature or one
