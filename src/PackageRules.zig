@@ -68,6 +68,8 @@ pub const Pair = struct {
     transfer: []const Transfer = &.{},
     /// What ends the value, checking that a release came first (`MustUse.deinit`).
     teardown: []const Reference = &.{},
+    /// Refused as written (`Problem.Why.refused`): what its operations do is not known.
+    refused: bool = false,
 };
 
 /// A member that moves an obligation off its value, and where it goes, read from the member's
@@ -170,6 +172,8 @@ pub const Publication = struct {
     /// The library's own files: those of its package's identity. A file republishing its API,
     /// or a copy vendored without its manifest, stays the program's.
     files: []const Project.FileId,
+    /// The obligations no body shows, each pair as its root declares it (`of`).
+    pairs: []const Pair = &.{},
 };
 /// A role on a declaration, with the fields only its package touches (`.internal`, A001's).
 pub const Entry = struct { role: u32, target: Target, internal: []const []const u8 = &.{} };
@@ -196,10 +200,12 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
     if (memo.found.get(keyed)) |known| return known;
     var entries: std.ArrayList(Entry) = .empty;
     var gaps: std.ArrayList(Gap) = .empty;
+    var pairs: std.ArrayList(Pair) = .empty;
     for (try facts.packageRoots(library.package)) |root| {
         const rules = try of(facts, root);
         if (rules.declared == null) try gaps.append(facts.gpa, .{ .root = root, .problem = null });
         for (rules.problems) |problem| try gaps.append(facts.gpa, .{ .root = root, .problem = problem });
+        try pairs.appendSlice(facts.gpa, rules.pairs);
         for (rules.roles) |declared| {
             const role_value = roleValue(Roles, declared.role) orelse continue;
             const decl = declared.type.declaration() orelse continue;
@@ -223,9 +229,29 @@ pub fn publication(facts: *Facts, library: anytype) Facts.ResolveError!*const Pu
     var files: std.ArrayList(Project.FileId) = .empty;
     for (facts.project.sources) |*source| if (facts.ofPackage(source.id, library.package)) try files.append(facts.gpa, source.id);
     const result = try facts.gpa.create(Publication);
-    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
+    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items, .pairs = pairs.items };
     try memo.found.put(facts.gpa, keyed, result);
     return result;
+}
+
+/// What a call of a declaration does to an obligation a pair declares (`Pair`): discharges it,
+/// moves it (to the call's result, or into an argument), checks at the value's end that it was
+/// discharged, or none of these (`operation` answers null). A refused pair's operations, and a
+/// transfer whose destination did not settle, are `unknown`.
+pub const Operation = union(enum) { release, transfer: @FieldType(Transfer, "to"), teardown, unknown };
+
+/// What `callee`, by its declaration, does to an obligation `library`'s package declares.
+pub fn operation(facts: *Facts, library: anytype, callee: Facts.Decl) Facts.ResolveError!?Operation {
+    const found = try publication(facts, library);
+    for (found.pairs) |pair| {
+        for (pair.release) |each| if (namesDecl(each, callee)) return if (pair.refused) .unknown else .release;
+        for (pair.transfer) |move| if (namesDecl(move.member, callee)) return if (pair.refused or move.to == .unknown) .unknown else .{ .transfer = move.to };
+        for (pair.teardown) |each| if (namesDecl(each, callee)) return if (pair.refused) .unknown else .teardown;
+    }
+    return null;
+}
+fn namesDecl(reference: Reference, decl: Facts.Decl) bool {
+    return std.meta.eql(reference.declaration() orelse return false, decl);
 }
 
 /// The value of the tag of `Roles` named `name`, or null where it names none: a role another pack reads.
@@ -462,6 +488,7 @@ const Reader = struct {
             }
             if (refused) {
                 for (moves) |*move| move.to = .unknown;
+                each.refused = true;
                 try r.problem(each.file, each.node, .refused);
             }
             each.transfer = moves;

@@ -338,7 +338,7 @@ fn flatRules(comptime guard_member: []const u8) []const u8 {
         "    .{ .type = int.Checked, .role = .scalar }, .{ .type = int.Saturating, .role = .scalar }, .{ .type = int.Ranged, .role = .scalar },\n" ++
         "    .{ .type = id.Id, .role = .scalar }, .{ .type = id.NonZero, .role = .scalar }, .{ .type = id.Counter, .role = .issuer },\n" ++
         "    .{ .type = units.Count, .role = .scalar }, .{ .type = units.Bytes, .role = .scalar }, .{ .type = units.Bits, .role = .scalar }, .{ .type = units.Duration, .role = .scalar }, .{ .type = units.Instant, .role = .scalar },\n" ++
-        "} };\n";
+        "},\n    .pairs = .{.{ .type = .{ .generic = Guarded, .member = ." ++ guard_member ++ " }, .release = .{.deinit} }},\n};\n";
 }
 const flat_declared = flat_root_head ++ "pub const Guarded = @import(\"Guarded.zig\").Guarded;\n" ++ flat_root_tail;
 const flat_root = flat_declared ++ "\n" ++ flatRules("Guard");
@@ -2536,4 +2536,68 @@ test "where only a value's role is known, a field every type of that role keeps 
     try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.used; }", pack.access, false, 0);
     // No type of the role keeps `extra`: none of their fields, nothing to report.
     try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.extra; }", pack.access, true, 0);
+}
+
+test "a result obligation's teardown after its discharge is clean; before it, the finding is at the teardown; a discharge after it is a use after its end" {
+    const head = "const aegis = @import(\"aegis\");\nconst M = aegis.own.MustUse(u32, \"read the count\");\n";
+    try expectJudged(head ++ "pub fn f(out: *u32) void {\n    var m = M.init(1);\n    m.take(out);\n    m.deinit();\n}", pack.cleanup, true, 0);
+    // One finding, at the teardown, and none again at the block's end.
+    try expectJudged(head ++ "pub fn f() void {\n    var m = M.init(1);\n    m.deinit();\n}", pack.cleanup, true, 1);
+    // The teardown's, and the take after it.
+    try expectJudged(head ++ "pub fn f(out: *u32) void {\n    var m = M.init(1);\n    m.deinit();\n    m.take(out);\n}", pack.cleanup, true, 2);
+}
+
+/// An aegis whose guard hands its release on to an optional hand-off: the move happens only
+/// when the call gives one.
+const handoff_root =
+    \\pub fn Guarded(comptime T: type) type {
+    \\    return struct {
+    \\        const Self = @This();
+    \\        data: T,
+    \\        lock: bool = false,
+    \\        pub fn acquire(o: *Self) Guard { o.lock = true; return .{ .owner = o }; }
+    \\        pub const Guard = struct {
+    \\            owner: *Self,
+    \\            pub fn deinit(g: *Guard) void { g.owner.lock = false; }
+    \\            pub fn handOff(g: *Guard) Handoff { return .{ .owner = g.owner }; }
+    \\            pub fn tryHandOff(g: *Guard) ?Handoff { return .{ .owner = g.owner }; }
+    \\        };
+    \\        pub const Handoff = struct {
+    \\            owner: *Self,
+    \\            pub fn release(h: *Handoff) void { h.owner.lock = false; }
+    \\        };
+    \\    };
+    \\}
+    \\pub const lint_rules = .{
+    \\    .version = 1,
+    \\    .roles = .{
+    \\        .{ .type = Guarded, .role = .guarded, .internal = .{ .lock, .data } },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .role = .guard, .internal = .{.owner} },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .role = .handoff, .internal = .{.owner} },
+    \\    },
+    \\    .pairs = .{
+    \\        .{ .type = .{ .generic = Guarded, .member = .Guard }, .release = .{.deinit}, .transfer = .{ .handOff, .tryHandOff } },
+    \\        .{ .type = .{ .generic = Guarded, .member = .Handoff }, .release = .{.release} },
+    \\    },
+    \\};
+;
+fn handedCleanup(program: []const u8) !struct { findings: usize, complete: bool } {
+    const own = glint.AegisPack.package;
+    var project = try P.init(std.testing.allocator, &.{
+        .{ .name = "consumer", .bytes = program },
+        .{ .name = "root.zig", .bytes = handoff_root, .selected = false, .package = own.name, .fingerprint = own.fingerprint },
+    }, &.{.{ .from = 0, .spelling = "aegis", .target = 1 }}, .{});
+    defer project.deinit();
+    var report = try glint.runConfigured(std.testing.allocator, &project, .{ .enabled = @splat(false), .selections = &.{.{ .rule = pack.cleanup, .level = .gate }} }, .{ .project_rules = &pack.rules });
+    defer report.deinit();
+    return .{ .findings = count(report, pack.cleanup), .complete = report.complete };
+}
+test "a guard's release moved to its hand-off by declaration; to an optional hand-off, only when one is given, which is undecided" {
+    const head = "const aegis = @import(\"aegis\");\nconst G = aegis.Guarded(u32);\n";
+    const moved = try handedCleanup(head ++ "pub fn f(b: *G) G.Handoff {\n    var g = b.acquire();\n    return g.handOff();\n}\n");
+    try std.testing.expect(moved.complete);
+    try std.testing.expectEqual(@as(usize, 0), moved.findings);
+    const maybe = try handedCleanup(head ++ "pub fn f(b: *G) ?G.Handoff {\n    var g = b.acquire();\n    return g.tryHandOff();\n}\n");
+    try std.testing.expect(!maybe.complete);
+    try std.testing.expectEqual(@as(usize, 0), maybe.findings);
 }
