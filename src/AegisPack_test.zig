@@ -2527,3 +2527,13 @@ test "an acquisition is read by its declared result through MustUse; one whose w
     try std.testing.expectEqual(@as(usize, 0), unknown.findings);
     try std.testing.expect(!unknown.complete);
 }
+
+test "where only a value's role is known, a field every type of that role keeps is A001's, one only some keep is undecided, one none keeps is not" {
+    const head = "const aegis = @import(\"aegis\");\nconst wide = @import(\"builtin\").cpu.arch == .x86_64;\nconst Tag = struct {};\nfn clean(_: *u32) void {}\nconst Pool = if (wide) aegis.handle.SlotPool(u8, Tag, .{}) else aegis.handle.RunPool(u8, Tag);\nconst O = if (wide) aegis.own.Owned(u32, clean) else aegis.own.OwnedIo(u32, cleanIo);\nfn cleanIo(_: *u32, _: @import(\"std\").Io) void {}\n";
+    // Owned and OwnedIo both keep `data` behind their operations: a finding, whichever it is.
+    try expectJudged(head ++ "pub fn f(o: *O) u32 { return o.data; }", pack.access, true, 1);
+    // SlotPool keeps `used`, RunPool does not: which one it is, glint does not know.
+    try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.used; }", pack.access, false, 0);
+    // No type of the role keeps `extra`: none of their fields, nothing to report.
+    try expectJudged(head ++ "pub fn f(p: *Pool) usize { return p.extra; }", pack.access, true, 0);
+}
