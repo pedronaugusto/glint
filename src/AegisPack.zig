@@ -773,17 +773,25 @@ fn publishedContainer(c: *Context, target: PackageRules.Target) Context.Error!?F
 /// Whether a name is a field only aegis touches (A001's): yes, no, or undecided.
 const Internal = enum { yes, no, unknown };
 /// Whether `name` is a field only aegis touches of `holder`, whose role is `k`: its type's own
-/// `.internal`, as aegis declares it, where its type resolves to one aegis gives a role. Where
+/// `.internal`, as aegis declares it, for each type aegis gives a role that it may be. Where
 /// only the role is known, glint does not know which of that role's types it is: a field every
 /// one of them keeps is one, a field only some keep is undecided, a field none keeps is not.
 fn internalField(c: *Context, holder: Facts.Value, k: Contract.Kind, name: []const u8) Context.Error!Internal {
-    if (try PackageRules.internalOf(c.facts, Contract.library, holder)) |own| return if (among(own, name)) .yes else .no;
-    const found = try PackageRules.publication(c.facts, Contract.library);
     var every = true;
     var some = false;
-    for (found.entries) |entry| {
-        if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
-        if (among(entry.internal, name)) some = true else every = false;
+    const types = try holderInternals(c, holder);
+    if (types.len != 0) {
+        for (types) |own| if (among(own, name)) {
+            some = true;
+        } else {
+            every = false;
+        };
+    } else {
+        const found = try PackageRules.publication(c.facts, Contract.library);
+        for (found.entries) |entry| {
+            if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+            if (among(entry.internal, name)) some = true else every = false;
+        }
     }
     return if (!some) .no else if (every) .yes else .unknown;
 }
@@ -791,15 +799,38 @@ fn internalField(c: *Context, holder: Facts.Value, k: Contract.Kind, name: []con
 /// `.internal`, or where only the role is known, yes where every type of that role keeps one,
 /// undecided where only some do.
 fn keepsInternal(c: *Context, holder: Facts.Value, k: Contract.Kind) Context.Error!Internal {
-    if (try PackageRules.internalOf(c.facts, Contract.library, holder)) |own| return if (own.len != 0) .yes else .no;
-    const found = try PackageRules.publication(c.facts, Contract.library);
     var every = true;
     var some = false;
-    for (found.entries) |entry| {
-        if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
-        if (entry.internal.len != 0) some = true else every = false;
+    const types = try holderInternals(c, holder);
+    if (types.len != 0) {
+        for (types) |own| if (own.len != 0) {
+            some = true;
+        } else {
+            every = false;
+        };
+    } else {
+        const found = try PackageRules.publication(c.facts, Contract.library);
+        for (found.entries) |entry| {
+            if (@as(Contract.Kind, @fromBackingInt(@intCast(entry.role))) != k) continue;
+            if (entry.internal.len != 0) some = true else every = false;
+        }
     }
     return if (!some) .no else if (every) .yes else .unknown;
+}
+/// The `.internal` lists of the aegis types `holder` may be (through pointers, optionals and error
+/// unions, each choice of a per-build or comptime choice): empty where none of them is one aegis
+/// gives a role.
+fn holderInternals(c: *Context, holder: Facts.Value) Context.Error![]const []const []const u8 {
+    var found: std.ArrayList([]const []const u8) = .empty;
+    var pending: std.ArrayList(Facts.Value) = .empty;
+    try pending.append(c.allocator, holder);
+    while (pending.pop()) |each| switch (each) {
+        .pointer => |inner| try pending.append(c.allocator, inner.child.*),
+        .optional, .error_union => |inner| try pending.append(c.allocator, inner.*),
+        .alternatives => |choices| try pending.appendSlice(c.allocator, choices),
+        else => if (try PackageRules.internalOf(c.facts, Contract.library, each)) |own| try found.append(c.allocator, own),
+    };
+    return found.items;
 }
 /// Whether `name` is a field only aegis touches of any type aegis gives a role.
 fn anyInternal(c: *Context, name: []const u8) Context.Error!bool {
