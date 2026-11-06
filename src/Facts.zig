@@ -1898,7 +1898,7 @@ const crowd_steps = 64;
 fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, copy: ParameterCopy, walk: *CrowdedWalk) ResolveError!?Value {
     const here: CrowdedStep = .{ .env = env, .function = function, .position = position };
     const memory = try self.memo(Crowded);
-    const key: CrowdedKey = .{ .step = here, .kind = copy.kind, .site = copy.site, .source = copy.source.? };
+    const key: CrowdedKey = .{ .step = here, .kind = copy.kind, .site = copy.site, .source = copy.source.?, .assumed = self.assumed };
     if (memory.found.get(key)) |kept| return kept;
     // A step the walk holds, being read or read in a cycle not yet closed, adds nothing new
     // here: what it reaches, the cycle's first step reads.
@@ -1936,7 +1936,7 @@ fn crowdedIn(self: *Facts, env: *const Env, function: Decl, position: usize, cop
     const closed = walk.low >= mine;
     if (closed) {
         const whole = !walk.spent and self.remaining != 0 and self.short == was_short and self.open_met == met and !self.wideSince(wide);
-        if (whole) for (walk.stack.items[base..]) |held| try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.? }, found);
+        if (whole) for (walk.stack.items[base..]) |held| try memory.found.put(self.gpa, .{ .step = held.step, .kind = copy.kind, .site = copy.site, .source = copy.source.?, .assumed = self.assumed }, found);
         walk.stack.items.len = base;
         walk.low = outer_low;
     } else walk.low = @min(outer_low, walk.low);
@@ -1978,7 +1978,9 @@ fn crowdedRead(self: *Facts, env: *const Env, function: Decl, position: usize, c
 /// A function's parameter being read for a crowded copy, in one reading.
 const CrowdedStep = struct { env: *const Env, function: Decl, position: usize };
 
-const CrowdedKey = struct { step: CrowdedStep, kind: @FieldType(ParameterCopy, "kind"), site: Key, source: Key };
+/// A step's answer is read under the asker's settled assumptions (`assumed`), as `resolve`
+/// reads each node: one kept under one set is not another's.
+const CrowdedKey = struct { step: CrowdedStep, kind: @FieldType(ParameterCopy, "kind"), site: Key, source: Key, assumed: ?Assumptions.Id };
 
 /// `crowdedIn`'s answers by reading, function, parameter and copy, where they are whole.
 const Crowded = struct {
@@ -16027,6 +16029,68 @@ test "a crowded copy's walk reads each step once, however many routes reach it: 
     cut.facts.remaining = 5000;
     try std.testing.expect(sameValue(from_root, try cut.ask("keep2")));
     try std.testing.expect(!cut.facts.short);
+}
+
+test "a crowded copy's answer is kept per set of settled assumptions: asked under another set it is read again, never given the one kept under the first" {
+    const source =
+        \\fn dup(comptime T: type, v: T) T {
+        \\    return T.clone(v);
+        \\}
+        \\fn keep(comptime T: type, v: T, n: u8) T {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => switch (n) {
+        \\            0 => return dup(T, v),
+        \\            1 => return dup(T, v),
+        \\            2 => return dup(T, v),
+        \\            else => return dup(T, v),
+        \\        },
+        \\        .@"enum" => return dup(T, v),
+        \\        else => return v,
+        \\    }
+        \\}
+        \\const E = enum {
+        \\    a,
+        \\    fn clone(e: E) E {
+        \\        return e;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    _ = keep(E, .a, 0);
+        \\}
+    ;
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = source }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    const tree = &project.sources[0].file.tree;
+    const file = project.sources[0].id;
+    const node = struct {
+        fn of(t: *const Ast, text: []const u8) Ast.Node.Index {
+            for (0..t.nodes.len) |i| {
+                const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+                if (std.mem.eql(u8, t.getNodeSource(at), text)) return at;
+            }
+            unreachable; // unreachable: the source holds each text asked
+        }
+    };
+    const enum_call = (try calls.at(&facts, file, node.of(tree, "keep(E, .a, 0)"))).?;
+    const keep = enum_call.callee.function;
+    const clone = node.of(tree, "T.clone(v)");
+    const crowded = for (try facts.parameterCopies(keep)) |copy| {
+        if (copy.source != null and copy.source.?.node == clone and copy.crowded) break copy;
+    } else return error.TestUnexpectedResult;
+    const plain = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
+    const kept = (try facts.memo(Crowded)).found.count();
+    try std.testing.expect(kept != 0);
+    // Another set in force: none of the first set's answers is given; the steps are read
+    // again, and kept beside them.
+    try facts.settled.append(facts.gpa, .{ .held = &.{.{ .parameter = keep, .value = .{ .boolean = true } }} });
+    facts.assumed = @fromBackingInt(@as(u32, @intCast(facts.settled.items.len - 1)));
+    const under = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(2 * kept, (try facts.memo(Crowded)).found.count());
+    try std.testing.expect(sameValue(plain, under));
 }
 
 test "a copy crowded past its routes is read along the routes its binding compiles, kept or not" {
