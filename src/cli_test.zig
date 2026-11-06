@@ -376,14 +376,14 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     defer a.free(wrapped);
     try std.testing.expect(std.mem.find(u8, wrapped, "A009: ") != null);
     try std.testing.expect(std.mem.find(u8, wrapped, "does not resolve") == null);
-    // A second revision of aegis under its own manifest, imported as aegis_old and lacking a
-    // member aegis requires: aegis, its roles read from what it publishes, the member it lacks
-    // a gap the run reports where it is imported.
+    // A second revision of aegis under its own manifest, imported as aegis_old, whose lint_rules
+    // names a guard its guarded types do not declare: aegis, its other roles read, the role that
+    // does not resolve a gap the run reports where it is imported.
     var old = try tmp.dir.openDir(std.testing.io, "old", .{});
     defer old.close(std.testing.io);
     const root = try old.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
     defer a.free(root);
-    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Guarded =");
+    const lacking = try std.mem.replaceOwned(u8, a, root, ".member = .Guard }", ".member = .Gaurd }");
     defer a.free(lacking);
     try std.testing.expect(!std.mem.eql(u8, root, lacking));
     try old.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });
@@ -391,7 +391,8 @@ test "publishing aegis's API turns the pack on and nothing more: a program file 
     const second = try runOn(a, &tmp, &.{ "--only", "A004", "--module", "aegis_old=old/src/root.zig" }, "two.zig", &status);
     defer a.free(second);
     try std.testing.expect(std.mem.find(u8, second, "A004: ") != null);
-    try std.testing.expect(std.mem.find(u8, second, "published member Guarded of aegis does not resolve") != null);
+    try std.testing.expect(std.mem.find(u8, second, "aegis's lint_rules at old/src/root.zig:") != null);
+    try std.testing.expect(std.mem.find(u8, second, ": a reference that does not resolve; the roles it declares are not all read in this file") != null);
 }
 
 test "the aegis pack is on where a file's import of aegis resolves to aegis, and on whatever the files import with --aegis" {
@@ -440,8 +441,9 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     defer a.free(by_path);
     try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
     try std.testing.expect(std.mem.startsWith(u8, by_path, "aegis pack: on (imported by "));
-    // aegis's sources vendored into the program's own package, with no manifest of their own:
-    // the program's identity, and aegis by what it publishes, on, by its name or another.
+    // aegis's sources vendored into another package's tree, with no manifest of their own: that
+    // package's code, not aegis (aegis is known by its package's identity alone, as a fork keeps
+    // its manifest): off, by its name or another, and the cast is the program's own finding.
     try tmp.dir.createDirPath(std.testing.io, "app/libs");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/build.zig.zon", .data = ".{ .name = .app, .version = \"0.1.0\", .fingerprint = 0x1c0ffee5ca1ab1e, .paths = .{\"\"} }\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app/uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
@@ -452,27 +454,8 @@ test "the aegis pack is on where a file's import of aegis resolves to aegis, and
     for ([_][2][]const u8{ .{ "aegis=app/libs/src/root.zig", "app/uses.zig" }, .{ "safety=app/libs/src/root.zig", "app/renamed.zig" } }) |case| {
         const in_tree = try runOn(a, &tmp, &.{ "--module", case[0] }, case[1], &status);
         defer a.free(in_tree);
-        try std.testing.expectEqual(@as(u8, 1), status); // safe: a findings exit.
-        try std.testing.expect(std.mem.startsWith(u8, in_tree, "aegis pack: on (imported by "));
+        try std.testing.expect(std.mem.find(u8, in_tree, "aegis pack") == null);
     }
-    // Vendored under aegis's name with a member it requires gone: aegis with that member
-    // missing, on, and the run says what it could not read.
-    try tmp.dir.createDirPath(std.testing.io, "part/libs");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "part/build.zig.zon", .data = ".{ .name = .part, .version = \"0.1.0\", .fingerprint = 0x2c0ffee5ca1ab1e, .paths = .{\"\"} }\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "part/uses.zig", .data = "const aegis = @import(\"aegis\");\ncomptime {\n    _ = aegis;\n}\n" ++ cast });
-    var part = try tmp.dir.openDir(std.testing.io, "part/libs", .{});
-    defer part.close(std.testing.io);
-    try aegis_sources.writeTree(a, std.testing.io, part);
-    const root = try part.readFileAlloc(std.testing.io, "src/root.zig", a, .unlimited);
-    defer a.free(root);
-    const lacking = try std.mem.replaceOwned(u8, a, root, "pub const Guarded =", "const Guarded =");
-    defer a.free(lacking);
-    try std.testing.expect(!std.mem.eql(u8, root, lacking));
-    try part.writeFile(std.testing.io, .{ .sub_path = "src/root.zig", .data = lacking });
-    const partial = try runOn(a, &tmp, &.{ "--module", "aegis=part/libs/src/root.zig" }, "part/uses.zig", &status);
-    defer a.free(partial);
-    try std.testing.expect(std.mem.startsWith(u8, partial, "aegis pack: on (imported by "));
-    try std.testing.expect(std.mem.find(u8, partial, "published member Guarded of aegis does not resolve") != null);
     // A module named aegis that is not aegis: off.
     const other = try runOn(a, &tmp, &.{ "--module", "aegis=fake.zig" }, "uses.zig", &status);
     defer a.free(other);
