@@ -90,53 +90,56 @@ pub const Dep = struct {
     /// parameter's data), as the callers give them, a number in each fact's lane where they give
     /// data (`concrete`'s `numbers`).
     bare_numbers: Slots = .{},
+    /// The lanes it may carry: a value whose type may hold no writer reaching a peer carries
+    /// none in the peer writer's lane, from its own level or its parameters' (`within`).
+    lanes: Mask = all_lanes,
 
     /// The same value, its slots' tails on `gpa`: what a solve round keeps past the round.
     fn kept(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level, .params = try a.params.kept(gpa), .numbers = try a.numbers.kept(gpa), .ranged = try a.ranged.kept(gpa), .maybe = try a.maybe.kept(gpa), .ruled = try a.ruled.kept(gpa), .length = a.length, .lengths = try a.lengths.kept(gpa), .ruled_lengths = try a.ruled_lengths.kept(gpa), .counted = try a.counted.kept(gpa), .counted_numbers = try a.counted_numbers.kept(gpa), .unchecked = a.unchecked, .bare = try a.bare.kept(gpa), .bare_numbers = try a.bare_numbers.kept(gpa) };
+        return .{ .level = a.level, .lanes = a.lanes, .params = try a.params.kept(gpa), .numbers = try a.numbers.kept(gpa), .ranged = try a.ranged.kept(gpa), .maybe = try a.maybe.kept(gpa), .ruled = try a.ruled.kept(gpa), .length = a.length, .lengths = try a.lengths.kept(gpa), .ruled_lengths = try a.ruled_lengths.kept(gpa), .counted = try a.counted.kept(gpa), .counted_numbers = try a.counted_numbers.kept(gpa), .unchecked = a.unchecked, .bare = try a.bare.kept(gpa), .bare_numbers = try a.bare_numbers.kept(gpa) };
     }
 
     pub fn join(a: Dep, gpa: Allocator, b: Dep) Allocator.Error!Dep {
-        return .{ .level = a.level.join(b.level), .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .counted = try a.counted.unite(gpa, b.counted), .counted_numbers = try a.counted_numbers.unite(gpa, b.counted_numbers), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare), .bare_numbers = try a.bare_numbers.unite(gpa, b.bare_numbers) };
+        return .{ .level = a.level.join(b.level), .lanes = a.lanes | b.lanes, .params = try a.params.unite(gpa, b.params), .numbers = try a.numbers.unite(gpa, b.numbers), .ranged = try a.ranged.unite(gpa, b.ranged), .maybe = try a.maybe.unite(gpa, b.maybe), .ruled = try a.ruled.unite(gpa, b.ruled), .length = a.length.join(b.length), .lengths = try a.lengths.unite(gpa, b.lengths), .ruled_lengths = try a.ruled_lengths.unite(gpa, b.ruled_lengths), .counted = try a.counted.unite(gpa, b.counted), .counted_numbers = try a.counted_numbers.unite(gpa, b.counted_numbers), .unchecked = a.unchecked.join(b.unchecked), .bare = try a.bare.unite(gpa, b.bare), .bare_numbers = try a.bare_numbers.unite(gpa, b.bare_numbers) };
     }
     fn lowered(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.lowered(), .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
+        return .{ .level = a.level.lowered(), .lanes = a.lanes, .maybe = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers, .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// Data made a number: a shift or a product of it, or what std decodes from it.
     fn widened(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.widened(), .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .counted_numbers = try a.counted.unite(gpa, a.counted_numbers), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
+        return .{ .level = a.level.widened(), .lanes = a.lanes, .params = a.params, .numbers = try Slots.all(gpa, &.{ a.numbers, a.params, a.ranged }), .maybe = a.maybe, .ruled = a.ruled, .counted_numbers = try a.counted.unite(gpa, a.counted_numbers), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// A value kept to a range the program chose: a number is data there.
     fn narrowed(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .level = a.level.narrowed(), .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .ruled = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
+        return .{ .level = a.level.narrowed(), .lanes = a.lanes, .ranged = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged }), .maybe = a.maybe, .ruled = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }), .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// What a condition reading this value decides: data held to the choice, for the facts
     /// that take what they decide (`Masks.control`); for the others nothing.
     fn ruling(a: Dep, gpa: Allocator, masks: Masks) Allocator.Error!Dep {
-        return .{ .level = a.level.narrowed().masked(masks.control), .ruled = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe, a.ruled, a.counted, a.counted_numbers }) };
+        return .{ .level = a.level.narrowed().masked(masks.control), .lanes = a.lanes, .ruled = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe, a.ruled, a.counted, a.counted_numbers }) };
     }
     /// What a loop whose passes this value decides counts into a sum each pass steps (`total
     /// += 1`), where the loop counts against it (a `for`'s range or input, a `while` comparing a
     /// counter it steps by a sum): as far as the value goes, for the facts control takes.
     fn counting(a: Dep, gpa: Allocator, masks: Masks) Allocator.Error!Dep {
-        return .{ .level = a.level.masked(masks.control), .counted = try a.params.unite(gpa, a.counted), .counted_numbers = try a.numbers.unite(gpa, a.counted_numbers), .ruled = try Slots.all(gpa, &.{ a.ranged, a.maybe, a.ruled }) };
+        return .{ .level = a.level.masked(masks.control), .lanes = a.lanes, .counted = try a.params.unite(gpa, a.counted), .counted_numbers = try a.numbers.unite(gpa, a.counted_numbers), .ruled = try Slots.all(gpa, &.{ a.ranged, a.maybe, a.ruled }) };
     }
     /// The same where nothing counts the loop's passes (a `while` on what it reads, a labeled
     /// switch): each pass steps the sum again as long as the value says, so a number.
     fn unbounded(a: Dep, gpa: Allocator, masks: Masks) Allocator.Error!Dep {
-        return .{ .level = a.level.widened().masked(masks.control), .counted_numbers = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe, a.ruled, a.counted, a.counted_numbers }) };
+        return .{ .level = a.level.widened().masked(masks.control), .lanes = a.lanes, .counted_numbers = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe, a.ruled, a.counted, a.counted_numbers }) };
     }
     /// Its length read as a value (`.len`): within the memory, so data at most, unless no
     /// build holds it there (`unchecked`). A parameter's own length (its `lengthSlot`) is
     /// what its callers measured; a parameter's value bounding a slice is data.
     fn measured(a: Dep) Dep {
-        return .{ .level = a.length.narrowed().join(a.unchecked), .params = a.bare, .numbers = a.bare_numbers, .ranged = a.lengths, .ruled = a.ruled_lengths };
+        return .{ .level = a.length.narrowed().join(a.unchecked), .lanes = a.lanes, .params = a.bare, .numbers = a.bare_numbers, .ranged = a.lengths, .ruled = a.ruled_lengths };
     }
     /// Memory whose length is this value written in place (`s.len = n`), which no build
     /// checks against the memory: the value's level, and a parameter's as its callers give it,
     /// a number in each fact's lane where it was made one (`bare_numbers`).
     fn written(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .unchecked = a.level, .bare = try a.params.unite(gpa, a.counted), .bare_numbers = try a.numbers.unite(gpa, a.counted_numbers), .lengths = try a.ranged.unite(gpa, a.maybe), .ruled_lengths = a.ruled };
+        return .{ .unchecked = a.level, .lanes = a.lanes, .bare = try a.params.unite(gpa, a.counted), .bare_numbers = try a.numbers.unite(gpa, a.counted_numbers), .lengths = try a.ranged.unite(gpa, a.maybe), .ruled_lengths = a.ruled };
     }
     /// Memory whose length a measure gave (`concreteLength`), read back.
     fn measuredLength(level: Levels) Dep {
@@ -144,22 +147,32 @@ pub const Dep = struct {
     }
     /// Memory whose length is this value (a slice's bound): data at most.
     fn sizing(a: Dep, gpa: Allocator) Allocator.Error!Dep {
-        return .{ .length = a.level.narrowed(), .lengths = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled_lengths = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }) };
+        return .{ .length = a.level.narrowed(), .lanes = a.lanes, .lengths = try Slots.all(gpa, &.{ a.params, a.numbers, a.ranged, a.maybe }), .ruled_lengths = try Slots.all(gpa, &.{ a.ruled, a.counted, a.counted_numbers }) };
     }
     /// What it holds, with no length.
     fn held(a: Dep) Dep {
-        return .{ .level = a.level, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe, .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers };
+        return .{ .level = a.level, .lanes = a.lanes, .params = a.params, .numbers = a.numbers, .ranged = a.ranged, .maybe = a.maybe, .ruled = a.ruled, .counted = a.counted, .counted_numbers = a.counted_numbers };
     }
     /// Its length alone: what a slice to the end of this memory keeps of it.
     fn lengthOnly(a: Dep) Dep {
-        return .{ .length = a.length, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
+        return .{ .length = a.length, .lanes = a.lanes, .lengths = a.lengths, .ruled_lengths = a.ruled_lengths, .unchecked = a.unchecked, .bare = a.bare, .bare_numbers = a.bare_numbers };
     }
     /// Whether it takes nothing: no level of its own and no parameter.
     pub fn clean(a: Dep) bool {
         return a.level.isClean() and a.params.empty() and a.numbers.empty() and a.ranged.empty() and a.maybe.empty() and a.ruled.empty() and a.length.isClean() and a.lengths.empty() and a.ruled_lengths.empty() and a.counted.empty() and a.counted_numbers.empty() and a.unchecked.isClean() and a.bare.empty() and a.bare_numbers.empty();
     }
+    /// The same, carrying only the lanes `mask` holds: what a place of a type that may hold no
+    /// writer keeps of it (`placeLanes`).
+    fn within(a: Dep, mask: Mask) Dep {
+        var out = a;
+        out.level = a.level.masked(mask);
+        out.length = a.length.masked(mask);
+        out.unchecked = a.unchecked.masked(mask);
+        out.lanes = a.lanes & mask;
+        return out;
+    }
     fn eql(a: Dep, b: Dep) bool {
-        return a.level.eql(b.level) and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.ruled.eql(b.ruled) and a.length.eql(b.length) and a.lengths.eql(b.lengths) and a.ruled_lengths.eql(b.ruled_lengths) and a.counted.eql(b.counted) and a.counted_numbers.eql(b.counted_numbers) and a.unchecked.eql(b.unchecked) and a.bare.eql(b.bare) and a.bare_numbers.eql(b.bare_numbers);
+        return a.lanes == b.lanes and a.level.eql(b.level) and a.params.eql(b.params) and a.numbers.eql(b.numbers) and a.ranged.eql(b.ranged) and a.maybe.eql(b.maybe) and a.ruled.eql(b.ruled) and a.length.eql(b.length) and a.lengths.eql(b.lengths) and a.ruled_lengths.eql(b.ruled_lengths) and a.counted.eql(b.counted) and a.counted_numbers.eql(b.counted_numbers) and a.unchecked.eql(b.unchecked) and a.bare.eql(b.bare) and a.bare_numbers.eql(b.bare_numbers);
     }
 };
 
@@ -252,6 +265,7 @@ pub const lane_count = 8;
 pub const Mask = u8;
 
 const none: Mask = 0;
+const all_lanes: Mask = ~none;
 
 fn selected(mask: Mask) @Vector(lane_count, bool) {
     return @bitCast(mask);
@@ -435,6 +449,8 @@ pub const Flow = struct {
     writer_unknown: bool = false,
     /// Whether a container outside the program may hold a writer, once each (`mayHoldWriter`).
     writer_holders: std.AutoHashMapUnmanaged(Facts.Container, bool) = .empty,
+    /// The lanes each place a declaration names may hold, once each (`placeLanes`).
+    place_lanes: std.AutoHashMapUnmanaged(Facts.Decl, Mask) = .empty,
     /// Functions whose result is what they read: std's `process.run`, which holds a child's output,
     /// and aegis's whole-file reads, `own.readFile` and `own.readFileSentinel`.
     reads: std.ArrayList(Facts.Decl) = .empty,
@@ -1143,6 +1159,32 @@ fn mayHoldWriter(c: *Context, flow: *Flow, value: Facts.Value, depth: usize) Con
     }
 }
 
+/// The lanes a place `decl` declares (a local, a parameter, a field, a container-level variable)
+/// may hold: every lane, the peer writer's only where its type may hold a writer
+/// (`mayHoldWriter`). A value of a type that holds none (bytes, a number, a record of the
+/// program's own, whose fields hold what is stored in them) is no writer, whatever it was made
+/// from: a field read of a writer's holder, a call given one, a store through one.
+fn placeLanes(c: *Context, flow: *Flow, decl: Facts.Decl) Context.Error!Mask {
+    if (flow.masks.peer_writer == none) return all_lanes;
+    if (flow.place_lanes.get(decl)) |found| return found;
+    const mask: Mask = if (try mayHoldWriter(c, flow, try c.facts.declaration(decl), 0)) all_lanes else ~flow.masks.peer_writer;
+    // What it keeps in the run's solve stays for the run.
+    const rule_memory = c.keep();
+    defer c.allocator = rule_memory;
+    try flow.place_lanes.put(c.allocator, decl, mask);
+    return mask;
+}
+
+/// The lanes a parameter's value slot (`placeLanes`) or length slot holds: a length is a
+/// number, no writer.
+fn slotLanes(c: *Context, flow: *Flow, g: Function, slot: usize) Context.Error!Mask {
+    if (slot % 2 == 1) return ~flow.masks.peer_writer;
+    const index = slot / 2;
+    if (index >= g.params.len) return all_lanes;
+    const param = g.params[index] orelse return all_lanes;
+    return placeLanes(c, flow, .{ .file = g.file, .index = param });
+}
+
 /// What a call that does not resolve may write into memory of `value`'s type: anything, but a
 /// writer that reaches a peer only where the type may hold one.
 fn unknownInto(c: *Context, flow: *Flow, value: Facts.Value) Context.Error!Dep {
@@ -1170,7 +1212,8 @@ fn declaredAt(model: *const Model, node: Ast.Node.Index) ?Model.Declaration.Id {
     return null;
 }
 
-fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Error!void {
+fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, given: Dep) Context.Error!void {
+    const value = given.within(try placeLanes(c, flow, decl));
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
@@ -1186,10 +1229,11 @@ fn raiseLocal(c: *Context, flow: *Flow, decl: Facts.Decl, value: Dep) Context.Er
 
 /// A field or a container-level variable given a value of `level` in memory of `length`.
 fn raiseGlobal(c: *Context, flow: *Flow, decl: Facts.Decl, level: Levels, length: Levels) Context.Error!void {
+    const lanes = try placeLanes(c, flow, decl);
     // What it keeps in the run's solve stays for the run.
     const rule_memory = c.keep();
     defer c.allocator = rule_memory;
-    for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Levels), Levels }{ .{ &flow.globals, level }, .{ &flow.lengths, length } }) |each| {
+    for ([_]struct { *std.AutoHashMapUnmanaged(Facts.Decl, Levels), Levels }{ .{ &flow.globals, level.masked(lanes) }, .{ &flow.lengths, length.masked(~flow.masks.peer_writer) } }) |each| {
         const map, const raised = each;
         if (raised.isClean()) continue;
         const entry = try map.getOrPut(c.allocator, decl);
@@ -1491,7 +1535,7 @@ fn raise(c: *Context, flow: *Flow, function: Function.Id, place: Place, value: D
         .local => |d| try raiseLocal(c, flow, .{ .file = f.file, .index = d }, value),
         .param => |index| {
             // Joined on the caller's memory (a round's), kept on the run's only where it changed.
-            const now = try f.writes[index].join(c.allocator, value);
+            const now = try f.writes[index].join(c.allocator, value.within(try slotLanes(c, flow, f, valueSlot(index))));
             if (!now.eql(f.writes[index])) {
                 f.writes[index] = try now.kept(c.facts.gpa);
                 flow.changed = true;
@@ -1542,7 +1586,8 @@ fn effects(c: *Context, flow: *Flow, function: Function.Id, callee: Callee) Cont
                 if (g.fixed.has(index)) continue;
                 const given = try dep(c, flow, function, arg);
                 for ([_]struct { usize, Levels }{ .{ valueSlot(index), concrete(flow, function, given) }, .{ lengthSlot(index), concreteLength(flow, function, given) } }) |each| {
-                    const slot, const level = each;
+                    const slot, const given_level = each;
+                    const level = given_level.masked(try slotLanes(c, flow, g, slot));
                     if (slot >= g.levels.len) continue;
                     if (!level.join(g.levels[slot]).eql(g.levels[slot])) {
                         flow.functions.items[@backingInt(target)].levels[slot] = level.join(g.levels[slot]);
@@ -1715,7 +1760,7 @@ fn concrete(flow: *const Flow, function: Function.Id, value: Dep) Levels {
         if (value.counted.has(index)) level = level.join(given.masked(flow.masks.control));
         if (value.counted_numbers.has(index)) level = level.join(given.widened().masked(flow.masks.control));
     }
-    return level;
+    return level.masked(value.lanes);
 }
 
 /// The level of a dependence's length, with what callers give the function's parameters.
@@ -2153,6 +2198,7 @@ fn fieldDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.Inde
         // A function or a type named through a value is no part of its data.
         const kind = c.project.at(decl.file).model.declarations[@backingInt(decl.index)].kind;
         if (kind == .function) return .{};
+        return out.within(try placeLanes(c, flow, decl));
     } else out = try out.join(c.allocator, .{ .level = try alternativeFields(c, flow, f.file, receiver, tree.tokenSlice(name)) });
     return out;
 }
@@ -2240,9 +2286,13 @@ fn builtinDep(c: *Context, flow: *Flow, function: Function.Id, node: Ast.Node.In
     // Bytes reinterpreted put themselves together into numbers, as a copy's do (input's
     // `[4]u8` cast to a `u32` is a peer's count; a pointer cast reads its memory as the new
     // type's).
-    for ([_][]const u8{ "@bitCast", "@ptrCast" }) |cast| if (std.mem.eql(u8, name, cast)) return out.widened(c.allocator);
+    // A reinterpretation may make a writer of what held none by its type (a pointer kept as
+    // an integer or as bytes, a parent found from its field): unknown in the peer writer's lane.
+    const remade: Dep = .{ .level = .in(flow.masks.peer_writer, .unknown) };
+    if (std.mem.eql(u8, name, "@fieldParentPtr")) return out.join(c.allocator, remade);
+    for ([_][]const u8{ "@bitCast", "@ptrCast" }) |cast| if (std.mem.eql(u8, name, cast)) return (try out.widened(c.allocator)).join(c.allocator, remade);
     // A pointer made from an integer reaches memory no place names.
-    if (std.mem.eql(u8, name, "@ptrFromInt")) return out.join(c.allocator, unnamed(flow));
+    if (std.mem.eql(u8, name, "@ptrFromInt")) return (try out.join(c.allocator, unnamed(flow))).join(c.allocator, remade);
     return out;
 }
 
@@ -2562,7 +2612,7 @@ fn summarized(c: *Context, flow: *Flow, function: Function.Id, callee: Callee, s
             if (summary.counted_numbers.has(slot)) out = try out.join(c.allocator, try held_there.unbounded(c.allocator, flow.masks));
         }
     }
-    return out;
+    return out.within(summary.lanes);
 }
 
 /// What a function outside the program may make of an argument: what it holds, and its length,
