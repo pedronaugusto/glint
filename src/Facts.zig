@@ -6079,6 +6079,37 @@ fn same(a: Value, b: Value, depth: usize) bool {
     };
 }
 
+/// Whether two values are one representation, every field read alike, recursively: what no
+/// reader of either can tell apart. A container's making is compared by where it is kept: two
+/// makings are two to a reader that reads them, whatever `sameMaking` finds. Past 64 levels,
+/// two (the safe side for a choice: both are kept).
+fn identical(a: Value, b: Value, depth: usize) bool {
+    if (depth == 64) return false;
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .unknown => |why| why == b.unknown,
+        .primitive => |p| std.mem.eql(u8, p, b.primitive),
+        .container, .instance => |c| switch (b) {
+            .container, .instance => |other| c.file == other.file and c.scope == other.scope and c.symbolic == other.symbolic and c.made_by == other.made_by,
+            else => false,
+        },
+        .function => |f| std.meta.eql(f, b.function),
+        .pointer => |inner| inner.size == b.pointer.size and identical(inner.child.*, b.pointer.child.*, depth + 1),
+        .array, .optional, .error_union => |inner| switch (b) {
+            .array, .optional, .error_union => |other| identical(inner.*, other.*, depth + 1),
+            else => false,
+        },
+        .error_set, .scalar => true,
+        .alternatives => |each| each.len == b.alternatives.len and for (each, b.alternatives) |x, y| {
+            if (!identical(x, y, depth + 1)) break false;
+        } else true,
+        .reflected => |r| r.at == b.reflected.at and identical(r.of.*, b.reflected.of.*, depth + 1),
+        .literal => |l| std.meta.eql(l, b.literal),
+        .reified => |built| built.value == b.reified.value and identical(built.fields.*, b.reified.fields.*, depth + 1),
+        .fn_type => |key| std.meta.eql(key, b.fn_type),
+    };
+}
+
 /// The container a type function returns when its body ends in one `return` of that container,
 /// whatever comptime checks come before. This is the template, not an instantiation: no
 /// arguments are evaluated.
@@ -7751,7 +7782,12 @@ fn instance(self: *Facts, value: Value) ResolveError!Value {
 }
 
 /// One value of `values`, each resolved: an unknown if any is, the value if they agree, else
-/// the alternatives.
+/// the alternatives. A part identical to one kept (`identical`: no reader can tell the two
+/// apart) is that one, so what is kept grows with what is new in a choice, never with how many
+/// routes gave the same value, and each part is compared with those alone; one of the same
+/// type (`same`) is that one too. Each part kept
+/// past the first is one of the run's resolutions (`remaining`): a choice that grows past the
+/// budget is unknown(budget). One value alone costs nothing, as it did.
 fn choose(self: *Facts, values: []const Value) ResolveError!Value {
     var kept: std.ArrayList(Value) = .empty;
     // An unknown that a binding would not settle comes first: the choice is unknown for it.
@@ -7761,8 +7797,15 @@ fn choose(self: *Facts, values: []const Value) ResolveError!Value {
         const parts: []const Value = if (value == .alternatives) value.alternatives else &.{value};
         for (parts) |part| {
             for (kept.items) |earlier| {
-                if (same(earlier, part, 0)) break;
-            } else try kept.append(self.gpa, part);
+                if (identical(earlier, part, 0) or same(earlier, part, 0)) break;
+            } else {
+                // The choice grows: one resolution for each part past the first.
+                if (kept.items.len != 0) {
+                    if (self.remaining == 0) return self.spent();
+                    self.remaining -= 1;
+                }
+                try kept.append(self.gpa, part);
+            }
         }
     }
     // An empty literal (`.{}`, `&.{}`) coerces to the type of a peer it is chosen with: a slice's,
@@ -15839,6 +15882,37 @@ test "a crowded copy is read along a route of generics deeper than any count of 
     // The enum's route reaches `dup` through 20 generics passing `v` on: `E.clone` gives an `E`.
     const value = (try facts.boundCopy(enum_call, keep, crowded)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(value == .instance);
+}
+
+test "a choice holds each value once however many routes give it, two values a reader tells apart by any field stay two, and each value kept past the first spends one of the run's resolutions" {
+    var project = try Project.init(std.testing.allocator, &.{.{ .name = "root", .bytes = "const A = u8;\n" }}, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    // `!T` with `T` not settled, given by 1000 routes, each its own copy: one value (strand's
+    // crowded walk held 281460 of it).
+    var copies: [1000]Value = undefined;
+    for (&copies) |*one| one.* = .{ .error_union = try facts.boxed(.{ .unknown = .comptime_dependent }) };
+    const once = try facts.choose(&copies);
+    try std.testing.expect(once == .error_union);
+    try std.testing.expectEqual(Unknown.comptime_dependent, once.error_union.unknown);
+    // Alike but for a reflected value's part, deep inside: two.
+    const of = try facts.boxed(.{ .primitive = "u8" });
+    const info: Value = .{ .error_union = try facts.boxed(.{ .reflected = .{ .of = of, .at = .info } }) };
+    const size: Value = .{ .error_union = try facts.boxed(.{ .reflected = .{ .of = of, .at = .size } }) };
+    const two = try facts.choose(&.{ info, size, info });
+    try std.testing.expectEqual(2, two.alternatives.len);
+    // Each kept past the first spends one: three kept with one left is past the budget; one
+    // alone spends none.
+    const third: Value = .{ .optional = of };
+    facts.remaining = 0;
+    try std.testing.expect(sameValue(info, try facts.choose(&.{ info, info })));
+    try std.testing.expect(!facts.short);
+    facts.remaining = 1;
+    try std.testing.expectEqual(Unknown.budget, (try facts.choose(&.{ info, size, third })).unknown);
+    try std.testing.expect(facts.short);
 }
 
 test "a crowded copy's walk reads each step once, however many routes reach it: 24 generics passing the value round in cycles, two routes from each, read within 5000 resolutions; one answer for the cycle whichever step is asked first, and none of it kept where the budget ran out inside it" {
