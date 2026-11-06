@@ -4,7 +4,6 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Project = @import("Project.zig");
 const Model = @import("Model.zig");
-const PackageRules = @import("PackageRules.zig");
 const Constructs = @import("Constructs.zig");
 const Ast = std.zig.Ast;
 const Facts = @This();
@@ -56,8 +55,6 @@ bound_places: std.AutoHashMapUnmanaged(struct { site: Key, place: Ast.Node.Index
 cast_sites: std.AutoHashMapUnmanaged(Key, Decl) = .empty,
 /// Whether a file declares any `comptime` parameter of type `bool`, found per file once.
 conditional_files: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
-/// Each library's declared roles, by its package and the pack's enum of roles.
-publications: std.AutoHashMapUnmanaged(u64, *const Publication) = .empty,
 /// Each package's roots the program reaches (`packageRoots`), by its fingerprint.
 package_roots: std.AutoHashMapUnmanaged(u64, []const Project.FileId) = .empty,
 templates: std.AutoHashMapUnmanaged(Decl, ?Value) = .empty,
@@ -240,22 +237,6 @@ pub const Spelled = union(enum) { name: []const u8, number: usize };
 /// Type information read off a type (`of`) at a part of it: the whole (`info`), a kind's own
 /// (`pointer`, ...), a pointer's size (`size`), a function's parameters, any other part.
 pub const Reflected = struct { of: *const Value, at: enum { info, pointer, size, optional, array, error_union, function, params, structure, tagged, enumeration, part } };
-/// A library's declared roles in this project (`publication`): what its package's roots declare.
-/// Roles are the caller's enum values; the resolver never interprets them.
-pub const Publication = struct {
-    entries: []const Entry,
-    /// Where the roles are not all read: undecided where a file imports that root, never silence.
-    gaps: []const Gap,
-    /// The library's own files: those of its package's identity. A file republishing its API,
-    /// or a copy vendored without its manifest, stays the program's.
-    files: []const Project.FileId,
-};
-pub const Entry = struct { role: u32, target: Target };
-pub const Target = union(enum) { function: Decl, container: Container };
-/// A root of the library whose roles are not all read: it declares no `lint_rules` (`problem`
-/// null), or part of what it declares could not be read (PackageRules.Problem, where it is
-/// written). Reported where a file imports that root, under whatever name.
-pub const Gap = struct { root: Project.FileId, problem: ?PackageRules.Problem };
 /// Why a value is unknown. `absent`: it comes from a module the build does not have for this
 /// file (Project.Input.absent), or it is a parameter no function of a reflected choice has
 /// (`param_types[6]` of a table whose functions take at most six), so the code that needs it
@@ -371,7 +352,6 @@ pub fn deinit(self: *Facts) void {
     self.bound_places.deinit(self.gpa);
     self.cast_sites.deinit(self.gpa);
     self.conditional_files.deinit(self.gpa);
-    self.publications.deinit(self.gpa);
     self.package_roots.deinit(self.gpa);
     self.templates.deinit(self.gpa);
     self.type_returns.deinit(self.gpa);
@@ -393,7 +373,7 @@ pub fn knownFile(self: *const Facts, file: Project.FileId) bool {
 }
 
 /// Whether the caller states `file` to be of `package`, by name and fingerprint.
-fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
+pub fn ofPackage(self: *const Facts, file: Project.FileId, package: Package) bool {
     const input = self.project.at(file).input;
     return input.fingerprint == package.fingerprint and std.mem.eql(u8, input.package, package.name);
 }
@@ -413,52 +393,6 @@ pub fn packageRoots(self: *Facts, package: Package) ResolveError![]const Project
     }
     try self.package_roots.put(self.gpa, key, roots.items);
     return roots.items;
-}
-
-/// What `library`'s package declares (`Library`): each role its roots' `lint_rules` give
-/// (PackageRules.of) that the library's `Role` names, on the declaration it names; a type
-/// function's role on each container it returns too, which its instances are. A root that
-/// declares no `lint_rules`, or whose rules are not all read (a version this reader does not
-/// know, a reference that does not resolve), is a gap: its roles may be missing, so a rule
-/// reading them is undecided where that root is imported, never plain. Found once per run and
-/// shared by every rule.
-pub fn publication(self: *Facts, library: anytype) ResolveError!*const Publication {
-    const Role = @TypeOf(library).Role;
-    const key = comptime std.hash.Wyhash.hash(0, @typeName(Role));
-    const keyed = key ^ library.package.fingerprint;
-    if (self.publications.get(keyed)) |found| return found;
-    var entries: std.ArrayList(Entry) = .empty;
-    var gaps: std.ArrayList(Gap) = .empty;
-    for (try self.packageRoots(library.package)) |root| {
-        const rules = try PackageRules.of(self, root);
-        if (rules.declared == null) try gaps.append(self.gpa, .{ .root = root, .problem = null });
-        for (rules.problems) |problem| try gaps.append(self.gpa, .{ .root = root, .problem = problem });
-        for (rules.roles) |declared| {
-            const role_value: u32 = @intCast(@backingInt(std.meta.stringToEnum(Role, declared.role) orelse continue));
-            const decl = declared.type.declaration() orelse continue;
-            switch (try self.declaration(decl)) {
-                .function => |function| {
-                    try entries.append(self.gpa, .{ .role = role_value, .target = .{ .function = function } });
-                    // The container a type function returns is also its type: instances declared
-                    // with it are the role's, each container it may return where it chooses one
-                    // by a comptime option (aegis 0.3's `SlotPool(T, Tag, options)`).
-                    if (try self.template(function)) |returned| for (try returnedContainers(self.gpa, returned)) |made| {
-                        try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } });
-                    };
-                },
-                .container => |made| try entries.append(self.gpa, .{ .role = role_value, .target = .{ .container = .{ .file = made.file, .scope = made.scope } } }),
-                // A role on what is no type and no function: the declarer's own lint reports
-                // the form; for its consumers the role is not read.
-                else => try gaps.append(self.gpa, .{ .root = root, .problem = .{ .file = decl.file, .node = self.project.at(decl.file).model.declarations[@backingInt(decl.index)].node, .why = .malformed } }),
-            }
-        }
-    }
-    var files: std.ArrayList(Project.FileId) = .empty;
-    for (self.project.sources) |*source| if (self.ofPackage(source.id, library.package)) try files.append(self.gpa, source.id);
-    const result = try self.gpa.create(Publication);
-    result.* = .{ .entries = entries.items, .gaps = gaps.items, .files = files.items };
-    try self.publications.put(self.gpa, keyed, result);
-    return result;
 }
 
 /// The containers a type function's template is (`template`): the one it returns, or each it
@@ -497,27 +431,6 @@ fn declarationLiteral(self: *Facts, file: Project.FileId, node: Ast.Node.Index) 
         .decl => |found| self.declaration(found),
         .none => .{ .unknown = .unsupported },
         .unknown => .{ .unknown = .comptime_dependent },
-    };
-}
-
-/// The role `library` publishes for a function declaration, or a type or instance of a
-/// published container, seen through pointers, optionals and error unions.
-pub fn role(self: *Facts, library: anytype, value: Value) ResolveError!?@TypeOf(library).Role {
-    const Role = @TypeOf(library).Role;
-    const found = try self.publication(library);
-    var current = value;
-    while (true) switch (current) {
-        .pointer => |inner| current = inner.child.*,
-        .array, .optional, .error_union => |inner| current = inner.*,
-        .function => |decl| {
-            for (found.entries) |entry| if (entry.target == .function and std.meta.eql(entry.target.function, decl)) return @as(Role, @fromBackingInt(@intCast(entry.role)));
-            return null;
-        },
-        .container, .instance => |c| {
-            for (found.entries) |entry| if (entry.target == .container and entry.target.container.file == c.file and entry.target.container.scope == c.scope) return @as(Role, @fromBackingInt(@intCast(entry.role)));
-            return null;
-        },
-        else => return null,
     };
 }
 
