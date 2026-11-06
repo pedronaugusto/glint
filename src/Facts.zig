@@ -86,6 +86,9 @@ storing: std.AutoHashMapUnmanaged(Decl, void) = .empty,
 /// and per file, the files that may share a compilation with it (`compiledWith`).
 imports_read: std.AutoHashMapUnmanaged(Project.FileId, bool) = .empty,
 compiled_with: std.AutoHashMapUnmanaged(Project.FileId, Files) = .empty,
+/// Per import edge, by its index in the project's, whether a compilation of the program may
+/// follow it (`edgeCompiled`).
+edges_compiled: std.AutoHashMapUnmanaged(usize, bool) = .empty,
 /// What a compilation of the program analyzes (`analysis`): per file, the parts Zig analyzes
 /// as one; the functions and container-level constants by name; and the budget of resolutions
 /// that reading spends, its own as a fact of the whole run.
@@ -260,9 +263,12 @@ pub const Gap = struct { module: []const u8, path: []const u8, why: Unknown, roo
 /// optimize mode, the build's options) any file imports, or the `root` std reads
 /// (`root.std_options`), which no library's reading binds; a type or value the compiler
 /// computes for each build, holding no store and none of the program's types.
+/// `erased_field`: a call through a field that holds a function pointer, whose stores are not
+/// all seen (`storedFunctions`: a parameter's or a cast's value stored there, a file that may
+/// share the compilation unread) or whose holder does not resolve: any function of its type.
 /// Whether something is so: yes, no, or unknown and why.
 pub const Is = union(enum) { yes, no, unknown: Unknown };
-pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own };
+pub const Unknown = enum { invalid_front_end, unresolved, missing_mapping, computed_import, comptime_dependent, cycle, budget, unsupported, absent, generic, zig_own, erased_field };
 /// The declaration an expression names (`definition`, `reflected`, `origin`): one known, none
 /// (no reference at all: a literal, a call, a member its holder does not declare, a primitive),
 /// or unknown and why (a holder that does not resolve, a choice of holders, a computed name, a
@@ -5266,8 +5272,8 @@ fn stores(self: *Facts, targets: *std.ArrayList(Value), file: Project.FileId, no
 const Files = std.AutoHashMapUnmanaged(Project.FileId, void);
 
 /// The files that may share a compilation with `file`: each a root that reaches it may build,
-/// so all its imports reach, by the program's import edges. A store in any other file is in
-/// another program, where no call of this one goes.
+/// so all its imports reach, by the program's import edges (`edgeCompiled`). A store in any
+/// other file is in another program, where no call of this one goes.
 fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
     if (self.compiled_with.getPtr(file)) |known| return known;
     var roots: Files = .empty;
@@ -5275,7 +5281,7 @@ fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
     var growing = true;
     while (growing) {
         growing = false;
-        for (self.project.imports) |edge| if (roots.contains(edge.target) and !roots.contains(edge.from)) {
+        for (self.project.imports, 0..) |edge, i| if (roots.contains(edge.target) and !roots.contains(edge.from) and try self.edgeCompiled(i)) {
             try roots.put(self.gpa, edge.from, {});
             growing = true;
         };
@@ -5286,7 +5292,7 @@ fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
     growing = true;
     while (growing) {
         growing = false;
-        for (self.project.imports) |edge| if (reached.contains(edge.from) and !reached.contains(edge.target)) {
+        for (self.project.imports, 0..) |edge, i| if (reached.contains(edge.from) and !reached.contains(edge.target) and try self.edgeCompiled(i)) {
             try reached.put(self.gpa, edge.target, {});
             growing = true;
         };
@@ -5298,7 +5304,8 @@ fn compiledWith(self: *Facts, file: Project.FileId) ResolveError!*const Files {
 
 /// Whether every `@import` `file` makes names a file the program holds: one of a computed name,
 /// or a name no mapping gives (Zig's own per-build files and names the build declares absent
-/// aside), may hold a store the program does not show.
+/// aside), may hold a store the program does not show. One a test of a file outside the
+/// program makes is in no compilation of the program (`testOnly`).
 fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
     if (self.imports_read.get(file)) |known| return known;
     const tree = &self.project.at(file).file.tree;
@@ -5306,6 +5313,7 @@ fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
         .builtin_call_two, .builtin_call_two_comma => {
             const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
             if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
+            if (try self.testOnly(file, node)) continue;
             switch (try self.resolve(file, node)) {
                 .unknown => |why| switch (why) {
                     .absent, .zig_own => {},
@@ -5318,6 +5326,56 @@ fn importsRead(self: *Facts, file: Project.FileId) ResolveError!bool {
     } else true;
     try self.imports_read.put(self.gpa, file, read);
     return read;
+}
+
+/// Whether a compilation of the program may follow the project's import edge `index`: one
+/// whose file is the program's, or that the file makes outside a test. Zig analyzes a file's
+/// tests only for the module under test, so an import only a test of a file outside the
+/// program makes (aegis's `test { _ = @import("tests.zig"); }`) shares no compilation with the
+/// program: the program's own tests are the ones `analysis` roots, by the same `program`. An
+/// edge whose spelling no `@import` of the file writes (a module the build binds) is followed.
+fn edgeCompiled(self: *Facts, index: usize) ResolveError!bool {
+    if (self.edges_compiled.get(index)) |known| return known;
+    const edge = self.project.imports[index];
+    const compiled = try self.importedOutsideTests(edge.from, edge.spelling);
+    try self.edges_compiled.put(self.gpa, index, compiled);
+    return compiled;
+}
+
+/// Whether `file` imports `spelling` where a compilation of the program analyzes it: it is
+/// the program's, or an `@import` of it is outside a test, or none is written.
+fn importedOutsideTests(self: *Facts, file: Project.FileId, spelling: []const u8) ResolveError!bool {
+    if (try self.program(file)) return true;
+    const source = self.project.at(file);
+    if (source.file.status != .parsed) return true;
+    const tree = &source.file.tree;
+    var spelled = false;
+    for (tree.nodes.items(.tag), 0..) |tag, i| switch (tag) {
+        .builtin_call_two, .builtin_call_two_comma => {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) continue;
+            var buffer: [2]Ast.Node.Index = undefined;
+            const args = builtinArgs(tree, node, &buffer);
+            if (args.len != 1 or tree.nodeTag(args[0]) != .string_literal) continue;
+            const named = std.mem.trim(u8, tree.tokenSlice(tree.nodeMainToken(args[0])), "\"");
+            if (!std.mem.eql(u8, named, spelling)) continue;
+            spelled = true;
+            if (!try self.testOnly(file, node)) return true;
+        },
+        else => {},
+    };
+    return !spelled;
+}
+
+/// Whether `node` is in a test of a file outside the program (`program`): code no compilation
+/// of the program analyzes, since Zig analyzes test blocks only for the module under test. The
+/// one reading of it: `compiledWith` and `importsRead` skip such an import by it, and a query
+/// that counts sites skips such a site by it. Narrower than exact while `program` puts only std
+/// and the known libraries outside: a dependency's own tests still count, which is sound.
+pub fn testOnly(self: *Facts, file: Project.FileId, node: Ast.Node.Index) ResolveError!bool {
+    if (try self.program(file)) return false;
+    const part = try self.partOf(file, node) orelse return false;
+    return self.project.at(file).file.tree.nodeTag(part) == .test_decl;
 }
 
 /// A pointer's `len` or `ptr` where what it points at has no such member: a slice's or an
@@ -9687,15 +9745,32 @@ pub fn handedOut(self: *Facts, function: Decl) ResolveError!bool {
 
 /// One call of a function the program makes: its arguments, after the receiver a method call
 /// on a value passes first (`holder`).
-pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index };
+pub const CallSite = struct { file: Project.FileId, params: []const Ast.Node.Index, receiver: usize, holder: Ast.Node.Index, call: Ast.Node.Index };
 const CallSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
 
 /// Every call of `function` the program makes, or null where it `escapes`. Read once.
 pub fn callSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
     const read = try self.memo(CallSites);
     if (read.map.get(function)) |known_sites| return known_sites;
-    const found = try self.scanCallSites(function, .consumers);
-    try read.map.put(self.gpa, function, found);
+    const met = self.open_met;
+    const found = try self.scanCallSites(function, .consumers, .aliases);
+    // An alias's value read while a query of it is in progress may be provisional: asked again.
+    if (self.open_met == met) try read.map.put(self.gpa, function, found);
+    return found;
+}
+
+const ProgramSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?[]const CallSite) = .empty };
+
+/// Every call of `function` the program makes, through an alias, a field or a table holding
+/// it as `scanCallSites` follows them, a consumer's call by its name aside (judged in the
+/// consumer's own run); null where it is otherwise used. A013 asks it of std's assert. Read once.
+pub fn programCallSites(self: *Facts, function: Decl) ResolveError!?[]const CallSite {
+    const read = try self.memo(ProgramSites);
+    if (read.map.get(function)) |known_sites| return known_sites;
+    const met = self.open_met;
+    const found = try self.scanCallSites(function, .program, .fields);
+    // An alias's value read while a query of it is in progress may be provisional: asked again.
+    if (self.open_met == met) try read.map.put(self.gpa, function, found);
     return found;
 }
 
@@ -9710,8 +9785,9 @@ const NamedSites = struct { map: std.AutoHashMapUnmanaged(Decl, ?usize) = .empty
 fn namedCalls(self: *Facts, function: Decl) ResolveError!?usize {
     const read = try self.memo(NamedSites);
     if (read.map.get(function)) |known| return known;
-    const found: ?usize = if (try self.scanCallSites(function, .program)) |sites| sites.len else null;
-    try read.map.put(self.gpa, function, found);
+    const met = self.open_met;
+    const found: ?usize = if (try self.scanCallSites(function, .program, .aliases)) |sites| sites.len else null;
+    if (self.open_met == met) try read.map.put(self.gpa, function, found);
     return found;
 }
 
@@ -9732,7 +9808,7 @@ pub fn boundInRun(self: *Facts, function: Decl) ResolveError!?bool {
     const read = try self.memo(BoundInRun);
     // One being read (a generic that binds itself) binds nothing of its own.
     if (read.map.get(function)) |known| return known orelse false;
-    const sites = (try self.scanCallSites(function, .program)) orelse {
+    const sites = (try self.scanCallSites(function, .program, .aliases)) orelse {
         try read.map.put(self.gpa, function, null);
         return null;
     };
@@ -9776,7 +9852,18 @@ fn functionAround(self: *Facts, file: Project.FileId, node: Ast.Node.Index) Reso
 
 /// `callers` says whether a consumer calling a public function by its name is a caller no
 /// scan of the program sees (`consumers`), or one judged in the consumer's own run (`program`).
-fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, program }) ResolveError!?[]const CallSite {
+const Callers = enum { consumers, program };
+
+/// What a use of a function's value that is no call of it is followed through (`heldCalls`).
+/// `aliases`, for every reader: a private alias or table, every call through which the scan
+/// sees. `fields` adds a field a struct literal stores it in, for `programCallSites` alone: a
+/// value holding the field may reach a consumer (a pub fn's return, a public declaration, a
+/// store through a pointer parameter), whose call through it its own run resolves by the
+/// field's stores (`fieldOf`) and judges, or leaves unresolved; it is no call this scan sees,
+/// so for `escapes` and `handedOut` the field escapes.
+const Follow = enum { aliases, fields };
+
+fn scanCallSites(self: *Facts, function: Decl, callers: Callers, follow: Follow) ResolveError!?[]const CallSite {
     const model = &self.project.at(function.file).model;
     const record = model.declarations[@backingInt(function.index)];
     if (callers == .consumers and record.public) return null;
@@ -9854,12 +9941,240 @@ fn scanCallSites(self: *Facts, function: Decl, callers: enum { consumers, progra
                 }
                 if (!calls_it) continue;
             }
-            const params = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) orelse return null;
+            const params = callParams(tree, parent, node, &callee_buffer, &tuple_buffer) orelse {
+                // Its value, not a call: followed where it goes to calls, else it escapes.
+                if (try self.heldCalls(id, node, function, &sites, follow, 0)) continue;
+                return null;
+            };
             const holder = if (tag == .field_access) tree.nodeData(node).node_and_token[0] else node;
-            try sites.append(self.gpa, .{ .file = id, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = receiver, .holder = holder });
+            try sites.append(self.gpa, .{ .file = id, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = receiver, .holder = holder, .call = parent });
         }
     }
     return sites.items;
+}
+
+/// Where `function`'s value at `node`, a use that is no call of it, goes, each call through it
+/// added to `sites`; false where it escapes. Followed: a `const` naming it or `&` of it (an
+/// alias, its uses read as the function's are) and an element of a `const` table, each private
+/// (`constDecl`), and for `fields` a field a struct literal stores it in. Anything else escapes:
+/// an argument, a return, a store, a `var`, a cast, and past 8 aliases deep.
+fn heldCalls(self: *Facts, file: Project.FileId, node: Ast.Node.Index, function: Decl, sites: *std.ArrayList(CallSite), follow: Follow, depth: u8) ResolveError!bool {
+    if (depth == 8) return false;
+    const tree = &self.project.at(file).file.tree;
+    const model = &self.project.at(file).model;
+    var value = node;
+    var parent = model.parentOf(value) orelse return false;
+    // `&f` is called as `f` is.
+    if (tree.nodeTag(parent) == .address_of) {
+        value = parent;
+        parent = model.parentOf(value) orelse return false;
+    }
+    if (tree.fullVarDecl(parent)) |declared| {
+        if (declared.ast.init_node.unwrap() != value) return false;
+        const alias = constDecl(tree, model, parent, follow) orelse return false;
+        return self.aliasCalls(.{ .file = file, .index = alias }, function, sites, follow, depth + 1, .callee);
+    }
+    var buffer: [2]Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, parent)) |literal| {
+        if (follow != .fields) return false;
+        if (std.mem.findScalar(Ast.Node.Index, literal.ast.fields, value) == null) return false;
+        const field = (try self.storedField(file, parent, Model.initName(tree, value) orelse return false)) orelse return false;
+        return self.fieldCalls(field, function, sites, depth + 1);
+    }
+    var elements: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&elements, parent)) |table| {
+        if (std.mem.findScalar(Ast.Node.Index, table.ast.elements, value) == null) return false;
+        const holder = model.parentOf(parent) orelse return false;
+        const declared = tree.fullVarDecl(holder) orelse return false;
+        if (declared.ast.init_node.unwrap() != parent) return false;
+        const alias = constDecl(tree, model, holder, follow) orelse return false;
+        return self.aliasCalls(.{ .file = file, .index = alias }, function, sites, follow, depth + 1, .indexed);
+    }
+    return false;
+}
+
+/// The declaration a `const` at `node` makes; null for a `var`, and for a public one but for
+/// `fields`.
+fn constDecl(tree: *const Ast, model: *const Model, node: Ast.Node.Index, follow: Follow) ?Model.Declaration.Id {
+    const declared = tree.fullVarDecl(node) orelse return null;
+    if (tree.tokenTag(declared.ast.mut_token) != .keyword_const) return null;
+    // A public one is the function handed out: a consumer's call through it is none this scan
+    // sees, so for `escapes` and `handedOut` it escapes; `fields` follows it, as a field, by
+    // the program's uses, a consumer's being its own run's (`Facts.calls` resolves it there).
+    if (declared.visib_token != null and follow != .fields) return null;
+    for (model.declarations, 0..) |d, i| if (d.kind == .variable and d.node == node) return @fromBackingInt(@intCast(i));
+    return null;
+}
+
+/// The calls through `alias`, a `const` holding `function` (`callee`) or a table of functions
+/// it is one of (`indexed`): each use of it a call's callee (`table[i](…)` for a table), or a
+/// value followed again (`heldCalls`). Its uses: its name in its own file, by reference, and a
+/// member so spelled (`@This().alias`, and for a public one `pkg.alias` in the program's other
+/// files), by definition; one that does not resolve, and `@field` in a file it may be used in,
+/// escape: nothing says what they name.
+fn aliasCalls(self: *Facts, alias: Decl, function: Decl, sites: *std.ArrayList(CallSite), follow: Follow, depth: u8, held: enum { callee, indexed }) ResolveError!bool {
+    const record = self.project.at(alias.file).model.declarations[@backingInt(alias.index)];
+    const name = self.project.at(alias.file).file.tree.tokenSlice(record.token);
+    for (try self.programFiles()) |file| {
+        const own = file == alias.file;
+        if (!own and !record.public) continue;
+        const tree = &self.project.at(file).file.tree;
+        const model = &self.project.at(file).model;
+        for (tree.nodes.items(.tag), 0..) |tag, i| {
+            const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            switch (tag) {
+                .identifier => {
+                    if (!own or tree.nodeMainToken(node) == record.token) continue;
+                    const ref = model.reference(node) orelse continue;
+                    if ((ref.declaration orelse continue) != alias.index) continue;
+                },
+                .field_access => {
+                    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeData(node).node_and_token[1]), name)) continue;
+                    switch (try self.definition(file, node)) {
+                        .decl => |found| if (!std.meta.eql(found, alias)) continue,
+                        .none => continue,
+                        .unknown => return false,
+                    }
+                },
+                .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => if (std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@field")) return false else continue,
+                else => continue,
+            }
+            var parent = model.node_parents[i] orelse return false;
+            if (isTypeQuery(tree, parent)) continue;
+            var callee = node;
+            if (held == .indexed) {
+                // `table[i]`: one of its elements, then called.
+                if (tree.nodeTag(parent) != .array_access or tree.nodeData(parent).node_and_node[0] != node) return false;
+                callee = parent;
+                parent = model.parentOf(parent) orelse return false;
+            }
+            var callee_buffer: [1]Ast.Node.Index = undefined;
+            var tuple_buffer: [2]Ast.Node.Index = undefined;
+            if (callParams(tree, parent, callee, &callee_buffer, &tuple_buffer)) |params| {
+                try sites.append(self.gpa, .{ .file = file, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = 0, .holder = callee, .call = parent });
+                continue;
+            }
+            if (held == .indexed or !try self.heldCalls(file, node, function, sites, follow, depth)) return false;
+        }
+    }
+    return true;
+}
+
+/// The calls through `field`, which a struct literal stores `function` in: each read of it in
+/// the program's files (`accesses`) exactly named and a call's callee whose callees
+/// (`Facts.calls`) include it or are not known, or a value followed again (`heldCalls`). A read through a holder
+/// that does not resolve or a computed `@field` (named, holder or unresolved reach), a write
+/// that covers it or takes its address, or a value of its container handed to code outside the
+/// program, escapes. A call through a callee that does not resolve (`.any`) reaches it only by
+/// such a read, which already escapes.
+fn fieldCalls(self: *Facts, field: Decl, function: Decl, sites: *std.ArrayList(CallSite), depth: u8) ResolveError!bool {
+    const files = try self.programFiles();
+    var writes = accesses.writes(self, .{ .field = field }, files);
+    while (try writes.next()) |site| switch (site.kind) {
+        .covered, .address => return false,
+        else => {},
+    };
+    if (try self.handedOutside(self.project.at(field.file).model.declarations[@backingInt(field.index)].scope, field.file)) return false;
+    var reads = accesses.reads(self, .{ .field = field }, files);
+    while (try reads.next()) |site| {
+        if (site.reach != .exact or site.computed) return false;
+        const target = site.target orelse site.node;
+        const model = &self.project.at(site.file).model;
+        const parent = model.parentOf(target) orelse return false;
+        const call = (try calls.at(self, site.file, parent)) orelse {
+            if (!try self.heldCalls(site.file, target, function, sites, .fields, depth)) return false;
+            continue;
+        };
+        if (call.callee_expr != target) {
+            if (!try self.heldCalls(site.file, target, function, sites, .fields, depth)) return false;
+            continue;
+        }
+        switch (call.callee) {
+            .function => |one| if (!std.meta.eql(one, function)) continue,
+            .choice => |each| for (each) |one| {
+                if (std.meta.eql(one, function)) break;
+            } else continue,
+            // A callee Facts.calls does not resolve: what the field holds, this function among
+            // what it may hold, so the call may reach it. A call whose callee may be anything
+            // reaches the field only by a read of it, each of which is here.
+            .any => {},
+        }
+        const params = switch (call.args) {
+            .known => |known| known,
+            .unknown => return false,
+        };
+        try sites.append(self.gpa, .{ .file = site.file, .params = try self.gpa.dupe(Ast.Node.Index, params), .receiver = 0, .holder = target, .call = parent });
+    }
+    return true;
+}
+
+/// The field a struct literal's `.name = v` sets, by the type Zig gives the literal where it is
+/// written (`literalType`) and its fields (`heldFields`).
+fn storedField(self: *Facts, file: Project.FileId, literal: Ast.Node.Index, name: Ast.TokenIndex) ResolveError!?Decl {
+    const container = switch (try self.literalType(file, literal)) {
+        .container => |container| container,
+        else => return null,
+    };
+    const spelled = try Model.identifier(self.gpa, self.project.at(file).file.tree.tokenSlice(name));
+    for (try self.heldFields(container)) |field| {
+        const decl = field.decl orelse continue;
+        if (std.mem.eql(u8, self.project.at(decl.file).model.declarations[@backingInt(decl.index)].name, spelled)) return decl;
+    }
+    return null;
+}
+
+const ProgramFileList = struct { built: bool = false, list: std.ArrayList(Project.FileId) = .empty };
+
+/// The program's files, found once.
+fn programFiles(self: *Facts) ResolveError![]const Project.FileId {
+    const found = try self.memo(ProgramFileList);
+    if (found.built) return found.list.items;
+    found.built = true;
+    for (self.project.sources) |*source| if (try self.program(source.id)) try found.list.append(self.gpa, source.id);
+    return found.list.items;
+}
+
+/// Whether the program hands a value that may hold the container declared at `scope` of
+/// `file` to code outside it: an argument of a call in the program's files whose callee is no
+/// function of the program's, or may be any, that may hold it (`mayHold`).
+fn handedOutside(self: *Facts, scope: Model.Scope.Id, file: Project.FileId) ResolveError!bool {
+    for (try self.programFiles()) |id| for (try calls.in(self, id)) |call| {
+        const elsewhere = switch (call.callee) {
+            .function => |one| !try self.program(one.file),
+            .choice => |each| for (each) |one| {
+                if (!try self.program(one.file)) break true;
+            } else false,
+            .any => true,
+        };
+        if (!elsewhere) continue;
+        const args = switch (call.args) {
+            .known => |known| known,
+            .unknown => return true,
+        };
+        for (args) |arg| if (try self.mayHoldContainer(try self.resolve(id, arg), file, scope, 0)) return true;
+    };
+    return false;
+}
+
+/// Whether a value of `value` may be, point to or hold by value an instance of the container
+/// declared at `scope` of `file`; one that does not resolve may.
+fn mayHoldContainer(self: *Facts, value: Value, file: Project.FileId, scope: Model.Scope.Id, depth: u8) ResolveError!bool {
+    if (depth == 8) return true;
+    return switch (value) {
+        .instance, .container => |c| if (c.file == file and c.scope == scope) true else for (try self.heldFields(c)) |field| {
+            // A field of a container written outside the program, and made of none of its
+            // types, names none of the program's types, whatever it does not resolve to.
+            if (field.value == .unknown and c.made_by == null and !try self.program(c.file)) continue;
+            if (try self.mayHoldContainer(field.value, file, scope, depth + 1)) break true;
+        } else false,
+        .pointer => |inner| self.mayHoldContainer(inner.child.*, file, scope, depth + 1),
+        .optional, .array => |inner| self.mayHoldContainer(inner.*, file, scope, depth + 1),
+        .alternatives => |each| for (each) |one| {
+            if (try self.mayHoldContainer(one, file, scope, depth + 1)) break true;
+        } else false,
+        .unknown => true,
+        else => false,
+    };
 }
 
 /// Whether code outside the program (std's or a known library's) may call a function named
@@ -13816,12 +14131,30 @@ pub const calls = struct {
     /// any where it names a function's type alone or does not resolve.
     fn calleeOf(facts: *Facts, env: ?*const Facts.Env, file: Project.FileId, node: Ast.Node.Index) Error!Callee {
         var found: std.ArrayList(Facts.Decl) = .empty;
-        if (try functionsIn(facts, try facts.resolveIn(env, file, node), &found)) |why| return .{ .any = why };
+        if (try functionsIn(facts, try facts.resolveIn(env, file, node), &found)) |why| {
+            // A function-pointer field read whose functions are not known: `fieldOf` gives its
+            // type (`erased`), as for any value of a function type, so the read says which.
+            if (why == .unresolved and calledField(&facts.project.at(file).file.tree, node)) return .{ .any = .erased_field };
+            return .{ .any = why };
+        }
         return switch (found.items.len) {
             // No source gives it a function: nothing it calls is known.
             0 => .{ .any = .unresolved },
             1 => .{ .function = found.items[0] },
             else => .{ .choice = found.items },
+        };
+    }
+
+    /// Whether a callee is a field read, `x.f` or `x.f.*`, through parentheses: a call through a
+    /// function-pointer field.
+    fn calledField(tree: *const Ast, node: Ast.Node.Index) bool {
+        var callee = node;
+        while (true) switch (tree.nodeTag(callee)) {
+            .grouped_expression => callee = tree.nodeData(callee).node_and_token[0],
+            .deref => callee = tree.nodeData(callee).node,
+            .field_access => return true,
+            .builtin_call_two, .builtin_call_two_comma => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(callee)), "@field"),
+            else => return false,
         };
     }
 
@@ -13889,6 +14222,49 @@ test "a value read part by part: any part, every part, or what every part agrees
     try std.testing.expectEqual(@as(usize, 1), valueParts(&scalar).len);
     try std.testing.expectEqual(true, PartReader.join(&scalar).any());
     try std.testing.expectEqual(null, PartReader.join(&unknown).any());
+}
+
+test "an import only a test of std or a known library makes shares no compilation with the program: a function-pointer field keeps its stores; outside a test, or in a test of the program's own, it erases" {
+    // `t.zig` imports a module no build binds (`material`): a file that may share the
+    // compilation and is not read, so a store there may go unseen.
+    const unread = "const m = @import(\"material\");\npub const x = m;";
+    const library = "pub const Ops = struct { run: *const fn () void };\npub fn a() void {}\npub const ops: Ops = .{ .run = a };\n";
+    const Row = struct { std: []const u8, root: []const u8, own: bool, erased: bool };
+    for ([_]Row{
+        // (a) std's test imports it: Zig analyzes std's tests only when std is the module
+        // under test, never in the program's compilation.
+        .{ .std = library ++ "test {\n    _ = @import(\"t.zig\");\n}", .root = "const std = @import(\"std\");\npub fn f() void {\n    std.ops.run();\n}", .own = false, .erased = false },
+        // (b) std imports it outside a test: compiled with the program, unread.
+        .{ .std = library ++ "const t = @import(\"t.zig\");\ncomptime {\n    _ = t;\n}", .root = "const std = @import(\"std\");\npub fn f() void {\n    std.ops.run();\n}", .own = false, .erased = true },
+        // (c) The program's own test imports it: the program's test build is a compilation.
+        .{ .std = "", .root = library ++ "pub fn f() void {\n    ops.run();\n}\ntest {\n    _ = @import(\"t.zig\");\n}", .own = true, .erased = true },
+    }) |row| {
+        var project = try Project.init(std.testing.allocator, &.{
+            .{ .name = "root", .bytes = row.root },
+            .{ .name = "std/std.zig", .bytes = row.std, .selected = false },
+            .{ .name = "t.zig", .bytes = unread, .selected = row.own },
+        }, &.{
+            .{ .from = 0, .spelling = "std", .target = 1 },
+            if (row.own) .{ .from = 0, .spelling = "t.zig", .target = 2 } else .{ .from = 1, .spelling = "t.zig", .target = 2 },
+        }, .{});
+        defer project.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+        defer facts.deinit();
+        const tree = &project.sources[0].file.tree;
+        const text = if (row.own) "ops.run()" else "std.ops.run()";
+        const node = for (0..tree.nodes.len) |i| {
+            const at: Ast.Node.Index = @fromBackingInt(@intCast(i));
+            if (std.mem.eql(u8, tree.getNodeSource(at), text)) break at;
+        } else unreachable;
+        const call = (try calls.at(&facts, project.sources[0].id, node)).?;
+        if (row.erased) {
+            try std.testing.expectEqual(Unknown.erased_field, call.callee.any);
+        } else {
+            try std.testing.expectEqualStrings("a", project.at(call.callee.function.file).model.declarations[@backingInt(call.callee.function.index)].name);
+        }
+    }
 }
 
 test "facts aliases cycles and absent module mappings stay unknown" {
@@ -14933,6 +15309,56 @@ test "a slice of what does not resolve is a slice: its `.len` is its count, neve
     try std.testing.expect(sliced_value == .pointer);
     try std.testing.expectEqual(Size.slice, sliced_value.pointer.size.?);
     try std.testing.expectEqual(Length.unsized, try facts.memoryField(file, len.?));
+}
+
+test "a function's value in a private alias or table is followed for every reader; a public alias, or a private one returned, escapes" {
+    // `a` is called through an alias, an alias of it and `@This().alias`; `b` through a table's
+    // elements: every call through them is the program's. `c` is a public alias's, which a
+    // consumer may call; `d` a private alias's that a pub fn returns.
+    var project = try Project.init(std.testing.allocator, &.{
+        .{ .name = "root", .bytes =
+        \\fn a(x: u8) u8 {
+        \\    return x;
+        \\}
+        \\fn b(x: u8) u8 {
+        \\    return x;
+        \\}
+        \\fn c(x: u8) u8 {
+        \\    return x;
+        \\}
+        \\fn d(x: u8) u8 {
+        \\    return x;
+        \\}
+        \\const alias = a;
+        \\const again = alias;
+        \\const table = [_]*const fn (u8) u8{ &b, &b };
+        \\pub const handed = &c;
+        \\const back = d;
+        \\pub fn f(x: u8, i: usize) u8 {
+        \\    return again(x) +% alias(x) +% table[i](x) +% @This().alias(x);
+        \\}
+        \\pub fn give() *const fn (u8) u8 {
+        \\    return back;
+        \\}
+        },
+    }, &.{}, .{});
+    defer project.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var facts: Facts = .{ .project = &project, .gpa = arena.allocator() };
+    defer facts.deinit();
+    var found: [4]?Decl = @splat(null);
+    for (project.sources[0].model.declarations, 0..) |decl, i| {
+        for ([_][]const u8{ "a", "b", "c", "d" }, 0..) |name, at| if (decl.kind == .function and std.mem.eql(u8, decl.name, name)) {
+            found[at] = .{ .file = project.sources[0].id, .index = @fromBackingInt(@intCast(i)) };
+        };
+    }
+    const a, const b, const c, const d = .{ found[0].?, found[1].?, found[2].?, found[3].? };
+    try std.testing.expect(!try facts.escapes(a) and !try facts.escapes(b));
+    try std.testing.expect(!try facts.handedOut(a) and !try facts.handedOut(b));
+    try std.testing.expectEqual(@as(usize, 3), (try facts.callSites(a)).?.len);
+    try std.testing.expect(try facts.escapes(c) and try facts.handedOut(c));
+    try std.testing.expect(try facts.escapes(d) and try facts.handedOut(d));
 }
 
 test "a parameter's type has a length where it is or holds memory that has one" {

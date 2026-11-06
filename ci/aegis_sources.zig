@@ -1,199 +1,70 @@
 //! The pinned aegis revision's own sources, as glint project inputs for the pack's tests and
-//! benchmark: every file of its module, so each import among them is mapped as aegis's build
-//! wires it; std and every other import stay unmapped.
+//! benchmark: its whole `src/` tree (build.zig's generated `aegis_tree`), each import between
+//! its files read from the file's own `@import` spelling, as Zig resolves it against the
+//! importing file's path. A module aegis's build binds (std, builtin, a test's) stays unmapped;
+//! a file spelling the tree lacks is an error, so the inputs cannot drift from the revision.
 const std = @import("std");
 const glint = @import("glint");
 const Project = glint.Project;
 
-const Source = struct { name: []const u8, bytes: []const u8 };
-const sources = [_]Source{
-    .{ .name = "src/root.zig", .bytes = @embedFile("aegis-root") },
-    .{ .name = "src/assert.zig", .bytes = @embedFile("aegis-assert") },
-    .{ .name = "src/Atomic.zig", .bytes = @embedFile("aegis-Atomic") },
-    .{ .name = "src/BlockingGuarded.zig", .bytes = @embedFile("aegis-BlockingGuarded") },
-    .{ .name = "src/bounded.zig", .bytes = @embedFile("aegis-bounded") },
-    .{ .name = "src/Condition.zig", .bytes = @embedFile("aegis-Condition") },
-    .{ .name = "src/Confined.zig", .bytes = @embedFile("aegis-Confined") },
-    .{ .name = "src/err.zig", .bytes = @embedFile("aegis-err") },
-    .{ .name = "src/flat.zig", .bytes = @embedFile("aegis-flat") },
-    .{ .name = "src/Guarded.zig", .bytes = @embedFile("aegis-Guarded") },
-    .{ .name = "src/handle.zig", .bytes = @embedFile("aegis-handle") },
-    .{ .name = "src/handle/dense.zig", .bytes = @embedFile("aegis-handle-dense") },
-    .{ .name = "src/handle/Domain.zig", .bytes = @embedFile("aegis-handle-Domain") },
-    .{ .name = "src/handle/index.zig", .bytes = @embedFile("aegis-handle-index") },
-    .{ .name = "src/handle/offset.zig", .bytes = @embedFile("aegis-handle-offset") },
-    .{ .name = "src/handle/overlap.zig", .bytes = @embedFile("aegis-handle-overlap") },
-    .{ .name = "src/handle/run_pool.zig", .bytes = @embedFile("aegis-handle-run_pool") },
-    .{ .name = "src/handle/secondary.zig", .bytes = @embedFile("aegis-handle-secondary") },
-    .{ .name = "src/handle/slot_pool.zig", .bytes = @embedFile("aegis-handle-slot_pool") },
-    .{ .name = "src/id.zig", .bytes = @embedFile("aegis-id") },
-    .{ .name = "src/input.zig", .bytes = @embedFile("aegis-input") },
-    .{ .name = "src/int.zig", .bytes = @embedFile("aegis-int") },
-    .{ .name = "src/interior.zig", .bytes = @embedFile("aegis-interior") },
-    .{ .name = "src/Lazy.zig", .bytes = @embedFile("aegis-Lazy") },
-    .{ .name = "src/measure.zig", .bytes = @embedFile("aegis-measure") },
-    .{ .name = "src/move.zig", .bytes = @embedFile("aegis-move") },
-    .{ .name = "src/Once.zig", .bytes = @embedFile("aegis-Once") },
-    .{ .name = "src/Order.zig", .bytes = @embedFile("aegis-Order") },
-    .{ .name = "src/own.zig", .bytes = @embedFile("aegis-own") },
-    .{ .name = "src/parts.zig", .bytes = @embedFile("aegis-parts") },
-    .{ .name = "src/Region.zig", .bytes = @embedFile("aegis-Region") },
-    .{ .name = "src/RwGuarded.zig", .bytes = @embedFile("aegis-RwGuarded") },
-    .{ .name = "src/scalar.zig", .bytes = @embedFile("aegis-scalar") },
-    .{ .name = "src/scope.zig", .bytes = @embedFile("aegis-scope") },
-    .{ .name = "src/scope/ref.zig", .bytes = @embedFile("aegis-scope-ref") },
-    .{ .name = "src/scope/slot.zig", .bytes = @embedFile("aegis-scope-slot") },
-    .{ .name = "src/scope/table.zig", .bytes = @embedFile("aegis-scope-table") },
-    .{ .name = "src/secret.zig", .bytes = @embedFile("aegis-secret") },
-    .{ .name = "src/secret/inline.zig", .bytes = @embedFile("aegis-secret-inline") },
-    .{ .name = "src/secret/machine.zig", .bytes = @embedFile("aegis-secret-machine") },
-    .{ .name = "src/secret/profiles.zig", .bytes = @embedFile("aegis-secret-profiles") },
-    .{ .name = "src/secret/SecretBytes.zig", .bytes = @embedFile("aegis-secret-SecretBytes") },
-    .{ .name = "src/secret/value.zig", .bytes = @embedFile("aegis-secret-value") },
-    .{ .name = "src/Shared.zig", .bytes = @embedFile("aegis-Shared") },
-    .{ .name = "src/SpinRwGuarded.zig", .bytes = @embedFile("aegis-SpinRwGuarded") },
-    .{ .name = "src/state.zig", .bytes = @embedFile("aegis-state") },
-    .{ .name = "src/state/carrying.zig", .bytes = @embedFile("aegis-state-carrying") },
-    .{ .name = "src/state/edge.zig", .bytes = @embedFile("aegis-state-edge") },
-    .{ .name = "src/state/machine.zig", .bytes = @embedFile("aegis-state-machine") },
-    .{ .name = "src/state/runtime.zig", .bytes = @embedFile("aegis-state-runtime") },
-    .{ .name = "src/state/stage.zig", .bytes = @embedFile("aegis-state-stage") },
-    .{ .name = "src/sync.zig", .bytes = @embedFile("aegis-sync") },
-    .{ .name = "src/units.zig", .bytes = @embedFile("aegis-units") },
-};
-/// Aegis's root, the module `aegis` (aegis exports no other).
-const root = blk: {
-    @setEvalBranchQuota(sources.len * 64);
-    break :blk index("src/root.zig");
-};
+const sources = @import("aegis_tree").files;
 
-/// Each import among aegis's files: the importing file, its spelling, the file it names.
-const wired = [_][3][]const u8{
-    .{ "src/BlockingGuarded.zig", "Condition.zig", "src/Condition.zig" },
-    .{ "src/bounded.zig", "move.zig", "src/move.zig" },
-    .{ "src/flat.zig", "assert.zig", "src/assert.zig" },
-    .{ "src/flat.zig", "bounded.zig", "src/bounded.zig" },
-    .{ "src/flat.zig", "input.zig", "src/input.zig" },
-    .{ "src/flat.zig", "measure.zig", "src/measure.zig" },
-    .{ "src/flat.zig", "Region.zig", "src/Region.zig" },
-    .{ "src/handle.zig", "handle/dense.zig", "src/handle/dense.zig" },
-    .{ "src/handle.zig", "handle/Domain.zig", "src/handle/Domain.zig" },
-    .{ "src/handle.zig", "handle/index.zig", "src/handle/index.zig" },
-    .{ "src/handle.zig", "handle/offset.zig", "src/handle/offset.zig" },
-    .{ "src/handle.zig", "handle/run_pool.zig", "src/handle/run_pool.zig" },
-    .{ "src/handle.zig", "handle/secondary.zig", "src/handle/secondary.zig" },
-    .{ "src/handle.zig", "handle/slot_pool.zig", "src/handle/slot_pool.zig" },
-    .{ "src/handle/dense.zig", "../move.zig", "src/move.zig" },
-    .{ "src/handle/dense.zig", "../Region.zig", "src/Region.zig" },
-    .{ "src/handle/dense.zig", "Domain.zig", "src/handle/Domain.zig" },
-    .{ "src/handle/dense.zig", "overlap.zig", "src/handle/overlap.zig" },
-    .{ "src/handle/dense.zig", "slot_pool.zig", "src/handle/slot_pool.zig" },
-    .{ "src/handle/offset.zig", "../Region.zig", "src/Region.zig" },
-    .{ "src/handle/run_pool.zig", "../assert.zig", "src/assert.zig" },
-    .{ "src/handle/run_pool.zig", "../Region.zig", "src/Region.zig" },
-    .{ "src/handle/run_pool.zig", "index.zig", "src/handle/index.zig" },
-    .{ "src/handle/run_pool.zig", "slot_pool.zig", "src/handle/slot_pool.zig" },
-    .{ "src/handle/secondary.zig", "../move.zig", "src/move.zig" },
-    .{ "src/handle/secondary.zig", "../Region.zig", "src/Region.zig" },
-    .{ "src/handle/secondary.zig", "overlap.zig", "src/handle/overlap.zig" },
-    .{ "src/handle/slot_pool.zig", "../assert.zig", "src/assert.zig" },
-    .{ "src/handle/slot_pool.zig", "../move.zig", "src/move.zig" },
-    .{ "src/handle/slot_pool.zig", "../Region.zig", "src/Region.zig" },
-    .{ "src/handle/slot_pool.zig", "Domain.zig", "src/handle/Domain.zig" },
-    .{ "src/handle/slot_pool.zig", "index.zig", "src/handle/index.zig" },
-    .{ "src/handle/slot_pool.zig", "overlap.zig", "src/handle/overlap.zig" },
-    .{ "src/id.zig", "scalar.zig", "src/scalar.zig" },
-    .{ "src/id.zig", "units.zig", "src/units.zig" },
-    .{ "src/int.zig", "scalar.zig", "src/scalar.zig" },
-    .{ "src/Lazy.zig", "interior.zig", "src/interior.zig" },
-    .{ "src/Once.zig", "Condition.zig", "src/Condition.zig" },
-    .{ "src/Order.zig", "Condition.zig", "src/Condition.zig" },
-    .{ "src/own.zig", "move.zig", "src/move.zig" },
-    .{ "src/own.zig", "units.zig", "src/units.zig" },
-    .{ "src/parts.zig", "assert.zig", "src/assert.zig" },
-    .{ "src/parts.zig", "measure.zig", "src/measure.zig" },
-    .{ "src/parts.zig", "units.zig", "src/units.zig" },
-    .{ "src/Region.zig", "bounded.zig", "src/bounded.zig" },
-    .{ "src/Region.zig", "units.zig", "src/units.zig" },
-    .{ "src/root.zig", "assert.zig", "src/assert.zig" },
-    .{ "src/root.zig", "bounded.zig", "src/bounded.zig" },
-    .{ "src/root.zig", "err.zig", "src/err.zig" },
-    .{ "src/root.zig", "flat.zig", "src/flat.zig" },
-    .{ "src/root.zig", "handle.zig", "src/handle.zig" },
-    .{ "src/root.zig", "id.zig", "src/id.zig" },
-    .{ "src/root.zig", "input.zig", "src/input.zig" },
-    .{ "src/root.zig", "int.zig", "src/int.zig" },
-    .{ "src/root.zig", "Order.zig", "src/Order.zig" },
-    .{ "src/root.zig", "own.zig", "src/own.zig" },
-    .{ "src/root.zig", "parts.zig", "src/parts.zig" },
-    .{ "src/root.zig", "Region.zig", "src/Region.zig" },
-    .{ "src/root.zig", "scope.zig", "src/scope.zig" },
-    .{ "src/root.zig", "secret.zig", "src/secret.zig" },
-    .{ "src/root.zig", "secret/inline.zig", "src/secret/inline.zig" },
-    .{ "src/root.zig", "secret/SecretBytes.zig", "src/secret/SecretBytes.zig" },
-    .{ "src/root.zig", "state.zig", "src/state.zig" },
-    .{ "src/root.zig", "sync.zig", "src/sync.zig" },
-    .{ "src/root.zig", "units.zig", "src/units.zig" },
-    .{ "src/scope.zig", "scope/ref.zig", "src/scope/ref.zig" },
-    .{ "src/scope.zig", "scope/slot.zig", "src/scope/slot.zig" },
-    .{ "src/scope.zig", "scope/table.zig", "src/scope/table.zig" },
-    .{ "src/scope/ref.zig", "slot.zig", "src/scope/slot.zig" },
-    .{ "src/scope/table.zig", "ref.zig", "src/scope/ref.zig" },
-    .{ "src/scope/table.zig", "slot.zig", "src/scope/slot.zig" },
-    .{ "src/secret.zig", "secret/machine.zig", "src/secret/machine.zig" },
-    .{ "src/secret.zig", "secret/profiles.zig", "src/secret/profiles.zig" },
-    .{ "src/secret.zig", "secret/value.zig", "src/secret/value.zig" },
-    .{ "src/secret/value.zig", "profiles.zig", "src/secret/profiles.zig" },
-    .{ "src/Shared.zig", "interior.zig", "src/interior.zig" },
-    .{ "src/Shared.zig", "move.zig", "src/move.zig" },
-    .{ "src/state.zig", "state/edge.zig", "src/state/edge.zig" },
-    .{ "src/state.zig", "state/machine.zig", "src/state/machine.zig" },
-    .{ "src/state/carrying.zig", "../move.zig", "src/move.zig" },
-    .{ "src/state/machine.zig", "carrying.zig", "src/state/carrying.zig" },
-    .{ "src/state/machine.zig", "edge.zig", "src/state/edge.zig" },
-    .{ "src/state/machine.zig", "runtime.zig", "src/state/runtime.zig" },
-    .{ "src/state/machine.zig", "stage.zig", "src/state/stage.zig" },
-    .{ "src/state/stage.zig", "../move.zig", "src/move.zig" },
-    .{ "src/sync.zig", "Atomic.zig", "src/Atomic.zig" },
-    .{ "src/sync.zig", "BlockingGuarded.zig", "src/BlockingGuarded.zig" },
-    .{ "src/sync.zig", "Condition.zig", "src/Condition.zig" },
-    .{ "src/sync.zig", "Confined.zig", "src/Confined.zig" },
-    .{ "src/sync.zig", "Guarded.zig", "src/Guarded.zig" },
-    .{ "src/sync.zig", "Lazy.zig", "src/Lazy.zig" },
-    .{ "src/sync.zig", "Once.zig", "src/Once.zig" },
-    .{ "src/sync.zig", "Order.zig", "src/Order.zig" },
-    .{ "src/sync.zig", "RwGuarded.zig", "src/RwGuarded.zig" },
-    .{ "src/sync.zig", "Shared.zig", "src/Shared.zig" },
-    .{ "src/sync.zig", "SpinRwGuarded.zig", "src/SpinRwGuarded.zig" },
-    .{ "src/units.zig", "assert.zig", "src/assert.zig" },
-    .{ "src/units.zig", "int.zig", "src/int.zig" },
-    .{ "src/units.zig", "scalar.zig", "src/scalar.zig" },
-};
-
-/// A pinned source's place among the project's inputs (the consumer is 0).
-fn index(comptime name: []const u8) u32 {
-    for (sources, 1..) |source, i| if (std.mem.eql(u8, source.name, name)) return i;
-    @compileError("not a pinned aegis source: " ++ name);
+/// The input index of aegis's source `name`: the consumer is input 0, aegis's sources follow.
+fn input(comptime name: []const u8) u32 {
+    @setEvalBranchQuota(100_000);
+    inline for (sources, 1..) |source, i| if (comptime std.mem.eql(u8, source.name, name)) return i;
+    @compileError("aegis's src/ has no " ++ name);
 }
 
-/// Imports as aegis's own build wires them, then the consumer's (source 0) of aegis.
-fn imports() [wired.len + 1]Project.Import {
-    return imported;
+const root = input("src/root.zig");
+
+/// The consumer's (input 0) import of aegis: the module `aegis`, the only one aegis exports.
+const consumer_imports = [_]Project.Import{.{ .from = 0, .spelling = "aegis", .target = root }};
+
+/// Imports as aegis's files spell them, then the consumer's (`consumer_imports`); the caller
+/// frees them. A spelling of a `.zig` or `.zon` file that names none of the tree's is
+/// `error.UnpinnedImport`.
+fn imports(gpa: std.mem.Allocator) ![]Project.Import {
+    var found: std.ArrayList(Project.Import) = .empty;
+    errdefer found.deinit(gpa);
+    for (sources, 1..) |source, from| {
+        var tokens: std.zig.Tokenizer = .init(source.bytes);
+        // The two tokens before this one: `@import` `(` before a string is an import.
+        var before: [2]std.zig.Token = @splat(.{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } });
+        while (true) {
+            const token = tokens.next();
+            if (token.tag == .eof) break;
+            defer before = .{ before[1], token };
+            if (token.tag != .string_literal or before[1].tag != .l_paren or before[0].tag != .builtin) continue;
+            if (!std.mem.eql(u8, source.bytes[before[0].loc.start..before[0].loc.end], "@import")) continue;
+            const spelling = source.bytes[token.loc.start + 1 .. token.loc.end - 1];
+            if (!std.mem.endsWith(u8, spelling, ".zig") and !std.mem.endsWith(u8, spelling, ".zon")) continue;
+            const path = try std.fs.path.resolveAllocPosix(gpa, &.{ std.fs.path.dirnamePosix(source.name) orelse ".", spelling });
+            defer gpa.free(path);
+            const target = for (sources, 1..) |each, i| {
+                if (std.mem.eql(u8, each.name, path)) break i;
+            } else {
+                std.debug.print("aegis_sources: {s} imports {s}, which aegis's src/ does not hold\n", .{ source.name, spelling });
+                return error.UnpinnedImport;
+            };
+            // A file that writes a spelling twice imports one file: one edge.
+            for (found.items) |edge| {
+                if (edge.from == from and std.mem.eql(u8, edge.spelling, spelling)) break;
+            } else try found.append(gpa, .{ .from = @intCast(from), .spelling = spelling, .target = @intCast(target) });
+        }
+    }
+    try found.appendSlice(gpa, &consumer_imports);
+    return found.toOwnedSlice(gpa);
 }
-const imported = blk: {
-    // Each of the wired imports looks up two names among the sources.
-    @setEvalBranchQuota(4 * wired.len * sources.len * 64);
-    var all: [wired.len + 1]Project.Import = undefined;
-    for (wired, 0..) |entry, i| all[i] = .{ .from = index(entry[0]), .spelling = entry[1], .target = index(entry[2]) };
-    all[wired.len] = .{ .from = 0, .spelling = "aegis", .target = root };
-    break :blk all;
-};
+
 /// A project whose first source is `consumer`, followed by the aegis files, none of them selected.
 pub fn project(gpa: std.mem.Allocator, consumer: []const u8) !glint.Project {
     var inputs: [sources.len + 1]Project.Input = undefined;
     inputs[0] = .{ .name = "consumer", .bytes = consumer };
     for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
-    return Project.init(gpa, &inputs, &imports(), .{});
+    const mapped = try imports(gpa);
+    defer gpa.free(mapped);
+    return Project.init(gpa, &inputs, mapped, .{});
 }
 
 /// `project`, with a second source of the program's own, imported by the consumer as `lib`
@@ -213,12 +84,14 @@ fn withLib(gpa: std.mem.Allocator, consumer: []const u8, lib: []const u8, select
     for (sources, 1..) |source, i| inputs[i] = aegisInput(source);
     inputs[sources.len + 1] = .{ .name = "lib", .bytes = lib, .selected = selected };
     const lib_file = sources.len + 1;
-    const mapped = imports();
-    var all: [mapped.len + 2]Project.Import = undefined;
-    @memcpy(all[0..mapped.len], &mapped);
+    const mapped = try imports(gpa);
+    defer gpa.free(mapped);
+    const all = try gpa.alloc(Project.Import, mapped.len + 2);
+    defer gpa.free(all);
+    @memcpy(all[0..mapped.len], mapped);
     all[mapped.len] = .{ .from = 0, .spelling = "lib", .target = lib_file };
     all[mapped.len + 1] = .{ .from = lib_file, .spelling = "aegis", .target = root };
-    return Project.init(gpa, &inputs, &all, .{});
+    return Project.init(gpa, &inputs, all, .{});
 }
 
 /// A source of another module beside aegis's, such as a fixture standing for std, in the
@@ -274,8 +147,9 @@ pub fn projectRevised(gpa: std.mem.Allocator, consumer: []const u8, name: []cons
         if (replaced) inputs[i].bytes = bytes;
     }
     if (!revised) return error.FileNotFound;
-    const mapped = imports();
-    return Project.init(gpa, &inputs, &mapped, .{});
+    const mapped = try imports(gpa);
+    defer gpa.free(mapped);
+    return Project.init(gpa, &inputs, mapped, .{});
 }
 
 /// `project`, with `extra` sources after aegis's, none of them selected, and their imports.
@@ -302,16 +176,25 @@ pub fn projectAs(gpa: std.mem.Allocator, consumer: []const u8, as: Consumer, ext
         inputs[i].compilations = others;
     }
     for (extra, sources.len + 1..) |source, i| inputs[i] = .{ .name = source.name, .bytes = source.bytes, .kind = source.kind, .selected = false, .package = source.package, .compilations = others };
-    const mapped = imports();
-    const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len);
+    const mapped = try imports(gpa);
+    defer gpa.free(mapped);
+    // The std the consumer imports is aegis's too, as one build binds one std for every module.
+    const std_target: ?u32 = for (extra_imports) |entry| {
+        if (entry.from == null and std.mem.eql(u8, entry.spelling, "std")) break entry.target;
+    } else null;
+    const aegis_std: usize = if (std_target != null) sources.len else 0;
+    const all = try gpa.alloc(Project.Import, mapped.len + extra_imports.len + aegis_std);
     defer gpa.free(all);
-    @memcpy(all[0..mapped.len], &mapped);
+    @memcpy(all[0..mapped.len], mapped);
     const first: u32 = sources.len + 1;
     for (extra_imports, mapped.len..) |entry, i| all[i] = .{ .from = if (entry.from) |from| first + from else 0, .spelling = entry.spelling, .target = switch (entry.target) {
         consumer_file => 0,
         aegis_file => root,
         else => first + entry.target,
     } };
+    if (std_target) |target| for (all[mapped.len + extra_imports.len ..], 1..) |*edge, from| {
+        edge.* = .{ .from = @intCast(from), .spelling = "std", .target = first + target };
+    };
     return Project.init(gpa, inputs, all, .{});
 }
 
