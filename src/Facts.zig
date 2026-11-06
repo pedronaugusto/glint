@@ -4044,10 +4044,7 @@ pub fn analyzedReadings(self: *Facts, decl: Decl) ResolveError!?[]const *const E
     if (found.everything) return null;
     // Code the walk did not read reads it binding nothing, as each instantiation's; a member of
     // a container a function declares, in each reading of that function.
-    if (try self.lazilyAnalyzed(found, decl)) {
-        if (self.instantiated(decl)) if (self.enclosingFunction(decl)) |outer| if (found.reached.get(outer)) |outer_readings| if (!outer_readings.every) return outer_readings.envs.items;
-        return null;
-    }
+    if (try self.lazilyAnalyzed(found, decl)) return self.lazyReadings(found, decl);
     const readings = found.reached.get(decl) orelse return &.{};
     return if (readings.every) null else readings.envs.items;
 }
@@ -4247,16 +4244,29 @@ fn lazilyRead(self: *Facts, found: *Analysis, site: Key) ResolveError!bool {
     return self.lazilyAnalyzed(found, decl);
 }
 
-/// Whether what `site` names, read binding nothing, may be `decl`: a reach of it by
-/// declaration, or a member of an unknown holder spelled as its name, as the walk reads the
-/// site (`reachFrom`) and the call the site is the callee of, recording what it reaches only.
+/// The readings code the walk did not read analyzes `decl` in, where it may (`lazilyAnalyzed`):
+/// a member of a container a function declares, each reading of that function, where the walk
+/// read the function in each it has (code it did not read analyzes the function nowhere, so
+/// makes no other instance); otherwise null, each one's (binding nothing).
+fn lazyReadings(self: *Facts, found: *Analysis, decl: Decl) ResolveError!?[]const *const Env {
+    if (!self.instantiated(decl)) return null;
+    const outer = self.enclosingFunction(decl) orelse return null;
+    const readings = found.reached.get(outer) orelse return null;
+    if (readings.every or try self.lazilyAnalyzed(found, outer)) return null;
+    return readings.envs.items;
+}
+
+/// Whether what `site` names, read in the readings code the walk did not read analyzes its part
+/// in (`lazyReadings`), may be `decl`: a reach of it by declaration, or a member of an unknown
+/// holder spelled as its name, as the walk reads the site (`reachFrom`) and the call the site
+/// is the callee of, recording what it reaches only.
 fn reachedFromSite(self: *Facts, found: *Analysis, site: Key, decl: Decl) ResolveError!bool {
-    _ = found;
+    const envs: ?[]const *const Env = if (try self.partOf(site.file, site.node)) |part| if ((try self.partsOf(site.file)).declared.get(part)) |d| try self.lazyReadings(found, .{ .file = site.file, .index = d }) else null else null;
     var check: Analysis = .{ .checking = true };
     var next: std.ArrayList(PartRead) = .empty;
     // A unit of its own (`enter`): the reader asking is charged nothing for it.
     const asker = self.enter(reading_budget);
-    const read = self.readSite(&check, &next, site);
+    const read = if (envs) |each| self.readSiteIn(&check, &next, site, each) else self.readSite(&check, &next, site, null);
     if (self.leave(asker)) return true;
     if (!try read) return false;
     if (check.everything or check.reached.contains(decl)) return true;
@@ -4264,11 +4274,20 @@ fn reachedFromSite(self: *Facts, found: *Analysis, site: Key, decl: Decl) Resolv
     return check.named.contains(record.name);
 }
 
-/// Reads one site and the call it is the callee of (`reachedFromSite`).
-/// False where no reading reaches the site (`reachedUnder` binding nothing).
-fn readSite(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site: Key) ResolveError!bool {
-    if (!try self.reachedUnder(null, site.file, site.node)) return false;
-    try self.reachFrom(check, next, site.file, site.node, null);
+/// `readSite` in each of `envs`: false where none reaches the site.
+fn readSiteIn(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site: Key, envs: []const *const Env) ResolveError!bool {
+    var any = false;
+    for (envs) |env| {
+        if (try self.readSite(check, next, site, env)) any = true;
+    }
+    return any;
+}
+
+/// Reads one site and the call it is the callee of in `env` (`reachedFromSite`).
+/// False where the reading does not reach the site (`reachedUnder`).
+fn readSite(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site: Key, env: ?*const Env) ResolveError!bool {
+    if (!try self.reachedUnder(env, site.file, site.node)) return false;
+    try self.reachFrom(check, next, site.file, site.node, env);
     const model = &self.project.at(site.file).model;
     var at = site.node;
     var parent = model.parentOf(at) orelse return true;
@@ -4278,7 +4297,7 @@ fn readSite(self: *Facts, check: *Analysis, next: *std.ArrayList(PartRead), site
     }
     var buffer: [1]Ast.Node.Index = undefined;
     const call = self.project.at(site.file).file.tree.fullCall(&buffer, parent) orelse return true;
-    if (call.ast.fn_expr == at) try self.reachFrom(check, next, site.file, parent, null);
+    if (call.ast.fn_expr == at) try self.reachFrom(check, next, site.file, parent, env);
     return true;
 }
 
